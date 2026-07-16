@@ -123,3 +123,26 @@ version.db.DbVersionTest
   large multi-method test classes that could legitimately be slow on any
   JVM under this harness's TRACE-level SQL logging configuration; don't
   assume CratonVM-specific without confirmation.
+
+## Resolution (2026-07-15)
+
+Resolved and retired. A serial Azure rerun covered every class in this list.
+The two reproducible residuals were `OptimizerConcurrencyUnitTest` and
+`SmokeTests.testQueryConcurrency`, both caused by the executor compatibility
+layer returning placeholder `FutureTask` objects and intercepting
+`AbstractExecutorService.invokeAll`. Real JDK methods consequently observed
+incomplete or incorrectly represented futures and collections.
+
+The executor bridge now returns initialized, completed `CompletableFuture`
+objects for native submit paths and leaves `invokeAll` to the JDK's own
+`AbstractExecutorService` implementation. This also cleared the temporal
+residuals in `ZonedDateTimeTest`.
+
+Final Azure validation using the release binary built from this change:
+
+- `SmokeTests`: 17/17 passed in 119997 ms.
+- `OptimizerConcurrencyUnitTest`: 12/12 passed in 144260 ms.
+- `ZonedDateTimeTest`: 196 found, 132 passed, 0 failed (64 suite aborts).
+- The original serial rerun completed the remaining 58 documented classes
+  without failures; pre-existing JUnit skips/aborts are retained as suite
+  outcomes, not CratonVM errors.

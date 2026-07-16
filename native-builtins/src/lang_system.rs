@@ -3215,7 +3215,6 @@ pub(crate) fn native_classloader_define_class1(
         }
         _ => 0,
     };
-
     // Optional PD at arg 5.
     let mut pd_url: Option<String> = None;
     if let Some(Value::Object(Some(pd))) = args.get(5) {

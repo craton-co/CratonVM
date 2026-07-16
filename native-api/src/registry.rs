@@ -2985,10 +2985,24 @@ pub trait NativeContext {
     }
 
     /// Force a class to complete its `<clinit>` immediately. Used by
-    /// `defineHiddenClass` when the `initialize` flag is `true`. The
-    /// default is a no-op — callers that care about deterministic init
+    /// `defineHiddenClass` when the `initialize` flag is `true`, and by
+    /// `Class.forName`/`Constructor.newInstance`/`Lookup.ensureInitialized`.
+    /// The default is a no-op — callers that care about deterministic init
     /// must override this in their NativeContext impl.
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), String> {
+    ///
+    /// HIB-CV-26 fix (2026-07-16): the error type is `MethodCallFailed`
+    /// (not a flattened `String`) so a `<clinit>` failure keeps its
+    /// two-layer identity all the way to the caller: a genuine Java
+    /// exception from a static initializer comes back as
+    /// `MethodCallFailed::ExceptionThrown` (already correctly wrapped as a
+    /// catchable `ExceptionInInitializerError`/`NoClassDefFoundError` by
+    /// `ensure_class_initialized_shared` per JVMS §5.5) and only a true
+    /// VM-level bug comes back as `MethodCallFailed::InternalError`.
+    /// Collapsing both into a `String` here previously forced every call
+    /// site to treat ordinary `<clinit>` exceptions as unrecoverable
+    /// internal errors, aborting the VM instead of letting Java code catch
+    /// them.
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
         let _ = class_id;
         Ok(())
     }
@@ -3691,12 +3705,26 @@ impl NativeMethodRegistry {
                     | ("group", "()Ljava/lang/String;")
                     | ("group", "(I)Ljava/lang/String;")
             );
+        // Pattern is immutable after its constructor finishes.  The two
+        // static factories below may therefore return a VM-rooted, fully
+        // constructed real-JDK Pattern from a bounded cache; unlike the old
+        // synthetic regex bridge they never fabricate or partially initialize
+        // a Pattern/Matcher layout.
+        let keep_real_pattern_compile_cache = self.current_category == NativeKind::Intrinsic
+            && class_name == "java/util/regex/Pattern"
+            && method_name == "compile"
+            && matches!(
+                descriptor,
+                "(Ljava/lang/String;)Ljava/util/regex/Pattern;"
+                    | "(Ljava/lang/String;I)Ljava/util/regex/Pattern;"
+            );
         if self.drop_real_layout_synthetic
             && matches!(
                 class_name,
                 "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
             && !keep_real_matcher_find_fastpath
+            && !keep_real_pattern_compile_cache
         {
             return;
         }

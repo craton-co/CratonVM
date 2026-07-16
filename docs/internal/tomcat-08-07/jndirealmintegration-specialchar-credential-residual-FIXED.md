@@ -58,3 +58,13 @@ cargo test --release -p cratonvm-vm unboundid_rdn_name_value_pairs --lib
 This closes both the special-character credential group and the escaped-OU
 residual group. The earlier connection-level JNDI LDAP fix remains documented
 in [jndirealmintegration-ldap-connection-npe-FIXED.md](jndirealmintegration-ldap-connection-npe-FIXED.md).
+
+## Diagnostic follow-up (2026-07-16)
+
+The JIT-on class continued to complete all 76 cases, but normal runs printed
+bounded GC "corrupt header" messages. Allocation breadcrumbs proved those
+addresses were interior conservative-root candidates in valid allocations,
+which the collector was already safely rejecting without marking or scanning.
+The A2 breadcrumb report is now emitted only when its documented
+`CRATONVM_DBG_A2=1` forensic switch is enabled. Default JIT runs remain quiet;
+the opt-in mode retains the candidate context for future collector diagnosis.

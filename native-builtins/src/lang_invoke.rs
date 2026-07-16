@@ -3300,13 +3300,12 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // across the call and re-read before reuse. See
             // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
             let target_class_pin = ctx.pin_native_root(target_class);
-            ctx.initialize_class(class_id).map_err(|message| {
-                cratonvm_types::error::MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Internal {
-                        message: format!("Lookup.ensureInitialized failed: {message}"),
-                    },
-                )
-            })?;
+            // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>`
+            // failure instead of re-wrapping it as an unrecoverable
+            // `VmError::Internal` — matches real JDK
+            // `Lookup.ensureInitialized`, which throws
+            // `ExceptionInInitializerError` for a failed initializer.
+            ctx.initialize_class(class_id)?;
             let target_class = ctx.read_native_pin(target_class_pin, target_class);
             ctx.unpin_native_roots(target_class_pin);
             Ok(Some(Value::Object(Some(target_class))))
@@ -4255,8 +4254,12 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .or_else(|| mh_read_desc(ctx, orig_mh))
         .unwrap_or_default();
     let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
-    // Encode `pos` into MH_CLASS so dispatch can recover it.
-    let pos_str = pos.to_string();
+    // Encode `pos:extra_n` into MH_CLASS so dispatch can recover BOTH
+    // the drop position and the exact number of dropped values directly,
+    // instead of re-deriving drop count later from an arg-count
+    // difference (see the dispatch-side comment on why that heuristic
+    // was wrong for chained/nested combinators).
+    let pos_str = format!("{pos}:{extra_n}");
     // GC-safety: `alloc_method_handle` allocates a new MethodHandle object,
     // which can trigger a collection that relocates `orig_mh`/`extra_classes`
     // (both captured well before this point and read again below). Pin them
@@ -5131,6 +5134,38 @@ pub(crate) const MH_KIND_CATCH: i32 = 21;
 /// reproduces it standalone, no Spring needed.
 pub(crate) const MH_KIND_RETURN_FILTER: i32 = 22;
 
+/// `MethodHandles.collectArguments(target, pos, filter)` adapter. Distinct
+/// from `MH_KIND_COLLECT` (`MethodHandle.asCollector`, which SPREADS one
+/// trailing array argument into N individual target params -- the inverse
+/// direction) and from `MH_KIND_FOLD` (`foldArguments`, which also runs a
+/// combiner over a slice of args at `pos` but SPLICES its result in ADDITION
+/// to -- not instead of -- the full original arg list). `collectArguments`
+/// consumes `filter.type().parameterCount()` args starting at `pos` by
+/// calling `filter` on them, then REPLACES that consumed range with filter's
+/// single (non-void) result before dispatching `target` -- the args outside
+/// the consumed range pass through unchanged, but the consumed ones do not
+/// reappear. Was previously a complete no-op stub (returned `target`
+/// unmodified, silently dropping `pos`/`filter` entirely) -- same failure
+/// shape as the `filterReturnValue` no-op bug fixed earlier in this
+/// investigation (commit `3af9ab62`). Confirmed live via
+/// `CRATONVM_DBG_MH_DISPATCH` tracing + `javap` decompile of the real
+/// `com.headius.invokebinder-1.14.jar`'s `Binder.collect(int, int, Class,
+/// MethodHandle)`, which JRuby 10.x's `BuildDynamicStringSite` uses (via
+/// `MethodHandles.collectArguments` under the hood) to reduce each
+/// `(ThreadContext, IRubyObject)` pair produced by an earlier
+/// `MethodHandles.permuteArguments` step (itself correct -- verified against
+/// real, unmodified invokebinder bytecode computing an intentional
+/// `[0, 0, 1, ...]`-shaped "ctx-per-dynamic-value" reorder array) down to a
+/// single `to_s`-guarded `IRubyObject`. With the no-op stub, that reduction
+/// never happened: the duplicated `ThreadContext` from the permute step
+/// survived unchanged all the way to `BuildDynamicStringSite.buildString`,
+/// landing in the argument slot its `IRubyObject` parameter expects, and
+/// `RubyString.append`/`appendAsStringOrAny` threw `ClassCastException:
+/// ThreadContext cannot be cast to IRubyObject` -- reached via
+/// `JRubyScriptTemplateTests`'s `require 'ostruct'` (`ostruct.rb:477`,
+/// string interpolation in `OpenStruct`'s class body).
+pub(crate) const MH_KIND_COLLECT_ARGS: i32 = 23;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5763,6 +5798,101 @@ fn mh_dispatch_fold(
     mh_dispatch(ctx, target, &full)
 }
 
+/// Construct a `MethodHandles.collectArguments(target, pos, filter)` adapter
+/// (`MH_KIND_COLLECT_ARGS`). Mirrors `make_fold_adapter`'s wrapper shape
+/// (target, combiner/filter, pos) -- only the DISPATCH-time splicing differs
+/// (replace vs. splice-in-addition; see `MH_KIND_COLLECT_ARGS`'s doc
+/// comment).
+fn make_collect_args_adapter(
+    ctx: &mut dyn NativeContext,
+    target: Option<Value>,
+    pos: i32,
+    filter: Option<Value>,
+) -> MethodCallResult {
+    let target = match target {
+        Some(Value::Object(Some(t))) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter_ref = match filter {
+        Some(Value::Object(Some(f))) => f,
+        // No filter → behave like the bare target.
+        _ => return Ok(Some(Value::Object(Some(target)))),
+    };
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `target`/`filter_ref`/
+    // `wrapper` (each captured/produced above and read again after a later
+    // allocation); pin them and re-read the forwarded references before
+    // each use.
+    let target_pin = ctx.pin_native_root(target);
+    let filter_pin = ctx.pin_native_root(filter_ref);
+    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let target = ctx.read_native_pin(target_pin, target);
+    let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
+    ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+    ctx.set_field(wrapper, 1, Value::Object(Some(filter_ref)));
+    ctx.set_field(wrapper, 2, Value::Int(pos));
+    let desc = mh_type_descriptor(ctx, target)
+        .or_else(|| mh_read_desc(ctx, target))
+        .unwrap_or_default();
+    let adapter = alloc_method_handle(ctx, "__adapter__", "collectargs", &desc, MH_KIND_COLLECT_ARGS);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(target_pin);
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+    Ok(Some(Value::Object(Some(adapter))))
+}
+
+/// `MethodHandles.collectArguments` dispatch (`MH_KIND_COLLECT_ARGS`). The
+/// filter consumes `filter.parameterCount()` args starting at `pos`; a
+/// non-void result REPLACES that consumed range (unlike `foldArguments`,
+/// which keeps the full original list and splices the combiner's result in
+/// ADDITION to it) before the target runs.
+fn mh_dispatch_collect_args(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(f)) => f,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    let pos = match ctx.get_field(wrapper, 2) {
+        Value::Int(p) => (p as usize).min(extra_args.len()),
+        _ => 0,
+    };
+    // The filter consumes `filter.parameterCount()` args starting at `pos`.
+    let fdesc = mh_type_descriptor(ctx, filter)
+        .or_else(|| mh_read_desc(ctx, filter))
+        .unwrap_or_default();
+    let (fparams, fret) = split_descriptor_params(&fdesc).unwrap_or_default();
+    let take = fparams.len().min(extra_args.len().saturating_sub(pos));
+    let filter_args: Vec<Value> = extra_args[pos..pos + take].to_vec();
+    // GC-safety: this recursive `mh_dispatch` call can trigger a collection
+    // that relocates `target` (captured above and dispatched again below);
+    // pin it and re-read the forwarded reference before its final use.
+    let target_pin = ctx.pin_native_root(target);
+    let filtered = mh_dispatch(ctx, filter, &filter_args)?;
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
+    // Replace the consumed [pos, pos+take) range with the filter's non-void
+    // result (a void filter just consumes the range, contributing nothing).
+    let mut full: Vec<Value> = Vec::with_capacity(extra_args.len());
+    full.extend_from_slice(&extra_args[..pos]);
+    if fret != "V" {
+        full.push(filtered.unwrap_or(Value::Object(None)));
+    }
+    full.extend_from_slice(&extra_args[pos + take..]);
+    mh_dispatch(ctx, target, &full)
+}
+
 fn mh_exception_matches(
     ctx: &dyn NativeContext,
     thrown: cratonvm_types::ObjectRef,
@@ -5953,9 +6083,27 @@ pub(crate) fn mh_dispatch(
             .class_name_of_id(ctx.class_id_of_object(mh))
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!(
-            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} kind={kind} bound={bound:?} argc={}",
+            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} desc={desc:?} kind={kind} bound={bound:?} argc={}",
             extra_args.len()
         );
+        // T2.9.X-dbg: dump each dynamic arg's runtime class (or the raw
+        // primitive) so a wrong-value / wrong-position bug in a combinator
+        // chain (dropArguments/insertArguments/foldArguments/...) is
+        // visible directly, not just the argc.
+        let arg_descs: Vec<String> = extra_args
+            .iter()
+            .map(|v| match v {
+                Value::Object(Some(o)) => {
+                    let cn = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*o))
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{:p}:{}", o.as_ptr(), cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        eprintln!("[MH_DISPATCH_ARGS] {arg_descs:?}");
         if kind == MH_KIND_GUARD {
             if let Value::Object(Some(wrapper)) = bound {
                 eprintln!(
@@ -6141,22 +6289,52 @@ pub(crate) fn mh_dispatch(
             };
             let reorder_len = ctx.array_length(reorder_arr);
             let mut permuted_args = Vec::with_capacity(reorder_len);
+            let mut reorder_vals: Vec<i32> = Vec::with_capacity(reorder_len);
             for i in 0..reorder_len {
                 let idx = match ctx.get_array_element(reorder_arr, i) {
                     Value::Int(v) => v as usize,
                     _ => i,
                 };
+                reorder_vals.push(idx as i32);
                 let val = extra_args.get(idx).copied().unwrap_or(Value::Object(None));
                 permuted_args.push(val);
+            }
+            if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                let target_desc = mh_read_desc(ctx, target_mh).unwrap_or_default();
+                eprintln!(
+                    "[MH_PERMUTE] reorder={reorder_vals:?} extra_args_len={} target_desc={target_desc:?}",
+                    extra_args.len()
+                );
             }
             mh_dispatch(ctx, target_mh, &permuted_args)
         }
         MH_KIND_DROP => {
             // C26: dropArgumentsTrusted wrapper. Unwrap to inner MH (in
             // MH_BOUND) and forward only the inner MH's expected args.
-            // Inner arity is derived from the inner MH's effective type. The
-            // drop position is encoded in MH_CLASS as "<pos>" decimal; if parse
-            // fails, drop from the head.
+            //
+            // The drop position AND count are encoded in MH_CLASS as
+            // "pos:count" (set by `make_drop_arguments_adapter` at
+            // construction time -- see its own comment). This USED to
+            // re-derive `drop_n` at dispatch time as
+            // `extra_args.len() - inner_expected` (inner_expected computed
+            // by re-parsing the INNER handle's reported descriptor/kind).
+            // That heuristic silently produces the wrong `drop_n` (and then
+            // a wrong, silently-clamped `pos`) whenever this DROP adapter is
+            // itself nested inside further combinators (JRuby's
+            // `org.jruby.ir.targets.indy.InvokeSite` composes SIX
+            // `dropArguments` + SIX `insertArguments` calls per call site) --
+            // any drift in what the inner handle's descriptor reports as its
+            // effective arity (e.g. a receiver-detection edge case, or an
+            // inner adapter whose own widened `type` field doesn't exactly
+            // match its TRUE effective arity) throws off the subtraction,
+            // which then throws off every downstream drop in the chain.
+            // Confirmed via `CRATONVM_DBG_INDY_GENERIC` tracing on
+            // `rubygems/version.rb`'s `@version.sub(regex, "")` call
+            // (reached through exactly this `InvokeSite` machinery): the
+            // receiver slot held `self` instead of `@version`'s string, and
+            // a stray `Regexp` literal landed in the replacement-string/
+            // block slots -- a classic "wrong args kept as the `pos` prefix"
+            // symptom of a silently-mis-clamped `pos`/`drop_n` pair.
             let inner = match bound {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Object(None))),
@@ -6177,11 +6355,29 @@ pub(crate) fn mh_dispatch(
                 } else {
                     0
                 };
-            let pos: usize = mh_read_class(ctx, mh)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-            // Drop `extra_args.len() - inner_expected` args starting at `pos`.
-            let drop_n = extra_args.len().saturating_sub(inner_expected);
+            let class_str = mh_read_class(ctx, mh);
+            let (pos, drop_n): (usize, usize) = class_str
+                .as_deref()
+                .and_then(|s| {
+                    let mut parts = s.splitn(2, ':');
+                    let p = parts.next()?.parse::<usize>().ok()?;
+                    let n = parts.next()?.parse::<usize>().ok()?;
+                    Some((p, n))
+                })
+                // Defensive fallback for a DROP handle whose MH_CLASS wasn't
+                // encoded in the "pos:count" format (shouldn't happen via
+                // `make_drop_arguments_adapter`, but avoid a hard failure on
+                // an unexpected encoding): fall back to the old
+                // arg-count-difference heuristic.
+                .unwrap_or_else(|| {
+                    let p = class_str
+                        .as_deref()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let n = extra_args.len().saturating_sub(inner_expected);
+                    (p, n)
+                });
+            let drop_n = drop_n.min(extra_args.len());
             let pos = pos.min(extra_args.len().saturating_sub(drop_n));
             let mut trimmed: Vec<Value> = Vec::with_capacity(inner_expected);
             trimmed.extend_from_slice(&extra_args[..pos]);
@@ -6493,6 +6689,7 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
+        MH_KIND_COLLECT_ARGS => mh_dispatch_collect_args(ctx, bound, extra_args),
         MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
         MH_KIND_RETURN_FILTER => mh_dispatch_return_filter(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
@@ -6611,6 +6808,22 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                            let last_desc = match adapted.last() {
+                                Some(Value::Object(Some(o))) if ctx.object_is_array(*o) => {
+                                    format!("array[len={}]", ctx.array_length(*o))
+                                }
+                                Some(Value::Object(Some(_))) => "obj".to_string(),
+                                Some(Value::Object(None)) => "null".to_string(),
+                                Some(other) => format!("{other:?}"),
+                                None => "<none>".to_string(),
+                            };
+                            eprintln!(
+                                "[MH_VIRTUAL_ADAPTED] class={class} name={name} desc={desc:?} collected_len={} adapted_len={} last={last_desc}",
+                                collected.len(),
+                                adapted.len()
+                            );
+                        }
                         let mut full_args = Vec::with_capacity(1 + adapted.len());
                         full_args.push(Value::Object(Some(receiver)));
                         full_args.extend_from_slice(&adapted);
@@ -7122,30 +7335,73 @@ fn collect_trailing_varargs(
     params: &[Value],
 ) -> Vec<Value> {
     // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
-    // hot path (every static/virtual MethodHandle dispatch — Groovy/Gradle/
+    // hot path (every static/virtual MethodHandle dispatch -- Groovy/Gradle/
     // Jackson/SpEL-compiled) pays only a descriptor parse, not a full
     // declared-methods scan.
     let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
     let p = ptypes.len();
-    let last = match ptypes.last() {
-        // Varargs ALWAYS has an array as its last parameter; if not, this can't
-        // be a varargs collection — return untouched.
-        Some(t) if t.starts_with('[') => t.clone(),
-        _ => return params.to_vec(),
+    // Locate the array-typed parameter. Real JDK varargs requires it to be
+    // the syntactically LAST parameter (JLS) -- but JRuby's Ruby-call
+    // convention routinely appends a trailing `Block` parameter AFTER the
+    // args array (e.g. `InvokeSite#invoke(ThreadContext, IRubyObject caller,
+    // IRubyObject self, IRubyObject[] args, Block)`), so search for the
+    // array anywhere in the descriptor rather than assuming index `p - 1`.
+    let array_idx = match ptypes.iter().position(|t| t.starts_with('[')) {
+        Some(idx) => idx,
+        // No array parameter at all -- this can't be a varargs/collect
+        // target, return untouched.
+        None => return params.to_vec(),
     };
-    // Already packed: exactly P args and the trailing one is an array (or null).
-    // Covers a correct `invokeExact`/pre-packed call AND e.g.
-    // `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection needed
-    // regardless of varargs-ness, so skip the method-table lookup entirely.
+    let last = ptypes[array_idx].clone();
+    let trailing_types = &ptypes[array_idx + 1..];
+    // Already packed: exactly P args and the array-position value is itself
+    // an array (or null). Covers a correct `invokeExact`/pre-packed call AND
+    // e.g. `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection
+    // needed regardless of varargs-ness, so skip the method-table lookup
+    // entirely.
     if params.len() == p {
-        match params.last() {
+        match params.get(array_idx) {
             Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
             Some(Value::Object(None)) => return params.to_vec(),
             _ => {}
         }
     }
-    // Only now (last param is an array AND args aren't packed) confirm the
-    // target is actually ACC_VARARGS before reshaping the arguments.
+    // Confirm collection is actually warranted before reshaping the
+    // arguments. Two independent triggers, either one is sufficient:
+    //
+    //  1. `is_varargs` -- the target is a genuine Java ACC_VARARGS method
+    //     (`foo(Object... xs)`), reached via reflection/MethodHandle spread
+    //     calling convention (`invokeWithArguments`, Groovy's boxed-args
+    //     dispatch, ...). This was the ONLY trigger originally.
+    //
+    //  2. `params.len() > p` -- MORE flat argument values were supplied than
+    //     the target descriptor declares params for, and SOME declared param
+    //     is an array type. This covers a target method whose array
+    //     parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby 10.x's
+    //     `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
+    //     .invoke(ThreadContext, IRubyObject, IRubyObject, IRubyObject[],
+    //     Block)` (confirmed via `javap` -- both real overloads take a plain
+    //     array, neither is declared `IRubyObject...`, so ACC_VARARGS is
+    //     never set on either). JRuby's `invokebinder`-built call-site chain
+    //     supplies the trailing Ruby-level arguments as flat individual
+    //     values via a sequence of `MethodHandles.insertArguments` calls
+    //     (CratonVM's `MH_KIND_INSERT`, which splices correctly at its own
+    //     `pos` -- verified by direct value tracing, not the bug) and never
+    //     calls `MethodHandle.asCollector`/anything else that would pack
+    //     them -- so by the time dispatch reaches the target method's own
+    //     descriptor, arity strictly exceeds the declared param count with
+    //     an array type declared somewhere in it. In a signature-polymorphic
+    //     MethodHandle-mediated call this arity/type mismatch has exactly
+    //     one legal resolution (collect the excess into the array); passing
+    //     the excess through flat/unchanged (the old behavior) desyncs
+    //     every argument at and after the array position -- confirmed via
+    //     `CRATONVM_DBG_MH_DISPATCH` live tracing on
+    //     `JRubyScriptTemplateTests`/`rubygems/version.rb`'s
+    //     `@version.sub(regex, "")`: the terminal `NormalInvokeSite.invoke`
+    //     dispatch received 6 flat args `[ctx, self, receiver, regex, BLOCK,
+    //     replacement]` against a 5-param `(ctx, self, receiver, args[],
+    //     block)` target -- the block landed in the array's slot, one
+    //     position early, pushing the real last argument out past it.
     let cid = match ctx.class_id_by_name(class) {
         Some(c) => c,
         None => return params.to_vec(),
@@ -7154,20 +7410,82 @@ fn collect_trailing_varargs(
         .declared_methods(cid)
         .iter()
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
-    if !is_varargs {
+    let arity_excess = params.len() > p;
+    // A second, narrower trigger alongside `arity_excess`: EXACTLY `p` args
+    // were supplied (no excess) but the value that naively lands at the
+    // array's declared position isn't itself an array (or null) -- a bare
+    // scalar sitting in an array-typed descriptor slot. Confirmed via the
+    // SAME `JRubyScriptTemplateTests` trace as `arity_excess` above: right
+    // after the `.sub()` call's 6-flat-args case (fixed by `arity_excess`),
+    // the very next call in the same chain --
+    // `org.jruby.ir.targets.indy.SelfInvokeSite.invoke(ThreadContext,
+    // IRubyObject, IRubyObject[], Block)` -- arrived with exactly 4 flat
+    // args (matching `p` exactly) where the array-typed 3rd param held a
+    // single bare `IRubyObject` instead of a 1-element array, later
+    // surfacing as `ArgumentError: wrong number of arguments (given 0,
+    // expected 1)` inside the interpreted Ruby method `checkArity` found it
+    // was calling. A single supplied value destined for a 1-element array
+    // needs the exact same wrap-into-array treatment as an excess of
+    // supplied values, just with `excess == 0`.
+    let array_slot_is_wrapped = match params.get(array_idx) {
+        Some(Value::Object(Some(arr))) => ctx.object_is_array(*arr),
+        Some(Value::Object(None)) => true,
+        _ => false,
+    };
+    let scalar_needs_wrap = params.len() == p && !array_slot_is_wrapped;
+    if !is_varargs && !arity_excess && !scalar_needs_wrap {
         return params.to_vec();
     }
-    let fixed = p - 1;
-    if params.len() < fixed {
-        // Fewer args than the leading fixed params — let `invoke` surface the
-        // arity error rather than fabricate a result.
+    if params.len() < array_idx + trailing_types.len() {
+        // Fewer args than the leading-fixed + trailing-fixed params could
+        // ever accommodate -- let `invoke` surface the arity error rather
+        // than fabricate a result.
         return params.to_vec();
     }
+    // The tail region (`params[array_idx..]`) needs to split into "values
+    // that collect into the array" and "values that satisfy the trailing
+    // fixed params declared AFTER the array" (e.g. a trailing `Block`). A
+    // naive positional split (last N values = trailing fixed params) is
+    // WRONG here: those trailing values can end up spliced into the MIDDLE
+    // of the tail region by an earlier, independently-correct
+    // `MethodHandles.insertArguments` step whose `pos` was computed against
+    // the COLLAPSED arity it expected -- CratonVM never actually collapses
+    // until this function runs, so a value meant to land after the array
+    // ends up interleaved among the to-be-collected values instead (exactly
+    // the `[..., Regexp, Block, replacement]` shape traced above: `Block`
+    // sitting between the two values that belong in the array). Recover the
+    // correct split by matching each trailing declared type against its
+    // RUNTIME class within the tail, pulling matched values out (in the
+    // trailing params' declared order) and leaving the rest, in their
+    // original relative order, to collect into the array.
+    let tail = &params[array_idx..];
+    let mut taken = vec![false; tail.len()];
+    let mut trailing_values: Vec<Value> = Vec::with_capacity(trailing_types.len());
+    for tt in trailing_types {
+        let want_class = tt.trim_start_matches('L').trim_end_matches(';');
+        let found = tail.iter().enumerate().find(|(i, v)| {
+            !taken[*i]
+                && matches!(v, Value::Object(Some(o))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+        }).map(|(i, _)| i);
+        let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
+        if let Some(i) = idx {
+            taken[i] = true;
+            trailing_values.push(tail[i]);
+        }
+    }
+    let collected: Vec<Value> = tail
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !taken[*i])
+        .map(|(_, v)| *v)
+        .collect();
     let component = &last[1..]; // strip one leading '['
-    let array = build_varargs_array(ctx, component, &params[fixed..]);
-    let mut out = Vec::with_capacity(fixed + 1);
-    out.extend_from_slice(&params[..fixed]);
+    let array = build_varargs_array(ctx, component, &collected);
+    let mut out = Vec::with_capacity(array_idx + 1 + trailing_values.len());
+    out.extend_from_slice(&params[..array_idx]);
     out.push(Value::Object(array));
+    out.extend_from_slice(&trailing_values);
     out
 }
 
@@ -8095,8 +8413,12 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "collectArguments",
         "(Ljava/lang/invoke/MethodHandle;ILjava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            make_collect_args_adapter(ctx, args.first().copied(), pos, args.get(2).copied())
         },
     );
     r.register(
@@ -9094,6 +9416,61 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
+
+    // MH_KIND_DROP dispatch must trim the dynamic args using the EXACT
+    // `pos:count` encoded at construction time (see MH_KIND_RETURN_FILTER's
+    // sibling doc comment on `make_drop_arguments_adapter` for the full
+    // story) rather than re-deriving the drop count later from
+    // `extra_args.len() - inner_expected`. Regression coverage for the
+    // JRubyScriptTemplateTests investigation (2026-07-15): a bare
+    // `dropArguments(leaf, pos, valueTypes)` adapter, dispatched with the
+    // widened arg list, must forward ONLY the kept (non-dropped) argument
+    // to `leaf`, regardless of what values sit in the dropped slots.
+    #[test]
+    fn drop_arguments_dispatch_keeps_correct_slot_not_adjacent_ones() {
+        let mut ctx = MockNativeContext::new();
+        // Leaf: identity(x) = x -- a plain 1-arg handle, so the dispatch
+        // result directly tells us which argument survived the drop.
+        let leaf = alloc_method_handle(
+            &mut ctx,
+            "java/lang/invoke/MethodHandles",
+            "identity",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_IDENTITY,
+        );
+        // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
+        // a 3-param adapter where params[1..3] are dropped and param[0] is
+        // the one forwarded to `leaf`. Built directly (bypassing
+        // `make_drop_arguments_adapter`'s `[Ljava/lang/Class;` machinery)
+        // to isolate the dispatch-side fix under test.
+        let adapter = alloc_method_handle(
+            &mut ctx,
+            "1:2",
+            "drop",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_DROP,
+        );
+        ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
+
+        // Three distinct sentinel objects so a wrong-position bug (e.g. a
+        // dropped arg silently reaching `leaf` instead of the kept one)
+        // is unmistakable rather than accidentally passing.
+        let kept = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped1 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped2 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let args = [
+            Value::Object(Some(kept)),
+            Value::Object(Some(dropped1)),
+            Value::Object(Some(dropped2)),
+        ];
+        let result = mh_dispatch(&mut ctx, adapter, &args).unwrap();
+        assert_eq!(
+            result,
+            Some(Value::Object(Some(kept))),
+            "dropArguments(leaf, pos=1, count=2) must keep only the arg at \
+             pos 0 and forward it to leaf, regardless of the dropped args"
+        );
+    }
 
     // C13: alloc_method_handle must populate the real-JDK
     // MethodHandle.type:MethodType field so JDK code paths that read

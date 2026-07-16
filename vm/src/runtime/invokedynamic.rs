@@ -577,12 +577,124 @@ fn bootstrap_generic(
         }
     }
 
+    // Some bootstrap methods declare a trailing `Object[]` formal parameter
+    // that collects ALL "extra" constant-pool bootstrap arguments beyond the
+    // fixed `(Lookup, String, MethodType)` prefix -- a JVMS-legal
+    // invokedynamic linkage shape (mirrors a Java varargs bootstrap method).
+    // JRuby 10.x's string-interpolation bootstrap uses exactly this shape:
+    // `BuildDynamicStringSite.buildDString(Lookup, String, MethodType,
+    // Object[])`. `bsm_args` above is built FLAT (`[lookup, name, mt,
+    // static_arg_1, ..., static_arg_N]`) and `invoke_shared` sets up the
+    // callee's locals positionally 1:1 -- so without this step, the 4th
+    // formal parameter (the declared `Object[]`) receives `bsm_args[3]`
+    // (the FIRST static bootstrap arg, a scalar) instead of an actual
+    // array. `BuildDynamicStringSite`'s own constructor then computes
+    // `bsmArgs.length - 6` as its metadata offset; CratonVM's
+    // `arraylength`-of-non-array guard silently returns 0 for the scalar
+    // (see `[GC-ARRAY-GUARD] array_length(non-array)`), so the offset goes
+    // negative and the very next `aaload` throws
+    // `ArrayIndexOutOfBoundsException` -- confirmed via `javap` decompile of
+    // the real `jruby-base-10.0.2.0.jar` class plus
+    // `JRubyScriptTemplateTests`'s `require 'ostruct'` (string
+    // interpolation in `OpenStruct`'s class body, `ostruct.rb:477`). Pack
+    // the excess trailing static args into a real `Object[]` (boxing any
+    // primitive `Value`s -- `Object[]` elements must be references) to
+    // match the declared descriptor before invoking.
+    if let Some((decl_param_count, is_last_object_array)) =
+        descriptor_param_count_and_last_is_object_array(&bsm_desc)
+    {
+        if is_last_object_array && decl_param_count > 0 && bsm_args.len() > decl_param_count {
+            let leading = decl_param_count - 1;
+            let tail: Vec<Value> = bsm_args[leading..].to_vec();
+            // GC-safety: the `valueOf` boxing calls below run arbitrary Java
+            // (class-load + <clinit>) and can trigger a moving young GC;
+            // pin the array AND every still-unprocessed object-typed tail
+            // value, re-reading each from its pin slot right before use
+            // (mirrors `bsm_pins` above, same function).
+            let arr = {
+                let mut ctx = NativeContextImpl {
+                    shared,
+                    thread: &mut *thread,
+                };
+                ctx.new_array(cratonvm_types::ArrayElementType::Reference, tail.len())
+            };
+            let base_pin = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(arr); // base_pin -> the array itself
+            let mut tail_pins: Vec<Option<usize>> = Vec::with_capacity(tail.len());
+            for v in &tail {
+                if let Value::Object(Some(o)) = v {
+                    tail_pins.push(Some(thread.native_pin_roots.len()));
+                    thread.native_pin_roots.push(*o);
+                } else {
+                    tail_pins.push(None);
+                }
+            }
+            for (i, v) in tail.into_iter().enumerate() {
+                let current_v = match tail_pins[i] {
+                    Some(slot) => Value::Object(Some(thread.native_pin_roots[slot])),
+                    None => v,
+                };
+                let boxed: Value = match current_v {
+                    Value::Int(x) => crate::vm::invoke_shared(
+                        shared,
+                        thread,
+                        "java/lang/Integer",
+                        "valueOf",
+                        "(I)Ljava/lang/Integer;",
+                        &[Value::Int(x)],
+                    )?
+                    .unwrap_or(Value::Object(None)),
+                    Value::Long(x) => crate::vm::invoke_shared(
+                        shared,
+                        thread,
+                        "java/lang/Long",
+                        "valueOf",
+                        "(J)Ljava/lang/Long;",
+                        &[Value::Long(x)],
+                    )?
+                    .unwrap_or(Value::Object(None)),
+                    Value::Float(x) => crate::vm::invoke_shared(
+                        shared,
+                        thread,
+                        "java/lang/Float",
+                        "valueOf",
+                        "(F)Ljava/lang/Float;",
+                        &[Value::Float(x)],
+                    )?
+                    .unwrap_or(Value::Object(None)),
+                    Value::Double(x) => crate::vm::invoke_shared(
+                        shared,
+                        thread,
+                        "java/lang/Double",
+                        "valueOf",
+                        "(D)Ljava/lang/Double;",
+                        &[Value::Double(x)],
+                    )?
+                    .unwrap_or(Value::Object(None)),
+                    // Already a reference (String/Class/MethodType/null static
+                    // arg, or a value with no tail_pins slot) -- passes through.
+                    other => other,
+                };
+                let arr_now = thread.native_pin_roots[base_pin];
+                let ctx = NativeContextImpl {
+                    shared,
+                    thread: &mut *thread,
+                };
+                ctx.set_array_element(arr_now, i, boxed);
+            }
+            let arr_final = thread.native_pin_roots[base_pin];
+            thread.native_pin_roots.truncate(base_pin);
+            bsm_args.truncate(leading);
+            bsm_args.push(Value::Object(Some(arr_final)));
+        }
+    }
+
     // --- Invoke the bootstrap method → CallSite. ---
     let dbg = std::env::var_os("CRATONVM_DBG_INDY_GENERIC").is_some();
     if dbg {
         eprintln!(
-            "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{}",
-            info.target_name, info.target_descriptor
+            "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{} bsm_args_len={}",
+            info.target_name, info.target_descriptor, bsm_args.len()
         );
     }
     let callsite_val = crate::vm::invoke_shared(
@@ -1300,6 +1412,59 @@ fn resolve_concat_constant(cp: &ConstantPool, index: u16) -> Option<String> {
 }
 
 /// Parse the argument types from a method descriptor.
+/// Returns `(total formal param count, is the LAST formal param exactly
+/// `Ljava/lang/Object;[]`)` for a method descriptor -- used by
+/// `bootstrap_generic` to detect the "trailing `Object[]` collects extra
+/// bootstrap args" invokedynamic linkage shape (JVMS-legal; mirrors a Java
+/// varargs bootstrap method). Deliberately narrower than a general varargs
+/// check: per JVMS this collecting parameter is always both syntactically
+/// LAST and always exactly `Object[]` (never some other array component
+/// type) for a bootstrap method, so no Block-after-array-style ordering
+/// complication applies here the way it did for JRuby's own MethodHandle
+/// combinator chains (see `collect_trailing_varargs` in
+/// `native-builtins/src/lang_invoke.rs` for that unrelated, harder case).
+fn descriptor_param_count_and_last_is_object_array(descriptor: &str) -> Option<(usize, bool)> {
+    let inner = descriptor.strip_prefix('(')?;
+    let close = inner.find(')')?;
+    let params_str = &inner[..close];
+    let bytes = params_str.as_bytes();
+    let mut i = 0;
+    let mut count = 0usize;
+    let mut last_is_object_array = false;
+    while i < bytes.len() {
+        let start = i;
+        last_is_object_array = false;
+        match bytes[i] {
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'L' {
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+                let token = &params_str[start..i];
+                last_is_object_array = token == "[Ljava/lang/Object;";
+            }
+            _ => {
+                i += 1;
+            }
+        }
+        count += 1;
+    }
+    Some((count, last_is_object_array))
+}
+
 fn parse_descriptor_args(descriptor: &str) -> Vec<char> {
     let mut args = Vec::new();
     let bytes = descriptor.as_bytes();

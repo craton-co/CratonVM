@@ -526,7 +526,10 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
         // a freshly defined application class). Comparing the loader-aware
         // resolved ids retains the exact direct edge without requiring the
         // parent record itself to be present.
-        if self.lookup(parent).is_some_and(|parent_id| parent_id == super_id) {
+        if self
+            .lookup(parent)
+            .is_some_and(|parent_id| parent_id == super_id)
+        {
             return true;
         }
         // The parent may have been resolved by a different initiating loader
@@ -1246,7 +1249,9 @@ pub struct ClassManager {
     /// Raw class file bytes for each loaded class, keyed by internal name.
     /// Populated during define_class() for CDS dump support, JVMTI
     /// `RetransformClasses`, and `getResourceAsStream("X.class")`.
-    /// T10.9.B: FxHashMap — keys are class-file internal names.
+    /// T10.9.B: FxHashMap — keys are the defining ClassId. A binary name is
+    /// not sufficient: two user-defined loaders may hold distinct enhanced
+    /// copies of the same class at once.
     ///
     /// **Round 4 audit fix (HIGH):** insertions go through
     /// [`Self::insert_class_bytes`], which tracks total bytes against
@@ -1256,14 +1261,14 @@ pub struct ClassManager {
     /// classes averaging 6 KB each). The default 16 MiB cap covers
     /// JVMTI agents (re-fetch typically targets recently-defined
     /// classes) without bounding the heap of an idle process.
-    pub class_bytes_cache: FxHashMap<String, Vec<u8>>,
+    pub class_bytes_cache: FxHashMap<ClassId, Vec<u8>>,
 
     /// Insertion-order tracker for [`Self::class_bytes_cache`] FIFO
     /// eviction. Deque front = oldest entry. Entries re-inserted
     /// (e.g. redefine) are re-pushed at the back: the FIFO ordering
     /// reflects most-recent-insert, not most-recent-access (a real
     /// LRU would need touch-on-read, which isn't worth the `&mut self`).
-    class_bytes_cache_fifo: std::collections::VecDeque<String>,
+    class_bytes_cache_fifo: std::collections::VecDeque<ClassId>,
 
     /// Running total bytes held by [`Self::class_bytes_cache`].
     class_bytes_cache_size: usize,
@@ -2724,8 +2729,7 @@ impl ClassManager {
     /// 2. Ask bootstrap → extension → application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
-        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata")
-        {
+        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
             eprintln!(
                 "[DBG_LOADCLASS] load_class({name}) already_loaded={:?}\n{bt}",
@@ -3745,7 +3749,7 @@ impl ClassManager {
         // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
         // this, every classfile would stay resident forever — ~90 MB on
         // a medium Spring app.
-        self.insert_class_bytes(name.to_string(), bytes.to_vec());
+        self.insert_class_bytes(id, bytes.to_vec());
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
         // during link-time so trusted hidden / generated classes
@@ -4527,7 +4531,7 @@ impl ClassManager {
         // from `class_bytes_cache`; if not present (synthetic stub or
         // old code path that never recorded them) we pass an empty
         // slice — JVMTI agents tolerate that.
-        let old_bytes_opt = self.class_bytes_cache.get(&existing_name).cloned();
+        let old_bytes_opt = self.class_bytes_cache.get(&class_id).cloned();
         let old_bytes_slice: &[u8] = old_bytes_opt.as_deref().unwrap_or(&[]);
         let class_id_u32 = class_id.as_u32();
         let effective_new_bytes: Vec<u8> = match fire_class_file_load_hook(
@@ -5104,7 +5108,7 @@ impl ClassManager {
             // no unused-variable lint fires when the cache update is skipped.
             let _ = &effective_new_bytes;
         } else {
-            self.insert_class_bytes(existing_name.clone(), effective_new_bytes);
+            self.insert_class_bytes(class_id, effective_new_bytes);
         }
 
         // ---- Step 6: rebuild + re-install vtable descriptor snapshots ----
@@ -5178,27 +5182,31 @@ impl ClassManager {
     /// older entries (FIFO) once the cumulative byte budget exceeds
     /// [`Self::class_bytes_cache_cap`].
     ///
-    /// Re-inserts of the same `name` (e.g. JVMTI redefine) update the
+    /// Re-inserts of the same `ClassId` (e.g. JVMTI redefine) update the
     /// size accounting and move the entry to the tail of the FIFO so
     /// it is the *last* candidate for eviction — agents that redefine
     /// hot classes keep them in cache.
-    pub fn insert_class_bytes(&mut self, name: String, bytes: Vec<u8>) {
+    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: Vec<u8>) {
         let new_size = bytes.len();
-        // If we already had an entry for this name, subtract its size
+        // If we already had an entry for this class, subtract its size
         // and remove it from the FIFO before re-appending.
-        if let Some(prev) = self.class_bytes_cache.remove(&name) {
+        if let Some(prev) = self.class_bytes_cache.remove(&class_id) {
             self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_sub(prev.len());
             // Remove the existing FIFO entry (linear scan — the deque is
             // small relative to total bytes; a real LRU would need a
             // doubly-linked list. Acceptable here because redefines are
             // rare next to first-loads).
-            if let Some(pos) = self.class_bytes_cache_fifo.iter().position(|n| n == &name) {
+            if let Some(pos) = self
+                .class_bytes_cache_fifo
+                .iter()
+                .position(|id| *id == class_id)
+            {
                 self.class_bytes_cache_fifo.remove(pos);
             }
         }
         self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_add(new_size);
-        self.class_bytes_cache.insert(name.clone(), bytes);
-        self.class_bytes_cache_fifo.push_back(name);
+        self.class_bytes_cache.insert(class_id, bytes);
+        self.class_bytes_cache_fifo.push_back(class_id);
 
         // Evict oldest entries until we fit under the cap. We always
         // keep at least the most-recently-inserted entry, so the cap
@@ -6122,7 +6130,7 @@ impl ClassManager {
         fire_resolution_invalidate_hook(id.as_u32());
 
         // Cache the class bytes (FIFO-bounded helper).
-        self.insert_class_bytes(name.to_string(), bytes.to_vec());
+        self.insert_class_bytes(id, bytes.to_vec());
 
         Ok(())
     }
@@ -12616,19 +12624,19 @@ mod tests {
     fn t10_9_b_class_manager_fxhash_swap_smoke() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
-        // class_bytes_cache: populate 50 entries, confirm round-trip.
+        // class_bytes_cache: populate 50 class identities, confirm round-trip.
         for i in 0..50u32 {
-            let name = format!("pkg/Cls{i}");
+            let class_id = ClassId::new(i);
             let bytes = vec![0xcafe_babeu32.to_be_bytes()[0]; i as usize + 4];
-            mgr.class_bytes_cache.insert(name, bytes);
+            mgr.class_bytes_cache.insert(class_id, bytes);
         }
         for i in 0..50u32 {
-            let name = format!("pkg/Cls{i}");
-            let got = mgr.class_bytes_cache.get(&name);
-            assert!(got.is_some(), "class_bytes_cache missing {name}");
+            let class_id = ClassId::new(i);
+            let got = mgr.class_bytes_cache.get(&class_id);
+            assert!(got.is_some(), "class_bytes_cache missing {class_id}");
             assert_eq!(got.unwrap().len(), i as usize + 4);
         }
-        assert!(mgr.class_bytes_cache.get("pkg/NotThere").is_none());
+        assert!(mgr.class_bytes_cache.get(&ClassId::new(99_999)).is_none());
 
         // cds_class_cache: populate and verify.
         for i in 0..25u32 {

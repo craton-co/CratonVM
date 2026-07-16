@@ -7973,6 +7973,7 @@ mod tests {
             num_params: 1,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         let resolver = |idx: u16| -> Option<(String, String, String)> {
             (idx == 1).then(|| ("pkg/Rec".to_string(), "f".to_string(), "(I)I".to_string()))
@@ -8119,6 +8120,7 @@ mod tests {
             num_params: 2,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
         // `#[repr(C)]`, so an all-zero bit pattern is valid (no niches/padding).
@@ -8192,6 +8194,7 @@ mod tests {
             num_params: 1,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
         // is valid and never called (the inline getfield emits no helper call,
@@ -8649,6 +8652,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
@@ -8782,6 +8786,7 @@ mod tests {
             num_params: 2,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -8893,6 +8898,7 @@ mod tests {
             num_params: 2,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -9008,6 +9014,7 @@ mod tests {
             num_params: 2,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure long-arithmetic method calls no helper.
@@ -9065,6 +9072,7 @@ mod tests {
             num_params: 1,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure FP-arithmetic method calls no helper.
@@ -9125,6 +9133,7 @@ mod tests {
             num_params: 2,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10329,6 +10338,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         let b_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(2),
@@ -10343,6 +10353,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: every helper address is an integer slot. This test only
         // inspects emitted metadata and never executes the generated code.

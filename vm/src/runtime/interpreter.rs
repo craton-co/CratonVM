@@ -2817,7 +2817,10 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     // `check_post_block_gc` (the monitor_wait early-return bug class). No-op
     // when the gate is off.
     if cratonvm_gc::blocked_access_debug::enabled()
-        && thread.gc_block_state.in_blocked_region.load(Ordering::Acquire)
+        && thread
+            .gc_block_state
+            .in_blocked_region
+            .load(Ordering::Acquire)
     {
         cratonvm_gc::blocked_access_debug::report_blocked_violation(
             "interpreter safepoint reached with in_blocked_region raised",
@@ -4640,8 +4643,7 @@ pub fn execute(
         // this process (mirrors the `mark_jit_bail_listed` invariant this
         // same session's other fix relies on), so none of this is needed
         // when `already_skipped` is true — skip straight to cheap defaults.
-        let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped
-        {
+        let (is_interface_default, static_skip_reason, fjp_skip, native_skip) = if already_skipped {
             (false, None, false, false)
         } else {
             // Static eligibility check — see vm/src/jit/skip_list.rs for the full
@@ -4706,7 +4708,12 @@ pub fn execute(
                     code_attr.code.len(),
                 )
             };
-            (is_interface_default, static_skip_reason, fjp_skip, native_skip)
+            (
+                is_interface_default,
+                static_skip_reason,
+                fjp_skip,
+                native_skip,
+            )
         };
         // DEBUG diagnostic — print every JIT compile decision for the
         // LazyProjection.equals method while bytebuddy_probe diagnosis
@@ -9578,6 +9585,119 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
             );
         }
     }
+    // TEMP DIAGNOSTIC (CRATONVM_DBG_BYTECODE_DUMP, 2026-07-15
+    // JRubyScriptTemplateTests investigation, round 3): dump the raw
+    // bytecode + a best-effort mnemonic disassembly for every frame whose
+    // class name matches the runtime-generated JRuby snippet under
+    // investigation (`uri_3a_classloader....rubygems.version`, the
+    // URI-mangled class name JRuby's IR-to-bytecode compiler produces for
+    // `rubygems/version.rb`'s method bodies). These snippets are
+    // synthesized at runtime -- there is no static .class file `javap` can
+    // decompile -- so this is the only way to see the literal opcode
+    // sequence CratonVM is actually executing around the `ivarGet`/
+    // `invoke:sub` invokedynamic call sites.
+    if crate::runtime::env_cache::dbg_bytecode_dump() {
+        let last = thread.frames.len() - 1;
+        let frame_ref = &thread.frames[last];
+        let cn = frame_ref.class_name();
+        if cn.contains("version") {
+            let mn = frame_ref.method_name();
+            let md = frame_ref.method_descriptor();
+            let code = &frame_ref.code;
+            eprintln!("[BYTECODE-DUMP] {}.{}{} ({} bytes)", cn, mn, md, code.len());
+            let mut pc = 0usize;
+            while pc < code.len() {
+                let op = code[pc];
+                let (mnemonic, extra_len) = opcode_mnemonic_and_operand_len(op, code, pc);
+                let operand_bytes: Vec<u8> =
+                    code[pc + 1..(pc + 1 + extra_len).min(code.len())].to_vec();
+                eprintln!(
+                    "  {:4}: {:02x} {:<20} operands={:?}",
+                    pc, op, mnemonic, operand_bytes
+                );
+                pc += 1 + extra_len;
+            }
+        }
+    }
+}
+
+/// Best-effort JVMS opcode mnemonic + trailing-operand-byte-count lookup,
+/// covering the opcodes relevant to a call-site-shaped bytecode sequence
+/// (stack shuffles, loads/stores, field/invoke family, branches, `ldc`/
+/// `new`/`checkcast`, returns). Not a complete disassembler -- unknown
+/// opcodes report `extra_len=0` (may misalign the dump past that point);
+/// good enough for the temporary `CRATONVM_DBG_BYTECODE_DUMP` diagnostic
+/// above, which only needs to identify a stack-shape opcode (`dup`,
+/// `dup_x1`, `swap`, `aload`, ...) near a known indy call site's operand
+/// bytes (which ARE handled precisely, so the scan re-syncs at each
+/// `invokedynamic`/`invokestatic`/etc. it passes).
+fn opcode_mnemonic_and_operand_len(op: u8, code: &[u8], pc: usize) -> (&'static str, usize) {
+    match op {
+        0x00 => ("nop", 0),
+        0x01 => ("aconst_null", 0),
+        0x02..=0x08 => ("iconst/lconst/fconst/dconst", 0),
+        0x10 => ("bipush", 1),
+        0x11 => ("sipush", 2),
+        0x12 => ("ldc", 1),
+        0x13 => ("ldc_w", 2),
+        0x14 => ("ldc2_w", 2),
+        0x15 => ("iload", 1),
+        0x16 => ("lload", 1),
+        0x17 => ("fload", 1),
+        0x18 => ("dload", 1),
+        0x19 => ("aload", 1),
+        0x1a..=0x1d => ("iload_N", 0),
+        0x1e..=0x21 => ("lload_N", 0),
+        0x22..=0x25 => ("fload_N", 0),
+        0x26..=0x29 => ("dload_N", 0),
+        0x2a..=0x2d => ("aload_N", 0),
+        0x36 => ("istore", 1),
+        0x37 => ("lstore", 1),
+        0x38 => ("fstore", 1),
+        0x39 => ("dstore", 1),
+        0x3a => ("astore", 1),
+        0x3b..=0x3e => ("istore_N", 0),
+        0x3f..=0x42 => ("lstore_N", 0),
+        0x43..=0x46 => ("fstore_N", 0),
+        0x47..=0x4a => ("dstore_N", 0),
+        0x4b..=0x4e => ("astore_N", 0),
+        0x57 => ("pop", 0),
+        0x58 => ("pop2", 0),
+        0x59 => ("dup", 0),
+        0x5a => ("dup_x1", 0),
+        0x5b => ("dup_x2", 0),
+        0x5c => ("dup2", 0),
+        0x5d => ("dup2_x1", 0),
+        0x5e => ("dup2_x2", 0),
+        0x5f => ("swap", 0),
+        0xa7 => ("goto", 2),
+        0xa8 => ("jsr", 2),
+        0xac..=0xb1 => ("Xreturn", 0),
+        0xb2 => ("getstatic", 2),
+        0xb3 => ("putstatic", 2),
+        0xb4 => ("getfield", 2),
+        0xb5 => ("putfield", 2),
+        0xb6 => ("invokevirtual", 2),
+        0xb7 => ("invokespecial", 2),
+        0xb8 => ("invokestatic", 2),
+        0xb9 => ("invokeinterface", 4),
+        0xba => ("invokedynamic", 4),
+        0xbb => ("new", 2),
+        0xbc => ("newarray", 1),
+        0xbd => ("anewarray", 2),
+        0xbe => ("arraylength", 0),
+        0xbf => ("athrow", 0),
+        0xc0 => ("checkcast", 2),
+        0xc1 => ("instanceof", 2),
+        0x99..=0x9e => ("if_icmp/ifxx", 2),
+        0x9f..=0xa4 => ("if_icmpXX", 2),
+        0xa5 | 0xa6 => ("if_acmpXX", 2),
+        0xc6 | 0xc7 => ("ifnull/ifnonnull", 2),
+        _ => {
+            let _ = (code, pc);
+            ("?", 0)
+        }
+    }
 }
 
 /// Convert a [`Value`] to the JVMTI-flavoured [`LocalValue`].
@@ -13416,6 +13536,41 @@ fn execute_instruction(
                         }
                         .into());
                     }
+                    // DoHead freed-while-live forensics (2026-07-15): the other
+                    // stale-receiver face — a VALID heap address whose object
+                    // was zeroed (all-zero header: ClassId(0), num_slots=0)
+                    // while a long-lived holder kept serving it. The gc guard
+                    // contains each read but names no Java context; print it
+                    // here (capped) so the holder structure is identifiable.
+                    // A getfield on a 0-slot object is always OOB, so this
+                    // never fires for a legitimate zero-hash ClassId(0)
+                    // container with fields.
+                    if p != 0 && shared.heap.is_heap_addr(p).is_some() {
+                        let h = shared.heap.get_header(obj_ref);
+                        if h.class_id.as_u32() == 0 && h.num_slots == 0 {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static NZ: AtomicUsize = AtomicUsize::new(0);
+                            let n = NZ.fetch_add(1, Ordering::Relaxed);
+                            if n < 12 {
+                                let field_name =
+                                    resolve_field_name(shared, current_class_id, *index);
+                                let cn = thread.frames[frame_idx].class_name().to_string();
+                                let mn = thread.frames[frame_idx].method_name().to_string();
+                                let pc = thread.frames[frame_idx].pc;
+                                eprintln!(
+                                    "[BADRECV-Z #{n}] getfield ZEROED receiver=0x{p:x} \
+                                 field={field_name:?} field_index={} in {cn}.{mn} pc={pc}",
+                                    field.field_index,
+                                );
+                                eprintln!("[BADRECV-Z #{n}] Java frames (innermost first):");
+                                for f in thread.frames.iter().rev().take(24) {
+                                    eprintln!("    {}.{}", f.class_name(), f.method_name());
+                                }
+                                use std::io::Write;
+                                let _ = std::io::stderr().flush();
+                            }
+                        }
+                    }
                 }
                 if crate::runtime::env_cache::hashtableofint_trace() {
                     let cname = thread.frames[frame_idx].class_name();
@@ -15724,7 +15879,8 @@ pub(crate) fn aastore_element_assignable(
 // ---------------------------------------------------------------------------
 
 /// WP2.5 — walks the superclass chain of `class_id` looking for
-/// `java/lang/reflect/Proxy$Instance`. Returns `true` if found within
+/// `java/lang/reflect/Proxy$Instance` or the real-JDK
+/// `java/lang/reflect/Proxy` base class. Returns `true` if found within
 /// `MAX_DEPTH` hops.
 ///
 /// Used by the cast/instanceof and dispatch hooks below to extend their
@@ -15741,9 +15897,10 @@ pub(crate) fn aastore_element_assignable(
 /// `load_class("Proxy$Instance")` on the slow path. Walking by name is
 /// simpler, lock-scoped, and depth-bounded against pathological cycles
 /// in user-loaded class graphs.
-fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
+pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> bool {
     const MAX_DEPTH: usize = 32;
     const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
+    const REAL_PROXY_BASE: &str = "java/lang/reflect/Proxy";
 
     let cm = shared.class_manager.read();
     let mut current = Some(class_id);
@@ -15756,7 +15913,7 @@ fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: ClassId) -> b
             Some(c) => c,
             None => return false,
         };
-        if &*class.name == PROXY_INSTANCE {
+        if &*class.name == PROXY_INSTANCE || &*class.name == REAL_PROXY_BASE {
             return true;
         }
         // Stop early once we hit Object — Proxy$Instance sits below it
@@ -18702,13 +18859,11 @@ fn execute_invoke_kind(
         return res;
     }
 
-    // `URLClassLoader.findClass` called from inside a subclass override (e.g.
-    // Jasper's `JasperLoader.loadClass` → `findClass`) names the subclass in its
-    // CP methodref, so the static-class force-native gate above misses it. Force
-    // `ucl_find_class` when the resolved declaring class is `URLClassLoader`
-    // (the real bytecode's shimmed `ucp` would otherwise throw CNF for every
-    // runtime-compiled JSP servlet).
-    if let Some(res) = intercept_urlclassloader_subclass_find_class(
+    // Inherited URLClassLoader methods invoked through a subclass-owned
+    // constant-pool entry evade the static-class native gate.  Intercept the
+    // resolved base methods so real-JDK URLClassPath shims never discard local
+    // resources or custom URLStreamHandler-backed URLs.
+    if let Some(res) = intercept_urlclassloader_subclass_native_method(
         shared,
         thread,
         frame_idx,
@@ -20081,8 +20236,7 @@ pub(crate) fn try_lambda_dispatch(
                 _ => None,
             })
             .collect();
-        let compatible =
-            lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
+        let compatible = lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
         // Re-read obj_ref/call_args through the pins -- the compatibility
         // check above may have triggered a moving GC that relocated either.
         obj_ref = thread.native_pin_roots[sam_compat_pin_base];
@@ -22986,12 +23140,66 @@ pub(crate) mod hotpath_counts {
     }
 }
 
+pub(crate) fn is_undertow_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, method_descriptor),
+        (
+            "io/undertow/Undertow",
+            "builder",
+            "()Lio/undertow/Undertow$Builder;"
+        ) | ("io/undertow/Undertow", "start", "()V")
+            | ("io/undertow/Undertow", "stop", "()V")
+            | (
+                "io/undertow/Undertow$Builder",
+                "addHttpListener",
+                "(ILjava/lang/String;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "addHttpsListener",
+                "(ILjava/lang/String;Ljavax/net/ssl/SSLContext;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setHandler",
+                "(Lio/undertow/server/HttpHandler;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setSocketOption",
+                "(Lorg/xnio/Option;Ljava/lang/Object;)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setWorkerThreads",
+                "(I)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "setIoThreads",
+                "(I)Lio/undertow/Undertow$Builder;"
+            )
+            | (
+                "io/undertow/Undertow$Builder",
+                "build",
+                "()Lio/undertow/Undertow;"
+            )
+    )
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    if is_undertow_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -24242,6 +24450,50 @@ fn force_native_over_real_jdk_bytecode(
     matches!(
         (class_name, method_name, method_descriptor),
         ("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")
+            // ServiceLoader-based JDK facilities (including AttachProvider)
+            // obtain their loader through Class.getClassLoader().  The real
+            // body reads host-layout fields, while CratonVM's native validates
+            // and returns the VM-owned loader; without this override a stale
+            // String-shaped slot reaches ClassLoader.findResources.
+            | ("java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;")
+            // Startup javaagents receive a real-JDK
+            // sun.instrument.InstrumentationImpl.  Its constructor calls
+            // VM-private initialization that CratonVM does not expose; the
+            // registered constructor is intentionally a no-op because the
+            // observable Instrumentation operations are supplied by our
+            // native bridge.  It must therefore beat the real bytecode just
+            // like the other layout-backed native overrides in this table.
+            | (
+                "sun/instrument/InstrumentationImpl",
+                "<init>",
+                "(JLjava/lang/String;ZZ)V",
+            )
+            | (
+                "java/lang/Thread",
+                "getContextClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            | (
+                "java/lang/Thread",
+                "setContextClassLoader",
+                "(Ljava/lang/ClassLoader;)V",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "attach",
+                "(Ljava/lang/String;)Lcom/sun/tools/attach/VirtualMachine;",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "loadAgent",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+            )
+            | (
+                "com/sun/tools/attach/VirtualMachine",
+                "loadAgent",
+                "(Ljava/lang/String;)V",
+            )
+            | ("com/sun/tools/attach/VirtualMachine", "detach", "()V")
             | (
                 "java/lang/ClassLoader",
                 "loadClass",
@@ -24484,7 +24736,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "addURL")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -24696,6 +24948,41 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // `Class.getClassLoader()` is a concrete JDK method, but Class mirrors in
+    // this VM use an internal layout and their real `classLoader` field can be
+    // a stale non-loader object.  Dispatch by the receiver's *runtime* class
+    // before the normal declaring-class gate: JDK calls reached through an
+    // inherited/cached method reference can otherwise bypass the static
+    // allowlist and hand ServiceLoader a String as its loader.
+    if method_name == "getClassLoader"
+        && method_descriptor == "()Ljava/lang/ClassLoader;"
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared.native_methods.find(
+            "java/lang/Class",
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+        )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native: class={} method={}{} \
@@ -24941,7 +25228,7 @@ fn intercept_jython_pymodule_findattr(
 /// native via the `declaring_name`-keyed `force_native_over_real_jdk_bytecode`
 /// entry, so repeat dispatches stay native too.
 #[inline]
-fn intercept_urlclassloader_subclass_find_class(
+fn intercept_urlclassloader_subclass_native_method(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
@@ -24952,8 +25239,11 @@ fn intercept_urlclassloader_subclass_find_class(
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
     if is_special
-        || method_name != "findClass"
-        || method_descriptor != "(Ljava/lang/String;)Ljava/lang/Class;"
+        || !matches!(
+            (method_name, method_descriptor),
+            ("findClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("addURL", "(Ljava/net/URL;)V")
+        )
     {
         return None;
     }
@@ -27120,11 +27410,7 @@ fn execute_invokestatic_cached(
             };
 
             if let Some(res) = intercept_force_registered_native_cached(
-                shared,
-                thread,
-                frame_idx,
-                &cached,
-                args_slice,
+                shared, thread, frame_idx, &cached, args_slice,
             ) {
                 return res;
             }
@@ -27626,8 +27912,8 @@ fn compile_osr_artifact(
                         // `build_helpers` — which registers the jit-crate
                         // atomic — only AFTER this construction block, so the
                         // first OSR compile in a process would read 0 there.)
-                        let entry = crate::jit::helpers::jit_integer_value_of_direct
-                            as *const () as usize;
+                        let entry =
+                            crate::jit::helpers::jit_integer_value_of_direct as *const () as usize;
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {
@@ -27649,8 +27935,8 @@ fn compile_osr_artifact(
                         && mn == "intValue"
                         && desc == "()I"
                     {
-                        let entry = crate::jit::helpers::jit_integer_int_value_direct
-                            as *const () as usize;
+                        let entry =
+                            crate::jit::helpers::jit_integer_int_value_direct as *const () as usize;
                         direct_calls2.push((
                             pc,
                             crate::jit::JitDirectCall {
@@ -30691,6 +30977,37 @@ fn background_compile_task(
     if crate::classloading::any_class_redefined() {
         return fail(0);
     }
+    // Keep asynchronous tiering aligned with the foreground admission paths.
+    // Without this gate, methods rejected by the conservative skip list are
+    // repeatedly queued by the tier manager. The final compiler gate then
+    // declines each task, but the hot interpreter path keeps paying for the
+    // failed background attempts. Hibernate's package-level fail-closed
+    // policy made that retry loop large enough to turn ordinary suite classes
+    // into timeout candidates.
+    let policy = if shared.config.jit_aggressive_compilation {
+        crate::jit::skip_list::SkipPolicy::Aggressive
+    } else {
+        crate::jit::skip_list::SkipPolicy::Conservative
+    };
+    let is_interface_default = {
+        let cm = shared.class_manager.read();
+        cm.get_loaded_class_id(&task.method_key.class_name)
+            .and_then(|id| cm.get_class(id))
+            .map_or(false, |class| class.is_interface())
+    };
+    if crate::jit::skip_list::should_skip_jit_with_init(
+        &task.method_key.class_name,
+        &task.method_key.method_name,
+        is_interface_default,
+        std::thread::current().name().is_some(),
+        policy,
+        crate::jit::skip_list::allow_packages_from_env(),
+        crate::jit::skip_list::InitComplexity::Unknown,
+    )
+    .is_some()
+    {
+        return fail(0);
+    }
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
         return fail(0);
     }
@@ -32565,9 +32882,11 @@ fn execute_invokevirtual_vtable_fast(
             // `findClass` (runtime-compiled `org.apache.jsp.*_jsp`) is the
             // canonical case. Only when the receiver inherits (does not override)
             // `findClass` — checked via the resolved declaring class.
-            if &*method_name == "findClass"
-                && &*method_descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
-                && &**rcv_name != "java/net/URLClassLoader"
+            if matches!(
+                (&*method_name, &*method_descriptor),
+                ("findClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                    | ("addURL", "(Ljava/net/URL;)V")
+            ) && &**rcv_name != "java/net/URLClassLoader"
                 && crate::classloading::find_method_recursive(
                     receiver_class_id,
                     &method_name,
@@ -33187,11 +33506,7 @@ fn execute_invokevirtual_cached(
                     }
 
                     if let Some(res) = intercept_force_registered_native_cached(
-                        shared,
-                        thread,
-                        frame_idx,
-                        &cached,
-                        args_slice,
+                        shared, thread, frame_idx, &cached, args_slice,
                     ) {
                         return res;
                     }
@@ -33589,11 +33904,7 @@ fn execute_invokevirtual_cached(
             }
 
             if let Some(res) = intercept_force_registered_native_cached(
-                shared,
-                thread,
-                frame_idx,
-                &cached,
-                args_slice,
+                shared, thread, frame_idx, &cached, args_slice,
             ) {
                 return res;
             }
