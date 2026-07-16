@@ -545,7 +545,7 @@ was empirically refuted this session. A confident fix needs the
 `MockMethodDispatcher.get()` identity instrumentation described above
 first.
 
-## 2026-07-16 local investigation — `ImportSelectorTests`: original repro no longer reproduces, but the real class exposes a NEW, more severe failure mode on 2/5 `spy()` sub-tests (still OPEN, new root cause needed)
+## 2026-07-16 local investigation — `ImportSelectorTests`: original repro no longer reproduces, but the real class exposes a NEW, more severe failure mode on 2/5 `spy()` sub-tests (FIXED — see 2026-07-16 joint verification addendum at the end of this section)
 
 Worktree `cratonvm-importselector-20260716` on the Azure host, branch
 `fix/importselector-spy-soe-20260716-141435`, dev tip `6c517cd9` (fetched
@@ -701,6 +701,73 @@ reflection/bytecode-generation-heavy workload can trigger.
    entry and the "leading, unconfirmed hypothesis" above — this session did
    not add new evidence toward or against that specific hypothesis, only
    toward the observable symptom shape changing.
+
+### 2026-07-16 joint verification addendum — FIXED, confirmed by rebuild+rerun
+
+Concrete next step #3 above ("coordinate with whoever owns the
+`ApplicationContextAotGeneratorTests` re-triage — if the two converge on one
+root cause, this becomes a single, higher-priority, cross-cutting GC bug")
+is what this task did. A third, independent, concurrent 2026-07-16 session
+(investigating `PersistenceAnnotationBeanPostProcessorAotContributionTests`,
+see `CRATONVM-SPRING-GENUINE-BUGLIST.md`) hit an identical-looking
+stale-ObjectRef/all-zero-header crash during `TestCompiler`'s in-process
+`javac` compile and traced it to an unrelated dev commit that landed mid-investigation:
+`fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID not special-cased in new young-GC
+exact-walk loops") — its description ("misparsing the TLAB gap-filler
+sentinel broke the young-GC exact object-start walk early, leaving
+everything allocated afterward outside the exact set — `mark_young`
+silently drops those live objects and the non-moving sweep reclaims them as
+garbage, i.e. mass stale-pointer/all-zero-header corruption") matches this
+class's symptom precisely, and matches the `ApplicationContextAotGeneratorTests`
+symptom precisely too (per the cross-reference two paragraphs above). This
+task verified the fix closes **both** independently-found instances.
+
+Fresh worktree `/data/data/wt-gcbug-verify-20260716`, `origin/dev` tip
+`47151b27` (confirmed `fb15be63` is an ancestor via `git merge-base
+--is-ancestor`), full `cargo build --release` (35m48s under heavy Azure-host
+contention — unrelated to the fix itself), real JDK 25, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`,
+same `KRun`/`MRun` JUnit-Platform launcher pattern and single-module
+`spring-context` classpath as the original 2026-07-16 investigation above.
+
+**Result: `9/9` methods pass, including both previously-crashing "nested
+group" methods:**
+```
+RESULT org.springframework.context.annotation.ImportSelectorTests found=9 succ=9 fail=0 skip=0 abort=0 ms=47126 status=OK
+```
+Grepping the full run log for the corruption signature (`Stale pointer
+detected`, `GC-ARRAY-GUARD`, `implausible extent`, `LOADERR`) returns **zero
+matches**. `importSelectorsWithNestedGroup` and
+`importSelectorsWithNestedGroupSameDeferredImport` — the two methods that
+deterministically `SIGABRT`ed on `GC: young object-start walk stopped at an
+implausible extent` every run in the pre-fix investigation above — now
+complete cleanly with no warnings beyond the usual harmless CGLIB/`[CCE]`
+logging.
+
+One methodology gotcha hit and worked around during this verification, worth
+recording for future investigators on this host: an initial single-method
+run via `MRun ImportSelectorTests importSelectorsWithNestedGroup` and an
+initial full-class run both failed uniformly on all 5 `spy()`-using methods
+with `java.lang.IllegalStateException: Could not initialize plugin: interface
+org.mockito.plugins.MockMaker` — a *different* failure from both the original
+`StackOverflowError` and the GC corruption, and initially concerning. This
+turned out to be a host-environment artifact, not a CratonVM bug: the Azure
+host's root filesystem (`/`) was at 100% (`0` bytes available per `df`),
+which broke Mockito's self-attach mechanism's write of its agent jar to the
+default `/tmp` (on root). Re-running with `TMPDIR`/`-Djava.io.tmpdir` pointed
+at the roomy `/data` partition instead resolved it immediately (the `9/9 OK`
+result above is from that rerun). Anyone hitting a cold `MockMaker` init
+failure on this host that doesn't match either of this bug family's two known
+signatures should check `df -h /` and redirect `TMPDIR` before assuming it's
+a new VM bug.
+
+**Not this session's fix; attributing correctly rather than claiming
+credit.** No code change was needed or made — this is a verification-only
+confirmation, corroborating the `PersistenceAnnotationBeanPostProcessorAotContributionTests`
+(0/3 crashes after `fb15be63` vs. 6/6 before) and `ApplicationContextAotGeneratorTests`
+(`LOADERR` → `found=40`, 0 corruption lines) results — three independent test
+classes, three independent investigating sessions, one shared root cause,
+one fix. See `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s `ApplicationContextAotGeneratorTests`
+entry for the sibling verification detail.
 
 ## 2026-07-13 local investigation — `web.service.registry.*` residuals (both root-caused, neither fixed — still OPEN)
 
@@ -1597,7 +1664,7 @@ rather than a coincidence:
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL, root-caused 2026-07-13, reconfirmed unchanged 2026-07-14 (still OPEN) | 763s (25s on the 2026-07-14 isolated rerun) | 3/5 | `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` in `ConfigurationClassParser$SourceClass.getAnnotationAttributes` — see dedicated section below |
 | `web.service.registry.GroupsMetadataValueDelegateTests` | **ABEND FIXED 2026-07-14** (`9bca11f5`); now FAIL on a new, distinct residual (still OPEN) | 1039s (25s combined w/ above on the 2026-07-14 rerun) | 0/8 | was fatal VM error `class file error: class not found: .../GroupsMetadata__TestCode` (FIXED); now `IllegalStateException: WritableContent did not append any content` — see dedicated section below |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 1132s → 600s×2 | 0/160 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean (same as `CrossOriginAnnotationIntegrationTests`) → **bean bug fixed**, now TIMEOUTs the same way, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
-| `context.annotation.ImportSelectorTests` | FAIL, root-caused 2026-07-13, **partially improved + new failure mode found 2026-07-16** (still OPEN) | 1456s (734s on the 2026-07-13 rebuild) | 4/9 → **7/9 individually** (2 now crash instead of cleanly failing) | Was `StackOverflowError` (Mockito `spy()` recursion); on 2026-07-16's `dev` tip the isolated repro no longer reproduces and 3 of the 5 `spy()` sub-tests pass, but the 2 "nested group" sub-tests now hit a deterministic native heap-corruption crash instead — see dedicated section below |
+| `context.annotation.ImportSelectorTests` | **FIXED (verified 2026-07-16)** | 47s | **9/9 OK** | Was `StackOverflowError` (Mockito `spy()` recursion), then a GC heap-corruption crash on 2 "nested group" sub-tests (2026-07-16); the corruption was closed by unrelated concurrent commit `fb15be63` — rebuild+rerun confirms all 9 methods pass cleanly, 0 corruption-signature lines — see the 2026-07-16 joint verification addendum in the dedicated section below |
 
 Notable sub-clusters within this bucket (candidates for shared root cause):
 
