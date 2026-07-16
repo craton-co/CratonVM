@@ -14615,10 +14615,24 @@ fn bytebuddy_field_value(
     field_name: &str,
     fallback_slot: usize,
 ) -> Value {
-    if let Some(class_name) = ctx.class_name_of_id(ctx.class_id_of_object(obj)) {
-        if let Some(slot) = ctx.resolve_field_index(&class_name, field_name) {
-            return ctx.get_field(obj, slot);
-        }
+    // Resolve by the object's OWN ClassId, not a name round-trip:
+    // `class_name_of_id(class_id_of_object(obj))` followed by a
+    // name-based `resolve_field_index` re-resolves the class GLOBALLY by
+    // name, which returns `None` (ambiguous) once 2+ loaders each define
+    // their own class under this same simple name -- exactly what
+    // happens to ByteBuddy's own support classes when redefined per-fork
+    // under a `@CompileWithForkedClassLoader`-style loader (confirmed:
+    // MethodList$TypeSubstituting/TypeList$Generic$Explicit). The lossy
+    // round-trip then silently fell back to a fixed slot number that
+    // only happened to be correct when the class had zero fields
+    // inherited ahead of its own, so the very first 2 distinct loaders
+    // succeeded and every one after failed -- landing on the wrong field
+    // (e.g. `declaringType` instead of `methodDescriptions`) and passing
+    // that wrong object to `.size()`/`.get()`, surfacing as a
+    // `NoSuchMethodError` deep inside seemingly unrelated bytecode.
+    let class_id = ctx.class_id_of_object(obj);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, field_name) {
+        return ctx.get_field(obj, slot);
     }
     ctx.get_field(obj, fallback_slot)
 }
@@ -14630,11 +14644,12 @@ fn bytebuddy_set_field_value(
     fallback_slot: usize,
     value: Value,
 ) {
-    if let Some(class_name) = ctx.class_name_of_id(ctx.class_id_of_object(obj)) {
-        if let Some(slot) = ctx.resolve_field_index(&class_name, field_name) {
-            ctx.set_field(obj, slot, value);
-            return;
-        }
+    // See `bytebuddy_field_value` for why this resolves by ClassId
+    // directly rather than through a class-name round-trip.
+    let class_id = ctx.class_id_of_object(obj);
+    if let Some(slot) = ctx.resolve_field_index_by_class_id(class_id, field_name) {
+        ctx.set_field(obj, slot, value);
+        return;
     }
     ctx.set_field(obj, fallback_slot, value);
 }

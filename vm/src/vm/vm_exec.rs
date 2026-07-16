@@ -3588,6 +3588,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        let cm = self.shared.class_manager.read();
+        resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
+    }
+
     fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
         // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
         // handles (base 0x10_0000_0000), not real pointers. A

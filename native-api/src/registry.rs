@@ -862,6 +862,23 @@ pub trait NativeContext {
     /// Returns `None` if the field is not found in the class hierarchy.
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize>;
 
+    /// Resolve a field name to its slot index by `ClassId` directly --
+    /// no class-name round-trip. Returns `None` if the field is not found
+    /// in the class hierarchy.
+    ///
+    /// Prefer this over `resolve_field_index` whenever the caller already
+    /// holds the object (and so its exact `ClassId` via
+    /// `class_id_of_object`): `resolve_field_index`'s name-based lookup
+    /// re-resolves the class GLOBALLY by name, which returns `None`
+    /// whenever 2+ distinct loaders each define their own class under the
+    /// same simple name (a legitimate "ambiguous" answer for a bare name,
+    /// but a needless loss when the caller already holds the exact,
+    /// unambiguous `ClassId` -- e.g. a native shim reading a field off a
+    /// third-party object whose class gets redefined under a fresh loader
+    /// each time, such as ByteBuddy classes under
+    /// `@CompileWithForkedClassLoader`).
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize>;
+
     /// Read `out.len()` bytes of native memory at `addr` into `out`.
     ///
     /// `addr` may be either a real OS pointer (e.g. a mapped buffer) OR one of
