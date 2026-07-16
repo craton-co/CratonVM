@@ -749,6 +749,43 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     characteristic — just no longer severe enough to cause an observed hang.
     Also unfixed: the T19.H1 watchdog stack-dump itself SIGSEGVs when JIT frames are on the stack
     (separate small bug; `--nojit` dumps work).
+    **2026-07-16 investigation**: root-caused the *reliability* half of this note but could
+    **not** reproduce a live SIGSEGV after extensive targeted testing on dev tip (single
+    tier-up-compiled JIT calls, OSR-adjacent long single-invocation loops, deep
+    JIT<->interpreter interface-dispatch recursion, and multi-threaded runs with one thread
+    parked deep inside a JIT-compiled method while another thread acks normally) — the
+    watchdog consistently either dumped correctly or fell back to its documented "0 java
+    threads responded" path, never crashed. What the testing DID confirm as a genuine,
+    reproducible gap: `SharedVm::dump_current_thread_frames` (`vm/src/vm/vm_init.rs`) walks
+    only `thread.frames`, the interpreter's own logical frame stack — a method dispatched
+    straight to already-JIT-compiled machine code
+    (`execute_invokestatic_cached`/`execute_jit_call` in `runtime/interpreter.rs`) never gets
+    a `Frame` pushed there at all, so that call level is silently invisible to the dump
+    (either the whole thread shows 0 acks, or the frame count is misleadingly shallow) —
+    never a fabricated/garbage frame in this revision, but a real diagnostic blind spot for
+    a debug-tooling feature whose whole job is showing what a thread is doing. Landed two
+    low-risk hardening changes on `fix/watchdog-jit-sigsegv-20260716` (both in
+    `vm/src/vm/vm_init.rs`, `dump_current_thread_frames` and `set_wait_site_snapshot`): (1)
+    each rendered frame line now goes through `catch_unwind` so a panic while formatting one
+    (e.g. future regression hitting a malformed frame) can't prevent the watchdog from
+    reaching its own `process::abort()` — that failure mode would otherwise turn an
+    intended, informative crash-with-dump into a silent hang instead; (2) when
+    `conservative_roots::current_thread_jit_depth()` is nonzero at dump time the output now
+    appends an explicit note that one or more call levels are JIT-compiled and not shown,
+    pointing at `--nojit` as a workaround, instead of leaving a shallow dump to be misread as
+    a shallow call stack. Verified: `cargo test -p cratonvm-vm --lib` (82/0 in the touched
+    `vm_init` module, no regressions) plus live re-runs of every repro scenario above on the
+    rebuilt binary — identical dump/abort behaviour to pre-fix, no crashes, notes render
+    correctly when the JIT-depth condition is met. Left as **UNFIXED** (not renamed
+    `-FIXED`): the originally-reported SIGSEGV itself was never reproduced or root-caused,
+    only hardened against; if it recurs, capture a core dump (`ulimit -c unlimited` +
+    `/proc/sys/kernel/core_pattern`) or run directly under `gdb -q --args cratonvm
+    --stack-dump-on-timeout=N ...` so the exact faulting frame is available next time,
+    ideally under the `release`/`profsym` profile (this session's repro attempts used the
+    `dev-full` profile — no LTO/opt-level=3 — because the shared build host repeatedly
+    OOM-killed the full `profsym` release+LTO link under concurrent multi-session load;
+    timing-sensitive interpreter/JIT-boundary races are plausible under release codegen that
+    a `dev-full` binary's much slower interpreter dispatch may simply not expose).
 *   ~~`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` —
     pathological slowness (>1800s vs HotSpot's 13s, 160 tests).~~ **2026-07-15 update**: confirmed
     genuine forward progress, not a hang (frame counts change across successive
