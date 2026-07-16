@@ -18261,6 +18261,35 @@ fn execute_invoke_kind(
                             if std::env::var_os("CRATONVM_DBG_STALE_RECV").is_some() {
                                 // Cast: object/code pointer to integer address
                                 let stale_addr = obj_ref.as_ptr() as usize;
+                                // Extend CRATONVM_DBG_STALE_RECV with the A2
+                                // allocation breadcrumb regardless of whether
+                                // the non-moving sweep_zero ring has a match
+                                // (it never will under the default MOVING
+                                // young collector -- sweep_zero only records
+                                // the non-moving-sweep code path, which the
+                                // moving collector never runs). Found during
+                                // the 2026-07-16 hib-aqs-livelock
+                                // investigation: the moving-collector case
+                                // needed its own always-on history dump to
+                                // rule out a double-free/overlap explanation
+                                // (it was in fact a stale native-caller
+                                // reference surviving a legitimate
+                                // relocation -- see
+                                // initialize_real_thread_pool_executor).
+                                if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+                                    let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
+                                    if hist.is_empty() {
+                                        eprintln!("[stale-recv] [A2] NO event touches {stale_addr:#x}");
+                                    } else {
+                                        for r in hist {
+                                            if r.kind == 0xFF {
+                                                eprintln!("[stale-recv] [A2] seq={} FREE @{:#x}", r.seq, r.addr);
+                                            } else {
+                                                eprintln!("[stale-recv] [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}", r.seq, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size);
+                                            }
+                                        }
+                                    }
+                                }
                                 eprintln!(
                                     "[stale-recv] ptr=0x{:x} method={}.{}{} — Java frames:",
                                     stale_addr,
