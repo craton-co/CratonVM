@@ -4806,6 +4806,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_fis_read_bytes,
     );
+    // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
+    // scanning reaches this signature directly, so route it to the same native
+    // implementation when selected by the interpreter bridge policy.
+    registry.register(
+        "java/io/FileInputStream",
+        "read",
+        "([BII)I",
+        native_fis_read_bytes,
+    );
     registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
     registry.register(
         "java/io/FileInputStream",

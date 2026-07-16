@@ -6313,7 +6313,9 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 pub(crate) fn register_weak_hashmap_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    // The real JDK class has bytecode and a different physical layout. Keep
+    // this three-slot implementation for the synthetic fallback only.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/WeakHashMap";
     r.register(c, "<init>", "()V", native_em_init);
     r.register(c, "<init>", "(I)V", native_em_init);
