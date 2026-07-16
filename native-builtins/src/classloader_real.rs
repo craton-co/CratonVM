@@ -250,11 +250,18 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
 /// natives expect). A plain `alloc_concurrent_synthetic` would leave the
 /// buckets array null and the subsequent `containsKey` would NPE instead.
 fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    // Both `new_object` and `invoke` below may trigger a moving collection.
+    // Keep the receiver rooted throughout and reload it before every write;
+    // otherwise a URLClassLoader can be observed with a null `ucp` after its
+    // constructor appears to have initialized it. Tomcat's
+    // WebappLoader.buildClassPath then immediately dereferences that field.
+    let this_pin = ctx.pin_native_root(this);
     let diag = std::env::var_os("CRATONVM_DBG_URLCL").is_some();
     // `closeables` — WeakHashMap. `getResourceAsStream` synchronizes on it.
     // Only populate when currently null so a real `<init>` that already ran
     // (e.g. the name-carrying constructor whose bytecode we don't override)
     // is not clobbered.
+    let this = ctx.read_native_pin(this_pin, this);
     let existing = ctx.get_field_by_name(this, "closeables");
     if diag {
         eprintln!(
@@ -265,6 +272,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
     }
     if !matches!(existing, Value::Object(Some(_))) {
         if let Ok(Some(Value::Object(Some(whm)))) = ctx.new_object("java/util/WeakHashMap") {
+            let whm_pin = ctx.pin_native_root(whm);
             // Route through the native `WeakHashMap.<init>()V` so the
             // backing buckets array is installed; ignore failure (the
             // object is still a valid non-null monitor either way).
@@ -274,6 +282,9 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
                 "()V",
                 &[Value::Object(Some(whm))],
             );
+            let whm = ctx.read_native_pin(whm_pin, whm);
+            ctx.unpin_native_roots(whm_pin);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "closeables", Value::Object(Some(whm)));
             if diag {
                 eprintln!(
@@ -301,11 +312,13 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // -> null) via `register_url_class_path_safe_stubs`. So a bare non-null
     // `URLClassPath` instance is sufficient to keep the real bytecode from
     // NPEing while leaving CratonVM's class loading unchanged.
+    let this = ctx.read_native_pin(this_pin, this);
     let ucp_existing = ctx.get_field_by_name(this, "ucp");
     if !matches!(ucp_existing, Value::Object(Some(_))) {
         if let Ok(Some(Value::Object(Some(ucp)))) =
             ctx.new_object("jdk/internal/loader/URLClassPath")
         {
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "ucp", Value::Object(Some(ucp)));
             if diag {
                 eprintln!(
@@ -315,6 +328,37 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
             }
         }
     }
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// Finish a simplified `URLClassLoader` constructor without allowing a moving
+/// collection to stale either its receiver or the caller-supplied URL array.
+///
+/// The three helpers below all allocate on realistic paths. In particular,
+/// keeping `this` only in a native local across `init_classloader_common_fields`
+/// could make the following `ucp` initialization write through a forwarded
+/// reference, leaving the live loader with its default null field.
+fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+    let this_pin = ctx.pin_native_root(this);
+    let urls_pin = match urls {
+        Value::Object(Some(urls)) => Some((ctx.pin_native_root(urls), urls)),
+        _ => None,
+    };
+
+    let this = ctx.read_native_pin(this_pin, this);
+    init_classloader_common_fields(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    init_urlclassloader_fields(ctx, this);
+    let this = ctx.read_native_pin(this_pin, this);
+    let urls = urls_pin
+        .map(|(pin, urls)| ctx.read_native_pin(pin, urls))
+        .map_or(urls, |urls| Value::Object(Some(urls)));
+    register_url_array(ctx, this, urls);
+
+    if let Some((pin, _)) = urls_pin {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(this_pin);
 }
 
 /// Register ClassLoader natives needed in real-JDK mode.
@@ -522,14 +566,12 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         // URLClassLoader extends SecureClassLoader extends ClassLoader;
         // the inherited `defaultDomain` / `classes` / `packages` fields
         // still need initialising (see `init_classloader_common_fields`).
-        init_classloader_common_fields(ctx, this);
-        // `closeables` (WeakHashMap) — see `init_urlclassloader_fields`.
-        init_urlclassloader_fields(ctx, this);
+        // `closeables` / `ucp` — see `init_urlclassloader_fields`.
         // Register the URLs with the application classpath so classes inside
         // the jars/dirs are actually loadable — without this a custom
         // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
         // can never find its classes and throws ClassNotFoundException.
-        register_url_array(ctx, this, urls);
+        init_urlclassloader_constructor(ctx, this, urls);
         Ok(None)
     });
     r.register(
@@ -544,9 +586,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "parent", parent);
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
@@ -570,9 +610,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = args.get(3).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
@@ -588,9 +626,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "parent", parent);
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
@@ -608,9 +644,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = args.get(3).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
@@ -652,9 +686,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             let parent = get_or_create_system_cl(ctx);
             ctx.set_field_by_name(this, "parent", Value::Object(parent));
             ctx.set_field_by_name(this, "acc", acc);
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
@@ -676,9 +708,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
             ctx.set_field_by_name(this, "acc", acc);
-            init_classloader_common_fields(ctx, this);
-            init_urlclassloader_fields(ctx, this);
-            register_url_array(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls);
             Ok(None)
         },
     );
