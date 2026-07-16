@@ -193,7 +193,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 re-triage: LOADERR found=0** — NEW GC heap-corruption bug, see below (regresses the earlier "discovers+runs 40 methods" note, which was never characterized) |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
-| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | FAIL 8/2/6 (Mockito attach residuals) |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-16 re-triage: FAIL 8/2/6** (was briefly hidden behind an unrelated GC crash, see below — now the SAME shape as before, 1 pre-existing cold-attach + 5 narrowed ByteBuddy-generics residual) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
 
@@ -249,11 +249,141 @@ the WRONG same-named copy. Eight fixes landed on
     unrelated host I/O contention (confirmed via A/B comparison that the
     slowness reproduces identically pre-fix) — worth a spot-check when the
     host is less loaded.
-*   `PersistenceAnnotationBeanPostProcessorAotContributionTests` — 8/2/6.
-    Post-fix the forked Mockito path advanced: now (a) fork attach via
-    `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
-    NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
-    Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
+*   `PersistenceAnnotationBeanPostProcessorAotContributionTests` — **2026-07-16
+    dedicated re-triage.** Rebuilt fresh off dev tip `6c517cd9` (already
+    includes the same-day ByteBuddy repeat-redefine fix `c812b622`/`a2515075`)
+    in an isolated worktree/binary (`/data/data/wt-persistannobpp-20260716-141911`,
+    Azure host), reusing the official `apps/spring-suite-runner` classpath/`KRun`
+    harness unmodified.
+
+    **Step 1 finding: a NEW, unrelated GC crash was hiding the real residual.**
+    6/6 clean repro attempts against the `6c517cd9` binary hit a hard failure
+    *before* the class ever reached Mockito: `LOADERR`,
+    `ClassCastException: java.lang.Object cannot be cast to
+    org.junit.platform.engine.TestExecutionResult$Status`, preceded by a burst
+    of `cratonvm::gc::guard` "out-of-bounds field read/write dropped"
+    all-zero-header warnings and `Stale pointer detected in invokevirtual
+    receiver ... falling back to CP class com/sun/tools/javac/...` during
+    `TestCompiler`'s real in-process `javac` compile step (the FIRST of the
+    six `testCompile()`-calling test methods; `@CompileWithForkedClassLoader`
+    forks a brand-new `ClassLoader` and does a real javac compile PER test
+    method, an unusually allocation/GC-heavy path run 6×). With
+    `CRATONVM_DBG_STALE_OBJREF=1` this became a clean, reproducible hard panic
+    pinpointing `native_hashmap_get_exact`/`map_keys_equal`/`unbox_wrapper`,
+    reached from `com/sun/tools/javac/util/StringNameTable.fromString`. This
+    is the SAME long-tail "Family-1 stale-ObjectRef" bug class tracked in
+    `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`
+    (specifically matching that doc's still-open "Follow-up session 6" finding
+    #2 — a freshly-pinned `ObjectRef` stale on first dereference with no
+    obvious missing pin) — corroborated by an independent, concurrent
+    2026-07-16 re-triage of the sibling class `ApplicationContextAotGeneratorTests`
+    (see below) hitting the *identical* symptom shape via the same TestCompiler
+    path. **Not fixed by this session** — instead, an unrelated concurrent
+    session's dev commit `fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID not
+    special-cased in new young-GC exact-walk loops", landed 2026-07-16 while
+    this investigation was in progress) turned out to be the actual fix: its
+    description ("misparsing the TLAB gap-filler sentinel broke the young-GC
+    exact object-start walk early, leaving everything allocated afterward
+    outside the exact set — `mark_young` silently drops those live objects and
+    the non-moving sweep reclaims them as garbage, i.e. mass stale-pointer/
+    all-zero-header corruption") matches this class's symptom precisely.
+    Rebuilt at dev tip `fb15be63` and reran: **0/3 repro attempts hit the GC
+    crash** (previously 6/6); the class now completes in ~150 s (previously
+    hung ~150 s before crashing, or crashed in seconds under
+    `CRATONVM_DBG_STALE_OBJREF`) and returns to the documented **8/2/6**
+    baseline shape. Not this session's fix; attributing correctly rather than
+    claiming credit.
+
+    **Step 2: with the GC crash out of the way, the residual is (a) 1
+    pre-existing cold-attach failure + (b) 5 ByteBuddy generics-resolution
+    failures — exactly the previously-documented split, confirmed by exact
+    stack trace this time.** (a) `processAheadOfTimeWhenCustomPersistenceUnitOnPublicSetter`
+    (whichever forked test executes first) fails with
+    `IllegalStateException: Could not initialize plugin: MockMaker` bottoming
+    out at `org.mockito.internal.PremainAttachAccess.getInstrumentation` ->
+    `ByteBuddyAgent.install` -> `IllegalStateException: The Byte Buddy agent is
+    not initialized or unavailable`. This is the SAME cold-self-attach quirk
+    already characterized via the standalone `BBProbe4.java` repro (fork #1
+    fails cold, forks #2+ succeed) — confirmed by design here too: because
+    `CompileWithForkedClassLoaderExtension.runTestWithModifiedClassPath`
+    creates a **brand-new `ClassLoader` per test method** (not once per class)
+    whose parent skips the original test loader entirely, every one of the 6
+    mock-using tests re-resolves `org.mockito.internal.PremainAttachAccess`
+    fresh — yet only the FIRST one to actually reach `Mockito.<clinit>` hits
+    the cold-attach failure; the other 5 succeed the attach step. This means
+    the "warm-up" that makes forks 2+ succeed in `BBProbe4` is **VM-process-level
+    state** (the underlying native self-attach mechanism's own one-time lazy
+    setup), not anything cached at the Java `PremainAttachAccess`/`ClassLoader`
+    level — confirming this is exactly the same pre-existing, unrelated,
+    already-characterized quirk, not something specific to this class's fork
+    mechanism. Regression-checked clean against `BBProbe4` directly (fork 1
+    cold-attach fails, forks 2-4 OK — unchanged).
+
+    (b) The other 5 tests fail with `MockitoException: Mockito cannot mock
+    this class: interface jakarta.persistence.EntityManagerFactory` /
+    `Underlying exception: IllegalArgumentException: Cannot resolve T from
+    class ...EntityManagerFactory$MockitoMock$...`, via
+    `net.bytebuddy.description.TypeVariableSource$AbstractBase.findExpectedVariable`
+    called from `Transformer$ForMethod$TransformedMethod$AttachmentVisitor.
+    onTypeVariable` during `MethodRegistry.compile`'s bridge-type resolution.
+    `EntityManagerFactory.<T> T unwrap(Class<T>)` is the trigger: a
+    METHOD-scoped (not class-scoped) type parameter.
+
+    **Root-caused (partially) and one real, independently-valuable bug fixed
+    along the way, but the ByteBuddy crash itself is NOT resolved.** Found via
+    a standalone reflection probe that `Method.getTypeParameters()`
+    (`native_method_get_type_parameters`, `native-builtins/src/lang_class.rs`)
+    built a brand-new synthetic `TypeVariable[]` on every call with no
+    memoization, unlike real JDK's `Executable.getTypeParameters()` (cached
+    per-Method `genericInfo`) — so `unwrap.getGenericReturnType()`'s "T" and
+    `unwrap.getTypeParameters()[0]`'s "T" were two DIFFERENT objects
+    (`==` false) instead of identity-equal as on HotSpot, which is exactly the
+    kind of break `generics.rs`'s existing identity-preserving
+    `resolve_declared_type_variable` machinery (added for an earlier, related
+    "Cannot resolve T" fix, see the ByteBuddy repeat-redefine entry below) was
+    designed to prevent. **Fixed** (dev commit `4cb070e5`,
+    `fix(reflect): Method/Constructor.getTypeParameters() now
+    identity-stable across calls`): caches the built array keyed by (VM
+    instance, declaring class, method name+descriptor), kept alive/remapped
+    across moving GCs via the existing `register_var_handle_root`/
+    `read_var_handle_root` permanent-native-root mechanism (built for
+    VarHandles, generic over any `ObjectRef`). Verified via the standalone
+    probe (identity mismatch before, `==` true after);
+    `cargo check -p cratonvm-native-builtins` clean pre- and post- the
+    `origin/dev` merge; `cargo test -p cratonvm-native-builtins --lib`
+    2999/0/6-ignored (matches baseline); `BBProbe4` regression-checked clean.
+
+    **However, re-running the full class after this fix showed the "Cannot
+    resolve T" failures UNCHANGED (still 5/5)** — this fix, while real and
+    correct, is not what ByteBuddy actually consults on this path. Traced one
+    level deeper via the real ByteBuddy 1.18.8 bytecode
+    (`Transformer$ForMethod$TransformedMethod$AttachmentVisitor.onTypeVariable`):
+    it first checks `TransformedMethod.getTypeVariables()` (the OVERRIDING
+    method as ByteBuddy is building it for the mock subclass) for a
+    same-named candidate, and only falls back to asking the **declaring
+    TYPE** (`findExpectedVariable`, which by design only ever looks at a
+    type's own declared params + its OUTER-class chain, never a method's) when
+    that list is empty. On CratonVM this list comes back empty for `unwrap`,
+    forcing the (structurally-guaranteed-to-fail-for-a-method-scoped-variable)
+    type-level fallback; on real HotSpot it evidently does not. Confirmed via
+    two more standalone probes that this is NOT a gap in CratonVM's own
+    reflective Method API: both `EntityManagerFactory.class.getDeclaredMethods()`
+    and `.getMethods()` correctly report `unwrap`'s own `<T>` (length 1,
+    `getGenericReturnType()` identity-equal to it, post-fix) — so the gap is
+    somewhere in how CratonVM's ByteBuddy-facing class/method model feeds
+    `MethodRegistry`'s token-copying machinery when it builds the new
+    override's OWN generic `Signature`, not in `java.lang.reflect` itself.
+    **OPEN — not fixed.** Next step for whoever picks this up: instrument (or
+    step through with `net.bytebuddy.dump`) exactly what
+    `TypeDescription.ForLoadedType(EntityManagerFactory).getDeclaredMethods()`
+    reports for `unwrap`'s `MethodDescription.getTypeVariables()` specifically
+    in the context ByteBuddy's `MethodRegistry.Default.Prepared.Entry.compile`
+    uses it (as opposed to a bare reflective probe, which was clean) — the
+    difference is most likely in how the *token* used to build the mock's own
+    override method (`MethodDescription.InDefinedShape.asTypeToken`/
+    `TypeDescription.Generic.Visitor.Substitutor`) round-trips a method-scoped
+    (not class-scoped) type variable, a narrower and more specific target than
+    this doc's original "(b)" description.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,

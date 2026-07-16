@@ -49,8 +49,15 @@
 > `web.socket.messaging
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
-> .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
-> fork-attach + generics residuals); `beans.factory.aot.BeanRegistrationsAotContributionTests`
+> .PersistenceAnnotationBeanPostProcessorAotContributionTests` (2026-07-16
+> dedicated re-triage: back to its documented 8/2/6 shape after an unrelated
+> GC crash — since fixed by `fb15be63` — was briefly hiding it; 1 pre-existing
+> Mockito cold-attach failure + 5 ByteBuddy method-type-variable-resolution
+> failures, the latter narrowed further but still open; one genuine,
+> independently-useful `Method.getTypeParameters()` identity-stability fix
+> landed, `4cb070e5`, but did not resolve the ByteBuddy residual — see
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s entry for the full trace);
+> `beans.factory.aot.BeanRegistrationsAotContributionTests`
 > (confirmed genuinely perf-bound — steady progress, 100% CPU, not a
 > deadlock — needs interpreter-throughput work, not a discrete fix);
 > `RequestMappingMessageConversionIntegrationTests` (partially fixed, 5
