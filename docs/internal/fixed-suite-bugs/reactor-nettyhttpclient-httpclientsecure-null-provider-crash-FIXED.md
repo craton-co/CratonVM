@@ -1,6 +1,13 @@
 # `reactor/netty/http/client/HttpClientSecure.<clinit>` NPE (`"provider"`) crashes the whole test process
 
-**Status: OPEN**
+**Status: FIXED (2026-07-16)**
+
+## Resolution
+
+Native SSLContext client-session support prevents Netty HTTP/2 setup from falling through to a null real-JDK SSLContextSpi. The closure also preserves JKS entry-password handling, server fatal-alert delivery, real embedded-Tomcat startup, and primitive MethodHandle return unboxing.
+
+- JIT off: both affected classes passed, 32/32 and 33/33 (`reactor-nettyhttpclientsecure-r2-final-jitoff-confirm`).
+- JIT on: both affected classes passed, 32/32 and 33/33 (`reactor-nettyhttpclientsecure-r2-final-jiton`).
 
 ## Symptom
 

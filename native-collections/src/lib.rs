@@ -1552,6 +1552,43 @@ fn list_element_matches(ctx: &mut dyn NativeContext, elem: &Value, target: &Valu
     false
 }
 
+/// GC-safe linear scan of `buf[0..len]` for an element matching `target`
+/// (JDK `indexOf`/`contains` semantics via [`list_element_matches`], whose
+/// `equals()` dispatch can trigger a moving GC on every iteration).
+///
+/// Family-1 stale-at-store fix (cce0079 follow-up): the naive loop most
+/// callers used — capture `buf`/`target` once, dispatch `equals()` per
+/// element — leaves both stale after the first GC-capable dispatch, so
+/// subsequent reads walk a recycled array (wrong result, or a stale element
+/// handed onward to a mutation such as remove/shift). This helper pins both,
+/// refreshes them after every dispatch, and returns the REFRESHED
+/// `(index, buf, target)` so the caller can act on current addresses.
+/// The caller must have pinned (and afterwards refresh) its own receiver.
+fn pinned_array_search(
+    ctx: &mut dyn NativeContext,
+    buf: ObjectRef,
+    len: usize,
+    target: Value,
+) -> (Option<usize>, ObjectRef, Value) {
+    let buf_pin = ctx.pin_native_root(buf);
+    let th = pin_value(ctx, target);
+    let mut buf = buf;
+    let mut target = target;
+    let mut found = None;
+    for i in 0..len {
+        let elem = ctx.get_array_element(buf, i);
+        let matched = list_element_matches(ctx, &elem, &target);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found = Some(i);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(buf_pin);
+    (found, buf, target)
+}
+
 // ===========================================================================
 // ArrayList — synthetic-jdk layout: field 0 = Object[] elementData, field 1 = Int size
 // Real-JDK layout: AbstractList.modCount(I) at slot 0, ArrayList.elementData at slot 1,
@@ -2362,27 +2399,40 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Int(0))),
     };
     let size = size as usize;
-    for i in 0..size {
+    // Family-1 fix (cce0079): search via the pinned helper — the per-element
+    // `equals()` dispatch can move `this`/`data`/`target`/the view source —
+    // then shift through the REFRESHED references.
+    let this_pin = ctx.pin_native_root(this);
+    let vh = view_src.map(|v| ctx.pin_native_root(v));
+    let (found, data, _target) = pinned_array_search(ctx, data, size, target);
+    let this = ctx.read_native_pin(this_pin, this);
+    let view_src = match (view_src, vh) {
+        (Some(v), Some(h)) => Some(ctx.read_native_pin(h, v)),
+        _ => None,
+    };
+    ctx.unpin_native_roots(this_pin);
+    if let Some(i) = found {
+        // Re-read the matched element from the refreshed array BEFORE the
+        // shift overwrites its slot (it is handed to the view-source
+        // propagation below).
         let elem = ctx.get_array_element(data, i);
-        if list_element_matches(ctx, &elem, &target) {
-            // Close the gap: shift the tail [i+1..size) left by one into
-            // [i..size-1). Use the bulk intrinsic (memmove-style overlap is
-            // handled by the VM) with a per-element fallback, mirroring
-            // `native_al_add_all`.
-            let tail_len = size - i - 1;
-            if !ctx.bulk_array_copy(data, i + 1, data, i, tail_len) {
-                for j in (i + 1)..size {
-                    let val = ctx.get_array_element(data, j);
-                    ctx.set_array_element(data, j - 1, val);
-                }
+        // Close the gap: shift the tail [i+1..size) left by one into
+        // [i..size-1). Use the bulk intrinsic (memmove-style overlap is
+        // handled by the VM) with a per-element fallback, mirroring
+        // `native_al_add_all`.
+        let tail_len = size - i - 1;
+        if !ctx.bulk_array_copy(data, i + 1, data, i, tail_len) {
+            for j in (i + 1)..size {
+                let val = ctx.get_array_element(data, j);
+                ctx.set_array_element(data, j - 1, val);
             }
-            ctx.set_array_element(data, size - 1, Value::Object(None));
-            al_set_size(ctx, this, (size - 1) as i32);
-            if let Some(source) = view_src {
-                propagate_list_removal(ctx, source, elem)?;
-            }
-            return Ok(Some(Value::Int(1)));
         }
+        ctx.set_array_element(data, size - 1, Value::Object(None));
+        al_set_size(ctx, this, (size - 1) as i32);
+        if let Some(source) = view_src {
+            propagate_list_removal(ctx, source, elem)?;
+        }
+        return Ok(Some(Value::Int(1)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -2431,18 +2481,37 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let (data, size) = al_state(ctx, this);
     if let Some(data) = data {
-        for i in 0..(size as usize) {
-            let elem = ctx.get_array_element(data, i);
-            if list_element_matches(ctx, &elem, &target) {
-                return Ok(Some(Value::Int(1)));
-            }
+        // Family-1 fix (cce0079): pinned scan — the `equals()` dispatch can
+        // move `data`/`target` mid-walk.
+        let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+        if found.is_some() {
+            return Ok(Some(Value::Int(1)));
         }
     } else {
+        // Family-1 fix (cce0079): pin the snapshot vector's elements — a GC
+        // triggered by any iteration's `equals()` leaves the LATER raw
+        // `Vec` slots stale.
         let elems = collect_collection_elements(ctx, this);
-        for elem in elems {
-            if list_element_matches(ctx, &elem, &target) {
-                return Ok(Some(Value::Int(1)));
+        let (pin_base, handles) = pin_value_slice(ctx, &elems);
+        let th = pin_value(ctx, target);
+        let mut target = target;
+        let mut found = false;
+        for (i, orig) in elems.iter().enumerate() {
+            let elem = read_pinned_elem(ctx, handles[i], *orig);
+            let matched = list_element_matches(ctx, &elem, &target);
+            target = read_pinned_elem(ctx, th, target);
+            if matched {
+                found = true;
+                break;
             }
+        }
+        if pin_base != usize::MAX {
+            ctx.unpin_native_roots(pin_base);
+        } else if th != usize::MAX {
+            ctx.unpin_native_roots(th);
+        }
+        if found {
+            return Ok(Some(Value::Int(1)));
         }
     }
     Ok(Some(Value::Int(0)))
@@ -2459,13 +2528,9 @@ pub fn native_al_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(d) => d,
         None => return Ok(Some(Value::Int(-1))),
     };
-    for i in 0..(size as usize) {
-        let elem = ctx.get_array_element(data, i);
-        if list_element_matches(ctx, &elem, &target) {
-            return Ok(Some(Value::Int(i as i32)));
-        }
-    }
-    Ok(Some(Value::Int(-1)))
+    // Family-1 fix (cce0079): pinned scan.
+    let (found, _, _) = pinned_array_search(ctx, data, size as usize, target);
+    Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
 }
 
 fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2480,13 +2545,25 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => return Ok(Some(Value::Int(-1))),
     };
     let size = size as usize;
+    // Family-1 fix (cce0079): pinned reverse scan — the `equals()` dispatch
+    // can move `data`/`target` mid-walk.
+    let data_pin = ctx.pin_native_root(data);
+    let th = pin_value(ctx, target);
+    let mut data = data;
+    let mut target = target;
+    let mut found = None;
     for i in (0..size).rev() {
         let elem = ctx.get_array_element(data, i);
-        if list_element_matches(ctx, &elem, &target) {
-            return Ok(Some(Value::Int(i as i32)));
+        let matched = list_element_matches(ctx, &elem, &target);
+        data = ctx.read_native_pin(data_pin, data);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found = Some(i);
+            break;
         }
     }
-    Ok(Some(Value::Int(-1)))
+    ctx.unpin_native_roots(data_pin);
+    Ok(Some(Value::Int(found.map_or(-1, |i| i as i32))))
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5134,9 +5211,16 @@ pub fn native_map_keys_as_array(ctx: &mut dyn NativeContext, map: Option<ObjectR
         Some(m) => map_collect_keys(ctx, m),
         None => Vec::new(),
     };
+    // Family-1 fix (cce0079): the array alloc can move every snapshot key —
+    // store their refreshed addresses.
+    let (pin_base, handles) = pin_value_slice(ctx, &keys);
     let arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
-        ctx.set_array_element(arr, i, *k);
+        let k = read_pinned_elem(ctx, handles[i], *k);
+        ctx.set_array_element(arr, i, k);
+    }
+    if pin_base != usize::MAX {
+        ctx.unpin_native_roots(pin_base);
     }
     arr
 }
@@ -6247,25 +6331,43 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let target_pin = pin_value(ctx, target);
     this = materialize_hm_int_fast(ctx, this)?;
     let target = read_pinned_elem(ctx, target_pin, target);
+    // Family-1 fix (cce0079): every `list_element_matches` below dispatches
+    // `equals()` (GC-capable) — the previous code walked buckets/chains and
+    // snapshot vectors through stale refs after the first dispatch, and its
+    // early `return`s also leaked `target_pin`. Pin the walk state, refresh
+    // after each dispatch, unpin on every exit.
+    let mut found = false;
     // Properties-backed ConcurrentHashMap path: keep the existing
     // segment-aware collection (rare; correctness over speed).
     if properties_backing_chm(ctx, this).is_some() {
         let values = map_collect_values(ctx, this);
-        for val in &values {
-            if list_element_matches(ctx, val, &target) {
-                return Ok(Some(Value::Int(1)));
+        let (_, v_handles) = pin_value_slice(ctx, &values);
+        let mut target = target;
+        for (i, val_orig) in values.iter().enumerate() {
+            let val = read_pinned_elem(ctx, v_handles[i], *val_orig);
+            let matched = list_element_matches(ctx, &val, &target);
+            target = read_pinned_elem(ctx, target_pin, target);
+            if matched {
+                found = true;
+                break;
             }
         }
-        return Ok(Some(Value::Int(0)));
+        if target_pin != usize::MAX {
+            ctx.unpin_native_roots(target_pin);
+        }
+        return Ok(Some(Value::Int(if found { 1 } else { 0 })));
     }
     // Plain HashMap: walk the buckets directly and short-circuit on the
     // first matching value instead of materializing every value into a Vec.
     let (buckets, _size, cap) = map_state(ctx, this);
     if let Some(b) = buckets {
+        let b_pin = ctx.pin_native_root(b);
+        let mut b = b;
+        let mut target = target;
         // Chain-walk cycle guard: bound each chain by the table-wide node
         // count to avoid a hang on a corrupt (cyclic) chain.
         const CHAIN_WALK_LIMIT: usize = 4096;
-        for i in 0..(cap as usize) {
+        'outer: for i in 0..(cap as usize) {
             let mut node_val = ctx.get_array_element(b, i);
             let mut walk_count: usize = 0;
             while let Value::Object(Some(node)) = node_val {
@@ -6273,16 +6375,27 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 if walk_count > CHAIN_WALK_LIMIT {
                     break;
                 }
+                let node_pin = ctx.pin_native_root(node);
                 let value = get_node_value(ctx, node);
-                if list_element_matches(ctx, &value, &target) {
-                    return Ok(Some(Value::Int(1)));
+                let matched = list_element_matches(ctx, &value, &target);
+                let node = ctx.read_native_pin(node_pin, node);
+                b = ctx.read_native_pin(b_pin, b);
+                target = read_pinned_elem(ctx, target_pin, target);
+                if matched {
+                    ctx.unpin_native_roots(node_pin);
+                    found = true;
+                    break 'outer;
                 }
                 node_val = ctx.get_field(node, NODE_FIELD_NEXT);
+                ctx.unpin_native_roots(node_pin);
             }
         }
+        ctx.unpin_native_roots(b_pin);
     }
-    ctx.unpin_native_roots(target_pin);
-    Ok(Some(Value::Int(0)))
+    if target_pin != usize::MAX {
+        ctx.unpin_native_roots(target_pin);
+    }
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
 fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7304,18 +7417,34 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             return map_collect_keys(ctx, backing);
         }
         if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
-            return collect_entries_any(ctx, source)
-                .into_iter()
-                .map(|(k, v)| {
-                    Value::Object(Some(alloc_live_entry(
-                        ctx,
-                        "java/util/AbstractMap$SimpleEntry",
-                        k,
-                        v,
-                        source,
-                    )))
-                })
+            // Family-1 fix (cce0079): every `alloc_live_entry` allocation can
+            // move `source`, the remaining snapshot keys/values, AND the
+            // entries already allocated by earlier iterations — pin all of
+            // them and hand back only refreshed addresses (canary-caught
+            // live via `native_hs_iterator` during WildFly domain boot).
+            let entries = collect_entries_any(ctx, source);
+            let src_pin = ctx.pin_native_root(source);
+            let (keys, vals): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
+            let (_, kh) = pin_value_slice(ctx, &keys);
+            let (_, vh) = pin_value_slice(ctx, &vals);
+            let mut source = source;
+            let mut raw_entries: Vec<ObjectRef> = Vec::with_capacity(keys.len());
+            let mut entry_handles: Vec<usize> = Vec::with_capacity(keys.len());
+            for i in 0..keys.len() {
+                let k = read_pinned_elem(ctx, kh[i], keys[i]);
+                let v = read_pinned_elem(ctx, vh[i], vals[i]);
+                let e = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", k, v, source);
+                source = ctx.read_native_pin(src_pin, source);
+                entry_handles.push(ctx.pin_native_root(e));
+                raw_entries.push(e);
+            }
+            let out: Vec<Value> = raw_entries
+                .iter()
+                .zip(&entry_handles)
+                .map(|(e, &h)| Value::Object(Some(ctx.read_native_pin(h, *e))))
                 .collect();
+            ctx.unpin_native_roots(src_pin);
+            return out;
         }
         return collect_keys_any(ctx, source);
     }
@@ -7470,13 +7599,30 @@ fn remove_source_entry_by_value(
     value: Value,
 ) -> Result<(), MethodCallFailed> {
     let entries = collect_entries_any(ctx, source);
-    for (k, v) in entries {
-        if list_element_matches(ctx, &v, &value) {
-            source_map_remove(ctx, source, k)?;
+    // Family-1 fix (cce0079): the per-entry `equals()` dispatch can move
+    // `source`/`value`/every snapshot key+value — pin them all, refresh per
+    // use, and hand `source_map_remove` current addresses.
+    let src_pin = ctx.pin_native_root(source);
+    let vh = pin_value(ctx, value);
+    let (keys, vals): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
+    let (_, k_handles) = pin_value_slice(ctx, &keys);
+    let (_, v_handles) = pin_value_slice(ctx, &vals);
+    let mut source = source;
+    let mut value = value;
+    let mut result = Ok(());
+    for i in 0..keys.len() {
+        let v = read_pinned_elem(ctx, v_handles[i], vals[i]);
+        let matched = list_element_matches(ctx, &v, &value);
+        source = ctx.read_native_pin(src_pin, source);
+        value = read_pinned_elem(ctx, vh, value);
+        if matched {
+            let k = read_pinned_elem(ctx, k_handles[i], keys[i]);
+            result = source_map_remove(ctx, source, k).map(|_| ());
             break;
         }
     }
-    Ok(())
+    ctx.unpin_native_roots(src_pin);
+    result
 }
 
 /// Propagate the removal of `removed` (an element of an ArrayList-backed map
@@ -8221,36 +8367,93 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             // populated and throws. The write-through itself is the native 1-arg
             // `remove(Object)` (`source_map_remove`), exactly as the keySet path
             // and the pre-fix entrySet path used. This mirrors `native_hs_contains`.
-            let has_key = matches!(
-                ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[key])?,
-                Some(Value::Int(1))
-            );
+            // Family-1 fix (cce0079): `containsKey`/`get`/`map_keys_equal`
+            // below all dispatch Java (GC-capable) — pin `source`/`key`/
+            // `want_val`, refresh after every dispatch, and hand
+            // `source_map_remove` current addresses.
+            let src_pin = ctx.pin_native_root(source);
+            let kh = pin_value(ctx, key);
+            let wh = pin_value(ctx, want_val);
+            let mut source = source;
+            let mut key = key;
+            let mut want_val = want_val;
+            let has_key = match ctx.invoke_virtual(
+                source,
+                "containsKey",
+                "(Ljava/lang/Object;)Z",
+                &[key],
+            ) {
+                Ok(v) => matches!(v, Some(Value::Int(1))),
+                Err(e) => {
+                    ctx.unpin_native_roots(src_pin);
+                    return Err(e);
+                }
+            };
+            source = ctx.read_native_pin(src_pin, source);
+            key = read_pinned_elem(ctx, kh, key);
+            want_val = read_pinned_elem(ctx, wh, want_val);
             if !has_key {
+                ctx.unpin_native_roots(src_pin);
                 return Ok(Some(Value::Int(0)));
             }
-            let got = ctx
-                .invoke_virtual(
-                    source,
-                    "get",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[key],
-                )?
-                .unwrap_or(Value::Object(None));
+            let got = match ctx.invoke_virtual(
+                source,
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[key],
+            ) {
+                Ok(v) => v.unwrap_or(Value::Object(None)),
+                Err(e) => {
+                    ctx.unpin_native_roots(src_pin);
+                    return Err(e);
+                }
+            };
+            source = ctx.read_native_pin(src_pin, source);
+            key = read_pinned_elem(ctx, kh, key);
+            want_val = read_pinned_elem(ctx, wh, want_val);
             let eq = values_equal(ctx, &got, &want_val)
                 || match (got, want_val) {
-                    (Value::Object(Some(a)), Value::Object(Some(b))) => map_keys_equal(ctx, a, b)?,
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                        match map_keys_equal(ctx, a, b) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                ctx.unpin_native_roots(src_pin);
+                                return Err(e);
+                            }
+                        }
+                    }
                     _ => false,
                 };
+            source = ctx.read_native_pin(src_pin, source);
+            key = read_pinned_elem(ctx, kh, key);
             if eq {
-                source_map_remove(ctx, source, key)?;
+                let r = source_map_remove(ctx, source, key);
+                ctx.unpin_native_roots(src_pin);
+                r?;
                 return Ok(Some(Value::Int(1)));
             }
+            ctx.unpin_native_roots(src_pin);
             return Ok(Some(Value::Int(0)));
         }
         // keySet view: remove the key from both the snapshot (for the result)
         // and the source map (write-through).
+        //
+        // Family-1 fix (cce0079): `native_map_remove` dispatches
+        // hashCode()/equals() — refresh `source`/`elem` through pins before
+        // the write-through.
+        let src_pin = ctx.pin_native_root(source);
+        let eh = pin_value(ctx, elem);
         let remove_args = [Value::Object(Some(backing)), elem];
-        let old = native_map_remove(ctx, &remove_args)?;
+        let old = match native_map_remove(ctx, &remove_args) {
+            Ok(o) => o,
+            Err(e) => {
+                ctx.unpin_native_roots(src_pin);
+                return Err(e);
+            }
+        };
+        let source = ctx.read_native_pin(src_pin, source);
+        let elem = read_pinned_elem(ctx, eh, elem);
+        ctx.unpin_native_roots(src_pin);
         let was_present = !matches!(old, Some(Value::Object(None)));
         source_map_remove(ctx, source, elem)?;
         return Ok(Some(Value::Int(if was_present { 1 } else { 0 })));
@@ -8419,8 +8622,14 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // refs held only in the Rust Vec from the first collection would otherwise
     // go stale and surface as null/stale iterator elements during WildFly MSC
     // state reporting.
-    let len = collect_view_snapshot_ordered(ctx, backing).len();
+    //
+    // Family-1 fix (cce0079): the FIRST collect below is itself GC-capable
+    // for entrySet views (it allocates a live entry per pair) — `backing`
+    // must be pinned BEFORE it, not after (pinning afterwards captured an
+    // already-stale address; canary-caught live at `view_backing_source`).
     let backing_pin = ctx.pin_native_root(backing);
+    let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let backing = ctx.read_native_pin(backing_pin, backing);
     let keys_arr = alloc_ref_array(ctx, len);
     let keys_arr_pin = ctx.pin_native_root(keys_arr);
     let backing = ctx.read_native_pin(backing_pin, backing);
@@ -9573,6 +9782,7 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
                 let cname = object_class_name(ctx, *obj);
+                dbg_cce_backtrace("sort_preflight", ctx, *obj, None);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -9657,6 +9867,40 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     false
 }
 
+/// `CRATONVM_DBG_CCE_BT` — when set, print a native backtrace plus operand
+/// identity at the moment a natural-order `ClassCastException` is
+/// constructed. Attribution tool for the WildFly `parallel-extension-add`
+/// stale-object CCE family (`class java.lang.Object cannot be cast to class
+/// java.lang.Comparable` with no useful Java frames): identifies the exact
+/// native caller (sort / tree / min-max path) and the victim object's
+/// address so it can be correlated against GC cycle logs and the
+/// `CRATONVM_DBG_STALE_OBJREF` quarantine. Default-off, one cached-bool
+/// branch when unset.
+fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Option<ObjectRef>) {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*E.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some()) {
+        return;
+    }
+    let a_name = object_class_name(ctx, ao);
+    let a_cid = ctx.class_id_of_object(ao);
+    let b_desc = bo
+        .map(|b| {
+            format!(
+                "{}(cid={}) @0x{:x}",
+                object_class_name(ctx, b),
+                ctx.class_id_of_object(b).as_u32(),
+                b.as_ptr() as usize
+            )
+        })
+        .unwrap_or_else(|| "<none>".to_string());
+    eprintln!(
+        "CRATONVM_DBG_CCE_BT: site={site} a={a_name}(cid={}) @0x{:x} b={b_desc}\n{}",
+        a_cid.as_u32(),
+        ao.as_ptr() as usize,
+        std::backtrace::Backtrace::force_capture()
+    );
+}
+
 /// Return a useful identity for diagnostics, including hidden lambda proxies.
 fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
     let cid = ctx.class_id_of_object(obj);
@@ -9714,6 +9958,7 @@ fn compare_via_compare_to(
             // `NoSuchMethodError` and the real failure would escape (spring-bug-04).
             if !implements_comparable(ctx, *ao) {
                 let cname = object_class_name(ctx, *ao).replace('/', ".");
+                dbg_cce_backtrace("compare_via_compare_to", ctx, *ao, Some(*bo));
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!("class {cname} cannot be cast to class java.lang.Comparable"),
                 }
@@ -10009,6 +10254,7 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         if let Value::Object(Some(obj)) = v {
             if !implements_comparable(ctx, *obj) {
                 let cname = object_class_name(ctx, *obj);
+                dbg_cce_backtrace("sort_preflight", ctx, *obj, None);
                 return Err(cratonvm_types::error::RuntimeError::ClassCastException {
                     message: format!(
                         "element of class {} does not implement java.lang.Comparable",
@@ -12007,21 +12253,33 @@ fn drain_spliterator_to_array_capped(
         }
     }
     let col = ctx.read_native_pin(col_pin, collector);
-    ctx.unpin_native_roots(spl_pin);
-    ctx.unpin_native_roots(col_pin);
     let len = match ctx.get_field(col, 1) {
         Value::Int(v) => v as usize,
         _ => 0,
     };
     let storage = match ctx.get_field(col, 0) {
         Value::Object(Some(a)) => a,
-        _ => return Ok(alloc_ref_array(ctx, 0)),
+        _ => {
+            ctx.unpin_native_roots(spl_pin);
+            return Ok(alloc_ref_array(ctx, 0));
+        }
     };
+    // Family-1 fix (cce0079): the `out` alloc below can trigger a moving GC.
+    // The previous code UNPINNED the collector before this point, so the
+    // collector + its storage array became garbage, the copy loop read a
+    // reclaimed array, and stale/recycled element refs were returned as the
+    // stream's contents — surfacing later as the WildFly domain-boot CCE /
+    // stale-canary firings in `native_stream_to_array_gen` and
+    // `get_array_element` (DE_002/DE_003 captures). Keep `storage` pinned
+    // across the alloc and copy from the refreshed address.
+    let storage_pin = ctx.pin_native_root(storage);
     let out = alloc_ref_array(ctx, len);
+    let storage = ctx.read_native_pin(storage_pin, storage);
     for i in 0..len {
         let v = ctx.get_array_element(storage, i);
         ctx.set_array_element(out, i, v);
     }
+    ctx.unpin_native_roots(spl_pin);
     Ok(out)
 }
 
@@ -22073,7 +22331,15 @@ const LL_NODE_NEXT: usize = 1;
 const LL_NODE_PREV: usize = 2;
 
 fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
+    // Family-1 stale-at-store fix (cce0079): the node alloc is GC-capable
+    // and can move `element` — store its refreshed address, not the pre-GC
+    // one (a later reader of the node would see a recycled object).
+    let eh = pin_value(ctx, element);
     let node = alloc_synthetic(ctx, "java/util/LinkedList$Node", 3);
+    let element = read_pinned_elem(ctx, eh, element);
+    if eh != usize::MAX {
+        ctx.unpin_native_roots(eh);
+    }
     ctx.set_field(node, LL_NODE_PREV, Value::Object(None));
     ctx.set_field(node, LL_NODE_NEXT, Value::Object(None));
     ctx.set_field(node, LL_NODE_ELEM, element);
@@ -22587,7 +22853,12 @@ fn native_ll_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
+    // Family-1 fix (cce0079): the node alloc can move `this` — refresh it
+    // before reading/writing the list's head/tail/size.
+    let this_pin = ctx.pin_native_root(this);
     let node = ll_alloc_node(ctx, element);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let size = ll_size(ctx, this);
     if let Value::Object(Some(tail)) = ll_get(ctx, this, "tail") {
         ctx.set_field(tail, LL_NODE_NEXT, Value::Object(Some(node)));
@@ -22602,7 +22873,12 @@ fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
 }
 
 fn ll_link_first(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
+    // Family-1 fix (cce0079): same as `ll_link_last` — refresh `this`
+    // across the node alloc.
+    let this_pin = ctx.pin_native_root(this);
     let node = ll_alloc_node(ctx, element);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let size = ll_size(ctx, this);
     if let Value::Object(Some(head)) = ll_get(ctx, this, "head") {
         ctx.set_field(head, LL_NODE_PREV, Value::Object(Some(node)));
@@ -22650,7 +22926,14 @@ fn native_ll_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 /// `this`. Updates `head`/`size` as needed; `tail` is unaffected because the
 /// new node is never the last.
 fn ll_link_before(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value, succ: ObjectRef) {
+    // Family-1 fix (cce0079): the node alloc can move `this` AND `succ` —
+    // refresh both before splicing the new node in.
+    let this_pin = ctx.pin_native_root(this);
+    let succ_pin = ctx.pin_native_root(succ);
     let node = ll_alloc_node(ctx, element);
+    let this = ctx.read_native_pin(this_pin, this);
+    let succ = ctx.read_native_pin(succ_pin, succ);
+    ctx.unpin_native_roots(this_pin);
     let pred = ctx.get_field(succ, LL_NODE_PREV);
     ctx.set_field(node, LL_NODE_PREV, pred);
     ctx.set_field(node, LL_NODE_NEXT, Value::Object(Some(succ)));
@@ -22983,27 +23266,62 @@ fn native_ll_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     })))
 }
 
+/// GC-safe walk of the overlay LinkedList node chain looking for the first
+/// node whose element matches `target` (per JDK `equals` semantics via
+/// [`list_element_matches`], whose dispatch can trigger a moving GC on every
+/// iteration — leaving `this`, `target`, and every node ref stale in the
+/// naive walk). Pins and refreshes all of them per iteration, mirroring the
+/// established `native_ll_remove_if` idiom. Walks tail→head when
+/// `from_tail` (for `removeLastOccurrence`). Returns the REFRESHED
+/// `(matching node, this)`.
+fn ll_pinned_find(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    target: Value,
+    from_tail: bool,
+) -> (Option<ObjectRef>, ObjectRef) {
+    let this_pin = ctx.pin_native_root(this);
+    let th = pin_value(ctx, target);
+    let mut this = this;
+    let mut target = target;
+    let start_field = if from_tail { "tail" } else { "head" };
+    let step_slot = if from_tail { LL_NODE_PREV } else { LL_NODE_NEXT };
+    let mut cur_opt = match ll_get(ctx, this, start_field) {
+        Value::Object(Some(r)) => Some(r),
+        _ => None,
+    };
+    let mut found = None;
+    while let Some(cur) = cur_opt {
+        let cur_pin = ctx.pin_native_root(cur);
+        let elem = ctx.get_field(cur, LL_NODE_ELEM);
+        let matched = list_element_matches(ctx, &elem, &target);
+        let cur = ctx.read_native_pin(cur_pin, cur);
+        this = ctx.read_native_pin(this_pin, this);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found = Some(cur);
+            ctx.unpin_native_roots(cur_pin);
+            break;
+        }
+        cur_opt = match ctx.get_field(cur, step_slot) {
+            Value::Object(Some(r)) => Some(r),
+            _ => None,
+        };
+        ctx.unpin_native_roots(cur_pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    (found, this)
+}
+
 fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ll_get(ctx, this, "head") {
-        Value::Object(Some(r)) => Some(r),
-        _ => None,
-    };
-    while let Some(cur) = cur_opt {
-        let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        if list_element_matches(ctx, &elem, &target) {
-            return Ok(Some(Value::Int(1)));
-        }
-        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
-            Value::Object(Some(r)) => Some(r),
-            _ => None,
-        };
-    }
-    Ok(Some(Value::Int(0)))
+    // Family-1 fix (cce0079): walk via the pinned chain-find helper.
+    let (found, _) = ll_pinned_find(ctx, this, target, false);
+    Ok(Some(Value::Int(if found.is_some() { 1 } else { 0 })))
 }
 
 /// `LinkedList.remove(Object)` / `removeFirstOccurrence(Object)` — remove the
@@ -23021,20 +23339,14 @@ fn native_ll_remove_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ll_get(ctx, this, "head") {
-        Value::Object(Some(r)) => Some(r),
-        _ => None,
-    };
-    while let Some(cur) = cur_opt {
-        let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        if list_element_matches(ctx, &elem, &target) {
-            ll_unlink_node(ctx, this, cur);
-            return Ok(Some(Value::Int(1)));
-        }
-        cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
-            Value::Object(Some(r)) => Some(r),
-            _ => None,
-        };
+    // Family-1 fix (cce0079): find via the pinned chain walk, then unlink
+    // using the REFRESHED node/receiver (the equals dispatches inside the
+    // walk can move both — relinking through stale copies corrupted the
+    // list structure).
+    let (found, this) = ll_pinned_find(ctx, this, target, false);
+    if let Some(cur) = found {
+        ll_unlink_node(ctx, this, cur);
+        return Ok(Some(Value::Int(1)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -23111,20 +23423,12 @@ fn native_ll_remove_last_occurrence(
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let mut cur_opt = match ll_get(ctx, this, "tail") {
-        Value::Object(Some(r)) => Some(r),
-        _ => None,
-    };
-    while let Some(cur) = cur_opt {
-        let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        if list_element_matches(ctx, &elem, &target) {
-            ll_unlink_node(ctx, this, cur);
-            return Ok(Some(Value::Int(1)));
-        }
-        cur_opt = match ctx.get_field(cur, LL_NODE_PREV) {
-            Value::Object(Some(r)) => Some(r),
-            _ => None,
-        };
+    // Family-1 fix (cce0079): same as `native_ll_remove_object`, walking
+    // tail→head.
+    let (found, this) = ll_pinned_find(ctx, this, target, true);
+    if let Some(cur) = found {
+        ll_unlink_node(ctx, this, cur);
+        return Ok(Some(Value::Int(1)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -24279,6 +24583,11 @@ fn native_lhm_put_evict(
             // `getKey`/`getValue` natives) for the hook call.
             let key = ctx.get_field(head, LHM_NODE_KEY);
             let val = ctx.get_field(head, LHM_NODE_VALUE);
+            // Family-1 fix (cce0079): `key` is re-used for the reentrant
+            // remove below, across BOTH the entry alloc and the hook's
+            // virtual dispatch (each GC-capable) — pin it so the remove
+            // receives the current address, not a pre-GC one.
+            let eldest_key_pin = pin_value(ctx, key);
             let eldest = match ctx.new_object_initialized(
                 "java/util/AbstractMap$SimpleImmutableEntry",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
@@ -24301,8 +24610,10 @@ fn native_lhm_put_evict(
             )?;
             if matches!(verdict, Some(Value::Int(n)) if n != 0) {
                 // `invoke_virtual` above runs arbitrary Java and can trigger
-                // a moving GC; refresh `this` before the reentrant remove.
+                // a moving GC; refresh `this` AND the eldest key before the
+                // reentrant remove (Family-1 fix, cce0079).
                 let this = ctx.read_native_pin(this_pin, this);
+                let key = read_pinned_elem(ctx, eldest_key_pin, key);
                 // Evict the eldest by key. If the override already removed it
                 // reentrantly (Hibernate's LRU calls `segment.remove` ->
                 // `eviction.onEntryRemove` -> `this.remove`), this is an
@@ -24502,15 +24813,30 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Family-1 fix (cce0079): pinned chain walk — the per-node `equals()`
+    // dispatch can move the node/target mid-scan.
+    let th = pin_value(ctx, target);
+    let mut target = target;
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
+    let mut found = false;
     while let Value::Object(Some(node)) = cur {
+        let node_pin = ctx.pin_native_root(node);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        if list_element_matches(ctx, &val, &target) {
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &val, &target);
+        let node = ctx.read_native_pin(node_pin, node);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            ctx.unpin_native_roots(node_pin);
+            found = true;
+            break;
         }
         cur = ctx.get_field(node, LHM_NODE_AFTER);
+        ctx.unpin_native_roots(node_pin);
     }
-    Ok(Some(Value::Int(0)))
+    if th != usize::MAX {
+        ctx.unpin_native_roots(th);
+    }
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
 fn native_lhm_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -24964,8 +25290,18 @@ fn native_ad_add_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Family-1 stale-at-store fix (cce0079): `ad_ensure_capacity` reallocates
+    // the ring buffer on grow (GC-capable) — pin `this` and `elem` across it
+    // and refresh both, otherwise the store below writes a pre-GC element
+    // address into the fresh buffer and the head/size fields of a stale
+    // receiver. (`data` is safe: `ad_state` re-reads it afterwards.)
+    let this_pin = ctx.pin_native_root(this);
+    let eh = pin_value(ctx, elem);
     let (_, _, _, size) = ad_state(ctx, this);
     ad_ensure_capacity(ctx, this, (size + 1) as usize);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elem = read_pinned_elem(ctx, eh, elem);
+    ctx.unpin_native_roots(this_pin);
     let (data, head, _tail, size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
     let new_head = (head - 1 + cap) % cap;
@@ -24983,8 +25319,16 @@ fn native_ad_add_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Family-1 stale-at-store fix (cce0079): same shape as
+    // `native_ad_add_first` — pin `this`/`elem` across the GC-capable ring
+    // buffer grow and refresh both before the store.
+    let this_pin = ctx.pin_native_root(this);
+    let eh = pin_value(ctx, elem);
     let (_, _, _, size) = ad_state(ctx, this);
     ad_ensure_capacity(ctx, this, (size + 1) as usize);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elem = read_pinned_elem(ctx, eh, elem);
+    ctx.unpin_native_roots(this_pin);
     let (data, _head, tail, size) = ad_state(ctx, this);
     let cap = data.map_or(0, |d| ctx.array_length(d)) as i32;
     if let Some(buf) = data {
@@ -25123,13 +25467,32 @@ fn native_ad_remove_first_occurrence(
     if cap == 0 || size <= 0 {
         return Ok(Some(Value::Int(0)));
     }
+    // Family-1 fix (cce0079): the per-element `equals()` dispatch can move
+    // `this`/`buf`/`target` — pin all three, refresh after each dispatch,
+    // and shift through the REFRESHED buffer/receiver.
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let th = pin_value(ctx, target);
+    let mut this = this;
+    let mut buf = buf;
+    let mut target = target;
+    let mut found_k = None;
     for k in 0..size as usize {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        if list_element_matches(ctx, &elem, &target) {
-            ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &elem, &target);
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found_k = Some(k);
+            break;
         }
+    }
+    ctx.unpin_native_roots(this_pin);
+    if let Some(k) = found_k {
+        ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
+        return Ok(Some(Value::Int(1)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -25155,13 +25518,31 @@ fn native_ad_remove_last_occurrence(
     if cap == 0 || size <= 0 {
         return Ok(Some(Value::Int(0)));
     }
+    // Family-1 fix (cce0079): same pinned walk as
+    // `native_ad_remove_first_occurrence`, scanning from the tail.
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let th = pin_value(ctx, target);
+    let mut this = this;
+    let mut buf = buf;
+    let mut target = target;
+    let mut found_k = None;
     for k in (0..size as usize).rev() {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        if list_element_matches(ctx, &elem, &target) {
-            ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &elem, &target);
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found_k = Some(k);
+            break;
         }
+    }
+    ctx.unpin_native_roots(this_pin);
+    if let Some(k) = found_k {
+        ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
+        return Ok(Some(Value::Int(1)));
     }
     Ok(Some(Value::Int(0)))
 }
@@ -25273,12 +25654,27 @@ fn native_ad_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (data, head, _, size) = ad_state(ctx, this);
     if let Some(buf) = data {
         let cap = ctx.array_length(buf);
+        // Family-1 fix (cce0079): pinned ring walk — the `equals()` dispatch
+        // can move `buf`/`target` mid-scan.
+        let buf_pin = ctx.pin_native_root(buf);
+        let th = pin_value(ctx, target);
+        let mut buf = buf;
+        let mut target = target;
+        let mut found = false;
         for i in 0..(size as usize) {
             let idx = (head as usize + i) % cap;
             let elem = ctx.get_array_element(buf, idx);
-            if list_element_matches(ctx, &elem, &target) {
-                return Ok(Some(Value::Int(1)));
+            let matched = list_element_matches(ctx, &elem, &target);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            target = read_pinned_elem(ctx, th, target);
+            if matched {
+                found = true;
+                break;
             }
+        }
+        ctx.unpin_native_roots(buf_pin);
+        if found {
+            return Ok(Some(Value::Int(1)));
         }
     }
     Ok(Some(Value::Int(0)))
@@ -25507,11 +25903,34 @@ fn pq_sift_up(
     buf: ObjectRef,
     mut idx: usize,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // Family-1 stale-at-store fix (cce0079): `pq_compare` dispatches the
+    // user comparator / `compareTo` (GC-capable) on every iteration —
+    // `this`, `buf`, and the two pre-compare element snapshots all go stale
+    // across it. Pin the receiver and buffer, refresh them after each
+    // dispatch, and RE-READ the two slots from the refreshed buffer before
+    // writing the swap back (the pre-compare copies may hold pre-GC
+    // addresses, which would poison the queue's backing array).
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut this = this;
+    let mut buf = buf;
+    let mut result = Ok(());
     while idx > 0 {
         let parent = (idx - 1) / 2;
         let child_val = ctx.get_array_element(buf, idx);
         let parent_val = ctx.get_array_element(buf, parent);
-        if pq_compare(ctx, this, &child_val, &parent_val)? < 0 {
+        let cmp = match pq_compare(ctx, this, &child_val, &parent_val) {
+            Ok(c) => c,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        if cmp < 0 {
+            let child_val = ctx.get_array_element(buf, idx);
+            let parent_val = ctx.get_array_element(buf, parent);
             ctx.set_array_element(buf, idx, parent_val);
             ctx.set_array_element(buf, parent, child_val);
             idx = parent;
@@ -25519,7 +25938,8 @@ fn pq_sift_up(
             break;
         }
     }
-    Ok(())
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn pq_sift_down(
@@ -25529,6 +25949,14 @@ fn pq_sift_down(
     mut idx: usize,
     size: usize,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // Family-1 stale-at-store fix (cce0079): same shape as `pq_sift_up` —
+    // refresh `this`/`buf` after every GC-capable `pq_compare` dispatch and
+    // re-read the swapped slots from the refreshed buffer.
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut this = this;
+    let mut buf = buf;
+    let mut result = Ok(());
     loop {
         let left = 2 * idx + 1;
         if left >= size {
@@ -25539,13 +25967,33 @@ fn pq_sift_down(
         if right < size {
             let lv = ctx.get_array_element(buf, left);
             let rv = ctx.get_array_element(buf, right);
-            if pq_compare(ctx, this, &rv, &lv)? < 0 {
+            let cmp = match pq_compare(ctx, this, &rv, &lv) {
+                Ok(c) => c,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            this = ctx.read_native_pin(this_pin, this);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            if cmp < 0 {
                 smallest = right;
             }
         }
         let cur_val = ctx.get_array_element(buf, idx);
         let small_val = ctx.get_array_element(buf, smallest);
-        if pq_compare(ctx, this, &small_val, &cur_val)? < 0 {
+        let cmp = match pq_compare(ctx, this, &small_val, &cur_val) {
+            Ok(c) => c,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
+        this = ctx.read_native_pin(this_pin, this);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        if cmp < 0 {
+            let cur_val = ctx.get_array_element(buf, idx);
+            let small_val = ctx.get_array_element(buf, smallest);
             ctx.set_array_element(buf, idx, small_val);
             ctx.set_array_element(buf, smallest, cur_val);
             idx = smallest;
@@ -25553,7 +26001,8 @@ fn pq_sift_down(
             break;
         }
     }
-    Ok(())
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
@@ -25659,8 +26108,17 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => return Ok(Some(Value::Int(0))),
     };
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Family-1 stale-at-store fix (cce0079): `pq_ensure_capacity`
+    // reallocates the heap array on grow (GC-capable) — pin `this`/`elem`
+    // across it and refresh both, otherwise the store below writes a pre-GC
+    // element address into the fresh buffer.
+    let this_pin = ctx.pin_native_root(this);
+    let eh = pin_value(ctx, elem);
     let (_, size) = pq_state(ctx, this);
     pq_ensure_capacity(ctx, this, (size + 1) as usize);
+    let this = ctx.read_native_pin(this_pin, this);
+    let elem = read_pinned_elem(ctx, eh, elem);
+    ctx.unpin_native_roots(this_pin);
     let (data, _) = pq_state(ctx, this);
     // `pq_ensure_capacity` allocates a buffer for any `min_cap >= 1`, so this
     // is normally `Some`. Guard against a None backing array (size/data
@@ -25709,7 +26167,17 @@ fn native_pq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(new_size));
     if new_size > 0 {
-        pq_sift_down(ctx, this, buf, 0, new_size as usize)?;
+        // Family-1 stale-at-store fix (cce0079): `pq_sift_down` dispatches
+        // the comparator (GC-capable) — the popped element must be returned
+        // at its CURRENT address, so pin it across the sift and re-read.
+        let rh = pin_value(ctx, result);
+        let sift = pq_sift_down(ctx, this, buf, 0, new_size as usize);
+        let result = read_pinned_elem(ctx, rh, result);
+        if rh != usize::MAX {
+            ctx.unpin_native_roots(rh);
+        }
+        sift?;
+        return Ok(Some(result));
     }
     Ok(Some(result))
 }
@@ -25725,15 +26193,15 @@ fn native_pq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(b) => b,
         None => return Ok(Some(Value::Int(0))),
     };
-    // Find element
-    let mut found_idx = None;
-    for i in 0..(size as usize) {
-        let elem = ctx.get_array_element(buf, i);
-        if list_element_matches(ctx, &elem, &target) {
-            found_idx = Some(i);
-            break;
-        }
-    }
+    // Family-1 stale-at-store fix (cce0079): the find loop dispatches
+    // `equals()` per element (GC-capable) — `this`/`buf`/`target` all go
+    // stale across it, and the post-loop swap would shift a stale `last`
+    // element into a stale array. Pin the receiver, search through the
+    // pinned helper, and act on the refreshed addresses it returns.
+    let this_pin = ctx.pin_native_root(this);
+    let (found_idx, buf, _target) = pinned_array_search(ctx, buf, size as usize, target);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let idx = match found_idx {
         Some(i) => i,
         None => return Ok(Some(Value::Int(0))),
@@ -25759,11 +26227,12 @@ fn native_pq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data, size) = pq_state(ctx, this);
     if let Some(buf) = data {
-        for i in 0..(size as usize) {
-            let elem = ctx.get_array_element(buf, i);
-            if list_element_matches(ctx, &elem, &target) {
-                return Ok(Some(Value::Int(1)));
-            }
+        // Family-1 fix (cce0079): the naive loop walked a `buf` left stale
+        // by the per-element `equals()` dispatch; search via the pinned
+        // helper instead.
+        let (found, _, _) = pinned_array_search(ctx, buf, size as usize, target);
+        if found.is_some() {
+            return Ok(Some(Value::Int(1)));
         }
     }
     Ok(Some(Value::Int(0)))
@@ -26120,11 +26589,25 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let (data, size) = al_state(ctx, this);
     // Search from top of stack (last element), return 1-based distance from top
     if let Some(buf) = data {
+        // Family-1 fix (cce0079): pinned reverse scan.
+        let buf_pin = ctx.pin_native_root(buf);
+        let th = pin_value(ctx, target);
+        let mut buf = buf;
+        let mut target = target;
+        let mut found = None;
         for i in (0..(size as usize)).rev() {
             let elem = ctx.get_array_element(buf, i);
-            if list_element_matches(ctx, &elem, &target) {
-                return Ok(Some(Value::Int((size as usize - i) as i32)));
+            let matched = list_element_matches(ctx, &elem, &target);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            target = read_pinned_elem(ctx, th, target);
+            if matched {
+                found = Some(i);
+                break;
             }
+        }
+        ctx.unpin_native_roots(buf_pin);
+        if let Some(i) = found {
+            return Ok(Some(Value::Int((size as usize - i) as i32)));
         }
     }
     Ok(Some(Value::Int(-1)))
@@ -26818,34 +27301,63 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // an empty list (e.g. `new ArrayList<>(Arrays.asList(Errors.values())).removeAll(x)`
     // wiped all 121 elements, emptying a `@MethodSource` stream → bug-14). Doing all
     // reads before any write removes that interleaving.
-    let mut kept: Vec<Value> = Vec::with_capacity(size as usize);
+    //
+    // Family-1 fix (cce0079): every `list_element_matches` below dispatches
+    // `equals()` (GC-capable), which left `this`/`buf`/the `coll_elems`
+    // snapshot/every previously-kept raw element stale — the write-back then
+    // stored pre-GC addresses into the array. Pin receiver/buffer/snapshot,
+    // refresh per dispatch, and track kept INDICES rather than raw values,
+    // re-reading each element from the refreshed buffer at write-back time
+    // (kept indices are ascending and >= their write position, so reads
+    // always happen before their slot is overwritten).
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let (_, ce_handles) = pin_value_slice(ctx, &coll_elems);
+    let mut this = this;
+    let mut buf = buf;
+    let mut kept_idx: Vec<usize> = Vec::with_capacity(size as usize);
     let mut modified = false;
     for read_idx in 0..(size as usize) {
-        let elem = ctx.get_array_element(buf, read_idx);
+        let elem0 = ctx.get_array_element(buf, read_idx);
+        let eh = pin_value(ctx, elem0);
+        let mut elem = elem0;
         // `c.contains(elem)` — real element equality (see `list_element_matches`).
         let mut in_coll = false;
-        for ce in &coll_elems {
-            if list_element_matches(ctx, ce, &elem) {
+        for (ci, ce_orig) in coll_elems.iter().enumerate() {
+            let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
+            let matched = list_element_matches(ctx, &ce, &elem);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            elem = read_pinned_elem(ctx, eh, elem);
+            if matched {
                 in_coll = true;
                 break;
             }
         }
+        if eh != usize::MAX {
+            ctx.unpin_native_roots(eh);
+        }
         if in_coll {
             modified = true;
         } else {
-            kept.push(elem);
+            kept_idx.push(read_idx);
         }
     }
+    this = ctx.read_native_pin(this_pin, this);
+    buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.unpin_native_roots(this_pin);
     if modified {
-        for (i, e) in kept.iter().enumerate() {
-            ctx.set_array_element(buf, i, *e);
+        for (k, &idx) in kept_idx.iter().enumerate() {
+            if k != idx {
+                let v = ctx.get_array_element(buf, idx);
+                ctx.set_array_element(buf, k, v);
+            }
         }
         // Null the vacated tail (ArrayList invariant: slots >= size are null);
         // see native_al_retain_all for why stale tail elements are harmful.
-        for i in kept.len()..(size as usize) {
+        for i in kept_idx.len()..(size as usize) {
             ctx.set_array_element(buf, i, Value::Object(None));
         }
-        al_set_size(ctx, this, kept.len() as i32);
+        al_set_size(ctx, this, kept_idx.len() as i32);
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
@@ -26867,27 +27379,50 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     // Two-pass (see native_al_remove_all): read+decide before writing, so a full
     // backing array (capacity == size) is handled correctly.
-    let mut kept: Vec<Value> = Vec::with_capacity(size as usize);
+    //
+    // Family-1 fix (cce0079): pinned walk + kept INDICES — see
+    // `native_al_remove_all` for the full rationale.
+    let this_pin = ctx.pin_native_root(this);
+    let buf_pin = ctx.pin_native_root(buf);
+    let (_, ce_handles) = pin_value_slice(ctx, &coll_elems);
+    let mut this = this;
+    let mut buf = buf;
+    let mut kept_idx: Vec<usize> = Vec::with_capacity(size as usize);
     let mut modified = false;
     for read_idx in 0..(size as usize) {
-        let elem = ctx.get_array_element(buf, read_idx);
+        let elem0 = ctx.get_array_element(buf, read_idx);
+        let eh = pin_value(ctx, elem0);
+        let mut elem = elem0;
         // `c.contains(elem)` — real element equality (see `list_element_matches`).
         let mut in_coll = false;
-        for ce in &coll_elems {
-            if list_element_matches(ctx, ce, &elem) {
+        for (ci, ce_orig) in coll_elems.iter().enumerate() {
+            let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
+            let matched = list_element_matches(ctx, &ce, &elem);
+            buf = ctx.read_native_pin(buf_pin, buf);
+            elem = read_pinned_elem(ctx, eh, elem);
+            if matched {
                 in_coll = true;
                 break;
             }
         }
+        if eh != usize::MAX {
+            ctx.unpin_native_roots(eh);
+        }
         if in_coll {
-            kept.push(elem);
+            kept_idx.push(read_idx);
         } else {
             modified = true;
         }
     }
+    this = ctx.read_native_pin(this_pin, this);
+    buf = ctx.read_native_pin(buf_pin, buf);
+    ctx.unpin_native_roots(this_pin);
     if modified {
-        for (i, e) in kept.iter().enumerate() {
-            ctx.set_array_element(buf, i, *e);
+        for (k, &idx) in kept_idx.iter().enumerate() {
+            if k != idx {
+                let v = ctx.get_array_element(buf, idx);
+                ctx.set_array_element(buf, k, v);
+            }
         }
         // Null the vacated tail so slots >= size are null (the real ArrayList
         // invariant). Leaving stale non-null elements there breaks heuristics
@@ -26895,10 +27430,10 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // as a view-source sentinel — that misfired after retainAll and made a
         // freshly-filtered list (e.g. the JSSE connector's enabled-cipher list)
         // resync to empty, throwing "None of the [ciphers] ... supported".
-        for i in kept.len()..(size as usize) {
+        for i in kept_idx.len()..(size as usize) {
             ctx.set_array_element(buf, i, Value::Object(None));
         }
-        al_set_size(ctx, this, kept.len() as i32);
+        al_set_size(ctx, this, kept_idx.len() as i32);
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
@@ -26913,13 +27448,29 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let elems = collect_collection_elements_or_real(ctx, coll);
+    // Family-1 fix (cce0079): each `native_hs_add` is GC-capable — an
+    // earlier iteration's GC left `this` and every later `elems` slot stale
+    // (the callee pins its own args, but was being handed already-dead
+    // addresses). Pin and refresh per iteration.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut this = this;
     let mut modified = false;
-    for e in &elems {
-        let result = native_hs_add(ctx, &[Value::Object(Some(this)), *e])?;
+    for (i, e) in elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        let result = match native_hs_add(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(r) => r,
+            Err(err) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(err);
+            }
+        };
         if result == Some(Value::Int(1)) {
             modified = true;
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -26937,13 +27488,27 @@ fn native_hs_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // no-op). Falls back to the collection's real `toArray()`. See
     // `native_hs_contains_all` for the Weld `ImmutableTinySet` case.
     let coll_elems = collect_collection_elements_or_real(ctx, coll);
+    // Family-1 fix (cce0079): same per-iteration pin refresh as
+    // `native_hs_add_all`.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, handles) = pin_value_slice(ctx, &coll_elems);
+    let mut this = this;
     let mut modified = false;
-    for e in &coll_elems {
-        let result = native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
+    for (i, e) in coll_elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        let result = match native_hs_remove(ctx, &[Value::Object(Some(this)), e]) {
+            Ok(r) => r,
+            Err(err) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(err);
+            }
+        };
         if result == Some(Value::Int(1)) {
             modified = true;
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -26967,21 +27532,37 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(m) => map_collect_keys(ctx, m),
         None => Vec::new(),
     };
+    // Family-1 fix (cce0079): both the equality dispatches and the reentrant
+    // `native_hs_remove` are GC-capable — pin `this` and both snapshot
+    // vectors, refreshing every operand per use.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, ce_handles) = pin_value_slice(ctx, &coll_elems);
+    let (_, cur_handles) = pin_value_slice(ctx, &current);
+    let mut this = this;
     let mut modified = false;
-    for e in &current {
+    for (i, e_orig) in current.iter().enumerate() {
+        let mut e = read_pinned_elem(ctx, cur_handles[i], *e_orig);
         // `coll.contains(e)` — real element equality (see `list_element_matches`).
         let mut should_keep = false;
-        for ce in &coll_elems {
-            if list_element_matches(ctx, ce, e) {
+        for (ci, ce_orig) in coll_elems.iter().enumerate() {
+            let ce = read_pinned_elem(ctx, ce_handles[ci], *ce_orig);
+            let matched = list_element_matches(ctx, &ce, &e);
+            e = read_pinned_elem(ctx, cur_handles[i], e);
+            if matched {
                 should_keep = true;
                 break;
             }
         }
         if !should_keep {
-            native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
+            this = ctx.read_native_pin(this_pin, this);
+            if let Err(err) = native_hs_remove(ctx, &[Value::Object(Some(this)), e]) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(err);
+            }
             modified = true;
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -26998,9 +27579,18 @@ fn native_ll_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
-    for e in &elems {
-        ll_link_last(ctx, this, *e);
+    // Family-1 fix (cce0079): every `ll_link_last` allocates a node — an
+    // earlier iteration's GC left `this` and every later `elems` slot stale.
+    // Pin and refresh per iteration.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut this = this;
+    for (i, e) in elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        ll_link_last(ctx, this, e);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -27017,9 +27607,21 @@ fn native_ad_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
-    for e in &elems {
-        native_ad_add_last(ctx, &[Value::Object(Some(this)), *e])?;
+    // Family-1 fix (cce0079): every `native_ad_add_last` can grow the ring
+    // buffer (GC-capable) — pin and refresh `this` + pending elements per
+    // iteration.
+    let this_pin = ctx.pin_native_root(this);
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    let mut this = this;
+    for (i, e) in elems.iter().enumerate() {
+        this = ctx.read_native_pin(this_pin, this);
+        let e = read_pinned_elem(ctx, handles[i], *e);
+        if let Err(err) = native_ad_add_last(ctx, &[Value::Object(Some(this)), e]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(err);
+        }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -28905,6 +29507,21 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
+    // Family-1 stale-AT-STORE fix (cce0079 follow-up): `key` and `value`
+    // must be pinned BEFORE any GC-capable step in this function — the
+    // fast-to-array migration and first-insert array alloc below, and the
+    // comparator dispatches inside `tm_binary_search`, can each move either
+    // object, and the eventual `tm_insert_at`/replace store would otherwise
+    // write the pre-GC address into the backing array. The previous
+    // Err-branch pins started too late: they captured locals that could
+    // already have gone stale during the search, so the pin faithfully
+    // tracked a dead address (a later reader then sees a recycled object —
+    // the WildFly `parallel-extension-add` "Object cannot be cast to X"
+    // shape). The replace (`Ok`) branch had no `value` protection at all.
+    let kh0 = pin_value(ctx, key);
+    let vh0 = pin_value(ctx, value);
+    let pin_base = if kh0 != usize::MAX { kh0 } else { vh0 };
+
     // Round-9 HIGH (MED-8 carryover): fast-mode BTreeMap path. Eligible
     // when no custom Comparator was supplied AND the key extracts into
     // a TreeKey (String / Integer / Long). For an empty map this also
@@ -28922,6 +29539,9 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     (old, bt.len() as i32)
                 });
                 tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(new_size));
+                if pin_base != usize::MAX {
+                    ctx.unpin_native_roots(pin_base);
+                }
                 return Ok(Some(old));
             }
         } else {
@@ -28930,11 +29550,15 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // we don't split state across two stores.
             tm_set_force_array(ctx, this);
             if tm_is_fast_mode(ctx, this) {
+                // The migration allocates (and can move this map); pin and
+                // refresh the receiver across it.
+                let tp = ctx.pin_native_root(this);
                 tm_migrate_fast_to_array(ctx, this);
+                this = ctx.read_native_pin(tp, this);
+                ctx.unpin_native_roots(tp);
             }
         }
     }
-
     let (data_opt, size, comparator) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
@@ -28948,13 +29572,26 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             buf
         }
     };
+    // Refresh `key` before the search (the first-insert alloc above may
+    // have moved it; `tm_binary_search` pins its own argument, so it must
+    // receive the current address).
+    let key = read_pinned_elem(ctx, kh0, key);
     // Family-1 stale-ObjectRef fix: `tm_binary_search` invokes the user
     // Comparator, which can trigger a moving GC — use its refreshed
     // `this`/`data`/`key` (shadowed here) instead of the pre-search copies
     // above; `key`'s own staleness (not just `this`/`data`) was the actual
     // root cause of the residual panics that survived the earlier fix.
-    let (search, mut this, data, key) = tm_binary_search(ctx, this, data, size, &comparator, &key)?;
-    match search {
+    let (search, mut this, data, key) = match tm_binary_search(ctx, this, data, size, &comparator, &key) {
+        Ok(t) => t,
+        Err(e) => {
+            if pin_base != usize::MAX {
+                ctx.unpin_native_roots(pin_base);
+            }
+            return Err(e);
+        }
+    };
+    let value = read_pinned_elem(ctx, vh0, value);
+    let result = match search {
         Ok(idx) => {
             // Key exists — replace value, return old
             let old = ctx.get_array_element(data, idx * 2 + 1);
@@ -28979,7 +29616,11 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             tm_set_slot(ctx, this, TM_FIELD_SIZE, Value::Int(size + 1));
             Ok(Some(Value::Object(None)))
         }
+    };
+    if pin_base != usize::MAX {
+        ctx.unpin_native_roots(pin_base);
     }
+    result
 }
 
 fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -29086,25 +29727,51 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
-        for v in values {
-            if list_element_matches(ctx, &v, &target) {
-                return Ok(Some(Value::Int(1)));
+        // Family-1 fix (cce0079): pin the snapshot — each `equals()`
+        // dispatch can move the remaining values and the target.
+        let (pin_base, handles) = pin_value_slice(ctx, &values);
+        let th = pin_value(ctx, target);
+        let mut target = target;
+        let mut found = false;
+        for (i, v_orig) in values.iter().enumerate() {
+            let v = read_pinned_elem(ctx, handles[i], *v_orig);
+            let matched = list_element_matches(ctx, &v, &target);
+            target = read_pinned_elem(ctx, th, target);
+            if matched {
+                found = true;
+                break;
             }
         }
-        return Ok(Some(Value::Int(0)));
+        if pin_base != usize::MAX {
+            ctx.unpin_native_roots(pin_base);
+        } else if th != usize::MAX {
+            ctx.unpin_native_roots(th);
+        }
+        return Ok(Some(Value::Int(if found { 1 } else { 0 })));
     }
     let (data_opt, size, _) = tm_state(ctx, this);
     let data = match data_opt {
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
+    // Family-1 fix (cce0079): pinned value-slot scan of the k/v array.
+    let data_pin = ctx.pin_native_root(data);
+    let th = pin_value(ctx, target);
+    let mut data = data;
+    let mut target = target;
+    let mut found = false;
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i * 2 + 1);
-        if list_element_matches(ctx, &v, &target) {
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &v, &target);
+        data = ctx.read_native_pin(data_pin, data);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found = true;
+            break;
         }
     }
-    Ok(Some(Value::Int(0)))
+    ctx.unpin_native_roots(data_pin);
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
 fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -36971,13 +37638,23 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(d) => d,
         None => return Ok(Some(Value::Int(0))),
     };
+    // Family-1 fix (cce0079): pinned scan (counts every match, so no
+    // early-exit helper).
+    let data_pin = ctx.pin_native_root(data);
+    let th = pin_value(ctx, target);
+    let mut data = data;
+    let mut target = target;
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
-        if list_element_matches(ctx, &elem, &target) {
+        let matched = list_element_matches(ctx, &elem, &target);
+        data = ctx.read_native_pin(data_pin, data);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
             count += 1;
         }
     }
+    ctx.unpin_native_roots(data_pin);
     Ok(Some(Value::Int(count)))
 }
 
@@ -37955,15 +38632,30 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let head = lbq_head(ctx, this);
+    // Family-1 fix (cce0079): pinned walk (equals() can move
+    // `this`/`arr`/`target`); the monitor exit must use the refreshed
+    // receiver or the real monitor leaks (SynchronizedMethodGuard class).
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let th = pin_value(ctx, target);
+    let mut this = this;
+    let mut arr = arr;
+    let mut target = target;
+    let mut found = false;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        if list_element_matches(ctx, &elem, &target) {
-            ctx.monitor_exit(this);
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &elem, &target);
+        this = ctx.read_native_pin(this_pin, this);
+        arr = ctx.read_native_pin(arr_pin, arr);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found = true;
+            break;
         }
     }
+    ctx.unpin_native_roots(this_pin);
     ctx.monitor_exit(this);
-    Ok(Some(Value::Int(0)))
+    Ok(Some(Value::Int(if found { 1 } else { 0 })))
 }
 
 fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -37985,23 +38677,45 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         }
     };
     let head = lbq_head(ctx, this);
+    // Family-1 fix (cce0079): the per-element `equals()` dispatch can move
+    // `this`/`arr`/`target`. Beyond the stale shift/store, the original code
+    // also exited the monitor through the PRE-GC `this` — releasing a stale
+    // monitor address leaks the real monitor forever (the
+    // SynchronizedMethodGuard bug class). Pin all three, refresh after each
+    // dispatch, and act only on refreshed addresses.
+    let this_pin = ctx.pin_native_root(this);
+    let arr_pin = ctx.pin_native_root(arr);
+    let th = pin_value(ctx, target);
+    let mut this = this;
+    let mut arr = arr;
+    let mut target = target;
+    let mut found_i = None;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        if list_element_matches(ctx, &elem, &target) {
-            // Shift the tail of the window left by one over the removed slot.
-            for j in i..(size - 1) as usize {
-                ctx.set_array_element(arr, head + j, ctx.get_array_element(arr, head + j + 1));
-            }
-            ctx.set_array_element(arr, head + (size - 1) as usize, Value::Object(None));
-            if size - 1 == 0 {
-                lbq_set_head(ctx, this, 0);
-            }
-            ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
-            // Wake any thread parked in `put()` — a slot just freed.
-            let _ = ctx.monitor_notify_all(this);
-            ctx.monitor_exit(this);
-            return Ok(Some(Value::Int(1)));
+        let matched = list_element_matches(ctx, &elem, &target);
+        this = ctx.read_native_pin(this_pin, this);
+        arr = ctx.read_native_pin(arr_pin, arr);
+        target = read_pinned_elem(ctx, th, target);
+        if matched {
+            found_i = Some(i);
+            break;
         }
+    }
+    ctx.unpin_native_roots(this_pin);
+    if let Some(i) = found_i {
+        // Shift the tail of the window left by one over the removed slot.
+        for j in i..(size - 1) as usize {
+            ctx.set_array_element(arr, head + j, ctx.get_array_element(arr, head + j + 1));
+        }
+        ctx.set_array_element(arr, head + (size - 1) as usize, Value::Object(None));
+        if size - 1 == 0 {
+            lbq_set_head(ctx, this, 0);
+        }
+        ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
+        // Wake any thread parked in `put()` — a slot just freed.
+        let _ = ctx.monitor_notify_all(this);
+        ctx.monitor_exit(this);
+        return Ok(Some(Value::Int(1)));
     }
     ctx.monitor_exit(this);
     Ok(Some(Value::Int(0)))
@@ -40656,15 +41370,39 @@ fn native_cowal_add_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         cowal_exit_monitor(ctx, this, lock_obj);
         return Ok(Some(Value::Int(0)));
     };
-    for i in 0..len {
-        let existing = ctx.get_array_element(arr, i);
-        if list_element_matches(ctx, &existing, &elem) {
-            cowal_exit_monitor(ctx, this, lock_obj);
-            return Ok(Some(Value::Int(0)));
-        }
+    // Family-1 stale-at-store fix (cce0079): the dedup scan dispatches
+    // `equals()` per element and the copy path allocates a fresh array —
+    // `this`, `elem`, the snapshot `arr`, and the monitor object all go
+    // stale across those, and the unfixed code then stored a pre-GC `elem`
+    // address into the published array (a later reader sees a recycled
+    // object). Pin everything, scan through the pinned helper, refresh
+    // before every use.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_val = lock_obj.map_or(Value::Object(None), |o| Value::Object(Some(o)));
+    let lock_h = pin_value(ctx, lock_val);
+    let (found, arr, elem) = pinned_array_search(ctx, arr, len, elem);
+    let mut this = ctx.read_native_pin(this_pin, this);
+    let mut lock_obj = match read_pinned_elem(ctx, lock_h, lock_val) {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    if found.is_some() {
+        ctx.unpin_native_roots(this_pin);
+        cowal_exit_monitor(ctx, this, lock_obj);
+        return Ok(Some(Value::Int(0)));
     }
 
+    let ah = ctx.pin_native_root(arr);
+    let eh = pin_value(ctx, elem);
     let new_arr = ctx.new_array(ArrayElementType::Reference, len + 1);
+    let arr = ctx.read_native_pin(ah, arr);
+    let elem = read_pinned_elem(ctx, eh, elem);
+    this = ctx.read_native_pin(this_pin, this);
+    lock_obj = match read_pinned_elem(ctx, lock_h, lock_val) {
+        Value::Object(o) => o,
+        _ => None,
+    };
+    ctx.unpin_native_roots(this_pin);
     for i in 0..len {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
     }
@@ -40690,11 +41428,10 @@ fn native_cowal_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Match by Java `equals` semantics, not reference identity — real
     // `CopyOnWriteArrayList.contains` uses `o.equals(elem)`.
     if let Some((arr, len)) = cowal_read_snapshot(ctx, this) {
-        for i in 0..len {
-            let elem = ctx.get_array_element(arr, i);
-            if list_element_matches(ctx, &elem, &needle) {
-                return Ok(Some(Value::Int(1)));
-            }
+        // Family-1 fix (cce0079): pinned scan.
+        let (found, _, _) = pinned_array_search(ctx, arr, len, needle);
+        if found.is_some() {
+            return Ok(Some(Value::Int(1)));
         }
     }
     Ok(Some(Value::Int(0)))
@@ -43849,6 +44586,12 @@ mod tests {
             }
             fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
             fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
+                None
+            }
+            // Drive-by test fix (cce0079): the trait gained
+            // `resolve_field_index_by_class_id` without this in-lib MockCtx
+            // being updated — the lib-test target did not compile on dev.
+            fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
                 None
             }
             fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {

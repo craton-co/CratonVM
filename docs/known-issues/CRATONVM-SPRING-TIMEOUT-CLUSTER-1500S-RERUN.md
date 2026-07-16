@@ -39,8 +39,14 @@
 > 2026-07-16): `context.annotation.ImportSelectorTests` (Mockito `spy()`
 > `StackOverflowError`, root cause narrowed to `MockMethodAdvice
 > .isOverridden`); `web.service.registry.ImportHttpServiceRegistrarTests`
-> (`ClassCastException`, narrowed to Spring's own `AnnotationTypeMapping
-> .getMappedAnnotationValue`); `web.socket.messaging
+> (`ClassCastException`, root-caused precisely 2026-07-16 to a cross-loader
+> `MergedAnnotation$Adapt` enum-identity split — NOT `AnnotationTypeMapping
+> .getMappedAnnotationValue`/`Method` identity as this doc and
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md` previously said; a targeted VM fix in
+> `resolve_field_ref`/`getstatic` was attempted and REVERTED after it caused
+> heap corruption — see `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s dedicated
+> entry for the full narrative, repro assets, and next-step guidance);
+> `web.socket.messaging
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
 > .PersistenceAnnotationBeanPostProcessorAotContributionTests` (ByteBuddy
@@ -699,6 +705,25 @@ added this session (commit `b34679e5`, kept in place): `CRATONVM_IAE_TRACE2`
 widened `CRATONVM_ANN_TRACE` gate covering `Import`/`ImportHttpServices`.
 
 ### `ImportHttpServiceRegistrarTests` — `ClassCastException`, root-caused, not fixed
+
+> **2026-07-16 update:** the exact root cause is now known — a cross-loader
+> `MergedAnnotation$Adapt` enum-identity split (`Adapt.CLASS_TO_STRING.isIn()`
+> returns a false negative comparing an application-loader `Adapt` constant
+> against a fork-loader one), traced live via instrumented Spring source
+> (not CratonVM's annotation/reflection layer, and NOT `AnnotationTypeMapping
+> .getMappedAnnotationValue`/`Method` identity as hypothesized below — that
+> path was traced and is clean). Pinned to `resolve_field_ref`
+> (`vm/src/runtime/interpreter.rs`) resolving a `getstatic`'s field-owning
+> class via a loader-blind fallback where `CONSTANT_Class` resolution
+> (`resolve_class_loader_aware`) already has a loader-faithful one. A fix
+> along those lines was implemented, built, and REVERTED after it corrupted
+> heap state (stale pointers / `ClassId(0)` / spurious `NoSuchMethodError`) —
+> likely a GC-safety precondition the field-opcode fast path doesn't
+> currently satisfy for a re-entrant `loadClass()` call. See
+> `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s `@Import` attribute CCE entry for
+> the full trace evidence, the reverted diff's location, and next-step
+> guidance. The narrative below (SoftReference hypothesis, `Method`-identity
+> hypothesis) is superseded but kept for history.
 
 **Confirmed 3/5 pass, 2/5 fail** (`basicListingWithAot`, `basicScanWithAot`
 fail; `basicListing`, `basicScan`, `clientType` pass). The passing 3 call
@@ -1557,7 +1582,7 @@ rather than a coincidence:
 | Class | Status | Elapsed | Pass/Total | First FAILCAUSE |
 |---|---|--:|--:|---|
 | `orm.jpa.support.InjectionCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 206s | 3/10 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**, now hangs instead, see 2026-07-14 update below |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL -> **TIMEOUT as of 2026-07-14** | 169s -> 600s+ (2x) | 0/16 -> 0/0 | `ServletException`/`UnsatisfiedDependencyException` (no `MessageHandler` bean) -> **bean/startup bug no longer reproduces**; 2026-07-16: NOT a real hang, root-caused to server-side `SocketChannel.close()` firing ~40ms-2s after the WS handshake (both Jetty+Tomcat), see the 2026-07-16 update below |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | FAIL → **TIMEOUT as of 2026-07-13** | 492s → 600s×2 (+1500s dedicated probe) | 0/68 → 0/0 | `BeanCreationException`: no `ApiVersionStrategy` bean → **bean bug fixed**, now deadlocks in `Semaphore.release()`'s monitor instead, see [2026-07-13 update #5](#2026-07-13-local-investigation-5--missing-apiversionstrategy-bean-resolved-both-classes-now-hit-a-different-new-deadlock-still-open) |
 | `web.servlet.mvc.method.annotation.ServletAnnotationControllerHandlerMethodTests` | **FIXED 2026-07-14** | 445s -> 149s | 211/241 -> **241/241** | Two native bugs, both fixed (`cd90774e`, `72a9ad40`): `PrintWriter.write(String)` bypassed subclass `write(String,int,int)` overrides (broke Spring test fixture auto-flush); `Matcher.group(int)` assumed cached text was always `java.lang.String`, threw spurious `NoSuchMethodError` on a general `CharSequence` (e.g. `AntPathMatcher`'s `MaxAttemptsCharSequence`) |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | FAIL → **TIMEOUT as of 2026-07-13** | 693s | 0/47 | `CompilationException: Unable to compile source` → now hangs instead, see [2026-07-13 update](#2026-07-13-local-investigation--aot-bean-registration-hang-cluster--in-memory-javac-compilationexception-cluster-confirmed-to-share-one-root-cause-still-open) |
@@ -1667,6 +1692,129 @@ routing/broker delivery, not a VM-level concurrency bug. Root cause not yet
 found; needs tracing on the server (broker) side to see whether it's
 sending the expected frame at all, or a client-side subscription/session
 bug. Left as the open item for a future session.
+
+## 2026-07-16 follow-up — StompWebSocketIntegrationTests: NOT a hang, NOT a VM concurrency bug; root-caused to a premature server-side `SocketChannel.close()` right after the WS handshake — OPEN, precise next step identified
+
+Worktree `wt-stompws-20260716-141512` on the Azure host, branch
+`fix/stompws-msgdelivery-20260716-141512`, synced to `origin/dev`. Task: pick
+up the 2026-07-14 investigation above (last known state: "no STOMP message
+ever arrives ... needs tracing on the server (broker) side").
+
+**Reproduced fresh on current `dev`.** Running the full class still times out
+(`timeout 120` on `KRun` never emits a `RESULT` line, log grows to ~1.8M
+lines/120s). But that turned out to be a **red herring about the nature of
+the problem**, not evidence of a true infinite hang — see below.
+
+### The 2026-07-14 hypothesis ("no message ever arrives, needs server tracing") is now resolved
+
+Added `System.err` tracing directly into a scratch copy of the test class
+(client `afterConnectionEstablished`/`handleTextMessage`, server
+`SimpleController.handle()`) and ran the two `sendMessageToController`
+parameterizations **in isolation** (the other 7 `@ParameterizedWebSocketTest`
+methods commented out, so there's no ambiguity about which sub-test produced
+which trace line). Result: the class does **not** hang forever — it finishes
+in ~30s with a normal `RESULT ... status=FAIL`, both parameterizations
+(`server=Jetty` and `server=Tomcat`, both with the `Standard` — i.e. Tomcat's
+own JSR-356 — client) failing the same
+`assertThat(...latch.await(10, SECONDS)).isTrue()` assertion. Trace evidence
+for both parameterizations:
+
+```
+[STOMPTRACE] client: afterConnectionEstablished, sending msg0=CONNECT...
+WARN [org.apache.tomcat.websocket.WsRemoteEndpointImplClient] Write to the
+  remote endpoint failed. ... (ExecutionException: java.io.IOException:
+  write failed: Broken pipe (os error 32))
+```
+
+The client's **very first write after the handshake** — the STOMP `CONNECT`
+frame — fails with a genuine OS-level `EPIPE`. This is CratonVM's own real
+(non-synthetic) `AsynchronousSocketChannel` Future-write path
+(`native-io/src/async_socket.rs::aio_asc_write_future` → a worker-pool
+`fd_table().tcp_write()` on a real `TcpStream`, confirmed by the
+`"write failed: {e}"` message format — that exact `Display` formatting,
+`(os error N)`, is CratonVM's own Rust `std::io::Error` formatting, not
+anything Tomcat prints itself, so the underlying `send()` really did receive
+`EPIPE`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is
+what eventually surfaces the failure as a JUnit assertion failure rather than
+a true hang — that 20s-per-sub-test-invocation, multiplied across all 16
+parameterizations (8 methods × 2 servers) in the full class, is what pushes
+the **class total past the suite's 600s per-class ceiling** and gets it
+bucketed as TIMEOUT rather than FAIL. **This fully explains the "TIMEOUT"
+symptom without any infinite loop or VM-level concurrency bug** — the
+2026-07-14 gdb snapshot that found `main-vm` parked in plain
+`native_lock_support_park()` was simply catching the process mid-run at a
+point where a CountDownLatch/Future wait happened to be live, not evidence of
+an unbounded park; `parkNanos`/`parkUntil`'s timeout plumbing
+(`native-builtins/src/lib.rs` ~50432-50570) was independently re-audited this
+session and is correct.
+
+### EPIPE root cause narrowed to the SERVER side, with millisecond-precision evidence
+
+Added a temporary-but-kept diagnostic hook,
+`CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`,
+commit `dd1cddec` — see its doc comment), that traces every real
+`java.nio.channels.SocketChannel.close()` with the local/peer address and a
+wall-clock timestamp. Correlated against a millisecond-stamped
+`System.currentTimeMillis()` STOMPTRACE line at the exact moment the client's
+`afterConnectionEstablished` fires:
+
+```
+[STOMPTRACE] t=1784224734832 client: afterConnectionEstablished, sending msg0=CONNECT...
+[SC_CLOSE]   t=1784224734869 id=0x60000001 local=127.0.0.1:46311 peer=127.0.0.1:51988   (Δ = 37ms, Jetty variant)
+...
+[STOMPTRACE] t=1784224749055 client: afterConnectionEstablished, sending msg0=CONNECT...
+[SC_CLOSE]   t=1784224750835 id=0x60000003 local=127.0.0.1:42617 peer=127.0.0.1:47334   (Δ = 1.78s, Tomcat variant)
+```
+
+`SocketChannel.close()` is the native that `org.apache.tomcat.util.net.
+NioChannel`/Jetty's `SocketChannelEndPoint` call when the **servlet
+container itself** decides a connection is done — it is not anything the
+`AsynchronousSocketChannel`-based WS *client* transport touches (that's a
+completely separate native module, `aio_asc_close`). So this is
+unambiguously the **server** — both the Jetty-backed and Tomcat-backed
+embedded test server — closing its just-accepted connection within
+tens-of-milliseconds to ~2 seconds of completing the WebSocket upgrade
+handshake, before the client's first post-handshake frame can be written.
+This reproduces identically for both servlet containers, which points at
+something generic (not container-specific) in how CratonVM's environment
+interacts with the post-Upgrade connection hand-off — most likely each
+container's own standard HTTP/1.1 keep-alive/"must-close" determination
+(normally suppressed for a `101 Switching Protocols` hand-off) firing
+because some signal the container relies on to recognize "this connection
+was upgraded, don't apply normal end-of-request socket bookkeeping" isn't
+correctly observed under CratonVM. No CratonVM-specific native code
+intercepts the JDK/Servlet upgrade APIs at all (`grep -r "HttpUpgradeHandler
+|UpgradeToken|isUpgrade"` across the tree: zero hits) — so bytecode-level
+Tomcat/Jetty logic is running unmodified; the defect is in some lower-level
+primitive it depends on (a `SocketChannel`/`SelectionKey` state, a response
+header value CratonVM computes differently for the 101 response, or similar)
+that this session did not narrow further.
+
+**Not caused by the diagnostic itself**: re-ran the same repro against the
+binary built *before* the `socket_channel.rs` change — identical EPIPE/close
+timing. Also confirmed the diagnostic hook introduces no regression on an
+unrelated, larger WS test class (`WebSocketConfigurationTests`, 4/4 OK).
+
+**Next step for whoever picks this up**: run with `CRATONVM_DBG_SC_CLOSE=1`
+and add a Java-side stack trace at the moment of `sc_close` (this session
+looked for a `NativeContext::thread_stack_trace`-style hook but it requires a
+`Thread` object handle that wasn't readily available from inside
+`native-io`; either thread that through or capture the trace from the Java
+side via a custom `Filter`/`HandshakeInterceptor` wrapping the
+`OutputStream`) to get the exact Tomcat/Jetty call site issuing the `close()`
+— that pinpoints whether it's a keep-alive/`Content-Length` determination, a
+poller/selector re-registration gap, or something else. `WebSocketConfigurationTests`
+and `WebSocketHandshakeTests` (both `extends AbstractWebSocketIntegrationTests`
+but neither sends a message right after the handshake) are unaffected — this
+narrows the trigger specifically to "the connection is written to
+immediately after the handshake," not the handshake/upgrade machinery
+itself (which already has substantial prior fix history: DF07,
+`e6e96b1d`, `0bb89ebf`).
+
+Not fixed this session — the exact Java-level trigger for the premature
+`close()` needs one more round of tracing. `CRATONVM_DBG_SC_CLOSE=1` is
+merged to `dev` (commit `dd1cddec`) as a zero-cost-when-unset diagnostic aid
+for that next round.
 
 ## Bucket 3 — Immediate crash, not a hang (0/25 — FIXED 2026-07-13)
 
