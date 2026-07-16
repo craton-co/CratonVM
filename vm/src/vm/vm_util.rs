@@ -477,9 +477,19 @@ pub fn ensure_class_initialized_shared(
                     .get_class(class_id)
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("<unknown class {class_id}>"));
-                return Err(MethodCallFailed::InternalError(VmError::Linkage(
-                    LinkageError::NoClassDefFoundError { class_name },
-                )));
+                // HIB-CV-26 fix (2026-07-16): JVMS §5.5 — re-triggering
+                // initialization of a class that already failed to
+                // initialize must raise a catchable `NoClassDefFoundError`,
+                // not an unrecoverable `VmError::Internal`.
+                // `raise_no_class_def_found` constructs the real Java
+                // exception object (falling back to the old internal-error
+                // form only if that construction itself fails, e.g. rt.jar
+                // unavailable).
+                return Err(crate::runtime::exceptions::raise_no_class_def_found(
+                    shared,
+                    thread,
+                    &class_name,
+                ));
             }
 
             _ => {
@@ -501,9 +511,21 @@ pub fn ensure_class_initialized_shared(
                                 ClassState::Initializing => false,
                                 ClassState::InitializationError => {
                                     let name = class.name.to_string();
-                                    return Err(MethodCallFailed::InternalError(VmError::Linkage(
-                                        LinkageError::NoClassDefFoundError { class_name: name },
-                                    )));
+                                    // HIB-CV-26 fix (2026-07-16): same JVMS
+                                    // §5.5 fix as the fast-path check above —
+                                    // raise a catchable
+                                    // `NoClassDefFoundError` instead of an
+                                    // internal error. `raise_no_class_def_found`
+                                    // needs `shared.class_manager` itself (to
+                                    // resolve/allocate the exception object),
+                                    // so the write-lock guard `cm` (which the
+                                    // `class` borrow above is tied to) must be
+                                    // released first — this non-reentrant
+                                    // `RwLock` would otherwise self-deadlock.
+                                    drop(cm);
+                                    return Err(crate::runtime::exceptions::raise_no_class_def_found(
+                                        shared, thread, &name,
+                                    ));
                                 }
                                 _ => {
                                     // Claim: set initializing_thread under the write lock.

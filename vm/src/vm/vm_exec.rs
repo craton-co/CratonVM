@@ -8265,25 +8265,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), String> {
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
         // NEW-8: force the class's <clinit> to run now. The interpreter's
         // `ensure_class_initialized_shared` handles thread-safe init and
         // skips classes that are already initialized.
-        match crate::vm::vm_util::ensure_class_initialized_shared(
-            &self.shared,
-            self.thread,
-            class_id,
-        ) {
-            Ok(()) => Ok(()),
-            Err(crate::error::MethodCallFailed::ExceptionThrown(_)) => {
-                // <clinit> raised a Java exception. Return a string
-                // summary; the caller (defineHiddenClass) surfaces it
-                // as an IllegalStateException tagged
-                // "ExceptionInInitializerError".
-                Err("class initialization raised an exception".to_string())
-            }
-            Err(crate::error::MethodCallFailed::InternalError(e)) => Err(format!("{e:?}")),
-        }
+        //
+        // HIB-CV-26 fix (2026-07-16): pass the result straight through
+        // instead of collapsing it into a `String`. `<clinit>` failures
+        // already come back from `ensure_class_initialized_shared` with
+        // the correct two-layer identity: a Java exception raised by a
+        // static initializer is already wrapped as a catchable
+        // `ExceptionInInitializerError`/`NoClassDefFoundError`
+        // (`MethodCallFailed::ExceptionThrown`) per JVMS §5.5, and only a
+        // genuine VM bug is `MethodCallFailed::InternalError`. Flattening
+        // both into a string here (as the old code did) forced every
+        // caller of `initialize_class` — including `Class.forName` — to
+        // re-wrap ordinary `<clinit>` exceptions as an unrecoverable
+        // `VmError::Internal`, aborting the whole VM instead of letting
+        // Java code catch them.
+        crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
     }
 
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
