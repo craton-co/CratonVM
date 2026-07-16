@@ -294,10 +294,68 @@ dialect-gated partial skips:
   gated by a Hibernate-internal default rather than `@CustomEnhancementContext`
   or a dialect check. No fix needed.
 
-One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest`
-shows a captured signature this run —
-`java.lang.InternalError: java.lang.CloneNotSupportedException` — on top of
-the usual partial-abort shape (608 found / 404 ok / 204 aborted). Worth a
-quick look to confirm this is the same expected-skip mechanism surfacing a
-different message, versus a distinct new issue riding along with the
-expected skips.
+One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest` —
+investigated 2026-07-16 against the frozen `dev@dcb24161` baseline (shared
+Azure Linux host). **Not yet confirmed same-mechanism; keep OPEN, and a
+separate, more severe defect surfaced during the attempt.**
+
+**HotSpot comparison** (`/home/victor/jdk25/bin/java`, identical classpath/
+props via `common.args`): solo run completes cleanly in 29.2s — 608 found /
+404 ok / 204 aborted / 0 failed, the identical shape reported for CratonVM.
+A full-text scan of the entire raw output (all WARN/INFO Hibernate logging
+included, via `-Dcraton.trace=1`) contains **zero** occurrences of
+"exception" (case-insensitive) anywhere. HotSpot's 204 aborted tests here
+are 100% silent assumption-based skips, exactly like the other
+`@CustomEnhancementContext`/dialect-gated entries in this list — there is no
+HotSpot-side message of any kind to compare against.
+
+**CratonVM comparison: could not obtain a completed run on this host.** 4
+independent solo attempts — JIT-on, JIT-on with `RUST_LOG=error`, `--nojit`,
+and `nice -n 19` — all deterministically hit a severe livelock instead of
+completing: tens of millions of repeated `Stale pointer detected in
+invokevirtual receiver (ptr=..., all-zero header) — falling back to CP class
+java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode`
+warnings (`vm/src/runtime/interpreter.rs`), against **the same object
+address sustained across checks taken minutes apart** — ruling out ordinary
+slow-but-progressing execution across the class's 608 parameterized
+iterations, which would churn through many different addresses. None of the
+4 attempts reached a single `@@RESULT` within bounded timeouts up to 300s
+(30-40M+ log lines emitted, no forward progress). A 5th attempt pinned to a
+single core (`taskset -c 0`) avoided the livelock but hit a different,
+unrelated harness bug instead (NPE: "Cannot invoke
+`EngineExecutionListener.getClass()` because `listener` is null" during
+JUnit class discovery/loading, found=0).
+
+This reproduces identically on the sibling `LocalDateTimeTest` (also in this
+same "already-expected" list, sharing the same `AbstractJavaTimeTypeTests`
+base): same livelock signature, same non-terminating spam, no `@@RESULT`.
+Both classes' shared `Timezones.withDefaultTimeZone()` helper
+(`hibernate-core/src/test/java/.../type/temporal/Timezones.java`) creates a
+brand-new `Executors.newSingleThreadExecutor()` + submits a `Future` on
+**every one of the class's ~608 iterations**, which is far heavier
+AQS/`ConditionNode`/thread-pool churn per run than any other class
+currently tracked in this doc — the likely reason this specific livelock
+only manifests for this pair of classes.
+
+**Conclusion so far:** since HotSpot's abort mechanism for this class is
+provably silent, the original hedge ("same expected-skip mechanism
+surfacing a different message") cannot be literally correct — there is no
+HotSpot message to be "the same" as. Whatever produced the original
+`InternalError: CloneNotSupportedException` capture in CratonVM must be a
+CratonVM-only artifact, not shared HotSpot behavior; it is **not** confirmed
+to belong in this "matches HotSpot, not a defect" section, and
+`ZonedDateTimeTest` should be treated as OPEN, not closed, until it can
+actually be re-verified. Root-causing the original signature itself was not
+possible this session because CratonVM never got far enough to reproduce it
+(the livelock above pre-empts it entirely on this host).
+
+**Separately flagged:** the livelock itself (AQS `ConditionNode`
+stale-pointer detection never resolving under heavy `ExecutorService`/
+`Future` churn) is a distinct, newly-discovered, clearly-reproducible defect
+in its own right — 4/4 reproduction rate, unrelated to JIT-vs-interpreter
+choice — that blocks any solo verification of this whole temporal-test pair
+on a contended host, and needs its own dedicated investigation (in the
+spirit of this project's existing "stale-objref"/root-coverage-gap bug
+family) with the `CRATONVM_DBG_SWEEP_ZERO`/`CRATONVM_DBG_STALE_RECV` probes
+already built into `interpreter.rs` for this exact scenario, ideally on a
+quiet host to get an uncontaminated signal.
