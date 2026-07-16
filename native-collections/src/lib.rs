@@ -43656,6 +43656,19 @@ mod tests {
         }
 
         impl NativeContext for MockCtx {
+            // Pre-existing test-fixture gap (unrelated to this session's fix):
+            // `c812b622` added this trait method with no default impl but
+            // never updated this inline mock, breaking `cargo test -p
+            // cratonvm-native-collections --lib` on `dev`. This mock has no
+            // notion of class field layout, so `None` (matching the trait's
+            // documented "field not found" case) is the correct stub.
+            fn resolve_field_index_by_class_id(
+                &self,
+                _class_id: ClassId,
+                _field_name: &str,
+            ) -> Option<usize> {
+                None
+            }
             fn new_array(&mut self, _et: ArrayElementType, length: usize) -> ObjectRef {
                 let mut s = self.shared.lock().unwrap();
                 s.alloc_entry(HeapEntry::Array {
