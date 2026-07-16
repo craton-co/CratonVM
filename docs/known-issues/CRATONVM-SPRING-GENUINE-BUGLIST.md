@@ -213,102 +213,59 @@ the WRONG same-named copy. Eight fixes landed on
     `PremainAttachAccess` -> "Byte Buddy agent is not initialized", and (b) a
     NEW ByteBuddy generics failure past the dispatcher: `IllegalArgumentException:
     Cannot resolve T from class ...EntityManagerFactory$MockitoMock$...`.
-*   **ByteBuddy repeat-redefine `NoSuchMethodError` family — investigated
-    exhaustively across two extended sessions 2026-07-15, still NOT FIXED,
-    but the failure mechanism is now precisely characterized.** Standalone
-    repro (`BBProbe4.java`, no Spring/JUnit needed, in
+*   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
+    (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
+    Standalone repro (`BBProbe4.java`,
     `/data/data/aot-fix-runs-20260715/bbprobe/`): 4 sequential independent
-    `ForkLoader` instances each run `Mockito.mock(SampleService.class)`.
-    Fork 1 fails cold (separate, known `Byte Buddy agent is not
-    initialized` quirk), fork 2 succeeds, fork 3+ deterministically fails
-    with `NoSuchMethodError:
+    `ForkLoader` instances each running `Mockito.mock()` — fork 3+
+    deterministically failed with `NoSuchMethodError:
     net/bytebuddy/description/type/TypeDescription$Generic$OfNonGenericType
     $ForLoadedType.size()I` from inside ByteBuddy's own
-    `FilterableList$AbstractBase.filter()` (surfaces to Java as
-    `NullPointerException: methods is null` once Mockito's `PluginLoader`
-    wraps it).
+    `FilterableList$AbstractBase.filter()`.
 
-    **The exact failing call chain (captured via a full interpreter-frame
-    stack dump at the moment of failure):** Mockito's own
-    `InstrumentationMemberAccessor.<clinit>` builds a dynamic ByteBuddy
-    proxy type (`DynamicType.Builder...make()`) →
-    `SubclassDynamicTypeBuilder.applyConstructorStrategy()` →
-    `ConstructorStrategy.Default$5.doExtractConstructors(TypeDescription)`.
-    Disassembled (`javap -v`) that method's bytecode: it calls
-    `instrumentedType.getSuperClass().getDeclaredMethods()` (returning a
-    `MethodList`) then `.filter(isConstructor().and(isVisibleTo(...)))` on
-    it (`invokeinterface net/bytebuddy/description/method/MethodList.filter`).
-    Disassembled `TypeDescription.Generic.OfNonGenericType.
-    getDeclaredMethods()` too: it constructs and returns `new
-    MethodList$TypeSubstituting(this, asErasure().getDeclaredMethods(),
-    visitor)` — so the receiver reaching `.filter()` (and therefore `this`
-    inside the inherited `FilterableList$AbstractBase.filter()` bytecode,
-    where `this.size()` is the failing instruction at bytecode offset 5)
-    should unambiguously be a `MethodList$TypeSubstituting` instance. It is
-    not: `class_id_of()` on that receiver instead resolves to
-    `TypeDescription$Generic$OfNonGenericType$ForLoadedType` — the exact
-    concrete type of `instrumentedType`'s OWN superclass description, an
-    object that was alive on the operand stack just two bytecode
-    instructions earlier in the very same `doExtractConstructors` method
-    (used to build the `isVisibleTo(...)` matcher argument). This is
-    reproducible byte-for-byte across repeated runs (not a GC-timing
-    heisenbug).
+    **Root cause:** `native-builtins/src/lib.rs`'s ByteBuddy native
+    compatibility shim (e.g.
+    `native_bytebuddy_method_list_type_substituting_size`, registered for
+    real ByteBuddy classes like
+    `net/bytebuddy/description/method/MethodList$TypeSubstituting`)
+    forwards `size()`/`get()` calls to an internal backing-list field.
+    `bytebuddy_field_value`/`bytebuddy_set_field_value` resolved that
+    field's slot via `class_name_of_id(class_id_of_object(obj))` followed
+    by a name-based `resolve_field_index()` call — a lossy
+    ClassId→name→ClassId round-trip. `resolve_field_index()`'s real
+    implementation (`get_loaded_class_id`) is a global, loader-blind,
+    name-only lookup that correctly returns `None` whenever 2+ distinct
+    loaders each define their own class under the same simple name (by
+    design — the same Groovy `GroovyClassLoader$InnerLoader` ambiguity
+    documented on that function). ByteBuddy classes redefined fresh under
+    every fork loader in `@CompileWithForkedClassLoader`-style scenarios
+    hit exactly this: once 2+ forks' copies of `MethodList$TypeSubstituting`
+    coexist, `resolve_field_index()` goes ambiguous and the shim silently
+    fell back to a hardcoded slot number that only happened to be correct
+    when no inherited fields preceded the object's own declared fields —
+    reading the wrong field (`declaringType` instead of
+    `methodDescriptions`) and forwarding `.size()` to it.
 
-    **Definitively ruled out, each with concrete evidence:**
-    1. **JIT tier-up / megamorphic inline cache** — reproduces identically
-       with `CRATONVM_DISABLE_JIT=1`; this is a pure interpreter bug.
-    2. **`invoke_on_class_shared_inner`'s interface/abstract retarget logic
-       and `is_subclass_of`** (`vm/src/vm/vm_exec.rs`) — env-gated tracing
-       showed this call passes through this function with the WRONG class
-       already substituted (i.e. the corruption happens upstream of this
-       function's own retarget decision, not within it).
-    3. **`execute_invokevirtual_cached`'s monomorphic inline cache**
-       (`vm/src/runtime/interpreter.rs`) — every `CachedInvokeTarget` arm
-       (`VirtualBytecode`/`VirtualNative`/`Intrinsic`) correctly validates
-       the live receiver's `class_id_of()` against the cached
-       `receiver_class_id` before use; a stale entry cannot explain a wrong
-       dispatch. Also confirmed this specific call never reaches this
-       function's cache-consult path at all (traced with the broadest
-       possible condition — any caller frame named `"filter"` — zero hits).
-    4. **`ClassLoaderId::UserDefined(u32)` reuse/collision** — confirmed via
-       `native-builtins/src/classloader.rs`'s `allocate_loader_id()` that
-       loader ids are a monotonic, never-recycled counter; each
-       `ForkLoader` gets a permanently unique id (observed ids 4, 6, 8
-       across forks 2-4 in one run).
-    5. **`SharedVm::initiating_resolution_cache`** (the per-`ClassLoaderId`,
-       per-class-name memoized `loadClass()` result cache consulted by
-       `lookup_loader_initiated`/`resolve_class_loader_aware`, which backs
-       the `new` bytecode's class resolution) — traced reads AND writes for
-       every class name in the failure chain
-       (`MethodList$TypeSubstituting`, `MethodList$ForLoadedMethods`,
-       `MethodList$Explicit`, `TypeDescription$Generic$OfNonGenericType`
-       `$ForLoadedType`/`$ForErasure`): every single name resolves to a
-       correct, internally-consistent, non-colliding `ClassId` per loader,
-       with zero cross-loader contamination visible anywhere. This cache is
-       NOT the bug (a real, similar-shaped bug in a DIFFERENT structure was
-       already fixed earlier this session — see the `BeanDefinitionMethod
-       GeneratorTests` orphaned-defining-loader fix above — but this
-       specific cache has no analogous defect).
+    **Fix:** added `NativeContext::resolve_field_index_by_class_id`
+    (`native-api/src/registry.rs` trait, `vm/src/vm/vm_exec.rs` impl using
+    `resolve_field_index_in_hierarchy` directly) so the shim resolves by
+    the object's own exact `ClassId`, never ambiguous regardless of how
+    many loaders redefine the same-named class. Verified: `BBProbe4`
+    forks 2/3/4 all `Mockito.mock -> OK` (fork 1's cold-attach
+    `IllegalStateException` is a separate, pre-existing, unrelated quirk).
+    Regression-clean: `cratonvm-native-api --lib` 179/0,
+    `cratonvm-vm --lib` 2205/9 (9 pre-existing `lock_order` debug-only
+    failures), `cratonvm-native-builtins --lib` 2997/1 (1 flaky test,
+    passes in isolation, unrelated), `ConfigurationClassPostProcessorAot
+    ContributionTests` 20/15/5 and `TestCompilerTests` 22/21/1 both match
+    their prior recorded baselines exactly.
 
-    **Two live hypotheses for a future session, neither yet tested:**
-    (a) resolution of the bare `net/bytebuddy/description/method/MethodList`
-    **interface** name itself (the literal constant-pool target of the
-    failing `invokeinterface`, resolved via `execute_invoke_kind`/
-    `resolve_method_ref`'s interface-dispatch path — NOT the `new`-bytecode
-    path already cleared above) and whatever logic retargets an interface
-    method onto the receiver's concrete class in that specific code path;
-    (b) an **operand-stack slot mixup** in the interpreter's `invokeinterface`
-    handling for this specific call shape — the wrong class showing up is
-    suspiciously exactly `instrumentedType`'s own type, an object alive on
-    the stack moments earlier in the same method, which smells like the
-    interpreter reading a stale/adjacent stack slot as the receiver rather
-    than a class-resolution problem at all. **Recommended next steps:**
-    dump the FULL operand stack (not just the receiver slot) at the exact
-    moment of this `invokeinterface` call, or attach `gdb` live (`sudo gdb
-    -p <pid> -batch -ex 'thread apply all bt'` — process is short-lived,
-    pair with a brief artificial pause) to get ground truth instead of more
-    static tracing.
-
+    *Investigation note:* an earlier hypothesis (a 128-bit hash collision
+    in `NativeMethodRegistry::find()`) was investigated and even
+    prototyped as a fix, but was directly disproven via a verification
+    trace — the "colliding" registration turned out to be a genuine,
+    intentional boot-time registration for that exact class, not a
+    collision — and was reverted before the real fix above was found.
 *   `PersistenceManagedTypesBeanRegistrationAotProcessorTests` — **NOT a
     CratonVM bug: host environment gap.** Both `processEntityManagerWithPackagesToScan`
     and `contributeJpaHints` hit `NoClassDefFoundError: java/lang/classfile/ClassFile`
