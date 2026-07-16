@@ -140,6 +140,7 @@ fn cached(
         num_params,
         is_synchronized: false,
         is_static: true,
+        force_native_cache: std::sync::OnceLock::new(),
     }
 }
 
