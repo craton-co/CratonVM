@@ -16875,12 +16875,28 @@ fn drive_defining_loader_load(
         use cratonvm_native_api::NativeContext as _;
         let mut ctx = crate::vm::NativeContextImpl { shared, thread };
         let name_obj = ctx.create_string(&dotted);
-        ctx.invoke_virtual(
+        let result = ctx.invoke_virtual(
             loader_obj,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
-        )
+        );
+        // Elasticsearch's EmbeddedImplClassLoader can report a failed Java
+        // `loadClass` while its provider archive still contains the requested
+        // implementation class. This fallback belongs at the VM's
+        // initiating-loader boundary, where bytecode references have no
+        // ServiceLoader context. The archive helper preserves this loader's
+        // namespace and defining-loader association.
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => result,
+            _ => cratonvm_native_builtins::service_loader::impl_jars_load_class(
+                &mut ctx,
+                Some(loader_obj),
+                name,
+            )
+            .map(|mirror| Ok(Some(Value::Object(Some(mirror)))))
+            .unwrap_or(result),
+        }
     };
     // Defensive: a re-entrant call that unwound abnormally must not leave stray
     // frames on this thread's stack.
@@ -19110,6 +19126,19 @@ fn execute_invoke_kind(
     // resolved base methods so real-JDK URLClassPath shims never discard local
     // resources or custom URLStreamHandler-backed URLs.
     if let Some(res) = intercept_urlclassloader_subclass_native_method(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        is_special,
+        &args,
+    ) {
+        return res;
+    }
+
+    if let Some(res) = intercept_classloader_subclass_resource_native(
         shared,
         thread,
         frame_idx,
@@ -24047,7 +24076,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+        // ClassLoader resource methods have the same issue: real JDK bytecode
+        // walks URLClassPath state which CratonVM intentionally replaces with
+        // native per-loader lookups.  Keep the singular, stream, and bulk
+        // methods together so URLClassLoader instances do not fall back to the
+        // process-wide dynamic classpath (which leaks resources between test
+        // loaders) and null arguments retain their specified NPE contract.
+        if class_name == "java/lang/ClassLoader"
+            && matches!(
+                method_name,
+                "getResource"
+                    | "getSystemResource"
+                    | "getResources"
+                    | "getSystemResources"
+                    | "getResourceAsStream"
+                    | "getSystemResourceAsStream"
+            )
+        {
+            return true;
+        }
+
+        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25347,6 +25396,38 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // The resource-name argument is specified to be non-null for every
+    // ClassLoader resource accessor.  A virtual call whose constant-pool
+    // owner is ClassLoader can resolve to an inherited cached method on a
+    // custom loader, so the generic force-native lookup below sees the custom
+    // class name and misses the callback registered on ClassLoader.  Route
+    // only the null-argument contract through that base callback before
+    // method-cache dispatch; normal non-null calls retain the custom loader's
+    // virtual implementation.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     // `Class.getClassLoader()` is a concrete JDK method, but Class mirrors in
     // this VM use an internal layout and their real `classLoader` field can be
     // a stale non-loader object.  Dispatch by the receiver's *runtime* class
@@ -25463,6 +25544,34 @@ fn intercept_force_registered_native_cached(
     let class_name = cached.class_name.as_ref();
     let method_name = cached.method_name.as_ref();
     let method_descriptor = cached.method_descriptor.as_ref();
+    // Keep the cached path aligned with the uncached null-resource contract
+    // above.  The cache is keyed by the resolved custom-loader method, while
+    // the implementation callback is deliberately registered on ClassLoader.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let ret_type = crate::jit::return_type(method_descriptor);
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     let force_native = *cached.force_native_cache.get_or_init(|| {
         force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
     });
@@ -25670,6 +25779,66 @@ fn intercept_urlclassloader_subclass_native_method(
         shared
             .native_methods
             .find("java/net/URLClassLoader", method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// A class may invoke an inherited ClassLoader resource method through a
+/// constant-pool reference to its concrete subclass.  The regular force-native
+/// gate is keyed by that symbolic class, so it misses the native registered on
+/// ClassLoader and the real JDK body silently accepts null names. Resolve the
+/// actual declaration and dispatch the shared ClassLoader native instead.
+#[inline]
+fn intercept_classloader_subclass_resource_native(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    is_special: bool,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if is_special
+        || !matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let declaring_name = {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        let (_m, declaring_id) = crate::classloading::find_method_recursive(
+            recv_cid,
+            method_name,
+            method_descriptor,
+            store,
+        )?;
+        store.get(declaring_id).map(|c| c.name.to_string())?
+    };
+    if declaring_name != "java/lang/ClassLoader"
+        || native_shadow_suppressed_by_redefine(shared, "java/lang/ClassLoader")
+    {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("java/lang/ClassLoader", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;

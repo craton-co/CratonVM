@@ -4617,6 +4617,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
 
+    // JIT dispatch normally calls a custom loader's inherited bytecode
+    // directly. ClassLoader's resource methods must throw NPE for a null name
+    // before that bytecode runs; the sentinel routes it through Java handlers.
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+
     let info_key = info_ptr as usize;
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
     // resolution/insertion slow path stays further down (after the compile
@@ -5966,6 +5982,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if args_slice.is_empty() {
         return 0;
     }
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     let receiver_raw = args_slice[0];
     if receiver_raw == 0 {
         // Null receiver: throw NullPointerException (JVM semantics), mirroring
@@ -6048,6 +6076,39 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
         values
     };
+
+    // ClassLoader's resource accessors require a non-null resource name. The
+    // MIC fast path dispatches on a custom loader's runtime class and can call
+    // inherited JDK bytecode without consulting the ClassLoader callback that
+    // owns this contract. Handle the null-only case before cache lookup; normal
+    // resource calls still use the loader's virtual implementation unchanged.
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        if let Some(callback) = vm.native_methods.find(
+            "java/lang/ClassLoader",
+            info.method_name,
+            info.descriptor,
+        ) {
+            let values = decode_values();
+            return match crate::vm::safe_native_call(vm, thread, callback, &values) {
+                Ok(Some(Value::Int(v))) => v as i64,
+                Ok(Some(Value::Long(v))) => v,
+                Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                Ok(Some(Value::Object(None)) | None) => 0,
+                Ok(_) => 0,
+                Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+            };
+        }
+    }
 
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();

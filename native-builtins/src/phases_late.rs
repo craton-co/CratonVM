@@ -26315,67 +26315,83 @@ fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let bfa = "java/nio/file/attribute/BasicFileAttributes";
-    r.register(
-        bfa,
-        "creationTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+    // FileTreeWalker hands `Files.find` the concrete platform attributes
+    // implementation, and its predicate invokes `isRegularFile` virtually on
+    // that class.  Registering only on the BasicFileAttributes interface is
+    // insufficient when the interpreter resolves the concrete override first:
+    // every file then appeared non-regular and Files.find produced an empty
+    // stream for a mounted embedded JAR.
+    for attrs_class in [
+        "java/nio/file/attribute/BasicFileAttributes",
+        "sun/nio/fs/WindowsFileAttributes",
+        "sun/nio/fs/UnixFileAttributes",
+    ] {
+        r.register(
+            attrs_class,
+            "creationTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "creation");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(
+            attrs_class,
+            "lastAccessTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "access");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(
+            attrs_class,
+            "lastModifiedTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "modified");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(attrs_class, "isDirectory", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "creation");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(
-        bfa,
-        "lastAccessTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+            Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
+                ctx, this,
+            )))))
+        });
+        r.register(attrs_class, "isRegularFile", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "access");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(
-        bfa,
-        "lastModifiedTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+            Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
+                ctx, this,
+            )))))
+        });
+        r.register(attrs_class, "isSymbolicLink", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(attrs_class, "isOther", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(attrs_class, "size", "()J", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "modified");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(bfa, "isDirectory", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
-            ctx, this,
-        )))))
-    });
-    r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
-            ctx, this,
-        )))))
-    });
-    r.register(bfa, "isSymbolicLink", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(bfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(bfa, "size", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
-    });
-    // `fileKey()` returns an object that uniquely identifies the file, or
-    // `null` if a file key is not available. The JDK Windows file system
-    // returns null when running on FAT-class volumes / network shares; we
-    // return null unconditionally — this is the documented JDK contract,
-    // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
-    // (the only `fileKey` consumer in the JDK walker) skip its identity
-    // comparison instead of throwing `AbstractMethodError`.
-    r.register(bfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
+        });
+        // `fileKey()` returns an object that uniquely identifies the file, or
+        // `null` if a file key is not available. The JDK Windows file system
+        // returns null when running on FAT-class volumes / network shares; we
+        // return null unconditionally — this is the documented JDK contract,
+        // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
+        // (the only `fileKey` consumer in the JDK walker) skip its identity
+        // comparison instead of throwing `AbstractMethodError`.
+        r.register(
+            attrs_class,
+            "fileKey",
+            "()Ljava/lang/Object;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
+    }
 
     // FileTime — see `filetime_alloc` / `filetime_read_millis`. The millis is
     // stored in the real `long value` field (by name) so descriptor coercion

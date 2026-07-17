@@ -9372,6 +9372,29 @@ pub fn invoke_or_native(
         return Ok(None);
     }
 
+    // A JIT helper resolves virtual calls against the runtime custom-loader
+    // class, while these callbacks are deliberately registered on ClassLoader.
+    // Preserve the JDK null-name contract before inherited cached bytecode can
+    // turn a null resource lookup into a null return.
+    if args.len() == 2
+        && args.get(1).is_some_and(Value::is_null)
+        && matches!(
+            (method_name, descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // In real-JDK mode ClassLoader's registered bridge can be tagged as a
     // synthetic stub and therefore lose to the JDK bytecode selector. That
     // bytecode uses the flat global class store and breaks child/fork-loader
@@ -13028,13 +13051,21 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/logging/Logger"
                             && (method_name == "getResourceBundleName"
                                 || method_name == "getResourceBundle"))
-                        // B3: ClassLoader.getResources / getSystemResources
-                        // have real-JDK bytecode but that bytecode walks
-                        // URLClassPath (which NPEs during <clinit>). Force
-                        // the native override ahead of the bytecode.
+                        // B3: ClassLoader resource methods have real-JDK
+                        // bytecode but that bytecode walks URLClassPath (which
+                        // is deliberately shimmed in CratonVM).  Force the
+                        // native overrides ahead of it.  The singular and
+                        // stream forms must be in the same group as the bulk
+                        // forms: EmbeddedImplClassLoader relies on them while
+                        // resolving its per-loader IMPL-JARS and otherwise a
+                        // null name silently returns null instead of NPE.
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
-                                || method_name == "getSystemResources"))
+                                || method_name == "getSystemResources"
+                                || method_name == "getResource"
+                                || method_name == "getSystemResource"
+                                || method_name == "getResourceAsStream"
+                                || method_name == "getSystemResourceAsStream"))
                         // WildFly process-controller bootstrap: real
                         // ServerSocket.getLocalSocketAddress() is Java bytecode
                         // that builds from ServerSocket's internal impl fields.
@@ -15052,17 +15083,24 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // `ClassLoader.loadClass` is backed by concrete JDK bytecode,
-                        // but CratonVM supplies the actual loader-aware implementation
-                        // as a native.  Let that native win when an inherited base
-                        // method is selected; direct subclass overrides still resolve
-                        // on their own declaring class and continue to run normally.
+                        // ClassLoader's concrete JDK bytecode reads URLClassPath state
+                        // that CratonVM replaces with loader-aware natives.  Let the
+                        // native win for the inherited base methods; direct subclass
+                        // overrides still resolve on their own declaring class and run
+                        // normally.  Besides preserving per-loader resource isolation,
+                        // this preserves ClassLoader's specified NPE contract for a
+                        // null resource name.
                         || (class_name == "java/lang/ClassLoader"
-                            && method_name == "loadClass"
                             && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;)Ljava/lang/Class;"
-                                    | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                                (method_name, descriptor),
+                                ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                                    | ("loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;")
+                                    | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getSystemResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getSystemResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                                    | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                             ));
                     if check_override
                         && shared

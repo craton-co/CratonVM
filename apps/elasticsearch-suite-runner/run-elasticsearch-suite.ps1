@@ -681,7 +681,11 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $javaName = if ($IsWindows) { 'bin\java.exe' } else { 'bin/java' }
+  # `$IsWindows is defined by PowerShell 6+, but is `$null in Windows
+  # PowerShell 5.1. The runner supports both hosts, so ask the runtime rather
+  # than treating an undefined compatibility variable as a non-Windows host.
+  $isWindowsHost = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+  $javaName = if ($isWindowsHost) { 'bin\java.exe' } else { 'bin/java' }
   $java = Join-Path $jdk $javaName
   if (-not (Test-Path $java)) { Die "HotSpot java not found: $java" }
   $craton = ''
