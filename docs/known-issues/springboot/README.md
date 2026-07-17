@@ -68,12 +68,11 @@ explain a large fraction of the 429:
 - [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) / [`conditionevaluationreport-capturedoutput-empty-cluster.md`](conditionevaluationreport-capturedoutput-empty-cluster.md) — `CapturedOutput`/`OutputCaptureExtension` sees empty or stale output across ~20 classes in a dozen+ modules. Not root-caused to one mechanism.
 - [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) / [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) — PKCS12/PEM keystore parsing fails against demonstrably-correct passwords/keys, confirmed across 5 independent modules/fixture files — strong evidence of a genuine CratonVM JCA-layer defect, not per-fixture corruption.
 
-Full per-doc index (99 docs from this round; status strings truncated —
+Full per-doc index (98 docs from this round; status strings truncated —
 open each doc for the full picture):
 
 | Doc | Status |
 |---|---|
-| [`batch-jdbc-mergedannotation-isdirectlypresent-abstractmethoderror.md`](batch-jdbc-mergedannotation-isdirectlypresent-abstractmethoderror.md) | OPEN — found 2026-07-17, root cause not pinned to a file:line |
 | [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) | OPEN — found 2026-07-17 |
 | [`cassandra-jni-thrownew-discards-payload-hang.md`](cassandra-jni-thrownew-discards-payload-hang.md) | OPEN — found 2026-07-17 |
 | [`certificatematchertests-dsa-keypairgenerator-gap.md`](certificatematchertests-dsa-keypairgenerator-gap.md) | OPEN — found 2026-07-17 |
