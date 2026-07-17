@@ -1,3 +1,82 @@
+# 2026-07-16/17: FIXED — root-caused via live gdb capture on the real `posix_madvise` syscall
+
+**Status: FIXED.** `testMergeAwayAllValues` now passes reliably.
+
+## Root cause, confirmed empirically
+
+A live `gdb` breakpoint on the real libc `posix_madvise` symbol (bypassing
+the need for further rebuild-instrumentation cycles, given this host's heavy
+build contention that day) captured the ACTUAL arguments reaching the
+syscall for the failing call: `posix_madvise(addr=0x114, len=276,
+advice=0)`. `0x114` is exactly `276` in decimal — **the segment's own byte
+length**, not a real address. Lucene's own exception message reports a
+different, plausible-looking address (`0x7FFFF77E3000`) only because it
+separately calls `MemorySegment.address()` *after* the failed downcall,
+purely to format the error string — and that native method already uses a
+different, correct implementation.
+
+`native-builtins/src/panama_libffi.rs::segment_address()` (used by
+`marshal_arg`'s `LAYOUT_ADDRESS`/struct-by-value arms to compute the native
+pointer for any `MemorySegment` downcall argument) unconditionally read
+`field 0` as the base pointer and `field 5` as a slice offset — the layout
+CratonVM's own synthetic `"java/lang/foreign/MemorySegment"` class uses
+(built by `ofAddress`/`asSlice`'s native handlers via
+`alloc_concurrent_synthetic(..., 6)`). But a memory-mapped file segment from
+real `FileChannel.map()` is a genuine, bytecode/JDK-constructed
+`jdk.internal.foreign.MappedMemorySegmentImpl` instance, whose REAL field
+order (confirmed via `javap` against the real JDK) is completely different:
+`AbstractMemorySegmentImpl{length, readOnly, scope}` then
+`NativeMemorySegmentImpl{min}` then `MappedMemorySegmentImpl{unmapper}` — 5
+fields total (matching the `num_slots=5` seen in the `gen_heap::get_field`
+out-of-bounds WARN this doc's original report flagged). **Field 0 there is
+the segment's byte length, not its address** — `min` (the real address) is
+at a different index entirely.
+
+This exact bug was already fixed once, correctly, for the *other* native
+method that needs a `MemorySegment`'s address —
+`MemorySegment.address()` itself, implemented by `p67_segment_address`
+(`native-builtins/src/phases_late.rs`), which resolves the `min` field
+**by name** first (`ctx.get_field_by_name(this, "min")`), falling back to
+the synthetic 6-field scheme only if that lookup misses. `segment_address()`
+in `panama_libffi.rs` (used only for the native-downcall marshaling path,
+a different call site) had never been updated to match.
+
+## Fix
+
+`segment_address()` now mirrors `p67_segment_address`'s exact resolution
+order: resolve `min` by name first (correct for any real JDK
+Native/MappedMemorySegmentImpl instance), then fall back to the synthetic
+`base@0 + offset@5` scheme for CratonVM's own `ofAddress`/`asSlice`-built
+segments (`object_num_fields(seg) >= 6`), then a final `field 0` fallback.
+
+## Verification
+
+- `testMergeAwayAllValues`: 3/3 clean (`OK (1 test)`, ~2s each, was a
+  deterministic failure before).
+- Full `IVFKnnFloatVectorQueryTests` class: `OK (28 tests)`, ~28s.
+- `cratonvm-native-builtins --lib`: 2999 passed, 0 failed.
+- Live gdb re-confirmation not repeated post-fix (the failing syscall
+  argument was the direct target of the fix and the Java-level test now
+  passes deterministically instead of failing deterministically).
+
+## Notes for anyone touching `panama.rs`/`panama_libffi.rs` again
+
+The generic `asSlice` native handler
+(`native-builtins/src/panama.rs`) and any OTHER call site reading
+`ctx.get_field(seg, 0)`/`ctx.get_field(seg, 5)` directly on an arbitrary
+`MemorySegment` argument carries the same latent hazard for real
+Native/MappedMemorySegmentImpl receivers — this fix only touched
+`segment_address()`, the one confirmed to matter for this doc's failure.
+`asSlice`'s own field-0/field-5 read on `this` happened to be harmless in
+this specific repro (the observed `base_off` read was `0`, and the
+resulting slice's base_ptr, while wrong, was never actually dereferenced
+before `segment_address()`'s OWN fix corrected the final address) — but it
+is not verified safe in general. Worth a dedicated look if a similar
+address-confusion bug surfaces again for a sliced (not root) mapped
+segment.
+
+---
+
 # ES FAIL - server org.elasticsearch.search.vectors.IVFKnnFloatVectorQueryTests#testMergeAwayAllValues — `posix_madvise` returns EINVAL via Panama FFI downcall
 
 Status: OPEN
