@@ -957,6 +957,112 @@ the WRONG same-named copy. Eight fixes landed on
        get a fresh stream) — but this is not confirmed; needs tracing which
        exact `Resource`/stream object SnakeYAML actually receives. Newly
        observed; not fixed.
+
+       ~~**FIXED (2026-07-17, branch `fix/yaml-resource-stream-20260717`).**~~
+       The leading hypothesis above (stale/shared stream position) was
+       **refuted** — raw resource-stream I/O was already confirmed correct
+       (`YamlProbe.java`), and this session's tracing shows the real
+       divergence never touches the YAML stream at all. `KRun` repro (real
+       JDK 25, single-class launcher, from-scratch `spring-test` classpath
+       via `./gradlew spring-test:testClasses spring-test:processTestResources`
+       plus a `sourceSets.test.runtimeClasspath` dump) hit a **different,
+       earlier, fully-deterministic blocker on every run**: before any of
+       the 4 test methods' own bodies execute,
+       `CompileWithForkedClassLoaderExtension.runTest()`'s inner
+       `LauncherFactory.create()` triggers JUnit Platform's own
+       `TestEngine` `ServiceLoader` discovery, which resolves
+       `org.junit.support.testng.engine.TestNGTestEngine` via CratonVM's
+       synthetic `ServiceLoader` reimplementation
+       (`native-builtins/src/service_loader.rs`, `load_provider_class`).
+       That function tried `loader.findClass(fqn)` **before**
+       `loader.loadClass(fqn)`. Real `java.util.ServiceLoader` always
+       resolves providers via `Class.forName(cn, false, loader)`, which is
+       spec'd to invoke `loader`'s **public** `loadClass(String)` — never
+       the **protected** `findClass(String)` helper directly (`findClass`
+       exists to be called *by* a loader's own `loadClass()` algorithm, not
+       by external callers). `CompileWithForkedClassLoaderClassLoader`
+       overrides `loadClass(String)` with a special case that delegates
+       `org.junit`/`org.testng` names to a *different* loader instance
+       (the real test classloader); its `findClass()` override has no such
+       special case and unconditionally self-defines the class. Calling
+       `findClass` first bypassed that delegation, so `TestNGTestEngine`
+       got self-defined into the fork loader's own namespace
+       (`UserDefined(N)`) instead of the `Application` loader. Its
+       `<clinit>` then `new`s the package-private sibling
+       `IsTestNGTestClass`, which resolves correctly via
+       `resolve_class_loader_aware`
+       (`vm/src/runtime/interpreter.rs`) → `loadClass()`'s proper
+       delegation → `Application` — a genuine two-different-loaders split
+       for the same-named, same-package pair, which
+       `classloading/src/access_control.rs`'s `same_runtime_package`
+       (loader-id-aware, correctly implemented) then correctly rejects,
+       throwing `IllegalAccessError: class …TestNGTestEngine cannot access
+       class …IsTestNGTestClass (not public, different package)` — deep
+       inside JUnit Platform's own bootstrap, aborting that
+       `@CompileWithForkedClassLoader`-intercepted test-method invocation
+       before its actual AOT-processing body ever ran. Confirmed via
+       targeted tracing (temporary `eprintln!`s at the `define_class`,
+       `resolve_class_loader_aware`, and `check_class_access` call sites,
+       env-var gated, removed before commit): `TestNGTestEngine` defined
+       twice — once `loader_id=Application` (outer `KRun` launcher, clean),
+       once `loader_id=UserDefined(N)` per forked-loader test method (one
+       fresh `UserDefined` id per `new CompileWithForkedClassLoaderClassLoader(...)`)
+       — while `IsTestNGTestClass` stayed `loader_id=Application` throughout.
+
+       Fix (`native-builtins/src/service_loader.rs`, `load_provider_class`):
+       swapped the order — try `loader.loadClass(fqn)` first, `findClass`
+       only as a fallback (matches real `Class.forName(cn, false, loader)`
+       semantics and lets any custom `loadClass()` delegation logic run).
+
+       Verified: `TestContextAotGeneratorIntegrationTests` KRun repro no
+       longer throws `IllegalAccessError` anywhere (grep for
+       `IllegalAccessError`/`TestNGTestEngine` across the full run log: zero
+       hits, down from 4/4 occurrences pre-fix — one per test method, direct
+       A/B against the pre-fix binary). All 4 methods now progress into
+       their real AOT-processing bodies. Specifically for
+       `processAheadOfTimeWithBasicTests` (this bug's assigned target): the
+       SnakeYAML `ParserException` on `test1.yaml` **no longer occurs** —
+       grep for `snakeyaml`/`ParserException`/`test1.yaml`/`test2.yaml`
+       across the full post-fix run log: zero hits, reproducible across
+       three separate rebuild-and-rerun cycles. The method now fails later,
+       for a **different, unrelated** reason:
+       `NullPointerException: Cannot invoke
+       "org.springframework.javapoet.LineWrapper$FlushType.ordinal()"
+       because "flushType" is null`, inside JavaPoet's own
+       `CodeWriter.emit`/`LineWrapper.flush` while stringifying
+       AOT-generated source for `TestCompiler.with(...)`'s in-memory
+       compile-and-verify step — clearly a separate, later-stage AOT
+       source-generation bug, not a classloader/resource-stream issue;
+       flagged here for a future session, not investigated further.
+       (`processAheadOfTimeWithWebTests` and `endToEndTests` also progress
+       to their own distinct, unrelated new failures post-fix — an
+       `AnnotationConfigurationException` `@AliasFor` mirror-value mismatch
+       for `endToEndTests`, and the same JavaPoet NPE for `WebTests`;
+       `processAheadOfTimeWithXmlTests` still hits the already-documented
+       `GroovySystem.<clinit>` `ArrayStoreException` from item 2 above —
+       none of these are classloader-resource-stream bugs, all out of
+       scope for this session.)
+
+       Regression-checked clean: `cratonvm-native-builtins --lib --release`
+       3000/0 (0 failed, 6 ignored, matches baseline exactly);
+       `cratonvm-vm --lib --release` 2200 passed/17 failed — 16 match the
+       documented pre-existing `lock_order`/`jit::skip_list` release-mode
+       baseline exactly; the 17th,
+       `runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode`,
+       is a separate, already-flagged, pre-existing failure (deterministic,
+       unrelated to classloading — a different concurrently-running session
+       was independently investigating it under the title
+       "bufferedinputstream-regression" during this same window) and is not
+       a regression from this fix. Spot-checked other
+       `ServiceLoader`/resource-heavy classpath consumers against both the
+       pre-fix and post-fix binaries: `org.springframework.core.io.support.
+       SpringFactoriesLoaderTests` 31/33 (2 `AssertionError` failures,
+       **identical** on both binaries — pre-existing, unrelated, confirmed
+       via direct A/B); `org.springframework.beans.factory.serviceloader.
+       ServiceLoaderTests` 3/3 OK (no regression); `org.springframework.
+       test.context.env.YamlTestPropertySourceTests` (an ordinary,
+       non-forked-loader `@YamlTestProperties` consumer) 4/4 OK (confirms
+       the normal YAML-loading path was never broken and stays unaffected).
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
