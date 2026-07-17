@@ -13555,6 +13555,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale (relocated by a moving GC) while it sat mid-flight
+            // between the operand-stack pop above and here. resolve_field_ref
+            // below is a cache-miss-cold path on a field's FIRST-ever
+            // resolution: it can call load_class_concurrent, which loads
+            // and links (and may run clinit for) the field's declaring
+            // class -- real work that allocates, and under GC-stress
+            // (or ordinary allocation pressure) can trigger a moving
+            // collection. obj_ref was popped into this bare Rust local
+            // BEFORE that call and is therefore invisible to the collector's
+            // root scan for its duration; a relocated receiver leaves this
+            // local pointing at an intact (structurally valid, so it evades
+            // the CRATONVM_DBG_STRAYSTACK num_slots/class_id sanity check)
+            // but dead from-space copy -- same shape as the native-call-arg
+            // and getfield-loaded-value barriers elsewhere in this file, just
+            // never applied to the getfield/putfield RECEIVER itself.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
@@ -13994,6 +14011,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale while resolving the field above. resolve_field_ref at
+            // the top of this opcode handler runs BEFORE this pop (the
+            // receiver was still nominally live on the Java operand stack
+            // during that call), but a cache-miss-cold resolution can load
+            // and link the field's declaring class for the first time --
+            // real allocating work -- and a moving collection triggered
+            // during it (confirmed live: java.lang.Thread$FieldHolder's
+            // very first "putfield task" under CRATONVM_DBG_GC_STRESS,
+            // which silently dropped the write, leaving Thread.holder.task
+            // permanently null and that worker's Runnable never invoked)
+            // can leave this local pointing at a forwarded-but-structurally-
+            // intact from-space copy that CRATONVM_DBG_STRAYSTACK's
+            // num_slots/class_id sanity check does not catch. Heal it the
+            // same way native-call arguments and the getfield RECEIVER
+            // (see the identical fix just above) already are.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
