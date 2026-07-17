@@ -917,7 +917,12 @@ fn chm_extra_entries(
             break;
         }
     }
-    ctx.unpin_native_roots(it_pin);
+    // cceres3 (PIN-DANGLING live capture): do NOT unpin it_pin here.
+    // `unpin_native_roots` TRUNCATES the pin stack, and every accumulated
+    // entry/key/value pin sits ABOVE it_pin — the read-back below was
+    // silently degrading to the raw, possibly-stale snapshot refs (the
+    // stale Properties pairs behind the entrySet-view / putAll captures).
+    // The single truncate after the read-back releases everything at once.
 
     let mut out = Vec::with_capacity(pinned.len());
     for entry in &pinned {
@@ -930,12 +935,8 @@ fn chm_extra_entries(
         };
         out.push((key_obj, value, entry.key_string.clone()));
     }
-    for entry in pinned {
-        if let Some((pin, _)) = entry.value_pin {
-            ctx.unpin_native_roots(pin);
-        }
-        ctx.unpin_native_roots(entry.key_pin);
-    }
+    let _ = pinned;
+    ctx.unpin_native_roots(it_pin);
     out
 }
 
