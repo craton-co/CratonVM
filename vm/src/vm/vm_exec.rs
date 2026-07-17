@@ -698,6 +698,44 @@ fn safe_native_call_impl(
     args: &[Value],
     prevalidated_objects: bool,
 ) -> MethodCallResult {
+    // DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector. A native that
+    // returns with FEWER pins than it entered with truncated its CALLER's
+    // pins (`unpin_native_roots` is a truncate) — every handle the caller
+    // still holds now dangles and `read_native_pin` silently degrades to the
+    // raw, possibly-stale fallback. The guard fires on every exit path
+    // (including unwind) via Drop and names the culprit at the funnel.
+    struct PinFloorGuard {
+        floor: usize,
+        thread: *const JvmThread,
+        callee_addr: usize,
+    }
+    impl Drop for PinFloorGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard lives strictly within this call frame; the
+            // thread outlives it (debug-only read of a Vec length).
+            let len = unsafe { (*self.thread).native_pin_roots.len() };
+            if len < self.floor {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
+                    eprintln!(
+                        "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
+                        self.floor,
+                    );
+                }
+            }
+        }
+    }
+    let _pin_floor_guard = if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        Some(PinFloorGuard {
+            floor: thread.native_pin_roots.len(),
+            thread: thread as *const JvmThread,
+            callee_addr: callback as usize,
+        })
+    } else {
+        None
+    };
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
