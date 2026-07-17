@@ -451,7 +451,7 @@ pub(crate) struct WireResponse {
 fn read_retry<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
             result => return result,
         }
     }

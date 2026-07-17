@@ -1123,7 +1123,7 @@ fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result
         match stream.read(buf) {
             Ok(n) => return Ok(n),
             // EINTR is a transient interruption, not a peer disconnect.
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
             Err(e)
                 if e.kind() == std::io::ErrorKind::UnexpectedEof
                     || e.to_string().contains("close_notify") =>
