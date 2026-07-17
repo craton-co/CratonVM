@@ -13559,23 +13559,48 @@ fn stream_apply_chain_full(
     // panics inside Xerces' `DefaultXMLSequence` ctor's `particles.stream()
     // .map(...).flatMap(...).collect(Collectors.toUnmodifiableList())`
     // pipeline.
+    // cceres3 (PIN-DANGLING live capture, every boot): pinning from INSIDE
+    // the pull callback is unsound — the pins land ABOVE the pull machinery's
+    // own per-element bases, so its legitimate unpin-to-base truncates them
+    // (read_value_slice then silently degraded to the raw, possibly-stale
+    // values — the surviving to_array_gen store-canary firings). The pin
+    // stack is strictly LIFO per scope; a callback must not pin into its
+    // callee's scope. Root the accumulated elements in the GLOBAL root table
+    // instead: persistent, GC-remapped, and independent of the pin stack.
     let mut out = Vec::new();
-    let mut handles: Vec<usize> = Vec::new();
-    let mut base = usize::MAX;
-    stream_pull(ctx, this, |c, v| {
-        let h = pin_value(c, v);
-        if base == usize::MAX {
-            base = h;
-        }
-        handles.push(h);
+    let mut ghandles: Vec<usize> = Vec::new();
+    let pull = stream_pull(ctx, this, |c, v| {
+        ghandles.push(match v {
+            Value::Object(Some(o)) => c.add_global_root(o),
+            _ => usize::MAX,
+        });
         out.push(v);
         Ok(PullStep::Continue)
-    })?;
-    let out = read_value_slice(ctx, &handles, &out);
-    if base != usize::MAX {
-        ctx.unpin_native_roots(base);
+    });
+    if let Err(e) = pull {
+        for &h in &ghandles {
+            if h != usize::MAX {
+                ctx.remove_global_root(h);
+            }
+        }
+        return Err(e);
     }
-    Ok(out)
+    let healed: Vec<Value> = out
+        .iter()
+        .zip(&ghandles)
+        .map(|(v, &h)| match (v, h) {
+            (Value::Object(Some(o)), h) if h != usize::MAX => {
+                Value::Object(Some(ctx.resolve_global_root(h).unwrap_or(*o)))
+            }
+            _ => *v,
+        })
+        .collect();
+    for &h in &ghandles {
+        if h != usize::MAX {
+            ctx.remove_global_root(h);
+        }
+    }
+    Ok(healed)
 }
 
 /// Defer an intermediate op when lazy streams are enabled and `this` is synthetic;
