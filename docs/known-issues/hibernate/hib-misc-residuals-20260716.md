@@ -2157,6 +2157,397 @@ confirmation task, not an open-ended search:**
 No code change made this session (the relevant fix was found already-landed
 on `dev`, not authored here) — this is a docs-only update.
 
+## Update 2026-07-17 (A/B confirmation session): the `dbba7c93`/`b34e09cd` oop-map-safepoint fix is **REFUTED** as the fix for this bug — direct before/after comparison on two frozen, md5-verified binaries shows statistically indistinguishable ~50% failure rates on both sides. Still OPEN; root cause remains genuinely unresolved.
+
+Picked up the immediately-prior entry's own recommendation: do a direct,
+mechanical A/B using the two frozen binaries it left on the shared host —
+no rebuild needed. Verified both binaries' provenance first (worktree
+reflog + commit-date cross-check, since these are shared worktrees that can
+move under a session): `frozen-hib-biginteger-lead3-20260717/
+cratonvm-biginteger-lead3-20260717` (md5 `c4362967433ce9a308c9695cdcaa6390`)
+was built from `dev@fcefa8ca` (checked out 10:56 UTC), confirmed **not** an
+ancestor of `dbba7c93` (committed 11:19 UTC, i.e. genuinely pre-fix).
+`frozen-hib-biginteger-oopmapfix-20260717/cratonvm-oopmapfix-20260717` (md5
+`e6416207046352100f95fbfafd9b34ae`) was built from `dev@0bd8f8be` (checked
+out 12:09 UTC), confirmed to include both `dbba7c93` and `b34e09cd`
+(post-fix). Both md5s matched the prior session's own recorded values
+exactly — binaries unmodified.
+
+**Pre-fix binary: got a live crash on the very first attempt.** Ran the
+real harness driver (`CratonRunner`/`DiscoverySelectors.selectClass`,
+exactly what the suite uses) against `DefaultCatalogAndSchemaTest`,
+`CRATONVM_DBG_AIOOBE3=1 -Dcraton.trace=true`, no other stress flags:
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=66 failed=66 aborted=0 skipped=0 ms=543442
+```
+All 66 failures were the exact production signature
+(`java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for
+length 2` at `BigInteger.smallToString`/`NamingHelper.hashedName`), each
+preceded by an `[AIOOBE3-DIAG]` capture matching this saga's established
+signature exactly (`array_length_field=2 num_slots=2 forwarding_ptr=0x0`).
+A second, independent clean run gave the identical shape:
+`found=132 ok=66 failed=66`. (A third parallel attempt hit a genuine,
+severe host-memory crunch this session ran into — see the "host contention"
+note below — and was OOM-killed mid-run, logged 62 more real
+`[AIOOBE3-DIAG]` firings before termination but never reached `@@RESULT`;
+not counted as one of the two clean data points above, but consistent with
+them.)
+
+**Post-fix binary: immediately re-ran the identical recipe. It crashes at
+the same rate.**
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=64 failed=68 aborted=0 skipped=0 ms=554731
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=64 failed=68 aborted=0 skipped=0 ms=514891
+```
+Two independent, clean, uncontended, complete `selectClass` runs, both
+`found=132 ok=64 failed=68` — same count both times. Every one of the 68
+failures per run carries the byte-for-byte identical stack trace as the
+pre-fix binary and the original production bug:
+```
+java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+	at org.hibernate.boot.model.naming.NamingHelper.generateHashedConstraintName(NamingHelper.java:104)
+	...
+```
+preceded by the identical `[AIOOBE3-DIAG]` header capture shape
+(`array_length_field=2 num_slots=2 gc_age=1 gc_flags=0
+forwarding_ptr=0x0`) as every pre-fix capture. (Two further post-fix
+attempts run in parallel earlier in the session, under the same host-memory
+crunch noted below, also independently fired 20+ and 45+ real
+`[AIOOBE3-DIAG]` occurrences respectively before being OOM-killed short of
+`@@RESULT` — additional, independent confirmation beyond the two clean
+runs.)
+
+**Conclusion: pre-fix 66/132 (50.0%) and 66/132 (50.0%) vs. post-fix
+68/132 (51.5%) and 68/132 (51.5%, identical rerun) is not a meaningful
+difference — well within this bug's own long-documented run-to-run
+variance, and on the same side of "still crashes" both times.** The
+`dbba7c93`/`b34e09cd` "select exact oop map at active safepoint" fix,
+despite the previous session's mechanistically well-reasoned case for it
+(missed-root-at-nested-JIT-callee-safepoint explaining every piece of this
+saga's evidence), **does not measurably change this bug's reproduction
+rate at all.** This is a clean refutation, not another inconclusive
+non-reproduction data point — both binaries were driven with the exact
+same recipe, back-to-back, on the same host, and both crashed reliably.
+
+**What this means for the mechanism:** either (a) the previous session's
+match between the oop-map bug's mechanism and this bug's evidence trail is
+a coincidence — both bugs can independently produce a "validly-allocated,
+non-forwarded, wrong-shape array" signature, since that is simply what any
+missed-root-adjacent *or* pure-arithmetic/codegen corruption of this
+specific `int[2]` looks like from the object-header level — or (b) the
+`dbba7c93`/`b34e09cd` fix is real and necessary in general (906/906
+`cratonvm-jit` tests still pass, per the prior session) but does not cover
+the specific nested-call shape `divideMagnitude`'s calls into
+`primitiveLeftShift`/`mulsub` actually hit, for a reason not yet
+identified. This session did not have time to distinguish between these
+after the A/B result came back negative; either way, **the search for this
+bug's true root cause must continue** — the oop-map-safepoint angle should
+be considered exhausted as a candidate unless new evidence specifically
+reopens it.
+
+**Host-contention note (methodological, not a finding about the bug):**
+this session's host was, for roughly a 20-minute window while running 4
+harness processes plus another concurrent session's `rustc -C lto=fat`
+build in parallel, driven into genuine OOM-kill territory —
+`journalctl -k` confirms the kernel OOM-killer fired repeatedly (killing,
+among others, one of this session's own harness processes, another
+session's `dbus-daemon`, and another session's `java` process) during a
+window where `free -m` showed as little as 270 MB free / 809 MB available
+out of 32 GB total. This did **not** invalidate any of the four `@@RESULT`
+captures above (all four completed after the session backed off to
+strictly one process at a time), but it did truncate three additional
+attempts (one pre-fix, two post-fix) before they reached `@@RESULT` — those
+are reported above only as supporting `[AIOOBE3-DIAG]` evidence, not as
+clean pass/fail data points, consistent with this doc's own established
+practice of not counting host-contention casualties as findings about the
+code.
+
+**Recommendation for the next session:** do not re-attempt the
+`dbba7c93`/`b34e09cd` angle — it is now empirically closed, negatively.
+Every other angle this 9-session investigation has tried (`iastore` index
+arithmetic, operand-stack/frame sizing, `mulsub`/`primitiveLeftShift`
+codegen down to the instruction level, register allocation, getfield
+caching, safepoint spill, GC conservative-root scanning, the precise
+oop-map scanner) has also been ruled out with comparable rigor (see this
+section's full history above). The one thread not yet fully chased to a
+concrete faulty line: this session's own re-confirmation that
+`[AIOOBE3-DIAG]`'s header dump is always self-consistent
+(`array_length_field=2` matching the reported `length=2`,
+`forwarding_ptr=0x0`) across every capture in this investigation's history,
+on both pre- and post-oop-map-fix binaries — meaning the array header
+itself is never corrupted or stale; only the *index* (always reported as
+`2`, i.e. one past the valid end) is ever wrong. A follow-up session should
+pivot from "what corrupts the array" (repeatedly ruled out) to "why is the
+index specifically always `length`, never some other out-of-range value" —
+that specific, narrow pattern (off-by-one at the array's own boundary,
+every single time, across dozens of independent captures) has not been
+explicitly interrogated by any prior session and may be the more tractable
+next thread to pull.
+
+**Not moving this item to `docs/internal/fixed-suite-bugs/` and not
+closing this doc.** This is the opposite of this doc's hoped-for outcome
+this session: a strong, mechanistically-plausible lead was tested directly
+and empirically refuted, not confirmed. `DefaultCatalogAndSchemaTest`'s
+BigInteger AIOOBE remains the last open item in this document, still
+unresolved after 10 sessions.
+
+No code change made this session (the fix under test was already landed on
+`dev` by a different session; this session's own findings are refutational,
+not a new fix candidate) — this is a docs-only update. `git fetch origin
+dev` immediately before this edit confirmed no other session has touched
+`divideMagnitude`, `scan_one_frame_precise`, or this doc's
+`DefaultCatalogAndSchemaTest` section since the entry above was written
+(two unrelated commits landed in the interim: `2c20a877`, JIT
+putstatic/new/invokestatic class-init fix, and `a4d8d2f0`, an unrelated
+doc-link-path retarget after the 120s-timeout-cluster doc's archival — both
+confirmed not to touch this bug's code paths or this section's content).
+
+## Update 2026-07-17 (index-always-equals-length + recompilation-transition session): the recompilation-transition hypothesis is REFUTED via direct empirical testing (two independent mechanisms both confirmed dormant for this method family); speculative BCE also ruled out for the specific loops involved via bytecode-pattern analysis; no live crash captured this session (2 attempts, both clean) — still OPEN, no fix landed
+
+Picked up this doc's own standing next step (get a live capture and pin the exact
+faulty instruction) plus a new angle: the observation, constant across every
+`CRATONVM_DBG_AIOOBE3` capture in this saga's history, that the JIT-reported
+`index` is **always exactly equal to** `length` (`index=2 length=2`, never any
+other out-of-range value) — never previously interrogated on its own — combined
+with a fresh hypothesis that CratonVM's tiered JIT recompiling a method (C1 →
+C2, or an "eager first compile" superseded later) mid-run could leave a caller
+executing against a stale/inconsistent view of a callee's bounds.
+
+**Setup.** Fresh worktree `wt-hib-biginteger-idxlen-20260717`,
+`CARGO_TARGET_DIR=cv-target-hib-biginteger-idxlen-20260717`,
+`CARGO_PROFILE_RELEASE_LTO=off`, built from `origin/dev@38192937` (current tip
+at session start and end — confirmed via `git fetch` immediately before writing
+this entry, no concurrent work landed). Frozen + md5-verified at
+`/data/data/frozen-hib-biginteger-idxlen-20260717/cratonvm-idxlen-20260717`
+(md5 `3b76f3e5a241ce230d3b1d44e316840a`).
+
+### Angle 1 — speculative bounds-check elimination (`analyze_bounds_elimination`, `jit/src/x64.rs`): RULED OUT for the specific loops on this bug's call path
+
+Never previously examined by any entry in this doc's history. Got the real
+JDK25 `MutableBigInteger.divideMagnitude`/`mulsub` bytecode via
+`javap -c -p -v --system=<jdk25> java.math.MutableBigInteger` (full dump kept
+at `/data/data/tmp/mbi_javap.txt` on the shared host) and read
+`x64.rs`'s BCE implementation (`find_induction_variable`, `analyze_loop_bound`,
+`find_safe_array_accesses`, `find_speculative_array_accesses`,
+`SpeculativeBCEGuard`) end to end.
+
+**Finding: both loops on this bug's established call path recompute their
+upper bound from a fresh `getfield` every iteration, not from a local variable
+— a shape `analyze_loop_bound` structurally does not recognize.** The D1-normalize
+branch-B loop (`for (i=1; i<intLen+1; i++)`, the loop this doc's own prior
+entries most strongly localized the defect to) compiles to
+`iload i; aload_0; getfield intLen; iconst_1; iadd; if_icmpge exit` — the
+comparison's second operand is a 4-instruction expression, not a bare
+`iload`/`bipush` immediately following the induction-variable load.
+`analyze_loop_bound`'s pattern matcher (`jit/src/x64.rs` ~line 6334) requires
+`iload iv; iload/bipush/sipush bound; if_icmp*` with the bound load
+*immediately* following the IV load — `aload_0` (the `getfield` receiver) does
+not match any of the recognized bound-load opcodes, so the matcher's `bound_local`
+resolves to `None` and the function falls through without returning a
+`LoopBoundsInfo` for this loop. The same is true of the main Knuth D2-D7 loop
+(`for (j=0; j<limit-1; j++)`, bytecode `iload j; iload limit; iconst_1; isub;
+if_icmpge`) — the trailing `iconst_1; isub` (computing `limit-1` fresh every
+iteration, exactly as javac emits it, no loop-invariant-code-motion) means the
+instruction right after the bound's `iload` is `iconst_1`, not a comparator
+opcode, so this loop is rejected on the same structural grounds. **Neither
+loop can ever receive static or speculative BCE elision from this JIT** — the
+whole `analyze_bounds_elimination` pass (both its static
+`find_safe_array_accesses` path, which additionally requires
+`find_bound_arraylength_provenance` — moot here since there's no `bound_local`
+at all — and its speculative `SpeculativeBCEGuard` path) is a dead end for this
+bug specifically, confirmed by direct bytecode-pattern reading rather than by
+disassembly or non-reproduction.
+
+### Angle 2 — PGO-driven loop-unroll-factor divergence between a first (unprofiled) and later (profiled) compile: real code path exists, but subsumed by this doc's own prior finding
+
+`jit/src/x64.rs` ~line 26570 selects the loop-unroll factor two different ways:
+a static body-size heuristic (used when no profile is available — 1 extra copy
+for a 20-50 byte body) vs. a PGO-driven factor from `LoopTripProfile::
+suggests_unroll_factor` (`jit/src/profile.rs`, 4x unroll for hot loops with
+average trip count ≤8, extending eligibility to larger loop bodies too). The
+D1-normalize loop's ~46-byte body would get 1 extra copy from the static path
+but 3 extra copies from the PGO path — genuinely different unrolled code for
+the *same* loop depending on whether profile data was available at compile
+time, which is exactly a "first compile vs. later recompile sees different
+inputs" shape. However, this doc's own `fast, minimal, Hibernate-free repro`
+entry already tested `CRATONVM_DISABLE_UNROLL=1` (which short-circuits *both*
+the static and PGO paths to zero extra copies) against the default (which, per
+that entry's own disassembly capture, happened to be running the *static*
+1-extra-copy path) and found **no change** in the ~88% failure rate. That
+result already rules out "unrolling of any factor is necessary for this bug"
+in general, so the PGO-vs-static distinction — while a real, previously
+unexamined divergent-codegen mechanism — is not a new candidate; recorded here
+only so a future session doesn't have to re-derive why it's not worth chasing
+further.
+
+### Angle 3 — the recompilation-transition hypothesis (this session's primary assigned lead): REFUTED via two independent, directly-tested mechanisms
+
+CratonVM has a genuine, well-engineered, default-on background recompilation
+mechanism (`jit/src/tiered.rs`'s `request_c2_upgrade`, the "C1→C2 supersede":
+after any qualifying method's C1 body publishes, a Low-priority C2 recompile —
+through the **completely different** optimizing IR pipeline, `jit/src/ir.rs`/
+`ir_lower.rs`/`ir_optimize.rs`/`ir_schedule.rs`, not just a re-run of the same
+single-pass backend — is automatically enqueued). `mulsub` structurally
+qualifies for this upgrade: it is call-free and allocation-free (confirmed via
+`javap`: pure `iload`/`lload`/`iaload`/`iastore`/arithmetic, zero
+`invoke*`/`new`/`anewarray`), and `c2_upgrade_would_engage`'s admission gate
+(`jit/src/lib.rs` ~line 2509) passes it via the `ir_emit_long && fp_free`
+clause since `CRATONVM_JIT_IR_LONG` is default-ON. **This is exactly the kind
+of previously-unexamined mechanism the task's hypothesis called for**: every
+prior session's exhaustive manual disassembly of `mulsub` (three-plus separate
+full instruction-by-instruction traces across this doc's history) explicitly
+discussed `x64.rs`-specific single-pass-backend constructs (`ARG_REGS`,
+`SCRATCH_REGS`, `emit_stack_arg_setup`) with no session ever checking whether
+`mulsub`'s *actual* compiled body was produced by that backend at all, versus
+the entirely separate, never-scrutinized IR-optimizing pipeline.
+
+**Directly tested, twice, and refuted both times:**
+
+1. **The C1→C2 async supersede never fires for this method family in
+   practice.** Ran `SmallDividendRepro` (this doc's own fast, reliable,
+   Hibernate-free repro) for up to 3,000,000 iterations / 90 seconds under
+   `CRATONVM_DBG_JITC=1` (verbose compile-lifecycle logging — `tiered-enqueue`,
+   `upgrade-OK`, `full-compile` are each distinct, unambiguous log lines) —
+   **zero `tiered-enqueue` and zero `upgrade-OK` events in the entire run**,
+   across 3 separate invocations (20 `full-compile` events total, covering
+   `divideMagnitude`, both `primitiveLeftShift` overloads, and `mulsub`, every
+   one of them via the `full-compile` label only). The async tiered
+   background-worker pipeline (`ensure_background_compiler`/`compiler_loop`)
+   is real, present, and default-on in this codebase, but for this exact
+   `SmallDividendRepro`-shaped, divide-heavy workload it never actually
+   dispatches a single task — every compile happens through the separate,
+   synchronous "eager direct-call callee compile" path instead (see below),
+   which pre-empts the tiered manager before it ever gets a chance to enqueue
+   anything (`compiled.or_else(...)` in `vm/src/runtime/interpreter.rs` only
+   runs the tiered-enqueue branch when the eager path returned `None` first).
+2. **Even the eager path's own `optimize=true` (C2/IR) request does not
+   change `mulsub`'s compiled output at all.** Both of the two mutator-side
+   "eager compile" call sites (`vm/src/runtime/interpreter.rs` ~lines 4906 and
+   28424, labelled "optimize = C2 / optimizing IR pipeline" and "Eager
+   direct-call callee compile — optimized (C2) tier" respectively) pass
+   `optimize: true` unconditionally on `mulsub`'s first and only compile —
+   meaning `mulsub` should, per `try_compile`'s own documented contract
+   ("`true` ... runs the optimizing IR pipeline"), never see the single-pass
+   backend at all. Directly tested this by forcing `CRATONVM_JIT_IR_LONG=0`
+   (mulsub's *only* qualifying admission clause into `ir_compatible`, since it
+   is long/category-2-heavy) against the default (`=1`, i.e. the IR pipeline
+   admission is open) and diffing the two `CRATONVM_DBG_JIT_DISASM=mulsub`
+   captures: **byte-for-byte identical compiled body both ways** (same
+   `len=1029`, same instruction sequence at every offset; the only diff lines
+   are ASLR-shifted absolute addresses baked into `movabs`/near-jump
+   immediates, not code shape). This proves the IR-optimizing pipeline is
+   **not actually the backend producing `mulsub`'s real compiled artifact**
+   despite structurally qualifying per the static admission scan — something
+   in the IR *builder* itself (not the coarse `ir_compatible` gate) evidently
+   still bails on `mulsub`'s specific bytecode shape and falls back to the
+   single-pass `x64::compile` backend every time, silently and consistently.
+   This is a real, minor, latent inefficiency (a call/alloc-free hot numeric
+   kernel that should be IR-eligible per the gate never actually takes the
+   optimizing path) but not a correctness concern for this bug, and it also
+   **positively confirms** (rather than merely failing to refute) every prior
+   session's implicit assumption that `mulsub`'s manually-traced disassembly
+   was examining the real single-pass-backend artifact all along.
+
+**Conclusion: the recompilation-transition hypothesis is REFUTED for this
+specific method family, via two independent, directly-executed tests rather
+than by absence-of-crash alone.** There is no live recompilation event for
+`divideMagnitude`/`mulsub`/`primitiveLeftShift` to race against under this
+workload shape: each compiles exactly once (via the eager, synchronous,
+mutator-blocking path), the async C1→C2 background supersede never engages for
+them, and even the theoretically-open IR-pipeline door for `mulsub` produces
+identical output to the closed-door case. A caller's compiled understanding of
+these callees' bounds cannot go stale mid-run because there is only ever one
+compiled version of each, for the lifetime of the process, under default
+settings and under every env-var combination tried this session.
+
+### Live-capture attempts this session
+
+1. **Full harness, `CratonRunner`/`selectClass`, plain settings +
+   `CRATONVM_DBG_AIOOBE3=1` + `CRATONVM_DBG_TIER_ENQUEUE=1`, wrapped in
+   `gdb -batch` breaking on `jit_throw_aioobe`** (reusing
+   `/data/data/tmp/gdb_aioobe_samecapture.gdb`'s technique, adapted to
+   `/data/data/tmp/gdb_idxlen_capture.gdb`): ran ~11.75 minutes (moderate host
+   contention, load average 3.7-4.7, one other concurrent session's `cargo
+   test` run sharing the host) — **clean, `found=132 started=132 ok=132
+   failed=0 ms=706073`, zero AIOOBE hits, zero tier-enqueue events for any of
+   `divideMagnitude`/`mulsub`/`primitiveLeftShift`** (confirming this doc's
+   own prior finding that `CRATONVM_DBG_TIER_ENQUEUE` doesn't cover these
+   methods regardless of outcome).
+2. **`SmallDividendRepro` under `CRATONVM_DBG_GC_STRESS=65536` +
+   `CRATONVM_DBG_AIOOBE3=1`** (the recipe multiple prior entries reported
+   firing "reliably on the first stressed run" at up to 88%): 20,000 trials,
+   all 4 divide-family methods disassembled — **clean, `bad=0 of 20000`, zero
+   `AIOOBE3-DIAG` hits.**
+
+Both consistent with — not contradicting — this doc's own long-established
+bimodal/heisenbug framing (several prior sessions also got 0/N clean on both
+the full-harness and the GC-stress isolated repro, on different days and
+different hosts, with no code difference).
+
+### Net assessment
+
+No live crash captured this session. No fix landed — per this doc's own
+standing guidance, declined to speculatively patch anything given no failing
+run to validate a fix against, and this session's own primary lead
+(recompilation-transition) came back refuted rather than confirmed. What this
+session adds beyond the doc's existing history:
+- Speculative BCE (`jit/src/x64.rs`) is now **positively ruled out** (not just
+  unmentioned) for the two loops this bug's call path actually goes through,
+  via direct bytecode-pattern analysis against real JDK25 `javap` output —
+  the bound-detection pattern matcher structurally cannot fire for either
+  loop's `getfield`-based, freshly-recomputed-every-iteration bound.
+- The recompilation-transition hypothesis — explicitly the primary new lead
+  for this session — is **refuted with concrete, repeatable, directly-executed
+  evidence** (zero tiered-enqueue/upgrade events across 3 runs and 90+ seconds
+  of dedicated divide-heavy execution; byte-identical `mulsub` output with
+  `CRATONVM_JIT_IR_LONG` on vs. off), not by absence of a crash. This closes
+  off an entire class of future hypotheses ("maybe it's a stale compiled
+  version of a callee") that no prior session had a concrete way to rule out.
+- A genuinely new, minor, separately-worth-flagging observation: `mulsub`
+  structurally qualifies for CratonVM's IR-optimizing-pipeline admission gate
+  (`c2_upgrade_would_engage`/`ir_compatible`) but never actually compiles
+  through it in practice — worth a future session's brief look (not on this
+  bug's critical path) since a hot, call-free, allocation-free numeric kernel
+  failing to reach the optimizing tier is a missed-performance opportunity,
+  independent of this correctness bug.
+
+**Next step for a follow-up session**, given the recompilation-transition and
+speculative-BCE angles are now both closed: return to this doc's own
+long-standing "same-process double-capture" plan (`gdb_aioobe_samecapture.gdb`
++ `CRATONVM_DBG_JIT_DISASM=divideMagnitude,mulsub` in the same process launch,
+no stress flags — the plain full-harness invocation has the best track record
+across this doc's history) and budget for **multiple session-lengths of
+attempts**, since this session's own two attempts (one full-harness, one
+GC-stress) both landed on the "clean" side of this doc's documented bimodal
+split, matching several prior sessions' experience on a given day. When (per
+this doc's own history, not "if") a live hit lands, the concrete mechanical
+next step is unchanged from several entries above: parse the `entry=` address
+from the same process's own `CRATONVM_DBG_JIT_DISASM` stdout, subtract from
+the live `frame 6` return PC, locate the offset in the dump, and walk backward
+from the tail-write bounds check to the nearest preceding `newarray`/
+allocation to compare the SIZE-argument's source (frame slot or register)
+against the INDEX-argument's source at the point of failure — the one
+concrete, mechanically-checkable question this doc's history has repeatedly
+identified as the actual remaining unknown, still unconfirmed by any session
+to date for lack of a correlatable live capture.
+
+Artifacts this session: fresh binary + worktree at
+`wt-hib-biginteger-idxlen-20260717` /
+`frozen-hib-biginteger-idxlen-20260717/cratonvm-idxlen-20260717`
+(`dev@38192937`, md5 `3b76f3e5a241ce230d3b1d44e316840a`); `javap` dump at
+`/data/data/tmp/mbi_javap.txt`; gdb script/log at
+`/data/data/tmp/gdb_idxlen_capture.gdb`/`.gdblog`; full-harness stdout at
+`/data/data/tmp/idxlen_run1_stdout.log`; isolated-repro logs and the
+`mulsub` IR-on/IR-off diff at `/data/data/tmp/idxlen-repro-20260717/`.
+
+**This item remains OPEN.** The rest of this doc's items are independently
+closed; this one still blocks declaring `hib-misc-residuals-20260716.md`
+fully closed.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`

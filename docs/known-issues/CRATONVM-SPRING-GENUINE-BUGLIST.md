@@ -4507,3 +4507,127 @@ have left. Verified via `cargo test -p cratonvm-native-io --lib --release`
 failed, all 16 the same pre-existing debug-build-only `lock_order` +
 already-broken `jit::skip_list` failures documented in the prior follow-up —
 zero regressions either run).
+
+
+---
+
+#### 5.8 follow-up #3 (2026-07-17/18, session 4): d82a18d6 stress-verified clean across ~200 targeted runs; root-caused why concurrent relocation is structurally impossible mid-walk; found and live-captured a SEPARATE, genuine GC-barrier accounting livelock
+
+Picked up the explicit open item from follow-up #2: `d82a18d6`'s
+`pin_native_root`/`read_native_pin` hardening of `tg_enumerate_threads`/
+`tg_matches_thread`/`tg_slot`/`tg_get_field`/`tg_of_thread` was landed as
+"hardening, not a closed fix" because the crash reproduced once more (at the
+same `tg_slot`/`class_id_of_object` site) even after two increasingly
+careful pinning passes. This session's brief was to either close it for
+real or precisely characterize what remains open.
+
+**Method**: built fresh debug + release binaries off a new worktree at dev
+tip (`d82a18d6` already included). Rather than reproducing via the full
+Tomcat/WebSocket suite (unavailable standalone in this checkout), wrote a
+standalone `TgEnumStress.java` harness that directly hammers the same code
+path: N "churn" threads continuously spawn short-lived `Thread`s nested 4
+`ThreadGroup` levels deep (to exercise `tg_matches_thread`'s parent-ancestry
+walk), M "enumerator" threads call `group.enumerate(arr, true)` in a loop
+and dereference every returned `Thread` (`getName()`, forcing a real heap
+touch through the handed-back `ObjectRef`), and K "alloc" threads
+continuously allocate small garbage under a tiny heap (`-Xmx 20-24m`) to
+force very frequent young-gen GC — sustained hundreds of GC cycles per
+second (observed `gen=0` → `gen=30` within ~150ms in one capture). Ran under
+`CRATONVM_DBG_STALE_OBJREF=1` (turns a stale-`ObjectRef` read into a clean,
+self-identifying panic instead of a raw SIGSEGV — the same technique
+follow-up #2 used) with `ulimit -c unlimited` for any raw-SIGSEGV fallback.
+
+**Result 1 — root-caused why NO concurrent relocation can happen during a
+single `tg_enumerate_threads` call, closing the "deeper native_pin_roots gap"
+hypothesis follow-up #2 left open**: traced the full cooperative-safepoint +
+cross-thread-takeover protocol end to end.
+`safe_native_call_impl` (`vm/src/vm/vm_exec.rs`) checks `stw_pending`
+exactly ONCE, at native-call entry, before invoking the callback — a native
+that itself never re-enters Java (confirmed: none of the `tg_*` helpers call
+back into bytecode) never checks in again until it returns. The GC-barrier's
+cross-thread takeover (`stw_take_over_and_wait`, BUG-03 machinery) exists
+specifically for JIT-compiled peers that can't reach a cooperative safepoint
+— `xt_root_scan.rs`'s `try_take` explicitly does NOT forcibly freeze a peer
+whose RIP is outside known JIT code ranges ("Interpreter / native / already
+parked → let it arrive cooperatively", `xt_root_scan.rs:441`). A thread
+executing plain Rust native code (like `tg_enumerate_threads`) is therefore
+*never* taken over: the GC initiator's `wait_for_all`/`wait_for_all_timeout`
+loop simply blocks until this thread's own next `safepoint_check`, which by
+construction cannot happen until the enumerate call fully returns. Since
+none of `tg_slot`/`tg_get_field`/`tg_of_thread`/`tg_matches_thread`/
+`tg_enumerate_threads` allocate or trigger `maybe_gc` internally either, no
+GC — on this thread or any other — can physically relocate an object while
+this walk is in flight. Also traced `ThreadRegistry::collect_all_root_snapshots`
+(rooting every alive entry's `java_thread_obj`, not gated on `stw_ready`) and
+`update_thread_objs_after_gc` (the registry's own post-GC remap, called from
+every `update_all_roots` completion path, single- and multi-threaded) and
+confirmed both are unconditionally correct for any entry `tg_enumerate_threads`
+could observe.
+
+**Result 2 — ~200 stress runs, zero reproductions of the target crash**: ran
+two configurations to completion or a substantial partial sample (stopped
+early both times to avoid piling more load onto a shared host mid-way
+through an independently-observed distress episode — `uptime` load1 peaked
+at 68.99 from other concurrent sessions' builds, unrelated to this work):
+a "light" config (≤40 live threads, 6/3/3 churn/enumerate/alloc threads,
+6s/run) reached 102/150 planned runs — 101 clean, 1 non-target livelock (see
+Result 3); an "amped" config (≤160 live threads, 4-level `ThreadGroup`
+nesting, 10/5/4 threads) reached 102/150 planned runs, all clean. Neither
+configuration reproduced the `tg_slot`/`class_id_of_object` SIGSEGV or a
+`CRATONVM_DBG_STALE_OBJREF` panic. This is a materially larger negative
+sample than follow-up #2's own reproduction context (which needed the full
+WebSocketIntegrationTests suite under real Tomcat/socket/JIT load to hit it
+even once in ~25 verification runs) — consistent with either (a) `d82a18d6`
+having actually closed the gap and follow-up #2's one post-fix reproduction
+being attributable to a difference this synthetic harness doesn't capture
+(real JIT-compiled Tomcat connector call sites, real socket I/O interleaving,
+or the different — and separately confirmed buggy, see Result 3 — thread
+churn pattern used there), or (b) the residual rate being low enough
+(≤1/~100–200 under this harness's conditions) that this sample still can't
+distinguish "closed" from "very rare." Not reclassifying the doc entry to
+FIXED without an actual reproduction+fix cycle; keeping it OPEN but
+substantially better-evidenced.
+
+**Result 3 — a separate, genuine, newly-discovered livelock in the GC
+barrier's `expected`/`arrived` accounting under rapid thread churn**: an
+early, more naive version of the stress harness (kid threads with a single
+allocation-only body, joined via `Thread.join()` by their spawner)
+reproduced a reliable hang — NOT a crash — where the GC initiator gets stuck
+forever in `stw_take_over_and_wait`/`wait_for_all_timeout`
+(`vm/src/runtime/interpreter.rs`) with `pending=1` and never progresses.
+Live-captured via `gdb` (launch under `gdb -batch -ex run -ex 'thread apply
+all bt' --args …`, external `kill -INT <gdb-pid>` after the stall to break
+in and let the queued backtrace command run — `ptrace_scope=1` on this host
+blocks attaching to an unrelated PID, so the process must be gdb's own
+child from the start): `thread apply all bt` showed every live thread
+correctly parked (`arrive_and_wait_auto`, `arrive_and_wait_excluded`, or
+`wait_out_pause_locked` after leaving a blocked region / thread-termination)
+— i.e. the barrier's `expected` count itself must be stale, counting a
+thread that already fully exited without its slot ever being satisfied.
+Extensively traced the candidate races (`enter_blocked`/
+`mark_blocked_region_enter` vs. `request_stw_counted_locked`'s snapshot,
+`run_if_no_stw_requested`'s startup-ready gate, the termination path's
+`deposit_root_snapshot` → `enter_blocked` → `finish_after(mark_dead)`
+sequence) — all are correctly serialized under the barrier's own `inner`
+lock in every ordering checked, so the exact gap was NOT isolated this
+session. Reduced the reproduction rate from "reliable" to ~1/70 by (a)
+giving spawned threads a small real workload instead of a single-statement
+body (so they pass through at least one ordinary interpreter safepoint
+before exiting) and (b) removing the spawner's `Thread.join()` (avoiding the
+contended-termination-monitor + `enter_blocked` path that pattern forced).
+This is a DIFFERENT bug from the `tg_slot` SIGSEGV (a hang, not a crash; no
+stale `ObjectRef` involved; reproduces with plain `Thread`/`ThreadGroup`
+churn, no `enumerate()` calls needed) but is in the exact same subsystem
+(`vm/src/threading/gc_barrier.rs`, thread-lifecycle-vs-STW-accounting) and
+plausibly explains why this whole area has needed so many "xt-hardening"/
+"GCAUDIT" fixes historically. Left OPEN, flagged for a dedicated future
+session — see the spawned follow-up task.
+
+**Verification**: `cargo test -p cratonvm-gc --lib --release` 791/791.
+`cargo test -p cratonvm-vm --lib --release`: 2200 passed / 17 failed on the
+first run under the same host distress episode noted above; the 17th
+failure beyond the documented 16-test baseline
+(`native::jni::tests::process_vm_publish_and_resolve`) was confirmed a
+load-induced flake by rerunning it alone (`cargo test … -- --exact`, passed
+immediately) — zero real regressions. `cargo test -p cratonvm-native-builtins
+--lib --release`: see below.
