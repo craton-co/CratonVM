@@ -23497,12 +23497,6 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    if class_name == "java/io/BufferedInputStream"
-        && method_name == "read"
-        && matches!(method_descriptor, "([BII)I" | "()I")
-    {
-        return true;
-    }
     if class_name == "java/io/DataInputStream"
         && matches!(
             (method_name, method_descriptor),
