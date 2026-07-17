@@ -1927,6 +1927,236 @@ store in the JIT would be far worse than no fix.
 this doc's items are independently closed; this one still blocks declaring
 `hib-misc-residuals-20260716.md` fully closed.
 
+## Update 2026-07-17 (lead1/lead2 static-audit + concurrent-fix cross-reference session): both assigned leads RULED OUT via exhaustive static audit; found a HIGH-CONFIDENCE candidate root cause/fix already landed on `dev` by a concurrent, differently-scoped session (`dbba7c93`/`b34e09cd`, "select exact oop map at active safepoint") whose mechanism matches every piece of this saga's evidence — NOT empirically confirmed via a live before/after reproduction this session (bimodal luck again), so NOT closing outright, but this is the strongest lead the whole investigation has produced
+
+Picked up this doc's own two flagged leads from the entry above: (i) an
+`iastore` index-computation arithmetic bug, and (ii) an operand-stack
+max-depth/frame-sizing bug. Setup: fresh `origin/dev@fcefa8ca` build,
+worktree `wt-hib-biginteger-lead3-20260717`, `CARGO_PROFILE_RELEASE_LTO=off`,
+frozen + md5-verified at
+`/data/data/frozen-hib-biginteger-lead3-20260717/cratonvm-biginteger-lead3-20260717`
+(md5 `c4362967433ce9a308c9695cdcaa6390`).
+
+**Lead 1 (`iastore` index arithmetic) — RULED OUT.** Read the actual
+`iastore`/bounds-check codegen (`jit/src/x64.rs`): the array length is
+loaded fresh from the object header (`MOV R10D, [RAX+ARRAY_LENGTH_OFFSET]`)
+at the bounds-check site itself, never cached from an earlier point — the
+JIT's bounds check is provably comparing the CURRENT header's length against
+whatever index reached it. `iastore`'s three-value pop sequence
+(`val_slot`/`index_slot`/`array_slot` popped in that order from the
+simulated LIFO stack) matches JVMS `iastore` semantics exactly. Extended
+the prior "same-process double-capture" entry's argument-marshaling audit
+(which only covered `mulsub`'s 6-arg call) to `primitiveLeftShift(I[II)V`'s
+4-arg invokevirtual call sites in `divideMagnitude` (`emit_stack_arg_setup`,
+`jit/src/x64.rs:11130`): with `has_ctx` consuming one `ARG_REGS` slot, all
+4 Java args (receiver+3 params) fit entirely within the remaining register
+slots — `stack_arg_count == 0`, no stack-arg spillover, no
+`SCRATCH_REGS`/`ARG_REGS` aliasing risk (the R8/R9 double-duty hazard the
+`CRATONVM_DBG_AIOOBE3` entry flagged for `mulsub`'s 6-arg shape structurally
+cannot arise for a 4-arg call). No arithmetic or index-computation defect
+found in this path.
+
+**Lead 2 (operand-stack/frame sizing) — RULED OUT, plus one genuinely new
+angle closed.** Confirmed `divideMagnitude`'s real `max_stack=7` (from
+`javap -v`, matching the class file's own verified value) flows through
+`jit/src/lib.rs`'s `set_pending_verified_max_stack` into `x64.rs`'s
+`max(verified_max_stack, estimated_max_stack) + max_invoke_args +
+inline_stack_reserve` — a deliberately over-provisioned reservation scheme
+(the `inline_stack_reserve` term's own doc comment records it was added
+after a prior real bug of exactly this shape, "observed as a
+`ClassCastException`... when a clobbered slot fed an enum-typed field", i.e.
+this exact failure family already has one fixed precedent in this
+codebase). **New check, not covered by any prior session on this bug:**
+verified `primitiveLeftShift(I[II)V`'s real bytecode length (90 bytes, from
+the `javap` dump) exceeds `MAX_INLINE_BYTECODE_SIZE=35`
+(`jit/src/lib.rs:2474`), so it can **never** be inlined into
+`divideMagnitude` — this closes out an inlined-frame-slot-collision
+hypothesis (the callee's own locals aliasing the caller's spill region via
+the `inline_sites`/`callee_local_base` mechanism) before it could even be
+seriously proposed. No frame-sizing defect found.
+
+**Clarifying, non-mechanism-changing finding:** got the real JDK25
+`BigInteger.smallToString` bytecode via `javap -c -p -v` for the first time
+in this investigation's history (prior sessions worked from the JDK25
+*source*, never the compiled `Code`/`LineNumberTable`). The reported crash
+frame `at java.math.BigInteger.smallToString(BigInteger.java:4170)` is,
+per the real `LineNumberTable`, the bytecode range **containing the
+`a.divide(b, q)` call itself** (`aload 10; aload 11; aload 9; invokevirtual
+divide; astore 12`) — not a direct array access. `smallToString`'s own
+`digitGroups` array is a `long[]` (`newarray long`, JDK25 refactored this
+method to use `long[]`+`StringBuilder` instead of the older `String[]`
+shape), so it cannot be the `elem_ty=10` (`ArrayElementType::Int`) array
+`CRATONVM_DBG_AIOOBE3` captures — there is no `int[]` anywhere in
+`smallToString`'s own bytecode. This confirms (does not newly establish)
+that the crash's Java-level stack trace is a routine consequence of the
+exception propagating up through `MutableBigInteger.divide`/`divideKnuth`/
+`divideMagnitude` frames to `smallToString`'s call site line, fully
+consistent with every prior session's localization to `divideMagnitude`'s
+own compiled body.
+
+### Reproduction battery this session — clean on both a pre-fix and a post-fix binary (see below), consistent with this doc's own documented bimodal/heisenbug pattern
+
+Neither lead's static ruling-out produced a concrete defect, so pursued
+live reproduction per this doc's standing plan. **Pre-fix binary**
+(`cratonvm-biginteger-lead3-20260717`, `dev@fcefa8ca`): 6 clean full-harness
+`CratonRunner`/`selectClass` runs (`found=132 ok=132 failed=0`, both
+`gdb`-wrapped-with-`CRATONVM_DBG_JIT_DISASM` and plain, `ms` range
+707061-1065418) + ~194,000 clean `SmallDividendRepro` trials across
+`CRATONVM_DBG_GC_STRESS` ∈ {4096, 65536} and `CRATONVM_TIER_C1_THRESHOLD=50`.
+2 additional full-harness launches (one plain, one
+`CRATONVM_DBG_GC_STRESS=65536`) were lost mid-run with no `@@RESULT` and no
+crash/exception in the log — likely host memory contention (this session's
+host load swung 7-94 and `free -m` briefly dropped under 500MB available
+during the busiest window; `dmesg` had no OOM entries in its retained
+scrollback either way) rather than anything attributable to the code;
+treated as inconclusive, not clean-or-crashed data points.
+
+### The actual finding this session adds: a concurrently-landed, differently-motivated fix on `dev` whose mechanism is an exact match for this bug's entire evidence trail
+
+A routine `git fetch origin dev` partway through this session picked up
+`dbba7c93`/`b34e09cd` (`fix(jit,gc): select exact oop map at active
+safepoint`, merged `f2021f99`..`0bd8f8be` range), landed by a **different,
+concurrently-running session** whose own scope (per its commit message and
+diff) was never stated as being about this BigInteger bug at all. Reading
+its full diff (`jit/src/lib.rs`, `vm/src/jit/conservative_roots.rs`) finds
+a real, previously-unidentified-by-any-prior-session-on-this-item defect
+in the precise GC root scanner, and the mechanism is a striking match:
+
+**The bug the fix closes:** `scan_one_frame_precise`'s old implementation,
+when a GC-capable safepoint fires, identified only ONE "boundary" compiled
+method (`info`/`cm`) and scanned the **union of every oop map that method
+has** (its own comment: "Enumerate EVERY oop map the method has... this is
+conservative-within-the-map... false negatives impossible given the
+union-of-all-maps"). That reasoning is correct **only** for a safepoint
+inside that one method's own frame — it has **no logic at all** for walking
+up the native call stack to also scan a JIT **caller's** frame when the
+active safepoint is inside a nested JIT-to-JIT callee. The fix's own commit
+message states this plainly: "the old implementation scanned the union of
+every map in only the boundary method; besides retaining dead oops, it
+**omitted maps belonging to nested JIT callers entirely**."
+
+**Why this applies exactly to `divideMagnitude`'s calls into
+`primitiveLeftShift`/`mulsub`.** Both are private methods CratonVM's JIT
+resolves via the direct-call fast path (confirmed by this doc's own prior
+"mulsub argument-marshaling" entries), which — verified this session,
+`jit/src/x64.rs:24542` — emits `self.emit_pre_safepoint_spill()`
+**immediately before** `self.emit_call_absolute(callee_entry)`.
+`emit_pre_safepoint_spill` is exactly the function (`jit/src/x64.rs:~9500`)
+that writes the caller's current bytecode PC into `divideMagnitude`'s own
+reserved `sp_id_slot_off` frame slot — i.e. `divideMagnitude`'s frame
+**does** get a correctly-populated safepoint-id at each of these two call
+sites, but the OLD scanner never consulted it for anything other than the
+single "boundary" frame the walker happened to identify. If a GC (including
+this codebase's background/concurrent STW takeover, which per this doc's
+own `gc/`-family memory can interrupt a running thread mid-instruction via
+signal, not only at an allocating bytecode) strikes while native execution
+is suspended **inside** `primitiveLeftShift`'s or `mulsub`'s own compiled
+frame (a nested JIT callee, itself allocation-free but still a full
+safepoint per `invokevirtual`'s "every dispatch is a safepoint" contract),
+the old scanner would identify the *innermost* frame as the boundary and
+never walk up one level to scan `divideMagnitude`'s own `divisor`/
+`remarr`/`rem`/`this` (dividend) references — a genuine missed root.
+
+**Why this precisely reproduces every symptom this 8-session investigation
+recorded**, in one mechanism, for the first time:
+- **"Self-consistent, validly-allocated `int[2]`, `forwarding_ptr=0x0`"**
+  (the `CRATONVM_DBG_AIOOBE3` entry's decisive capture) — exactly the
+  signature of reading through a dangling reference into memory that was
+  freed (because nothing marked it live) and **reused** for a new,
+  unrelated, but validly-shaped allocation, not a relocated/stale pointer.
+  This is the one hypothesis that entry's own reasoning left open
+  ("favors an out-of-bounds write... or a genuine arithmetic bug") without
+  identifying a missed-root explanation as a third option — because no
+  prior session had read this specific scanner code path.
+- **"GC-amplified"** (`CRATONVM_DBG_GC_STRESS` turning a silent
+  wrong-result into a deterministic crash) — a missed-root bug is, by
+  construction, only observable when a GC actually runs at the exact
+  vulnerable window; raising GC frequency directly raises the odds of
+  landing in that window.
+- **"Hard state transition, correct before the relevant methods finish
+  compiling, then consistently wrong after"** (an earlier entry's
+  `FixedValRepro` finding) — this scanner-selection bug is dormant under
+  `--nojit` (no compiled frames to mis-scan) and, once `divideMagnitude`/
+  `primitiveLeftShift`/`mulsub` are JIT-compiled with precise maps active,
+  every subsequent GC that happens to strike mid-callee is vulnerable —
+  matching the observed determinism-after-compile shape.
+- **"Not `mulsub`'s or `primitiveLeftShift`'s own compiled body"** (three
+  separate sessions' full manual disassembly traces, all clean) — correct:
+  the defect is not in either callee's codegen at all, it is in the GC's
+  own root-scanning of the **caller's** frame while a callee is active.
+- **Not a stale-register-cache or getfield-caching issue** (the
+  "same-process double-capture" entry's findings 1-2) — correct and
+  unaffected by this finding; those really were clean, the defect lives one
+  layer below JIT codegen, in the GC integration around it.
+
+**This fix was not authored by this session** — it landed from a
+concurrently-running, differently-scoped investigation
+(oop-map-selection-at-safepoint bug), and its commit message makes no
+reference to `BigInteger`, `divideMagnitude`, or this doc. This session is,
+as far as the git history and this doc's own record show, the first to
+connect the two.
+
+**Verification performed this session (inconclusive on causation, clean on
+regression):** built `origin/dev@0bd8f8be` (includes both `dbba7c93` and
+`b34e09cd`) in worktree `wt-hib-biginteger-oopmapfix-20260717`, frozen +
+md5-verified at
+`/data/data/frozen-hib-biginteger-oopmapfix-20260717/cratonvm-oopmapfix-20260717`
+(md5 `e6416207046352100f95fbfafd9b34ae`). 2 clean full-harness
+`CratonRunner` runs (`found=132 ok=132 failed=0`, `ms=784499`/`758275`,
+zero `AIOOBE3-DIAG`) + 48,000 clean isolated `SmallDividendRepro` trials
+(2 more full-harness launches lost mid-run with no result, same
+inconclusive host-contention pattern as the pre-fix binary above — **not**
+attributable to this fix; see the "host contention" note above). `cargo
+test --release -p cratonvm-jit --lib`: **906/906 pass**, no regression from
+either landed commit.
+
+**Why this is NOT being called a confirmed fix, despite the strength of the
+mechanistic match:** this session's own reproduction attempts landed on
+the "clean" polarity on **both** the pre-fix and the post-fix binary — a
+real `0/N` on the pre-fix binary specifically means this session never
+caught a live "before" crash to A/B against the post-fix binary's clean
+runs. Per this doc's own long-standing, repeatedly-reconfirmed conclusion,
+absence of failure on the pre-fix binary is not evidence the bug is rare or
+fixed — it is simply this session's data point on the "clean" side of the
+doc's own documented bimodal split (the same split multiple earlier
+entries hit on both sides, sometimes on the very same day). A
+mechanistically airtight explanation that also happens to match a
+non-reproduction is not the same as an empirically demonstrated fix.
+
+**Recommendation for the next session — now a narrow, mechanical
+confirmation task, not an open-ended search:**
+1. Reuse the two frozen binaries already on the shared host — pre-fix
+   `/data/data/frozen-hib-biginteger-lead3-20260717/cratonvm-biginteger-lead3-20260717`
+   (`dev@fcefa8ca`, confirmed predates `dbba7c93`) and post-fix
+   `/data/data/frozen-hib-biginteger-oopmapfix-20260717/cratonvm-oopmapfix-20260717`
+   (`dev@0bd8f8be`, confirmed includes it) — no rebuild needed.
+2. Get ONE live "before" crash on the pre-fix binary using whichever
+   recipe this doc's history shows working on a given session's host
+   conditions (plain full-harness `CratonRunner` runs have been the more
+   reliable trigger in several entries; the `gdb`-wrapped
+   `jit_throw_aioobe` breakpoint recipe at
+   `/data/data/tmp/gdb_aioobe_samecapture.gdb`/`gdb_lead3_samecapture.gdb`
+   remains available and mechanically verified working). If host
+   contention is the blocker (as it partly was this session), retry on a
+   quieter window or budget for a long unattended loop per the
+   "post-`f377eb69`" entries' own advice.
+3. Immediately re-run the **identical** recipe against the post-fix binary.
+   If the pre-fix binary crashes and the post-fix binary stays clean across
+   a comparable trial count, this closes the item for real — move a full
+   consolidated writeup (covering the entire mulsub-refutation →
+   divideMagnitude-relocalization → missed-root-at-nested-safepoint arc)
+   to `docs/internal/fixed-suite-bugs/`, and re-check whether this also
+   closes the whole `hib-misc-residuals-20260716.md` doc (it is, per every
+   entry in this section, the last blocking item).
+4. If the pre-fix binary also stays clean (i.e. this specific session's
+   inability to reproduce turns out not to be bad luck but something about
+   current host/build conditions generally suppressing the trigger), that
+   itself would be worth a dedicated investigation into what changed
+   between the sessions that reliably got the ~50% hit rate and now.
+
+No code change made this session (the relevant fix was found already-landed
+on `dev`, not authored here) — this is a docs-only update.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
