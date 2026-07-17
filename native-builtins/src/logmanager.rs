@@ -2522,14 +2522,28 @@ fn publish_to_jul_handlers_src(
     result
 }
 
-/// Resolve a JUL log message argument that is EITHER a `String` OR a
-/// `java.util.function.Supplier<String>` (invoke `get()` and read it).
+/// Render a JUL message value: read `String`s directly, invoke `get()` only
+/// on actual `java.util.function.Supplier` instances, and use `toString()`
+/// for ordinary parameter objects.
 fn jul_resolve_msg(ctx: &mut dyn NativeContext, o: ObjectRef) -> String {
     if let Some(s) = ctx.read_string(o) {
         return s;
     }
+    let supplier_class = ctx.class_id_by_name("java/util/function/Supplier");
+    let object_class = ctx.class_id_of_object(o);
+    if supplier_class.is_some_and(|supplier| {
+        object_class == supplier || ctx.is_subclass(object_class, supplier)
+    }) {
+        if let Ok(Some(Value::Object(Some(r)))) =
+            ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[])
+        {
+            if let Some(s) = ctx.read_string(r) {
+                return s;
+            }
+        }
+    }
     if let Ok(Some(Value::Object(Some(r)))) =
-        ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[Value::Object(Some(o))])
+        ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[])
     {
         if let Some(s) = ctx.read_string(r) {
             return s;
