@@ -3442,8 +3442,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     let sn_for_mirror = sn_pin
         .map(|(pin, original)| ctx.read_native_pin(pin, original))
         .unwrap_or_else(|| alloc_java_service_name(ctx, &name));
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // controller-mirror allocation below can move `sn_for_mirror` (read from
+    // its pin just above, or freshly allocated in the anonymous branch) before
+    // the NAME-slot store; re-read it after the alloc.
+    let sn_mirror_pin = ctx.pin_native_root(sn_for_mirror);
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
+    let sn_for_mirror = ctx.read_native_pin(sn_mirror_pin, sn_for_mirror);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
     ctx.set_field(

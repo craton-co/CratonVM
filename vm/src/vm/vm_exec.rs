@@ -3138,6 +3138,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_BLOCKGC): pin-time canary —
+        // pinning an ALREADY-forwarded address preserves the staleness (the
+        // GC only remaps pins through per-cycle pointer maps, which never
+        // contain long-dead addresses). A hit here means the CALLER received
+        // a stale value from upstream; the backtrace names it.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} caller:\n{}",
+                        self.thread.thread_id.0,
+                        obj.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
         // CRATONVM_DBG_BLOCKED_ACCESS: a pin pushed while this thread's
         // `in_blocked_region` flag is raised is invisible to BOTH the STW root
         // scan (which reads the deposit-time snapshot) and the blocked-thread

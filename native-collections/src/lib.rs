@@ -6457,16 +6457,26 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `values().remove(v)` can write through to the backing map (live-view
     // semantics). The slot lives beyond the logical size, so it is invisible
     // to size-based operations yet still GC-scanned as part of the array.
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // list/buffer allocations move `this` and every snapshotted value before
+    // the stores below (mirrors native_map_keys_as_array).
+    let this_pin = ctx.pin_native_root(this);
+    let (_, val_handles) = pin_value_slice(ctx, &values);
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
     let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
     for (i, val) in values.iter().enumerate() {
-        ctx.set_array_element(buf, i, *val);
+        let val = read_pinned_elem(ctx, val_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
     }
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
+    let list = ctx.read_native_pin(list_pin, list);
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -6498,12 +6508,19 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
     let this = ctx.read_native_pin(this_pin, this);
     let entries = map_collect_entries(ctx, this);
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // per-entry alloc_synthetic/map_alloc_node allocations move `this`,
+    // `backing_map`, its bucket array, and every not-yet-stored (key, value)
+    // pair; re-read all of them through their pins per iteration (mirrors the
+    // already-fixed resync_view_set).
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, pair_handles) = pin_value_slice(ctx, &flat);
 
     // Each entry is a Map.Entry object with 2 fields: key and value.
     // Use `java/util/Map$Entry` instead of `HashMap$Entry`: in early
     // bootstrap the concrete nested class can be unresolved and degrade to
     // cid=0 (`java/lang/Object`), breaking downstream checkcasts.
-    for (key, value) in &entries {
+    for (i, (key, value)) in entries.iter().enumerate() {
         // 3-field Map$Entry: key@0, value@1, sourceMap@2. The source-map
         // reference makes `Entry.setValue(v)` write back to the originating map
         // (`native_entry_set_value`), matching the JDK live-entry contract
@@ -6512,12 +6529,16 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         // GC-scanned object field, so it survives relocation (a Rust side-table
         // holding the ObjectRef would go stale).
         let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *value);
+        let key = read_pinned_elem(ctx, pair_handles[2 * i], *key);
+        let value = read_pinned_elem(ctx, pair_handles[2 * i + 1], *value);
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.set_field(entry_obj, 0, key);
+        ctx.set_field(entry_obj, 1, value);
         ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
 
         // Add to the set's backing map
         let hash = ctx.identity_hash_code(entry_obj);
+        let backing_map = ctx.read_native_pin(backing_pin, backing_map);
         let (b, size, c) = map_state(ctx, backing_map);
         let b = b.unwrap();
         let idx = map_bucket_index(hash, c);
@@ -6527,9 +6548,13 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => None,
         };
         let sentinel = Value::Int(1);
+        let b_pin = ctx.pin_native_root(b);
         let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        let b = ctx.read_native_pin(b_pin, b);
         ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        let backing_map = ctx.read_native_pin(backing_pin, backing_map);
         set_map_size(ctx, backing_map, size + 1);
+        ctx.unpin_native_roots(b_pin);
     }
 
     let set = ctx.read_native_pin(set_pin, set);
@@ -6672,14 +6697,26 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // LinkedHashMap and fell back to HashMap-bucket scanning, so `putAll(tm)`
     // for a TreeMap / unmodifiable-sorted-map source silently copied nothing
     // (the Elasticsearch `Settings.Builder.put(Settings)` failure).
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
+    // native_map_put re-enters Java, moving `this` and every pending pair.
+    let this_pin = ctx.pin_native_root(this);
     let entries = collect_entries_any(ctx, other);
-    for (key, value) in entries {
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, pair_handles) = pin_value_slice(ctx, &flat);
+    for (i, (key, value)) in entries.iter().enumerate() {
+        let key = read_pinned_elem(ctx, pair_handles[2 * i], *key);
         if let Value::Object(Some(k)) = key {
             // Call put on this map
+            let this = ctx.read_native_pin(this_pin, this);
+            let value = read_pinned_elem(ctx, pair_handles[2 * i + 1], *value);
             let put_args = [Value::Object(Some(this)), Value::Object(Some(k)), value];
-            native_map_put(ctx, &put_args)?;
+            if let Err(e) = native_map_put(ctx, &put_args) {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -7217,14 +7254,35 @@ fn make_view_set_of(
     kind: i32,
     elems: &[Value],
 ) -> Result<ObjectRef, MethodCallFailed> {
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // set/backing allocations move `source` and the snapshot elems, and every
+    // native_map_put below re-enters Java, moving `backing` + pending elems.
+    let (elem_base, elem_handles) = pin_value_slice(ctx, elems);
+    let source_pin = ctx.pin_native_root(source);
+    let first_pin = if elem_base == usize::MAX {
+        source_pin
+    } else {
+        elem_base
+    };
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let set_pin = ctx.pin_native_root(set);
     let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let source = ctx.read_native_pin(source_pin, source);
     let backing = alloc_view_backing(ctx, source, kind, cap);
+    let backing_pin = ctx.pin_native_root(backing);
+    let set = ctx.read_native_pin(set_pin, set);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
     let sentinel = Value::Int(1);
-    for elem in elems {
-        native_map_put(ctx, &[Value::Object(Some(backing)), *elem, sentinel])?;
+    for (i, elem) in elems.iter().enumerate() {
+        let backing = ctx.read_native_pin(backing_pin, backing);
+        let elem = read_pinned_elem(ctx, elem_handles[i], *elem);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), elem, sentinel]) {
+            ctx.unpin_native_roots(first_pin);
+            return Err(e);
+        }
     }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(first_pin);
     Ok(set)
 }
 
@@ -9176,12 +9234,17 @@ fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
     let old_len = ctx.array_length(src);
     let comp_cid = ctx.class_id_of_object(src);
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // result-array allocation can move `src` before the copy loop.
+    let src_pin = ctx.pin_native_root(src);
     let result = ctx.new_ref_array(comp_cid, new_len);
+    let src = ctx.read_native_pin(src_pin, src);
     let copy_len = std::cmp::min(old_len, new_len);
     for i in 0..copy_len {
         let val = ctx.get_array_element(src, i);
         ctx.set_array_element(result, i, val);
     }
+    ctx.unpin_native_roots(src_pin);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -9198,11 +9261,16 @@ fn native_arrays_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let len = ctx.array_length(arr);
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
+    // obj_to_display_string can dispatch toString and move `arr`.
+    let arr_pin = ctx.pin_native_root(arr);
     let mut parts = Vec::with_capacity(len);
     for i in 0..len {
+        let arr = ctx.read_native_pin(arr_pin, arr);
         let val = ctx.get_array_element(arr, i);
         parts.push(obj_to_display_string(ctx, &val));
     }
+    ctx.unpin_native_roots(arr_pin);
     let text = format!("[{}]", parts.join(", "));
     let s = ctx.create_string(&text);
     Ok(Some(Value::Object(Some(s))))
@@ -10480,35 +10548,61 @@ fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `set(int, E)`. Uses the list's own (native or bytecode) methods, so it works
 /// for LinkedList, sublists, etc.
 fn collections_reverse_generic(ctx: &mut dyn NativeContext, list: ObjectRef) -> MethodCallResult {
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — every
+    // size/get/set dispatch re-enters Java; re-read `list` and the gathered
+    // elements through pins per iteration.
+    let list_pin = ctx.pin_native_root(list);
     // invoke_virtual dispatches on the receiver's actual class (LinkedList, …).
     let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
         Ok(Some(Value::Int(n))) => n,
-        _ => return Ok(None),
+        _ => {
+            ctx.unpin_native_roots(list_pin);
+            return Ok(None);
+        }
     };
     if size <= 1 {
+        ctx.unpin_native_roots(list_pin);
         return Ok(None);
     }
     let len = size as usize;
     let mut elems: Vec<Value> = Vec::with_capacity(len);
+    let mut elem_handles: Vec<usize> = Vec::with_capacity(len);
     for i in 0..len {
-        let v = ctx
-            .invoke_virtual(
-                list,
-                "get",
-                "(I)Ljava/lang/Object;",
-                &[Value::Int(i as i32)],
-            )?
-            .unwrap_or(Value::Object(None));
+        let list = ctx.read_native_pin(list_pin, list);
+        let v = match ctx.invoke_virtual(
+            list,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(i as i32)],
+        ) {
+            Ok(r) => r.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                ctx.unpin_native_roots(list_pin);
+                return Err(e);
+            }
+        };
+        elem_handles.push(pin_value(ctx, v));
         elems.push(v);
     }
-    for (i, val) in elems.iter().rev().enumerate() {
-        ctx.invoke_virtual(
+    for (i, (val, handle)) in elems
+        .iter()
+        .rev()
+        .zip(elem_handles.iter().rev())
+        .enumerate()
+    {
+        let list = ctx.read_native_pin(list_pin, list);
+        let val = read_pinned_elem(ctx, *handle, *val);
+        if let Err(e) = ctx.invoke_virtual(
             list,
             "set",
             "(ILjava/lang/Object;)Ljava/lang/Object;",
-            &[Value::Int(i as i32), *val],
-        )?;
+            &[Value::Int(i as i32), val],
+        ) {
+            ctx.unpin_native_roots(list_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(list_pin);
     Ok(None)
 }
 
@@ -21048,9 +21142,13 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             // null or missing — just init empty
+            // cceres3: pin across GC-capable call (stream stale-at-store wave)
+            let this_pin = ctx.pin_native_root(this);
             let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
+            let this = ctx.read_native_pin(this_pin, this);
             al_set_data(ctx, this, buf);
             al_set_size(ctx, this, 0);
+            ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
     };
@@ -21079,17 +21177,27 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             // backing array, so the `_arr0` captured before the allocation is a
             // stale pointer afterwards. Re-read the source's array AFTER the
             // alloc, then copy element-by-element (no allocation in the loop).
+            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+            // `this` and `source` themselves also move across that alloc.
+            let this_pin = ctx.pin_native_root(this);
+            let src_pin = ctx.pin_native_root(source);
             let buf = alloc_ref_array(ctx, cap);
+            let source = ctx.read_native_pin(src_pin, source);
             let arr = match al_state(ctx, source).0 {
                 Some(a) => a,
-                None => return Ok(None),
+                None => {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(None);
+                }
             };
             for i in 0..size as usize {
                 let val = ctx.get_array_element(arr, i);
                 ctx.set_array_element(buf, i, val);
             }
+            let this = ctx.read_native_pin(this_pin, this);
             al_set_data(ctx, this, buf);
             al_set_size(ctx, this, size);
+            ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
         // `al_state` reported a 0-size ArrayList layout. That is either a
@@ -21113,15 +21221,27 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // collection load). Collect once only for the length, allocate, then
     // RE-collect from the live source and store immediately — no allocation
     // between the read and the store.
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // second element collection re-enters Java (size/toArray) and can move
+    // `buf`/`this`/`source` and the just-gathered elements.
+    let this_pin = ctx.pin_native_root(this);
+    let src_pin = ctx.pin_native_root(source);
     let len = collect_collection_elements_or_real(ctx, source).len();
     let cap = std::cmp::max(len, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
+    let buf_pin = ctx.pin_native_root(buf);
+    let source = ctx.read_native_pin(src_pin, source);
     let elems = collect_collection_elements_or_real(ctx, source);
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
+    let buf = ctx.read_native_pin(buf_pin, buf);
     for (i, val) in elems.iter().enumerate().take(len) {
-        ctx.set_array_element(buf, i, *val);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
     }
+    let this = ctx.read_native_pin(this_pin, this);
     al_set_data(ctx, this, buf);
     al_set_size(ctx, this, len as i32);
+    ctx.unpin_native_roots(this_pin);
 
     Ok(None)
 }
@@ -21136,15 +21256,25 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             // Init empty set (LinkedHashMap backing for insertion-ordered sets).
+            // cceres3: pin across GC-capable call (stream stale-at-store wave)
+            let this_pin = ctx.pin_native_root(this);
             let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
+            ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
     };
 
     // Create the backing map for this set (LinkedHashMap for insertion-ordered
     // sets so iteration preserves order) and populate it.
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // backing alloc moves `this`, and every native_map_put below re-enters Java
+    // (hashCode/equals, possible resize) moving `backing` + pending elems.
+    let this_pin = ctx.pin_native_root(this);
     let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
+    let backing_pin = ctx.pin_native_root(backing);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
 
     // Round 49 fix: route through `collect_collection_elements` so we
@@ -21158,11 +21288,18 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
     let elems = collect_collection_elements_or_real(ctx, source);
+    let (_, elem_handles) = pin_value_slice(ctx, &elems);
     let sentinel = Value::Int(1);
-    for val in elems {
-        native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
+    for (i, val) in elems.iter().enumerate() {
+        let backing = ctx.read_native_pin(backing_pin, backing);
+        let val = read_pinned_elem(ctx, elem_handles[i], *val);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -21176,7 +21313,10 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
             // Init empty HashMap
+            // cceres3: pin across GC-capable call (stream stale-at-store wave)
+            let this_pin = ctx.pin_native_root(this);
             let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
             set_map_size(ctx, this, 0);
             ctx.set_field(
@@ -21184,6 +21324,7 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 MAP_FIELD_CAPACITY,
                 Value::Int(MAP_DEFAULT_CAPACITY as i32),
             );
+            ctx.unpin_native_roots(this_pin);
             return Ok(None);
         }
     };
@@ -21192,8 +21333,13 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let source = unwrap_unmod(ctx, source);
 
     // Init this map
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // buckets alloc moves `this`, and every native_map_put below re-enters
+    // Java, moving `this` and every not-yet-stored (key, value) pair.
+    let this_pin = ctx.pin_native_root(this);
     let cap = MAP_DEFAULT_CAPACITY;
     let buckets = alloc_ref_array(ctx, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, this, 0);
     ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
@@ -21206,10 +21352,19 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // `new HashMap<>(treeMap)` / `new HashMap<>(unmodifiableNavigableMap)`
     // silently produced an empty map.
     let entries = collect_entries_any(ctx, source);
-    for (key, value) in entries {
-        native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, pair_handles) = pin_value_slice(ctx, &flat);
+    for (i, (key, value)) in entries.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, pair_handles[2 * i], *key);
+        let value = read_pinned_elem(ctx, pair_handles[2 * i + 1], *value);
+        if let Err(e) = native_map_put(ctx, &[Value::Object(Some(this)), key, value]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
     }
 
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -23863,10 +24018,18 @@ fn native_ll_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None), // null/empty collection — overlay stays empty
     };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // source drain re-enters Java and every `ll_link_last` allocates a node;
+    // re-read `this` + each element per iteration (mirrors native_ll_add_all).
+    let this_pin = ctx.pin_native_root(this);
     let elems = collect_collection_elements_or_real(ctx, source);
-    for val in elems {
+    let (_, handles) = pin_value_slice(ctx, &elems);
+    for (i, val) in elems.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let val = read_pinned_elem(ctx, handles[i], *val);
         ll_link_last(ctx, this, val);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -25447,8 +25610,15 @@ fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+    // lhm_init_with_cap allocates, so pass `native_lhm_put_all` refreshed
+    // refs, not the pre-alloc `this`/`src`.
+    let this_pin = ctx.pin_native_root(this);
+    let src0 = args.get(1).copied().unwrap_or(Value::Object(None));
+    let src_handle = pin_value(ctx, src0);
     lhm_init_with_cap(ctx, this, MAP_DEFAULT_CAPACITY);
-    let src = args.get(1).copied().unwrap_or(Value::Object(None));
+    let this = ctx.read_native_pin(this_pin, this);
+    let src = read_pinned_elem(ctx, src_handle, src0);
     // S111r24-fix: Route through `native_lhm_put_all` so insertion-order
     // linkage (head/tail) is established for each copied entry. Calling
     // `native_map_put_all` would invoke `native_map_put` which writes
@@ -25456,7 +25626,9 @@ fn native_lhm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // leaving the LHM's insertion-order list empty and the entries
     // invisible to `entrySet()`/`putAll(...)` consumers like Spring's
     // `AnnotationAttributes(Map)` copy constructor.
-    native_lhm_put_all(ctx, &[Value::Object(Some(this)), src])?;
+    let r = native_lhm_put_all(ctx, &[Value::Object(Some(this)), src]);
+    ctx.unpin_native_roots(this_pin);
+    r?;
     Ok(None)
 }
 
@@ -26150,10 +26322,22 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `map_collect_entries`, so `new LinkedHashMap<>(treeMap)` / `lhm.putAll(
     // treeMap)` (and real-JDK unmodifiable-map sources) silently produced an
     // empty map. `collect_entries_any` preserves LHM insertion order.
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
+    // native_lhm_put re-enters Java, moving `this` and every pending pair.
+    let this_pin = ctx.pin_native_root(this);
     let entries = collect_entries_any(ctx, source);
-    for (key, val) in entries {
-        native_lhm_put(ctx, &[Value::Object(Some(this)), key, val])?;
+    let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+    let (_, pair_handles) = pin_value_slice(ctx, &flat);
+    for (i, (key, val)) in entries.iter().enumerate() {
+        let this = ctx.read_native_pin(this_pin, this);
+        let key = read_pinned_elem(ctx, pair_handles[2 * i], *key);
+        let val = read_pinned_elem(ctx, pair_handles[2 * i + 1], *val);
+        if let Err(e) = native_lhm_put(ctx, &[Value::Object(Some(this)), key, val]) {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -38805,12 +38989,32 @@ fn native_collections_extreme(
             .into(),
         );
     }
-    let mut best = elems[0].clone();
-    for elem in elems.into_iter().skip(1) {
-        let cmp = compare_via_compare_to(ctx, &elem, &best)?;
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // compareTo dispatch re-enters Java, moving `best` and every later elem;
+    // track `best` by handle like native_stream_min does.
+    let (elem_base, elem_handles) = pin_value_slice(ctx, &elems);
+    let mut best = elems[0];
+    let mut best_handle = elem_handles[0];
+    for i in 1..elems.len() {
+        let elem = read_pinned_elem(ctx, elem_handles[i], elems[i]);
+        let best_arg = read_pinned_elem(ctx, best_handle, best);
+        let cmp = match compare_via_compare_to(ctx, &elem, &best_arg) {
+            Ok(c) => c,
+            Err(e) => {
+                if elem_base != usize::MAX {
+                    ctx.unpin_native_roots(elem_base);
+                }
+                return Err(e);
+            }
+        };
         if (want_max && cmp > 0) || (!want_max && cmp < 0) {
-            best = elem;
+            best = elems[i];
+            best_handle = elem_handles[i];
         }
+    }
+    let best = read_pinned_elem(ctx, best_handle, best);
+    if elem_base != usize::MAX {
+        ctx.unpin_native_roots(elem_base);
     }
     Ok(Some(best))
 }
@@ -38868,13 +39072,24 @@ fn native_collections_n_copies(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
     let __al_n_fields = al_slots(ctx).2;
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // two allocations can move `val` and the freshly allocated `list`.
+    let val_handle = pin_value(ctx, val);
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
     let arr = alloc_ref_array(ctx, n.max(0) as usize);
+    let val = read_pinned_elem(ctx, val_handle, val);
     for i in 0..n.max(0) as usize {
         ctx.set_array_element(arr, i, val);
     }
+    let list = ctx.read_native_pin(list_pin, list);
     al_set_data(ctx, list, arr);
     al_set_size(ctx, list, n.max(0));
+    ctx.unpin_native_roots(if val_handle == usize::MAX {
+        list_pin
+    } else {
+        val_handle
+    });
     Ok(Some(Value::Object(Some(list))))
 }
 
