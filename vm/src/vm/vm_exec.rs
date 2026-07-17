@@ -2269,6 +2269,24 @@ impl<'a> NativeContextImpl<'a> {
         let group = self.get_or_create_main_thread_group();
         // Re-read the (GC-remapped) holder after the group allocation.
         let holder = self.thread.native_pin_roots[pin_base];
+        // `group` (whether freshly built by this call or served from the
+        // `main_thread_group` cache — including the claim/wait/notify path's
+        // "another thread is building, wait then re-read" branch) is a bare
+        // Rust local from here on. `SharedVm::main_thread_group` is itself a
+        // GC root now (memory/roots.rs step 8d / memory/gc.rs step 6d), so
+        // the CACHE stays live and gets remapped by any later GC — but this
+        // local `Copy` of the `ObjectRef` does not track that remap. Pin it
+        // alongside `holder` so the invoke below (which runs `<init>`
+        // bytecode and can itself trigger further moving GCs) can't leave it
+        // stale; confirmed live via a `cratonvm-aio-dispatch-N` SIGSEGV
+        // (`is_forwarded`/`get_header:1558`) inside the `FieldHolder.<init>`
+        // field-setter that stores this exact value into `holder.group`.
+        let group_idx = group.map(|g| {
+            let idx = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(g);
+            idx
+        });
+        let group = group_idx.map(|idx| self.thread.native_pin_roots[idx]);
         let args = [
             Value::Object(Some(holder)),
             Value::Object(group), // ThreadGroup (may be None if group alloc failed)
@@ -2307,10 +2325,140 @@ impl<'a> NativeContextImpl<'a> {
     /// `(String)` ctor would recurse through
     /// `Thread.currentThread().getThreadGroup()` вЂ” our caller is the
     /// thread construction path itself, so that would loop.
+    ///
+    /// CONCURRENCY (fixes a confirmed TOCTOU race — see
+    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// follow-up #4"): the body below allocates two `ThreadGroup` objects
+    /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
+    /// cannot simply hold `main_thread_group`'s write lock across the
+    /// whole build — `RwLock` is not reentrant, and this same function is
+    /// reachable indirectly from inside a `<clinit>`/`<init>` it runs, and
+    /// concurrent GC-blocked-region waits must not stall holding a plain
+    /// lock across a safepoint. Instead this mirrors the codebase's own
+    /// JVMS §5.5 class-init claim/wait/notify idiom
+    /// (`vm_util::ensure_class_initialized_shared`,
+    /// `SharedVm::class_init_waiters`): exactly one thread transitions
+    /// `main_thread_group_init` `Idle -> InProgress` and performs the
+    /// build; every other concurrent caller blocks on the `InProgress`
+    /// claim's condvar — via the same deposit/enter_blocked/
+    /// arrive_and_wait/check_post_block_gc protocol class-init waiters use
+    /// — until the builder finishes and notifies, then re-checks the
+    /// (now-published) result instead of racing its own independent build.
     pub(crate) fn get_or_create_main_thread_group(&mut self) -> Option<ObjectRef> {
+        use std::sync::Arc;
         if let Some(obj) = *self.shared.main_thread_group.read() {
             return Some(obj);
         }
+        let current_thread_id = self.thread.thread_id.0;
+        loop {
+            // Try to claim the build under the (cheap, never held across an
+            // allocation) init-state lock; discover an in-progress build by
+            // someone else; or discover the result already landed while we
+            // were retrying.
+            let waiter = {
+                let mut init = self.shared.main_thread_group_init.lock();
+                match &*init {
+                    super::MainThreadGroupInit::InProgress {
+                        owner_thread,
+                        waiter,
+                    } => {
+                        if *owner_thread == current_thread_id {
+                            // Re-entrant call on the SAME thread that is
+                            // already building the group (e.g. a nested
+                            // currentThread() triggered from within
+                            // ThreadGroup's own <clinit>/<init>). Mirrors
+                            // JVMS §5.5 step 2's re-entrant rule for class
+                            // init ("release LC and complete normally"):
+                            // return None (no group yet) rather than
+                            // deadlocking on our own claim.
+                            return None;
+                        }
+                        Some(Arc::clone(waiter))
+                    }
+                    super::MainThreadGroupInit::Idle => {
+                        // Re-check under the lock: another thread may have
+                        // finished (or failed) a build between our
+                        // lock-free fast-path read above and acquiring
+                        // this lock.
+                        if let Some(obj) = *self.shared.main_thread_group.read() {
+                            return Some(obj);
+                        }
+                        *init = super::MainThreadGroupInit::InProgress {
+                            owner_thread: current_thread_id,
+                            waiter: Arc::new((
+                                parking_lot::Mutex::new(false),
+                                parking_lot::Condvar::new(),
+                            )),
+                        };
+                        None
+                    }
+                }
+            };
+
+            let Some(waiter) = waiter else {
+                // We claimed the build — proceed to the code below.
+                break;
+            };
+
+            // Someone else is building; block until they finish. Same
+            // GC-safe blocked-region protocol as class-init waiters: retire
+            // the TLAB, deposit a root snapshot, arrive-and-wait if a STW
+            // is already in flight so we don't strand a GC initiator, wait
+            // on the condvar (bounded, so a builder that somehow never
+            // notifies can't wedge us forever), then re-sync any
+            // cross-GC fixups before touching heap state again.
+            self.thread.tlab.retire();
+            self.deposit_root_snapshot();
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait_auto(ThreadId(current_thread_id));
+            }
+            {
+                let (lock, cvar) = &*waiter;
+                let mut guard = lock.lock();
+                if !*guard {
+                    let _ = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                }
+            }
+            drop(blk);
+            self.check_post_block_gc();
+            // Loop back to re-check: `Some` once the builder published a
+            // result; `Idle` (no result) if the builder failed, in which
+            // case we retry and may become the new builder ourselves.
+            if let Some(obj) = *self.shared.main_thread_group.read() {
+                return Some(obj);
+            }
+        }
+
+        // We are now the sole builder. This guard runs on EVERY exit path
+        // below (success, an early `None` return via `?`/`return`, or a
+        // panic unwind) so a builder that bails out never leaves waiters
+        // blocked for the full 30s timeout — or, worse, permanently wedges
+        // `main_thread_group_init` in `InProgress` for a thread that has
+        // already moved on.
+        struct FinishGuard<'s> {
+            shared: &'s SharedVm,
+        }
+        impl Drop for FinishGuard<'_> {
+            fn drop(&mut self) {
+                let prev = std::mem::replace(
+                    &mut *self.shared.main_thread_group_init.lock(),
+                    super::MainThreadGroupInit::Idle,
+                );
+                if let super::MainThreadGroupInit::InProgress { waiter, .. } = prev {
+                    let (lock, cvar) = &*waiter;
+                    *lock.lock() = true;
+                    cvar.notify_all();
+                }
+            }
+        }
+        let _finish_guard = FinishGuard {
+            shared: self.shared,
+        };
+
         let tg_class =
             <Self as NativeContext>::ensure_class_initialized(self, "java/lang/ThreadGroup")
                 .ok()?;

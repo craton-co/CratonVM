@@ -286,6 +286,26 @@ fn reject_startup_jvmti_agents_when_disabled(config: &VmConfig) {
     }
 }
 
+/// State for the `main_thread_group` lazy singleton's claim/wait
+/// coordination (see `SharedVm::main_thread_group_init`'s doc). Mirrors the
+/// `Class::initializing_thread` + `class_init_waiters` shape used for JVMS
+/// §5.5 class initialization, scoped down to a single global singleton
+/// instead of a `ClassId`-keyed map.
+pub enum MainThreadGroupInit {
+    /// No thread is currently building the group. Either it has never been
+    /// attempted, or the previous attempt already finished (check
+    /// `SharedVm::main_thread_group` for the result) or failed (in which
+    /// case a later caller may attempt the build again).
+    Idle,
+    /// `owner_thread` (a `ThreadId(..).0`) is currently running the build.
+    /// Every other thread that observes this variant blocks on `waiter`'s
+    /// condvar until the owner transitions back to `Idle` and notifies.
+    InProgress {
+        owner_thread: u64,
+        waiter: Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>,
+    },
+}
+
 pub struct SharedVm {
     /// Process-unique identity for this VM/heap lifetime.
     ///
@@ -458,6 +478,22 @@ pub struct SharedVm {
     /// in real-JDK mode — the ThreadGroup constructor invokes bytecode,
     /// so it can't run during `SharedVm::new`.
     pub main_thread_group: RwLock<Option<ObjectRef>>,
+
+    /// Claim/wait coordination for the lazy `main_thread_group` build
+    /// (`NativeContextImpl::get_or_create_main_thread_group`,
+    /// `vm/src/vm/vm_exec.rs`). Mirrors `class_init_waiters`'s JVMS §5.5
+    /// claim/wait/notify shape: exactly one thread transitions
+    /// `Idle -> InProgress` and performs the (allocating, bytecode-running)
+    /// build; every other concurrent caller blocks on the `InProgress`
+    /// waiter's condvar instead of redundantly building its own
+    /// `ThreadGroup` pair. Fixes a confirmed TOCTOU race (see
+    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// follow-up #4") where several `cratonvm-aio-dispatch-N` threads
+    /// lazily building their first `Thread` mirror at the same instant
+    /// could each observe `main_thread_group == None` and independently
+    /// race through the whole unguarded build, corrupting whichever
+    /// build's objects lost the final write.
+    pub main_thread_group_init: parking_lot::Mutex<MainThreadGroupInit>,
 
     /// Pre-allocated singleton `java.lang.OutOfMemoryError`, thrown when the
     /// heap is too full to even materialize a fresh exception object (the
@@ -2695,6 +2731,7 @@ impl SharedVm {
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
             main_thread_group: RwLock::new(None),
+            main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
             singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
             lambda_proxies: RwLock::new(FxHashMap::default()),
