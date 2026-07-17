@@ -129,11 +129,66 @@ This document tracks the **genuine remaining failures**.
     RenderingResponse 1/1, RSocketRequester 13/13, WebClientObservation 9/9,
     CoExchangeFilterFunction 1/1, InvocableHandlerMethodKotlin 40/40 — all OK. A/B control: unfixed
     binary, identical flags -> 10/10 SOE.
-  *   Residual: `WebClientExtensionsTests` 20/32 (SOE gone). The 12 failures are two separate,
-    pre-existing families: (a) `IllegalStateException: Unable to create proxy for sealed class
-    interface org.springframework.http.HttpStatusCode, no subclasses available` — mockk resolves
-    `KClass.sealedSubclasses` (kotlin-reflect metadata family); (b) mockk `verify` matcher failures
-    (`... was not called`), same family as the tracked `RestClientExtensionsTests` residual.
+  *   **Residual — FIXED (2026-07-17)**: `WebClientExtensionsTests` was 20/32 (SOE gone, but 12
+    failures remained), split into two apparent families that turned out to share ONE root cause:
+    (a) `IllegalStateException: Unable to create proxy for sealed class interface
+    org.springframework.http.HttpStatusCode, no subclasses available`; (b) mockk `verify{}` matcher
+    failures (`... was not called`) on `ParameterizedTypeReference<List<? extends Foo>>`-typed
+    args, the same symptom family as the tracked `RestClientExtensionsTests` residual below.
+    **Root cause**: `Class.getPermittedSubclasses0()` (`native_class_get_permitted_subclasses`,
+    `native-builtins/src/lang_class.rs`) resolved each permitted-subclass NAME via
+    `ctx.class_id_by_name(name)`, a PASSIVE cache lookup that never triggers classloading. mockk's
+    `ProxyMaker.findActualClassToBeProxied` (decompiled from `mockk-agent-jvm-1.14.5.jar`) does
+    `clazz.kotlin.sealedSubclasses.firstOrNull() ?: error("Unable to create proxy for sealed class
+    $clazz, no subclasses available")`; since `HttpStatusCode` is a plain Java `sealed interface`
+    (no Kotlin `@Metadata`), kotlin-reflect resolves `sealedSubclasses` via
+    `Java16SealedRecordLoader`, i.e. by reflectively calling the standard
+    `Class.isSealed()`/`Class.getPermittedSubclasses()` pair. A live probe (calling
+    `getPermittedSubclasses0()` directly via reflection, bypassing the public wrapper) showed
+    `isSealed()` correctly `true` (the classfile's `PermittedSubclasses` attribute parses fine) but
+    `getPermittedSubclasses0()` returning `[null, null]` — a correctly-SIZED 2-element array with
+    BOTH entries unresolved, because `HttpStatus`/`DefaultHttpStatusCode` simply hadn't been loaded
+    yet at the time the reflective probe ran (the common case — nothing forces Spring to touch a
+    concrete `HttpStatus`/`DefaultHttpStatusCode` before mockk's `ProxyMaker` asks). Real JDK's own
+    `Class.getPermittedSubclasses()` Java wrapper then filters the raw native result down to entries
+    that verifiably extend/implement `this`; a `null` entry fails that check, so the 2-element
+    `[null, null]` silently collapsed to the empty `[]` mockk observed. Same root-cause family as
+    the `getEnclosingClass`/`getDeclaringClass` loader-identity fix (`aca7f635`) and the
+    getstatic/putstatic loader-aware fix (`19d7f417`/`b04eb903`): a flat, passive class-name lookup
+    standing in for what should be a real (re-entrant) `loadClass()` resolution.
+    **Fix**: `native_class_get_permitted_subclasses` now falls back to an ACTIVE, loader-correct
+    resolution on a cache miss — `ctx.invoke_virtual(loader, "loadClass", ...)` on `this` sealed
+    class's OWN classloader (reusing `native_class_get_class_loader`'s existing defining-loader /
+    app-loader-fallback logic), mirroring `declaring_class_loader_aware`'s re-entrant-call pattern.
+    Safe here (unlike the REVERTED getstatic/putstatic interpreter-opcode attempt documented in the
+    `ImportHttpServiceRegistrarTests` entry below): `getPermittedSubclasses0()` is an ordinary
+    native-method call boundary, the same shape `Class.forName`'s native already uses for
+    re-entrant `loadClass()` calls routinely and safely. The passive cache lookup still runs first
+    (cheap, handles the overwhelming common case where the subclass is already loaded).
+    **Verified**: fresh `dev`-tip worktree (`fix/mockk-webclientext-20260717`), full-class run via a
+    JUnit5-Launcher driver against the real spring-webflux test classpath: pre-fix `20/33` (13
+    failures — 9x family-(a) `IllegalStateException`, 4x family-(b) `AssertionError: Verification
+    failed ... was not called`, all on PTR-typed args — 33 not 32 methods found, one more than the
+    original report, likely a parameterized variant added since); post-fix `33/33`, reproduced
+    twice. A standalone live probe confirms `getPermittedSubclasses0()` now returns
+    `[DefaultHttpStatusCode, HttpStatus]` instead of `[null, null]`, and kotlin-reflect's
+    `KClass.isSealed`/`.sealedSubclasses` (called directly, not just through mockk) match.
+    Family (b) was NOT separately root-caused — fixing family (a) made it disappear too on this
+    class, most likely because mockk's `JvmSignatureValueGenerator.instantiate()` (decompiled from
+    `mockk-jvm-1.14.5.jar`, `io/mockk/impl/recording/JvmSignatureValueGenerator.class` — the exact
+    class flagged as the prime suspect in the `RestClientExtensionsTests` residual writeup below)
+    shares the identical `sealedSubclasses`/`getPermittedSubclasses0()` code path for dummy-value
+    generation during argument-signature detection, and some earlier-executing method on the same
+    mock's declared surface (e.g. `ResponseSpec#onStatus(Predicate<HttpStatusCode>, ...)`) was
+    likely throwing/corrupting mockk's internal signature-detection state before the later PTR-arg
+    calls were ever reached. **Not independently reconfirmed against `RestClientExtensionsTests`**
+    itself — that class's Kotlin test sources aren't currently compiled/testcp'd on the Azure host,
+    and building a fresh spring-web test module was out of scope this session given host disk/load
+    pressure (load average briefly exceeded 120 mid-session; see
+    `azure-host-disk-full-flapping-20260715`). Given the identical symptom shape and shared
+    mechanism, re-verifying `RestClientExtensionsTests` against this fix is a strong, low-effort
+    next step for whoever picks it up next — likely fixed or substantially improved, but unverified
+    as of this writing.
   *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
     hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
@@ -179,6 +234,10 @@ This document tracks the **genuine remaining failures**.
       `ImportHttpServiceRegistrarTests`'s `ClassCastException` is **gone** — confirmed absent across every run (baseline vs. fixed vs. post-merge, ~10 total runs). The class still does not reach 5/5: both `basicListingWithAot`/`basicScanWithAot` now fail on `java.lang.NoClassDefFoundError: java/lang/classfile/ClassFile` — the SAME pre-existing, already-documented host-environment gap as `PersistenceManagedTypesBeanRegistrationAotProcessorTests` above (JDK 24+'s Class-File API; this Azure worktree host's `java` on PATH is JDK 21.0.11, confirmed via `java -version`). Not a regression — the next-layer-down gap this fix's correctness improvement now lets the test reach.
 
       **Merge-time finding (unrelated, NOT caused by this fix):** post-merge with same-day `origin/dev`, `ImportHttpServiceRegistrarTests` intermittently instead shows `java.util.ServiceConfigurationError: Provider org.junit.support.testng.engine.TestNGTestEngine could not be instantiated` on the same two methods, and `cargo test -p cratonvm-vm --lib` shows one additional failure (`runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode`, "BufferedInputStream.read()I must keep its real-JDK bytecode") beyond the 16 pre-existing `lock_order`/`skip_list` ones. **Both A/B-isolated via `git revert --no-commit` of this fix's own commit on top of the same merge**: both reproduce identically with this fix present OR reverted — caused by one of the OTHER commits that landed on `dev` the same day (package-private access enforcement, `f62f1772`, is the leading suspect for both — TestNG's engine and `BufferedInputStream` dispatch both cross a loader/native-dispatch boundary), not by this change. Worth a follow-up investigation by whoever owns that area; out of scope here.
+
+      **2026-07-17 follow-up — `buffered_input_stream_real_jdk_uses_its_own_bytecode` root-caused and FIXED; `f62f1772` exonerated for this half of the finding.** Bisected with `git blame`/`git log -S` on `force_native_over_real_jdk_bytecode` (`vm/src/runtime/interpreter.rs`): the regression was introduced by `995ff48c7` ("Fix Tomcat silent-hang scanner and JIT residuals", landed 2026-07-16 19:09:33 -0300, well before `f62f1772`'s 23:17:35 UTC), which added a brand-new, unconditional `if class_name == "java/io/BufferedInputStream" && method_name == "read" && matches!(method_descriptor, "([BII)I" | "()I") { return true; }` block. This directly contradicts the pre-existing (2026-07-14, `d8092acb`) contract test, and also contradicts `native-builtins/src/lib.rs`'s own adjacent comment on the real `BufferedInputStream` native registrations ("Real JDK BufferedInputStream has a layout and close protocol that the old synthetic bridge cannot emulate safely ... Keep the bridge only for synthetic-JDK builds; real-JDK execution must use the class bytecode" — those natives are gated `if cfg!(feature = "synthetic-jdk")`, so in real-JDK mode nothing is even registered for `BufferedInputStream.read`, making the interpreter.rs force-native block a dead-end/behavior-change with no matching native, not an intentional fast path). `f62f1772` does not touch `force_native_over_real_jdk_bytecode`, `BufferedInputStream`, or any native-dispatch code at all (it only wires `check_class_access` into `Instruction::New` plus two JIT allocation-site resolvers) — it is not implicated in this half of the merge-time finding; the TestNG `ServiceConfigurationError` half remains open and unexplored.
+      **Fix**: removed the offending block (`vm/src/runtime/interpreter.rs`, was ~line 23500-23505, immediately after the Tomcat BCEL `Constant.readConstant` force-native check), restoring real-JDK bytecode dispatch for `BufferedInputStream.read()I`/`read([BII)I`. No native replacement needed since real-JDK mode never had one registered.
+      **Verified**: `runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode` passes. `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed / 111 ignored — exactly the documented 9 `lock_order` + 7 `jit::skip_list` baseline, no new failures. `cargo test -p cratonvm-gc --lib --release`: 791/0. `cargo test -p cratonvm-native-builtins --lib --release`: 3000/0 (6 ignored).
 
       Verified regression-free: `cargo test -p cratonvm-vm --lib` 2200 passed/16 failed/111 ignored on the pre-merge branch, **byte-identical failing-test list with vs. without this fix** (`git stash`-isolated A/B). `cargo test -p cratonvm-native-builtins --lib`: 3000 passed/0 failed. Spot-checked `GroupsMetadataValueDelegateTests` and `ConfigurationClassPostProcessorAotContributionTests` (same loader-identity investigation cluster) — both are extremely slow AOT/compilation-heavy tests that don't complete within a 200s per-class ceiling on this host EITHER WAY (confirmed identical timeout behavior baseline vs. fixed, 2 runs each) — pre-existing host/AOT-overhead characteristic, not a regression.
 
@@ -3127,3 +3186,54 @@ still has none) rather than assuming it is the same family as (a) or (c) above.
 (StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
 CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
 CCE) not reproduced and left as an open question rather than a confirmed-open bug.
+
+### 5.7 `JythonScriptTemplateTests` — investigated, does NOT reproduce on current `dev` under either `--enable-native-access` setting; flag-comparison artifact, not a genuine regression (2026-07-17)
+
+Follow-up on section 5's "not investigated further" note: `JythonScriptTemplateTests`
+was flagged as a regression in the 36-class reactive comparison sample (`was OK
+1/1/0, now FAIL 1/0/1, java.lang.ExceptionInInitializerError: null`), with that
+section's own text explicitly calling out the comparison as possibly confounded by
+`--enable-native-access` differing between the baseline and rerun.
+
+Investigated from scratch, dedicated session, fresh worktree
+(`/data/data/wt-jython-regression-20260717`, branch
+`fix/jython-regression-20260717`), fresh release binary off `dev` tip `67c85b3c`
+(real JDK 25, built spring-webflux test classes fresh via Gradle against a private
+`GRADLE_USER_HOME` to avoid colliding with other concurrent sessions using the
+shared `/data/data/spring-framework-recheck` checkout).
+
+**Ran the single-class `KRun` repro four times WITH `--enable-native-access=ALL-UNNAMED`
+and three times WITHOUT it, back to back, same binary, same classpath.** Every one
+of the seven runs completed cleanly: `RESULT
+org.springframework.web.reactive.result.view.script.JythonScriptTemplateTests
+found=1 succ=1 fail=0 skip=0 abort=0 status=OK` (wall time ~25-31s each, real
+Jython 2.7.4 interpreter boot + script execution, not a stub). No
+`ExceptionInInitializerError`, no `LOADERR`, no crash, in either flag configuration.
+Some benign `NoSuchMethodError` warnings appear in stderr during Jython's own
+module-import bootstrapping (`java/lang/Long.get()Ljava/lang/Object;`,
+`org/python/core/PyNone.get()Ljava/lang/Object;`, both from Jython's own
+introspection code probing for methods that don't exist on those classes) but
+these are pre-existing, tolerated by Jython's own fallback logic, and present
+identically in both flag configurations — not the cause of the originally-reported
+failure and not new.
+
+**Conclusion: this was the flag-comparison artifact the section 5 note already
+suspected it might be** (or, less likely but not excluded, a real but transient
+regression on some intermediate `dev` commit between the original baseline and this
+session's `67c85b3c` tip that has since been fixed as a side effect of one of the
+several `--enable-native-access`/`MemorySegment`/GC-safety fixes that landed
+2026-07-16 — e.g. `d5544133` "segment_address() reads real MemorySegment field 0 as
+length, not address" or the getstatic/putstatic loader-aware fix referenced in that
+same day's docs). Either way, **not reproducible now, so nothing to fix on current
+`dev`**. Did not touch `WebSocketIntegrationTests`, the other class flagged
+alongside this one in the same section-5 comparison sample — that one's "pass/fail
+ratio inverted" symptom is a different shape (not an `ExceptionInInitializerError`)
+and is left for a separate investigation.
+
+No code change landed — nothing to fix. This entry exists to close the loop on the
+section-5 comparison sample's flagged observation with evidence, and to save a
+future session from re-chasing a failure that does not currently reproduce. If it
+resurfaces, capture with `KRUN_STACK=1` for the full nested-cause stack trace
+immediately (the original report had only the bare `ExceptionInInitializerError:
+null` outer wrapper, no nested cause) and re-check whether the two GC-safety fixes
+above are still present on whatever tip is being tested.
