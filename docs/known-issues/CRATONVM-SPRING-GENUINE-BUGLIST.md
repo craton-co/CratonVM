@@ -3127,3 +3127,112 @@ still has none) rather than assuming it is the same family as (a) or (c) above.
 (StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
 CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
 CCE) not reproduced and left as an open question rather than a confirmed-open bug.
+
+### 5.7 `WebSocketIntegrationTests` "inversion" (was FAIL 72/48/24, then FAIL 72/24/48) — investigated (2026-07-17): NOT a real inversion, it's a stable `TomcatWebSocketClient` defect; root-caused at the byte level but the actual hang is still OPEN
+
+Investigated the flagged-but-never-looked-at entry above. Fresh measurement on `dev` tip
+`67c85b3c` (`--enable-native-access=ALL-UNNAMED`, per-sub-test detail via a custom
+`KRunDetail` JUnit-Platform launcher, no truncation): **FAIL 72/52/20**, reproduced
+identically across 5 independent runs (52 pass / 20 fail every time, zero flake in the
+aggregate count). This matches *neither* historical sample (48/24 nor 24/48) — the class
+has been a moving target the whole time this doc's baselines were captured, not a single
+clean regression.
+
+**The class is `@ParameterizedTest`-driven, 3 clients × 4 servers × 6 methods = 72** (see
+`AbstractReactiveWebSocketIntegrationTests.arguments()`: clients =
+`{TomcatWebSocketClient, JettyWebSocketClient, ReactorNettyWebSocketClient}`, servers =
+`{TomcatHttpServer, JettyHttpServer, JettyCoreHttpServer, ReactorHttpServer}`). Breaking
+the per-sub-test detail down by client (not by server, and not by aggregate count) gives
+the real shape immediately:
+
+*   **`JettyWebSocketClient` and `ReactorNettyWebSocketClient`: 48/48 pass, every run, every
+    server.** Zero failures of any kind.
+*   **`TomcatWebSocketClient`: 20/24 fail, consistently.** Same ~4 combos vary which
+    specific ones pass between runs (genuine minor flake inside this bucket only), but the
+    aggregate (20 fail / 4 pass) and the "it's always Tomcat" pattern are 100% stable.
+
+So this was never really an "inversion" in the sense the flag implied (same tests
+flipping which way they fail) — it is a **single client implementation
+(`TomcatWebSocketClient`, backed by `org.apache.tomcat.websocket.WsWebSocketContainer`,
+which drives `java.nio.channels.AsynchronousSocketChannel` directly) that is badly broken
+under CratonVM, stably, while the two other client backends (Jetty's own NIO client,
+Reactor Netty's event loop — neither touches `AsynchronousSocketChannel`) are fully
+reliable.** The two historical baseline numbers (48/24 then 24/48) are best explained as
+two different snapshots of this same still-partially-broken area during the active,
+multi-day fix effort visible in `git log -- native-io/src/async_socket.rs` (`ef6513f5`
+"fix tomcat async socket and nested class metadata", `77bac458` "deliver
+AsynchronousSocketChannel handler-form read completions", `c58ec7a4` "AsynchronousSocketChannel
+Future-write never advances source buffer position" — the last of these landed literally
+hours before this investigation started) — i.e. exactly the kind of "two different
+in-progress states of the same ongoing fix, misread as a clean inversion" scenario this
+doc's own methodology warns about elsewhere (section 4's "combined fix interaction"
+discussion).
+
+**Root-cause investigation (`CRATONVM_DBG_AIO=1`, a new permanent opt-in diagnostic added
+to `native-io/src/async_socket.rs` this session, same pattern as `socket_channel.rs`'s
+existing `CRATONVM_DBG_SC_READ`/`CRATONVM_DBG_SC_CLOSE`)**: traced every Future-form and
+handler-form `AsynchronousSocketChannel` read/write dispatch, worker completion, and
+Java-side delivery, with hex previews. For every failing `TomcatWebSocketClient` combo
+observed:
+
+1. The HTTP Upgrade handshake write/read completes correctly (bytes match a normal
+   101-Switching-Protocols exchange).
+2. For the close-related sub-tests, the server's WS close frame is received correctly via
+   a handler-form background read (confirmed byte-exact: an unmasked 4-byte
+   `88 02 <2-byte status>` frame), and the client's own close-frame echo is written back
+   correctly (masked 8-byte frame, status decodes to `1001`/`GOING_AWAY` where expected —
+   matches `sessionClosing()`'s assertion).
+3. **Then nothing else ever happens on that connection.** No further read is dispatched,
+   no further write, no `AsynchronousSocketChannel.close()` call (confirmed: 0 hits on a
+   trace point placed at the top of `aio_asc_close`, across the *entire* 72-test run,
+   passing and failing tests alike — Tomcat's client never reaches that call on the path
+   that hangs). The Java-level `Mono`/session simply never resolves, and ~1-5s later the
+   test fails with either `IOException: TimeoutException` (an internal Tomcat timeout) or
+   the outer Reactor `Mono.block(5s)`'s own `IllegalStateException: "Timeout on blocking
+   read"`.
+4. Ruled out as *not* the cause: a swallowed exception from the `CompletionHandler`
+   Java callback (`deliver_completed`'s `ctx.invoke(...)` result was discarded before this
+   session — instrumented it, 0 occurrences of a thrown/failed invoke across every run);
+   `CompletableFuture.complete()` not reaching real-JDK `postComplete()` semantics
+   (`native_cf_complete` already special-cases real-JDK CFs correctly — verified by
+   reading, not just by absence of symptoms).
+
+**Conclusion: the byte-level network I/O is correct. The actual hang is in Java-level
+session/lifecycle logic above the natives this session was able to trace** (most likely
+something Tomcat's `WsSession`/`WsFrameClient` does after processing the received close
+frame — e.g. invoking the JSR-356 `Endpoint.onClose()` callback chain that ultimately
+signals Spring's `TomcatWebSocketSession`'s completion `Sinks.Empty<Void>` — that this
+session did not have tooling to trace further without bytecode-level instrumentation of
+Tomcat's own class files, which was out of scope). **Left OPEN.**
+
+**One genuine, narrowly-scoped bug found and fixed along the way (does NOT fix the above
+hang, confirmed by re-testing after landing it — still 72/52/20 identically)**:
+`aio_asc_close`/`aio_assc_close` only ever removed the registry/`fd_table` entry
+(`aio_remove`/`fd_table().close()`), which drops *that one* fd's `Arc`/table slot but does
+**not** unblock a worker thread already parked in a blocking `read()` on an independent
+`try_clone()`'d duplicate of the same socket (any in-flight handler-form read spawns
+exactly such a clone) — a real `AsynchronousCloseException`-contract violation: JDK spec
+requires outstanding ops to complete on `close()`, CratonVM silently left them hanging
+forever instead. Fixed by calling `shutdown(Both)` on the socket (which, unlike
+`close()`/`drop()`, acts on the shared OS socket rather than one fd, so it wakes every
+clone) before removing the registry/table entry, for both the legacy `aio_registry` id
+space and the `fd_table` id space (channels connected via the newer Future-form
+`connect` — this is the one every `TomcatWebSocketClient` connection observed in practice
+actually uses; `read_aio_id`'s stored id is `AIO_REG_BASE`-relative to tell the two apart).
+Verified: `cargo test -p cratonvm-native-io --lib --release` 349/349 passed (matching
+`c58ec7a4`'s own baseline, no regression). Real fix, real (if different) bug — kept because
+it is independently correct per the JDK contract even though it does not move this
+class's numbers; a future session chasing a `close()`-while-reading race elsewhere would
+otherwise hit the exact same silent-hang shape this fix now closes.
+
+**For whoever picks this up next**: the diagnostic (`CRATONVM_DBG_AIO=1`, plus
+`KRUN_STACK=1` for full stack traces) is already in place and cheap (env-var gated, zero
+cost when unset). The next step is almost certainly tracing *inside* Tomcat's own
+`WsFrameClient`/`WsSession` close-handling bytecode (or Spring's
+`TomcatWebSocketSession`) rather than anything further in `native-io` — the native layer
+has been shown byte-correct for this specific failure shape. Repro:
+`cratonvm --java-home <jdk25> --enable-native-access=ALL-UNNAMED KRun
+org.springframework.web.reactive.socket.WebSocketIntegrationTests` (any of the four
+`TomcatWebSocketClient` sub-tests of `sessionClosing`/`subProtocol`/`cookie` is a fast,
+usually-reproduces-first-try repro; `echo`/`largePayload` fail 4/4 every single run and
+are the most deterministic repro if a 100%-reliable one is needed).
