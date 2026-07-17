@@ -2548,6 +2548,201 @@ Artifacts this session: fresh binary + worktree at
 closed; this one still blocks declaring `hib-misc-residuals-20260716.md`
 fully closed.
 
+
+## Update 2026-07-17/18 (concurrency-investigation session): confirmed real multi-thread execution reaches the vulnerable window; found and flagged a genuinely new, distinct CountDownLatch/AQS hang under thread churn (not fixed by the same-day `cce6e1c6` GC-barrier fix); could NOT connect concurrency to the AIOOBE's silent-corruption signature despite direct targeted testing; 5 consecutive clean full-harness runs this session (0/132 AIOOBE across every attempt, spanning both sides of `cce6e1c6`) — still OPEN, no fix landed for this specific bug
+
+This session picked up a dimension no prior session on this item had
+examined: whether CratonVM's own multi-thread execution or its JIT/GC
+runtime's own thread-coordination machinery (not just single-threaded
+GC-root-scanning of one thread's JIT frames) is implicated, following the
+explicit precedent that a real, now-fixed concurrency bug
+(`Executors.new*ThreadPool*`'s GC-relocation-stale-return-value defect,
+`62be72a0`, `docs/internal/fixed-suite-bugs/hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md`)
+already exists in this exact codebase area.
+
+**Confirmed real concurrent execution reaches the vulnerable window.** Live
+`ps -T`/`/proc/<tid>/comm` inspection of a real `CratonRunner`/`selectClass`
+run of `DefaultCatalogAndSchemaTest` (default settings) shows five real OS
+threads alive simultaneously during metadata building — the exact phase
+that calls `NamingHelper.hashedName`: the launcher thread, `main-vm` (the
+interpreter thread that runs the JUnit5 launcher and Hibernate boot code),
+`cratonvm-jit-co[mpiler]` (the process-wide background tiered-compilation
+thread — started idempotently on the first interpreter invocation hook per
+`jit/src/tiered.rs::ensure_background_compiler`, present even when
+Java-level execution is single-threaded), `Hibernate Conne[ction Pool
+Validation Thread]` (spawned by
+`org.hibernate.engine.jdbc.connections.internal.PoolState.startIfNeeded()`
+via `Executors.newSingleThreadScheduledExecutor` — confirmed via direct
+source read of `PoolState.java:44-48`; this thread is created fresh once
+per `SessionFactory` build, i.e. up to 132 times per class run, so this is
+genuine repeated thread CHURN throughout the run, not just a single
+persistent extra thread), and `junit-jupiter-t[imeout-watcher]` (JUnit5's
+`TimeoutExtension` — confirmed via `javap` on the real
+`junit-jupiter-engine-6.0.3.jar` that even `Timeout.ThreadMode.SAME_THREAD`,
+the mode this harness's global `-Djunit.jupiter.execution.timeout.default=120s`
+resolves to absent parallel-execution config, still runs a
+`ScheduledExecutorService`-backed watchdog thread).
+
+**However, `NamingHelper.hashedName` itself is not directly invoked by
+multiple Java threads concurrently** — JUnit test execution is
+single-threaded absent explicit parallel-execution config (none found in
+this harness: no `junit-platform.properties`, no
+`junit.jupiter.execution.parallel.enabled` in `common.args`, confirmed via
+jar/classpath inspection). The concurrency is in the surrounding VM/runtime
+machinery (background JIT compiler, connection-pool thread, timeout-watcher
+thread churn), not in two threads racing to call
+`smallToString`/`divideMagnitude` at the same instant.
+
+**Found and cleanly isolated a new, highly-reproducible CratonVM
+concurrency bug** while probing this angle with purpose-built synthetic
+repros (`MultiThreadDivRepro.java`, `CdlSpawnRepro.java`,
+`MultiSpawnRepro.java`, `MinimalThreadRepro.java`, `ThreadChurnHashRepro.java`
+— all kept at `/data/data/tmp/idxlen-repro-20260717/` on the shared host):
+4 threads each doing 50,000 trivial allocations then
+`CountDownLatch.countDown()` (no `Thread.join()` anywhere), released via a
+shared start latch, under `CRATONVM_DBG_GC_STRESS=65536` (`CdlSpawnRepro.java`)
+**hangs reliably on the very first round** — `CountDownLatch.await(30,
+SECONDS)` times out with `getCount()==1` (one thread's countdown is never
+observed), on both a pre- and a **post**-`cce6e1c6` build (see below).
+Cross-checked plain concurrent execution (4 threads dividing
+`BigInteger`s concurrently, no churn, no stress: clean, 0/80,000) and plain
+thread churn without a `CountDownLatch` (`MultiSpawnRepro.java`, `Thread.join()`
+instead: clean, sub-second per round even under the same stress level) —
+isolating the defect specifically to the `CountDownLatch`/monitor-wait path
+under concurrent thread activity, not to concurrency or thread churn alone.
+
+**This independently corroborates — via a completely different, from-first-principles
+repro built without knowledge of it — a separate, concurrently-running
+session's same-day discovery of "a genuine livelock in the GC barrier's
+`expected`/`arrived` accounting under rapid thread churn"** in the identical
+subsystem (`vm/src/threading/gc_barrier.rs`), documented in
+`docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md` (§5.8 follow-up #3,
+commit `6e5f4582`, reproduced there at only ~1/70 via a `ThreadGroup`/ordinary
+`Thread` churn harness). That session's follow-up (§5.8 follow-up #5, commit
+**`cce6e1c6`**, landed mid-way through this session) root-caused and fixed
+one concrete instance of the mechanism: the *contended* branch of
+thread-termination's "notify waiting `Thread.join()`ers" step called
+`GcBarrier::enter_blocked()` without first calling `deposit_root_snapshot()`,
+so a terminating thread parked in `Monitor::block_enter()` while a `join()`er
+held its monitor was silently counted in a GC pause's `expected` quota with
+no way to ever arrive.
+
+**This session rebuilt from `cce6e1c6` (frozen + md5-verified at
+`/data/data/frozen-hib-biginteger-concurrency-v2-20260717/cratonvm-concurrency-v2-20260717`,
+md5 `155b9ac81cc6ee89f95bd544c1c8a3fe`) and re-ran `CdlSpawnRepro` against it
+— it still hangs, identically.** This is expected, not a refutation of
+`cce6e1c6`: `CdlSpawnRepro`'s threads never call `Thread.join()`, so they
+cannot hit the exact contended-monitor branch that fix targeted. A fresh
+`CRATONVM_DBG_STW_CENSUS=1` capture on the post-fix build additionally shows
+the GC barrier itself is **not** stuck this time — many consecutive STW
+generations complete successfully (`arrived==expected` cycling cleanly
+through 2502→2507+ during the hang) while the repro's `CountDownLatch`
+still never reaches zero. This means `CdlSpawnRepro`'s hang is likely a
+**different bug entirely** from the GC-barrier accounting family — most
+likely a genuine lost-wakeup/lost-notification defect in the
+`CountDownLatch`/monitor-wait implementation itself (`native_cdl_await`/
+`native_cdl_count_down`, `vm/src/vm/vm_exec.rs`'s `monitor_wait`,
+`vm/src/threading/monitor.rs`), closer in spirit to the
+`Executors.new*ThreadPool*` precedent bug's family than to the GC-barrier
+livelock family. **Not investigated to a fix this session** — flagged as a
+standalone follow-up (spawned task, self-contained repro instructions
+included) rather than chased further here, since it is a distinct
+concurrency bug from the AIOOBE this doc tracks and the connection to it
+(next paragraph) came back negative.
+
+**Could NOT connect any of the above — the CDL hang, thread churn, or plain
+concurrent BigInteger execution — to the AIOOBE's silent-corruption
+signature, despite direct, targeted testing.** `ThreadChurnHashRepro.java`
+inlines `NamingHelper.hashedName`'s exact MD5-pad-hash +
+`BigInteger(1, digest).toString(35)` algorithm byte-for-byte (no Hibernate
+classpath dependency needed) and was run for 2000 rounds × 3 threads × 50
+calls/thread (300,000 real `hashedName`-shaped calls, genuine thread
+create/exit churn every round) against the doc's own previously-confirmed-crashing
+frozen binary (`cratonvm-idxlen-20260717`, `dev@38192937`) —
+**deliberately without `CRATONVM_DBG_GC_STRESS`**, since that flag reliably
+triggers the (unrelated) CDL hang above and would mask any AIOOBE signal.
+**Result: 0/300,000, no hang, no exception, ~46s wall time.** The
+non-churning, purely-concurrent 4-thread divide test (no stress) was
+likewise clean (0/80,000, sub-second).
+
+**Full end-to-end harness reproduction status this session: 0/5, the
+cleanest run of runs this saga has recorded to date.** Five independent,
+complete `CratonRunner`/`DiscoverySelectors.selectClass` runs, no
+concurrency-specific env vars beyond one with `CRATONVM_DBG_AIOOBE3=1`
+enabled (to guarantee a capture if it fired): the original
+`cratonvm-idxlen-20260717` frozen binary (`dev@38192937`) — `found=132
+ok=132 failed=0`; three runs of a freshly built, md5-verified
+`dev@6e5f4582` binary (`cratonvm-concurrency-20260717`, before `cce6e1c6`
+landed) — `found=132 ok=132 failed=0` × 3 (one with
+`CRATONVM_DBG_AIOOBE3=1 -Dcraton.trace=true`, zero `AIOOBE3-DIAG` captures);
+one run of the post-`cce6e1c6` rebuild (`cratonvm-concurrency-v2-20260717`,
+`dev@cce6e1c6`) — `found=132 ok=132 failed=0`. Zero
+`ArrayIndexOutOfBoundsException` anywhere, across all five. Per this doc's
+own long-standing, repeatedly-reconfirmed "absence of failure is not
+evidence of a fix" conclusion (established across at least four prior
+sessions that each independently hit both the "reliable ~50%" and "0/N
+clean" polarities on ostensibly-equivalent code, sometimes the same day),
+**this is not read as evidence the AIOOBE is fixed or has become rare** —
+only as this session's own data point on the doc's documented "clean" side
+of its bimodal reproduction pattern. Notably, `cce6e1c6`'s own tripwire
+diagnostic (an always-on cross-check in `stw_take_over_and_wait` comparing
+the barrier's legacy `blocked_count()` against the registry's
+`in_blocked_region` census whenever the takeover loop stalls 64+ rounds) did
+not fire in any of this session's runs either, for what that is worth.
+
+**Verification (regression only — no code change landed for the AIOOBE
+this session):** `cargo test --release -p cratonvm-jit --lib`: 906/906
+pass. `cargo test --release -p cratonvm-gc --lib`: 880/880 pass. `cargo test
+--release -p cratonvm-vm --lib`: 2201 passed / 16 failed — the exact,
+previously-documented pre-existing debug-build-only `lock_order` +
+already-broken `jit::skip_list` baseline this doc's history has repeatedly
+confirmed are environmental, not regressions (matches every prior session's
+count for this target).
+
+**Assessment.** The concurrency angle this investigation was explicitly
+tasked with examining is real and was pursued with positive engineering
+rigor for the first time in this saga (a working, independently-reproduced,
+now cross-referenced OTHER concurrency bug in the identical broad subsystem,
+rather than the purely negative "didn't find anything" pattern every
+single-threaded session before it produced) — but it does **not** appear to
+be the mechanism behind this specific AIOOBE: the one hypothesis that would
+connect them (thread churn interacting with an in-flight
+`BigInteger`/`divideMagnitude` computation) was tested directly, at volume,
+with the exact production algorithm, and came back clean both before and
+after a real, unrelated fix landed in the same subsystem. Combined with
+this session's uncharacteristically clean 5/5 full-harness reproduction
+attempts, the balance of evidence this session gathered leans (without
+proof, per this doc's own standing caution) toward "not concurrency, and
+possibly incidentally rarer or fixed by some recent change" — but per this
+doc's ten-session history of that exact impression being wrong on both
+sides more than once, **this item is NOT being closed or moved to
+`docs/internal/fixed-suite-bugs/`**. The concurrency hypothesis specifically
+should be considered **explored and not supported by direct evidence** (not
+"ruled out with certainty," since a bimodal/heisenbug this fragile resists
+certainty either way) — a future session should not need to re-derive the
+threading-model facts established here (no JUnit parallel execution, real
+but indirect thread churn via Hibernate's connection-pool validation thread,
+background JIT compiler thread always present) but should look elsewhere
+for the AIOOBE's mechanism, or spend a dedicated session attempting the
+now-larger battery of full-harness reproduction (this session's 0/5 joins
+several prior sessions' both-polarity results; the doc's own established
+"practical recommendation" — pivot to `CRATONVM_DBG_JIT_DISASM` +
+same-process `gdb` double-capture the moment a live hit lands — remains the
+most concrete unclaimed next step whenever that happens).
+
+**New standalone finding spun off as a follow-up task** (not part of this
+item, tracked separately): the `CountDownLatch`/monitor-wait hang under
+thread churn + heavy GC pressure (`CdlSpawnRepro.java`, reproduces on
+round 1 of 1, dramatically more reliable than the GC-barrier livelock's
+documented ~1/70) is a genuine, distinct, still-open CratonVM concurrency
+bug, confirmed NOT fixed by `cce6e1c6`. Self-contained repro and analysis
+left for whoever picks it up next.
+
+No code change landed for the AIOOBE this session. `git fetch origin dev`
+immediately before this edit confirms tip `cce6e1c6`; no other session has
+touched this doc's `DefaultCatalogAndSchemaTest` section since the entry
+above.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`

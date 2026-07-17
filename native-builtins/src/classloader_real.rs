@@ -90,13 +90,10 @@ fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value)
     if dbg {
         eprintln!("[UCLREG-DBG] <init> count={count} extracted={:?}", paths);
     }
-    if !paths.is_empty() {
-        tracing::debug!(
-            "URLClassLoader.<init> (real-JDK): registering {} URL(s) to classpath",
-            paths.len()
-        );
-        ctx.register_dynamic_classpath(&paths);
-    }
+    // A URLClassLoader owns an isolated search path. Publishing constructor
+    // URLs into CratonVM's process-wide application path made later temporary
+    // loaders observe resources from earlier ones. The URLClassLoader natives
+    // resolve from the recorded per-loader URLs, so do not flatten them here.
 }
 
 /// Cached system/platform classloader objects (created lazily).
