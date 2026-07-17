@@ -176,23 +176,54 @@ This document tracks the **genuine remaining failures**.
     Family (b) was NOT separately root-caused — fixing family (a) made it disappear too on this
     class, most likely because mockk's `JvmSignatureValueGenerator.instantiate()` (decompiled from
     `mockk-jvm-1.14.5.jar`, `io/mockk/impl/recording/JvmSignatureValueGenerator.class` — the exact
-    class flagged as the prime suspect in the `RestClientExtensionsTests` residual writeup below)
+    class flagged as the prime suspect in the `RestClientExtensionsTests` entry below)
     shares the identical `sealedSubclasses`/`getPermittedSubclasses0()` code path for dummy-value
     generation during argument-signature detection, and some earlier-executing method on the same
     mock's declared surface (e.g. `ResponseSpec#onStatus(Predicate<HttpStatusCode>, ...)`) was
     likely throwing/corrupting mockk's internal signature-detection state before the later PTR-arg
-    calls were ever reached. **Not independently reconfirmed against `RestClientExtensionsTests`**
-    itself — that class's Kotlin test sources aren't currently compiled/testcp'd on the Azure host,
-    and building a fresh spring-web test module was out of scope this session given host disk/load
-    pressure (load average briefly exceeded 120 mid-session; see
-    `azure-host-disk-full-flapping-20260715`). Given the identical symptom shape and shared
-    mechanism, re-verifying `RestClientExtensionsTests` against this fix is a strong, low-effort
-    next step for whoever picks it up next — likely fixed or substantially improved, but unverified
-    as of this writing.
+    calls were ever reached. **Independently reconfirmed against `RestClientExtensionsTests` on
+    2026-07-17 — also FIXED**, same mechanism; see the dedicated entry immediately below for the
+    full re-verification writeup.
   *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
     hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
     (`java.io.tmpdir` honoring).
+*   **mockk `verify{}` matcher failures on `ParameterizedTypeReference`-typed args** (`web.client.RestClientExtensionsTests`) — **FIXED, independently reconfirmed 2026-07-17**
+  *   **Original status (through 2026-07-16, see [[restclientextensions-mockk-verify-ptr-residual]]
+    for the full original investigation)**: all 5 tests failed with
+    `io.mockk.MockKException: Can't instantiate proxy for class RestClient$RequestBodySpec`
+    (`AnnotatedTypeFactory$AnnotatedTypeBaseImpl.getAnnotatedOwnerType()` NPE, `location` null); this
+    was fixed by the unrelated AnnotatedType location seed (dev `3ee5ffaf`,
+    `annotated_type_fill_bookkeeping`), taking the class from 0/5 to 2/5. The residual 3/5
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) was
+    `java.lang.AssertionError: Verification failed ... body(eq(ParameterizedTypeReference<List<?
+    extends Foo>>)) ... arguments are not matching`, with the recorded arg and the verify matcher
+    rendering IDENTICALLY yet mockk's `eq` (`.equals`-based) reporting no match. Two hypotheses
+    (Type-equality bug, identity-hashCode magnitude) were both ruled out by standalone kotlinc
+    repros; remaining suspicion landed on mockk's `JvmSignatureValueGenerator`/`sealedSubclasses`
+    dummy-value-generation path (same class flagged in the `WebClientExtensionsTests` entry above),
+    but this was never pinned down to a CratonVM source line before this session.
+  *   **2026-07-17 reconfirmation**: built a fresh `dev`-tip worktree
+    (`/data/data/wt-restclientext-confirm-20260717`, branch `confirm/restclientext-20260717`, tip
+    `08808a57`, which contains `ce6bf419` — the `Class.getPermittedSubclasses0()` loader-aware-resolution
+    fix documented in the `WebClientExtensionsTests` entry above). `spring-web`'s Kotlin test sources
+    weren't previously compiled/testcp'd on this host, so they were built fresh via Gradle
+    (`/data/data/spring-framework-recheck` checkout, `:spring-web:testClasses`, JDK25
+    (`/home/victor/jdk25`, the system `/usr/bin/java` is a JRE-only OpenJDK21 install with no
+    `javac`), a private `GRADLE_USER_HOME` (`/data/tmp/gradle-home-restclientext-20260717`, seeded
+    from an existing cache then topped up online for a handful of newer Jackson/rsocket artifacts
+    not yet cached) to avoid colliding with other concurrent sessions' Gradle daemons/caches on this
+    host). Ran the real `org.springframework.web.client.RestClientExtensionsTests` class via the
+    standard `KRun` JUnit5-Launcher driver against the generated `spring-web` test runtime classpath
+    (205 entries) on the fresh binary. **Result: `found=5 succ=5 fail=0` — all 5 tests pass**,
+    reproduced identically across 4 consecutive runs (no flakiness). This is up from the previously
+    documented 2/5; the 3 previously-failing `verify{}`-matcher tests
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) now all pass.
+  *   **Conclusion**: confirms the fixing agent's hypothesis for `WebClientExtensionsTests` — both
+    classes' `verify{}` matcher failures were the same root cause
+    (`JvmSignatureValueGenerator.instantiate()`'s `sealedSubclasses`/`getPermittedSubclasses0()`
+    dummy-value-generation path), and `ce6bf419` fixes both. **Status: FIXED, no further action
+    needed for this class.**
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
   *   **Status**: **FIXED** (2026-07-16, `resolve_field_ref_loader_aware` — see the "2026-07-16 update #2" section below for full verification). The original `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119` no longer reproduces. The class still does not reach 5/5 OK — the remaining 2/5 fail on an unrelated, pre-existing, documented host-environment gap (`java.lang.classfile.ClassFile` needs JDK24+; this host only has JDK17/21).
   *   **2026-07-16/17 addendum (independent parallel investigation, unresolved flag for follow-up)**: a separate session investigating this same bug (before discovering this fix had already landed) built and stress-tested an equivalent re-entrant fix and additionally ran a memory/RSS stress check that the verification above did not cover: a single larger, loader-heavy AOT-cluster class (`BeanDefinitionMethodGeneratorTests` alone, real in-process javac, 34 test methods) grew the VM process's RSS past 4GB and was OOM-killed by the kernel (`sudo dmesg`: "Out of memory: Killed process ... (cratonvm-fieldr) total-vm:8856216kB anon-rss:4063936kB"), and the flagship repro itself ran roughly 60-100x slower than baseline (2.2s to 135-280s across runs) with an equivalent fix applied. This happened on a host that was ALSO under severe, independent, confirmed disk-full/memory pressure at the time (dmesg shows an unrelated `rustc` process OOM-killed in the same general window; both `/dev/root` and `/data/data`'s backing volume were at or near 100% full) — so it is NOT conclusively proven this fix specifically causes unbounded memory growth outside that already-degraded environment. This session's own attempt to re-verify directly against this exact landed commit was itself blocked by the same disk-full condition recurring (`cargo build` failing with "No space left on device" mid-archive-write) before it could be settled either way. Recorded here, unresolved, as a flag for follow-up: re-run the same stress scenario (a single heavy, loader-forking AOT test class, watching peak RSS over the whole run, not just pass/fail) on a host with real headroom before treating this fix as fully hardened for broad, unattended CI use.
@@ -307,7 +338,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
-| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-17 re-triage: FAIL 8/3/5** — the two previously-documented failure modes ((a) cold-attach, (b) ByteBuddy "Cannot resolve T") are CONFIRMED GONE on current dev tip; a third, distinct, NOT-yet-root-caused AssertJ reflection residual now blocks the remaining 5, see below |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **FIXED (2026-07-17, commit TBD)** — **OK 8/8**. The AssertJ `IntrospectionError` residual root-caused to loader-identity-blind exception-handler catch-type matching (NOT a stale-ObjectRef/GC bug, see below) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | **FIXED (2026-07-17, commit `9af322e4`)** — **OK 14/14** |
 
@@ -662,6 +693,84 @@ the WRONG same-named copy. Eight fixes landed on
     style loader from calling code loaded by a *different* loader in the
     same process, since the one common thread across all 5 failures is that
     exact cross-loader-reflection shape post-real-compile.
+
+    **FIXED (2026-07-17).** The stale-ObjectRef/GC hypothesis above was
+    investigated and REFUTED: `CRATONVM_DBG_FIELD_INTROSPECT` (temporary
+    probe broadened to log any Rust-raised exception whose live frames sit
+    inside `org.assertj.core.util.introspection.*`) showed AssertJ's own
+    `FieldSupport`/`FieldUtils.readField` path never throws at all — the
+    field access genuinely succeeds. `CRATONVM_DBG_ATHROW` confirmed the
+    final exception seen by JUnit is a bytecode-level rethrow with the EXACT
+    stack trace of the ORIGINAL property-getter `IntrospectionError`
+    (`Introspection.getPropertyGetter`, "No getter for property" —
+    constructed via the 1-arg constructor, so `getterInvocationException()`
+    is empty) — which, per AssertJ 3.27.7's own decompiled bytecode
+    (`PropertyOrFieldSupport.getSimpleValue`), should only resurface as-is
+    if the *field*-side attempt inside its `catch (IntrospectionError e)`
+    block ALSO threw `IntrospectionError`. Since `FieldSupport` never
+    throws, the only remaining explanation was that the exception was
+    escaping `getSimpleValue`'s own `catch (IntrospectionError e)` clause
+    entirely — i.e. a JVM-level exception-*dispatch* bug, not a
+    stale-reference bug.
+
+    Root-caused with a second temporary probe
+    (`CRATONVM_DBG_EXC_HANDLER_MATCH`, instrumenting all three
+    exception-handler catch-type matching sites in
+    `vm/src/runtime/interpreter.rs`): `find_exception_handler_impl`,
+    `find_exception_handler_pc_unknown`, and
+    `route_jit_exception_through_method` all resolve a `catch_type`'s class
+    via `ClassManager::find_class_by_name` — a flat, global, name-only
+    lookup — instead of the loader-faithful `resolve_class_loader_aware`
+    already used for `new`/`checkcast`/`instanceof`/`ldc X.class`
+    resolution. The probe showed `catch_class_id` pinned at a single
+    `ClassId` for `org/assertj/core/util/introspection/IntrospectionError`
+    across the whole run, while `exc_class_id` (the actual thrown object's
+    class) took on a DIFFERENT `ClassId` — also named
+    `IntrospectionError` — on every one of the 4 distinct forked-loader
+    test-method invocations that failed (one match, four mismatches,
+    matching the observed 3-pass/5-fail split exactly). Spring's
+    `CompileWithForkedClassLoaderClassLoader` forks a brand-new
+    `ClassLoader` per test method whose `loadClass` is supposed to delegate
+    up its parent chain for ordinary library classes like AssertJ's; each
+    fork ends up with its own independently-defined copy of
+    `IntrospectionError` (and presumably the rest of
+    `org.assertj.core.util.introspection.*`), so `is_subclass_of(exc_class_id,
+    catch_class_id)` — comparing two `ClassId`s that are logically "the
+    same class" but not identical — returned `false`, letting the
+    exception escape a `catch` block it should have matched.
+
+    **Fixed** in `classloading/src/class.rs`
+    (`Class::is_subclass_of_by_name`) and `classloading/src/class_manager.rs`
+    (`ClassManager::is_subclass_of_by_name`): walks the thrown exception's
+    superclass chain (interfaces are never valid catch types per JVMS
+    SS4.7.3, so only superclasses are walked) comparing each ancestor's OWN
+    name to the catch type's name textually, ignoring `ClassId` identity.
+    Wired in as an `||` fallback alongside the existing `ClassId`-based
+    `is_subclass_of` check at all three call sites in
+    `vm/src/runtime/interpreter.rs`, so it can only ever catch MORE
+    exceptions that HotSpot would also catch, never change already-correct
+    behavior (same accepted-tradeoff pattern as
+    `native_class_get_declaring_class`'s loader-aware fallback elsewhere in
+    this codebase). A full loader-faithful fix (resolving `catch_type` via
+    `resolve_class_loader_aware`) would be more principled but needs
+    `&mut JvmThread` threaded into all three matching functions and their 8
+    call sites (none currently take it) — left as a follow-up; the
+    by-name fallback is a low-risk, immediately-effective fix for the
+    observed symptom.
+
+    Verified: `found=8 succ=3 fail=5` -> `found=8 succ=7 fail=1` on this
+    fix alone (all 5 `IntrospectionError` failures gone); after merging
+    fresh `origin/dev` (which had since landed `9af322e4`, the unrelated
+    `Files.walkFileTree` GC-root-pinning fix that the 1 residual failure
+    matched exactly) -> **`found=8 succ=8 fail=0`**, full class clean.
+    Regression suites on the merged tip: `cargo test -p cratonvm-gc --lib
+    --release` 791/791 passed; `cargo test -p cratonvm-native-builtins --lib
+    --release` 3000/3000 passed (6 ignored); `cargo test -p cratonvm-vm --lib
+    --release` 2201 passed / 16 failed, all 16 matching the
+    already-documented pre-existing lock_order/skip_list release-mode
+    baseline noise (see the `ApplicationContextAotGeneratorTests`
+    2026-07-17 third-reverification entry above for the same baseline
+    signature) — zero failures touch exception dispatch or classloading.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,
