@@ -1427,6 +1427,9 @@ mod tests {
         fn resolve_field_index(&self, c: &str, f: &str) -> Option<usize> {
             self.inner.resolve_field_index(c, f)
         }
+        fn resolve_field_index_by_class_id(&self, c: ClassId, f: &str) -> Option<usize> {
+            self.inner.resolve_field_index_by_class_id(c, f)
+        }
         fn method_exists(&self, c: &str, m: &str, d: &str) -> bool {
             self.inner.method_exists(c, m, d)
         }

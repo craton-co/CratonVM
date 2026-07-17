@@ -878,6 +878,51 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         if let Some(id) = read_reg_id(ctx, this) {
+            // Diagnostic (CRATONVM_DBG_SC_CLOSE=1, added 2026-07-16 during the
+            // StompWebSocketIntegrationTests investigation): trace every
+            // SocketChannel.close() with local/peer address + wall-clock time.
+            // Confirmed the server side closes a just-upgraded WebSocket
+            // connection (via this exact native) within ~40ms-2s of the
+            // handshake completing, before the client's first post-handshake
+            // frame write — root cause of that class's TIMEOUT still open, see
+            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md. Kept as a
+            // permanent opt-in hook (zero cost when unset) for whoever
+            // continues that investigation, matching CRATONVM_DBG_NET /
+            // CRATONVM_DBG_STALE_RECV etc.
+            if std::env::var_os("CRATONVM_DBG_SC_CLOSE").is_some() {
+                let (local, peer) = match tcp_registry().read().get(&id) {
+                    Some(TcpHandle::Stream(s)) => (
+                        s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                        s.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    ),
+                    _ => (String::new(), String::new()),
+                };
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                eprintln!(
+                    "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
+                );
+                // 2026-07-16 follow-up: pin the exact Java call site issuing
+                // this close(). `NativeContext::capture_stack_trace` needs no
+                // `Thread` object handle -- it walks the CURRENT thread's live
+                // Java call stack, which is exactly the thread executing this
+                // native (the one that called SocketChannel.close()). Gated
+                // behind the same env var; printed innermost-frame-first (the
+                // `close()` caller itself first, working outward) to match
+                // conventional stack-trace reading order -- `capture_stack_trace`
+                // itself returns outer->inner, so reverse it here.
+                let raw_trace = ctx.capture_stack_trace(0);
+                eprintln!("[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)", raw_trace.len());
+                for entry in raw_trace.iter().rev() {
+                    let file = entry.source_file.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  at {}.{}({}:{})",
+                        entry.class_name, entry.method_name, file, entry.line_number
+                    );
+                }
+            }
             // Force the write-side FIN now. A selector this channel was
             // registered with holds a `try_clone()`d duplicate of the socket
             // (see `nio_selector::selector_register`); on Windows, closing only
@@ -1089,7 +1134,22 @@ fn sc_connect_inner(
         // cloud-metadata IPs like 169.254.169.254) and (2) applies the
         // configured connect timeout (default 30 s) so a black-hole target
         // can't pin the VM thread for the OS-default ~2 minutes.
-        let stream = match crate::outbound_policy::policy_connect(&target) {
+        //
+        // GC/STW-cooperation: `policy_connect` performs a genuine OS-level
+        // blocking `connect()` (up to the configured timeout). This is the
+        // path taken whenever a `SocketChannel` is used in its default
+        // blocking mode (i.e. before `configureBlocking(false)` is called,
+        // or via `sun.nio.ch.SocketAdaptor.connect()` — see
+        // `sc_blocking_connect` above) — unlike the non-blocking branch
+        // below, which never blocks the OS thread. Bracket it in
+        // `begin_blocking_region`/`end_blocking_region` so a concurrent STW
+        // pause (JIT takeover or GC) does not count this thread as an
+        // expected cooperator and wait on it forever. Same pattern as
+        // `socket_accept`/`socket_connect` in `plain_socket.rs`.
+        ctx.begin_blocking_region();
+        let connect_result = crate::outbound_policy::policy_connect(&target);
+        ctx.end_blocking_region();
+        let stream = match connect_result {
             Ok(s) => s,
             Err(crate::outbound_policy::PolicyConnectError::Denied(reason)) => {
                 return Err(ioex(format!("connect denied by outbound policy: {reason}")));
@@ -1333,6 +1393,19 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 ///   * Ok(None) when EAGAIN/WouldBlock
 ///   * Ok(Some(-1)) on EOF
 ///   * Err(...) on hard error
+/// FNV-1a 64-bit hash, used only by the `CRATONVM_DBG_SC_READ` diagnostic
+/// below to cheaply fingerprint the bytes a given `sc_read` call actually
+/// delivered, so two calls can be compared for byte-identical content
+/// without dumping full hex payloads into the log.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
     match s.read(buf) {
@@ -1378,27 +1451,149 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         return Ok(Some(Value::Int(0)));
     }
     let mut buf = vec![0u8; len as usize];
+    // The OS read below may enter a GC-blocking region. Keep the Java buffer
+    // rooted and reload it before writing the received bytes back.
+    let bb_pin = ctx.pin_native_root(bb);
 
-    let n_opt = {
+    // GC/STW-cooperation: when the channel is in its default *blocking*
+    // mode (`configureBlocking(false)` never called — see F_BLOCKING /
+    // `sc_connect_inner`'s `allow_block` branch), the underlying
+    // `TcpStream` is left in genuine OS-blocking mode too, so `s.read()`
+    // inside `try_read_nb` below can block indefinitely for data rather
+    // than returning EAGAIN. Bracket the call in
+    // `begin_blocking_region`/`end_blocking_region` unconditionally (cheap
+    // for the common non-blocking case, where the call returns immediately)
+    // so a concurrent STW pause never waits on a thread parked here. Same
+    // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
+    ctx.begin_blocking_region();
+    let read_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_read_nb(s, &mut buf).map_err(|e| map_err("read", e))?
+                let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read", e));
+                ctx.end_blocking_region();
+                r
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
-            _ => return Err(ioex("read: channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Ok(Some(Value::Int(0)));
+            }
+            _ => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(ioex("read: channel not a stream"));
+            }
         }
     };
 
+    let n_opt = match read_result {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(bb_pin);
+            return Err(e);
+        }
+    };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Int(0))), // EAGAIN — JDK convention
+        None => {
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('r', id, &buf[..n as usize]);
+        // Reload `bb` through the pin BEFORE touching it again: the blocking
+        // read above may have crossed a GC pause that relocated the object,
+        // so the original `bb` reference could be stale here (see
+        // `pin_native_root`'s doc comment on this exact hazard). Both the
+        // diagnostic below and the real write path use this reloaded ref.
+        let bb = ctx.read_native_pin(bb_pin, bb);
+        // Diagnostic (CRATONVM_DBG_SC_READ=1, added 2026-07-17 continuing the
+        // StompWebSocketIntegrationTests premature-close investigation): the
+        // prior session pinned the failure to the server dispatching one
+        // client-written STOMP CONNECT frame to Spring's
+        // handleMessageFromClient TWICE, with live gdb confirming exactly 2
+        // physical `sc_read` calls occur before either dispatch (Jetty
+        // backend) — i.e. this native genuinely gets invoked twice, each
+        // apparently returning a real, non-empty payload. Fingerprint every
+        // real (n>0) read with an FNV-1a hash + byte count + the buffer's
+        // `position` field before/after, so a rerun can show directly
+        // whether the two reads return byte-identical content (a
+        // duplicate-delivery bug below `try_read_nb`/the OS socket) or two
+        // genuinely different byte ranges (pointing the remaining
+        // investigation at Jetty's/Tomcat's own frame-parser instead). Kept
+        // as a permanent opt-in hook, zero cost when unset, matching
+        // CRATONVM_DBG_SC_CLOSE's precedent in this same file.
+        if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+            let pos_before = match ctx.get_field_by_name(bb, "position") {
+                Value::Int(v) => v,
+                _ => -1,
+            };
+            let (local, peer) = match tcp_registry().read().get(&id) {
+                Some(TcpHandle::Stream(s)) => (
+                    s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    s.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let hash = fnv1a64(&buf[..n as usize]);
+            let dump_len = (n as usize).min(64);
+            let hex: String = buf[..dump_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!(
+                "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
+            );
+            // 2026-07-17 continuation: a live rerun of StompWebSocketIntegrationTests
+            // against this diagnostic found the Tomcat parameterization's `sc_read`
+            // returning the SAME (id, byte-content) pair dozens of times in a row
+            // (identical FNV-1a hash) at a steady ~20-60ms cadence -- i.e. the
+            // native read layer itself, not just Spring's message dispatch, sees
+            // byte-identical "new" reads. Capture ONE Java stack trace the first
+            // time a read's hash repeats the immediately preceding read on the
+            // same channel id, to pin the exact Tomcat call site re-issuing the
+            // read (only once per repeat streak, to avoid flooding the log across
+            // a long redelivery spin).
+            fn last_read_hash() -> &'static parking_lot::Mutex<HashMap<i32, (u64, bool)>> {
+                static T: OnceLock<parking_lot::Mutex<HashMap<i32, (u64, bool)>>> = OnceLock::new();
+                T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            }
+            let mut streak_started = false;
+            {
+                let mut m = last_read_hash().lock();
+                let entry = m.entry(id).or_insert((0, false));
+                if entry.0 == hash && !entry.1 {
+                    entry.1 = true;
+                    streak_started = true;
+                } else if entry.0 != hash {
+                    *entry = (hash, false);
+                }
+            }
+            if streak_started {
+                let raw_trace = ctx.capture_stack_trace(0);
+                eprintln!(
+                    "[SC_READ_REPEAT_STACK] t={ms} id={id:#x} n={n} fnv1a={hash:#018x} ({} frames)",
+                    raw_trace.len()
+                );
+                for entry in raw_trace.iter().rev() {
+                    let file = entry.source_file.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  at {}.{}({}:{})",
+                        entry.class_name, entry.method_name, file, entry.line_number
+                    );
+                }
+            }
+        }
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
+    ctx.unpin_native_roots(bb_pin);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1416,25 +1611,55 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
-    let n_opt = {
+    // The OS write below may enter a GC-blocking region. Keep the Java buffer
+    // rooted until its position has been advanced after the write completes.
+    let bb_pin = ctx.pin_native_root(bb);
+    // GC/STW-cooperation: same reasoning as `sc_read` above — a
+    // blocking-mode channel's `TcpStream` can genuinely block in
+    // `try_write_nb`'s `s.write()` (e.g. a full socket send buffer with a
+    // slow/stalled peer), so bracket it unconditionally.
+    ctx.begin_blocking_region();
+    let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write", e))?
+                let r = try_write_nb(s, &data).map_err(|e| map_err("write", e));
+                ctx.end_blocking_region();
+                r
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Int(0))),
-            _ => return Err(ioex("write: channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Ok(Some(Value::Int(0)));
+            }
+            _ => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(ioex("write: channel not a stream"));
+            }
         }
     };
 
+    let n_opt = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(bb_pin);
+            return Err(e);
+        }
+    };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Int(0))), // EAGAIN
+        None => {
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
+        let bb = ctx.read_native_pin(bb_pin, bb);
         buffer_advance(ctx, bb, n);
     }
+    ctx.unpin_native_roots(bb_pin);
     Ok(Some(Value::Int(n)))
 }
 
@@ -1493,50 +1718,82 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // so we can advance its position by the bytes actually consumed.
     let arr_len = ctx.array_length(srcs) as i32;
     let (start, end) = vec_window(args, arr_len);
-    let mut chunks: Vec<(ObjectRef, Vec<u8>)> = Vec::new();
+    let mut chunks = Vec::new();
     let mut total: usize = 0;
     for i in start..end {
         if let Value::Object(Some(bb)) = ctx.get_array_element(srcs, i as usize) {
             let bytes = buffer_read_bytes(ctx, bb).unwrap_or_default();
             total += bytes.len();
-            chunks.push((bb, bytes));
+            let pin = ctx.pin_native_root(bb);
+            chunks.push((pin, bb, bytes));
         }
     }
     if total == 0 {
+        for (pin, _, _) in chunks {
+            ctx.unpin_native_roots(pin);
+        }
         return Ok(Some(Value::Long(0)));
     }
     let mut data = Vec::with_capacity(total);
-    for (_, bytes) in &chunks {
+    for (_, _, bytes) in &chunks {
         data.extend_from_slice(bytes);
     }
 
-    let n_opt = {
+    let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))?
+                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
-            _ => return Err(ioex("write(gathering): channel not a stream")),
+            Some(TcpHandle::Connecting(_)) => {
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Ok(Some(Value::Long(0)));
+            }
+            _ => {
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Err(ioex("write(gathering): channel not a stream"));
+            }
+        }
+    };
+    let n_opt = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
+            }
+            return Err(e);
         }
     };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Long(0))), // EAGAIN — JDK convention
+        None => {
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
         // Distribute the written count across the source buffers, advancing
         // each position by the portion of its bytes that made it out.
         let mut remaining = n;
-        for (bb, bytes) in &chunks {
+        for (pin, bb, bytes) in &chunks {
             if remaining <= 0 {
                 break;
             }
             let consume = (bytes.len() as i32).min(remaining);
-            buffer_advance(ctx, *bb, consume);
+            let bb = ctx.read_native_pin(*pin, *bb);
+            buffer_advance(ctx, bb, consume);
             remaining -= consume;
         }
+    }
+    for (pin, _, _) in chunks {
+        ctx.unpin_native_roots(pin);
     }
     Ok(Some(Value::Long(n as i64)))
 }
@@ -1878,6 +2135,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // from that side-channel first so we don't block on a queue that
     // has already been emptied.
     let preaccepted = crate::nio_selector::take_any_pending_accepted(id);
+    let preaccepted_used = preaccepted.is_some();
 
     // Clone listener out so the registry lock isn't held across blocking accept.
     let listener_clone = {
@@ -1925,6 +2183,25 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some((stream, peer)) = accepted else {
         return Ok(Some(Value::Object(None)));
     };
+    // Diagnostic (CRATONVM_DBG_SC_READ=1, shares the read diagnostic's env
+    // var — same investigation): log every successful accept() with the
+    // NEW child id and whether it came from the selector's pre-drained
+    // `pending_accepted` side-channel or a fresh OS `accept()` call. If the
+    // StompWebSocketIntegrationTests repro ever shows TWO child ids for
+    // what should be one client connection (same peer port), that is a
+    // double-accept bug upstream of `sc_read` entirely; if it shows only
+    // ONE id (as expected), the duplicate-CONNECT-dispatch investigation
+    // stays focused on `sc_read` / the buffer fill-and-parse path.
+    if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!(
+            "[SC_ACCEPT] t={ms} listener_id={id:#x} peer={peer} source={}",
+            if preaccepted_used { "preaccepted" } else { "fresh" }
+        );
+    }
 
     // Inherit non-blocking flag of the parent channel.
     let _ = stream.set_nonblocking(!blocking);

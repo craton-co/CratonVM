@@ -281,6 +281,26 @@ pub struct SourceChannel {
     pub read_ready: AtomicBool,
     pub read_suspended: AtomicBool,
     pub shutdown: AtomicBool,
+    /// HC0053 follow-up (2026-07-16): non-reentrant dispatch guard. Real
+    /// XNIO always services a channel's listener from exactly one IO
+    /// thread; here, the dedicated source-poller thread
+    /// (`native_source_poller_run`) and a paired sink's direct
+    /// `resumeWrites`-triggered notify (`notify_paired_source_readable*`)
+    /// can both race to invoke this same source's read listener from two
+    /// different native threads. The real (interpreted) listener code —
+    /// e.g. `org.xnio.streams.BufferPipeInputStream`'s push/pop path —
+    /// synchronizes on more than one object without a globally consistent
+    /// order (it never needs one under real XNIO's single-thread-per-
+    /// channel guarantee), so two concurrent invocations can lock-order-
+    /// invert and deadlock permanently (observed: one invocation holding
+    /// the pipe's internal queue monitor while blocked entering the
+    /// `BufferPipeInputStream` monitor, the other holding that monitor
+    /// while blocked entering the queue's). This flag makes dispatch
+    /// non-reentrant instead: a notifier that finds dispatch already in
+    /// progress skips firing this round rather than invoking concurrently;
+    /// the poller's next tick (or the caller's own retry-with-delays loop)
+    /// fires it once the in-flight dispatch completes.
+    pub dispatching: AtomicBool,
 }
 
 /// One live sink (write-side) conduit channel.
@@ -518,6 +538,7 @@ pub fn register_source_channel(transport: ConduitTransport) -> u64 {
         read_ready: AtomicBool::new(false),
         read_suspended: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
+        dispatching: AtomicBool::new(false),
     });
     source_channels()
         .lock()
@@ -1194,12 +1215,43 @@ fn notify_source_readable_with_delays(
             continue;
         }
         ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
-        if let Some(ch) = get_source_channel(id) {
+        let channel = get_source_channel(id);
+        if let Some(ch) = &channel {
             ch.read_ready.store(true, Ordering::Release);
         }
+        // HC0053 follow-up: non-reentrant dispatch guard (see
+        // `SourceChannel::dispatching`). If another native thread is
+        // already inside this source's listener (the source-poller thread
+        // and a paired sink's direct resumeWrites-notify race for the same
+        // source), skip firing this round instead of invoking concurrently
+        // — the next poller tick or retry-with-delays call will fire it
+        // once the in-flight dispatch completes.
+        let guard = channel.as_ref().and_then(|ch| {
+            (ch.dispatching
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+            .then(|| DispatchGuard { flag: &ch.dispatching })
+        });
+        if channel.is_some() && guard.is_none() {
+            xnio_tcp_dbg!("notify_source id={id} skipped_reentrant_dispatch");
+            return;
+        }
         let fired = invoke_source_read_listener(ctx, source);
+        drop(guard);
         xnio_tcp_dbg!("notify_source id={id} fired_listener={fired}");
         return;
+    }
+}
+
+/// RAII reset for `SourceChannel::dispatching` — clears the flag on every
+/// exit path (normal return or unwind) once acquired via CAS above.
+struct DispatchGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -1536,9 +1588,20 @@ fn native_sink_get_write_listener(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Family-1 fix (cce0079): the conduit delegate and the write-listener
+    // dispatch below both run Java (GC-capable) — `this` must be refreshed
+    // after each, or the field writes / registry lookups / paired-source
+    // notify below operate on a stale address (canary-caught live in
+    // `RemoteConnection$RemoteWriteListener.lambda$send$0`; a stale identity
+    // hash here also MISSES the registries — a lost-wakeup hazard).
+    let this_pin = ctx.pin_native_root(this);
     if let Some(result) = with_sink_conduit_delegate(ctx, this, "resumeWrites", "()V", &[]) {
-        result?;
+        if let Err(e) = result {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
     }
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(0));
     ctx.set_field(this, SINK_FIELD_WRITE_READY_FLAG, Value::Int(1));
     if let Some(id) = sink_id_of(ctx, this) {
@@ -1548,6 +1611,7 @@ fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             ch.write_ready.store(true, Ordering::Release);
         }
         let fired = invoke_sink_write_listener(ctx, this);
+        let this = ctx.read_native_pin(this_pin, this);
         xnio_tcp_dbg!("resume_writes id={id} fired_listener={fired}");
         if fired {
             notify_paired_source_readable_with_delays(
@@ -1558,14 +1622,23 @@ fn native_sink_resume_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             );
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
 fn native_sink_suspend_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Family-1 fix (cce0079): refresh `this` across the conduit delegate
+    // dispatch (same shape as `native_sink_resume_writes`).
+    let this_pin = ctx.pin_native_root(this);
     if let Some(result) = with_sink_conduit_delegate(ctx, this, "suspendWrites", "()V", &[]) {
-        result?;
+        if let Err(e) = result {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
     if let Some(id) = sink_id_of(ctx, this) {
         if let Some(ch) = get_sink_channel(id) {
@@ -1604,6 +1677,11 @@ fn native_sink_truncate_writes(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     shutdown_sink_transport(ctx, this);
     Ok(None)
 }
+
+// NOTE (cce0079): `native_sink_shutdown_writes`/`native_sink_truncate_writes`
+// above return DIRECTLY when the delegate path is taken and only touch
+// `this` on the no-delegate path (no dispatch has happened yet) — no stale
+// window, unlike resume/suspend which fall through after dispatching.
 
 /// `flush()` - return true if the internal buffered-byte count is zero and
 /// the underlying transport has been drained. With no local staging buffer
@@ -1723,7 +1801,15 @@ fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
 #[doc(hidden)]
 pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS);
+    // Family-1 fix (cce0079): the conduit alloc below can move the
+    // still-unrooted `obj` — pin and refresh it, or `remember_source_obj`
+    // registers the WRONG identity-hash key (every later
+    // `source_id_by_obj` lookup then misses — lost wakeups) and the field
+    // stores/return value hand out a stale address.
+    let obj_pin = ctx.pin_native_root(obj);
     let conduit = alloc_source_conduit_obj(ctx, id);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1)); // start suspended
@@ -1735,7 +1821,12 @@ pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectR
 #[doc(hidden)]
 pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS);
+    // Family-1 fix (cce0079): same as `alloc_source_channel_obj` — refresh
+    // `obj` across the conduit alloc before registry/field use.
+    let obj_pin = ctx.pin_native_root(obj);
     let conduit = alloc_sink_conduit_obj(ctx, id);
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));

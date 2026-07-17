@@ -712,11 +712,21 @@ impl VmHeap {
 
     /// Descriptor-aware set.
     pub fn set_field_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
+        // Like `set_field`, descriptor-aware stores use the collector's
+        // inherent barrier path. Close the debug SATB triad sentinel here;
+        // otherwise an interpreter/JIT pre-barrier followed by putfield via
+        // this typed entry point leaves it armed until the next store.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field_as(obj, index, value, desc_byte))
     }
 
     /// Volatile descriptor-aware set.
     pub fn set_field_volatile_as(&self, obj: ObjectRef, index: usize, value: Value, desc_byte: u8) {
+        // Same inherent-barrier path and debug-triad closure as
+        // `set_field_as` above.
+        #[cfg(debug_assertions)]
+        clear_pending_pre_barrier();
         dispatch!(self, set_field_volatile_as(obj, index, value, desc_byte))
     }
 
@@ -919,6 +929,68 @@ impl VmHeap {
         }
     }
 
+    /// Native-wrapper young-exhaustion signal, consumed at the
+    /// `safe_native_call` boundary to run the GC the wrappers themselves
+    /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the
+    /// generational young→old spill-then-abort shape report `false`.
+    #[inline]
+    pub fn young_spill_pressure(&self) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.young_spill_pressure(),
+            VmHeap::G1(_) => false,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => false,
+        }
+    }
+
+    /// Clear the native-wrapper young-exhaustion signal (no-op on
+    /// non-generational collectors).
+    #[inline]
+    pub fn clear_young_spill_pressure(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.clear_young_spill_pressure();
+        }
+    }
+
+    /// Record a native-wrapper young-exhaustion spill (no-op on
+    /// non-generational collectors) — see `GenHeap::note_young_spill_pressure`.
+    #[inline]
+    pub fn note_young_spill_pressure(&self) {
+        if let VmHeap::Generational(h) = self {
+            h.note_young_spill_pressure();
+        }
+    }
+
+    /// DBG: young-arena state snapshot — see `GenHeap::young_arena_diag`.
+    pub fn young_arena_diag(&self) -> (usize, usize, usize, usize) {
+        match self {
+            VmHeap::Generational(h) => h.young_arena_diag(),
+            _ => (0, 0, 0, 0),
+        }
+    }
+
+    /// Live-bytes estimate for GC-productivity accounting — see
+    /// `GenHeap::live_bytes_estimate` (young free-list-aware; the raw bump
+    /// cursor never retreats under the non-moving sweep). Other collectors
+    /// fall back to `allocated_bytes`, their historical metric.
+    pub fn live_bytes_estimate(&self) -> usize {
+        match self {
+            VmHeap::Generational(h) => h.live_bytes_estimate(),
+            _ => self.allocated_bytes(),
+        }
+    }
+
+    /// Total bytes promoted young→old across all collections (selective
+    /// promotion + the moving collector's tenuring). Used by the
+    /// GC-overhead productivity metric: a promotion-only cycle conserves
+    /// live bytes but did useful allocation-enabling work.
+    pub fn bytes_promoted_total(&self) -> u64 {
+        match self {
+            VmHeap::Generational(h) => h.stats().snapshot().bytes_promoted,
+            _ => 0,
+        }
+    }
+
     /// Run a garbage collection cycle.
     ///
     /// The `stw` parameter is type-level proof that the caller is in a
@@ -1008,6 +1080,34 @@ impl VmHeap {
             VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(h, slot, old),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => <ZgcRealHeap as GarbageCollector>::write_barrier_pre(h, slot, old),
+        }
+    }
+
+    /// Enqueue a reference as live for an active SATB mark cycle without
+    /// performing a heap store. This is used by `Reference.get()` paths: the
+    /// referent was read, not overwritten, so it must not participate in the
+    /// debug `(pre, store, post)` triad tracked by [`Self::write_barrier_pre`].
+    #[inline]
+    pub fn write_barrier_keep_alive(&self, referent: ObjectRef) {
+        match self {
+            VmHeap::Generational(h) => {
+                <GenerationalHeap as GarbageCollector>::write_barrier_pre(
+                    h,
+                    std::ptr::null_mut(),
+                    referent,
+                )
+            }
+            VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => <ZgcRealHeap as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
         }
     }
 

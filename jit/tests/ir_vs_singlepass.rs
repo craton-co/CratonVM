@@ -49,6 +49,12 @@ fn dummy_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("ir_vs_singlepass invoked an unwired runtime helper");
     }
+    unsafe extern "C" fn self_guard(_vm_ptr: i64) -> i64 {
+        0
+    }
+    unsafe extern "C" fn native_stack_floor() -> i64 {
+        0
+    }
     let s = stub as *const () as usize;
     JitRuntimeHelpers {
         newarray: s,
@@ -80,6 +86,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         throw_arithmetic: s,
         invoke_dispatch: s,
         invoke_virtual_mic: s,
+        lambda_int_to_double: s,
         write_barrier: s,
         satb_pre_write_barrier: s,
         uncommon_trap: s,
@@ -100,9 +107,9 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         dispatch_threw: s,
         jit_frem: s,
         jit_drem: s,
-        self_call_stack_guard: 0,
+        self_call_stack_guard: self_guard as *const () as usize,
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
-        native_stack_floor_fn: 0,
+        native_stack_floor_fn: native_stack_floor as *const () as usize,
     }
 }
 
@@ -133,6 +140,7 @@ fn cached(
         num_params,
         is_synchronized: false,
         is_static: true,
+        force_native_cache: std::sync::OnceLock::new(),
     }
 }
 
@@ -3284,15 +3292,24 @@ fn ir_vs_singlepass_fp_to_long_fixup() {
 
 // ── Backend-routing guards for the fib44 self-recursion fix ──
 //
-// A SELF-RECURSIVE wide-return (J/D/F) call must bail the method to single-pass
-// (fast direct self-call), NOT lower to an IR `Op::Call` routed through the
-// generic `jit_invoke_dispatch` helper per call (the ~8.6x fib44 regression).
+// With the direct-call opt-out forced for this test, a SELF-RECURSIVE
+// wide-return (J/D/F) call must bail the method to single-pass, NOT lower to an
+// IR `Op::Call` routed through the generic dispatch helper per call.
 // The gate is keyed on `CompiledMethod::used_ir_backend` (true = optimizing IR
 // pipeline produced the body; false = single-pass, incl. a bail). These pin the
 // gate's behaviour AND its specificity (it fires ONLY for self-recursive J/D/F).
 
 #[test]
 fn selfrec_long_return_bails_to_singlepass() {
+    struct ResetOverride;
+    impl Drop for ResetOverride {
+        fn drop(&mut self) {
+            cratonvm_jit::__set_selfrec_direct_override(None);
+        }
+    }
+    let _guard = ResetOverride;
+    cratonvm_jit::__set_selfrec_direct_override(Some(false));
+
     // static long fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }  // (I)J
     let helpers = dummy_helpers();
     let code = vec![
@@ -3370,6 +3387,60 @@ fn crossmethod_long_return_uses_ir() {
         compiled.used_ir_backend,
         "a cross-method long-returning call must NOT be gated (intended IR unblock)"
     );
+}
+
+#[test]
+fn selfrec_int_direct_call_executes_correctly() {
+    // Integer-returning self-recursion is the common QuickBench fib shape.
+    // With the direct-call gate on it must stay on IR without routing every
+    // recursive edge through jit_invoke_dispatch.
+    struct ResetOverride;
+    impl Drop for ResetOverride {
+        fn drop(&mut self) {
+            cratonvm_jit::__set_selfrec_direct_override(None);
+        }
+    }
+    let _guard = ResetOverride;
+    cratonvm_jit::__set_selfrec_direct_override(Some(true));
+
+    let helpers = dummy_helpers();
+    // static int fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
+    let code = vec![
+        0x1a, 0x04, 0xa3, 0x00, 0x05, // iload_0; iconst_1; if_icmpgt 7
+        0x1a, 0xac, // iload_0; ireturn
+        0x1a, 0x04, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_1; isub; invokestatic #2
+        0x1a, 0x05, 0x64, 0xb8, 0x00, 0x02, // iload_0; iconst_2; isub; invokestatic #2
+        0x60, 0xac, // iadd; ireturn
+    ];
+    let cm = cached("fib", "(I)I", code, 1, 1);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("Corpus".into(), "fib".into(), "(I)I".into()))
+        } else {
+            None
+        }
+    };
+    let compiled = compile_with_dispatch(&cm, &helpers, &resolver)
+        .expect("self-recursive int compiles on the IR direct-call path");
+    assert!(
+        compiled.used_ir_backend,
+        "integer self-recursion should use the IR direct-call backend"
+    );
+
+    let dummy_vm = [0u8; 64];
+    for (n, expect) in [
+        (0i64, 0i64),
+        (1, 1),
+        (2, 1),
+        (5, 5),
+        (10, 55),
+        (20, 6765),
+        (30, 832040),
+    ] {
+        let r = unsafe { compiled.try_call_with_context(dummy_vm.as_ptr() as i64, &[n]) }
+            .unwrap_or_else(|e| panic!("call fib({n}): {e:?}"));
+        assert_eq!(r, expect, "fib({n}) via IR direct self-call");
+    }
 }
 
 #[test]

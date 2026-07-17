@@ -181,6 +181,7 @@ pub struct Listener {
 /// A live Undertow server instance.
 pub struct UndertowInstance {
     pub id: u64,
+    pub listener_spec: String,
     pub listeners: Vec<Listener>,
     pub handler_obj_raw: usize,
     pub worker_threads: u32,
@@ -208,6 +209,87 @@ fn undertow_instances() -> &'static Mutex<HashMap<u64, UndertowInstance>> {
 fn next_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, Ordering::SeqCst)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct UndertowObjKey {
+    vm: usize,
+    identity: i32,
+}
+
+fn undertow_obj_key(ctx: &dyn NativeContext, obj: ObjectRef) -> UndertowObjKey {
+    UndertowObjKey {
+        vm: ctx.vm_identity(),
+        identity: ctx.identity_hash_code(obj),
+    }
+}
+
+fn undertow_obj_registry() -> &'static Mutex<HashMap<UndertowObjKey, u64>> {
+    static R: OnceLock<Mutex<HashMap<UndertowObjKey, u64>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_undertow_instance(ctx: &dyn NativeContext, obj: ObjectRef, id: u64) {
+    undertow_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(undertow_obj_key(ctx, obj), id);
+}
+
+fn undertow_instance_id_of(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<u64> {
+    undertow_obj_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&undertow_obj_key(ctx, obj))
+        .copied()
+        .or_else(|| match ctx.get_field(obj, UND_FIELD_BOUND_FDS) {
+            Value::Long(id) => Some(id as u64),
+            _ => None,
+        })
+}
+
+#[derive(Clone)]
+struct UndertowBuilderConfig {
+    listener_spec: String,
+    handler_obj_raw: usize,
+    worker_threads: u32,
+    io_threads: u32,
+}
+
+impl Default for UndertowBuilderConfig {
+    fn default() -> Self {
+        Self {
+            listener_spec: String::new(),
+            handler_obj_raw: 0,
+            worker_threads: 16,
+            io_threads: 2,
+        }
+    }
+}
+
+fn undertow_builder_configs() -> &'static Mutex<HashMap<UndertowObjKey, UndertowBuilderConfig>> {
+    static C: OnceLock<Mutex<HashMap<UndertowObjKey, UndertowBuilderConfig>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn builder_config_of(ctx: &dyn NativeContext, obj: ObjectRef) -> UndertowBuilderConfig {
+    undertow_builder_configs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&undertow_obj_key(ctx, obj))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn update_builder_config(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    update: impl FnOnce(&mut UndertowBuilderConfig),
+) {
+    let mut configs = undertow_builder_configs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    update(configs.entry(undertow_obj_key(ctx, obj)).or_default());
 }
 
 // ---------------------------------------------------------------------------
@@ -520,10 +602,23 @@ pub fn build_http_response(
 
 fn native_undertow_builder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_concurrent_synthetic(ctx, CLS_UNDERTOW_BUILDER, UND_NUM_SLOTS);
-    // Default worker / io threads.
-    ctx.set_field(obj, UND_FIELD_WORKER_THREADS, Value::Int(16));
-    ctx.set_field(obj, UND_FIELD_IO_THREADS, Value::Int(2));
+    // The real Undertow$Builder layout is not compatible with the native
+    // bridge's compact fields. Keep all bridge state outside the Java object.
+    undertow_builder_configs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(undertow_obj_key(ctx, obj), UndertowBuilderConfig::default());
     Ok(Some(Value::Object(Some(obj))))
+}
+
+fn native_builder_set_socket_option(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // CratonVM's native Undertow bridge does not model XNIO option maps yet.
+    // Keep the builder chain intact; the listener bridge handles the socket.
+    Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_builder_add_http_listener(
@@ -532,18 +627,13 @@ fn native_builder_add_http_listener(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    let host_obj = args.get(2).copied().unwrap_or(Value::Object(None));
-    let host = match host_obj {
+    let host = match args.get(2).copied().unwrap_or(Value::Object(None)) {
         Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
         _ => "0.0.0.0".to_string(),
     };
-
-    // Store the listener config in the `listeners` field — we model the
-    // list via a String("host:port:http") for now since the stubs don't
-    // pull in a full List implementation.
-    let spec = format!("{host}:{port}:http");
-    let spec_obj = ctx.create_string(&spec);
-    ctx.set_field(this, UND_FIELD_LISTENERS, Value::Object(Some(spec_obj)));
+    update_builder_config(ctx, this, |config| {
+        config.listener_spec = format!("{host}:{port}:http");
+    });
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -553,24 +643,23 @@ fn native_builder_add_https_listener(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    let host_obj = args.get(2).copied().unwrap_or(Value::Object(None));
-    let host = match host_obj {
+    let host = match args.get(2).copied().unwrap_or(Value::Object(None)) {
         Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_default(),
         _ => "0.0.0.0".to_string(),
     };
-    // args[3] = SSLContext — stashed for T19.9 to pick up. Deferred.
-    let spec = format!("{host}:{port}:https");
-    let spec_obj = ctx.create_string(&spec);
-    ctx.set_field(this, UND_FIELD_LISTENERS, Value::Object(Some(spec_obj)));
+    update_builder_config(ctx, this, |config| {
+        config.listener_spec = format!("{host}:{port}:https");
+    });
     Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_builder_set_handler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Store the handler reference directly.
-    if let Some(h) = args.get(1).copied() {
-        _ctx.set_field(this, UND_FIELD_HANDLER, h);
-    }
+    let raw = match args.get(1).copied() {
+        Some(Value::Object(Some(handler))) => handler.as_ptr() as usize,
+        _ => 0,
+    };
+    update_builder_config(_ctx, this, |config| config.handler_obj_raw = raw);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -579,39 +668,26 @@ fn native_builder_set_worker_threads(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(16);
-    ctx.set_field(this, UND_FIELD_WORKER_THREADS, Value::Int(n.max(1)));
+    let threads = args.get(1).and_then(|v| v.as_int()).unwrap_or(16).max(1) as u32;
+    update_builder_config(ctx, this, |config| config.worker_threads = threads);
     Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_builder_set_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(2);
-    ctx.set_field(this, UND_FIELD_IO_THREADS, Value::Int(n.max(1)));
+    let threads = args.get(1).and_then(|v| v.as_int()).unwrap_or(2).max(1) as u32;
+    update_builder_config(ctx, this, |config| config.io_threads = threads);
     Ok(Some(Value::Object(Some(this))))
 }
 
 fn native_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Allocate a new Undertow object with the same fields carried over.
+    let config = builder_config_of(ctx, this);
     let undertow = alloc_concurrent_synthetic(ctx, CLS_UNDERTOW, UND_NUM_SLOTS);
-    let listeners = ctx.get_field(this, UND_FIELD_LISTENERS);
-    let handler = ctx.get_field(this, UND_FIELD_HANDLER);
-    let wt = ctx.get_field(this, UND_FIELD_WORKER_THREADS);
-    let it = ctx.get_field(this, UND_FIELD_IO_THREADS);
-    ctx.set_field(undertow, UND_FIELD_LISTENERS, listeners);
-    ctx.set_field(undertow, UND_FIELD_HANDLER, handler);
-    ctx.set_field(undertow, UND_FIELD_WORKER_THREADS, wt);
-    ctx.set_field(undertow, UND_FIELD_IO_THREADS, it);
-    // Pre-register an instance so start()/stop() find it.
     let id = next_id();
-    ctx.set_field(undertow, UND_FIELD_BOUND_FDS, Value::Long(id as i64));
-    let handler_raw = match handler {
-        Value::Object(Some(o)) => o.as_ptr() as usize,
-        _ => 0,
-    };
-    let wt_n = wt.as_int().unwrap_or(16).max(1) as u32;
-    let it_n = it.as_int().unwrap_or(2).max(1) as u32;
+    // See `undertow_instance_id_of`: real Undertow fields have incompatible
+    // types, so the instance association lives in the identity side table.
+    remember_undertow_instance(ctx, undertow, id);
     undertow_instances()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -619,10 +695,11 @@ fn native_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             id,
             UndertowInstance {
                 id,
+                listener_spec: config.listener_spec,
                 listeners: Vec::new(),
-                handler_obj_raw: handler_raw,
-                worker_threads: wt_n,
-                io_threads: it_n,
+                handler_obj_raw: config.handler_obj_raw,
+                worker_threads: config.worker_threads,
+                io_threads: config.io_threads,
                 running: false,
             },
         );
@@ -631,18 +708,17 @@ fn native_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn native_undertow_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let id = match ctx.get_field(this, UND_FIELD_BOUND_FDS) {
-        Value::Long(l) => l as u64,
-        _ => {
-            return Err(MethodCallFailed::InternalError(VmError::Internal {
-                message: "Undertow.start: instance id missing".into(),
-            }));
-        }
-    };
-    let listeners_txt = match ctx.get_field(this, UND_FIELD_LISTENERS) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let id = undertow_instance_id_of(ctx, this).ok_or_else(|| {
+        MethodCallFailed::InternalError(VmError::Internal {
+            message: "Undertow.start: instance id missing".into(),
+        })
+    })?;
+    let listeners_txt = undertow_instances()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .map(|instance| instance.listener_spec.clone())
+        .unwrap_or_default();
     // Format: "host:port:scheme" (one listener today; extendable).
     let parts: Vec<&str> = listeners_txt.rsplitn(3, ':').collect();
     if parts.len() != 3 {
@@ -683,9 +759,8 @@ fn native_undertow_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_undertow_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let id = match ctx.get_field(this, UND_FIELD_BOUND_FDS) {
-        Value::Long(l) => l as u64,
-        _ => return Ok(None),
+    let Some(id) = undertow_instance_id_of(ctx, this) else {
+        return Ok(None);
     };
     let mut map = undertow_instances()
         .lock()
@@ -847,6 +922,11 @@ fn http_string_hash_code(bytes: &[u8]) -> i32 {
 
 fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `this` must survive the `create_string` call in the `string_obj` match
+    // below (a GC-triggering allocation), and both `this` and `string_obj`
+    // must survive the `new_array` allocation further down before either is
+    // read again for the `set_field*` calls.
+    let this_pin = ctx.pin_native_root(this);
     let text_arg = args.get(1).copied().unwrap_or(Value::Object(None));
     let text = match text_arg {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -856,6 +936,7 @@ fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(s)) if ctx.read_string(s).is_some() => s,
         _ => ctx.create_string(&text),
     };
+    let string_obj_pin = ctx.pin_native_root(string_obj);
 
     if class_has_field(ctx, CLS_HTTP_STRING, "bytes") {
         let bytes = text.as_bytes();
@@ -863,14 +944,19 @@ fn native_http_string_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
         }
+        let this = ctx.read_native_pin(this_pin, this);
+        let string_obj = ctx.read_native_pin(string_obj_pin, string_obj);
         ctx.set_field_by_name(this, "bytes", Value::Object(Some(arr)));
         ctx.set_field_by_name(this, "hashCode", Value::Int(http_string_hash_code(bytes)));
         ctx.set_field_by_name(this, "orderInt", Value::Int(0));
         ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
     } else {
+        let this = ctx.read_native_pin(this_pin, this);
+        let string_obj = ctx.read_native_pin(string_obj_pin, string_obj);
         ctx.set_field(this, HS_FIELD_BYTES, Value::Object(Some(string_obj)));
         ctx.set_field_by_name(this, "string", Value::Object(Some(string_obj)));
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -1027,8 +1113,14 @@ fn exchange_header_map_or_create(
         match ctx.get_field(this, synthetic_slot) {
             Value::Object(Some(map)) => Ok(Some(Value::Object(Some(map)))),
             _ => {
+                // Mirror the real-layout branch above: `this` must survive
+                // the GC-triggering `alloc_header_map_for_exchange` call
+                // before being read again for `set_field`.
+                let this_pin = ctx.pin_native_root(this);
                 let map = alloc_header_map_for_exchange(ctx)?;
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(this, synthetic_slot, Value::Object(Some(map)));
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Object(Some(map))))
             }
         }
@@ -1129,16 +1221,24 @@ fn real_exchange_force_empty_response_body(
     else {
         return Ok(None);
     };
+    // `headers` and `name_text`/`name` all need to survive the two
+    // `create_string` calls and the `new_object_initialized` call below
+    // before being read again for the final `native_header_map_put`.
+    let headers_pin = ctx.pin_native_root(headers);
     let name_text = ctx.create_string("Content-Length");
+    let name_text_pin = ctx.pin_native_root(name_text);
     let name = match ctx.new_object_initialized(
         CLS_HTTP_STRING,
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(name_text))],
     )? {
         Some(Value::Object(Some(o))) => o,
-        _ => name_text,
+        _ => ctx.read_native_pin(name_text_pin, name_text),
     };
+    let name_pin = ctx.pin_native_root(name);
     let zero = ctx.create_string("0");
+    let headers = ctx.read_native_pin(headers_pin, headers);
+    let name = ctx.read_native_pin(name_pin, name);
     let _ = native_header_map_put(
         ctx,
         &[
@@ -1147,6 +1247,7 @@ fn real_exchange_force_empty_response_body(
             Value::Object(Some(zero)),
         ],
     )?;
+    ctx.unpin_native_roots(headers_pin);
     Ok(None)
 }
 
@@ -1268,6 +1369,12 @@ pub fn register_undertow_natives(r: &mut NativeMethodRegistry) {
         "setHandler",
         "(Lio/undertow/server/HttpHandler;)Lio/undertow/Undertow$Builder;",
         native_builder_set_handler,
+    );
+    r.register(
+        CLS_UNDERTOW_BUILDER,
+        "setSocketOption",
+        "(Lorg/xnio/Option;Ljava/lang/Object;)Lio/undertow/Undertow$Builder;",
+        native_builder_set_socket_option,
     );
     r.register(
         CLS_UNDERTOW_BUILDER,
@@ -1606,13 +1713,10 @@ mod tests {
             Value::Object(Some(o)) => assert_eq!(o, builder),
             _ => panic!("expected builder returned"),
         }
-        // Listener spec stored.
-        let stored = ctx.get_field(builder, UND_FIELD_LISTENERS);
-        let spec = match stored {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        assert_eq!(spec, "127.0.0.1:8080:http");
+        assert_eq!(
+            builder_config_of(&ctx, builder).listener_spec,
+            "127.0.0.1:8080:http"
+        );
     }
 
     fn build_and_configure(ctx: &mut crate::test_utils::MockNativeContext, port: i32) -> ObjectRef {
@@ -1645,10 +1749,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let undertow = build_and_configure(&mut ctx, 0); // ephemeral
         native_undertow_start(&mut ctx, &[Value::Object(Some(undertow))]).unwrap();
-        let id = ctx
-            .get_field(undertow, UND_FIELD_BOUND_FDS)
-            .as_long()
-            .unwrap();
+        let id = undertow_instance_id_of(&ctx, undertow).expect("instance id");
         let map = undertow_instances().lock().unwrap();
         let inst = map.get(&(id as u64)).expect("instance");
         assert!(inst.running, "instance must be running after start");
@@ -1663,10 +1764,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let undertow = build_and_configure(&mut ctx, 0);
         native_undertow_start(&mut ctx, &[Value::Object(Some(undertow))]).unwrap();
-        let id = ctx
-            .get_field(undertow, UND_FIELD_BOUND_FDS)
-            .as_long()
-            .unwrap() as u64;
+        let id = undertow_instance_id_of(&ctx, undertow).expect("instance id");
         // Grab the bound port before stop so we can re-bind on it.
         let saved_port = {
             let map = undertow_instances().lock().unwrap();

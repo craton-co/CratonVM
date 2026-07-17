@@ -5,8 +5,8 @@
 > separate heap-corruption bug in 3 test classes; that turned out to be a
 > pre-existing, already-fixed-on-`dev` bug (`e7e3bb91f`) hit far more often
 > by this fix's new code path — see the successor doc for the full
-> resolution. One small, separate, non-memory-unsafe residual remains open:
-> [`docs/known-issues/springboot/brave-baggagefields-classcast-summary-printing.md`](../../known-issues/springboot/brave-baggagefields-classcast-summary-printing.md).
+> resolution. The separate, non-memory-unsafe Brave residual is now retired:
+> [`brave-baggagefields-classcast-summary-printing-FIXED.md`](brave-baggagefields-classcast-summary-printing-FIXED.md).
 > Kept here for historical reference only, per this repo's
 > known-issues-must-not-contain-addressed-bugs convention.
 

@@ -54,6 +54,10 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     ANY_DEFINING_LOADER_REGISTERED.store(false, Ordering::Release);
     loader_namespace_id_store()
         .lock()
@@ -180,6 +184,15 @@ pub fn gc_reconcile_defining_loaders(
         if !alive {
             // Loader unreachable and collected this cycle — drop the stale entry.
             // (No deref of `obj_ref`; the memory may already be freed/reused.)
+            // Record the class as permanently orphaned FIRST: dropping the
+            // entry alone makes `defining_loader_for` indistinguishable from
+            // "never restricted", which would make this class incorrectly
+            // visible to every other loader from now on (see
+            // `is_defining_loader_orphaned` doc comment).
+            orphaned_defining_loader_classes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(*_class_id);
             return false;
         }
         // Survivor: remap if it relocated (moving collection).
@@ -197,6 +210,25 @@ pub fn gc_reconcile_defining_loaders(
         .map(|(&cid, obj_ref)| (cid, obj_ref.as_ptr() as usize))
         .collect();
     cratonvm_types::loader_pin::replace_loader_pins(&pins);
+
+    // Same treatment for the loader-namespace side-table (object-keyed): drop
+    // entries whose loader was collected this cycle, remap survivors that
+    // moved. A pruned dead loader's address can then be reused by a NEW
+    // loader without inheriting the dead namespace.
+    let mut ns = loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ns.retain_mut(|(obj_ref, _)| {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if !is_marked(old_addr) {
+            return false;
+        }
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+        true
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +280,30 @@ fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Val
 fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, ObjectRef>> {
     static INSTANCE: OnceLock<Mutex<std::collections::HashMap<u32, ObjectRef>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Class-ids whose registered defining loader was confirmed DEAD by a prior
+/// `gc_reconcile_defining_loaders` pass. Once a class lands here it must
+/// never again be treated as globally visible: `defining_loader_for`
+/// returning `None` is ALSO the answer for "never had a registered loader in
+/// the first place" (the overwhelmingly common built-in-loader case), so
+/// `cid_visible_mirror` cannot distinguish "no restriction" from "the
+/// restriction's target died" without this separate permanent record.
+/// Entries are never removed (matches real unloading: once a defining loader
+/// is gone, the class is gone from every OTHER loader's perspective forever;
+/// a new loader wanting the same simple name must define its own copy).
+fn orphaned_defining_loader_classes() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Whether `class_id`'s defining loader has been confirmed collected. See
+/// [`orphaned_defining_loader_classes`].
+pub(crate) fn is_defining_loader_orphaned(class_id: u32) -> bool {
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&class_id)
 }
 
 /// Perf (silent-hang-no-signature-cluster throughput residual, 2026-07-13):
@@ -349,7 +405,23 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
 pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     let existing = *app_loader_store().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(obj) = existing {
-        return obj;
+        // The singleton is a Rust-side cache.  If a moving collection ever
+        // leaves an unremapped reference behind, its old heap slot can be
+        // reused by an unrelated object (observed as String.findResources
+        // during Mockito plugin discovery).  Never return that object as a
+        // ClassLoader; discard the stale cache entry and rebuild it below.
+        let is_loader = ctx
+            .class_id_by_name("java/lang/ClassLoader")
+            .map(|loader_class_id| {
+                let actual_class_id = ctx.class_id_of_object(obj);
+                actual_class_id == loader_class_id
+                    || ctx.is_subclass(actual_class_id, loader_class_id)
+            })
+            .unwrap_or(false);
+        if is_loader {
+            return obj;
+        }
+        *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     let platform = get_or_create_platform_loader(ctx);
     let platform_pin = ctx.pin_native_root(platform);
@@ -799,6 +871,40 @@ pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
         || internal.starts_with("[")
 }
 
+/// Whether `loader_obj` is eligible for loader-initiated resolution of a
+/// class it defined -- either the global `CRATONVM_LOADER_AWARE_RESOLUTION`
+/// gate is on (default-on since the Hibernate custom-loader soak; see
+/// `vm::runtime::env_cache::loader_aware_resolution`'s doc comment for the
+/// validation history -- duplicated here rather than shared because
+/// `native-builtins` cannot depend on `vm`), or `loader_obj` is a
+/// `groovy.lang.GroovyClassLoader` / Spring's own AOT-test isolating loaders
+/// (`org.springframework.core.test.tools.{DynamicClassLoader,
+/// CompileWithForkedClassLoaderClassLoader}`) -- narrow carve-outs for when
+/// the global gate is explicitly disabled (`CRATONVM_LOADER_AWARE_
+/// RESOLUTION=0`), mirroring `is_groovy_class_loader` in interpreter.rs.
+pub(crate) fn is_loader_aware_resolution_eligible(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+) -> bool {
+    let global_gate = match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => true,
+    };
+    if global_gate {
+        return true;
+    }
+    let loader_cid = ctx.class_id_of_object(loader_obj);
+    const NARROW_CARVEOUT: [&str; 3] = [
+        "groovy/lang/GroovyClassLoader",
+        "org/springframework/core/test/tools/DynamicClassLoader",
+        "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader",
+    ];
+    NARROW_CARVEOUT.iter().any(|name| {
+        ctx.class_id_by_name(name)
+            .is_some_and(|id| loader_cid == id || ctx.is_subclass(loader_cid, id))
+    })
+}
+
 /// HIB-CV-24 / SBR-14 gate. When ON (default), `findBootstrapClass` is scoped to
 /// genuine bootstrap classes for a custom loader that overrides `findClass` with
 /// a null parent — so the real `ClassLoader.loadClass` bytecode proceeds to that
@@ -884,8 +990,20 @@ pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: O
             Some(n) => n,
             None => return false,
         };
+        if name == "java/net/URLClassLoader" {
+            // `URLClassLoader` provides a genuine, non-trivial `findClass`
+            // (its own URL/HTTP-based resolution -- `ucl_real_find_class` /
+            // `ucl_find_class`) even for a bare instance or a subclass that
+            // does not itself declare `findClass`, unlike `java/lang/
+            // ClassLoader` / `SecureClassLoader` (whose inherited findClass
+            // just throws). Must NOT be treated as a "no override" builtin
+            // base, or a null-parent `URLClassLoader` never consults its own
+            // URLs at all -- see docs/known-issues/keycloak/
+            // test-classserver-invalidpackage-classnotfound-not-thrown.md.
+            return true;
+        }
         if is_builtin_loader_class(&name) {
-            // Reached the builtin base without seeing a user override.
+            // Reached a different builtin base without seeing a user override.
             return false;
         }
         // A `findClass` declared on this (non-builtin) class is a real
@@ -896,6 +1014,45 @@ pub(crate) fn receiver_overrides_find_class(ctx: &mut dyn NativeContext, this: O
             .any(|m| m.name == "findClass")
         {
             return true;
+        }
+        cid = ctx.superclass_of(id);
+    }
+    false
+}
+
+/// True iff the receiver's `findClass` resolution is CratonVM's own
+/// URLClassLoader native (`ucl_real_find_class` / `ucl_find_class`) rather
+/// than user-supplied bytecode -- i.e. no subclass in the hierarchy declares
+/// its own `findClass` before the walk reaches `java/net/URLClassLoader`. A
+/// `ClassNotFoundException` from this source reflects a genuine,
+/// authoritative miss against the loader's own recorded URLs (including a
+/// real HTTP fetch) and must propagate as-is. A genuine user `findClass`
+/// override's miss, by contrast, may just reflect incomplete CratonVM
+/// emulation of whatever custom source it reads from, so it keeps the
+/// existing best-effort global-store fallback (HIB-CV-24 / SBR-14 step 2b /
+/// step 6). See `receiver_overrides_find_class` above for the paired check.
+pub(crate) fn find_class_is_urlclassloader_native(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(id) = cid {
+        let name = match ctx.class_name_of_id(id) {
+            Some(n) => n,
+            None => return false,
+        };
+        if name == "java/net/URLClassLoader" {
+            return true;
+        }
+        if is_builtin_loader_class(&name) {
+            return false;
+        }
+        if ctx
+            .declared_methods(id)
+            .iter()
+            .any(|m| m.name == "findClass")
+        {
+            return false;
         }
         cid = ctx.superclass_of(id);
     }
@@ -984,9 +1141,16 @@ pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRe
 /// In real-JDK mode that slot is a genuine `java.lang.ClassLoader` field and
 /// cannot be repurposed, so the id is keyed instead on the loader's STABLE
 /// identity hash. Holds only `i32 → u32` (no `ObjectRef`s) — no GC rooting.
-fn loader_namespace_id_store() -> &'static Mutex<std::collections::HashMap<i32, u32>> {
-    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<i32, u32>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
+    // Keyed by the loader OBJECT, not its identity hash: identity hashes can
+    // collide across distinct loader instances (address-derived hashes recur
+    // after a collection reuses the region), and the old hash-keyed map never
+    // pruned dead loaders — a fresh per-compile loader (Spring TestCompiler's
+    // DynamicClassLoader) could inherit a dead sibling's namespace id and
+    // resolve THAT loader's same-named generated classes. Entries are
+    // remapped/pruned post-GC by [`gc_reconcile_defining_loaders`].
+    static INSTANCE: OnceLock<Mutex<Vec<(ObjectRef, u32)>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
@@ -1005,15 +1169,14 @@ pub(crate) fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef
             return v as u32;
         }
     }
-    let ihc = ctx.identity_hash_code(loader);
     let mut map = loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(id) = map.get(&ihc) {
-        return *id;
+    if let Some(&(_, id)) = map.iter().find(|(l, _)| l.as_ptr() == loader.as_ptr()) {
+        return id;
     }
     let id = ctx.allocate_loader_id();
-    map.insert(ihc, id);
+    map.push((loader, id));
     id
 }
 
@@ -1032,12 +1195,12 @@ pub(crate) fn peek_loader_namespace_id(
             return Some(v as u32);
         }
     }
-    let ihc = ctx.identity_hash_code(loader);
     loader_namespace_id_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&ihc)
-        .copied()
+        .iter()
+        .find(|(l, _)| l.as_ptr() == loader.as_ptr())
+        .map(|&(_, id)| id)
 }
 
 /// True for a JDK dynamic-proxy class's internal name (`jdk/proxyN/$ProxyM` on
@@ -1239,6 +1402,23 @@ fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<
 /// found it too (HotSpot throws ClassNotFoundException). That made
 /// `ClassUtils.isCacheSafe(composite, siblingLoader)` wrongly true via its
 /// `isLoadable` fallback. ClassUtilsTests.isCacheSafe.
+/// Whether a BUILT-IN loader (application/platform -- anything CratonVM does
+/// not classify as user-defined) appears in `loader`'s parent chain,
+/// including `loader` itself. A `false` answer means the chain terminates at
+/// the bootstrap (null) without ever passing a built-in loader, so per
+/// JVMS 5.3 only bootstrap classes are resolvable through delegation.
+pub(crate) fn builtin_loader_reachable(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    let mut cur = Some(loader);
+    for _ in 0..256 {
+        let Some(l) = cur else { break };
+        if !is_user_defined_loader(ctx, l) {
+            return true;
+        }
+        cur = classloader_parent(ctx, l);
+    }
+    false
+}
+
 fn loader_can_see_defining(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
@@ -1275,6 +1455,13 @@ pub(crate) fn cid_visible_mirror(
     this: ObjectRef,
     cid: cratonvm_types::ClassId,
 ) -> Option<ObjectRef> {
+    // A class whose defining loader was confirmed collected is gone from
+    // every OTHER loader's perspective (real unloading semantics) -- checked
+    // BEFORE the live-registry lookup so a pruned entry never falls through
+    // to "no restriction, visible to all" (see `is_defining_loader_orphaned`).
+    if is_defining_loader_orphaned(cid.as_u32()) {
+        return None;
+    }
     if let Some(def) = defining_loader_for(cid.as_u32()) {
         if !loader_can_see_defining(ctx, this, def) {
             return None;
@@ -1283,13 +1470,48 @@ pub(crate) fn cid_visible_mirror(
     Some(ctx.get_class_mirror(cid))
 }
 
+/// Real-JDK-mode-analogue diagnostic (see `classloader_real::load_class_visible_to`
+/// / `no_class_def_found_error`, fixed 2026-07-17): `ensure_class_initialized`
+/// bottoms out in the same `ClassManager::load_class` that propagates a
+/// recursive supertype/interface load failure UNCHANGED, so a `ClassNotFound`
+/// naming something other than `internal` means the requested class file
+/// exists but a *dependency* is missing -- JVMS §5.3/§5.4:
+/// `NoClassDefFoundError`, not a bare CNFE on the requested class. Surfaced
+/// as an immediate `Err` (rather than folded into the `Ok(None)` "not
+/// found" case) so the caller throws it instead of silently returning a
+/// null `Class` (this native's genuine-miss contract -- see step 7 of
+/// `cl_load_class_base_delegation`).
 fn resolve_global_if_visible(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     internal: &str,
-) -> Option<ObjectRef> {
-    let cid = ctx.ensure_class_initialized(internal).ok()?;
-    cid_visible_mirror(ctx, this, cid)
+) -> Result<Option<ObjectRef>, cratonvm_types::error::MethodCallFailed> {
+    match ctx.ensure_class_initialized(internal) {
+        Ok(cid) => Ok(cid_visible_mirror(ctx, this, cid)),
+        Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ClassFile(
+                cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
+            ),
+        )) if class_name != internal => {
+            tracing::debug!(
+                requested = internal,
+                missing_dependency = %class_name,
+                "resolve_global_if_visible: requested class exists but a \
+                 dependency failed to resolve -- NoClassDefFoundError"
+            );
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                crate::classloader_real::no_class_def_found_error(ctx, &class_name),
+            ))
+        }
+        Err(e) => {
+            tracing::debug!(
+                requested = internal,
+                error = %e,
+                "resolve_global_if_visible: ensure_class_initialized failed"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Base-class `ClassLoader.loadClass` parent-first delegation, reimplemented in
@@ -1347,7 +1569,27 @@ fn cl_load_class_base_delegation(
     let defer_to_find_class = cl_bootstrap_scoped()
         && (parent_is_null || parent_is_platform)
         && !is_bootstrap_class_name(&internal)
+        // A jar appended via Instrumentation.appendToBootstrapClassLoaderSearch
+        // belongs to the bootstrap loader: parent delegation must serve it
+        // BEFORE any findClass override defines a per-loader copy (Mockito
+        // asserts its injected MockMethodDispatcher has a null loader).
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
         && receiver_has_find_class_override;
+    // JVMS 5.3-faithful scoping of the flat-store fallback (same gate as the
+    // defer logic above): CratonVM's global store stands in for "the app
+    // classpath, reachable through the parent chain". A loader whose REAL
+    // parent chain never passes through a built-in loader (e.g.
+    // `new ClassLoader(null) {}`, or a loader parented to such) can only see
+    // bootstrap classes on HotSpot; answering an application class from the
+    // flat store bypasses the loader's own fallback logic (seen:
+    // ThrowawayClassLoader.loadClassFromResource never ran because
+    // super.loadClass resolved the probe class globally, failing its
+    // stream-closing contract test). Loaders with a findClass override keep
+    // their step-6 rescue below, so only override-less chains change.
+    let scoped_user_chain = cl_bootstrap_scoped()
+        && !is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !builtin_loader_reachable(ctx, this);
     // JVM spec §5.3.2 — parent-first delegation:
     // 1. Check if this loader already loaded the class (findLoadedClass)
     let loader_type = match ctx.get_field(this, CL_LOADER_TYPE) {
@@ -1436,16 +1678,16 @@ fn cl_load_class_base_delegation(
             }
         }
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
-        if parent_type != LOADER_CUSTOM && !defer_to_find_class {
+        if parent_type != LOADER_CUSTOM && !defer_to_find_class && !scoped_user_chain {
             // Standard delegation handles bootstrap → extension → app
-            if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+            if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
                 return Ok(Some(Value::Object(Some(mirror))));
             }
         }
-    } else if !defer_to_find_class {
+    } else if !defer_to_find_class && !scoped_user_chain {
         // No parent (or null parent) → delegate directly to bootstrap loader
         // Bootstrap delegation: use the standard class loading chain
-        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -1454,8 +1696,8 @@ fn cl_load_class_base_delegation(
     //    (this covers bootstrap → extension → application delegation).
     //    Skipped when deferring to a custom `findClass` override (HIB-CV-24) so
     //    the supplied loader runs before CratonVM's global store answers.
-    if !defer_to_find_class {
-        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+    if !defer_to_find_class && !scoped_user_chain {
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -1478,18 +1720,29 @@ fn cl_load_class_base_delegation(
     //    throws ClassNotFoundException (e.g. EmbeddedImplClassLoader with
     //    empty jarMetas).
     if receiver_overrides_find_class(ctx, this) {
-        // `invoke_virtual` resolves on the receiver's actual class, so this
-        // dispatches to the subclass's overriding `findClass` bytecode.
-        let result = ctx.invoke_virtual(
+        // The base `ClassLoader.findClass` itself is registered as a native.
+        // A regular virtual call can therefore re-enter that native through
+        // the inherited declaration and bypass this known subclass override.
+        // The predicate above proves a real bytecode implementation exists on
+        // the receiver hierarchy; select that implementation explicitly.
+        let result = ctx.invoke_virtual_bytecode_only(
             this,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
         );
         match result {
-            Ok(Some(Value::Object(Some(_)))) => {
+            Ok(Some(Value::Object(Some(_)))) => return result,
+            // A miss from URLClassLoader's own native URL/HTTP search is
+            // authoritative -- propagate it (e.g. ClassNotFoundException)
+            // rather than falling through to step 6's global-store fallback,
+            // which would let a null-parent URLClassLoader resolve
+            // application classes its own (failed) URL search should have
+            // hidden from it. See docs/known-issues/keycloak/
+            // test-classserver-invalidpackage-classnotfound-not-thrown.md.
+            _ if defer_to_find_class && find_class_is_urlclassloader_native(ctx, this) => {
                 return result
-            },
+            }
             // findClass threw (ClassNotFoundException) or returned null — fall through.
             _ => {}
         }
@@ -2277,12 +2530,20 @@ pub(crate) fn define_class_via_full(
                 set_class_data(mirror, data);
             }
             // Eager-init request: run <clinit> now (defineClass0 path
-            // when `initialize == true`).
+            // when `initialize == true`). `ctx.initialize_class` can
+            // allocate and trigger a moving GC, so `mirror` (a raw
+            // `ObjectRef` captured above and returned again below) must be
+            // rooted across the call — same Family-1 stale-ObjectRef
+            // pattern as the sibling `lk_ensure_initialized` fix. See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let mirror_pin = ctx.pin_native_root(mirror);
             if initialize {
                 if let Err(msg) = ctx.initialize_class(cid) {
                     tracing::warn!("defineClass0 initialize: <clinit> for {name} failed: {msg}");
                 }
             }
+            let mirror = ctx.read_native_pin(mirror_pin, mirror);
+            ctx.unpin_native_roots(mirror_pin);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
@@ -3146,6 +3407,44 @@ fn collect_url_enumeration_strings(
     ctx.unpin_native_roots(p_enum);
 }
 
+/// A URL retained while two resource enumerations are being merged.  The
+/// fallback is only for lightweight non-moving test contexts whose global-root
+/// implementation is intentionally a no-op.
+#[derive(Clone, Copy)]
+struct RootedUrl {
+    root: usize,
+    fallback: ObjectRef,
+}
+
+fn collect_url_enumeration_objects(
+    ctx: &mut dyn NativeContext,
+    enumeration: ObjectRef,
+    out: &mut Vec<RootedUrl>,
+) {
+    const MAX_RESOURCE_ENUMERATION: usize = 16_384;
+    let p_enum = ctx.pin_native_root(enumeration);
+    for _ in 0..MAX_RESOURCE_ENUMERATION {
+        let enumeration = ctx.read_native_pin(p_enum, enumeration);
+        let has_more = match ctx.invoke_virtual(enumeration, "hasMoreElements", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) => v != 0,
+            _ => false,
+        };
+        if !has_more {
+            break;
+        }
+
+        let enumeration = ctx.read_native_pin(p_enum, enumeration);
+        let next = ctx.invoke_virtual(enumeration, "nextElement", "()Ljava/lang/Object;", &[]);
+        if let Ok(Some(Value::Object(Some(url)))) = next {
+            out.push(RootedUrl {
+                root: ctx.add_global_root(url),
+                fallback: url,
+            });
+        }
+    }
+    ctx.unpin_native_roots(p_enum);
+}
+
 fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
@@ -3157,6 +3456,36 @@ fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) ->
         let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+    }
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
+    ctx.set_field(enm, 0, Value::Object(Some(arr)));
+    ctx.set_field(enm, 1, Value::Int(0));
+    enm
+}
+
+/// Build a merged enumeration without converting its URLs through external
+/// forms.  Custom URLStreamHandler instances are object state, so rebuilding a
+/// URL from its String (as the flat-classpath path does) makes in-memory
+/// archives such as ShrinkWrap's `archive:` resources unreadable.
+fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> ObjectRef {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, rooted) in urls.iter().copied().enumerate() {
+        let url = if rooted.root != 0 {
+            ctx.resolve_global_root(rooted.root)
+                .or(Some(rooted.fallback))
+        } else {
+            Some(rooted.fallback)
+        };
+        if let Some(url) = url {
+            let arr_live = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_array_element(arr_live, i, Value::Object(Some(url)));
+        }
+        if rooted.root != 0 {
+            let _ = ctx.remove_global_root(rooted.root);
+        }
     }
     let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
@@ -3258,7 +3587,35 @@ fn cl_get_resources_impl(
             if is_classloader_instance(ctx, this_ref) {
                 let class_id = ctx.class_id_of_object(this_ref);
                 if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                    if !is_builtin_loader_class(&class_name) {
+                    // URLClassLoader is a JDK builtin, but its local
+                    // findResources implementation is precisely the native
+                    // hook that serves constructor-supplied and custom-handler
+                    // URLs.  Treat it like a delegating loader here; its native
+                    // findResources calls back with allow_delegate=false, so
+                    // this cannot recurse.
+                    // A third-party URLClassLoader subclass (notably
+                    // ShrinkWrapClassLoader) may return URLs backed by an
+                    // application URLStreamHandler.  The generic merge below
+                    // serialises every URL to a String and rebuilds it, which
+                    // discards that handler.  Keep the concrete URL objects
+                    // by dispatching straight to findResources for the entire
+                    // URLClassLoader family, just as the JDK's implementation
+                    // does for this local lookup.
+                    let is_url_loader = object_extends(ctx, this_ref, "java/net/URLClassLoader");
+                    if !is_builtin_loader_class(&class_name) || is_url_loader {
+                        // Keep URLClassLoader's returned URL objects intact:
+                        // serialising them through the generic parent merge
+                        // loses application URLStreamHandler state.
+                        if is_url_loader {
+                            // Calling findResources virtually can select the
+                            // real URLClassLoader bytecode through a subclass
+                            // call site.  That bytecode recreates a custom
+                            // protocol URL without its application handler.
+                            // Invoke the native lookup directly so the URL
+                            // objects resolved from the recorded base retain
+                            // their handler end-to-end.
+                            return ucl_find_resources(ctx, args);
+                        }
                         // Real `ClassLoader.getResources` is parent-first:
                         // parent.getResources(name) followed by this loader's
                         // findResources(name). The previous native returned only
@@ -3282,7 +3639,7 @@ fn cl_get_resources_impl(
                                 "(Ljava/lang/String;)Ljava/util/Enumeration;",
                                 &[name_for_parent],
                             ) {
-                                collect_url_enumeration_strings(
+                                collect_url_enumeration_objects(
                                     ctx,
                                     parent_enum,
                                     &mut delegated_urls,
@@ -3301,7 +3658,7 @@ fn cl_get_resources_impl(
                                 "(Ljava/lang/String;)Ljava/util/Enumeration;",
                                 &[name_for_find],
                             ) {
-                                collect_url_enumeration_strings(ctx, own_enum, &mut delegated_urls);
+                                collect_url_enumeration_objects(ctx, own_enum, &mut delegated_urls);
                             }
                         }
                         ctx.unpin_native_roots(p_this);
@@ -3315,7 +3672,7 @@ fn cl_get_resources_impl(
                         // findResources override above has already contributed
                         // this loader's local entries, so return the combined
                         // enumeration even when it is empty.
-                        let enm = enumeration_from_url_strings(ctx, &delegated_urls);
+                        let enm = enumeration_from_rooted_urls(ctx, &delegated_urls);
                         return Ok(Some(Value::Object(Some(enm))));
                     }
                 }
@@ -4043,6 +4400,27 @@ pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls
     };
     if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
         ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(url_arr)));
+
+        // The real-mode URLClassLoader constructors call this helper directly,
+        // bypassing URLClassPath.addURL.  Stashing the array is enough for
+        // getURLs(), but findResource(s) resolves application-provided schemes
+        // (notably ShrinkWrap's in-memory `archive:`) from `ucp.path`.  Mirror
+        // addURL's recording here so constructor-supplied custom URLs remain
+        // discoverable as well as inspectable.
+        //
+        // `record_url_on_path` can allocate and move both the array and the
+        // placeholder, so keep both rooted and reload them on every iteration.
+        let p_urls = ctx.pin_native_root(url_arr);
+        let p_ucp = ctx.pin_native_root(ucp);
+        let count = ctx.array_length(url_arr);
+        for i in 0..count {
+            let urls = ctx.read_native_pin(p_urls, url_arr);
+            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                let ucp = ctx.read_native_pin(p_ucp, ucp);
+                record_url_on_path(ctx, ucp, url);
+            }
+        }
+        ctx.unpin_native_roots(p_urls);
     }
 }
 
@@ -4050,6 +4428,10 @@ fn ucl_init_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
     ucl_setup(ctx, this, urls, Value::Object(None));
+    // The real-JDK layout cannot use ucl_setup's synthetic slots as its
+    // authoritative URL store. Publish the constructor array on the shimmed
+    // URLClassPath as well, which backs getURLs and custom-handler lookup.
+    record_ucl_urls(ctx, this, urls);
     Ok(None)
 }
 
@@ -4058,6 +4440,7 @@ fn ucl_init_urls_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
     let parent = args.get(2).copied().unwrap_or(Value::Object(None));
     ucl_setup(ctx, this, urls, parent);
+    record_ucl_urls(ctx, this, urls);
     Ok(None)
 }
 
@@ -4161,11 +4544,23 @@ fn resolve_url_against(
         ],
     );
     let url = ctx.read_native_pin(p_url, url);
-    ctx.unpin_native_roots(p_base);
-    match r {
-        Ok(_) => Some(url),
+    let result = match r {
+        Ok(_) => {
+            let base = ctx.read_native_pin(p_base, base);
+            if let Value::Object(Some(handler)) = ctx.get_field_by_name(base, "handler") {
+                // `URL(URL, String)` normally copies this private field.  Keep
+                // that invariant explicit for native construction paths too;
+                // a process-global side table keyed by identity hash can collide
+                // after collection and apply an old archive handler to a later
+                // unrelated URL.
+                ctx.set_field_by_name(url, "handler", Value::Object(Some(handler)));
+            }
+            Some(url)
+        }
         Err(_) => None,
-    }
+    };
+    ctx.unpin_native_roots(p_base);
+    result
 }
 
 /// Probe whether `url` resolves to an existing resource through its custom
@@ -4233,22 +4628,30 @@ fn build_custom_handler_url_list(
     if !is_url_class_path_object(ctx, ucp) {
         return None;
     }
-    let path_list = match ctx.get_field_by_name(ucp, "path") {
-        Value::Object(Some(o)) => o,
-        _ => return None,
+    // URLClassPath's real `path` field is not a stable writable extension
+    // point across JDK builds.  Constructors always retain their URLs in our
+    // dedicated placeholder slot, so use that array when no usable path list
+    // is exposed.
+    let (path_list, array_backed) = match ctx.get_field_by_name(ucp, "path") {
+        Value::Object(Some(o)) if is_array_list_object(ctx, o) => (o, false),
+        _ => match ctx.get_field(ucp, UCP_STASHED_URLS) {
+            Value::Object(Some(o)) => (o, true),
+            _ => return None,
+        },
     };
-    if !is_array_list_object(ctx, path_list) {
-        return None;
-    }
     // Fast path: skip the work entirely unless at least one recorded base URL
     // actually carries a custom handler (ordinary loaders record only
     // file:/jar: URLs, whose handler is null/`sun.net.*`).
     let p_path = ctx.pin_native_root(path_list);
-    let size = match ctx.invoke_virtual(path_list, "size", "()I", &[]) {
-        Ok(Some(Value::Int(n))) => n,
-        _ => {
-            ctx.unpin_native_roots(p_path);
-            return None;
+    let size = if array_backed {
+        ctx.array_length(path_list) as i32
+    } else {
+        match ctx.invoke_virtual(path_list, "size", "()I", &[]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => {
+                ctx.unpin_native_roots(p_path);
+                return None;
+            }
         }
     };
     let result = match ctx.new_object("java/util/ArrayList") {
@@ -4268,11 +4671,17 @@ fn build_custom_handler_url_list(
     let mut matched = 0u32;
     for i in 0..size {
         let path_list = ctx.read_native_pin(p_path, path_list);
-        let base =
+        let base = if array_backed {
+            match ctx.get_array_element(path_list, i as usize) {
+                Value::Object(Some(b)) => b,
+                _ => continue,
+            }
+        } else {
             match ctx.invoke_virtual(path_list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)]) {
                 Ok(Some(Value::Object(Some(b)))) => b,
                 _ => continue,
-            };
+            }
+        };
         let p_base = ctx.pin_native_root(base);
         if url_has_custom_handler(ctx, base) {
             if let Some(resolved) = resolve_url_against(ctx, base, name) {
@@ -4393,6 +4802,119 @@ fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> V
     out
 }
 
+/// Collect `http`/`https` base URL strings from a URLClassLoader's own
+/// constructor URLs -- the network-classpath counterpart of
+/// `loader_constructor_url_paths` (which only handles `file:`/`jar:` entries
+/// resolvable as local filesystem paths).
+fn loader_constructor_http_bases(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
+        let count = match ctx.get_field(loader, UCL_URL_COUNT) {
+            Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
+            _ => 0,
+        };
+        for i in 0..count {
+            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                if let Some(base) = http_base_from_url(ctx, url) {
+                    out.push(base);
+                }
+            }
+        }
+    }
+
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(loader, "ucp") {
+        if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+            for i in 0..ctx.array_length(urls) {
+                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                    if let Some(base) = http_base_from_url(ctx, url) {
+                        out.push(base);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Reconstruct an `http(s)://host[:port]/path` base string from a
+/// `java.net.URL` object, or `None` if it is not an http/https URL. Reads
+/// fields by NAME first (works for real-JDK URL objects, which carry genuine
+/// JDK field names -- the same pattern `ucp_add_url`'s `"protocol"` read
+/// uses), falling back to the synthetic numeric layout (`URL_FIELD_*`) so
+/// synthetic-JDK mode's placeholder URL objects resolve too.
+fn http_base_from_url(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<String> {
+    let read = |name: &str, idx: usize| -> Option<String> {
+        match ctx.get_field_by_name(url_obj, name) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => match ctx.get_field(url_obj, idx) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            },
+        }
+    };
+    let protocol = read("protocol", 0)?;
+    if protocol != "http" && protocol != "https" {
+        return None;
+    }
+    let host = read("host", 1).unwrap_or_default();
+    let port = match ctx.get_field_by_name(url_obj, "port") {
+        Value::Int(p) if p > 0 => Some(p),
+        _ => match ctx.get_field(url_obj, 2) {
+            Value::Int(p) if p > 0 => Some(p),
+            _ => None,
+        },
+    };
+    let path = read("path", 3).unwrap_or_default();
+
+    let mut base = format!("{protocol}://{host}");
+    if let Some(p) = port {
+        base.push(':');
+        base.push_str(&p.to_string());
+    }
+    base.push_str(&path);
+    Some(base)
+}
+
+/// Attempt a real HTTP(S) GET for `resource_name` against each of `bases` in
+/// turn (each a base URL collected by `loader_constructor_http_bases`, e.g.
+/// `http://localhost:8500/test-classes/`). Returns the response body on the
+/// first `200 OK`; returns `None` when every base yields a non-2xx status or
+/// a connection failure -- a definitive "not found via this loader's own
+/// classpath" the caller must NOT paper over with CratonVM's flat global
+/// class store (see docs/known-issues/keycloak/
+/// test-classserver-invalidpackage-classnotfound-not-thrown.md -- Keycloak's
+/// `TestClassServer` answers a non-permitted package with HTTP 403, which
+/// must surface as `ClassNotFoundException`, not a silent success).
+fn fetch_http_resource(
+    ctx: &mut dyn NativeContext,
+    bases: &[String],
+    resource_name: &str,
+) -> Option<Vec<u8>> {
+    for base in bases {
+        let sep = if base.ends_with('/') { "" } else { "/" };
+        let uri = format!("{base}{sep}{resource_name}");
+        ctx.begin_blocking_region();
+        let result = crate::http_client::perform_request(
+            "GET",
+            &uri,
+            &[],
+            &[],
+            std::time::Duration::from_secs(10),
+            false,
+            5,
+        );
+        ctx.end_blocking_region();
+        if let Ok(resp) = result {
+            if resp.status == 200 {
+                return Some(resp.body);
+            }
+        }
+    }
+    None
+}
+
 fn loader_local_resource_urls(
     ctx: &dyn NativeContext,
     loader: ObjectRef,
@@ -4406,9 +4928,19 @@ fn loader_local_resource_urls(
 }
 
 /// Try to resolve `URLClassLoader.findClass(name)` from the receiver's own
-/// URL set and define the resulting class under that receiver's loader
-/// namespace. Returns `None` when the receiver's URLs do not contain the class,
-/// leaving callers free to use their historical fallback path.
+/// URL set (local filesystem paths and/or real HTTP(S) fetches) and define
+/// the resulting class under that receiver's loader namespace.
+///
+/// Returns `None` only when this loader has NO usable URL entries at all (no
+/// local paths, no http(s) bases) -- leaving callers free to use their
+/// historical fallback path. Returns `Some(Err(ClassNotFoundException))` when
+/// the loader DOES have http(s) entries but none of them produced the class
+/// (e.g. every base answered non-200, or refused the connection) -- this is a
+/// definitive miss against the loader's own recorded sources and callers
+/// must propagate it rather than falling back to the flat global class
+/// store, which would let a `URLClassLoader(urls, null)` resolve application
+/// classes its own (failed) URL search should have hidden from it. See
+/// docs/known-issues/keycloak/test-classserver-invalidpackage-classnotfound-not-thrown.md.
 pub(crate) fn ucl_try_define_local_class(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
@@ -4420,10 +4952,34 @@ pub(crate) fn ucl_try_define_local_class(
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
-    if paths.is_empty() {
-        return None;
-    }
-    let bytes = cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)?;
+    let bytes = if !paths.is_empty() {
+        cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)
+    } else {
+        None
+    };
+
+    let http_bases = loader_constructor_http_bases(ctx, loader);
+    let bytes = match bytes {
+        Some(b) => Some(b),
+        None if !http_bases.is_empty() => fetch_http_resource(ctx, &http_bases, &resource_name),
+        None => None,
+    };
+
+    let bytes = match bytes {
+        Some(b) => b,
+        None if http_bases.is_empty() => return None,
+        None => {
+            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+                ctx,
+                "java/lang/ClassNotFoundException",
+                1,
+                internal_name,
+            );
+            return Some(Err(
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+            ));
+        }
+    };
 
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);
@@ -4473,16 +5029,7 @@ pub(crate) fn ucl_try_define_local_class(
 /// `jdk.internal.loader.URLClassPath`, so shimming `URLClassPath.addURL`
 /// intercepts the same operation through a call-site the gates DO match. `this`
 /// here is the `URLClassPath` (the loader's `ucp`). See the module banner.
-pub(crate) fn ucp_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let ucp = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    let url = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-
+fn record_real_ucl_url(ctx: &mut dyn NativeContext, ucp: ObjectRef, url: ObjectRef) {
     // Record the base URL on `ucp.path` so `ucl_find_resource(s)` can resolve
     // against custom-handler URLs. Pin `url` across the re-entrant recording so
     // the protocol read below still sees a live ref.
@@ -4506,6 +5053,38 @@ pub(crate) fn ucp_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     ctx.unpin_native_roots(p_url);
+}
+
+/// Record a URL appended through the real `URLClassLoader.addURL(URL)`
+/// wrapper.  Subclasses such as ShrinkWrap invoke that protected inherited
+/// method with a subclass-owned call site, so the ordinary static-class native
+/// gate cannot see it.  Keeping the original URL is essential for application
+/// URLStreamHandler-backed schemes such as `archive:`.
+pub(crate) fn ucl_add_url_real(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let url = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+        record_real_ucl_url(ctx, ucp, url);
+    }
+    Ok(None)
+}
+
+pub(crate) fn ucp_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let ucp = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let url = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    record_real_ucl_url(ctx, ucp, url);
     Ok(None)
 }
 
@@ -4908,13 +5487,21 @@ fn lk_ensure_initialized(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             message: "Lookup.ensureInitialized target is not a Class mirror".to_string(),
         }
     })?;
-    ctx.initialize_class(class_id).map_err(|message| {
-        cratonvm_types::error::MethodCallFailed::InternalError(
-            cratonvm_types::error::VmError::Internal {
-                message: format!("Lookup.ensureInitialized failed: {message}"),
-            },
-        )
-    })?;
+    // Family-1 stale-ObjectRef fix (2026-07-13): `ctx.initialize_class` runs
+    // the target's `<clinit>`, which can allocate and trigger a moving GC.
+    // `target_class` is a raw `ObjectRef` captured above and was being
+    // returned again after this call without being refreshed — exactly the
+    // "held across a GC-triggering call" pattern documented in
+    // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+    // Root and re-read it around the call.
+    let target_class_pin = ctx.pin_native_root(target_class);
+    // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>` failure
+    // instead of re-wrapping it as an unrecoverable `VmError::Internal` —
+    // matches real JDK `Lookup.ensureInitialized`, which throws
+    // `ExceptionInInitializerError` for a failed initializer.
+    ctx.initialize_class(class_id)?;
+    let target_class = ctx.read_native_pin(target_class_pin, target_class);
+    ctx.unpin_native_roots(target_class_pin);
     Ok(Some(Value::Object(Some(target_class))))
 }
 
@@ -7117,11 +7704,10 @@ mod classloader_tests {
     fn test_reset_clears_real_jdk_loader_namespace_ids() {
         let mut ctx = MockNativeContext::new();
         let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
-        let ihc = ctx.identity_hash_code(loader);
         loader_namespace_id_store()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(ihc, 42);
+            .push((loader, 42));
 
         assert_eq!(peek_loader_namespace_id(&mut ctx, loader), Some(42));
 
@@ -7265,7 +7851,9 @@ mod classloader_tests {
             "built-in loaders must not see app-namespace classes defined by a child loader"
         );
         assert!(
-            resolve_global_if_visible(&mut ctx, app_loader, "MyMessenger").is_none(),
+            resolve_global_if_visible(&mut ctx, app_loader, "MyMessenger")
+                .unwrap()
+                .is_none(),
             "base loadClass global fallback must apply the same child-loader visibility rule"
         );
     }

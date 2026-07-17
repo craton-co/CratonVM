@@ -305,6 +305,63 @@ pub enum GpuFutureResult {
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
 /// module dependencies between `native` and `vm`.
 pub trait NativeContext {
+    /// Whether this context can construct and dispatch real generated proxy
+    /// classes. Lightweight unit-test contexts intentionally return `false`:
+    /// they model native object state but do not own a VM-wide class-loader and
+    /// proxy-class namespace.
+    fn supports_real_proxy_generation(&self) -> bool {
+        true
+    }
+
+    /// Force-refresh this thread's deposited GC root snapshot (the same
+    /// mechanism `NativeContextImpl::deposit_root_snapshot` uses before a
+    /// blocking call) without actually blocking.
+    ///
+    /// Background: a peer-initiated stop-the-world collection has two ways
+    /// to see a thread's roots — (1) a live conservative register/stack scan
+    /// if that thread is forcibly frozen while executing JIT-compiled code
+    /// (`jit::xt_root_scan`), which does NOT know about `native_pin_roots`
+    /// (a native-side `Vec` living on the Rust heap, not the JIT frame), or
+    /// (2) this thread's last-deposited snapshot
+    /// (`collect_all_root_snapshots`/`root_snapshots_for_os_tids`), which
+    /// DOES include `native_pin_roots` but is only refreshed at specific
+    /// checkpoints: a cooperative interpreter safepoint arrival, entry into
+    /// a blocking native region, or this thread itself initiating a GC.
+    /// JIT-compiled code has no periodic cooperative safepoint poll at all
+    /// (see the comment on `jit::helpers::jit_safepoint_flush_satb`) — it
+    /// only touches those checkpoints via specific GC-triggering runtime
+    /// helpers, which a hot loop making only fast-path allocations may never
+    /// call.
+    ///
+    /// A native method that pins a long-lived batch of objects (e.g. a
+    /// materialized `Stream` of elements, each pinned once up front) and then
+    /// drives per-element re-entrant Java execution that can run for a long
+    /// time and/or tier up into JIT — without itself ever blocking or
+    /// initiating GC — leaves a window where neither mechanism above sees
+    /// those pins: not (1), because `native_pin_roots` isn't scanned that
+    /// way, and not (2), because nothing has refreshed the deposit since
+    /// before the pins were pushed. A peer thread's GC during that window
+    /// can reclaim a still-pinned object; the next read through the pin
+    /// (correctly re-validated, `via_pin=true`) observes a stale/reused
+    /// address. Confirmed live for JUnit 5's `TestTemplateExecutor`/
+    /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
+    /// java.lang.Object cannot be cast to
+    /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
+    /// `obj_cid=0` — see `docs/known-issues/
+    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
+    /// which documents the same family from WildFly's `parallel-extension-add`
+    /// boot step) — one more independent occurrence of that already-tracked
+    /// "register-invisible root" / cross-thread GC-root-visibility family,
+    /// now with this specific closeable checkpoint gap identified.
+    ///
+    /// Calling this right after establishing such a batch of pins (and
+    /// optionally again periodically across a long per-element loop) closes
+    /// that window by (re-)publishing a fresh deposit — the exact same
+    /// mechanism already relied on for peers parked in a blocking region —
+    /// without requiring this thread to actually block. Default impl is a
+    /// no-op: test/mock contexts have no cross-thread GC to defend against.
+    fn refresh_root_snapshot(&mut self) {}
+
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
@@ -670,6 +727,40 @@ pub trait NativeContext {
         args: &[Value],
     ) -> MethodCallResult;
 
+    /// Invoke a method on an ALREADY-RESOLVED declaring class, bypassing
+    /// name-based class resolution entirely.
+    ///
+    /// `Method.invoke()` (reflection) on a static method already has an
+    /// unambiguous declaring `ClassId` in hand (from the `Method` object's
+    /// own `clazz` mirror) — it must not re-resolve the class by NAME, which
+    /// goes through the loader-blind global lookup (`load_class`/
+    /// `get_loaded_class_id`). That lookup deliberately returns "not found"
+    /// (not a guess) whenever 2+ *different* user-defined loaders each
+    /// register their own distinct class under the identical simple name —
+    /// an intentional, documented anti-ambiguity guard (see
+    /// `ClassManager::get_loaded_class_id`), but it means ANY name-based
+    /// re-resolution after the fact is unsound the moment a second same-named
+    /// class from a different loader exists anywhere in the process — a
+    /// completely ordinary pattern for repeatedly-invoked test/codegen
+    /// harnesses that mint a fresh ClassLoader + identically-named generated
+    /// class each time (e.g. Spring's `TestCompiler`/
+    /// `@CompileWithForkedClassLoader`, which produced the exact
+    /// `GroupsMetadataValueDelegateTests` "class file error: class not
+    /// found" VM abort this fixes). Default implementation falls back to the
+    /// name-based [`Self::invoke`] for callers/mocks that have no ClassId
+    /// fast path; the real VM overrides this to skip re-resolution.
+    fn invoke_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke(class_name, method_name, descriptor, args)
+    }
+
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
@@ -819,6 +910,23 @@ pub trait NativeContext {
     /// Resolve a field name to its slot index for a given class.
     /// Returns `None` if the field is not found in the class hierarchy.
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize>;
+
+    /// Resolve a field name to its slot index by `ClassId` directly --
+    /// no class-name round-trip. Returns `None` if the field is not found
+    /// in the class hierarchy.
+    ///
+    /// Prefer this over `resolve_field_index` whenever the caller already
+    /// holds the object (and so its exact `ClassId` via
+    /// `class_id_of_object`): `resolve_field_index`'s name-based lookup
+    /// re-resolves the class GLOBALLY by name, which returns `None`
+    /// whenever 2+ distinct loaders each define their own class under the
+    /// same simple name (a legitimate "ambiguous" answer for a bare name,
+    /// but a needless loss when the caller already holds the exact,
+    /// unambiguous `ClassId` -- e.g. a native shim reading a field off a
+    /// third-party object whose class gets redefined under a fresh loader
+    /// each time, such as ByteBuddy classes under
+    /// `@CompileWithForkedClassLoader`).
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize>;
 
     /// Read `out.len()` bytes of native memory at `addr` into `out`.
     ///
@@ -1131,6 +1239,14 @@ pub trait NativeContext {
         self.create_string(text)
     }
 
+    /// Create a dynamic String at a native-call safepoint when the caller has
+    /// no unpinned Java references.  The VM implementation may collect before
+    /// allocating; the default keeps mock contexts and legacy implementations
+    /// on the ordinary uninterned path.
+    fn create_string_uninterned_gc_safe(&mut self, text: &str) -> ObjectRef {
+        self.create_string_uninterned(text)
+    }
+
     /// Populate an *already-allocated* `java/lang/String` object's backing
     /// fields directly from raw UTF-16 code `units`, using the same
     /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
@@ -1401,6 +1517,38 @@ pub trait NativeContext {
 
     /// Acquire the monitor (synchronized) on the given object.
     fn monitor_enter(&mut self, obj: ObjectRef);
+
+    /// GC-safe variant of [`monitor_enter`], for the rare native whose
+    /// contended wait needs to be excused from an in-flight STW barrier
+    /// pause instead of leaving the calling thread counted in its `expected`
+    /// set for the whole wait (see
+    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
+    ///
+    /// Deliberately NARROW: `monitor_enter` itself stays on its original,
+    /// non-GC-blocked path for the other ~80 native call sites that use
+    /// it (Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
+    /// ReentrantLock/Condition/etc.) — a from-scratch audit of every one of
+    /// those (2026-07-13) found the overwhelming majority keep reading
+    /// fields off the SAME `obj`/`this` after the call without any
+    /// pin-and-refresh, so blanket-switching `monitor_enter`'s contended
+    /// path to span a completing (possibly moving) GC pause would expose
+    /// all of them to the stale-`ObjectRef`-across-GC bug class this
+    /// codebase has repeatedly hit (see
+    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// — an unaudited-at-scale regression risk far worse than the original
+    /// hang. This method exists so the ONE call site with live-gdb-confirmed
+    /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
+    /// `native_cdl_await_timeout` / `native_cdl_count_down` polling loop,
+    /// contending a shared handshake latch under WildFly's
+    /// `parallel-extension-add`) can opt in individually, and MUST use the
+    /// returned reference for anything after the call — the object may have
+    /// moved if the wait spanned a GC. Default implementation is a no-op
+    /// pass-through to `monitor_enter` (correct for every mock/test context
+    /// in this workspace, none of which move objects mid-wait).
+    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
+        self.monitor_enter(obj);
+        obj
+    }
 
     /// Release the monitor (synchronized) on the given object.
     fn monitor_exit(&mut self, obj: ObjectRef);
@@ -2886,10 +3034,24 @@ pub trait NativeContext {
     }
 
     /// Force a class to complete its `<clinit>` immediately. Used by
-    /// `defineHiddenClass` when the `initialize` flag is `true`. The
-    /// default is a no-op — callers that care about deterministic init
+    /// `defineHiddenClass` when the `initialize` flag is `true`, and by
+    /// `Class.forName`/`Constructor.newInstance`/`Lookup.ensureInitialized`.
+    /// The default is a no-op — callers that care about deterministic init
     /// must override this in their NativeContext impl.
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), String> {
+    ///
+    /// HIB-CV-26 fix (2026-07-16): the error type is `MethodCallFailed`
+    /// (not a flattened `String`) so a `<clinit>` failure keeps its
+    /// two-layer identity all the way to the caller: a genuine Java
+    /// exception from a static initializer comes back as
+    /// `MethodCallFailed::ExceptionThrown` (already correctly wrapped as a
+    /// catchable `ExceptionInInitializerError`/`NoClassDefFoundError` by
+    /// `ensure_class_initialized_shared` per JVMS §5.5) and only a true
+    /// VM-level bug comes back as `MethodCallFailed::InternalError`.
+    /// Collapsing both into a `String` here previously forced every call
+    /// site to treat ordinary `<clinit>` exceptions as unrecoverable
+    /// internal errors, aborting the VM instead of letting Java code catch
+    /// them.
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
         let _ = class_id;
         Ok(())
     }
@@ -3347,6 +3509,18 @@ impl NativeMethodRegistry {
         // fake. Bridges and intrinsics are always registered. (See the
         // `drop_synthetic_stubs` field doc.)
         if self.drop_synthetic_stubs && self.current_category == NativeKind::SyntheticStub {
+            // CRATONVM_DBG_DROPPED_STUBS=1: list every registration this mode
+            // silently drops. Added 2026-07-14 while chasing a real-JDK-mode
+            // bootstrap regression (`InternalError: null property: java.home`)
+            // that traced back to a whole register_* function's worth of
+            // permanent bridges (java.util.Properties' side-table natives)
+            // being mis-tagged SyntheticStub by inheriting the wrong ambient
+            // category at one of its call sites — this made the drop visible
+            // in seconds instead of a multi-round bisection. Cheap/no-op when
+            // unset; kept as a permanent diagnostic for the next occurrence.
+            if std::env::var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
+                eprintln!("[DROPPED-STUB] {class_name}.{method_name}{descriptor}");
+            }
             return;
         }
         // NIO-SERVER-SOCKET (route 1): when `CRATONVM_REAL_NET_SOCKETS` is set,
@@ -3580,12 +3754,26 @@ impl NativeMethodRegistry {
                     | ("group", "()Ljava/lang/String;")
                     | ("group", "(I)Ljava/lang/String;")
             );
+        // Pattern is immutable after its constructor finishes.  The two
+        // static factories below may therefore return a VM-rooted, fully
+        // constructed real-JDK Pattern from a bounded cache; unlike the old
+        // synthetic regex bridge they never fabricate or partially initialize
+        // a Pattern/Matcher layout.
+        let keep_real_pattern_compile_cache = self.current_category == NativeKind::Intrinsic
+            && class_name == "java/util/regex/Pattern"
+            && method_name == "compile"
+            && matches!(
+                descriptor,
+                "(Ljava/lang/String;)Ljava/util/regex/Pattern;"
+                    | "(Ljava/lang/String;I)Ljava/util/regex/Pattern;"
+            );
         if self.drop_real_layout_synthetic
             && matches!(
                 class_name,
                 "java/util/regex/Pattern" | "java/util/regex/Matcher"
             )
             && !keep_real_matcher_find_fastpath
+            && !keep_real_pattern_compile_cache
         {
             return;
         }

@@ -66,7 +66,10 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{atomic::{AtomicI64, Ordering}, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Mutex, OnceLock,
+};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
@@ -141,6 +144,23 @@ fn logger_registry() -> &'static Mutex<HashMap<String, u64>> {
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// JULI's `ClassLoaderLogManager` deliberately permits the same logger name
+/// in independent web application class loaders. Keep those synthetic loggers
+/// out of the default process-wide registry and key them by the stable identity
+/// hash of the current thread context class loader instead.
+fn tomcat_juli_logger_registry() -> &'static Mutex<HashMap<(i32, String), u64>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<(i32, String), u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Root handlers must be scoped by the thread context class loader as well:
+/// every web application uses the JUL root name `""`, but each has an
+/// independent FileHandler configuration.
+fn tomcat_juli_root_handler_registry() -> &'static Mutex<HashMap<i32, Vec<u64>>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<i32, Vec<u64>>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Explicit handlers installed on synthetic JUL loggers. The JDK normally
 /// keeps this state in `Logger.ConfigurationData`; our compact Logger mirror
 /// deliberately does not model that private layout, so keep the Java-visible
@@ -148,6 +168,14 @@ fn logger_registry() -> &'static Mutex<HashMap<String, u64>> {
 /// (Tomcat's `LogCapture` is one such user), not only console output.
 fn logger_handlers() -> &'static Mutex<HashMap<String, Vec<u64>>> {
     static INSTANCE: OnceLock<Mutex<HashMap<String, Vec<u64>>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Explicit JUL levels for real Logger objects. Their private configuration
+/// layout is not always materialized by the VM, but callers such as Tomcat's
+/// LogCapture rely on `setLevel(FINE)` taking effect immediately.
+fn logger_explicit_levels() -> &'static Mutex<HashMap<String, i32>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -500,6 +528,168 @@ fn jboss_log_manager_requested(ctx: &dyn NativeContext) -> bool {
     )
 }
 
+fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
+    let thread = match ctx
+        .invoke(
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            &[],
+        )
+        .ok()
+        .flatten()
+    {
+        Some(Value::Object(Some(thread))) => thread,
+        _ => return 0,
+    };
+    let thread_pin = ctx.pin_native_root(thread);
+    let loader = ctx.invoke(
+        "java/lang/Thread",
+        "getContextClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(thread))],
+    );
+    ctx.unpin_native_roots(thread_pin);
+    match loader.ok().flatten() {
+        Some(Value::Object(Some(loader))) => ctx.identity_hash_code(loader),
+        _ => 0,
+    }
+}
+
+/// Return the root logger already configured by Tomcat for the current thread
+/// context class loader.  Calling `getLogger("")` is safe here: JULI creates
+/// and configures that root as part of its own class-loader-info bootstrap;
+/// unlike `addLogger(child)`, it does not recurse through parent logger names.
+fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(manager))
+        .as_deref()
+        != Some("org/apache/juli/ClassLoaderLogManager")
+    {
+        return None;
+    }
+    let manager_pin = ctx.pin_native_root(manager);
+    let root_name = ctx.create_string("");
+    let manager = ctx.read_native_pin(manager_pin, manager);
+    let root = ctx
+        .invoke_virtual_bytecode_only(
+            manager,
+            "getLogger",
+            "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+            &[Value::Object(Some(root_name))],
+        )
+        .ok()
+        .flatten();
+    ctx.unpin_native_roots(manager_pin);
+    match root {
+        Some(Value::Object(Some(root))) => Some(root),
+        _ => None,
+    }
+}
+
+fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    if !is_valid_logger_name(name) {
+        return allocate_logger(ctx, "");
+    }
+    // The JUL root is a real logger installed by ClassLoaderLogManager while
+    // it reads the current webapp's logging.properties. Returning it directly
+    // preserves the configured root level instead of manufacturing a second,
+    // unconfigured synthetic root.
+    if name.is_empty() {
+        if let Some(root) = tomcat_juli_root_logger(ctx) {
+            return root;
+        }
+    }
+    let context_loader_key = tomcat_context_loader_key(ctx);
+    let key = (context_loader_key, name.to_string());
+    if let Some(&address) = tomcat_juli_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        if address != 0 {
+            return unsafe { object_from_u64(address) };
+        }
+    }
+    let logger = allocate_logger(ctx, name);
+    // Do not merely cache the child: Tomcat's addLogger bytecode applies the
+    // current context-class-loader configuration, wires its parent chain and
+    // instantiates any per-logger handlers. Bypassing this path was why the
+    // per-webapp FileHandler and root level disappeared.
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(manager))
+        .as_deref()
+        == Some("org/apache/juli/ClassLoaderLogManager")
+    {
+        let manager_pin = ctx.pin_native_root(manager);
+        let logger_pin = ctx.pin_native_root(logger);
+        let manager = ctx.read_native_pin(manager_pin, manager);
+        let logger_arg = ctx.read_native_pin(logger_pin, logger);
+        let _ = ctx.invoke_virtual_bytecode_only(
+            manager,
+            "addLogger",
+            "(Ljava/util/logging/Logger;)Z",
+            &[Value::Object(Some(logger_arg))],
+        );
+        ctx.unpin_native_roots(logger_pin);
+        ctx.unpin_native_roots(manager_pin);
+    }
+    if let Some(root) = tomcat_juli_root_logger(ctx) {
+        if let Some(handlers) = crate::jul_logger_handlers_get(ctx, root) {
+            // `publish_to_jul_handlers` is intentionally compact and does not
+            // walk a Java parent chain.  Share JULI's already-filtered root
+            // handler list with the context-local child so it observes the
+            // same per-webapp FileHandler configuration.
+            crate::jul_logger_handlers_set(ctx, logger, handlers);
+        } else {
+            // Older JULI setup paths register a root handler through the
+            // name-keyed compatibility table. Snapshot that current root list
+            // into a distinct identity-keyed ArrayList so two webapps with
+            // root name "" cannot subsequently overwrite one another.
+            let root_handlers = tomcat_juli_root_handler_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&context_loader_key)
+                .cloned()
+                .unwrap_or_default();
+            if !root_handlers.is_empty() {
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                let _ =
+                    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))]);
+                for address in root_handlers {
+                    let handler = unsafe { object_from_u64(address) };
+                    let _ = cratonvm_native_collections::native_al_add(
+                        ctx,
+                        &[Value::Object(Some(list)), Value::Object(Some(handler))],
+                    );
+                }
+                crate::jul_logger_handlers_set(ctx, logger, list);
+            }
+        }
+    }
+    let mut registry = tomcat_juli_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&address) = registry.get(&key) {
+        if address != 0 {
+            return unsafe { object_from_u64(address) };
+        }
+    }
+    registry.insert(key, logger.as_ptr() as u64);
+    logger
+}
+
+fn tomcat_classloader_log_manager_requested(ctx: &dyn NativeContext) -> bool {
+    matches!(
+        ctx.get_system_property("java.util.logging.manager")
+            .as_deref()
+            .map(str::trim),
+        Some("org.apache.juli.ClassLoaderLogManager" | "org/apache/juli/ClassLoaderLogManager")
+    )
+}
+
 fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -507,6 +697,10 @@ fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     if jboss_log_manager_requested(ctx) {
         let logger = get_or_create_jboss_logger(ctx, &name);
+        return Ok(Some(Value::Object(Some(logger))));
+    }
+    if tomcat_classloader_log_manager_requested(ctx) {
+        let logger = get_or_create_tomcat_juli_logger(ctx, &name);
         return Ok(Some(Value::Object(Some(logger))));
     }
     let logger = get_or_create_logger(ctx, &name);
@@ -528,6 +722,12 @@ pub(crate) fn reset_state_for_tests() {
         *g = None;
     }
     if let Ok(mut r) = logger_registry().lock() {
+        r.clear();
+    }
+    if let Ok(mut r) = tomcat_juli_logger_registry().lock() {
+        r.clear();
+    }
+    if let Ok(mut r) = tomcat_juli_root_handler_registry().lock() {
         r.clear();
     }
     if let Ok(mut h) = logger_handlers().lock() {
@@ -634,6 +834,12 @@ fn native_read_configuration_with_stream(
 fn native_reset(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Drop all logger bindings but keep the manager singleton alive.
     if let Ok(mut r) = logger_registry().lock() {
+        r.clear();
+    }
+    if let Ok(mut r) = tomcat_juli_logger_registry().lock() {
+        r.clear();
+    }
+    if let Ok(mut r) = tomcat_juli_root_handler_registry().lock() {
         r.clear();
     }
     Ok(None)
@@ -1004,9 +1210,7 @@ fn native_level_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 for candidate in names {
                     if let Some(idx) = ctx.static_field_index_by_name(cid, candidate) {
                         if let Value::Object(Some(level_obj)) = ctx.get_static_field(cid, idx) {
-                            if let Value::Int(v) =
-                                ctx.get_field_by_name(level_obj, "value")
-                            {
+                            if let Value::Int(v) = ctx.get_field_by_name(level_obj, "value") {
                                 if v == target {
                                     return Ok(Some(Value::Object(Some(level_obj))));
                                 }
@@ -1886,21 +2090,76 @@ fn native_jul_log_record_get_message(
 /// Store an explicit handler without relying on the private JDK Logger layout.
 fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
-        (args.first(), args.get(1)) else {
+        (args.first(), args.get(1))
+    else {
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
+    let is_root = name.is_empty();
     let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
     let handlers = all.entry(name).or_default();
     if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
         handlers.push(handler.as_ptr() as u64);
     }
+    if is_root && tomcat_classloader_log_manager_requested(ctx) {
+        let loader_key = tomcat_context_loader_key(ctx);
+        let mut roots = tomcat_juli_root_handler_registry()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entries = roots.entry(loader_key).or_default();
+        if !entries.iter().any(|&addr| addr == handler.as_ptr() as u64) {
+            entries.push(handler.as_ptr() as u64);
+        }
+    }
+    // The compatibility map above is name-keyed for legacy synthetic JUL
+    // callers. JULI must additionally retain handlers by logger identity:
+    // two webapps may both configure the root logger named "" but with
+    // independent FileHandlers. The delivery bridge consumes this side table.
+    let side_list = match crate::jul_logger_handlers_get(ctx, *logger) {
+        Some(list) => list,
+        None => {
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
+            crate::jul_logger_handlers_set(ctx, *logger, list);
+            list
+        }
+    };
+    let size = match ctx.invoke_virtual(side_list, "size", "()I", &[])? {
+        Some(Value::Int(size)) if size > 0 => size as usize,
+        _ => 0,
+    };
+    let mut already_present = false;
+    for index in 0..size {
+        if ctx.invoke_virtual(
+            side_list,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(index as i32)],
+        )? == Some(Value::Object(Some(*handler)))
+        {
+            already_present = true;
+            break;
+        }
+    }
+    if !already_present {
+        let _ = cratonvm_native_collections::native_al_add(
+            ctx,
+            &[
+                Value::Object(Some(side_list)),
+                Value::Object(Some(*handler)),
+            ],
+        )?;
+    }
     Ok(None)
 }
 
-fn native_jul_logger_remove_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_jul_logger_remove_handler(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(handler)))) =
-        (args.first(), args.get(1)) else {
+        (args.first(), args.get(1))
+    else {
         return Ok(None);
     };
     let name = read_jul_logger_name(ctx, *logger);
@@ -1920,15 +2179,37 @@ fn publish_jul_handlers(
     level: Option<ObjectRef>,
     message: Option<ObjectRef>,
 ) {
+    publish_jul_handlers_src(ctx, logger, level, message, None, None)
+}
+
+/// `publish_jul_handlers` with the caller-provided source class/method pair
+/// (`Logger.logp` args) stamped into each record so JULI's OneLineFormatter
+/// prints the real source instead of "null.null".
+fn publish_jul_handlers_src(
+    ctx: &mut dyn NativeContext,
+    logger: Option<ObjectRef>,
+    level: Option<ObjectRef>,
+    message: Option<ObjectRef>,
+    src_cls: Option<ObjectRef>,
+    src_mth: Option<ObjectRef>,
+) {
     let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
         return;
     };
+    // The record allocations below can move these; pin so each iteration
+    // re-reads the current addresses (native stale-local family).
+    let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
     let handlers = logger_handlers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&read_jul_logger_name(ctx, logger))
         .cloned()
         .unwrap_or_default();
+    // Resolve the producing thread's Java tid once, BEFORE any record
+    // allocation below can move freshly-created objects.
+    let producer_tid = crate::current_java_thread_tid(ctx);
+    let producer_short_tid = crate::short_thread_id(producer_tid);
     for addr in handlers {
         // SAFETY: handlers are strongly referenced by Java-side LogCapture for
         // the whole interval they are registered; this is the same stable-ref
@@ -1948,6 +2229,20 @@ fn publish_jul_handlers(
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
         ctx.set_field(record, 4, Value::Object(Some(message)));
+        // Records must carry the producing thread's id: JULI's OneLineFormatter
+        // resolves record.getLongThreadID() via ThreadMXBean.getThreadInfo(long),
+        // which throws IllegalArgumentException for the 0 an unpopulated record
+        // reports (seen as "ErrorManager: 5" on every AsyncFileHandler format).
+        ctx.set_field_by_name(record, "longThreadID", Value::Long(producer_tid));
+        ctx.set_field_by_name(record, "threadID", Value::Int(producer_short_tid));
+        if let Some((pin, obj)) = src_cls_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(src)));
+        }
+        if let Some((pin, obj)) = src_mth_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
+        }
         // Prefer the JDK setter too: it writes the resolved private slot even
         // when the compact allocator has not materialized field metadata yet.
         let _ = ctx.invoke_virtual(
@@ -1960,7 +2255,9 @@ fn publish_jul_handlers(
         // stable identity across the moving collector.
         let record_id = next_log_record_id();
         ctx.set_field(record, 1, Value::Long(record_id));
-        let mut messages = log_record_messages().lock().unwrap_or_else(|e| e.into_inner());
+        let mut messages = log_record_messages()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         messages.insert(record_id, ctx.read_string(message).unwrap_or_default());
         // A long-lived handler must not turn the bridge into an unbounded
         // message cache. Records are ephemeral; retain a generous recent
@@ -1979,6 +2276,11 @@ fn publish_jul_handlers(
             "(Ljava/util/logging/LogRecord;)V",
             &[Value::Object(Some(record))],
         );
+    }
+    if let Some((pin, _)) = src_cls_pin {
+        ctx.unpin_native_roots(pin);
+    } else if let Some((pin, _)) = src_mth_pin {
+        ctx.unpin_native_roots(pin);
     }
 }
 
@@ -2011,6 +2313,17 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // The explicit source class/method pair JULI's DirectJDKLog resolves
+    // from the caller stack. Stamped into bridged records so
+    // OneLineFormatter prints the real source instead of "null.null".
+    let src_cls_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let src_mth_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -2030,13 +2343,29 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         "WARNING" => "WARN",
         "INFO" => "INFO",
         "CONFIG" => "INFO",
-        "FINE" | "FINER" | "FINEST" => return Ok(None), // suppress noise
+        // Keep fine-grained messages off the console, but do publish them to
+        // explicitly installed handlers. Tomcat's LogCapture sets a logger to
+        // FINE specifically to assert a recoverable handshake underflow.
+        "FINE" | "FINER" | "FINEST" => {
+            publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
+            if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
+                publish_to_jul_handlers_src(
+                    ctx,
+                    logger,
+                    level,
+                    message,
+                    src_cls_obj,
+                    src_mth_obj,
+                )?;
+            }
+            return Ok(None);
+        }
         other => other,
     };
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
-    publish_jul_handlers(ctx, this, level_obj, message_obj);
+    publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
     if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
@@ -2061,7 +2390,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         eprintln!("{tag} [{logger_name}] {message}");
     }
     if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-        publish_to_jul_handlers(ctx, logger, level, message)?;
+        publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
     }
     Ok(None)
 }
@@ -2075,16 +2404,50 @@ fn publish_to_jul_handlers(
     level: ObjectRef,
     message: ObjectRef,
 ) -> MethodCallResult {
+    publish_to_jul_handlers_src(ctx, logger, level, message, None, None)
+}
+
+/// `publish_to_jul_handlers` with the caller-provided source class/method
+/// pair (`Logger.logp` args) stamped into the bridged record.
+fn publish_to_jul_handlers_src(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    level: ObjectRef,
+    message: ObjectRef,
+    src_cls: Option<ObjectRef>,
+    src_mth: Option<ObjectRef>,
+) -> MethodCallResult {
     let base_pin = ctx.pin_native_root(logger);
     let level_pin = ctx.pin_native_root(level);
     let message_pin = ctx.pin_native_root(message);
+    // Released with base_pin below (stack discipline).
+    let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
     let result = (|| {
         let logger = ctx.read_native_pin(base_pin, logger);
         let level = ctx.read_native_pin(level_pin, level);
         let message = ctx.read_native_pin(message_pin, message);
-        let handlers = match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
-            Value::Object(Some(list)) => list,
-            _ => return Ok(None),
+        let handlers = crate::jul_logger_handlers_get(ctx, logger).or_else(|| {
+            // Only our legacy synthetic logger stores its parent/handler
+            // fallback at raw slot 2.  On a real JDK Logger that slot is the
+            // `name` String; treating it as an ArrayList reintroduces the
+            // `java/lang/String.size()I` failure when Tomcat's
+            // ClassLoaderLogManager creates a real per-webapp logger.
+            let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
+                Value::Object(Some(name))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        == Some("java/lang/String"));
+            if synthetic_layout {
+                match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
+                    Value::Object(Some(list)) => Some(list),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        });
+        let Some(handlers) = handlers else {
+            return Ok(None);
         };
         let handlers_pin = ctx.pin_native_root(handlers);
         let record = match ctx.new_object_initialized(
@@ -2095,6 +2458,33 @@ fn publish_to_jul_handlers(
             Some(Value::Object(Some(record))) => record,
             _ => return Ok(None),
         };
+        // The compact VM may not materialize the JDK's private LogRecord
+        // layout through its constructor. FileHandler.isLoggable() and its
+        // formatter consume the public level/message surface, so make that
+        // surface explicit just as the direct-handler bridge does.
+        ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
+        ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+        ctx.set_field(record, 4, Value::Object(Some(message)));
+        if let Some((pin, obj)) = src_cls_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(src)));
+        }
+        if let Some((pin, obj)) = src_mth_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
+        }
+        let _ = ctx.invoke_virtual(
+            record,
+            "setMessage",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(message))],
+        );
+        let record_id = next_log_record_id();
+        ctx.set_field(record, 1, Value::Long(record_id));
+        log_record_messages()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(record_id, ctx.read_string(message).unwrap_or_default());
         let record_pin = ctx.pin_native_root(record);
         let handlers = ctx.read_native_pin(handlers_pin, handlers);
         let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
@@ -2121,6 +2511,10 @@ fn publish_to_jul_handlers(
                 "(Ljava/util/logging/LogRecord;)V",
                 &[Value::Object(Some(record))],
             );
+            // FileHandler buffers output. The native publication bridge is
+            // synchronous, so preserve JUL's observable completion contract
+            // before the caller inspects its per-webapp log file.
+            let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
         }
         Ok(None)
     })();
@@ -2346,13 +2740,22 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// prints nothing" symptom). Mirror the JDK default: the root logger
 /// is INFO, so anything at INFO or higher (INTvalue >= 800) is
 /// loggable, and FINE/FINER/FINEST are not.
-fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_jul_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let logger = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     let level_obj = match args.get(1) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
     // `Level` exposes an int `value` field (e.g. WARNING=900, INFO=800,
-    // CONFIG=700, FINE=500). Compare against the JDK default root level.
+    // CONFIG=700, FINE=500). Use the logger's configured level when it is a
+    // real JUL Logger (LogCapture temporarily sets it to FINE); otherwise
+    // mirror the JDK root default of INFO.
     let level_value = level_obj
         .and_then(|o| match ctx.get_field_by_name(o, "value") {
             Value::Int(v) => Some(v),
@@ -2380,7 +2783,55 @@ fn native_jul_logger_is_loggable(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 })
         })
         .unwrap_or(800);
-    Ok(Some(Value::Int(if level_value >= 800 { 1 } else { 0 })))
+    let configured_threshold = logger
+        .and_then(|logger| match ctx.get_field_by_name(logger, "config") {
+            Value::Object(Some(config)) => match ctx.get_field_by_name(config, "levelObject") {
+                Value::Object(Some(level)) => match ctx.get_field_by_name(level, "value") {
+                    Value::Int(value) => Some(value),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(800);
+    let threshold = logger
+        .map(|logger| read_jul_logger_name(ctx, logger))
+        .and_then(|name| {
+            logger_explicit_levels()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&name)
+                .copied()
+        })
+        .unwrap_or(configured_threshold);
+    Ok(Some(Value::Int(if level_value >= threshold {
+        1
+    } else {
+        0
+    })))
+}
+
+pub(crate) fn record_jul_logger_level(ctx: &dyn NativeContext, logger: ObjectRef, level: Value) {
+    let name = read_jul_logger_name(ctx, logger);
+    if name.is_empty() {
+        return;
+    }
+    let value = match level {
+        Value::Object(Some(level)) => match ctx.get_field_by_name(level, "value") {
+            Value::Int(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut levels = logger_explicit_levels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = value {
+        levels.insert(name, value);
+    } else {
+        levels.remove(&name);
+    }
 }
 
 fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2398,8 +2849,10 @@ fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     publish_jul_convenience(ctx, args, "SEVERE")?;
     Ok(None)
 }
-fn native_jul_logger_fine(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Suppress fine/finer/finest — too noisy and not useful for boot visibility.
+fn native_jul_logger_fine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Keep fine/finer/finest quiet on the console, but explicit JUL handlers
+    // (for example Tomcat's LogCapture) must still receive the record.
+    publish_jul_convenience(ctx, args, "FINE")?;
     Ok(None)
 }
 
@@ -2531,6 +2984,22 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
     {
         push_addr(addr);
     }
+    for &addr in tomcat_juli_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        push_addr(addr);
+    }
+    for handlers in tomcat_juli_root_handler_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        for &addr in handlers {
+            push_addr(addr);
+        }
+    }
     for &addr in jboss_logger_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2594,6 +3063,22 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
         .values_mut()
     {
         *addr = remap(*addr);
+    }
+    for addr in tomcat_juli_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values_mut()
+    {
+        *addr = remap(*addr);
+    }
+    for handlers in tomcat_juli_root_handler_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values_mut()
+    {
+        for addr in handlers {
+            *addr = remap(*addr);
+        }
     }
     for addr in jboss_logger_registry()
         .lock()

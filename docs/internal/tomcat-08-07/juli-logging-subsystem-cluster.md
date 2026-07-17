@@ -1,44 +1,41 @@
-# JULI logging subsystem — resolved 4-class cluster
+# JULI logging subsystem cluster
 
-**Status:** FIXED on 2026-07-11. **Severity:** medium (test/logging
-infrastructure correctness; no crash).
+**Status: resolved and archived on 2026-07-15.**
 
-## Resolution
+## Final resolution
 
-The failure cluster had four independent runtime gaps on the real-JDK JUL
-path:
+The remaining `TestPerWebappJuliIntegration` residual was a combination of
+three real-JDK JUL bridge defects:
 
-- `ThreadMXBean` returned an unnamed/basic `ThreadInfo`, so JULI's thread-name
-  cache observed `main` instead of the worker's registered name.
-- Native JUL dispatch printed intercepted `Logger` calls but did not fan them
-  out to attached JULI handlers; `LogRecord` and `Handler` bridge state was
-  incomplete as well.
-- `AsyncFileHandler`'s concrete executor did not use the real
-  `ThreadPoolExecutor` state machine or wait for termination, leaving its
-  overflow writes unflushed.
-- `FileHandler.clean()` was queued through that path rather than performing
-  its bounded expired-file deletion reliably during initialization.
+- JULI loggers were cached globally by name rather than by the thread context
+  class loader, so independent webapps could not retain distinct root levels
+  and handlers.
+- The inherited `java.util.logging.Handler` no-op native suppressed concrete
+  `org.apache.juli.FileHandler` publication and formatting. The bridge now
+  leaves concrete handler bytecode intact and retains level/formatter state.
+- The Formatter bridge treated the real `LogRecord` sequence-number slot as a
+  message. It now uses `LogRecord.getMessage()`, so `OneLineFormatter` receives
+  the materialized message and `FileHandler` writes it.
 
-The runtime now preserves named `ThreadInfo`, handler/formatter/log-record
-state and handler fan-out, routes the JULI executor through the real
-`ThreadPoolExecutor` implementation, and performs the bounded JULI cleanup
-operation deterministically.
+The JUL bridge now scopes Tomcat logger and root-handler state by context class
+loader, roots and relocates that state safely, and fans records out through the
+configured per-webapp handler list.
 
 ## Verification
 
-Fresh real-JDK CratonVM run on the Azure Linux host, with JIT enabled:
+Fresh Windows real-JDK 25 CratonVM release run, using the uniquely named
+`cratonvm-tomcat-juli-residual-closure-20260715-014.exe`:
 
-```bash
-JH=/home/victor/jdk25
-CP=$(cat /data/data/apps/tomcat/.suite/cp-linux-fixed.txt)
-"$CRATONVM_EXE" --java-home "$JH" -Xmx2g -cp "$CP" org.junit.runner.JUnitCore \
-  org.apache.juli.TestAsyncFileHandlerOverflow \
-  org.apache.juli.TestFileHandler \
-  org.apache.juli.TestPerWebappJuliIntegration \
-  org.apache.juli.TestThreadNameCache
+```text
+org.apache.juli.TestPerWebappJuliIntegration
+OK (2 tests)
+
+org.apache.juli.TestAsyncFileHandlerOverflow
+org.apache.juli.TestFileHandler
+org.apache.juli.TestPerWebappJuliIntegration
+org.apache.juli.TestThreadNameCache
+OK (10 tests)
 ```
 
-Result: `OK (10 tests)` in 3.139 seconds on 2026-07-11.
-
-This record was moved from `docs/known-issues/tomcat-08-07/` after that full
-cluster rerun passed.
+This document is archived because the complete original four-class cluster and
+the reopened per-webapp handler-isolation residual now pass.

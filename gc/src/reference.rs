@@ -1013,6 +1013,18 @@ impl ReferenceProcessor {
         }
         v
     }
+
+    /// Queue addresses for active Weak/Phantom references. These are live
+    /// through the Reference object's queue field, but a non-moving young
+    /// sweep needs an identity pointer-map entry before post-GC enqueue writes.
+    pub fn weak_phantom_active_queue_addrs(&self) -> Vec<usize> {
+        self.weak_refs
+            .iter()
+            .chain(self.phantom_refs.iter())
+            .filter(|e| !e.cleared && !e.enqueued)
+            .filter_map(|e| e.queue_addr)
+            .collect()
+    }
 }
 
 impl Default for ReferenceProcessor {

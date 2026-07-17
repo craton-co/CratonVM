@@ -477,9 +477,19 @@ pub fn ensure_class_initialized_shared(
                     .get_class(class_id)
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("<unknown class {class_id}>"));
-                return Err(MethodCallFailed::InternalError(VmError::Linkage(
-                    LinkageError::NoClassDefFoundError { class_name },
-                )));
+                // HIB-CV-26 fix (2026-07-16): JVMS §5.5 — re-triggering
+                // initialization of a class that already failed to
+                // initialize must raise a catchable `NoClassDefFoundError`,
+                // not an unrecoverable `VmError::Internal`.
+                // `raise_no_class_def_found` constructs the real Java
+                // exception object (falling back to the old internal-error
+                // form only if that construction itself fails, e.g. rt.jar
+                // unavailable).
+                return Err(crate::runtime::exceptions::raise_no_class_def_found(
+                    shared,
+                    thread,
+                    &class_name,
+                ));
             }
 
             _ => {
@@ -501,9 +511,21 @@ pub fn ensure_class_initialized_shared(
                                 ClassState::Initializing => false,
                                 ClassState::InitializationError => {
                                     let name = class.name.to_string();
-                                    return Err(MethodCallFailed::InternalError(VmError::Linkage(
-                                        LinkageError::NoClassDefFoundError { class_name: name },
-                                    )));
+                                    // HIB-CV-26 fix (2026-07-16): same JVMS
+                                    // §5.5 fix as the fast-path check above —
+                                    // raise a catchable
+                                    // `NoClassDefFoundError` instead of an
+                                    // internal error. `raise_no_class_def_found`
+                                    // needs `shared.class_manager` itself (to
+                                    // resolve/allocate the exception object),
+                                    // so the write-lock guard `cm` (which the
+                                    // `class` borrow above is tied to) must be
+                                    // released first — this non-reentrant
+                                    // `RwLock` would otherwise self-deadlock.
+                                    drop(cm);
+                                    return Err(crate::runtime::exceptions::raise_no_class_def_found(
+                                        shared, thread, &name,
+                                    ));
                                 }
                                 _ => {
                                     // Claim: set initializing_thread under the write lock.
@@ -780,11 +802,11 @@ fn initialize_class_shared(
     // constraints, abstract-method implementation, Code attribute presence),
     // which is cheap and well-tested on both synthetic and real .class files.
     //
-    // Pass 3 (bytecode type-checking) is run for synthetic stub classes
-    // unconditionally. For real .class files (already verified by javac), Pass 3
-    // is run unless `--noverify` is set on the CLI, matching HotSpot's default
-    // behavior. Failures convert to `VerifyError` and prevent the class from
-    // being linked.
+    // Pass 3 (bytecode type-checking) runs at DEFINE time only
+    // (`define_class_with_options`, class_manager.rs), where ClassManager's
+    // loader-aware ClassStoreHierarchy resolves referenced names through the
+    // defining loader's delegation order. It is deliberately not repeated
+    // here; see the comment at the former call site below.
     if !shared.config.skip_verification {
         let cm = shared.class_manager.read();
         let store = &cm.class_store;
@@ -810,35 +832,28 @@ fn initialize_class_shared(
                 // This matches HotSpot's behavior: -Xverify:none for
                 // java.base, -Xverify:remote for application classes.
                 if !per_class_skip && !verifier_skip_eligible(class) {
-                    let hierarchy = ClassStoreHierarchy { store };
                     // Pass 2 вЂ” structural verification.
                     let structural =
                         crate::classloading::verifier::verify_class_structure(class, store);
-                    // Pass 3 вЂ” bytecode type-checking, lenient mode.
-                    // F3: route through `verify_class_bytecode` (JSR-aware)
-                    // instead of `bytecode_verifier::verify_bytecode` so
-                    // pre-Java-7 classes with `jsr`/`ret` subroutines
-                    // (e.g. ByteBuddy 1.12 targeting Java 5) are not
-                    // rejected by the worklist's two-`ReturnAddress`
-                    // merge в†’ Top false positive. See
-                    // `classloading/src/verifier.rs` module docs for
-                    // the JVMS В§4.10.2.5 background.
-                    // `define_class_with_options` has already performed Pass 3
-                    // using ClassManager's loader-aware hierarchy. This adapter
-                    // has only a name-indexed ClassStore, so repeating Pass 3 for
-                    // a user-defined loader can resolve a same-named app copy and
-                    // reject valid forked bytecode. Keep Pass 2 here, but trust the
-                    // authoritative define-time Pass 3 for such classes.
-                    let bytecode = structural.and_then(|()| {
-                        if matches!(
-                            class.loader_id,
-                            cratonvm_types::ClassLoaderId::UserDefined(_)
-                        ) {
-                            Ok(())
-                        } else {
-                            crate::classloading::verifier::verify_class_bytecode(class, &hierarchy)
-                        }
-                    });
+                    // Pass 3 (bytecode type-checking) is deliberately NOT
+                    // repeated at link time. Define time already ran it with
+                    // the loader-aware hierarchy; the adapter available here
+                    // is only a name-indexed ClassStore (first match across
+                    // ALL loaders). When an unrelated user-defined loader
+                    // (e.g. Spring's per-test forked TestCompiler loader)
+                    // also defines a same-named library class, is_subclass /
+                    // is_direct_superclass walk the WRONG class's hierarchy
+                    // and this re-check throws a spurious VerifyError for
+                    // bytecode the authoritative define-time Pass 3 already
+                    // accepted (seen on AssertJ's
+                    // AbstractThrowableAssert.<init> super() call in the
+                    // Spring AOT bean-registration cluster, 2026-07-13).
+                    // UserDefined-loaded classes deliberately defer Pass 3 at
+                    // define time for the same loader-fidelity reason
+                    // (`defer_loader_sensitive_pass3`), so re-checking any
+                    // loader's classes here with the naive hierarchy only
+                    // reintroduces false rejections.
+                    let bytecode = structural;
                     if let Err(e) = bytecode {
                         drop(cm);
                         // Cleanup (state -> InitializationError, clear the init
@@ -1163,10 +1178,32 @@ fn initialize_class_shared(
                 // JDK 25's legacy sun.misc.Unsafe derives its memory-access
                 // policy from the nested MemoryAccessOption enum during
                 // <clinit>. Real-JDK execution can leave the final result
-                // field null even though the enum value itself is available;
-                // repair that slot before any ordered Unsafe access reaches
-                // beforeMemoryAccessSlow().
+                // field null and can also skip loading the nested enum. Load
+                // and initialize that enum only after Unsafe itself has been
+                // finalized, then repair the slot before any ordered Unsafe
+                // access reaches beforeMemoryAccessSlow(). Doing this inside
+                // post_clinit_fixup used to deadlock because Unsafe was still
+                // claimed as Initializing at that point.
                 if matches!(&*class_name_for_jfr, "sun/misc/Unsafe") {
+                    match shared.load_class_concurrent("sun/misc/Unsafe$MemoryAccessOption") {
+                        Ok(enum_class_id) => {
+                            if let Err(error) =
+                                ensure_class_initialized_shared(shared, thread, enum_class_id)
+                            {
+                                tracing::warn!(
+                                    "Post-clinit fixup: failed to initialize \
+                                     sun.misc.Unsafe$MemoryAccessOption after Unsafe finalization: \
+                                     {error:?}"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "Post-clinit fixup: failed to load sun.misc.Unsafe$MemoryAccessOption \
+                                 after Unsafe finalization: {error:?}"
+                            );
+                        }
+                    }
                     post_clinit_fixup(shared, class_id, &class_name_for_jfr);
                 }
                 // (Removed) R15 WildFly Module.<clinit> post-success fixup.
@@ -2083,6 +2120,16 @@ impl<'a> crate::classloading::vtype::ClassHierarchy for ClassStoreHierarchy<'a> 
         false
     }
 
+    fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+        let Some(child_class) = self.store.find_by_name(child) else {
+            return false;
+        };
+        child_class
+            .superclass
+            .and_then(|super_id| self.store.get(super_id))
+            .is_some_and(|super_class| super_class.name.as_ref() == parent)
+    }
+
     fn common_superclass(&self, a: &str, b: &str) -> String {
         if a == b {
             return a.to_string();
@@ -2247,7 +2294,9 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             ] {
                 n += set_static_by_name(name, Value::Int(scale)) as i32;
             }
-            tracing::warn!("Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)");
+            tracing::warn!(
+                "Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated ({n}/18)"
+            );
         }
         "sun/misc/Unsafe" => {
             // JDK 25's `Unsafe.<clinit>` stores the result of
@@ -2290,15 +2339,55 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     None
                 })
             };
+            // KEYCLOAK-MEMACCESS-FIELDINDEX-20260714: the manually-recomputed
+            // `static_idx` above uses the same static-only, declaration-order
+            // convention as `resolve_field_ref`/`set_static_by_name`, so it is
+            // NOT the bug (verified against both call sites). But under the
+            // real Keycloak/Infinispan boot path (unlike the isolated repair
+            // probes), `sun/misc/Unsafe`'s statics vec can be lazily
+            // pre-sized/touched by an unrelated earlier static write before
+            // MEMORY_ACCESS_OPTION's own `<clinit>` store runs, and/or this
+            // slot can otherwise hold a stale non-null `Object` left over from
+            // a different code path than the enum constant this repair
+            // expects. Trusting "slot is non-null" alone as "already
+            // initialized" is therefore a false-positive trap: it forces
+            // `repaired=false` and leaves the true null in place, reproducing
+            // the exact NPE this fixup exists to prevent. Require the slot to
+            // actually hold an instance of `MemoryAccessOption` (not just any
+            // non-null object) before treating it as already initialized.
+            // EVIDENCE (2026-07-14, isolated reflection-only Unsafe probe on
+            // Azure host): the already-initialized check below correctly read
+            // `Value::Int(0)` here (genuinely uninitialized, not a false
+            // positive) while `find_class_by_name` returned `None` for
+            // `sun/misc/Unsafe$MemoryAccessOption`. The success path now
+            // loads and initializes that enum after finalizing Unsafe, before
+            // this lookup-only repair pass runs. See docs/internal once the
+            // regression is closed.
+            let enum_class_id = shared
+                .class_manager
+                .read()
+                .find_class_by_name("sun/misc/Unsafe$MemoryAccessOption");
             let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
-                matches!(
-                    super::vm_object::get_static_shared(shared, class_id, static_idx),
-                    Value::Object(Some(_))
-                )
+                match super::vm_object::get_static_shared(shared, class_id, static_idx) {
+                    Value::Object(Some(obj)) => {
+                        let obj_class_id = shared.heap.class_id_of(obj);
+                        let is_option = enum_class_id.is_some_and(|eid| obj_class_id == eid);
+                        if !is_option {
+                            tracing::warn!(
+                                "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION slot \
+                                 held a non-null object of class_id={obj_class_id:?} (expected \
+                                 MemoryAccessOption class_id={enum_class_id:?}) — treating as \
+                                 NOT already initialized"
+                            );
+                        }
+                        is_option
+                    }
+                    _ => false,
+                }
             });
             let enum_slot = {
                 let cm = shared.class_manager.read();
-                cm.find_class_by_name("sun/misc/Unsafe$MemoryAccessOption")
+                enum_class_id
                     .and_then(|enum_class_id| cm.get_class(enum_class_id))
                     .and_then(|enum_class| {
                         let mut static_idx = 0usize;
@@ -2317,13 +2406,25 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 false
             } else if let Some((enum_class_id, static_idx)) = enum_slot {
                 match super::vm_object::get_static_shared(shared, enum_class_id, static_idx) {
-                    Value::Object(Some(option)) => set_static_by_name(
-                        "MEMORY_ACCESS_OPTION",
-                        Value::Object(Some(option)),
-                    ),
-                    _ => false,
+                    Value::Object(Some(option)) => {
+                        set_static_by_name("MEMORY_ACCESS_OPTION", Value::Object(Some(option)))
+                    }
+                    other => {
+                        tracing::warn!(
+                            "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION repair \
+                             found enum_slot but its value was {other:?}, not \
+                             Value::Object(Some(_)) — repair skipped"
+                        );
+                        false
+                    }
                 }
             } else {
+                tracing::warn!(
+                    "Post-clinit fixup: sun.misc.Unsafe MEMORY_ACCESS_OPTION repair could not \
+                     resolve enum_slot (unsafe_option_slot={unsafe_option_slot:?} \
+                     enum_class_id={enum_class_id:?} policy_field={policy_field}) — repair \
+                     skipped"
+                );
                 false
             };
             tracing::warn!(
@@ -2727,6 +2828,127 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 crate::dispatch_trace::record_note(
                     "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated",
                 );
+
+                // KC16 RBIGDEC.1 follow-up (2026-07-17, hib-defaultcatalog
+                // investigation): `smallToString`'s radix-conversion tables
+                // (`digitsPerLong`/`longRadix`, populated by JDK's own static
+                // array initializers evaluated inside this same `<clinit>`)
+                // are casualties of the identical incomplete-clinit failure
+                // fixed above for ZERO/ONE/TWO/NEGATIVE_ONE/TEN — but went
+                // unnoticed until now because nothing in the suite
+                // previously called `BigInteger.toString(radix)` for a
+                // radix other than the JDK's own internal fast paths.
+                // Hibernate's `NamingHelper.hashedName()` calls
+                // `toString(35)` to derive constraint-name hashes, hits
+                // `smallToString`'s `longRadix[35]`, and finds a truncated
+                // (length-2 instead of 37) array —
+                // `ArrayIndexOutOfBoundsException: Index 2 out of bounds for
+                // length 2` on `DefaultCatalogAndSchemaTest`'s foreign-key
+                // binding path (`CollectionBinder.bindOwnedManyToManyForeignKeyMappedBy`
+                // -> `Table.createUniqueKey` -> `ImplicitNamingStrategyJpaCompliantImpl`
+                // -> `NamingHelper.generateHashedConstraintName`). Only
+                // reproduces when 2+ distinct `@Test` methods run against
+                // the same `@ParameterizedClass` instance in one process
+                // (confirmed via isolated single-method `MethodRunner`
+                // reruns, all 12/12 clean; the failure needs a prior
+                // `entityPersister`-style invocation ahead of
+                // `createSchema_fromSessionFactory` in the same JVM to
+                // surface — consistent with a once-per-process clinit gap
+                // rather than a per-call bug). Force-populate both tables
+                // with the real JDK's own constants (`java.math.BigInteger`
+                // source, radices 2..=36; indices 0/1 are legitimately
+                // unused/null per the JDK's own doc comment on these
+                // fields).
+                const DIGITS_PER_LONG: [i32; 37] = [
+                    0, 0, 62, 39, 31, 27, 24, 22, 20, 19, 18, 18, 17, 17, 16, 16, 15, 15, 15, 14,
+                    14, 14, 14, 13, 13, 13, 13, 13, 13, 12, 12, 12, 12, 12, 12, 12, 12,
+                ];
+                const LONG_RADIX_HEX: [u64; 37] = [
+                    0,
+                    0,
+                    0x4000000000000000,
+                    0x383d9170b85ff80b,
+                    0x4000000000000000,
+                    0x6765c793fa10079d,
+                    0x41c21cb8e1000000,
+                    0x3642798750226111,
+                    0x1000000000000000,
+                    0x12bf307ae81ffd59,
+                    0x0de0b6b3a7640000,
+                    0x4d28cb56c33fa539,
+                    0x1eca170c00000000,
+                    0x780c7372621bd74d,
+                    0x1e39a5057d810000,
+                    0x5b27ac993df97701,
+                    0x1000000000000000,
+                    0x27b95e997e21d9f1,
+                    0x5da0e1e53c5c8000,
+                    0x0b16a458ef403f19,
+                    0x16bcc41e90000000,
+                    0x2d04b7fdd9c0ef49,
+                    0x5658597bcaa24000,
+                    0x06feb266931a75b7,
+                    0x0c29e98000000000,
+                    0x14adf4b7320334b9,
+                    0x226ed36478bfa000,
+                    0x383d9170b85ff80b,
+                    0x5a3c23e39c000000,
+                    0x04e900abb53e6b71,
+                    0x07600ec618141000,
+                    0x0aee5720ee830681,
+                    0x1000000000000000,
+                    0x172588ad4f5f0981,
+                    0x211e44f7d02c1000,
+                    0x2ee56725f06e5c71,
+                    0x41c21cb8e1000000,
+                ];
+                let mut radix_fixed = false;
+                if let Some(dpl_arr) = shared.heap.try_alloc_array(
+                    ClassId::new(0),
+                    ArrayElementType::Int,
+                    DIGITS_PER_LONG.len(),
+                ) {
+                    for (i, &d) in DIGITS_PER_LONG.iter().enumerate() {
+                        let _ = shared.heap.set_array_element(dpl_arr, i, Value::Int(d));
+                    }
+                    if set_static_by_name("digitsPerLong", Value::Object(Some(dpl_arr))) {
+                        radix_fixed = true;
+                    }
+                }
+                if let Some(lr_arr) = shared.heap.try_alloc_array(
+                    class_id,
+                    ArrayElementType::Reference,
+                    LONG_RADIX_HEX.len(),
+                ) {
+                    for (i, &hex) in LONG_RADIX_HEX.iter().enumerate() {
+                        if i < 2 || hex == 0 {
+                            continue;
+                        }
+                        let mag_words: Vec<i32> = if hex <= 0xFFFF_FFFF {
+                            vec![hex as i32]
+                        } else {
+                            vec![(hex >> 32) as i32, (hex & 0xFFFF_FFFF) as i32]
+                        };
+                        if let Some(bi) = make_or_patch_bi(None, 1, &mag_words) {
+                            let _ = shared.heap.set_array_element(
+                                lr_arr,
+                                i,
+                                Value::Object(Some(bi)),
+                            );
+                        }
+                    }
+                    if set_static_by_name("longRadix", Value::Object(Some(lr_arr))) {
+                        radix_fixed = true;
+                    }
+                }
+                if radix_fixed {
+                    tracing::warn!(
+                        "Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated"
+                    );
+                    crate::dispatch_trace::record_note(
+                        "Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated",
+                    );
+                }
             } else {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger fixup skipped — signum/mag field indices not resolved"
@@ -3499,6 +3721,19 @@ mod tests {
         use crate::classloading::vtype::ClassHierarchy;
         assert!(hierarchy.is_subclass("java/lang/String", "java/lang/Object"));
         assert!(hierarchy.is_subclass("java/io/PrintStream", "java/lang/Object"));
+    }
+
+    #[test]
+    fn hierarchy_direct_superclass_uses_linked_class_edge() {
+        let shared = test_shared();
+        let mut cm = shared.class_manager.write();
+        cm.load_class("java/lang/String").unwrap();
+        let hierarchy = ClassStoreHierarchy {
+            store: &cm.class_store,
+        };
+        use crate::classloading::vtype::ClassHierarchy;
+        assert!(hierarchy.is_direct_superclass("java/lang/String", "java/lang/Object"));
+        assert!(!hierarchy.is_direct_superclass("java/lang/String", "java/io/Serializable"));
     }
 
     #[test]

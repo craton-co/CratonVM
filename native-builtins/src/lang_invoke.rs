@@ -3292,13 +3292,22 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                             .to_string(),
                     }
                 })?;
-            ctx.initialize_class(class_id).map_err(|message| {
-                cratonvm_types::error::MethodCallFailed::InternalError(
-                    cratonvm_types::error::VmError::Internal {
-                        message: format!("Lookup.ensureInitialized failed: {message}"),
-                    },
-                )
-            })?;
+            // Family-1 stale-ObjectRef fix (2026-07-13): same defect as the
+            // sibling registration in classloader.rs::lk_ensure_initialized
+            // (whichever registration order wins in a given context reaches
+            // this exact bug) — `ctx.initialize_class` can run `<clinit>`
+            // and trigger a moving GC, so `target_class` must be rooted
+            // across the call and re-read before reuse. See
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let target_class_pin = ctx.pin_native_root(target_class);
+            // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>`
+            // failure instead of re-wrapping it as an unrecoverable
+            // `VmError::Internal` — matches real JDK
+            // `Lookup.ensureInitialized`, which throws
+            // `ExceptionInInitializerError` for a failed initializer.
+            ctx.initialize_class(class_id)?;
+            let target_class = ctx.read_native_pin(target_class_pin, target_class);
+            ctx.unpin_native_roots(target_class_pin);
             Ok(Some(Value::Object(Some(target_class))))
         },
     );
@@ -3545,6 +3554,15 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // must be the lookup class or have PRIVATE-mode access) is permissive
     // here: we trust JDK-side `Lookup.checkSpecial`. A stricter check would
     // require lookup-mode bookkeeping not yet wired through native-api.
+    //
+    // GC-safety: `ensure_class_initialized` below (both the conditional
+    // caller-class load and the later target-class load) can trigger a
+    // collection that relocates `class_obj`/`name_obj`/`mt_obj` (all
+    // captured above, each read again afterward); pin them and re-read the
+    // forwarded references before use.
+    let class_obj_pin = ctx.pin_native_root(class_obj);
+    let name_obj_pin = ctx.pin_native_root(name_obj);
+    let mt_obj_pin = ctx.pin_native_root(mt_obj);
     if let Some(Value::Object(Some(caller_obj))) = args.get(4) {
         if let Some(caller_name) = resolve_class_name_robust(ctx, *caller_obj) {
             // Ensure caller class is loaded so member-access verification has
@@ -3552,10 +3570,14 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             let _ = ctx.ensure_class_initialized(&caller_name);
         }
     }
+    let class_obj = ctx.read_native_pin(class_obj_pin, class_obj);
+    let name_obj = ctx.read_native_pin(name_obj_pin, name_obj);
+    let mt_obj = ctx.read_native_pin(mt_obj_pin, mt_obj);
     let class = resolve_class_name_robust(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let _ = ctx.ensure_class_initialized(&class);
+    ctx.unpin_native_roots(class_obj_pin);
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL);
     Ok(Some(Value::Object(Some(mh))))
 }
@@ -4232,9 +4254,21 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .or_else(|| mh_read_desc(ctx, orig_mh))
         .unwrap_or_default();
     let widened_desc = widen_descriptor(ctx, &inner_desc, extra_classes, pos);
-    // Encode `pos` into MH_CLASS so dispatch can recover it.
-    let pos_str = pos.to_string();
+    // Encode `pos:extra_n` into MH_CLASS so dispatch can recover BOTH
+    // the drop position and the exact number of dropped values directly,
+    // instead of re-deriving drop count later from an arg-count
+    // difference (see the dispatch-side comment on why that heuristic
+    // was wrong for chained/nested combinators).
+    let pos_str = format!("{pos}:{extra_n}");
+    // GC-safety: `alloc_method_handle` allocates a new MethodHandle object,
+    // which can trigger a collection that relocates `orig_mh`/`extra_classes`
+    // (both captured well before this point and read again below). Pin them
+    // and re-read the forwarded references before their next use.
+    let orig_mh_pin = ctx.pin_native_root(orig_mh);
+    let extra_classes_pin = ctx.pin_native_root(extra_classes);
     let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
+    let orig_mh = ctx.read_native_pin(orig_mh_pin, orig_mh);
+    let extra_classes = ctx.read_native_pin(extra_classes_pin, extra_classes);
     ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
     // Also widen the `type:MethodType` field so JDK-internal code
     // that reads mh.type().parameterCount() sees the widened arity.
@@ -4244,7 +4278,14 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         if let Value::Object(Some(orig_ptypes)) = ctx.get_field(mt, 1) {
             let orig_n = ctx.array_length(orig_ptypes);
             let new_n = orig_n + extra_n;
+            // GC-safety: `new_array` can trigger a collection that relocates
+            // `orig_ptypes` (and re-covers `extra_classes`, still pinned
+            // above); pin/re-read before the element-copy loops below.
+            let orig_ptypes_pin = ctx.pin_native_root(orig_ptypes);
             let new_ptypes = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_n);
+            let new_ptypes_pin = ctx.pin_native_root(new_ptypes);
+            let orig_ptypes = ctx.read_native_pin(orig_ptypes_pin, orig_ptypes);
+            let extra_classes = ctx.read_native_pin(extra_classes_pin, extra_classes);
             let pos_c = pos.min(orig_n);
             for i in 0..pos_c {
                 let v = ctx.get_array_element(orig_ptypes, i);
@@ -4258,13 +4299,19 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
                 let v = ctx.get_array_element(orig_ptypes, i);
                 ctx.set_array_element(new_ptypes, extra_n + i, v);
             }
+            // GC-safety: `alloc_concurrent_synthetic` below can trigger a
+            // collection that relocates `new_ptypes` (fully populated above,
+            // read again once the new MethodType wraps it).
             let new_mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let new_ptypes = ctx.read_native_pin(new_ptypes_pin, new_ptypes);
+            ctx.unpin_native_roots(orig_ptypes_pin);
             ctx.set_field(new_mt, 0, ret);
             ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
             populate_method_type_form(ctx, new_mt);
             ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
         }
     }
+    ctx.unpin_native_roots(orig_mh_pin);
     Ok(Some(Value::Object(Some(wrapper))))
 }
 
@@ -5065,6 +5112,60 @@ pub(crate) const MH_KIND_INVOKER: i32 = 20;
 /// by the leading original arguments that fit the handler's type.
 pub(crate) const MH_KIND_CATCH: i32 = 21;
 
+/// Return-value-filtering adapter produced by `MethodHandles.filterReturnValue`.
+/// `MH_BOUND` holds a 2-field wrapper: field 0 = target MH, field 1 = filter MH
+/// (unary, applied to the target's return value). Dispatch invokes `target`
+/// with the incoming args, then passes its result through `filter`, returning
+/// the filter's result in place of the target's raw one.
+///
+/// Was previously a no-op stub (`filterReturnValue` returned `target`
+/// unchanged, silently dropping `filter`). JRuby 10.x's
+/// `org.jruby.runtime.invokedynamic.VariableSite.ivar` bootstrap builds its
+/// instance-variable-getter call-site targets by filtering the raw
+/// `IRubyObject.getInstanceVariable(String)` result (which is a genuine Java
+/// `null` for an unset ivar -- normal at that raw layer) through a handle that
+/// substitutes the JRuby runtime's `nil` singleton. With the filter dropped,
+/// `mh.invoke()` returned the raw `null` straight through; the caller (e.g.
+/// `@canonical_segments ||= ...`'s truthiness test) then fed that `null` into
+/// `org.jruby.ir.targets.indy.IsTrueSite.init`, which unconditionally calls
+/// `obj.getRuntime()` on it -- `NullPointerException`. Found chasing the
+/// residual `JRubyScriptTemplateTests` failure left after the array-vs-scalar
+/// SAM-mismatch fix (2026-07-15); `require 'erb'; require 'ostruct'` alone
+/// reproduces it standalone, no Spring needed.
+pub(crate) const MH_KIND_RETURN_FILTER: i32 = 22;
+
+/// `MethodHandles.collectArguments(target, pos, filter)` adapter. Distinct
+/// from `MH_KIND_COLLECT` (`MethodHandle.asCollector`, which SPREADS one
+/// trailing array argument into N individual target params -- the inverse
+/// direction) and from `MH_KIND_FOLD` (`foldArguments`, which also runs a
+/// combiner over a slice of args at `pos` but SPLICES its result in ADDITION
+/// to -- not instead of -- the full original arg list). `collectArguments`
+/// consumes `filter.type().parameterCount()` args starting at `pos` by
+/// calling `filter` on them, then REPLACES that consumed range with filter's
+/// single (non-void) result before dispatching `target` -- the args outside
+/// the consumed range pass through unchanged, but the consumed ones do not
+/// reappear. Was previously a complete no-op stub (returned `target`
+/// unmodified, silently dropping `pos`/`filter` entirely) -- same failure
+/// shape as the `filterReturnValue` no-op bug fixed earlier in this
+/// investigation (commit `3af9ab62`). Confirmed live via
+/// `CRATONVM_DBG_MH_DISPATCH` tracing + `javap` decompile of the real
+/// `com.headius.invokebinder-1.14.jar`'s `Binder.collect(int, int, Class,
+/// MethodHandle)`, which JRuby 10.x's `BuildDynamicStringSite` uses (via
+/// `MethodHandles.collectArguments` under the hood) to reduce each
+/// `(ThreadContext, IRubyObject)` pair produced by an earlier
+/// `MethodHandles.permuteArguments` step (itself correct -- verified against
+/// real, unmodified invokebinder bytecode computing an intentional
+/// `[0, 0, 1, ...]`-shaped "ctx-per-dynamic-value" reorder array) down to a
+/// single `to_s`-guarded `IRubyObject`. With the no-op stub, that reduction
+/// never happened: the duplicated `ThreadContext` from the permute step
+/// survived unchanged all the way to `BuildDynamicStringSite.buildString`,
+/// landing in the argument slot its `IRubyObject` parameter expects, and
+/// `RubyString.append`/`appendAsStringOrAny` threw `ClassCastException:
+/// ThreadContext cannot be cast to IRubyObject` -- reached via
+/// `JRubyScriptTemplateTests`'s `require 'ostruct'` (`ostruct.rb:477`,
+/// string interpolation in `OpenStruct`'s class body).
+pub(crate) const MH_KIND_COLLECT_ARGS: i32 = 23;
+
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
 // ---------------------------------------------------------------------------
@@ -5183,9 +5284,20 @@ pub(crate) fn alloc_method_handle(
     // `set_field_by_name(mh, "type", ...)` — which resolves to slot 0 — from
     // overwriting our class/name/desc/kind/bound data.
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    // GC-safety: the `create_string` calls below (and `build_method_type_
+    // from_descriptor` further down) can trigger a collection that
+    // relocates `mh`; `cls`/`nm` are each also read again after a LATER
+    // `create_string` call of their own. Pin everything now and re-read the
+    // forwarded reference right before each use (mirrors `create_field_object`).
+    let mh_pin = ctx.pin_native_root(mh);
     let cls = ctx.create_string(class);
+    let cls_pin = ctx.pin_native_root(cls);
     let nm = ctx.create_string(name);
+    let nm_pin = ctx.pin_native_root(nm);
     let dc = ctx.create_string(desc);
+    let mh = ctx.read_native_pin(mh_pin, mh);
+    let cls = ctx.read_native_pin(cls_pin, cls);
+    let nm = ctx.read_native_pin(nm_pin, nm);
     ctx.set_field(mh, MH_CLASS, Value::Object(Some(cls)));
     ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
@@ -5223,9 +5335,13 @@ pub(crate) fn alloc_method_handle(
     };
     let mt_opt = build_method_type_from_descriptor(ctx, type_desc)
         .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    // `build_method_type_from_descriptor` allocates too; re-read `mh` once
+    // more before its final use, then release the whole pinned batch.
+    let mh = ctx.read_native_pin(mh_pin, mh);
     if let Some(mt) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
+    ctx.unpin_native_roots(mh_pin);
     mh
 }
 
@@ -5248,7 +5364,14 @@ pub(crate) fn string_concat_render_value(ctx: &mut dyn NativeContext, v: Value) 
             }
             // Best-effort: call Object.toString(); if it returns a String,
             // unwrap it. Failure modes fall through to the class@hash form.
+            //
+            // GC-safety: `invoke_virtual` runs the object's real `toString()`,
+            // which can trigger a collection that relocates `obj`; pin it and
+            // re-read the forwarded reference before the fallback reads below.
+            let obj_pin = ctx.pin_native_root(obj);
             let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
             if let Ok(Some(Value::Object(Some(s_obj)))) = result {
                 if let Some(s) = ctx.read_string(s_obj) {
                     return s;
@@ -5287,9 +5410,19 @@ pub(crate) fn alloc_string_concat_method_handle(
     // alloc_method_handle, but the class slot carries the recipe string
     // instead of a class name.
     let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    // GC-safety: see `alloc_method_handle` above -- the same triple-
+    // `create_string` + subsequent-allocation shape, on the same
+    // MethodHandle-skeleton object. Pin everything and re-read the
+    // forwarded reference right before each use.
+    let mh_pin = ctx.pin_native_root(mh);
     let cls = ctx.create_string(recipe);
+    let cls_pin = ctx.pin_native_root(cls);
     let nm = ctx.create_string("concat");
+    let nm_pin = ctx.pin_native_root(nm);
     let dc = ctx.create_string("()Ljava/lang/String;");
+    let mh = ctx.read_native_pin(mh_pin, mh);
+    let cls = ctx.read_native_pin(cls_pin, cls);
+    let nm = ctx.read_native_pin(nm_pin, nm);
     ctx.set_field(mh, MH_CLASS, Value::Object(Some(cls)));
     ctx.set_field(mh, MH_NAME, Value::Object(Some(nm)));
     ctx.set_field(mh, MH_DESC, Value::Object(Some(dc)));
@@ -5297,6 +5430,7 @@ pub(crate) fn alloc_string_concat_method_handle(
     // Wrap the constants array in a 1-field holder so MH_BOUND is a single
     // ObjectRef (the rest of mh_dispatch assumes that shape).
     let holder = alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1);
+    let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.set_field(
         holder,
         0,
@@ -5308,9 +5442,12 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(holder)));
     // Populate the real-JDK `type:MethodType` field at slot 0 so JDK-internal
     // `mh.type()` walks see a non-null MethodType.
-    if let Some(mt) = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;") {
+    let mt_opt = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;");
+    let mh = ctx.read_native_pin(mh_pin, mh);
+    if let Some(mt) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
+    ctx.unpin_native_roots(mh_pin);
     mh
 }
 
@@ -5542,6 +5679,11 @@ fn mh_dispatch_filter(
         _ => 0,
     };
     let mut filtered: Vec<Value> = extra_args.to_vec();
+    // GC-safety: the recursive `mh_dispatch` calls below (both inside the
+    // per-filter loop and the final target dispatch) can trigger a
+    // collection that relocates `target`; pin it and re-read the forwarded
+    // reference before its final use.
+    let target_pin = ctx.pin_native_root(target);
     if let Value::Object(Some(farr)) = filters {
         let n = ctx.array_length(farr);
         for i in 0..n {
@@ -5558,6 +5700,8 @@ fn mh_dispatch_filter(
             }
         }
     }
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
     mh_dispatch(ctx, target, &filtered)
 }
 
@@ -5580,7 +5724,17 @@ fn make_fold_adapter(
         // No combiner → behave like the bare target.
         _ => return Ok(Some(Value::Object(Some(target)))),
     };
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `target`/`combiner_ref`/
+    // `wrapper` (each captured/produced above and read again after a
+    // later allocation); pin them and re-read the forwarded references
+    // before each use.
+    let target_pin = ctx.pin_native_root(target);
+    let combiner_pin = ctx.pin_native_root(combiner_ref);
     let wrapper = alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let target = ctx.read_native_pin(target_pin, target);
+    let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
     ctx.set_field(wrapper, 0, Value::Object(Some(target)));
     ctx.set_field(wrapper, 1, Value::Object(Some(combiner_ref)));
     ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -5588,6 +5742,8 @@ fn make_fold_adapter(
         .or_else(|| mh_read_desc(ctx, target))
         .unwrap_or_default();
     let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
     Ok(Some(Value::Object(Some(adapter))))
 }
@@ -5624,7 +5780,13 @@ fn mh_dispatch_fold(
     let (cparams, cret) = split_descriptor_params(&cdesc).unwrap_or_default();
     let take = cparams.len().min(extra_args.len().saturating_sub(pos));
     let combine_args: Vec<Value> = extra_args[pos..pos + take].to_vec();
+    // GC-safety: this recursive `mh_dispatch` call can trigger a collection
+    // that relocates `target` (captured above and dispatched again below);
+    // pin it and re-read the forwarded reference before its final use.
+    let target_pin = ctx.pin_native_root(target);
     let combined = mh_dispatch(ctx, combiner, &combine_args)?;
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
     // Splice a non-void combiner result in at `pos`; void combiners contribute
     // nothing (the target then sees the original arg list unchanged).
     let mut full: Vec<Value> = Vec::with_capacity(extra_args.len() + 1);
@@ -5633,6 +5795,101 @@ fn mh_dispatch_fold(
         full.push(combined.unwrap_or(Value::Object(None)));
     }
     full.extend_from_slice(&extra_args[pos..]);
+    mh_dispatch(ctx, target, &full)
+}
+
+/// Construct a `MethodHandles.collectArguments(target, pos, filter)` adapter
+/// (`MH_KIND_COLLECT_ARGS`). Mirrors `make_fold_adapter`'s wrapper shape
+/// (target, combiner/filter, pos) -- only the DISPATCH-time splicing differs
+/// (replace vs. splice-in-addition; see `MH_KIND_COLLECT_ARGS`'s doc
+/// comment).
+fn make_collect_args_adapter(
+    ctx: &mut dyn NativeContext,
+    target: Option<Value>,
+    pos: i32,
+    filter: Option<Value>,
+) -> MethodCallResult {
+    let target = match target {
+        Some(Value::Object(Some(t))) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter_ref = match filter {
+        Some(Value::Object(Some(f))) => f,
+        // No filter → behave like the bare target.
+        _ => return Ok(Some(Value::Object(Some(target)))),
+    };
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `target`/`filter_ref`/
+    // `wrapper` (each captured/produced above and read again after a later
+    // allocation); pin them and re-read the forwarded references before
+    // each use.
+    let target_pin = ctx.pin_native_root(target);
+    let filter_pin = ctx.pin_native_root(filter_ref);
+    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let target = ctx.read_native_pin(target_pin, target);
+    let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
+    ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+    ctx.set_field(wrapper, 1, Value::Object(Some(filter_ref)));
+    ctx.set_field(wrapper, 2, Value::Int(pos));
+    let desc = mh_type_descriptor(ctx, target)
+        .or_else(|| mh_read_desc(ctx, target))
+        .unwrap_or_default();
+    let adapter = alloc_method_handle(ctx, "__adapter__", "collectargs", &desc, MH_KIND_COLLECT_ARGS);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(target_pin);
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+    Ok(Some(Value::Object(Some(adapter))))
+}
+
+/// `MethodHandles.collectArguments` dispatch (`MH_KIND_COLLECT_ARGS`). The
+/// filter consumes `filter.parameterCount()` args starting at `pos`; a
+/// non-void result REPLACES that consumed range (unlike `foldArguments`,
+/// which keeps the full original list and splices the combiner's result in
+/// ADDITION to it) before the target runs.
+fn mh_dispatch_collect_args(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(f)) => f,
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    let pos = match ctx.get_field(wrapper, 2) {
+        Value::Int(p) => (p as usize).min(extra_args.len()),
+        _ => 0,
+    };
+    // The filter consumes `filter.parameterCount()` args starting at `pos`.
+    let fdesc = mh_type_descriptor(ctx, filter)
+        .or_else(|| mh_read_desc(ctx, filter))
+        .unwrap_or_default();
+    let (fparams, fret) = split_descriptor_params(&fdesc).unwrap_or_default();
+    let take = fparams.len().min(extra_args.len().saturating_sub(pos));
+    let filter_args: Vec<Value> = extra_args[pos..pos + take].to_vec();
+    // GC-safety: this recursive `mh_dispatch` call can trigger a collection
+    // that relocates `target` (captured above and dispatched again below);
+    // pin it and re-read the forwarded reference before its final use.
+    let target_pin = ctx.pin_native_root(target);
+    let filtered = mh_dispatch(ctx, filter, &filter_args)?;
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
+    // Replace the consumed [pos, pos+take) range with the filter's non-void
+    // result (a void filter just consumes the range, contributing nothing).
+    let mut full: Vec<Value> = Vec::with_capacity(extra_args.len());
+    full.extend_from_slice(&extra_args[..pos]);
+    if fret != "V" {
+        full.push(filtered.unwrap_or(Value::Object(None)));
+    }
+    full.extend_from_slice(&extra_args[pos + take..]);
     mh_dispatch(ctx, target, &full)
 }
 
@@ -5711,16 +5968,29 @@ fn mh_dispatch_catch(
         _ => return mh_dispatch(ctx, target, extra_args),
     };
 
+    // GC-safety: `mh_dispatch(ctx, target, ...)` below runs the target
+    // handle, which can trigger a collection that relocates `catch_type`/
+    // `handler` (both captured above and read again in the Err arm below).
+    let catch_type_pin = ctx.pin_native_root(catch_type);
+    let handler_pin = ctx.pin_native_root(handler);
     match mh_dispatch(ctx, target, extra_args) {
         Err(MethodCallFailed::ExceptionThrown(thrown)) => {
+            let catch_type = ctx.read_native_pin(catch_type_pin, catch_type);
+            let handler = ctx.read_native_pin(handler_pin, handler);
             if !mh_exception_matches(ctx, thrown, catch_type) {
                 return Err(MethodCallFailed::ExceptionThrown(thrown));
             }
+            // `mh_type_descriptor` can itself allocate; pin `thrown`/
+            // `handler` across it too and re-read before dispatch.
+            let thrown_pin = ctx.pin_native_root(thrown);
             let hdesc = mh_type_descriptor(ctx, handler)
                 .or_else(|| mh_read_desc(ctx, handler))
                 .unwrap_or_default();
             let hparams = count_descriptor_params(&hdesc);
             let forward_n = hparams.saturating_sub(1).min(extra_args.len());
+            let handler = ctx.read_native_pin(handler_pin, handler);
+            let thrown = ctx.read_native_pin(thrown_pin, thrown);
+            ctx.unpin_native_roots(catch_type_pin);
             let mut hargs = Vec::with_capacity(1 + forward_n);
             hargs.push(Value::Object(Some(thrown)));
             hargs.extend_from_slice(&extra_args[..forward_n]);
@@ -5729,11 +5999,74 @@ fn mh_dispatch_catch(
         other => other,
     }
 }
+
+/// `MethodHandles.filterReturnValue` dispatch (`MH_KIND_RETURN_FILTER`).
+/// `bound` is the 2-field wrapper (target MH, filter MH). Invokes `target`
+/// with the incoming args, then passes its result through the unary `filter`
+/// handle, returning the filter's result. A `void`-returning target (mh_
+/// dispatch yields `Ok(None)`) is paired only with a zero-arg filter per the
+/// JDK contract (the filter's sole parameter type must match the target's
+/// return type), so the filter is invoked with no arguments in that case.
+fn mh_dispatch_return_filter(
+    ctx: &mut dyn NativeContext,
+    bound: Value,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let wrapper = match bound {
+        Value::Object(Some(w)) => w,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let target = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(t)) => t,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let filter = match ctx.get_field(wrapper, 1) {
+        Value::Object(Some(f)) => f,
+        // No filter -> behave like the bare target.
+        _ => return mh_dispatch(ctx, target, extra_args),
+    };
+    // GC-safety: `mh_dispatch(ctx, target, ...)` below can trigger a
+    // collection that relocates `filter` (captured above, read again after).
+    let filter_pin = ctx.pin_native_root(filter);
+    let result = mh_dispatch(ctx, target, extra_args)?;
+    let filter = ctx.read_native_pin(filter_pin, filter);
+    ctx.unpin_native_roots(filter_pin);
+    match result {
+        Some(v) => mh_dispatch(ctx, filter, &[v]),
+        None => mh_dispatch(ctx, filter, &[]),
+    }
+}
+
 pub(crate) fn mh_dispatch(
     ctx: &mut dyn NativeContext,
     mh: cratonvm_types::ObjectRef,
     extra_args: &[Value],
 ) -> MethodCallResult {
+    // A real-JDK guard/invoker adapter can ultimately target a synthetic
+    // foreign downcall. Those compact handles store the function address in
+    // field 0 rather than the MethodHandle metadata slots, so dispatch them
+    // directly before trying to decode the generic MethodHandle layout.
+    if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
+        == Some("java/lang/foreign/DowncallHandle")
+    {
+        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+            let arg_slots: Vec<Value> = extra_args
+                .iter()
+                .map(|value| match value {
+                    Value::Object(Some(obj)) => ctx.get_field(*obj, 0),
+                    other => *other,
+                })
+                .collect();
+            eprintln!(
+                "[MH_DOWNCALL] fn={:?} args={arg_slots:?}",
+                ctx.get_field(mh, 0)
+            );
+        }
+        let mut args = Vec::with_capacity(extra_args.len() + 1);
+        args.push(Value::Object(Some(mh)));
+        args.extend_from_slice(extra_args);
+        return crate::panama::pe_downcall_invoke(ctx, &args);
+    }
     let class = match mh_read_class(ctx, mh) {
         Some(c) => c,
         None => return Ok(Some(Value::Object(None))),
@@ -5745,6 +6078,43 @@ pub(crate) fn mh_dispatch(
         _ => MH_KIND_VIRTUAL,
     };
     let bound = ctx.get_field(mh, MH_BOUND);
+    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+        let runtime_class = ctx
+            .class_name_of_id(ctx.class_id_of_object(mh))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!(
+            "[MH_DISPATCH] runtime={runtime_class} class={class} name={name} desc={desc:?} kind={kind} bound={bound:?} argc={}",
+            extra_args.len()
+        );
+        // T2.9.X-dbg: dump each dynamic arg's runtime class (or the raw
+        // primitive) so a wrong-value / wrong-position bug in a combinator
+        // chain (dropArguments/insertArguments/foldArguments/...) is
+        // visible directly, not just the argc.
+        let arg_descs: Vec<String> = extra_args
+            .iter()
+            .map(|v| match v {
+                Value::Object(Some(o)) => {
+                    let cn = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*o))
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{:p}:{}", o.as_ptr(), cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        eprintln!("[MH_DISPATCH_ARGS] {arg_descs:?}");
+        if kind == MH_KIND_GUARD {
+            if let Value::Object(Some(wrapper)) = bound {
+                eprintln!(
+                    "[MH_GUARD] test={:?} target={:?} fallback={:?}",
+                    ctx.get_field(wrapper, 0),
+                    ctx.get_field(wrapper, 1),
+                    ctx.get_field(wrapper, 2),
+                );
+            }
+        }
+    }
 
     match kind {
         MH_KIND_STATIC => {
@@ -5797,11 +6167,18 @@ pub(crate) fn mh_dispatch(
                                                      // params align 1:1 with extra_args (no receiver), so this is exact.
                                                      // invokeExact does NOT pre-adapt, so unboxing here covers both the
                                                      // invoke and invokeExact paths (Jackson 3 uses invokeExact).
+                                                     // GC-safety: `adapt_invoke_args`/the `<init>` invocation below
+                                                     // can both allocate; pin `new_obj` and re-read the forwarded
+                                                     // reference before it's returned.
+            let new_obj_pin = ctx.pin_native_root(new_obj);
             let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+            let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
             let mut init_args = Vec::with_capacity(1 + adapted.len());
             init_args.push(Value::Object(Some(new_obj)));
             init_args.extend_from_slice(&adapted);
             ctx.invoke(&class, "<init>", &desc, &init_args)?;
+            let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
+            ctx.unpin_native_roots(new_obj_pin);
             Ok(Some(Value::Object(Some(new_obj))))
         }
         MH_KIND_GETTER => {
@@ -5912,22 +6289,52 @@ pub(crate) fn mh_dispatch(
             };
             let reorder_len = ctx.array_length(reorder_arr);
             let mut permuted_args = Vec::with_capacity(reorder_len);
+            let mut reorder_vals: Vec<i32> = Vec::with_capacity(reorder_len);
             for i in 0..reorder_len {
                 let idx = match ctx.get_array_element(reorder_arr, i) {
                     Value::Int(v) => v as usize,
                     _ => i,
                 };
+                reorder_vals.push(idx as i32);
                 let val = extra_args.get(idx).copied().unwrap_or(Value::Object(None));
                 permuted_args.push(val);
+            }
+            if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                let target_desc = mh_read_desc(ctx, target_mh).unwrap_or_default();
+                eprintln!(
+                    "[MH_PERMUTE] reorder={reorder_vals:?} extra_args_len={} target_desc={target_desc:?}",
+                    extra_args.len()
+                );
             }
             mh_dispatch(ctx, target_mh, &permuted_args)
         }
         MH_KIND_DROP => {
             // C26: dropArgumentsTrusted wrapper. Unwrap to inner MH (in
             // MH_BOUND) and forward only the inner MH's expected args.
-            // Inner arity is derived from the inner MH's effective type. The
-            // drop position is encoded in MH_CLASS as "<pos>" decimal; if parse
-            // fails, drop from the head.
+            //
+            // The drop position AND count are encoded in MH_CLASS as
+            // "pos:count" (set by `make_drop_arguments_adapter` at
+            // construction time -- see its own comment). This USED to
+            // re-derive `drop_n` at dispatch time as
+            // `extra_args.len() - inner_expected` (inner_expected computed
+            // by re-parsing the INNER handle's reported descriptor/kind).
+            // That heuristic silently produces the wrong `drop_n` (and then
+            // a wrong, silently-clamped `pos`) whenever this DROP adapter is
+            // itself nested inside further combinators (JRuby's
+            // `org.jruby.ir.targets.indy.InvokeSite` composes SIX
+            // `dropArguments` + SIX `insertArguments` calls per call site) --
+            // any drift in what the inner handle's descriptor reports as its
+            // effective arity (e.g. a receiver-detection edge case, or an
+            // inner adapter whose own widened `type` field doesn't exactly
+            // match its TRUE effective arity) throws off the subtraction,
+            // which then throws off every downstream drop in the chain.
+            // Confirmed via `CRATONVM_DBG_INDY_GENERIC` tracing on
+            // `rubygems/version.rb`'s `@version.sub(regex, "")` call
+            // (reached through exactly this `InvokeSite` machinery): the
+            // receiver slot held `self` instead of `@version`'s string, and
+            // a stray `Regexp` literal landed in the replacement-string/
+            // block slots -- a classic "wrong args kept as the `pos` prefix"
+            // symptom of a silently-mis-clamped `pos`/`drop_n` pair.
             let inner = match bound {
                 Value::Object(Some(r)) => r,
                 _ => return Ok(Some(Value::Object(None))),
@@ -5948,11 +6355,29 @@ pub(crate) fn mh_dispatch(
                 } else {
                     0
                 };
-            let pos: usize = mh_read_class(ctx, mh)
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-            // Drop `extra_args.len() - inner_expected` args starting at `pos`.
-            let drop_n = extra_args.len().saturating_sub(inner_expected);
+            let class_str = mh_read_class(ctx, mh);
+            let (pos, drop_n): (usize, usize) = class_str
+                .as_deref()
+                .and_then(|s| {
+                    let mut parts = s.splitn(2, ':');
+                    let p = parts.next()?.parse::<usize>().ok()?;
+                    let n = parts.next()?.parse::<usize>().ok()?;
+                    Some((p, n))
+                })
+                // Defensive fallback for a DROP handle whose MH_CLASS wasn't
+                // encoded in the "pos:count" format (shouldn't happen via
+                // `make_drop_arguments_adapter`, but avoid a hard failure on
+                // an unexpected encoding): fall back to the old
+                // arg-count-difference heuristic.
+                .unwrap_or_else(|| {
+                    let p = class_str
+                        .as_deref()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let n = extra_args.len().saturating_sub(inner_expected);
+                    (p, n)
+                });
+            let drop_n = drop_n.min(extra_args.len());
             let pos = pos.min(extra_args.len().saturating_sub(drop_n));
             let mut trimmed: Vec<Value> = Vec::with_capacity(inner_expected);
             trimmed.extend_from_slice(&extra_args[..pos]);
@@ -5988,7 +6413,16 @@ pub(crate) fn mh_dispatch(
                 .or_else(|| mh_read_desc(ctx, test_mh))
                 .unwrap_or_default();
             let test_argc = count_descriptor_params(&test_desc).min(extra_args.len());
+            // GC-safety: this recursive `mh_dispatch` (running the test
+            // handle) can trigger a collection that relocates
+            // `target_mh`/`fallback_mh` (both captured above, one of which
+            // is dispatched again below depending on the test result).
+            let target_pin = ctx.pin_native_root(target_mh);
+            let fallback_pin = ctx.pin_native_root(fallback_mh);
             let test_result = mh_dispatch(ctx, test_mh, &extra_args[..test_argc])?;
+            let target_mh = ctx.read_native_pin(target_pin, target_mh);
+            let fallback_mh = ctx.read_native_pin(fallback_pin, fallback_mh);
+            ctx.unpin_native_roots(target_pin);
             let is_true = mh_guard_truthy(ctx, test_result);
             if is_true {
                 mh_dispatch(ctx, target_mh, extra_args)
@@ -6009,6 +6443,13 @@ pub(crate) fn mh_dispatch(
                 },
                 _ => None,
             };
+            // GC-safety: `string_concat_render_value` below can trigger a
+            // collection (it may call a dynamic arg's real `toString()`); a
+            // GC during ANY loop iteration can relocate `constants_arr`'s
+            // object, which is then read again on a LATER iteration. Pin it
+            // once for the whole recipe walk and re-read the forwarded
+            // reference before each use.
+            let constants_pin = constants_arr.map(|a| ctx.pin_native_root(a));
             let mut out = String::with_capacity(recipe.len() + 16);
             let mut arg_idx: usize = 0;
             let mut const_idx: usize = 0;
@@ -6023,7 +6464,8 @@ pub(crate) fn mh_dispatch(
                         arg_idx += 1;
                     }
                     '\u{0002}' => {
-                        if let Some(arr) = constants_arr {
+                        if let (Some(arr), Some(pin)) = (constants_arr, constants_pin) {
+                            let arr = ctx.read_native_pin(pin, arr);
                             if const_idx < ctx.array_length(arr) {
                                 let v = ctx.get_array_element(arr, const_idx);
                                 out.push_str(&string_concat_render_value(ctx, v));
@@ -6033,6 +6475,9 @@ pub(crate) fn mh_dispatch(
                     }
                     c => out.push(c),
                 }
+            }
+            if let Some(pin) = constants_pin {
+                ctx.unpin_native_roots(pin);
             }
             let s = ctx.create_string(&out);
             Ok(Some(Value::Object(Some(s))))
@@ -6207,6 +6652,13 @@ pub(crate) fn mh_dispatch(
             };
             let leading = extra_args.len() - count;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
+            // GC-safety: `box_value` inside the loop below can trigger a
+            // collection that relocates `arr` (created once, before the
+            // loop, then written into on every iteration) and `target`
+            // (captured earlier, dispatched only after the loop finishes).
+            // Pin both and re-read the forwarded references before each use.
+            let arr_pin = ctx.pin_native_root(arr);
+            let target_pin = ctx.pin_native_root(target);
             for i in 0..count {
                 // Box primitive values into their wrappers — the collector
                 // gathers into an `Object[]`. The indy call site passes raw
@@ -6224,8 +6676,12 @@ pub(crate) fn mh_dispatch(
                     Value::Double(_) => crate::lang_class::box_value(ctx, v, "D"),
                     other => other,
                 };
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, boxed);
             }
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let target = ctx.read_native_pin(target_pin, target);
+            ctx.unpin_native_roots(arr_pin);
             let mut full: Vec<Value> = Vec::with_capacity(leading + 1);
             full.extend_from_slice(&extra_args[..leading]);
             full.push(Value::Object(Some(arr)));
@@ -6233,7 +6689,9 @@ pub(crate) fn mh_dispatch(
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
+        MH_KIND_COLLECT_ARGS => mh_dispatch_collect_args(ctx, bound, extra_args),
         MH_KIND_CATCH => mh_dispatch_catch(ctx, bound, extra_args),
+        MH_KIND_RETURN_FILTER => mh_dispatch_return_filter(ctx, bound, extra_args),
         MH_KIND_INVOKER => {
             // `MethodHandles.exactInvoker`/`invoker`/`spreadInvoker`: the
             // target handle is the FIRST incoming argument (not captured at
@@ -6248,6 +6706,11 @@ pub(crate) fn mh_dispatch(
             };
             let rest = &extra_args[1..];
             let spread_n: Option<usize> = mh_read_name(ctx, mh).and_then(|s| s.parse().ok());
+            // GC-safety: `new_array` inside the `Some(n)` arm below can
+            // trigger a collection that relocates `target` (captured above,
+            // dispatched only after this match completes, regardless of
+            // which arm ran).
+            let target_pin = ctx.pin_native_root(target);
             let full: Vec<Value> = match spread_n {
                 Some(n) if n <= rest.len() => {
                     let leading = rest.len() - n;
@@ -6262,6 +6725,8 @@ pub(crate) fn mh_dispatch(
                 }
                 _ => rest.to_vec(),
             };
+            let target = ctx.read_native_pin(target_pin, target);
+            ctx.unpin_native_roots(target_pin);
             mh_dispatch(ctx, target, &full)
         }
         MH_KIND_SPREAD => {
@@ -6343,6 +6808,22 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
+                        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                            let last_desc = match adapted.last() {
+                                Some(Value::Object(Some(o))) if ctx.object_is_array(*o) => {
+                                    format!("array[len={}]", ctx.array_length(*o))
+                                }
+                                Some(Value::Object(Some(_))) => "obj".to_string(),
+                                Some(Value::Object(None)) => "null".to_string(),
+                                Some(other) => format!("{other:?}"),
+                                None => "<none>".to_string(),
+                            };
+                            eprintln!(
+                                "[MH_VIRTUAL_ADAPTED] class={class} name={name} desc={desc:?} collected_len={} adapted_len={} last={last_desc}",
+                                collected.len(),
+                                adapted.len()
+                            );
+                        }
                         let mut full_args = Vec::with_capacity(1 + adapted.len());
                         full_args.push(Value::Object(Some(receiver)));
                         full_args.extend_from_slice(&adapted);
@@ -6393,12 +6874,22 @@ pub(crate) fn native_record_support_deserialization_ctr(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // GC-SAFETY: `desc` is used again below (stored into the new
+    // MethodHandle's MH_BOUND slot) after `ctx.invoke_virtual` (Java
+    // dispatch) and `alloc_method_handle`'s own internal allocations,
+    // either of which can trigger a moving GC. Pin it up front and re-read
+    // before the final use.
+    let desc_pin = ctx.pin_native_root(desc);
     let cls_mirror = match ctx.invoke_virtual(desc, "forClass", "()Ljava/lang/Class;", &[])? {
         Some(Value::Object(Some(m))) => m,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => {
+            ctx.unpin_native_roots(desc_pin);
+            return Ok(Some(Value::Object(None)));
+        }
     };
     let cls_name = crate::lang_class::mirror_class_name(ctx, cls_mirror).unwrap_or_default();
     if cls_name.is_empty() {
+        ctx.unpin_native_roots(desc_pin);
         return Ok(Some(Value::Object(None)));
     }
     let mh = alloc_method_handle(
@@ -6408,7 +6899,9 @@ pub(crate) fn native_record_support_deserialization_ctr(
         "([B[Ljava/lang/Object;)Ljava/lang/Object;",
         MH_KIND_RECORD_DESER,
     );
+    let desc = ctx.read_native_pin(desc_pin, desc);
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
+    ctx.unpin_native_roots(desc_pin);
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -6453,29 +6946,49 @@ fn record_deser_dispatch(
             _ => return Ok(Some(Value::Object(None))),
         };
     let nfields = ctx.array_length(fields);
+    // GC-safety: the per-field `invoke_virtual` calls below (getName /
+    // isPrimitive / getTypeCode / getOffset) can each trigger a collection
+    // that relocates `fields`/`prim_values`/`obj_values` (all captured once
+    // and read again on EVERY later loop iteration below). Pin them for the
+    // whole function and re-read the forwarded reference before each use.
+    let fields_pin = ctx.pin_native_root(fields);
+    let prim_values_pin = prim_values.map(|a| ctx.pin_native_root(a));
+    let obj_values_pin = obj_values.map(|a| ctx.pin_native_root(a));
     // name -> (is_primitive, slot, type_code) where slot = objValues index
     // (reference) or primValues byte offset (primitive).
     let mut field_src: std::collections::HashMap<String, (bool, usize, char)> =
         std::collections::HashMap::with_capacity(nfields);
     let mut obj_index = 0usize;
     for i in 0..nfields {
+        let fields = ctx.read_native_pin(fields_pin, fields);
         let f = match ctx.get_array_element(fields, i) {
             Value::Object(Some(o)) => o,
             _ => continue,
         };
+        // GC-safety: each `invoke_virtual` call below can trigger a
+        // collection that relocates `f`, read again by the NEXT call in
+        // this same chain. Pin per-iteration and release before the next
+        // iteration (must not accumulate across iterations).
+        let f_pin = ctx.pin_native_root(f);
         let fname = match ctx.invoke_virtual(f, "getName", "()Ljava/lang/String;", &[])? {
             Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(f_pin);
+                continue;
+            }
         };
+        let f = ctx.read_native_pin(f_pin, f);
         let is_prim = matches!(
             ctx.invoke_virtual(f, "isPrimitive", "()Z", &[])?,
             Some(Value::Int(1))
         );
+        let f = ctx.read_native_pin(f_pin, f);
         let tc = match ctx.invoke_virtual(f, "getTypeCode", "()C", &[])? {
             Some(Value::Int(c)) => char::from_u32(c as u32).unwrap_or('L'),
             _ => 'L',
         };
         if is_prim {
+            let f = ctx.read_native_pin(f_pin, f);
             let offset = match ctx.invoke_virtual(f, "getOffset", "()I", &[])? {
                 Some(Value::Int(n)) => n.max(0) as usize,
                 _ => 0,
@@ -6485,6 +6998,7 @@ fn record_deser_dispatch(
             field_src.insert(fname, (false, obj_index, tc));
             obj_index += 1;
         }
+        ctx.unpin_native_roots(f_pin);
     }
 
     // Enumerate canonical components (declaration order) → build ctor args + desc.
@@ -6502,31 +7016,56 @@ fn record_deser_dispatch(
         _ => return Ok(Some(Value::Object(None))),
     };
     let ncomp = ctx.array_length(comps);
+    // GC-safety: same cross-iteration risk as the `fields` loop above, now
+    // for `comps` (the still-pinned `obj_values`/`prim_values` are re-read
+    // through their own pins inside the arm that uses each).
+    let comps_pin = ctx.pin_native_root(comps);
     let mut ctor_desc = String::from("(");
     let mut ctor_args: Vec<Value> = Vec::with_capacity(ncomp);
     for j in 0..ncomp {
+        let comps = ctx.read_native_pin(comps_pin, comps);
         let comp = match ctx.get_array_element(comps, j) {
             Value::Object(Some(o)) => o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // GC-safety: `getType` below can trigger a collection that
+        // relocates `comp` (read again by that same call); pin
+        // per-iteration and release before the next iteration.
+        let comp_pin = ctx.pin_native_root(comp);
         let cname = match ctx.invoke_virtual(comp, "getName", "()Ljava/lang/String;", &[])? {
             Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
             _ => return Ok(Some(Value::Object(None))),
         };
+        let comp = ctx.read_native_pin(comp_pin, comp);
         let ctype_mirror = match ctx.invoke_virtual(comp, "getType", "()Ljava/lang/Class;", &[])? {
             Some(Value::Object(Some(m))) => m,
             _ => return Ok(Some(Value::Object(None))),
         };
+        ctx.unpin_native_roots(comp_pin);
         let comp_desc = mirror_to_descriptor(ctx, ctype_mirror).into_owned();
         ctor_desc.push_str(&comp_desc);
 
         let value = match field_src.get(&cname) {
             Some(&(false, idx, _)) => match obj_values {
-                Some(arr) if idx < ctx.array_length(arr) => ctx.get_array_element(arr, idx),
+                Some(arr) => {
+                    let arr = obj_values_pin
+                        .map(|p| ctx.read_native_pin(p, arr))
+                        .unwrap_or(arr);
+                    if idx < ctx.array_length(arr) {
+                        ctx.get_array_element(arr, idx)
+                    } else {
+                        Value::Object(None)
+                    }
+                }
                 _ => Value::Object(None),
             },
             Some(&(true, offset, tc)) => match prim_values {
-                Some(arr) => record_decode_primitive(ctx, arr, offset, tc),
+                Some(arr) => {
+                    let arr = prim_values_pin
+                        .map(|p| ctx.read_native_pin(p, arr))
+                        .unwrap_or(arr);
+                    record_decode_primitive(ctx, arr, offset, tc)
+                }
                 None => default_for_descriptor(&comp_desc),
             },
             None => default_for_descriptor(&comp_desc),
@@ -6534,14 +7073,20 @@ fn record_deser_dispatch(
         ctor_args.push(value);
     }
     ctor_desc.push_str(")V");
+    ctx.unpin_native_roots(fields_pin);
 
     // Allocate + run the canonical constructor.
     let cid = ctx.ensure_class_initialized(&record_class)?;
     let new_obj = ctx.alloc_object(cid, ncomp.max(16));
+    // GC-safety: the `<init>` invocation below can itself allocate; pin
+    // `new_obj` and re-read the forwarded reference before it's returned.
+    let new_obj_pin = ctx.pin_native_root(new_obj);
     let mut init_args = Vec::with_capacity(1 + ctor_args.len());
     init_args.push(Value::Object(Some(new_obj)));
     init_args.extend_from_slice(&ctor_args);
     ctx.invoke(&record_class, "<init>", &ctor_desc, &init_args)?;
+    let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
+    ctx.unpin_native_roots(new_obj_pin);
     Ok(Some(Value::Object(Some(new_obj))))
 }
 
@@ -6790,30 +7335,73 @@ fn collect_trailing_varargs(
     params: &[Value],
 ) -> Vec<Value> {
     // Cheap pre-checks BEFORE the allocating `declared_methods` lookup, so the
-    // hot path (every static/virtual MethodHandle dispatch — Groovy/Gradle/
+    // hot path (every static/virtual MethodHandle dispatch -- Groovy/Gradle/
     // Jackson/SpEL-compiled) pays only a descriptor parse, not a full
     // declared-methods scan.
     let (ptypes, _) = crate::lang_class::parse_descriptor_param_and_return(desc);
     let p = ptypes.len();
-    let last = match ptypes.last() {
-        // Varargs ALWAYS has an array as its last parameter; if not, this can't
-        // be a varargs collection — return untouched.
-        Some(t) if t.starts_with('[') => t.clone(),
-        _ => return params.to_vec(),
+    // Locate the array-typed parameter. Real JDK varargs requires it to be
+    // the syntactically LAST parameter (JLS) -- but JRuby's Ruby-call
+    // convention routinely appends a trailing `Block` parameter AFTER the
+    // args array (e.g. `InvokeSite#invoke(ThreadContext, IRubyObject caller,
+    // IRubyObject self, IRubyObject[] args, Block)`), so search for the
+    // array anywhere in the descriptor rather than assuming index `p - 1`.
+    let array_idx = match ptypes.iter().position(|t| t.starts_with('[')) {
+        Some(idx) => idx,
+        // No array parameter at all -- this can't be a varargs/collect
+        // target, return untouched.
+        None => return params.to_vec(),
     };
-    // Already packed: exactly P args and the trailing one is an array (or null).
-    // Covers a correct `invokeExact`/pre-packed call AND e.g.
-    // `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection needed
-    // regardless of varargs-ness, so skip the method-table lookup entirely.
+    let last = ptypes[array_idx].clone();
+    let trailing_types = &ptypes[array_idx + 1..];
+    // Already packed: exactly P args and the array-position value is itself
+    // an array (or null). Covers a correct `invokeExact`/pre-packed call AND
+    // e.g. `#formatPrimitiveVarargs('fmt', new int[]{1})`. No collection
+    // needed regardless of varargs-ness, so skip the method-table lookup
+    // entirely.
     if params.len() == p {
-        match params.last() {
+        match params.get(array_idx) {
             Some(Value::Object(Some(arr))) if ctx.object_is_array(*arr) => return params.to_vec(),
             Some(Value::Object(None)) => return params.to_vec(),
             _ => {}
         }
     }
-    // Only now (last param is an array AND args aren't packed) confirm the
-    // target is actually ACC_VARARGS before reshaping the arguments.
+    // Confirm collection is actually warranted before reshaping the
+    // arguments. Two independent triggers, either one is sufficient:
+    //
+    //  1. `is_varargs` -- the target is a genuine Java ACC_VARARGS method
+    //     (`foo(Object... xs)`), reached via reflection/MethodHandle spread
+    //     calling convention (`invokeWithArguments`, Groovy's boxed-args
+    //     dispatch, ...). This was the ONLY trigger originally.
+    //
+    //  2. `params.len() > p` -- MORE flat argument values were supplied than
+    //     the target descriptor declares params for, and SOME declared param
+    //     is an array type. This covers a target method whose array
+    //     parameter is an ORDINARY (non-varargs) `T[]` -- e.g. JRuby 10.x's
+    //     `org.jruby.ir.targets.indy.InvokeSite`/`NormalInvokeSite
+    //     .invoke(ThreadContext, IRubyObject, IRubyObject, IRubyObject[],
+    //     Block)` (confirmed via `javap` -- both real overloads take a plain
+    //     array, neither is declared `IRubyObject...`, so ACC_VARARGS is
+    //     never set on either). JRuby's `invokebinder`-built call-site chain
+    //     supplies the trailing Ruby-level arguments as flat individual
+    //     values via a sequence of `MethodHandles.insertArguments` calls
+    //     (CratonVM's `MH_KIND_INSERT`, which splices correctly at its own
+    //     `pos` -- verified by direct value tracing, not the bug) and never
+    //     calls `MethodHandle.asCollector`/anything else that would pack
+    //     them -- so by the time dispatch reaches the target method's own
+    //     descriptor, arity strictly exceeds the declared param count with
+    //     an array type declared somewhere in it. In a signature-polymorphic
+    //     MethodHandle-mediated call this arity/type mismatch has exactly
+    //     one legal resolution (collect the excess into the array); passing
+    //     the excess through flat/unchanged (the old behavior) desyncs
+    //     every argument at and after the array position -- confirmed via
+    //     `CRATONVM_DBG_MH_DISPATCH` live tracing on
+    //     `JRubyScriptTemplateTests`/`rubygems/version.rb`'s
+    //     `@version.sub(regex, "")`: the terminal `NormalInvokeSite.invoke`
+    //     dispatch received 6 flat args `[ctx, self, receiver, regex, BLOCK,
+    //     replacement]` against a 5-param `(ctx, self, receiver, args[],
+    //     block)` target -- the block landed in the array's slot, one
+    //     position early, pushing the real last argument out past it.
     let cid = match ctx.class_id_by_name(class) {
         Some(c) => c,
         None => return params.to_vec(),
@@ -6822,20 +7410,82 @@ fn collect_trailing_varargs(
         .declared_methods(cid)
         .iter()
         .any(|m| m.name == name && m.descriptor == desc && (m.access_flags & 0x0080) != 0);
-    if !is_varargs {
+    let arity_excess = params.len() > p;
+    // A second, narrower trigger alongside `arity_excess`: EXACTLY `p` args
+    // were supplied (no excess) but the value that naively lands at the
+    // array's declared position isn't itself an array (or null) -- a bare
+    // scalar sitting in an array-typed descriptor slot. Confirmed via the
+    // SAME `JRubyScriptTemplateTests` trace as `arity_excess` above: right
+    // after the `.sub()` call's 6-flat-args case (fixed by `arity_excess`),
+    // the very next call in the same chain --
+    // `org.jruby.ir.targets.indy.SelfInvokeSite.invoke(ThreadContext,
+    // IRubyObject, IRubyObject[], Block)` -- arrived with exactly 4 flat
+    // args (matching `p` exactly) where the array-typed 3rd param held a
+    // single bare `IRubyObject` instead of a 1-element array, later
+    // surfacing as `ArgumentError: wrong number of arguments (given 0,
+    // expected 1)` inside the interpreted Ruby method `checkArity` found it
+    // was calling. A single supplied value destined for a 1-element array
+    // needs the exact same wrap-into-array treatment as an excess of
+    // supplied values, just with `excess == 0`.
+    let array_slot_is_wrapped = match params.get(array_idx) {
+        Some(Value::Object(Some(arr))) => ctx.object_is_array(*arr),
+        Some(Value::Object(None)) => true,
+        _ => false,
+    };
+    let scalar_needs_wrap = params.len() == p && !array_slot_is_wrapped;
+    if !is_varargs && !arity_excess && !scalar_needs_wrap {
         return params.to_vec();
     }
-    let fixed = p - 1;
-    if params.len() < fixed {
-        // Fewer args than the leading fixed params — let `invoke` surface the
-        // arity error rather than fabricate a result.
+    if params.len() < array_idx + trailing_types.len() {
+        // Fewer args than the leading-fixed + trailing-fixed params could
+        // ever accommodate -- let `invoke` surface the arity error rather
+        // than fabricate a result.
         return params.to_vec();
     }
+    // The tail region (`params[array_idx..]`) needs to split into "values
+    // that collect into the array" and "values that satisfy the trailing
+    // fixed params declared AFTER the array" (e.g. a trailing `Block`). A
+    // naive positional split (last N values = trailing fixed params) is
+    // WRONG here: those trailing values can end up spliced into the MIDDLE
+    // of the tail region by an earlier, independently-correct
+    // `MethodHandles.insertArguments` step whose `pos` was computed against
+    // the COLLAPSED arity it expected -- CratonVM never actually collapses
+    // until this function runs, so a value meant to land after the array
+    // ends up interleaved among the to-be-collected values instead (exactly
+    // the `[..., Regexp, Block, replacement]` shape traced above: `Block`
+    // sitting between the two values that belong in the array). Recover the
+    // correct split by matching each trailing declared type against its
+    // RUNTIME class within the tail, pulling matched values out (in the
+    // trailing params' declared order) and leaving the rest, in their
+    // original relative order, to collect into the array.
+    let tail = &params[array_idx..];
+    let mut taken = vec![false; tail.len()];
+    let mut trailing_values: Vec<Value> = Vec::with_capacity(trailing_types.len());
+    for tt in trailing_types {
+        let want_class = tt.trim_start_matches('L').trim_end_matches(';');
+        let found = tail.iter().enumerate().find(|(i, v)| {
+            !taken[*i]
+                && matches!(v, Value::Object(Some(o))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+        }).map(|(i, _)| i);
+        let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
+        if let Some(i) = idx {
+            taken[i] = true;
+            trailing_values.push(tail[i]);
+        }
+    }
+    let collected: Vec<Value> = tail
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !taken[*i])
+        .map(|(_, v)| *v)
+        .collect();
     let component = &last[1..]; // strip one leading '['
-    let array = build_varargs_array(ctx, component, &params[fixed..]);
-    let mut out = Vec::with_capacity(fixed + 1);
-    out.extend_from_slice(&params[..fixed]);
+    let array = build_varargs_array(ctx, component, &collected);
+    let mut out = Vec::with_capacity(array_idx + 1 + trailing_values.len());
+    out.extend_from_slice(&params[..array_idx]);
     out.push(Value::Object(array));
+    out.extend_from_slice(&trailing_values);
     out
 }
 
@@ -7317,6 +7967,20 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         "asType",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
+            // Panama downcalls use a compact synthetic layout whose field 0 is
+            // the native function address. Their MethodHandle type is derived
+            // from the FunctionDescriptor, so assigning the inherited real-JDK
+            // type field here would overwrite that address and turn a later
+            // void invokeExact into a silent no-op.
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if ctx
+                    .class_name_of_id(ctx.class_id_of_object(*this))
+                    .as_deref()
+                    == Some("java/lang/foreign/DowncallHandle")
+                {
+                    return Ok(Some(args[0]));
+                }
+            }
             if let (Some(Value::Object(Some(this))), Some(Value::Object(Some(mt)))) =
                 (args.first(), args.get(1))
             {
@@ -7387,17 +8051,30 @@ pub fn build_method_type_from_descriptor(
         ctx.primitive_class_mirror(&ret_name)
     };
 
+    // GC-safety: `new_array`/`primitive_class_mirror` (lazily allocates a
+    // synthetic mirror on first use, same as `synthetic_class_mirror`)/
+    // `alloc_concurrent_synthetic` below can all trigger a collection that
+    // relocates `ret_mirror`; pin it and re-read the forwarded reference
+    // before each subsequent use.
+    let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
+
     // Create params array
     let arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
         param_names.len(),
     );
+    let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
+    // Same GC-safety concern applies to `arr`, written into on every loop
+    // iteration after a per-iteration `primitive_class_mirror`/allocating
+    // call; pin it too and re-read before each write.
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, pname) in param_names.iter().enumerate() {
         let mirror = if let Some(cid) = ctx.class_id_by_name(pname) {
             ctx.get_class_mirror(cid)
         } else {
             ctx.primitive_class_mirror(pname)
         };
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
 
@@ -7405,6 +8082,9 @@ pub fn build_method_type_from_descriptor(
     // invokers(4), methodDescriptor(5). Allocate 6 slots so the JDK-resolved
     // `form` slot (2) lives within the synthetic object.
     let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+    let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(ret_mirror_pin);
     ctx.set_field(mt, 0, Value::Object(Some(ret_mirror)));
     ctx.set_field(mt, 1, Value::Object(Some(arr)));
 
@@ -7670,9 +8350,43 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "filterReturnValue",
         "(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            // Simplified: return the target MH unchanged
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            // filterReturnValue(target, filter): invoke target, then pass its
+            // result through the unary filter, returning the filter's result.
+            // See MH_KIND_RETURN_FILTER's doc comment for why this can no
+            // longer be the earlier "return target unchanged" simplification
+            // (JRuby's ivar-getter call sites rely on this filter step to
+            // substitute the runtime `nil` singleton for a raw Java `null`).
+            let target = match args.first() {
+                Some(Value::Object(Some(t))) => *t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let filter = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                // No filter -> behaves like the identity wrapper over target.
+                _ => return Ok(Some(Value::Object(Some(target)))),
+            };
+            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2);
+            ctx.set_field(wrapper, 0, Value::Object(Some(target)));
+            ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
+            // The adapter's parameter types match the target's; its return
+            // type matches the filter's return type (JDK contract: the
+            // filter's sole parameter type must equal the target's return
+            // type, and the filter's own return type becomes the adapter's).
+            let target_desc = mh_type_descriptor(ctx, target)
+                .or_else(|| mh_read_desc(ctx, target))
+                .unwrap_or_default();
+            let filter_desc = mh_type_descriptor(ctx, filter).or_else(|| mh_read_desc(ctx, filter));
+            let desc = match (filter_desc, target_desc.rfind(')')) {
+                (Some(fd), Some(paren)) => {
+                    format!("{}){}", &target_desc[..paren], return_type_desc(&fd))
+                }
+                _ => target_desc,
+            };
+            let adapter =
+                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER);
+            ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+            Ok(Some(Value::Object(Some(adapter))))
         },
     );
     // foldArguments(target, combiner): fold at position 0.
@@ -7699,8 +8413,12 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         mhs,
         "collectArguments",
         "(Ljava/lang/invoke/MethodHandle;ILjava/lang/invoke/MethodHandle;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, args| {
-            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        |ctx, args| {
+            let pos = match args.get(1) {
+                Some(Value::Int(p)) => *p,
+                _ => 0,
+            };
+            make_collect_args_adapter(ctx, args.first().copied(), pos, args.get(2).copied())
         },
     );
     r.register(
@@ -8022,13 +8740,24 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Build the new descriptor from the MethodType
     let new_desc = descriptor_from_method_type(ctx, new_type);
 
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `target_mh`/`reorder_arr`/
+    // `wrapper` (all captured/produced above and read again afterward);
+    // pin them and re-read the forwarded references before use.
+    let target_pin = ctx.pin_native_root(target_mh);
+    let reorder_pin = ctx.pin_native_root(reorder_arr);
     // Create a wrapper synthetic to hold (target_mh, reorder_arr)
     let wrapper = alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let target_mh = ctx.read_native_pin(target_pin, target_mh);
+    let reorder_arr = ctx.read_native_pin(reorder_pin, reorder_arr);
     ctx.set_field(wrapper, 0, Value::Object(Some(target_mh)));
     ctx.set_field(wrapper, 1, Value::Object(Some(reorder_arr)));
 
     // Create the adapter MH with kind=PERMUTE
     let adapter = alloc_method_handle(ctx, "__adapter__", "permute", &new_desc, MH_KIND_PERMUTE);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
     Ok(Some(Value::Object(Some(adapter))))
 }
@@ -8099,8 +8828,19 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
 
+    // GC-safety: `alloc_concurrent_synthetic`/`alloc_method_handle` below
+    // can trigger a collection that relocates `test_mh`/`target_mh`/
+    // `fallback_mh`/`wrapper` (all captured/produced above and read again
+    // afterward); pin them and re-read the forwarded references before use.
+    let test_pin = ctx.pin_native_root(test_mh);
+    let target_pin = ctx.pin_native_root(target_mh);
+    let fallback_pin = ctx.pin_native_root(fallback_mh);
     // Create a wrapper synthetic to hold (test, target, fallback)
     let wrapper = alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3);
+    let wrapper_pin = ctx.pin_native_root(wrapper);
+    let test_mh = ctx.read_native_pin(test_pin, test_mh);
+    let target_mh = ctx.read_native_pin(target_pin, target_mh);
+    let fallback_mh = ctx.read_native_pin(fallback_pin, fallback_mh);
     ctx.set_field(wrapper, 0, Value::Object(Some(test_mh)));
     ctx.set_field(wrapper, 1, Value::Object(Some(target_mh)));
     ctx.set_field(wrapper, 2, Value::Object(Some(fallback_mh)));
@@ -8110,6 +8850,8 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `type` MethodType with the correct arity for the GUARD kind (which does
     // NOT itself prepend a receiver).
     let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD);
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    ctx.unpin_native_roots(test_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
     Ok(Some(Value::Object(Some(adapter))))
 }
@@ -8161,8 +8903,13 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Reference kind is encoded in bits 24-27 of flags
     let ref_kind = (flags >> 24) & 0x0F;
 
+    // GC-safety: `ensure_class_initialized` below can trigger a collection
+    // that relocates `member_name` (captured above, read/written again
+    // afterward); pin it and re-read the forwarded reference before use.
+    let member_name_pin = ctx.pin_native_root(member_name);
     // Ensure the class is loaded
     let _ = ctx.ensure_class_initialized(&class_name);
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
 
     // Mark as resolved by setting field 4 (vmindex) to a non-zero sentinel
     // The JDK checks this field to determine if resolution succeeded.
@@ -8179,6 +8926,7 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
                     // Method not found — for speculative resolve, return null
                     let speculative = matches!(args.get(3), Some(Value::Int(1)));
                     if speculative {
+                        ctx.unpin_native_roots(member_name_pin);
                         return Ok(Some(Value::Object(None)));
                     }
                 }
@@ -8186,6 +8934,7 @@ pub(crate) fn native_mhn_resolve(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
 
+    ctx.unpin_native_roots(member_name_pin);
     Ok(Some(Value::Object(Some(member_name))))
 }
 
@@ -8228,6 +8977,18 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let ref_class_id = ctx.class_id_of_object(ref_obj);
     let ref_class_name = ctx.class_name_of_id(ref_class_id).unwrap_or_default();
 
+    // GC-safety: the Constructor branch below calls `create_string`/
+    // `new_array`/`primitive_class_mirror`/`alloc_concurrent_synthetic`,
+    // any of which can trigger a collection that relocates `member_name`/
+    // `ref_obj` (both captured above, well before the match). Pin them for
+    // the whole match; the Constructor branch re-reads through the pins
+    // before each of its own risky re-uses, and this final re-read (right
+    // before the trailing `set_field` below) corrects `member_name`
+    // regardless of which branch ran or how many times it was internally
+    // re-read (a Rust `let` shadow inside one match arm does not persist
+    // past that arm, so the outer binding needs its own final refresh).
+    let member_name_pin = ctx.pin_native_root(member_name);
+    let ref_obj_pin = ctx.pin_native_root(ref_obj);
     match ref_class_name.as_str() {
         "java/lang/reflect/Field" => {
             // Copy clazz, name, type from the Field; compute flags.
@@ -8283,6 +9044,7 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             ctx.set_field_by_name(member_name, "clazz", clazz);
             // name = "<init>" — the constructor's name
             let name_str = ctx.create_string("<init>");
+            let member_name = ctx.read_native_pin(member_name_pin, member_name);
             ctx.set_field_by_name(member_name, "name", Value::Object(Some(name_str)));
             ctx.set_field_by_name(member_name, "flags", Value::Int(flags));
 
@@ -8301,18 +9063,26 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             // A constructor's invocation type is `(paramTypes...)void`, so
             // build that MethodType from the reflected Constructor's
             // `parameterTypes` and a void return mirror.
-            let ptypes = match ctx.get_field_by_name(ref_obj, "parameterTypes") {
-                Value::Object(Some(a)) => Value::Object(Some(a)),
-                _ => {
-                    let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    Value::Object(Some(empty))
-                }
+            let ref_obj = ctx.read_native_pin(ref_obj_pin, ref_obj);
+            let ptypes_ref = match ctx.get_field_by_name(ref_obj, "parameterTypes") {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
             };
+            // GC-safety: `primitive_class_mirror`/`alloc_concurrent_synthetic`
+            // below can trigger a collection that relocates `ptypes_ref`
+            // (embedded into the new MethodType only after both run); pin it
+            // too (same batch as `void_mirror`).
+            let ptypes_pin = ctx.pin_native_root(ptypes_ref);
             let void_mirror = ctx.primitive_class_mirror(NAME_VOID);
+            let void_mirror_pin = ctx.pin_native_root(void_mirror);
             let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let void_mirror = ctx.read_native_pin(void_mirror_pin, void_mirror);
+            let ptypes_ref = ctx.read_native_pin(ptypes_pin, ptypes_ref);
+            ctx.unpin_native_roots(ptypes_pin);
             ctx.set_field(mt, 0, Value::Object(Some(void_mirror)));
-            ctx.set_field(mt, 1, ptypes);
+            ctx.set_field(mt, 1, Value::Object(Some(ptypes_ref)));
             populate_method_type_form(ctx, mt);
+            let member_name = ctx.read_native_pin(member_name_pin, member_name);
             ctx.set_field_by_name(member_name, "type", Value::Object(Some(mt)));
         }
         _ => {
@@ -8320,7 +9090,11 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
 
-    // Mark resolved (legacy-safe index-based resolution marker)
+    // Mark resolved (legacy-safe index-based resolution marker). Re-read
+    // `member_name` once more (see the pin-setup comment above the match):
+    // whichever branch ran, this is the authoritative final refresh.
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    ctx.unpin_native_roots(member_name_pin);
     ctx.set_field(member_name, 4, Value::Int(1));
     Ok(None)
 }
@@ -8479,8 +9253,16 @@ pub(crate) fn native_mhn_get_member_vm_info(
         _ => 0,
     };
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
+    // GC-safety: `box_value` below can trigger a collection that relocates
+    // `arr`/`member_name` (both captured/produced above and read again
+    // afterward); pin them and re-read the forwarded references before use.
+    let arr_pin = ctx.pin_native_root(arr);
+    let member_name_pin = ctx.pin_native_root(member_name);
     // Box vmindex as Integer
     let boxed = crate::lang_class::box_value(ctx, Value::Int(vmindex), "I");
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    let member_name = ctx.read_native_pin(member_name_pin, member_name);
+    ctx.unpin_native_roots(arr_pin);
     ctx.set_array_element(arr, 0, boxed);
     ctx.set_array_element(arr, 1, Value::Object(Some(member_name)));
     Ok(Some(Value::Object(Some(arr))))
@@ -8634,6 +9416,61 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
 mod tests {
     use super::*;
     use crate::test_utils::MockNativeContext;
+
+    // MH_KIND_DROP dispatch must trim the dynamic args using the EXACT
+    // `pos:count` encoded at construction time (see MH_KIND_RETURN_FILTER's
+    // sibling doc comment on `make_drop_arguments_adapter` for the full
+    // story) rather than re-deriving the drop count later from
+    // `extra_args.len() - inner_expected`. Regression coverage for the
+    // JRubyScriptTemplateTests investigation (2026-07-15): a bare
+    // `dropArguments(leaf, pos, valueTypes)` adapter, dispatched with the
+    // widened arg list, must forward ONLY the kept (non-dropped) argument
+    // to `leaf`, regardless of what values sit in the dropped slots.
+    #[test]
+    fn drop_arguments_dispatch_keeps_correct_slot_not_adjacent_ones() {
+        let mut ctx = MockNativeContext::new();
+        // Leaf: identity(x) = x -- a plain 1-arg handle, so the dispatch
+        // result directly tells us which argument survived the drop.
+        let leaf = alloc_method_handle(
+            &mut ctx,
+            "java/lang/invoke/MethodHandles",
+            "identity",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_IDENTITY,
+        );
+        // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
+        // a 3-param adapter where params[1..3] are dropped and param[0] is
+        // the one forwarded to `leaf`. Built directly (bypassing
+        // `make_drop_arguments_adapter`'s `[Ljava/lang/Class;` machinery)
+        // to isolate the dispatch-side fix under test.
+        let adapter = alloc_method_handle(
+            &mut ctx,
+            "1:2",
+            "drop",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            MH_KIND_DROP,
+        );
+        ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
+
+        // Three distinct sentinel objects so a wrong-position bug (e.g. a
+        // dropped arg silently reaching `leaf` instead of the kept one)
+        // is unmistakable rather than accidentally passing.
+        let kept = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped1 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let dropped2 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let args = [
+            Value::Object(Some(kept)),
+            Value::Object(Some(dropped1)),
+            Value::Object(Some(dropped2)),
+        ];
+        let result = mh_dispatch(&mut ctx, adapter, &args).unwrap();
+        assert_eq!(
+            result,
+            Some(Value::Object(Some(kept))),
+            "dropArguments(leaf, pos=1, count=2) must keep only the arg at \
+             pos 0 and forward it to leaf, regardless of the dropped args"
+        );
+    }
 
     // C13: alloc_method_handle must populate the real-JDK
     // MethodHandle.type:MethodType field so JDK code paths that read

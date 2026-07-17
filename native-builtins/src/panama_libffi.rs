@@ -497,15 +497,35 @@ pub fn marshal_arg(
 /// Read the absolute base address of a MemorySegment synthetic
 /// (field 0 + field 5 offset).
 pub fn segment_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
-    let base = match ctx.get_field(seg, 0) {
+    // Real JDK-loaded NativeMemorySegmentImpl/MappedMemorySegmentImpl instances
+    // do NOT share CratonVM's synthetic (base@0, offset@5) MemorySegment layout.
+    // Their real field order (confirmed via javap against the real JDK):
+    // AbstractMemorySegmentImpl{length, readOnly, scope} then
+    // NativeMemorySegmentImpl{min} then MappedMemorySegmentImpl{unmapper} --
+    // so "field 0" there is the segment's BYTE LENGTH, not its address.
+    // Resolving "min" by name first (falling back to the synthetic scheme)
+    // mirrors the already-correct, established pattern in
+    // p67_segment_address (phases_late.rs, MemorySegment.address()) --
+    // confirmed via live gdb capture that a real posix_madvise downcall was
+    // otherwise passed the segment's byte length (276) as its address.
+    if let Value::Long(v) = ctx.get_field_by_name(seg, "min") {
+        return v;
+    }
+    if ctx.object_num_fields(seg) >= 6 {
+        let base = match ctx.get_field(seg, 0) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
+        let off = match ctx.get_field(seg, 5) {
+            Value::Long(n) => n,
+            _ => 0,
+        };
+        return base.wrapping_add(off);
+    }
+    match ctx.get_field(seg, 0) {
         Value::Long(n) => n,
         _ => 0,
-    };
-    let off = match ctx.get_field(seg, 5) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    base.wrapping_add(off)
+    }
 }
 
 /// Allocate a return buffer sized for the given layout. For void

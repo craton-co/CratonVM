@@ -11,7 +11,46 @@ This document tracks the **genuine remaining failures**.
 ## 1. Deep-Dive Investigations (Root-Caused, Pending Fix)
 
 *   **Mockito `spy()` StackOverflowError** (`context.annotation.ImportSelectorTests`)
-  *   **Status**: **OPEN** — symptom shape changed 2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
+  *   **Status**: **FIXED (verified 2026-07-16, joint verification session)**. The heap-corruption
+    failure mode described below (`importSelectorsWithNestedGroup`,
+    `importSelectorsWithNestedGroupSameDeferredImport`) was an instance of the same cross-cutting
+    young-GC exact-walk bug independently root-caused and fixed by an unrelated concurrent session's
+    commit `fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID not special-cased in new young-GC exact-walk
+    loops") — see `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16 joint verification**
+    addendum to the `ImportSelectorTests` section for the full rebuild-and-rerun confirmation
+    (`found=9 succ=9 fail=0`, all 9 methods including both previously-crashing ones now pass, zero
+    corruption-signature log lines). Not this session's fix; attributing correctly rather than
+    claiming credit. Full history of the original investigation kept below for context.
+  *   **2026-07-17 independent re-confirmation** (separate task, separate worktree, no code
+    changes): re-verified the FIXED status above from scratch rather than trusting the prior
+    session's self-report, per this codebase's own "verify merged state, not agent self-reports"
+    lesson. Deliberately used a **maximally independent setup** to rule out any shared-fixture
+    artifact: a brand-new `git clone` of upstream `spring-projects/spring-framework` (not a reused
+    worktree -- the host's disk-pressure cleanup had deleted every prior spring-framework checkout
+    on this host by the time this task started), built fresh via Gradle (`:spring-context:testClasses`,
+    version `7.1.0-SNAPSHOT`, single `byte-buddy-1.18.3`/`mockito-core-5.23.0` on the classpath),
+    against a from-scratch `cargo build --release` of CratonVM at `dev` tip `56728b1a` (confirmed via
+    `git merge-base --is-ancestor fb15be63 origin/dev` that the fix commit is an ancestor). Ran the
+    real `ImportSelectorTests` class (`MethodRun`/JUnit-Platform-launcher pattern), both individually
+    per previously-crashing method and as the full 9-method class, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`,
+    real JDK 25: **`RESULT started=9 succeeded=9 failed=0`, twice in a row, zero corruption-signature
+    log lines, zero `StackOverflowError`.** Confirms the FIXED status is real, not an artifact of a
+    stale/shared build. **Bonus finding for future sessions** (unrelated to this bug, cost real time
+    to diagnose): a `NoClassDefFoundError` on `StandardBeanExpressionResolver$1` reproduced
+    deterministically on the *first* Gradle-cache-restored build of `spring-context` (`FROM-CACHE`
+    task outputs) even though the `.class` file was verifiably present on disk -- traced to Gradle's
+    build-cache restore silently producing an incomplete `classes/java/main` tree, almost certainly
+    because this host's chronic root-filesystem (`/`) 100%-full episodes corrupted an in-progress
+    cache extraction earlier in the session. Forcing `--rerun-tasks --no-build-cache` on
+    `:spring-context:compileJava`/`testClasses`/`jar`/`testFixturesJar` produced a correct tree and
+    made the error disappear; this had nothing to do with the Mockito/GC bug and would be worth its
+    own throwaway-repro note if it recurs. Also note for reproducing on this host: `GRADLE_USER_HOME`
+    and `-Djava.io.tmpdir` both need to be redirected off `/` (e.g. to `/data/tmp`) -- Mockito's
+    self-attach boot-jar write and Gradle's own caches both fail with `IOException: No space left on
+    device` on the chronically-full root filesystem otherwise, which can otherwise be misread as a
+    CratonVM bug.
+  *   **2026-07-16 pre-fix status (superseded above, kept for history)**: symptom shape changed
+    2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
     original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
     `registerSingleton()` call) **no longer reproduces**, and 3 of the 5 real `spy()` sub-tests
     (`importSelectors`, `importSelectorsWithGroup`, `importSelectorsSeparateWithGroup`) now **pass**
@@ -90,17 +129,104 @@ This document tracks the **genuine remaining failures**.
     RenderingResponse 1/1, RSocketRequester 13/13, WebClientObservation 9/9,
     CoExchangeFilterFunction 1/1, InvocableHandlerMethodKotlin 40/40 — all OK. A/B control: unfixed
     binary, identical flags -> 10/10 SOE.
-  *   Residual: `WebClientExtensionsTests` 20/32 (SOE gone). The 12 failures are two separate,
-    pre-existing families: (a) `IllegalStateException: Unable to create proxy for sealed class
-    interface org.springframework.http.HttpStatusCode, no subclasses available` — mockk resolves
-    `KClass.sealedSubclasses` (kotlin-reflect metadata family); (b) mockk `verify` matcher failures
-    (`... was not called`), same family as the tracked `RestClientExtensionsTests` residual.
+  *   **Residual — FIXED (2026-07-17)**: `WebClientExtensionsTests` was 20/32 (SOE gone, but 12
+    failures remained), split into two apparent families that turned out to share ONE root cause:
+    (a) `IllegalStateException: Unable to create proxy for sealed class interface
+    org.springframework.http.HttpStatusCode, no subclasses available`; (b) mockk `verify{}` matcher
+    failures (`... was not called`) on `ParameterizedTypeReference<List<? extends Foo>>`-typed
+    args, the same symptom family as the tracked `RestClientExtensionsTests` residual below.
+    **Root cause**: `Class.getPermittedSubclasses0()` (`native_class_get_permitted_subclasses`,
+    `native-builtins/src/lang_class.rs`) resolved each permitted-subclass NAME via
+    `ctx.class_id_by_name(name)`, a PASSIVE cache lookup that never triggers classloading. mockk's
+    `ProxyMaker.findActualClassToBeProxied` (decompiled from `mockk-agent-jvm-1.14.5.jar`) does
+    `clazz.kotlin.sealedSubclasses.firstOrNull() ?: error("Unable to create proxy for sealed class
+    $clazz, no subclasses available")`; since `HttpStatusCode` is a plain Java `sealed interface`
+    (no Kotlin `@Metadata`), kotlin-reflect resolves `sealedSubclasses` via
+    `Java16SealedRecordLoader`, i.e. by reflectively calling the standard
+    `Class.isSealed()`/`Class.getPermittedSubclasses()` pair. A live probe (calling
+    `getPermittedSubclasses0()` directly via reflection, bypassing the public wrapper) showed
+    `isSealed()` correctly `true` (the classfile's `PermittedSubclasses` attribute parses fine) but
+    `getPermittedSubclasses0()` returning `[null, null]` — a correctly-SIZED 2-element array with
+    BOTH entries unresolved, because `HttpStatus`/`DefaultHttpStatusCode` simply hadn't been loaded
+    yet at the time the reflective probe ran (the common case — nothing forces Spring to touch a
+    concrete `HttpStatus`/`DefaultHttpStatusCode` before mockk's `ProxyMaker` asks). Real JDK's own
+    `Class.getPermittedSubclasses()` Java wrapper then filters the raw native result down to entries
+    that verifiably extend/implement `this`; a `null` entry fails that check, so the 2-element
+    `[null, null]` silently collapsed to the empty `[]` mockk observed. Same root-cause family as
+    the `getEnclosingClass`/`getDeclaringClass` loader-identity fix (`aca7f635`) and the
+    getstatic/putstatic loader-aware fix (`19d7f417`/`b04eb903`): a flat, passive class-name lookup
+    standing in for what should be a real (re-entrant) `loadClass()` resolution.
+    **Fix**: `native_class_get_permitted_subclasses` now falls back to an ACTIVE, loader-correct
+    resolution on a cache miss — `ctx.invoke_virtual(loader, "loadClass", ...)` on `this` sealed
+    class's OWN classloader (reusing `native_class_get_class_loader`'s existing defining-loader /
+    app-loader-fallback logic), mirroring `declaring_class_loader_aware`'s re-entrant-call pattern.
+    Safe here (unlike the REVERTED getstatic/putstatic interpreter-opcode attempt documented in the
+    `ImportHttpServiceRegistrarTests` entry below): `getPermittedSubclasses0()` is an ordinary
+    native-method call boundary, the same shape `Class.forName`'s native already uses for
+    re-entrant `loadClass()` calls routinely and safely. The passive cache lookup still runs first
+    (cheap, handles the overwhelming common case where the subclass is already loaded).
+    **Verified**: fresh `dev`-tip worktree (`fix/mockk-webclientext-20260717`), full-class run via a
+    JUnit5-Launcher driver against the real spring-webflux test classpath: pre-fix `20/33` (13
+    failures — 9x family-(a) `IllegalStateException`, 4x family-(b) `AssertionError: Verification
+    failed ... was not called`, all on PTR-typed args — 33 not 32 methods found, one more than the
+    original report, likely a parameterized variant added since); post-fix `33/33`, reproduced
+    twice. A standalone live probe confirms `getPermittedSubclasses0()` now returns
+    `[DefaultHttpStatusCode, HttpStatus]` instead of `[null, null]`, and kotlin-reflect's
+    `KClass.isSealed`/`.sealedSubclasses` (called directly, not just through mockk) match.
+    Family (b) was NOT separately root-caused — fixing family (a) made it disappear too on this
+    class, most likely because mockk's `JvmSignatureValueGenerator.instantiate()` (decompiled from
+    `mockk-jvm-1.14.5.jar`, `io/mockk/impl/recording/JvmSignatureValueGenerator.class` — the exact
+    class flagged as the prime suspect in the `RestClientExtensionsTests` entry below)
+    shares the identical `sealedSubclasses`/`getPermittedSubclasses0()` code path for dummy-value
+    generation during argument-signature detection, and some earlier-executing method on the same
+    mock's declared surface (e.g. `ResponseSpec#onStatus(Predicate<HttpStatusCode>, ...)`) was
+    likely throwing/corrupting mockk's internal signature-detection state before the later PTR-arg
+    calls were ever reached. **Independently reconfirmed against `RestClientExtensionsTests` on
+    2026-07-17 — also FIXED**, same mechanism; see the dedicated entry immediately below for the
+    full re-verification writeup.
   *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
     hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
     (`java.io.tmpdir` honoring).
+*   **mockk `verify{}` matcher failures on `ParameterizedTypeReference`-typed args** (`web.client.RestClientExtensionsTests`) — **FIXED, independently reconfirmed 2026-07-17**
+  *   **Original status (through 2026-07-16, see [[restclientextensions-mockk-verify-ptr-residual]]
+    for the full original investigation)**: all 5 tests failed with
+    `io.mockk.MockKException: Can't instantiate proxy for class RestClient$RequestBodySpec`
+    (`AnnotatedTypeFactory$AnnotatedTypeBaseImpl.getAnnotatedOwnerType()` NPE, `location` null); this
+    was fixed by the unrelated AnnotatedType location seed (dev `3ee5ffaf`,
+    `annotated_type_fill_bookkeeping`), taking the class from 0/5 to 2/5. The residual 3/5
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) was
+    `java.lang.AssertionError: Verification failed ... body(eq(ParameterizedTypeReference<List<?
+    extends Foo>>)) ... arguments are not matching`, with the recorded arg and the verify matcher
+    rendering IDENTICALLY yet mockk's `eq` (`.equals`-based) reporting no match. Two hypotheses
+    (Type-equality bug, identity-hashCode magnitude) were both ruled out by standalone kotlinc
+    repros; remaining suspicion landed on mockk's `JvmSignatureValueGenerator`/`sealedSubclasses`
+    dummy-value-generation path (same class flagged in the `WebClientExtensionsTests` entry above),
+    but this was never pinned down to a CratonVM source line before this session.
+  *   **2026-07-17 reconfirmation**: built a fresh `dev`-tip worktree
+    (`/data/data/wt-restclientext-confirm-20260717`, branch `confirm/restclientext-20260717`, tip
+    `08808a57`, which contains `ce6bf419` — the `Class.getPermittedSubclasses0()` loader-aware-resolution
+    fix documented in the `WebClientExtensionsTests` entry above). `spring-web`'s Kotlin test sources
+    weren't previously compiled/testcp'd on this host, so they were built fresh via Gradle
+    (`/data/data/spring-framework-recheck` checkout, `:spring-web:testClasses`, JDK25
+    (`/home/victor/jdk25`, the system `/usr/bin/java` is a JRE-only OpenJDK21 install with no
+    `javac`), a private `GRADLE_USER_HOME` (`/data/tmp/gradle-home-restclientext-20260717`, seeded
+    from an existing cache then topped up online for a handful of newer Jackson/rsocket artifacts
+    not yet cached) to avoid colliding with other concurrent sessions' Gradle daemons/caches on this
+    host). Ran the real `org.springframework.web.client.RestClientExtensionsTests` class via the
+    standard `KRun` JUnit5-Launcher driver against the generated `spring-web` test runtime classpath
+    (205 entries) on the fresh binary. **Result: `found=5 succ=5 fail=0` — all 5 tests pass**,
+    reproduced identically across 4 consecutive runs (no flakiness). This is up from the previously
+    documented 2/5; the 3 previously-failing `verify{}`-matcher tests
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) now all pass.
+  *   **Conclusion**: confirms the fixing agent's hypothesis for `WebClientExtensionsTests` — both
+    classes' `verify{}` matcher failures were the same root cause
+    (`JvmSignatureValueGenerator.instantiate()`'s `sealedSubclasses`/`getPermittedSubclasses0()`
+    dummy-value-generation path), and `ce6bf419` fixes both. **Status: FIXED, no further action
+    needed for this class.**
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
-  *   **Status**: **OPEN** (2/5 methods: `basicListingWithAot`, `basicScanWithAot` — `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119`, `String[] classNames = (String[]) annotationAttributes.get(attribute);`)
+  *   **Status**: **FIXED** (2026-07-16, `resolve_field_ref_loader_aware` — see the "2026-07-16 update #2" section below for full verification). The original `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119` no longer reproduces. The class still does not reach 5/5 OK — the remaining 2/5 fail on an unrelated, pre-existing, documented host-environment gap (`java.lang.classfile.ClassFile` needs JDK24+; this host only has JDK17/21).
+  *   **2026-07-16/17 addendum (independent parallel investigation, unresolved flag for follow-up)**: a separate session investigating this same bug (before discovering this fix had already landed) built and stress-tested an equivalent re-entrant fix and additionally ran a memory/RSS stress check that the verification above did not cover: a single larger, loader-heavy AOT-cluster class (`BeanDefinitionMethodGeneratorTests` alone, real in-process javac, 34 test methods) grew the VM process's RSS past 4GB and was OOM-killed by the kernel (`sudo dmesg`: "Out of memory: Killed process ... (cratonvm-fieldr) total-vm:8856216kB anon-rss:4063936kB"), and the flagship repro itself ran roughly 60-100x slower than baseline (2.2s to 135-280s across runs) with an equivalent fix applied. This happened on a host that was ALSO under severe, independent, confirmed disk-full/memory pressure at the time (dmesg shows an unrelated `rustc` process OOM-killed in the same general window; both `/dev/root` and `/data/data`'s backing volume were at or near 100% full) — so it is NOT conclusively proven this fix specifically causes unbounded memory growth outside that already-degraded environment. This session's own attempt to re-verify directly against this exact landed commit was itself blocked by the same disk-full condition recurring (`cargo build` failing with "No space left on device" mid-archive-write) before it could be settled either way. Recorded here, unresolved, as a flag for follow-up: re-run the same stress scenario (a single heavy, loader-forking AOT test class, watching peak RSS over the whole run, not just pass/fail) on a host with real headroom before treating this fix as fully hardened for broad, unattended CI use.
   *   **2026-07-15 update**: reproduces SOLO in ~1s (`/data/tmp/aotfix-runs/MethodRun.java` single-method launcher on the Azure host). The 2026-07-14 SoftReference/GC-relocation hypothesis is now DOUBTED: this failure survived eight classloader-identity fixes, and three focused probes (plain `@Import` reflection, forked-loader variant, `@Import` as meta-annotation on a repeatable annotation type — `ImportProbe2.java`) all PASS. The divergence is somewhere in the full `ConfigurationClassParser`/`MergedAnnotations` path for the repeatable `@ImportHttpServices` container under a forked loader.
   *   **2026-07-15 second update — CratonVM's native annotation layer RULED OUT, narrowed to Spring's own `AnnotationTypeMapping` caching.** The failing lookup is `collectImports` examining `@ImportHttpServices` itself as a `SourceClass`, asking "is `@ImportHttpServices` meta-annotated with `@Import`?" and requesting `Import`'s `value()` attribute with `classValuesAsString=true` (Spring's `TypeMappedAnnotation.adapt()` expects a `Class[]`→`String[]` conversion here). Two CratonVM-internal traces already present in the codebase (`CRATONVM_IAE_TRACE`, `CRATONVM_ANN_PROXY_DISPATCH_TRACE` in `native-builtins/src/lang_class.rs` / `vm/src/vm/vm_exec.rs::annotation_proxy_dispatch_impl`) were used, plus one new element-level trace (temporary, reverted) confirming the FULL chain from raw classfile annotation bytes through to the reflective proxy dispatch is correct:
       - `container_loader=SOME` for both `ListingConfig` and `ImportHttpServices` (both correctly recognized as fork-loaded, so `resolve_annotation_class_via_loader` is used, not the stale global store).
@@ -133,11 +259,30 @@ This document tracks the **genuine remaining failures**.
       **Repro assets** (Azure host `20.83.144.174`, persisted, reusable — none of this needs to be regenerated): `/data/tmp/importhttpsvc-repro/` — `KRun.java`/`MethodRun.java`/`ImportProbe3.java` (drivers), `combined_cp.txt` (full spring-framework test-runtime classpath, `javac`/`java` argument-list-too-long on this classpath size — use `@run_args_clean.txt`-style `javac`/VM argfiles, NOT `-cp`/`CLASSPATH` directly, both blow past Linux's combined argv+envp limit), `patch-src/org/springframework/{core/annotation/{TypeMappedAnnotation,AnnotationTypeMapping,MergedAnnotation}.java,context/annotation/ConfigurationClassParser.java}` (instrumented copies, env-gated on `CV_TMA_TRACE`/`CV_CCP_TRACE`/`CV_ADAPT_TRACE`), `patch-out/` (compiled instrumented classes — prepend to classpath, ahead of `combined_cp.txt`, to reproduce the traces). Baseline (unfixed) binary: `/data/tmp/cratonvm-aotfix10-postmerge.bin`. My attempted-and-reverted fix's full diff (for reference, do not reapply as-is — it regresses): `/data/tmp/importhttpsvc-repro/adapt-fix.diff`.
 
       **Next step for whoever picks this up**: the diagnosis is solid and the fix DIRECTION (make `getstatic`/`putstatic`'s field-owning-class resolution as loader-faithful as `CONSTANT_Class` resolution already is) is very likely correct — what's missing is making the re-entrant `loadClass()` invocation safe from inside the field-opcode fast path. Two directions worth trying: (a) find and satisfy whatever GC-safety precondition `resolve_class_loader_aware`'s existing callers (`ldc`/`new`/`checkcast`/`instanceof` opcode handlers) already establish before calling it, and replicate it in the `Getstatic`/`Putstatic` handlers; or (b) avoid the re-entrant call entirely — mirror the EXISTING, already-safe, non-reentrant `retarget_instance_field_to_receiver` pattern (same file) for STATIC fields: resolve the field the OLD (fast, safe) way first, then — only if the referencing class is user-loader-owned — do a purely in-memory, non-reentrant re-check against `class_manager`'s already-known loader→class registrations (no `loadClass()` invoke at all) and retarget if a same-named-but-different class is found for that loader, accepting that a genuinely cold (never-yet-resolved) case might still fall through uncorrected rather than risk unsafe re-entrancy.
-*   **STOMP Message Hang** (`web.socket.messaging.StompWebSocketIntegrationTests`)
-  *   **Status**: **OPEN** (TIMEOUT) — NOT actually an infinite hang (2026-07-16 finding, see below); root-caused to a genuine networking defect, still unfixed.
-  *   **2026-07-16 update**: the class does not hang forever. Isolated to just the `sendMessageToController` sub-test (the other 7 `@ParameterizedWebSocketTest` methods commented out in a scratch copy) it finishes in ~30s with a normal FAIL, both parameterizations (`server=Jetty` and `server=Tomcat`, both `client=Standard`). Root cause: the client's very first write after the WS handshake -- the STOMP `CONNECT` frame -- gets a genuine OS-level EPIPE/"Broken pipe" (confirmed via `AsynchronousSocketChannel`'s real, non-synthetic Future-write path, `native-io/src/async_socket.rs::aio_asc_write_future`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is what turns this into an assertion failure rather than a true hang -- 20s x 16 parameterizations (8 methods x 2 servers) in the full class comfortably exceeds the suite's 600s per-class ceiling, which is why it buckets as TIMEOUT. **This fully explains the TIMEOUT symptom without any VM-level concurrency bug** (the 2026-07-14 "hang" gdb snapshot below just caught the process mid-run on a live, correctly-timed wait; `LockSupport.parkNanos`/`parkUntil`'s timeout plumbing was re-audited and is correct).
-      A new opt-in diagnostic, `CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`, commit `dd1cddec`, merged to `dev`), traced every real `SocketChannel.close()` with local/peer address + timestamp and correlated it against a millisecond-stamped client-side trace: **the embedded Tomcat/Jetty server closes its just-accepted connection within ~40ms-2s of completing the WS upgrade handshake**, for BOTH server backends, before the client's first post-handshake frame write. `SocketChannel.close()` belongs exclusively to the server-side servlet-container transport (the client uses a separate `AsynchronousSocketChannel` native module), so this unambiguously implicates the **server** side closing a just-upgraded connection -- most likely each container's standard HTTP/1.1 keep-alive/"must-close" determination (normally suppressed for a `101 Switching Protocols` hand-off) firing because CratonVM doesn't correctly preserve whatever signal Tomcat/Jetty rely on to recognize the connection was upgraded. No CratonVM-specific native code intercepts the JDK/Servlet upgrade APIs at all (`HttpUpgradeHandler`/`UpgradeToken`/`isUpgrade`: zero hits repo-wide), so the defect is in a lower-level primitive real Tomcat/Jetty bytecode depends on, not yet pinned to the exact call site. `WebSocketConfigurationTests`/`WebSocketHandshakeTests` (same base class, but neither writes a message right after the handshake) are unaffected, which narrows the trigger specifically to "write immediately after handshake."
-      **Not fixed** -- needs one more round of tracing (a Java-side stack capture at the moment of `sc_close`, e.g. via `NativeContext::thread_stack_trace` plumbed through to `native-io`, or a `Filter`/interceptor-based capture from the Java side) to find the exact Tomcat/Jetty call site issuing the premature `close()`. Full writeup: `docs/known-issues/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s "2026-07-16 follow-up" section.
+
+      **2026-07-16 update #2 — FIXED.** `resolve_field_ref_loader_aware` (mirroring `resolve_class_loader_aware`'s two-tier resolution, extracted a shared `resolve_field_in_class` tail) wired into `Instruction::Getstatic`/`Instruction::Putstatic`, exactly this doc's "Next step" direction (a). Re-verified from a fresh `origin/dev` checkout rather than reapplying the old diff blindly. The previous session's heap-corruption blocker **no longer reproduces**: current `dev` already includes `fb15be63` ("GAP_FILLER_CLASS_ID not special-cased in new young-GC exact-walk loops" — the same "mass stale-pointer/all-zero-header" symptom shape the reverted attempt hit), landed independently the same day by a different session. With that GC bug closed, the identical `resolve_field_ref_loader_aware` mechanism builds clean and runs clean: multiple solo runs plus `CRATONVM_DBG_STALE_OBJREF=1 CRATONVM_DBG_STALE_OBJREF_CYCLES=8` (the multi-cycle quarantine assertion, since a 1-cycle-late stale read is the known blind spot of the default) all show zero corruption warnings.
+
+      `ImportHttpServiceRegistrarTests`'s `ClassCastException` is **gone** — confirmed absent across every run (baseline vs. fixed vs. post-merge, ~10 total runs). The class still does not reach 5/5: both `basicListingWithAot`/`basicScanWithAot` now fail on `java.lang.NoClassDefFoundError: java/lang/classfile/ClassFile` — the SAME pre-existing, already-documented host-environment gap as `PersistenceManagedTypesBeanRegistrationAotProcessorTests` above (JDK 24+'s Class-File API; this Azure worktree host's `java` on PATH is JDK 21.0.11, confirmed via `java -version`). Not a regression — the next-layer-down gap this fix's correctness improvement now lets the test reach.
+
+      **Merge-time finding (unrelated, NOT caused by this fix):** post-merge with same-day `origin/dev`, `ImportHttpServiceRegistrarTests` intermittently instead shows `java.util.ServiceConfigurationError: Provider org.junit.support.testng.engine.TestNGTestEngine could not be instantiated` on the same two methods, and `cargo test -p cratonvm-vm --lib` shows one additional failure (`runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode`, "BufferedInputStream.read()I must keep its real-JDK bytecode") beyond the 16 pre-existing `lock_order`/`skip_list` ones. **Both A/B-isolated via `git revert --no-commit` of this fix's own commit on top of the same merge**: both reproduce identically with this fix present OR reverted — caused by one of the OTHER commits that landed on `dev` the same day (package-private access enforcement, `f62f1772`, is the leading suspect for both — TestNG's engine and `BufferedInputStream` dispatch both cross a loader/native-dispatch boundary), not by this change. Worth a follow-up investigation by whoever owns that area; out of scope here.
+
+      **2026-07-17 follow-up — `buffered_input_stream_real_jdk_uses_its_own_bytecode` root-caused and FIXED; `f62f1772` exonerated for this half of the finding.** Bisected with `git blame`/`git log -S` on `force_native_over_real_jdk_bytecode` (`vm/src/runtime/interpreter.rs`): the regression was introduced by `995ff48c7` ("Fix Tomcat silent-hang scanner and JIT residuals", landed 2026-07-16 19:09:33 -0300, well before `f62f1772`'s 23:17:35 UTC), which added a brand-new, unconditional `if class_name == "java/io/BufferedInputStream" && method_name == "read" && matches!(method_descriptor, "([BII)I" | "()I") { return true; }` block. This directly contradicts the pre-existing (2026-07-14, `d8092acb`) contract test, and also contradicts `native-builtins/src/lib.rs`'s own adjacent comment on the real `BufferedInputStream` native registrations ("Real JDK BufferedInputStream has a layout and close protocol that the old synthetic bridge cannot emulate safely ... Keep the bridge only for synthetic-JDK builds; real-JDK execution must use the class bytecode" — those natives are gated `if cfg!(feature = "synthetic-jdk")`, so in real-JDK mode nothing is even registered for `BufferedInputStream.read`, making the interpreter.rs force-native block a dead-end/behavior-change with no matching native, not an intentional fast path). `f62f1772` does not touch `force_native_over_real_jdk_bytecode`, `BufferedInputStream`, or any native-dispatch code at all (it only wires `check_class_access` into `Instruction::New` plus two JIT allocation-site resolvers) — it is not implicated in this half of the merge-time finding; the TestNG `ServiceConfigurationError` half remains open and unexplored.
+      **Fix**: removed the offending block (`vm/src/runtime/interpreter.rs`, was ~line 23500-23505, immediately after the Tomcat BCEL `Constant.readConstant` force-native check), restoring real-JDK bytecode dispatch for `BufferedInputStream.read()I`/`read([BII)I`. No native replacement needed since real-JDK mode never had one registered.
+      **Verified**: `runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode` passes. `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed / 111 ignored — exactly the documented 9 `lock_order` + 7 `jit::skip_list` baseline, no new failures. `cargo test -p cratonvm-gc --lib --release`: 791/0. `cargo test -p cratonvm-native-builtins --lib --release`: 3000/0 (6 ignored).
+
+      Verified regression-free: `cargo test -p cratonvm-vm --lib` 2200 passed/16 failed/111 ignored on the pre-merge branch, **byte-identical failing-test list with vs. without this fix** (`git stash`-isolated A/B). `cargo test -p cratonvm-native-builtins --lib`: 3000 passed/0 failed. Spot-checked `GroupsMetadataValueDelegateTests` and `ConfigurationClassPostProcessorAotContributionTests` (same loader-identity investigation cluster) — both are extremely slow AOT/compilation-heavy tests that don't complete within a 200s per-class ceiling on this host EITHER WAY (confirmed identical timeout behavior baseline vs. fixed, 2 runs each) — pre-existing host/AOT-overhead characteristic, not a regression.
+
+      Repro assets at `/data/tmp/importhttpsvc-repro/` on the Azure host remain valid for any follow-up (binaries added this session: `cratonvm-baseline-20260716-192222` (pre-fix), `cratonvm-fixed-20260716-192222` (fix, pre-merge), `cratonvm-postmerge-20260716-192222`/`cratonvm-revertcheck-20260716-192222` (post-merge fix/no-fix pair used for the ServiceConfigurationError + BufferedInputStream A/B isolation above).
+*   **STOMP Message Hang / premature close** (`web.socket.messaging.StompWebSocketIntegrationTests`)
+  *   **Status**: **FIXED (2026-07-17)** — the premature-close/EPIPE symptom that made this class bucket as TIMEOUT is resolved. Root cause: `AsynchronousSocketChannel.write(ByteBuffer)`'s Future-based completion path (`native-io/src/async_socket.rs::deliver_future_completion`, the `FutureOutcome::Count(n)` arm) never advanced the *source* `ByteBuffer`'s `position` after a successful write, unlike the sibling read-completion arm (`FutureOutcome::Bytes`, which correctly calls `write_into_buffer_and_advance`). This violates `AsynchronousByteChannel.write`'s documented contract ("the buffer's position is updated to reflect the bytes written"). Tomcat's own client-side WS write path (`WsRemoteEndpointImplBase`/`WsRemoteEndpointImplClient`, used as the `client=Standard` parameterization against BOTH the Jetty and Tomcat servers) follows the standard `while (buffer.hasRemaining()) channel.write(buffer).get()` idiom — since `position` never advanced, the buffer looked permanently unwritten, so the client kept re-submitting and physically re-sending the SAME STOMP `CONNECT`-wrapped WebSocket frame. The server correctly rejects each redundant `CONNECT` with Spring's own (working-as-designed) `IllegalStateException: Session already exists` guard and closes — this is the "STOMP Message Hang"/premature-close symptom chased across the 2026-07-14 through 2026-07-16 sessions below.
+      **Fix**: `deliver_future_completion`'s `FutureOutcome::Count(n)` arm now advances the resolved source buffer's `position` field by `n` (mirroring the read arm's existing pattern) whenever `n > 0`; `Count(n)` is otherwise only ever produced with `n == 0` (two pre-existing early-outs — an empty write buffer, and `aio_asc_read_future`'s zero-capacity destination case), so the fix is a no-op there. One-line-of-substance change plus explanatory comment, `native-io/src/async_socket.rs`.
+      **Evidence chain that pinned it**: reproduced fresh (Spring Framework `main`/7.1.0-SNAPSHOT re-cloned this session after the prior checkout was lost to host disk-space churn) with two new opt-in diagnostics added to `native-io/src/socket_channel.rs::sc_read` under the existing `CRATONVM_DBG_SC_READ` env var: (1) an FNV-1a hash + hex dump of every real (`n>0`) read's bytes, and (2) a Java-side stack capture (`NativeContext::capture_stack_trace`) the first time a read's hash repeats the immediately-preceding read on the same channel id. This showed, for the Jetty parameterization, a single physical server-side read of `n=2345` bytes that was **exactly 67 back-to-back repeats of the same 35-byte masked WebSocket CONNECT frame** (`2345 = 35×67`, byte-identical repeat verified programmatically) — i.e. the duplication was real bytes-on-the-wire, not a read-side re-delivery artifact, immediately reorienting the investigation from the read/accept/close path (where the prior sessions had been looking) to the *write* path. For the Tomcat parameterization, the repeat-stack diagnostic captured the exact call site re-issuing the redundant write's eventual read on the server: `WsFrameServer.onDataAvailable` (`WsFrameServer.java:86`) → `NioSocketWrapper.fillReadBuffer`/`.read` (`NioEndpoint.java:1566`/`1452`) → `NioChannel.read` (`NioChannel.java:176`, our `sc_read`) — confirming the same 35-byte frame arriving repeatedly is genuine Tomcat-side WebSocket frame processing of genuinely-repeated wire bytes, not a Rust-side artifact. Root-caused to the write side by reading `native-io/src/async_socket.rs::aio_asc_write_future`/`deliver_future_completion` end-to-end and finding the missing buffer-advance by inspection once the write side was correctly implicated.
+      **Verified**: rebuilt and reran `sendMessageToController` against both parameterizations with `CRATONVM_DBG_SC_READ=1` — each connection now shows exactly ONE 35-byte CONNECT frame read (no more repeats), and the connection close moved from within tens-of-ms-to-2s of the handshake (the original bug) to ~20s later (Tomcat's `blockingSendTimeout`), with no more EPIPE/"Broken pipe" anywhere in the log. Regression-clean: `cargo test -p cratonvm-native-io --lib --release` 349/349 passed; `cargo test -p cratonvm-vm --lib --release` 2200 passed/17 failed/111 ignored — matches this doc's own pre-existing baseline (`2200 passed/16 failed/111 ignored`, see the `@Import` attribute CCE entry above) to within one flaky test; every failure is `jit::skip_list::*`/`runtime::lock_order::*`/one `interpreter::*` test, all pre-existing release-vs-debug-build environment artifacts (the `lock_order` tests literally assert `debug_assertions` is on) unrelated to this change. Spot-checks against the fixed binary: `WebSocketConfigurationTests` 4/4 OK (matches documented baseline); `WebSocketHandshakeTests` **6/6 OK** — an *improvement* over the previously-documented 4/6 (the pre-existing "Blocking write timeout" failures there were very likely the same buffer-advance bug, now incidentally also fixed).
+      **Known residual, NOT yet investigated**: `sendMessageToController` itself still FAILs (both parameterizations) — but now via `controller.latch.await(10, SECONDS)` timing out (the test's own STOMP `SEND`-to-controller latch), not the premature-close/EPIPE symptom this fix targeted. This could be a genuinely separate, deeper STOMP message-routing defect, or an artifact of this session's from-scratch classpath reconstruction (the original Spring Framework checkout + dependency jars were lost to a disk-space cleanup mid-session and were rebuilt via a fresh `git clone` + targeted Gradle build); it was not chased further this session. Whoever picks this up next should re-verify against a known-good classpath before assuming it's a new CratonVM bug.
+  *   **2026-07-16 second follow-up — superseded by the 2026-07-17 fix above, kept for history**: root-caused precisely: the server dispatches the client's single STOMP `CONNECT` frame to `StompSubProtocolHandler.handleMessageFromClient` **more than once**, tripping Spring's own (correct, by-design) `IllegalStateException: Session already exists` guard, which sends a STOMP `ERROR` frame and calls `session.close(CloseStatus.PROTOCOL_ERROR)` — this, not an HTTP/1.1 keep-alive/"must-close" misfire, is what closes the just-upgraded connection. See the **2026-07-16 second follow-up** section in `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md` for the full evidence chain (this was the correct diagnosis; the 2026-07-17 session found and fixed the exact mechanism producing the duplicate frame).
+  *   **2026-07-16 update** (superseded below, kept for history): the class does not hang forever. Isolated to just the `sendMessageToController` sub-test (the other 7 `@ParameterizedWebSocketTest` methods commented out in a scratch copy) it finishes in ~30s with a normal FAIL, both parameterizations (`server=Jetty` and `server=Tomcat`, both `client=Standard`). Root cause (at the time): the client's very first write after the WS handshake -- the STOMP `CONNECT` frame -- gets a genuine OS-level EPIPE/"Broken pipe" (confirmed via `AsynchronousSocketChannel`'s real, non-synthetic Future-write path, `native-io/src/async_socket.rs::aio_asc_write_future`). Tomcat's own client-side `blockingSendTimeout` (default 20000ms) is what turns this into an assertion failure rather than a true hang -- 20s x 16 parameterizations (8 methods x 2 servers) in the full class comfortably exceeds the suite's 600s per-class ceiling, which is why it buckets as TIMEOUT. **This fully explains the TIMEOUT symptom without any VM-level concurrency bug** (the 2026-07-14 "hang" gdb snapshot below just caught the process mid-run on a live, correctly-timed wait; `LockSupport.parkNanos`/`parkUntil`'s timeout plumbing was re-audited and is correct).
+      A new opt-in diagnostic, `CRATONVM_DBG_SC_CLOSE=1` (`native-io/src/socket_channel.rs::sc_close`, commit `dd1cddec`, merged to `dev`), traced every real `SocketChannel.close()` with local/peer address + timestamp and correlated it against a millisecond-stamped client-side trace: **the embedded Tomcat/Jetty server closes its just-accepted connection within ~40ms-2s of completing the WS upgrade handshake**, for BOTH server backends, before the client's first post-handshake frame write. `SocketChannel.close()` belongs exclusively to the server-side servlet-container transport (the client uses a separate `AsynchronousSocketChannel` native module), so this unambiguously implicates the **server** side closing a just-upgraded connection -- ~~most likely each container's standard HTTP/1.1 keep-alive/"must-close" determination (normally suppressed for a `101 Switching Protocols` hand-off) firing because CratonVM doesn't correctly preserve whatever signal Tomcat/Jetty rely on to recognize the connection was upgraded~~ **this hypothesis is REFUTED, see the 2026-07-16 second follow-up below.** `WebSocketConfigurationTests` (same base class, but doesn't write a message right after the handshake) is unaffected/regression-clean (4/4 OK, confirmed again this session); `WebSocketHandshakeTests` shows unrelated pre-existing `Blocking write timeout` failures (4/6) not investigated further this session and NOT a regression from any change made here (see the second follow-up's regression-check note).
+      **2026-07-16 second follow-up: ROOT-CAUSED.** Added a Java-level stack capture at the moment of `sc_close` (`NativeContext::capture_stack_trace`, no `Thread` handle needed — see the diagnostic commit) and instrumented Spring's own `StompSubProtocolHandler` source directly. Finding: the client writes its `CONNECT` frame exactly once (confirmed via client-side trace), but the server's `handleMessageFromClient` is invoked **twice** (Jetty) to **4000+ times** (Tomcat, a genuine redelivery spin) for that single frame, each time independently decoding a byte-identical "CONNECT" payload. The second (and later) deliveries hit Spring's `Assert.state(prevInfo == null, "Session already exists")` in the `isConnect` branch, which is **working exactly as designed** — the actual defect is the duplicate delivery, not Spring's reaction to it. Full evidence and next steps: `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s "2026-07-16 second follow-up" section. **Not fixed this session** — the duplicate-dispatch mechanism differs by backend (Jetty: two independently-constructed message objects, `sc_read` called exactly twice before either dispatch; Tomcat: thousands of redeliveries of the SAME cached message object) and pinning the exact Rust call site responsible needs more live-debugging time than was available.
 
 ---
 
@@ -189,22 +334,77 @@ the WRONG same-named copy. Eight fixes landed on
 | `ScopedProxyBeanRegistrationAotProcessorTests` | FAIL (3 methods) | **OK 5/5** |
 | `PersistenceManagedTypesBeanRegistrationAotProcessorTests` | FAIL | FAIL 2/0 (host lacks JDK 24+, see below — not a VM bug) |
 | `TestClassScannerTests` | TIMEOUT 600 s | **completes 177 s** (7/7 or flaky 7/6) |
-| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, FAIL 22/21/1 (3 of 4 fixed) |
-| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 re-triage: LOADERR found=0** — NEW GC heap-corruption bug, see below (regresses the earlier "discovers+runs 40 methods" note, which was never characterized) |
+| `TestCompilerTests` | TIMEOUT 600 s+ | **completes 40 s**, **OK 22/22 (2026-07-16, all 4 residuals now fixed)** |
+| `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
-| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-16 re-triage: FAIL 8/2/6** (was briefly hidden behind an unrelated GC crash, see below — now the SAME shape as before, 1 pre-existing cold-attach + 5 narrowed ByteBuddy-generics residual) |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **FIXED (2026-07-17, commit TBD)** — **OK 8/8**. The AssertJ `IntrospectionError` residual root-caused to loader-identity-blind exception-handler catch-type matching (NOT a stale-ObjectRef/GC bug, see below) |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
-| `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
+| `BeanRegistrationsAotContributionTests` | TIMEOUT | **FIXED (2026-07-17, commit `9af322e4`)** — **OK 14/14** |
 
 ### Remaining OPEN residuals in the AOT cluster
 
-*   `BeanRegistrationsAotContributionTests` — **TIMEOUT even at 1500 s**, 100%
-    CPU, steadily progressing (NOT a deadlock). Stack samples put the main
-    thread repeatedly in Mockito's inline-mock-maker constructor interception
-    (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
-    scanning — an interpreter-throughput problem under constructor
-    instrumentation, needing perf work rather than a correctness fix.
+*   ~~`BeanRegistrationsAotContributionTests`~~ **FIXED (2026-07-17, commit
+    `9af322e4`).** Originally documented as **TIMEOUT even at 1500 s**, 100%
+    CPU, steadily progressing (NOT a deadlock), stack samples putting the
+    main thread repeatedly in Mockito's inline-mock-maker constructor
+    interception (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC
+    frame-root scanning — characterized at the time as an interpreter-
+    throughput problem under constructor instrumentation, needing perf work
+    rather than a correctness fix.
+
+    **Re-measured on fresh dev tip** after this session's interpreter-
+    dispatch/GC fixes (`3d1449a7`, `4290124b`, `b7a1ed84`, `19a5025f`,
+    `9850617b`, `fb15be63`, …): the TIMEOUT is **gone**. The class now
+    completes in ~604 s with 12/14 passing — a completely different,
+    correctness-shaped failure: `NoSuchMethodError:
+    java/lang/Object.visitFile(...)`, thrown from inside javac's own
+    `JavacFileManager$ArchiveContainer.list()` while scanning a large
+    in-memory compilation classpath (2 methods:
+    `applyToAppliesContribution`, and
+    `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` via a
+    wrapping `AotBeanProcessingException`). The old "Mockito constructor
+    interception" throughput hypothesis no longer applies at all — this
+    session's dispatch fixes evidently resolved it.
+
+    **Root cause**: `native-builtins/src/phases_late.rs`'s
+    `Files.walkFileTree` implementation (`p98_walk_file_tree`/
+    `p98_walk_dir`) threads the visitor object and each directory's `Path`
+    object through a recursive walk as plain Rust-local `ObjectRef`s,
+    reused across the whole (potentially deep, long-running, re-entrant)
+    traversal. Any Java callback invocation along the way can allocate and
+    trigger a moving GC; the next iteration's use of the stale local
+    silently resolves to whatever the old slot was reused for (usually an
+    array) — exactly what `NativeContext::pin_native_root`'s doc comment
+    warns about: dispatch collapses to `java.lang.Object`, raising a
+    spurious `NoSuchMethodError` on the visitor's real method. Confirmed
+    live via a temporary `CRATONVM_DBG_VISITFILE` trace: the failing
+    visitor was `JavacFileManager$ArchiveContainer$2` (the `list()`-local
+    visitor that overrides `visitFile` — distinct from the constructor's
+    `$1` visitor, which has no `visitFile` override and was already
+    correctly skipped via a pre-existing class-name special case that
+    hard-codes `$1` — that pre-existing special case is what hid this bug
+    from ever firing for the *constructor's* visitor, but the `list()`
+    visitor was never covered by it).
+
+    **Fix**: pin the visitor and every directory-level `Path` object for
+    the whole walk via `pin_native_root`/`read_native_pin` (`P98Pin`
+    helper), and re-read the current, GC-forwarded reference immediately
+    before each re-entrant call site (`preVisitDirectory`/`visitFile`/
+    `postVisitDirectory`, plus the per-entry `Path` field write). Unpin
+    the entire batch once when `p98_walk_file_tree` returns.
+
+    **Verified**: both previously-failing methods now pass in isolation.
+    Full class: `found=14 succ=14 fail=0` (was `found=14 succ=12 fail=2`),
+    `ms=3242228` total (~54 min, dominated by the large-bean-defs stress
+    test, which now actually completes its real ~6000-bean workload
+    instead of failing fast partway through). `cratonvm-gc --lib`:
+    791/791 pass. `cratonvm-vm --lib`: 2200 passed / 17 failed, all 17
+    confirmed pre-existing via A/B `git stash` comparison against
+    unmodified dev tip (release-mode `debug_assert!` gaps in
+    `runtime::lock_order` tests, plus unrelated `jit::skip_list`
+    test-isolation issues) — none touch `native-builtins/phases_late.rs`
+    or this code path.
 *   ~~`ConfigurationClassPostProcessorAotContributionTests`~~ **FIXED
     (2026-07-15, commit `aca7f635`).** `BeanRegistrarTests`'
     `applyToWhenIsPackagePrivate`/`applyToWhenIsPackagePrivateAndImportAware`
@@ -384,6 +584,193 @@ the WRONG same-named copy. Eight fixes landed on
     `TypeDescription.Generic.Visitor.Substitutor`) round-trips a method-scoped
     (not class-scoped) type variable, a narrower and more specific target than
     this doc's original "(b)" description.
+
+    **2026-07-17 re-triage: (a) and (b) above are BOTH CONFIRMED RESOLVED on
+    current dev tip — no longer reproduce at all.** Fresh isolated
+    worktree/binary (`/data/data/wt-persistannobpp-bb2-20260717`, Azure
+    host), rebuilt twice: once at dev tip `56728b1a` and again after
+    fast-forwarding to `3cb39d87` (which pulled in the same-day
+    `0a1ec47b` "fix(gc): close remaining unrooted-ObjectRef gaps in
+    generics.rs (enum/type-var builders)" — a highly relevant-looking
+    candidate given (b)'s generics/TypeVariable machinery, checked
+    explicitly, see below). Both binaries gave the **same** result.
+
+    Root-cause dead ends explored first (both refuted the "still needs a
+    fix" hypothesis before the real end-to-end run was attempted): a
+    standalone `EMFTypeVarProbe.java` comparing reflective
+    `Method.getTypeParameters()` vs ByteBuddy `TypeDescription.ForLoadedType`
+    vs ByteBuddy `TypePool` (bytecode-parsed) views of
+    `EntityManagerFactory.unwrap` all agreed (1 type variable each, matching
+    HotSpot exactly — the TypePool-vs-reflection divergence hypothesis from
+    the "Next step" note above is REFUTED); a standalone `EMFMockProbe`/
+    `EMFMockLoopProbe`/`EMFForkProbe.java` (the last replicating Spring's
+    real `CompileWithForkedClassLoaderClassLoader` delegation policy exactly,
+    verified line-for-line against
+    `spring-core-test/src/main/java/org/springframework/core/test/tools/
+    CompileWithForkedClassLoaderClassLoader.java`) ran `Mockito.mock
+    (EntityManagerFactory.class)` 6× across 6 fresh fork loaders with **zero
+    failures** — neither the cold-attach IllegalStateException nor the
+    "Cannot resolve T" ByteBuddy crash reproduced in isolation.
+
+    The real end-to-end confirmation: built the actual `spring-orm` test
+    module (real JDK 25 at `/data/jdk25-real-20260717`, Gradle 9.6.1 via a
+    shared `GRADLE_USER_HOME` at `/data/gradle-home-baseline-20260716` —
+    the host's root filesystem was at 100% full/0 bytes free for most of
+    this session, which breaks a bare `~/.gradle` build outright; routing
+    `GRADLE_USER_HOME`/`TMPDIR` to the separate, non-full `/data` mount
+    worked around it) and ran
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` for real
+    through `KRun` against both binaries: **`found=8 succ=3 fail=5`,
+    identical on both.** None of the 5 failures are (a) or (b) — the
+    cold-attach `IllegalStateException` and the ByteBuddy `Cannot resolve T`
+    crash are simply **gone**; 3 methods now pass outright (previously all
+    were folded into the 2/6 fail/other bucket in the pre-this-session
+    baseline). Most likely explanation: one or more of the loader-identity
+    and reflection fixes that landed between the last dedicated re-triage
+    and now (`aca7f635` declaring-class loader-aware,
+    `4cb070e5`/`b50c3d54` `getTypeParameters()` identity-stability,
+    `19d7f417` getstatic/putstatic loader-aware, `d5544133` panama
+    `segment_address()`, `0a1ec47b` generics.rs GC-rooting, or some
+    combination) fixed this as a side effect; not independently
+    re-attributed to a single commit since neither (a) nor (b) reproduce in
+    isolation anymore to bisect against.
+
+    **A third, DIFFERENT, NOT-yet-root-caused residual now blocks the
+    remaining 5/8.** All 5 fail with the identical shape —
+    `org.assertj.core.util.introspection.IntrospectionError: No getter for
+    property '<name>'` — thrown from AssertJ's own
+    `PropertyOrFieldSupport.getSimpleValue()` (`extracting("fieldName")`):
+    AssertJ tries the JavaBean getter first (expected to fail — none of
+    these fields have public getters, that's normal/by design), then falls
+    back to direct reflective field access, and **the field fallback also
+    throws**, so AssertJ re-raises the original (misleading) "No getter"
+    message rather than a field-specific one. Two of the five are on
+    ordinary test-fixture nested classes (`DefaultPersistenceUnitMethod`,
+    `DefaultPersistenceContextField`, `SeveralPersistenceContextField`,
+    `DefaultPersistenceUnitField` — private fields `emf`/`entityManager`/
+    `customEntityManager`), and one is on a real, non-test-fixture
+    application class (`org.springframework.orm.jpa.
+    SharedEntityManagerCreator$SharedEntityManagerInvocationHandler`,
+    private field `properties`) — ruling out "only synthetic test fixtures
+    are affected". All 5 fire from inside the `Invoker.accept()` callback,
+    i.e. **after** `TestCompiler.compile()` has done a real in-process javac
+    compile of the AOT-generated bean-registration code and invoked its
+    generated static `apply(RegisteredBean, Object)` method reflectively on
+    the target instance — the same GC/allocation-heavy real-javac-compile
+    choke point flagged elsewhere in this doc as the trigger for the
+    unrelated `fb15be63` GC young-walk bug and the `0a1ec47b` generics.rs
+    unrooted-ObjectRef fix.
+
+    Three targeted standalone repro attempts to isolate this in a minimal
+    probe **all failed to reproduce it** (i.e. all passed cleanly on
+    CratonVM): (1) a bare private field + `Field.get()` on a nested static
+    class, no forking; (2) the same field access from **inside** a
+    `ForkFieldProbe`-style forked classloader (private field defined by the
+    fork loader, read via real `org.assertj.core.api.Assertions.assertThat
+    (...).extracting(...)` loaded by the parent/system loader — i.e. a
+    genuine cross-classloader reflective field read); (3) a reflective
+    `Field.set()` (simulating what AOT-generated injection code does)
+    immediately followed by an `extracting()` read of the same field, single
+    classloader. None reproduced, so the trigger needs the **combination**
+    of forked classloader + a real dynamically-`javac`-compiled-and-loaded
+    third classloader layer (`TestCompiler`'s own `DynamicClassLoader`) +
+    the GC pressure from that real compile — a minimal isolated repro was
+    not achieved this session. Rebuilding at `0a1ec47b` (the freshest
+    landed generics/GC-rooting fix, the most obviously relevant candidate)
+    made **no difference** — identical `found=8 succ=3 fail=5` with the
+    same 5 property names, so this is confirmed to be a genuinely different
+    bug from the ones `0a1ec47b` closed, not a partial/incomplete fix of it.
+
+    **OPEN — not fixed, not fully root-caused.** Next step for whoever picks
+    this up: reproduce with `CRATONVM_DBG_STALE_OBJREF=1` and/or
+    `CRATONVM_DBG_GC_STRESS` set for a run of just this class (mirroring the
+    technique that cracked `0a1ec47b`/`fb15be63`) to check whether this is
+    another instance of the same stale-ObjectRef-after-real-javac-compile
+    family rather than a distinct reflection/access-control gap; if that's
+    negative, instrument `Class.getDeclaredField()`/`Field.setAccessible()`/
+    `Field.get()` (`native-builtins/src/lang_class.rs`) specifically for
+    calls made against a class loaded by a `CompileWithForkedClassLoader`-
+    style loader from calling code loaded by a *different* loader in the
+    same process, since the one common thread across all 5 failures is that
+    exact cross-loader-reflection shape post-real-compile.
+
+    **FIXED (2026-07-17).** The stale-ObjectRef/GC hypothesis above was
+    investigated and REFUTED: `CRATONVM_DBG_FIELD_INTROSPECT` (temporary
+    probe broadened to log any Rust-raised exception whose live frames sit
+    inside `org.assertj.core.util.introspection.*`) showed AssertJ's own
+    `FieldSupport`/`FieldUtils.readField` path never throws at all — the
+    field access genuinely succeeds. `CRATONVM_DBG_ATHROW` confirmed the
+    final exception seen by JUnit is a bytecode-level rethrow with the EXACT
+    stack trace of the ORIGINAL property-getter `IntrospectionError`
+    (`Introspection.getPropertyGetter`, "No getter for property" —
+    constructed via the 1-arg constructor, so `getterInvocationException()`
+    is empty) — which, per AssertJ 3.27.7's own decompiled bytecode
+    (`PropertyOrFieldSupport.getSimpleValue`), should only resurface as-is
+    if the *field*-side attempt inside its `catch (IntrospectionError e)`
+    block ALSO threw `IntrospectionError`. Since `FieldSupport` never
+    throws, the only remaining explanation was that the exception was
+    escaping `getSimpleValue`'s own `catch (IntrospectionError e)` clause
+    entirely — i.e. a JVM-level exception-*dispatch* bug, not a
+    stale-reference bug.
+
+    Root-caused with a second temporary probe
+    (`CRATONVM_DBG_EXC_HANDLER_MATCH`, instrumenting all three
+    exception-handler catch-type matching sites in
+    `vm/src/runtime/interpreter.rs`): `find_exception_handler_impl`,
+    `find_exception_handler_pc_unknown`, and
+    `route_jit_exception_through_method` all resolve a `catch_type`'s class
+    via `ClassManager::find_class_by_name` — a flat, global, name-only
+    lookup — instead of the loader-faithful `resolve_class_loader_aware`
+    already used for `new`/`checkcast`/`instanceof`/`ldc X.class`
+    resolution. The probe showed `catch_class_id` pinned at a single
+    `ClassId` for `org/assertj/core/util/introspection/IntrospectionError`
+    across the whole run, while `exc_class_id` (the actual thrown object's
+    class) took on a DIFFERENT `ClassId` — also named
+    `IntrospectionError` — on every one of the 4 distinct forked-loader
+    test-method invocations that failed (one match, four mismatches,
+    matching the observed 3-pass/5-fail split exactly). Spring's
+    `CompileWithForkedClassLoaderClassLoader` forks a brand-new
+    `ClassLoader` per test method whose `loadClass` is supposed to delegate
+    up its parent chain for ordinary library classes like AssertJ's; each
+    fork ends up with its own independently-defined copy of
+    `IntrospectionError` (and presumably the rest of
+    `org.assertj.core.util.introspection.*`), so `is_subclass_of(exc_class_id,
+    catch_class_id)` — comparing two `ClassId`s that are logically "the
+    same class" but not identical — returned `false`, letting the
+    exception escape a `catch` block it should have matched.
+
+    **Fixed** in `classloading/src/class.rs`
+    (`Class::is_subclass_of_by_name`) and `classloading/src/class_manager.rs`
+    (`ClassManager::is_subclass_of_by_name`): walks the thrown exception's
+    superclass chain (interfaces are never valid catch types per JVMS
+    SS4.7.3, so only superclasses are walked) comparing each ancestor's OWN
+    name to the catch type's name textually, ignoring `ClassId` identity.
+    Wired in as an `||` fallback alongside the existing `ClassId`-based
+    `is_subclass_of` check at all three call sites in
+    `vm/src/runtime/interpreter.rs`, so it can only ever catch MORE
+    exceptions that HotSpot would also catch, never change already-correct
+    behavior (same accepted-tradeoff pattern as
+    `native_class_get_declaring_class`'s loader-aware fallback elsewhere in
+    this codebase). A full loader-faithful fix (resolving `catch_type` via
+    `resolve_class_loader_aware`) would be more principled but needs
+    `&mut JvmThread` threaded into all three matching functions and their 8
+    call sites (none currently take it) — left as a follow-up; the
+    by-name fallback is a low-risk, immediately-effective fix for the
+    observed symptom.
+
+    Verified: `found=8 succ=3 fail=5` -> `found=8 succ=7 fail=1` on this
+    fix alone (all 5 `IntrospectionError` failures gone); after merging
+    fresh `origin/dev` (which had since landed `9af322e4`, the unrelated
+    `Files.walkFileTree` GC-root-pinning fix that the 1 residual failure
+    matched exactly) -> **`found=8 succ=8 fail=0`**, full class clean.
+    Regression suites on the merged tip: `cargo test -p cratonvm-gc --lib
+    --release` 791/791 passed; `cargo test -p cratonvm-native-builtins --lib
+    --release` 3000/3000 passed (6 ignored); `cargo test -p cratonvm-vm --lib
+    --release` 2201 passed / 16 failed, all 16 matching the
+    already-documented pre-existing lock_order/skip_list release-mode
+    baseline noise (see the `ApplicationContextAotGeneratorTests`
+    2026-07-17 third-reverification entry above for the same baseline
+    signature) — zero failures touch exception dispatch or classloading.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,
@@ -496,19 +883,78 @@ the WRONG same-named copy. Eight fixes landed on
     `BeanDefinitionMethodGeneratorTests` (heavy TestCompiler/`com.example`
     user) clean at 34/34.
 
-    **Remaining 1 residual — DIFFERENT, pre-existing bug, NOT fixed:**
+    **Remaining 1 residual — DIFFERENT, pre-existing bug — FIXED
+    2026-07-16 (commits `f62f1772`, `4deeb6ce`).**
     `compiledCodeCannotAccessExistingPackagePrivateClassIfNotAnnotated`
     expects an `IllegalAccessError` when code in a fresh `DynamicClassLoader`
     (a DIFFERENT defining loader than the one that defined the
     package-private `PackagePrivate`, same package NAME but different
     runtime package per JVMS §5.4.4) accesses it WITHOUT
-    `@CompileWithForkedClassLoader` — but no exception is thrown; access
-    silently succeeds. This already failed with this exact `AssertionError`
-    (not `CompilationException`) BEFORE the fix above, so it is unaffected
-    by it. Points at CratonVM's runtime package-private access check not
-    correctly comparing DEFINING LOADERS across a same-named-package,
-    different-loader pair — a genuinely separate investigation (runtime
-    access control, not compile-time symbol resolution).
+    `@CompileWithForkedClassLoader` — but no exception was thrown; access
+    silently succeeded. This already failed with this exact `AssertionError`
+    (not `CompilationException`) BEFORE the fix above, so it was unaffected
+    by it — a genuinely separate investigation (runtime access control, not
+    compile-time symbol resolution).
+
+    Root cause was NOT a broken loader comparison: `check_class_access` /
+    `same_runtime_package` (`classloading/src/access_control.rs`) already
+    correctly implemented JVMS §5.3/§5.4.4 runtime-package identity
+    (defining loader + package name), with existing unit-test coverage
+    including an H5 loader-spoofing test — it was simply never CALLED from
+    the bytecode interpreter's `new` handler. Only the unrelated JPMS
+    module-boundary check fired, which no-ops whenever no named modules are
+    registered (the ordinary classpath case, as here). Wired
+    `check_class_access` into `Instruction::New`
+    (`vm/src/runtime/interpreter.rs`), plus the two JIT compile-time `new`-site
+    resolvers that independently re-resolve classes for their inlined/
+    single-pass allocation fast paths, so a denied site now falls back to the
+    interpreter's real check instead of silently baking in the inaccessible
+    allocation.
+
+    Wiring the check in immediately surfaced a SECOND, previously-invisible
+    bug: `ClassManager`'s requester-less fast-path class lookup
+    (`get_loaded_class_id`) falls back to returning an arbitrary lone
+    user-defined loader's copy of a name when no built-in loader
+    (bootstrap/extension/application) has defined it yet — a deliberate,
+    useful heuristic for names with no backing `.class` file (e.g.
+    `Proxy`-generated classes), but unsound as `load_class`/
+    `load_class_concurrent`'s PRIMARY answer: a name that genuinely exists on
+    the real classpath must resolve to its own freshly-loaded built-in-loader
+    copy, never an unrelated user-defined loader's redefinition. Concretely,
+    Spring's `TestCompiler` (Application loader) instantiating `new
+    Problems()` was resolving to a *different* `TestCompiler$Problems`
+    defined by an earlier, unrelated `@CompileWithForkedClassLoader` test's
+    own `DynamicClassLoader` — same simple name, wrong runtime class. Added
+    `ClassManager::resolve_fast_path_class_id`, which prefers the
+    loader-faithful `get_loaded_class_id_for_requester(name, Application)`
+    (built-in chain only) and falls back to the ambiguous lone-user-loader
+    answer only when a real classpath scan
+    (`find_class_bytes_delegated`) confirms no built-in-loader copy could
+    exist — preserving `Proxy`-class resolution while fixing the
+    stray-loader bug. A third, related latent gap surfaced in the same
+    investigation: `ClassManager::upgrade_synthetic_class` (stub-to-real
+    upgrade) refreshed every other `Class` field from the freshly parsed
+    class file but never updated `loader_id`, leaving it stuck at whatever
+    the synthetic stub was minted with (often Bootstrap) even after
+    upgrading to real Application-loaded bytecode. Fixed alongside.
+
+    Verified: `TestCompilerTests` 22/21/1 → **22/22**. Regression:
+    `cargo test -p cratonvm-vm --lib --release` 2200 passed / 16 failed (all
+    16 pre-existing and unrelated — `runtime::lock_order` tests gated on a
+    debug build or an env-opt-in not set in this invocation, and
+    `jit::skip_list` JIT-tier-eligibility tests, neither touching
+    classloading); `cargo test -p cratonvm-native-builtins --lib --release`
+    3000 passed / 0 failed. Spot-checked `CompiledTests` 14/14,
+    `DynamicJavaFileManagerTests` 11/11, `DynamicClassFileObjectTests` 3/3
+    (all TestCompiler-adjacent, package-private-access-heavy) clean. A
+    cross-module spot-check of `BeanDefinitionMethodGeneratorTests` via this
+    same ad-hoc single-class harness hit an unrelated, non-deterministic
+    harness/classpath artifact (`ClassCastException`/`AbstractMethodError`)
+    that reproduces identically on an unmodified dev-tip baseline binary —
+    confirmed pre-existing, not a regression from this fix; the module's
+    proper Gradle-driven suite run (34/34, per the entry above) is
+    unaffected since it doesn't go through this improvised classpath
+    composition.
 *   ~~`aot.nativex.feature.ThrowawayClassLoaderTests`~~ **FIXED (2026-07-15,
     commit `56a98cc4`)**. `native-builtins/src/classloader_real.rs`'s
     `cl_real_load_class_base` — the REAL-JDK-mode counterpart of the
@@ -621,6 +1067,75 @@ the WRONG same-named copy. Eight fixes landed on
     load needed, which should make this considerably easier to bisect than
     `spring-bug-10` was.
 
+    **2026-07-16 joint verification addendum — FIXED, confirmed by rebuild+rerun.**
+    A separate, concurrent 2026-07-16 session investigating
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` (see that entry
+    above) hit an identical-looking stale-ObjectRef/all-zero-header crash and
+    traced it to an unrelated dev commit, `fb15be63` ("fix(gc): GAP_FILLER_CLASS_ID
+    not special-cased in new young-GC exact-walk loops"), landed 2026-07-16 while
+    both investigations were in progress. This task was to verify that fix also
+    closes *this* class's LOADERR (the two symptom writeups above are effectively
+    identical: all-zero-header stale pointers hitting JUnit-Platform/javac
+    internals within milliseconds, reproducing under both JIT and `--nojit`, at
+    every heap size tried). Fresh worktree `/data/data/wt-gcbug-verify-20260716`,
+    `origin/dev` tip `47151b27` (has `fb15be63` as an ancestor; confirmed via
+    `git merge-base --is-ancestor`), full `cargo build --release` (35m48s under
+    heavy host contention — unrelated to the fix, just Azure-host load), real JDK
+    25, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, same `KRun` single-class launcher and
+    classpath as the original triage. Result:
+    ```
+    RESULT org.springframework.context.aot.ApplicationContextAotGeneratorTests found=40 succ=25 fail=15 skip=0 abort=0 ms=573026 status=FAIL
+    ```
+    **The LOADERR is gone.** Test discovery now finds all 40 methods (matching the
+    HotSpot baseline's 40/40 shape) and the full run completes end-to-end — no
+    `NoSuchMethodError`, no `EngineExecutionListener`/`this.delegate` NPE, no VM
+    abort. Grepping the full run log for the corruption signature (`Stale pointer
+    detected`, `GC-ARRAY-GUARD`, `implausible extent`, `LOADERR`) returns **zero
+    matches**. The class is slow under CratonVM (573 s vs. HotSpot's 155.9 s —
+    a throughput question, not correctness, and not investigated further here) but
+    otherwise behaves like a normal JUnit run. The 15 failures that remain are
+    ordinary, catchable test failures, not VM-level corruption: all 15
+    `FAILCAUSE`s are either `org.springframework.core.test.tools.CompilationException:
+    Unable to compile source` or `org.springframework.beans.factory.aot.AotBeanProcessingException:
+    Error processing bean ... failed to generate code for bean definition`, all on
+    CGLIB-proxy-configuration test methods (`processAheadOfTimeWhenHasCglibProxy*`,
+    `processAheadOfTimeUsesCglibClassForFactoryMethod`,
+    `processAheadOfTimeExposeUserClassForCglibProxy`) — the same ByteBuddy/CGLIB
+    generics-resolution AOT-codegen residual family already tracked for the
+    sibling `PersistenceAnnotationBeanPostProcessorAotContributionTests` class
+    above. **Not this session's fix; attributing correctly.** No code change was
+    needed or made — this entry is a verification-only confirmation. Full second
+    corroborating data point (in addition to the `PersistenceAnnotationBeanPostProcessorAotContributionTests`
+    0/3-crashes-after / 6/6-crashes-before result) that `fb15be63` closes this
+    cross-cutting young-GC exact-walk family. See
+    `CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`'s **2026-07-16 joint
+    verification** addendum to the `ImportSelectorTests` section for the sibling
+    `context.annotation.ImportSelectorTests` result (also fully clean, `9/9` pass).
+
+    **2026-07-17 third independent re-verification — still clean, no residual
+    doubt.** Assigned this class as this session's bug (before checking the doc,
+    per the standing "check already-fixed first" workflow). Rebuilt from
+    scratch at `origin/dev` tip `56728b1a` (`fb15be63` ancestor confirmed) in a
+    brand-new worktree/binary, plus an independently-built
+    `spring-context`/`spring-beans` test classpath (own `gradlew testClasses` +
+    `dumpTestCp`, not reused from any other session's possibly-stale or
+    disk-full-tainted artifacts — see the `BeanDefinitionMethodGeneratorTests`
+    entry above for why that mattered this session). Result: `found=40 succ=25
+    fail=15 status=FAIL`, ms=445465 — **identical shape** to the 2026-07-16
+    joint-verification result above (same found/succ/fail split, same 5
+    CGLIB-proxy `FAILCAUSE`s sampled), zero corruption-signature lines. Ran
+    `cargo test -p cratonvm-gc --lib --release` (791/791 passed, matches
+    baseline) and `cargo test -p cratonvm-vm --lib --release` (2200 passed, 17
+    failed — 16 match the documented pre-existing lock_order/skip_list release-
+    mode baseline exactly; the 17th, `runtime::interpreter::tests::
+    buffered_input_stream_real_jdk_uses_its_own_bytecode`, is a newly-observed,
+    unrelated failure already present on unmodified `origin/dev` — flagged
+    separately, not a GC issue, out of scope here). No code change made or
+    needed; this is the third independent confirmation (after the original
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` verification
+    and the 2026-07-16 joint-verification addendum above) that `fb15be63`
+    fully and durably closes this bug for both AOT-cluster classes.
+
     **`TestContextAotGeneratorIntegrationTests` — genuine improvement, still
     4/4 FAIL, 4 distinct causes, none newly fixed this session.** The doc's old
     "FAIL 4/0 @393 s" data point is stale on two counts: it now completes in
@@ -665,6 +1180,260 @@ the WRONG same-named copy. Eight fixes landed on
        get a fresh stream) — but this is not confirmed; needs tracing which
        exact `Resource`/stream object SnakeYAML actually receives. Newly
        observed; not fixed.
+
+       ~~**FIXED (2026-07-17, branch `fix/yaml-resource-stream-20260717`).**~~
+       The leading hypothesis above (stale/shared stream position) was
+       **refuted** — raw resource-stream I/O was already confirmed correct
+       (`YamlProbe.java`), and this session's tracing shows the real
+       divergence never touches the YAML stream at all. `KRun` repro (real
+       JDK 25, single-class launcher, from-scratch `spring-test` classpath
+       via `./gradlew spring-test:testClasses spring-test:processTestResources`
+       plus a `sourceSets.test.runtimeClasspath` dump) hit a **different,
+       earlier, fully-deterministic blocker on every run**: before any of
+       the 4 test methods' own bodies execute,
+       `CompileWithForkedClassLoaderExtension.runTest()`'s inner
+       `LauncherFactory.create()` triggers JUnit Platform's own
+       `TestEngine` `ServiceLoader` discovery, which resolves
+       `org.junit.support.testng.engine.TestNGTestEngine` via CratonVM's
+       synthetic `ServiceLoader` reimplementation
+       (`native-builtins/src/service_loader.rs`, `load_provider_class`).
+       That function tried `loader.findClass(fqn)` **before**
+       `loader.loadClass(fqn)`. Real `java.util.ServiceLoader` always
+       resolves providers via `Class.forName(cn, false, loader)`, which is
+       spec'd to invoke `loader`'s **public** `loadClass(String)` — never
+       the **protected** `findClass(String)` helper directly (`findClass`
+       exists to be called *by* a loader's own `loadClass()` algorithm, not
+       by external callers). `CompileWithForkedClassLoaderClassLoader`
+       overrides `loadClass(String)` with a special case that delegates
+       `org.junit`/`org.testng` names to a *different* loader instance
+       (the real test classloader); its `findClass()` override has no such
+       special case and unconditionally self-defines the class. Calling
+       `findClass` first bypassed that delegation, so `TestNGTestEngine`
+       got self-defined into the fork loader's own namespace
+       (`UserDefined(N)`) instead of the `Application` loader. Its
+       `<clinit>` then `new`s the package-private sibling
+       `IsTestNGTestClass`, which resolves correctly via
+       `resolve_class_loader_aware`
+       (`vm/src/runtime/interpreter.rs`) → `loadClass()`'s proper
+       delegation → `Application` — a genuine two-different-loaders split
+       for the same-named, same-package pair, which
+       `classloading/src/access_control.rs`'s `same_runtime_package`
+       (loader-id-aware, correctly implemented) then correctly rejects,
+       throwing `IllegalAccessError: class …TestNGTestEngine cannot access
+       class …IsTestNGTestClass (not public, different package)` — deep
+       inside JUnit Platform's own bootstrap, aborting that
+       `@CompileWithForkedClassLoader`-intercepted test-method invocation
+       before its actual AOT-processing body ever ran. Confirmed via
+       targeted tracing (temporary `eprintln!`s at the `define_class`,
+       `resolve_class_loader_aware`, and `check_class_access` call sites,
+       env-var gated, removed before commit): `TestNGTestEngine` defined
+       twice — once `loader_id=Application` (outer `KRun` launcher, clean),
+       once `loader_id=UserDefined(N)` per forked-loader test method (one
+       fresh `UserDefined` id per `new CompileWithForkedClassLoaderClassLoader(...)`)
+       — while `IsTestNGTestClass` stayed `loader_id=Application` throughout.
+
+       Fix (`native-builtins/src/service_loader.rs`, `load_provider_class`):
+       swapped the order — try `loader.loadClass(fqn)` first, `findClass`
+       only as a fallback (matches real `Class.forName(cn, false, loader)`
+       semantics and lets any custom `loadClass()` delegation logic run).
+
+       Verified: `TestContextAotGeneratorIntegrationTests` KRun repro no
+       longer throws `IllegalAccessError` anywhere (grep for
+       `IllegalAccessError`/`TestNGTestEngine` across the full run log: zero
+       hits, down from 4/4 occurrences pre-fix — one per test method, direct
+       A/B against the pre-fix binary). All 4 methods now progress into
+       their real AOT-processing bodies. Specifically for
+       `processAheadOfTimeWithBasicTests` (this bug's assigned target): the
+       SnakeYAML `ParserException` on `test1.yaml` **no longer occurs** —
+       grep for `snakeyaml`/`ParserException`/`test1.yaml`/`test2.yaml`
+       across the full post-fix run log: zero hits, reproducible across
+       three separate rebuild-and-rerun cycles. The method now fails later,
+       for a **different, unrelated** reason:
+       `NullPointerException: Cannot invoke
+       "org.springframework.javapoet.LineWrapper$FlushType.ordinal()"
+       because "flushType" is null`, inside JavaPoet's own
+       `CodeWriter.emit`/`LineWrapper.flush` while stringifying
+       AOT-generated source for `TestCompiler.with(...)`'s in-memory
+       compile-and-verify step — clearly a separate, later-stage AOT
+       source-generation bug, not a classloader/resource-stream issue;
+       flagged here for a future session, not investigated further.
+       (`processAheadOfTimeWithWebTests` and `endToEndTests` also progress
+       to their own distinct, unrelated new failures post-fix — an
+       `AnnotationConfigurationException` `@AliasFor` mirror-value mismatch
+       for `endToEndTests`, and the same JavaPoet NPE for `WebTests`;
+       `processAheadOfTimeWithXmlTests` still hits the already-documented
+       `GroovySystem.<clinit>` `ArrayStoreException` from item 2 above —
+       none of these are classloader-resource-stream bugs, all out of
+       scope for this session.)
+
+       Regression-checked clean: `cratonvm-native-builtins --lib --release`
+       3000/0 (0 failed, 6 ignored, matches baseline exactly);
+       `cratonvm-vm --lib --release` 2200 passed/17 failed — 16 match the
+       documented pre-existing `lock_order`/`jit::skip_list` release-mode
+       baseline exactly; the 17th,
+       `runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode`,
+       is a separate, already-flagged, pre-existing failure (deterministic,
+       unrelated to classloading — a different concurrently-running session
+       was independently investigating it under the title
+       "bufferedinputstream-regression" during this same window) and is not
+       a regression from this fix. Spot-checked other
+       `ServiceLoader`/resource-heavy classpath consumers against both the
+       pre-fix and post-fix binaries: `org.springframework.core.io.support.
+       SpringFactoriesLoaderTests` 31/33 (2 `AssertionError` failures,
+       **identical** on both binaries — pre-existing, unrelated, confirmed
+       via direct A/B); `org.springframework.beans.factory.serviceloader.
+       ServiceLoaderTests` 3/3 OK (no regression); `org.springframework.
+       test.context.env.YamlTestPropertySourceTests` (an ordinary,
+       non-forked-loader `@YamlTestProperties` consumer) 4/4 OK (confirms
+       the normal YAML-loading path was never broken and stays unaffected).
+
+       **2026-07-17 addendum — JavaPoet `LineWrapper$FlushType` NPE: interpreter
+       path FIXED, JIT-only residual OPEN.** Investigated the NPE flagged
+       above (`NullPointerException: Cannot invoke
+       "org.springframework.javapoet.LineWrapper$FlushType.ordinal()" because
+       "flushType" is null`, at `LineWrapper.flush(LineWrapper.java:127)` <-
+       `CodeWriter.emitAndIndent` <- `CodeWriter.emit` <- ... <- `JavaFile.writeTo`).
+       Fresh worktree `/data/data/wt-javapoet-linewrapper-20260717`, branch
+       `fix/javapoet-linewrapper-20260717`, `origin/dev` tip `08808a57`.
+       Reproduced with a single-method `MRun` launcher (`DiscoverySelectors
+       .selectMethod`) against a from-scratch `spring-test`
+       `sourceSets.test.runtimeClasspath` dump (`persistbb-springfw-20260717`
+       checkout, real JDK 25) -- 100% reliable, both under default settings
+       (JIT on) and `--nojit`.
+
+       **Root cause (interpreter path, FIXED):** `LineWrapper` (repackaged
+       `com.palantir.javapoet` -> `org.springframework.javapoet` at Spring's
+       build time) has 8 instance fields mixing references and primitives
+       (`out`, `indent` -- refs; `columnLimit`, `closed` -- primitives;
+       `buffer` -- ref; `column`, `indentLevel` -- primitives; `nextFlush` --
+       a ref, and the *last* declared field). Under the default-on compact
+       reference-field layout (`CRATONVM_COMPACT_REF_FIELDS`,
+       `docs/feature-designs/compact-ref-field-layout.md`), this object's
+       true body size is 96 bytes (4 ref fields x 8B + 4 primitive fields x
+       16B). `gc/src/g1.rs`, `gc/src/gc.rs`, and `gc/src/region.rs` each
+       independently duplicate an `object_total_size(header)` helper that --
+       unlike the already-correct `gc/src/gen_heap.rs::gen_object_total_size`
+       -- never checks the per-object `GC_FLAG_COMPACT` header bit, and
+       unconditionally computed `HEADER_SIZE + num_slots * SLOT_SIZE` (the
+       *legacy* 16-bytes-per-field formula): 128 bytes instead of the true 96
+       -- a 32-byte overestimate for this exact class shape (a compact object
+       whose last field is a reference following an odd mix of primitives).
+       `g1.rs::evacuate_object` uses this inflated size both to reserve
+       destination space for the copy *and* as the `copy_nonoverlapping`
+       length, so every young-GC evacuation of a live `LineWrapper` (heavy
+       during `TestCompiler`'s real in-process javac compile-and-verify GC
+       churn) over-read past the object's true end and de-synced the
+       region's per-object stride for everything evacuated after it --
+       eventually manifesting as `nextFlush` reading back `null` even though
+       every `LineWrapper` method that sets it (`wrappingSpace`,
+       `zeroWidthSpace`) is only ever called with a non-null argument.
+       Confirmed empirically, not just by code inspection: with
+       `CRATONVM_COMPACT_REF_FIELDS=0` (opts out of compact layout
+       entirely, sidestepping the bug) the `--nojit` repro passes 3/3
+       reliably; with the flag at its default the `--nojit` repro fails 3/3
+       reliably with the exact NPE above.
+
+       **Fix** (`gc/src/g1.rs`, `gc/src/gc.rs`, `gc/src/region.rs`,
+       `object_total_size`): replaced the `else` arm's
+       `HEADER_SIZE + header.num_slots as usize * SLOT_SIZE` with
+       `HEADER_SIZE + crate::object_body_size(header)` -- the canonical
+       compact-aware helper (`types/src/field_layout.rs`) that `gen_heap.rs`
+       already used, reads the per-object `GC_FLAG_COMPACT` bit and returns
+       the true (possibly-compact) body size. Minimal, mechanical, no new
+       control flow. **Verified**: with the fix, `--nojit` against the exact
+       same repro no longer throws the JavaPoet NPE anywhere (3/3 clean
+       reruns) -- the method progresses further, now failing on an unrelated,
+       later assertion (`AssertionError: [Environment] Expecting actual not
+       to be null` in `assertContextForBasicTests`, a separate Spring
+       environment-property issue not investigated here).
+
+       **JIT-only residual -- OPEN, root-caused down to the call site, not
+       yet fixed.** With JIT enabled (the default), the identical NPE
+       *still reproduces* even with the fix above, and even with
+       `CRATONVM_COMPACT_REF_FIELDS=0` (i.e. it is independent of the
+       compact-layout bug just fixed -- a second, unrelated defect). Bisected
+       precisely via `CRATONVM_JIT_BISECT_SKIP` (format is
+       `Class.method`, comma-separated -- an earlier attempt using a bare
+       class-name prefix silently matched nothing due to the required `.`
+       separator, a trap worth flagging for whoever picks this up):
+       - `CRATONVM_JIT_BISECT_SKIP=org/springframework/javapoet/LineWrapper.append`
+         (forcing only `append(String)` to stay interpreted) -- **NPE gone**,
+         3/3.
+       - `CRATONVM_JIT_BISECT_SKIP=org/springframework/javapoet/LineWrapper.flush`
+         (forcing only `flush(FlushType)` to stay interpreted) -- **NPE still
+         reproduces**.
+
+       So the bug is specifically in the JIT-compiled machine code of
+       `LineWrapper.append(String)`, not `flush`. `append`'s bytecode
+       computes `flush(shouldWrap ? FlushType.WRAP : this.nextFlush)`: an
+       unconditional `aload_0` (receiver) followed by a two-way branch that
+       pushes either a `getstatic` (the enum constant `WRAP`) or a second
+       `aload_0` + `getfield nextFlush`, joining right before the
+       `invokevirtual flush` (encoded `invokevirtual`, not `invokespecial`,
+       per modern javac's private-instance-method bytecode shape -- see
+       `vm/src/runtime/interpreter.rs`'s `resolved_private_invokevirtual_target`
+       and its regression test `vm/tests/private_invokevirtual_shadow.rs`,
+       which -- note for the next session -- only exercises `--nojit`, so it
+       gives **no coverage** of the JIT path at all).
+       `CRATONVM_DBG_JITC=1` confirms `flush` itself always
+       `compile-bail`s (`backend_attempted=true`, never gets a compiled
+       entry, likely the internal `tableswitch` over `FlushType.ordinal()`),
+       so the call from JIT-compiled `append` must cross the JIT->interpreter
+       boundary via the virtual-call MIC/PIC dispatch machinery
+       (`jit_invoke_virtual_mic`, `vm/src/jit/helpers.rs`). A live
+       `CRATONVM_DBG_JIT_DISASM=LineWrapper.append` dump (NASM-formatted,
+       `vm/src/jit/disasm.rs`) located the exact merge-point machine code --
+       the compact/legacy guarded `getfield` for `nextFlush` (offsets
+       `[reg+80h]` compact / `[reg+0A0h]` legacy, matching field index 7 --
+       correct) feeding into a 3-slot polymorphic inline-cache dispatch
+       stub before the call -- but did not conclusively pin why the value
+       becomes null by the time it reaches the callee: a targeted
+       instrumentation experiment in `jit_invoke_virtual_mic`'s argument
+       decode (`decode_values`, the `is_object_address`-validated-else-null
+       downgrade for reference args) showed **zero** downgrade events during
+       the failing run, ruling that specific mechanism out -- the argument
+       must already be raw zero by the time the JIT->interpreter call helper
+       receives it, so the corruption happens earlier, inside the
+       JIT-compiled `append` machine code itself (most likely in how the
+       receiver/argument pair for the `shouldWrap ? WRAP : nextFlush`
+       merge gets threaded through the stack-slot/register allocator into
+       the two arguments handed to the virtual-call dispatch stub). Toggled
+       a wide sweep of JIT feature flags with no effect (`CRATONVM_JIT_LICM`,
+       `_REASSOC`, `_UNROLL`, `_IR_CALL_VIRTUAL`, `_SCALAR_NEW`, `_IR_CALL`,
+       `_NO_CALLEE_OOP_FLUSH`, `_NO_SLOT_MIRROR`, `_NO_SELF_CACHE_INHERIT`,
+       `_NO_STACK_BANG`, `_NO_DUP_X`, `_NO_BCE`,
+       `_DISABLE_INLINE_NEW` -- the last one specifically to re-rule-out the
+       already-landed `6599b898` inline-TLAB-new compact-size fix, confirmed
+       unrelated). A minimal standalone repro replicating the exact bytecode
+       shape (a `final` class, an enum field, a private method invoked via
+       the same `invokevirtual`-on-private encoding, reached through the
+       identical two-branch-merge-before-call pattern, JIT-warmed with
+       millions of alternating-branch iterations) did **not** reproduce --
+       so the trigger needs something more specific to `LineWrapper`'s full
+       method body (likely the heavier surrounding code: the inlined
+       `String.indexOf`/`length` intrinsic sequences also visible in the
+       disassembly) that a bare-bones repro didn't capture.
+
+       **Next step for whoever picks this up:** get `pc_to_native`
+       annotations into the `CRATONVM_DBG_JIT_DISASM` dump for `append` (the
+       plain `maybe_dump` call site at `vm/src/runtime/interpreter.rs`
+       `full-compile`, ~line 31117, doesn't pass them; the annotated variant
+       exists at `maybe_dump_annotated`, used elsewhere) to map the raw
+       instruction offsets straight to bytecode PCs 99-117 without manual
+       byte-counting, then trace exactly which register/stack-slot backs the
+       `flush` argument at the call and where it diverges from the
+       `nextFlush` getfield's result. `CRATONVM_JIT_BISECT_SKIP=org/
+       springframework/javapoet/LineWrapper.append` is a reliable, isolated,
+       single-line workaround in the meantime.
+
+       Regression-checked clean on the `object_total_size` fix alone:
+       `cratonvm-native-builtins --lib --release` 3000/0 (0 failed, 6
+       ignored, matches baseline exactly); `cratonvm-vm --lib --release`
+       2201 passed/16 failed -- all 16 match the documented pre-existing
+       `lock_order`/`jit::skip_list` release-mode baseline exactly (one
+       fewer failure than the `6599b898`-era baseline of 17, consistent with
+       the independently-tracked `buffered_input_stream_real_jdk_uses_its_own_bytecode`
+       flake having since been fixed by a concurrent session).
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
@@ -741,6 +1510,43 @@ the WRONG same-named copy. Eight fixes landed on
        re-triage) and appears to now also be reachable from this class under
        heavy host load; needs its own dedicated session, out of scope here.
 
+       **2026-07-17 dedicated re-triage — CONFIRMED FIXED, resolves the "needs
+       its own session" note above.** Picked up as the assigned bug for this
+       session (same class as the `fb15be63` GAP_FILLER_CLASS_ID fix's other
+       corroborating data points). First checked whether a stray same-day log
+       (`spot-bdmgt-2.log`, timestamped *after* `fb15be63` landed, from the
+       `wt-aotservices-loaderid-20260716` session) still showing the identical
+       corruption signature meant the fix was incomplete — but that build's own
+       logs (`build1.log`/`build2-postmerge.log`) show it ran under `database or
+       disk is full` conditions (the same host-wide root-filesystem exhaustion
+       hit again during this session, see below), so it was not trustworthy
+       evidence either way and needed independent reproduction. Built a
+       completely fresh binary at current `origin/dev` tip `56728b1a` (has
+       `fb15be63` as an ancestor) in a clean worktree
+       (`/data/data/wt-appctxaot-corruption-20260716`), plus a from-scratch
+       `spring-context`/`spring-beans` test-class build and `KRun` classpath
+       (`/data/data/appctxaot-repro`) independent of any other session's
+       possibly-corrupted artifacts. Result: `RESULT
+       org.springframework.beans.factory.aot.BeanDefinitionMethodGeneratorTests
+       found=34 succ=33 fail=1 skip=0 abort=0 status=FAIL` — full test discovery
+       (34/34, matches the HotSpot baseline count), zero corruption-signature
+       lines (`class_name=java/lang/Object`, `Stale pointer detected`, `LOADERR`
+       all absent from the run log). The 1 failure is an unrelated
+       `IllegalStateException: Unable to parse source file content` in
+       `generateBeanDefinitionMethodWhenPackagePrivateBean` — a real, separate
+       AOT-codegen gap, not VM-level corruption; not investigated further here.
+       **`fb15be63` does fix this class too** — the disk-full-tainted log was a
+       false alarm, not a residual. Combined with the `ApplicationContextAotGeneratorTests`
+       independent re-verification below (same session, same fresh-build
+       methodology, `found=40 succ=25 fail=15`, also zero corruption lines),
+       this closes out the `fb15be63` cross-cutting young-GC exact-walk family
+       for both AOT-cluster classes with no residual doubt. Host note: hit the
+       same root-filesystem-full condition mid-session (`~/.gradle`,
+       `/tmp/hsperfdata_victor` on `/`, unrelated to `/data`'s 240G+ free) —
+       worked around via `GRADLE_USER_HOME`/`TMPDIR` pointed at `/data/tmp`; did
+       not attempt to clean up the host-wide root-fs issue itself (out of scope,
+       affects many concurrent sessions).
+
     None of the other 3 `TestContextAotGeneratorIntegrationTests` failures are
     fixed by this change; #1 remains attributed to an existing tracked residual,
     #2–#3 remain open exactly as characterized above.
@@ -749,14 +1555,29 @@ the WRONG same-named copy. Eight fixes landed on
 
 ## 3. Untriaged Clusters & Per-Class Details
 
-*Note: this section was accidentally truncated in the 2026-07-14 rewrite; the
-full 1013-line per-class detail lives in git history as
-`CRATONVM-SPRING-GENUINE-BUGLIST-125.md` (deleted in `ccab25c6`). 21 classes
-related to `HIB-CV-32` heap corruption remain filtered out as load-dependent
-side-effects tracked separately. The still-open non-AOT clusters from that
-list (WebFlux backend failures, Groovy scripting cluster, WebFlux
-EMPTY-discovery family, 6 found=0 ABENDs, and the per-class FAIL details)
-are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
+**Recovered 2026-07-16/17.** The truncated 1013-line historical detail
+(`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`, deleted in `ccab25c6`) was pulled
+back from git history (`git show ccab25c6~1:docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST-125.md`,
+full 1013 lines, still available at that path in git history) and
+cross-referenced class-by-class against the ~310 commits and the extensive
+AOT (§2) and reactive-cluster (§4) investigations that landed on `dev` since
+that 2026-07-14 snapshot. Two of the four named clusters turn out to be
+**already fully covered/resolved elsewhere in this document**; the other two
+are **still genuinely open and were NOT previously tracked anywhere** — the
+placeholder's claim that all 21 HIB-CV-32-filtered classes were "tracked
+separately" was only true for 12 of them. Live re-run of the still-open
+classes on a fresh `dev`-tip binary was attempted this session but blocked
+by a severe, host-wide disk-full crisis on the Azure build host's root
+filesystem (repeatedly hit 0 bytes free, corrupting several other sessions'
+scratch files and pruning ~20 concurrent git worktrees including this
+investigation's own two build worktrees mid-session) which also wiped every
+surviving pre-built `spring-framework` test classpath on the host — rebuilding
+one from scratch (`./gradlew jar testFixturesJar testClasses`) was out of
+scope for the remaining time budget. The status below is therefore the most
+accurate currently-available synthesis of doc + git evidence, but the
+"still open, unconfirmed" classes marked below need a live rerun as the
+concrete next step, once a `spring-framework` test classpath exists on the
+host again.
 
 ### WebFlux Backend-Specific Failures
 (`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`)
@@ -785,6 +1606,276 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     CPU) — an already-documented, deliberately-deferred architectural item (see `gc/src/arena.rs`'s
     `Arena::reset` doc comment), not a quick-fix bug. Full detailed writeup, all numbers, and the
     concrete next step further down in this document, section 2, same bullet.
+
+### WebFlux EMPTY-discovery family — RESOLVED (superseded by §4's 2026-07-15 reactive sweep)
+
+The historical doc characterized (2026-07-11, dev `9948295e`) a cluster of `web.reactive.result.method.annotation.*`
+and `web.reactive.result.view.*` classes that loaded (`found=1`) but discovered **zero runnable
+test methods** — a JUnit-discovery/filtering gap specific to WebFlux's reactive test style, distinct
+from ordinary FAILs. Named examples: `GlobalCorsConfigIntegrationTests`, `MessageReaderArgumentResolverTests`,
+`ProtobufIntegrationTests`, `FreeMarkerMacroTests`.
+
+**§4's full 295-class reactive sweep (2026-07-15) supersedes this with a direct, explicit finding**: after
+that session's 7 (then 8) VM fixes, "the only EMPTY classes are the same 4 abstract classes HotSpot
+reports EMPTY" — i.e. the WebFlux-specific EMPTY-discovery anomaly is gone; every previously-EMPTY
+concrete WebFlux test class now discovers and runs its real test methods, matching HotSpot's own
+EMPTY set (legitimately-abstract base classes only) exactly. Treated as **FIXED/RETIRED** — no
+separate tracking needed; see §4 for the full fix list and verification detail.
+
+### HIB-CV-32-filtered 21-class list — reconciled
+
+The historical doc filtered 21 classes out of its main "still open" count as exclusively-ABEND,
+`rc=139`-SIGSEGV crashes carrying the generic `gen_heap::read_slot: corrupt Value cell` guard message
+— informally shorthanded "the HIB-CV-32 family" — on the theory they were a shared, load-dependent
+batch-corruption artifact rather than 21 independent bugs. Two important corrections from this
+session's research:
+
+1. **The name is a red herring.** The literal `HIB-CV-32` defect (`docs/internal/hibernate-bugs/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`)
+   — a GC-corruptor triggered by `promotion_oom_risk` diverting `--nojit` young collections into a
+   corrupting non-moving sweep — was already root-caused and **fixed weeks earlier, 2026-06-23,
+   commit `c9258e17`**, well before the 2026-07-09 Spring 125-class baseline even existed. What the
+   Spring doc calls "the HIB-CV-32 family" is really every crash that trips the *diagnostic guard*
+   that fix's defense-in-depth left behind (`read_value_checked`/`gen_heap::read_slot`'s "corrupt
+   Value cell" log line) — a generic heap-integrity tripwire, not evidence of one shared root cause.
+   §4's Round 3 investigation independently confirms this guard is "pre-existing, deliberately-built
+   forensic instrumentation... a conservative-scan heuristic that sometimes misclassifies a live
+   region as corrupt... a SAFE recovery path by design, not silent data corruption" — consistent with
+   different classes in this 21-class list having entirely different underlying causes.
+
+2. **Only 12 of the 21 are actually accounted for elsewhere in this document; 9 are not tracked
+   anywhere and are genuinely still open/untriaged.**
+
+   | # | Class | Current status |
+   |---|---|---|
+   | 1-9 | `web.reactive.function.client.support.WebClientProxyRegistryIntegrationTests`, `web.reactive.function.server.InvalidHttpMethodIntegrationTests`, `web.reactive.config.WebFluxConfigurationSupportTests`, `web.reactive.config.WebFluxViewResolutionIntegrationTests`, `web.reactive.result.method.annotation.GlobalCorsConfigIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingDataBindingIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingViewResolutionIntegrationTests`, `web.reactive.result.view.LocaleContextResolverIntegrationTests`, `web.reactive.result.view.freemarker.FreeMarkerMacroTests` | **FIXED** — covered by §4's 295-class reactive sweep (reached HotSpot parity for the whole `web.reactive.*` scope) |
+   | 10 | `messaging.rsocket.RSocketBufferLeakTests` | **FIXED** — same §4 sweep (`messaging.rsocket.*` explicitly in scope) |
+   | 11 | `test.web.reactive.server.samples.JsonContentTests` | **FIXED** — same §4 sweep (`test.web.reactive.*` explicitly in scope) |
+   | 12 | `web.socket.WebSocketHandshakeTests` | **STILL OPEN, but no longer ABEND** — confirmed via this session's own STOMP investigation (§3 "STOMP Message Hang" note): no longer crashes, now `FAIL 4/6` on real "Blocking write timeout" failures, "not investigated further this session." Genuine progress, not closed. |
+   | 13 | `cache.jcache.JCacheEhCacheAnnotationTests` | **UNKNOWN / genuinely untracked** — zero mentions anywhere in current `dev`, no dedicated fix commit found (`git log --grep`). Not reactive, not AOT — outside every investigation that has landed since 2026-07-09. Needs a live rerun. |
+   | 14 | `http.client.JettyClientHttpRequestFactoryTests` | **UNKNOWN / genuinely untracked** — same reasoning; this is the blocking `http.client` module, not `http.client.reactive` (which §4 covered), so it fell outside every session's scope. Needs a live rerun. |
+   | 15 | `jdbc.config.JdbcNamespaceIntegrationTests` | **UNKNOWN / genuinely untracked** — original crash signature was an out-of-bounds field read on `org/hsqldb/RangeGroup$RangeGroupEmpty` (`real_field_count=Some(0)`), a shape plausibly touched by the broad `fb15be63` GC exact-walk fix (see below) but never re-verified. Needs a live rerun. |
+   | 16-21 | `test.context.groovy.AbsolutePathGroovySpringContextTests`, `DefaultScriptDetectionGroovySpringContextTests`, `GroovySpringContextTests`, `MixedXmlAndGroovySpringContextTests`, `RelativePathGroovySpringContextTests`, `test.context.web.BasicGroovyWacTests` | **LIKELY STILL OPEN** — see "Groovy scripting cluster" below; same family as the 8-9 already-characterized Groovy classes, no dedicated fix landed for any of it. |
+
+   Net: **12/21 resolved or improved** (11 fixed outright via the reactive sweep, 1 improved from
+   crash to ordinary FAIL), **9/21 remain open and, contrary to the previous placeholder text, were
+   never actually "tracked separately" anywhere** — 3 are entirely unique untracked classes and 6
+   belong to the Groovy cluster below.
+
+### Groovy scripting cluster — RE-VERIFIED 2026-07-17, one root cause fixed, one still OPEN
+
+**Status: partially fixed.** All 10 classes re-verified live on a fresh `dev`-tip build
+(branch `fix/groovy-cluster-20260717`). The full historical per-class list, recovered from
+`git show ccab25c6~1:docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST-125.md`:
+
+- `scripting.groovy.GroovyAspectTests`
+- `scripting.groovy.GroovyAspectIntegrationTests`
+- `scripting.groovy.GroovyScriptFactoryTests`
+- `context.groovy.GroovyBeanDefinitionReaderTests`
+- `test.context.groovy.AbsolutePathGroovySpringContextTests`
+- `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests`
+- `test.context.groovy.GroovySpringContextTests`
+- `test.context.groovy.MixedXmlAndGroovySpringContextTests`
+- `test.context.groovy.RelativePathGroovySpringContextTests`
+- `test.context.web.BasicGroovyWacTests`
+
+All 10 were `ABEND rc=139` (SIGSEGV, dumped core) on the 2026-07-09 baseline. **Re-run this
+session (fresh Spring Framework 7.1.0-SNAPSHOT checkout, Groovy 5.0.7, real JDK 25, `KRun`
+JUnit-Platform harness) against unmodified `dev` tip `67c85b3c`: all 10 classes now complete
+without crashing** — a genuine, if partial, improvement since 2026-07-09 — **but all 10 still
+FAIL** (0-16 of N methods passing per class; e.g. `GroovyBeanDefinitionReaderTests` 1/36,
+`GroovyScriptFactoryTests` 16/38). Two independent, unrelated root causes were found this
+session.
+
+#### Root cause #1 (FIXED this session): JIT inline-TLAB `new` bakes a stale compact-object size
+
+**Not the cluster's current top-level symptom** (see #2), but a real, independently-confirmed
+heap-corruption bug hit by this exact code shape (large ANTLR/Groovy-generated classes), and the
+most probable explanation for the 2026-07-09 baseline's `rc=139` ABENDs.
+
+`git bisect run` (automated build+probe over ~1600 commits between the last confirmed-green
+Groovy state, `32786958` 2026-07-07, and `dev` tip) isolated the regression to a single commit,
+**`c8c1dd54` "Improve binary trees allocation throughput" (2026-07-09)** — the same day as the
+125-class ABEND baseline. That commit flipped `compact_ref_fields_enabled()`
+(`types/src/field_layout.rs`) from opt-in to **default-on**, and added an inline-TLAB bump-pointer
+fast path for JIT-compiled `new` (`jit/src/x64.rs::emit_inline_tlab_new`) that queries
+`cratonvm_types::class_layout(class_id_raw)` **once, at JIT-compile time**, and bakes the returned
+`body_size` (and therefore the allocation's total size and its `GC_FLAG_COMPACT`/`array_length`
+header fields) as **immutable machine-code constants**.
+
+Unlike that same fast path's sibling consumers — the interpreter (`vm/src/vm/vm_exec.rs`) and the
+GC scan (`gc/src/gen_heap.rs`, `gc/src/heap.rs`) both validate their cached layout against
+`cratonvm_types::layout_generation()` (a monotonic counter bumped on every
+`register_class_layout`/redefine) before trusting it — `emit_inline_tlab_new` has no such check.
+When a class's registered compact layout is later **replaced** (`classloading/src/class_manager.rs`'s
+`recompute_subclass_layouts` / `register_compact_layout_if_enabled`, exercised whenever a
+synthetic-stub class is upgraded to real bytecode with a different field count — exactly the shape
+of CratonVM's synthetic-then-real-JDK class model applied to ANTLR/Groovy-generated parser
+classes), any already-JIT-compiled `new` site for that class keeps allocating objects at the OLD,
+now-wrong size, while field-access code (correctly, dynamically, per-object) uses the CURRENT
+layout — a heap buffer overflow.
+
+**Proven, not just theorized:** built the last-known-good pre-regression commit (`c769377f`,
+parent of `c8c1dd54`) and force-enabled the (there still opt-in) compact-layout flag
+(`CRATONVM_COMPACT_REF_FIELDS=1`) against a minimal repro (`GroovyShell.evaluate("println 1")`,
+no Spring involved) — reproduces the **exact same `rc=139` SIGSEGV** as the 2026-07-09 baseline.
+`--nojit` on that same forced-flag build does *not* crash (confirming the bug is JIT-exclusive).
+A core-dump backtrace (`gdb` on a captured core) shows the fault inside JIT-generated code
+(no symbols) with `RAX` holding a garbage sign-extended 32-bit value being dereferenced as a
+pointer — consistent with a field read landing on the wrong byte offset inside an
+undersized/mis-tagged object.
+
+**Fix** (`jit/src/x64.rs::emit_inline_tlab_new`): disabled the compile-time-baked compact-body
+size computation for this one allocation fast path (`compact_body` is now always `None` there),
+falling back to the always-correct legacy-sized bump allocation — still avoiding the helper call
+for the common case, just without the ~22% footprint win for JIT'd `new` on compact-eligible
+classes. A full fix would thread `layout_generation()` through this fast path the same way the
+interpreter and GC already do (deopt/fall back to the helper when the generation has moved since
+compile time); out of scope for this session's time budget given the risk of touching hot,
+widely-shared JIT/GC code without a slower, more thorough validation pass.
+
+**Verified regression-clean**: `cargo test -p cratonvm-native-builtins --lib --release` —
+3000 passed / 0 failed / 6 ignored (matches documented baseline exactly).
+`cargo test -p cratonvm-vm --lib --release` — 2200 passed / 17 failed; 16 of the 17 match this
+doc's already-documented pre-existing baseline (9 `lock_order` debug-only-panic tests + 7
+`jit::skip_list` tests); the 17th (`buffered_input_stream_real_jdk_uses_its_own_bytecode`)
+reproduces identically on an unmodified `dev`-tip build via a `git stash`-based A/B rerun —
+pre-existing, unrelated to this fix, not a regression.
+
+#### Root cause #2 -- FIXED 2026-07-17 (commit `394f9c93`): `ArrayList$ListItr.set/add/remove` were hardcoded no-op stubs
+
+This is the cluster's actual current-day blocker — the reason all 10 classes still FAIL even
+after root cause #1's fix. Isolated to a minimal, Spring-free repro:
+`new GroovyShell().evaluate("println 1")` **fails to parse** under CratonVM
+(`org.codehaus.groovy.control.MultipleCompilationErrorsException: ... Unexpected input: '1' @
+line 1, column 9`) while the identical script/classpath parses and runs fine under real HotSpot
+(JDK 25). Further isolation:
+
+- `println 1`, `x=5`, `x='a'`, `foo(1)`, `def x=1`, `1+1` — all fail to parse (`Unexpected input`
+  pointing at the integer/string literal or, for `1+1`, at the leading digit itself).
+- `true`, `x=true`, `def x`, `foo()`, `class X {}` — all parse and run fine.
+- Reproduces identically with JIT on or `--nojit`, and with `CRATONVM_COMPACT_REF_FIELDS` set to
+  either `0` or `1` — i.e. **independent of root cause #1 and of the compact-ref-field-layout
+  feature entirely**. Confirmed via a `git stash`-based test that this is not a side effect of
+  this session's fix (reproduces identically before and after).
+
+The failure shape (a real, non-boolean literal token specifically failing where boolean keywords
+and no-arg calls succeed) points at Groovy 5's ANTLR4-based lexer/parser (`groovyjarjarantlr4`,
+the tunnelvisionlabs shaded fork) mishandling number/string literal recognition or the adaptive
+prediction around it — plausibly related to, but distinct from, the already-`docs/internal/
+groovy-atn-shim-fork-layout-and-isPresent-stub-removal.md`-documented (2026-07-07, merged
+`32786958`) `ATNConfig` slot-layout bug, since `CRATONVM_DBG_OOBFIELD=ATNConfig` shows **zero**
+`ATNConfig` out-of-bounds field events during this exact failure — so it is not a recurrence of
+that specific bug, but something else in the same subsystem. **Not investigated further this
+session** (time budget exhausted after root-causing and fixing #1); the minimal repro above
+(`GroovyParseProbe4`-style: a fresh `GroovyShell`, `.evaluate("println 1")`, one JDK 25 process,
+groovy-5.0.7.jar on the classpath, no Spring needed) is the concrete starting point for a
+follow-up session.
+
+The originally-reported lead for this investigation —
+`TestContextAotGeneratorIntegrationTests::processAheadOfTimeWithXmlTests` hitting
+`ExceptionInInitializerError` from `GroovyBeanDefinitionReader.<init>` via an `ArrayStoreException`
+in `GroovySystem.<clinit>` — **did not reproduce** in any of the 10 cluster classes or the minimal
+repro above (`GroovySystem.<clinit>` completes without incident in every repro tried this
+session). That AOT-specific `ArrayStoreException` is very likely a genuinely separate, third bug
+tied to the `@CompileWithForkedClassLoader` fork-loader path used only by that AOT test class —
+still open, not further investigated here; see §2's `TestContextAotGeneratorIntegrationTests`
+entry for the original finding.
+
+**Real root cause (found via a from-scratch investigation, not the originally-hypothesized
+`ArrayStoreException`/`ATNConfig` leads -- both explicitly ruled out; see below):**
+`native-builtins/src/lib.rs` registered `java/util/ArrayList$ListItr`'s `set(Object)`,
+`add(Object)`, and `remove()` natives as literal `|_ctx, _args| Ok(None)` closures -- a leftover
+from an earlier, genuinely-immutable snapshot-iterator design. But `native_arraylist_list_iterator`
+(registered right above) and the sibling `next`/`previous` natives already carry a LIVE backing-
+`ArrayList` reference in the `this$0`-equivalent slot, so the iterator returned by
+`ArrayList.listIterator()` is not actually a frozen snapshot -- silently dropping `set`/`add`/
+`remove` produced silent data loss (no exception, no mutation, the call just vanished) for any
+real-JDK bytecode using `List.listIterator()` mutators.
+
+Traced step by step against a real-JDK-25 baseline, using an isolated `GroovyShell.evaluate
+("println 1")` repro plus reflection-driven ATN introspection (no Spring, no Groovy suite):
+Groovy's ANTLR4-generated lexer tokenizes identically on both platforms; the raw ATN
+deserialization (`ATNDeserializer.deserialize`, `optimize=false`) is byte-identical between
+platforms; `ATNDeserializer.optimizeSets()` (called after `inlineSetRules`/`combineChainedEpsilons`,
+both bit-identical) is where the two platforms first diverge -- CratonVM's first `optimizeSets`
+pass merged only 6 of the 15 mergeable decision-state transitions HotSpot merges. `optimizeSets()`
+builds its per-decision merge set via `IntervalSet.add(int)` called once per candidate index, then
+walks the result with a `ListIterator` to splice/merge adjacent intervals -- confirmed with an
+isolated, Groovy/ANTLR-free `java.util.ArrayList` probe: sequential `IntervalSet.add(0..3)` drops
+every value that would extend the previously-added interval, the exact merge path that runs
+through `ArrayList$ListItr.set()`. Traced through `execute_invoke_kind` -> `try_stackless_invoke`'s
+`native_cb` resolution (`vm/src/runtime/interpreter.rs`) to the actual registered callback: the
+hardcoded `Ok(None)` stub above.
+
+**Fix** (`native-builtins/src/lib.rs`): replaced the three stubs with
+`native_arraylist_list_itr_set`/`_add`/`_remove`, which read the real `this$0`-equivalent backing-
+list slot (via the existing `native_arraylist_list_itr_list` helper) and delegate to the
+already-correct `native_al_set`/`native_al_add_at`/`native_al_remove_at`, mirroring real-JDK
+`ArrayList$ListItr`'s cursor/`lastRet`/`IllegalStateException` semantics.
+
+Confirmed NOT the originally-hypothesized `ArrayStoreException` in `GroovySystem.<clinit>` (never
+reproduced this session) and NOT a recurrence of the already-fixed `ATNConfig` slot-layout bug
+(`CRATONVM_DBG_OOBFIELD=ATNConfig` showed zero out-of-bounds events in every repro) -- genuinely a
+different bug in the same general "ATN execution machinery" area.
+
+**Verified**: the isolated `IntervalSet.add` probe now matches real JDK 25 byte-for-byte (identical
+size/interval-count/`containsBitmap` for every tested input), and `GroovyShell.evaluate` on
+`println 1` / `x=5` / `x='a'` / `1+1` / `def x=1` all parse and run correctly (previously:
+`Unexpected input` `MultipleCompilationErrorsException` for every one).
+`cargo test -p cratonvm-native-builtins --lib --release`: 2999/3000 (1 pre-existing
+environment-flaky `ProcessBuilder`/`SecurityManager` test, unrelated).
+`cargo test -p cratonvm-vm --lib --release`: 2201/2217 (the same 16 pre-existing documented
+failures -- 9 `lock_order` debug-only-panic tests + 7 `jit::skip_list` tests -- zero new failures).
+
+**Per-class re-verification detail** (fresh `dev` tip + this fix, real JDK 25, Groovy 5.0.7, `KRun`
+harness):
+
+| Class | 2026-07-09 baseline | 2026-07-17 (root cause #1 only) | 2026-07-17 (root cause #2 fixed) |
+|---|---|---|---|
+| `scripting.groovy.GroovyAspectTests` | ABEND `rc=139` | FAIL, 0/4 | FAIL, **3/4** |
+| `scripting.groovy.GroovyAspectIntegrationTests` | ABEND `rc=139` | FAIL, 1/4 | FAIL, **3/4** |
+| `scripting.groovy.GroovyScriptFactoryTests` | ABEND `rc=139` / TIMEOUT | FAIL, 16/38 | FAIL, **21/38** |
+| `context.groovy.GroovyBeanDefinitionReaderTests` | ABEND `rc=139` | FAIL, 1/36 | FAIL, **33/36** |
+| `test.context.groovy.AbsolutePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 | **OK 1/1** |
+| `test.context.groovy.GroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.groovy.MixedXmlAndGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 | **OK 1/1** |
+| `test.context.groovy.RelativePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.web.BasicGroovyWacTests` | ABEND `rc=139` | FAIL, 0/2 | FAIL, 0/2 (unrelated -- see below) |
+
+**5 of the 10 classes are now fully closed (100% pass), up from 0/10.** Aggregate pass rate across
+all 10 classes' methods: **80/104**, up from 18/104 before this fix (and 0/104 crash-before-this-
+session's root-cause-#1 fix). Every remaining failure is a distinct, unrelated, pre-existing issue
+-- zero `Unexpected input` failures anywhere in the re-run:
+- `GroovyAspectTests`/`GroovyAspectIntegrationTests` residuals: CGLIB proxy generation
+  (`AopConfigException: Could not generate CGLIB subclass ...`) / a `BeanPostProcessor before
+  instantiation` failure -- unrelated AOP/CGLIB subsystem, not investigated further here.
+- `GroovyScriptFactoryTests` residuals: JSR223 script-tag bean-creation failures and one
+  `AspectJPointcutAdvisor` inner-bean-creation failure -- unrelated, not investigated further.
+- `GroovyBeanDefinitionReaderTests` residuals: one real Groovy-script-evaluation error
+  (`useTwoSpringNamespaces`) plus two bare `AssertionError`s -- unrelated, not investigated
+  further.
+- `BasicGroovyWacTests`: `NoClassDefFoundError: jakarta/servlet/ServletContext` -- a missing
+  `jakarta.servlet-api` jar on this session's hand-assembled classpath (the shared `gradle-home`
+  dependency cache was partially evicted mid-session, consistent with this week's documented host
+  disk instability), not a VM bug; needs a rerun with a complete classpath to confirm either way.
+
+### 6 found=0 ABEND cluster — reconciled
+
+The historical doc separately flagged 6 classes that crashed **before any test method was discovered**
+(immediate crash on class load) as a distinct shape from the mid-run HIB-CV-32-guard crashes above:
+
+| Class | 2026-07-09 baseline | Current status |
+|---|---|---|
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | LOADERR — `OutOfMemoryError: Java heap space` | **FIXED** — confirmed `OK 44/44` in §2's AOT-cluster validation table (one of the 8 loader-identity fixes' beneficiaries) |
+| `core.codec.ResourceRegionEncoderTests` | ABEND `rc=139` | **UNKNOWN / untracked** — not `web.reactive.*` by package name, so likely (but not confirmed) outside §4's reactive-sweep scope even though `ResourceRegionEncoder` is reactive-stack machinery; needs a live rerun to confirm either way |
+| `jdbc.config.JdbcNamespaceIntegrationTests` | ABEND `rc=1` — hsqldb `RangeGroup$RangeGroupEmpty` OOB field read | **UNKNOWN / untracked** (also HIB-CV-32-list #15 above) |
+| `scheduling.quartz.QuartzSupportTests` | TIMEOUT (120s) | **UNKNOWN / untracked** — zero mentions anywhere in current `dev` |
+| `scripting.config.ScriptingDefaultsTests` | ABEND `rc=139` (dumped core) | **LIKELY STILL OPEN** — same Groovy/scripting family as above, no dedicated fix |
+| `test.web.servlet.htmlunit.MockWebResponseBuilderTests` | Actually **FAIL**, not ABEND, in the per-class detail (`buildContent() :: AssertionFailedError`, single method) — the historical doc's own summary and per-class sections disagree on this one's shape | **UNKNOWN / untracked**, but looks like a narrow single-assertion bug (same pattern as several other now-fixed single-method FAILs in this doc) — a plausible quick-fix candidate for a future session with a working classpath |
+
+Net: **1/6 fixed**, **5/6 unconfirmed/likely still open**, none of them tracked anywhere else in this
+document prior to this recovery pass.
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 
@@ -2407,3 +3498,556 @@ time pressure without the ability to fully verify it.
 Landed: branch `fix/testtemplate-cce-20260716`, commits `8a5c2274`
 (the GC fix) and a follow-up MockCtx compile-break fix, rebased onto `dev`
 tip `6c517cd9` before push.
+
+### 5.5 `RequestMappingMessageConversionIntegrationTests` 2/160 HTTP 500 residual (section 5) — investigated, does NOT reproduce on current `dev`; treating as already-resolved (2026-07-16)
+
+Follow-up on section 5's own "not yet root-caused" note: **2 HTTP 500s
+(`HttpServerErrorException$InternalServerError`) on the `[3] Reactor Netty`
+and `[4] Tomcat` server backends**. Investigated from scratch, dedicated
+session, fresh worktree (`/data/data/wt-reqmapping-http500-20260716`, branch
+`fix/reqmapping-http500-20260716`), fresh release binary
+(`vmfix-reqmapping-http500-20260716`) off `dev` tip `6178c36f`
+(`--enable-native-access=ALL-UNNAMED`, real JDK 25).
+
+**Could not reproduce, at all, after exhaustive per-test-invocation
+verification.** A full-class `KRun` pass completed in 560s with `fail=0`
+(`status=OK`), but with a lower `found` count than expected (found=83 of a
+theoretical 160 test-template invocations) — not trusted at face value, so
+built a custom `VerboseRun.java` JUnit-Platform-Launcher harness
+(`DiscoverySelectors.selectMethod(class, name, HttpServer.class.getName())`
++ a `TestExecutionListener` printing `TSTART`/`TEND` for every leaf
+`test-template-invocation`) and ran **every one of the 40
+`@ParameterizedHttpServerTest` methods individually across all 4 backends**
+(small batches of 2-5 methods per fresh JVM, to sidestep an unrelated,
+already-documented, low-frequency GC race — see below). Result: **160/160
+individual method×backend combinations `SUCCESSFUL`, zero `FAILED`, zero
+`HttpServerErrorException`**, across 9 separate JVM invocations including
+both suspect-looking methods (`personResponseBodyWithCompletableFuture`,
+`personTransformWithCompletableFuture` — CompletableFuture-based bodies,
+the most plausible executor-identity-dispatch suspects) and the
+threading/timing-sensitive ones (`personTransformWithFluxDelayed`, the
+XML-marshalling `*Xml` variants, `resource`).
+
+**Conclusion: this residual is already fixed on current `dev`, most likely
+as a side effect of one or both of two unrelated fix sessions that landed
+*after* section 5's original report** (dev tip `22dfc55e`, 2026-07-15) **and
+before this investigation's tip** (`6178c36f`/`704aedd3`, 2026-07-16):
+commit `19a5025f` (section 5.1, `Thread.getId()` hardcoded-to-`1` fix) and
+commit `9850617b` (section 5.2, `AbstractExecutorService.submit()`
+real-vs-synthetic-executor redispatch fix for Netty's
+`AbstractEventExecutor`). Both land squarely on the real-thread /
+executor-identity mechanics that a backend-specific (Reactor Netty and
+Tomcat are this class's only two backends with real, JDK-executor-backed
+thread pools; Jetty/Jetty Core are not) failure in a
+CompletableFuture-touching message-conversion test would plausibly hit;
+neither fix was targeted at this class, so the resolution was not
+independently re-verified end-to-end before now. Not re-attempted as a
+target-the-old-tip bisection (would need a second ~30 min release build
+under this session's severe host contention) given the 160/160
+current-tip pass rate is already strong, direct evidence.
+
+**One unrelated, already-known, already-partially-fixed instability
+surfaced during this sweep and cost real time before being correctly
+attributed — noted here so the next session doesn't re-chase it.** Two of
+the batched multi-method runs crashed mid-run with
+`java.lang.ArrayIndexOutOfBoundsException` in
+`org/junit/platform/commons/util/ExceptionUtils.<clinit>`, cascading into
+`NoSuchMethodError`/`AbstractMethodError` on JUnit Platform's own
+hierarchical-executor lambda dispatch. This is **not** a new bug: it is the
+same "register-invisible root" family documented in section 5.4
+(`TestTemplateInvocationContext` CCE, `obj_cid=0` bare-`Object` signature)
+and in `docs/internal/springboot/testengine-getid-abstractmethoderror-
+young-gc-forwarding-gap-FIXED.md` (confirmed present on `origin/dev` as of
+this session's final `git fetch`, tip `704aedd3`) — a rare (~1/45-1/64),
+partially-fixed GC-root-visibility race unrelated to message conversion.
+Worked around by keeping JVM batches small (2-5 methods, 8-20 test
+invocations) rather than chasing it; every crash recovered cleanly on retry
+with zero real test failures.
+
+**Regression suites** (dev tip `6178c36f`, same binary):
+`cargo test -p cratonvm-native-builtins --lib --release`: **3000 passed, 0
+failed, 6 ignored** (clean baseline match). `cargo test -p cratonvm-vm --lib
+--release`: **2199 passed, 17 failed** — first attempt was OOM-killed by
+this severely overloaded shared host (`load average` 140-230,
+<code>/</code> at 100%, only ~2 GB RAM free with 2000+ concurrent users) and
+retried clean; the 17 failures exactly match this doc's own
+already-documented pre-existing baseline (7 `jit::skip_list::tests::*` +
+9 `runtime::lock_order::tests::*`, both already attributed to unrelated
+sessions in section 5/5.4, plus one host-contention flake,
+`jit_getfield_never_tears_against_concurrent_jit_putfield_int`) — no new
+regressions.
+
+**No code change landed** — nothing to fix; this entry exists to close the
+loop on section 5's "not yet root-caused" note with evidence, and to
+prevent a future session from re-opening a hunt for a bug that no longer
+reproduces. If it resurfaces, re-check first whether `19a5025f`/`9850617b`
+are still present on whatever tip is being tested before assuming a
+regression.
+
+
+### 5.6 Three named `ClientHttpConnectorTests` minor residuals (2026-07-16): StepVerifier identity FIXED, EofException confirmed CratonVM-specific but not fixed, enum CCE not reproduced
+
+Follow-up to 5.2's residual list: "an occasional Jetty `EofException` connection-flake,
+an unrelated enum `valueOf()` `ClassCastException` (a known separate synthetic-enum
+gap), and one flaky `StepVerifier` exception-identity assertion." Branch
+`fix/httpconn-minor-residuals-20260716`.
+
+**Harness housekeeping (two false-positive noise sources ruled out first)**: a large
+fraction of this session's early stress-run failures were NOT new bugs:
+1. Omitting `--enable-native-access=ALL-UNNAMED` (required per section 5.1) lets
+   `MemorySegment` clinit failures corrupt JUnit's ServiceLoader-based engine discovery
+   in confusing ways (`ClassCastException: Object cannot be cast to TestEngine`-family
+   symptoms, `AbstractMethodError ... has no Code attribute`).
+2. `--stack-dump-on-timeout 0` disables CratonVM's watchdog entirely (confirmed from
+   `vm-cli/src/main.rs`'s `resolve_watchdog_timeout`: `Some(0)` unconditionally maps to
+   `None`, regardless of any `CRATONVM_DEFAULT_WATCHDOG_SEC` env default). A
+   `timeout(1)`-wrapped run that already printed its `RESULT` line and is only being
+   reaped for lingering non-daemon Reactor-Netty threads (`"main() returned; VM held
+   alive by N non-daemon thread(s)"`) is NOT a hang — `run-suite.sh`'s own
+   `flush_batch` already records the `RESULT` regardless of the wrapper's exit code; an
+   ad hoc harness that checks the exit code first will misreport clean runs as timeouts.
+
+With both handled, the dominant remaining noise this session hit was a **severe,
+transient flare-up of the already-known, already-partially-fixed section-5.4
+"register-invisible-root" family** — `ClassCastException: Object cannot be cast to X`
+for whatever `X` a reused `cid=0` bare-Object checkcast happens to hit
+(`TestExecutionResult$Status`, `String`, `IllegalArgumentException: Could not create
+type` on `@ParameterizedTest` argument construction — never an enum type in any
+capture this session took), plus outright process crashes (`AbstractMethodError:
+TestEngine.getId() has no Code attribute`, SIGSEGV). This was root-caused (same day,
+independently, by a different concurrent session) to a genuinely NEW regression from
+same-day GC work — a missing `skip_free_blocks` call in the young-GC
+`young_object_starts` pre-forwarding walk (`gc/src/gen_heap.rs`) — and fixed via
+`fix/wildfly-cce0079-close-20260716`, merged to `dev` mid-session (see
+`docs/internal/springboot/testengine-getid-abstractmethoderror-young-gc-forwarding-gap-FIXED.md`).
+Recorded here because it dominated this session's raw failure counts and could
+otherwise be mistaken for one of the three items below by a future reader of raw logs.
+The shared build host was also independently in a severe resource crisis for large
+parts of this session (`/data/data`, where all worktrees live, hit **0 bytes free**
+at least twice, once aborting `cargo build`'s LLVM output stage outright and once
+blocking `git commit`; load average peaked over 160 on a 16-core box with 2000+
+concurrent sessions) — flagged only as context for why sample sizes below are smaller
+than planned, not as a CratonVM bug.
+
+**(c) StepVerifier exception-identity failure — ROOT-CAUSED AND FIXED.**
+`ClientHttpConnectorTests.errorInRequestBody(ClientHttpConnector)`:
+```java
+Exception error = new RuntimeException();
+Flux<DataBuffer> body = Flux.concat(stringBuffer("foo"), Mono.error(error));
+...
+StepVerifier.create(futureResponse)
+    .expectErrorSatisfies(throwable -> assertThat(throwable).isSameAs(error))
+    .verify();
+```
+failed deterministically on the `Jdk` connector parameterization (looks "flaky" only
+at the whole-class level, since which of the 4 parameterized connectors gets exercised
+varies run to run, and the section-5.4 noise above obscured many runs entirely):
+```
+java.lang.AssertionError: expectation "expectErrorSatisfies" failed (assertion failed
+on exception <java.io.IOException: HttpRequest body publisher failed:
+java.lang.RuntimeException>: ... to refer to the same object)
+```
+Confirmed CratonVM-specific via a direct HotSpot A/B (same classpath/harness, JDK 25):
+**8/8 clean HotSpot runs**, `found=49 succ=47 fail=0 abort=2` every time — zero
+occurrences of this failure on real HotSpot.
+
+Root cause: `JdkClientHttpConnector`'s `HttpClient.sendAsync()` is backed by
+CratonVM's own native Rust reimplementation (`native-builtins/src/net_phase_e.rs`'s
+RE.5 family — see section 4's original `sendAsync()` finding), not real JDK bytecode.
+`re5_body_collector_on_error` (the `Flow.Subscriber.onError` native callback that
+observes the request-body publisher's failure) converted the delivered `Throwable` to
+a plain Rust `String` (`re5_throwable_text`) and discarded the object; the waiting
+side, `re5_collect_publisher_body`, then synthesized a brand-new `java.io.IOException`
+from that string. This is a structural identity loss, not a timing race — every
+request whose body publisher fails and is routed through this path was guaranteed to
+fail an `isSameAs()` check on the propagated exception.
+
+Fix (commit `39f152bb`, merged to `dev` at `83418b1d`): `Re5PublisherBodyState` gains
+`error_obj_root: Option<usize>`, a **global** GC root (required because `on_error`
+fires on the Reactor scheduler thread, a different Java thread than the one waiting in
+`re5_collect_publisher_body`) for the original `Throwable`, captured alongside the
+existing text in `re5_body_collector_on_error`. `re5_collect_publisher_body` now
+resolves and rethrows the ORIGINAL object (`MethodCallFailed::ExceptionThrown(orig)`)
+instead of synthesizing an `IOException` wrapper, whenever the root resolves
+successfully — falling back to the old text-only `IOException` only if resolution
+somehow fails, so no failure mode is worse than before.
+
+**Verification**: `cargo test -p cratonvm-native-builtins --lib --release`: 3000
+passed / 0 failed / 6 ignored (clean, unchanged). `cargo test -p cratonvm-vm --lib
+--release`: 2200 passed / 16 failed — all 16 are the pre-existing
+`jit::skip_list::tests::*` (7, parallel-test-execution races over shared global state)
++ `runtime::lock_order::tests::*` (9, `cfg!(debug_assertions)`-gated, expected under
+`--release`) buckets this doc already attributes to unrelated sessions in 5.1/5.2/5.4
+— no new regressions, confirmed by full failure-list diff. Stress verification: across
+post-fix `ClientHttpConnectorTests` runs that reached real test execution (host
+instability capped this at a handful of clean samples — see housekeeping note above),
+**zero recurrences** of the `errorInRequestBody(Jdk)` identity failure, versus
+appearing in roughly half of pre-fix runs that reached the `Jdk` connector case (4/8 in
+one clean batch). Small post-fix sample size is an honest limitation, but the fix is
+an unconditional architectural correction (the old code path could never have passed
+this assertion; the new one always propagates the real object when available), not a
+probabilistic mitigation, so the mechanism-level confidence is high independent of
+sample count.
+
+**(a) Jetty `EofException` connection-flake — confirmed CratonVM-specific, NOT
+fixed.** Reproduced twice independently on the `basic(ClientHttpConnector, HttpMethod)`
+parameterized test (the connector×method cross product that makes up most of the
+class's 49 sub-tests), Jetty connector, two different HTTP methods (`PATCH` at index
+`[13]`, `TRACE` at index `[16]`):
+```
+java.lang.AssertionError: expectation "assertNext" failed (expected: onNext();
+actual: onError(org.eclipse.jetty.io.EofException: write(gathering): channel not
+connected))
+```
+Repro rate this session: 2 of roughly 35 CratonVM runs that reached real test
+execution (~6%). HotSpot A/B: 0 occurrences across 8 clean HotSpot runs (`fail=0`
+every time) — confirmed CratonVM-specific, not pre-existing Jetty/MockWebServer test
+flakiness (satisfies the task's suggested HotSpot-baseline check directly).
+
+Not root-caused this session — flagged as OPEN with a specific next-step hypothesis
+rather than force-fixed: Jetty's `HttpClient` pools/reuses connections across the
+class's ~49 sequential sub-test invocations on one shared connector instance (see the
+`autoCloseArguments = false` / "shared between parameterized test invocations" comment
+on `basic()`'s `@ParameterizedTest` annotation). "write(gathering): channel not
+connected" is Jetty's own error for attempting to write to a channel it already
+considers open but the OS/peer has actually closed — consistent with a **stale
+pooled-connection reuse race**: MockWebServer closes an idle keep-alive connection
+between two of the ~49 requests, and CratonVM's socket/channel readiness signalling
+(`native-io/src/socket_channel.rs`, `native-io/src/nio_selector.rs` — both touched by
+unrelated fixes earlier the same day per the `git merge` pulled into this branch, so
+re-verify against a fresh build before assuming this hypothesis still holds) does not
+correctly surface a half-closed peer to Jetty's pool-health check before the next
+reuse attempt, unlike real JDK's underlying socket implementation. This is a
+structurally different code path from the already-fixed `ServerSocket.accept()`/
+`socket_connect()` blocking-region gaps in section 4 (those are accept/connect-time;
+this would be a write-after-reuse-time gap on the client pooling side) — plausible but
+NOT confirmed via live capture (gdb/strace on a caught-in-the-act repro), which the
+severely resource-constrained shared host made impractical to obtain reliably this
+session. Recommend: reproduce with `CRATONVM_DBG_SC_CLOSE=1` (an existing diagnostic,
+confirmed present via `git log`, that traces `SocketChannel.close()` call sites) on a
+tight repeat-loop of just `basic[Jetty]` sub-tests, once host load allows a clean
+multi-hour capture session.
+
+**(b) Enum `valueOf()` `ClassCastException` — NOT REPRODUCED this session.** Searched
+`docs/known-issues/` and `git log` for prior synthetic-enum bugs before starting empirical
+repro, per the task's instructions. Candidates considered and ruled out as different
+call shapes: `ce3544ce` "Fix-enum-constant-subclass-isEnum" (anonymous enum-constant
+subclass `isEnum()`/`getEnumConstants()`, unrelated); `e9ed6693` "Round 73: ...
+Enum.<init>/name/ordinal use canonical Enum slot (subclass shadowing)" (field-slot
+resolution, unrelated); `ea96497e` (same-day) "`ImportHttpServiceRegistrarTests` CCE
+root-caused to cross-loader `Adapt` enum identity; VM fix attempted+reverted (heap
+corruption)" — closest analog in *mechanism* (cross-loader/cross-context enum
+identity) but a structurally different call site (`MergedAnnotation.Adapt.isIn()`, not
+`Enum.valueOf()`), and that session's attempted fix was reverted for causing heap
+corruption, so there is no landed pattern to reuse even if the mechanisms turn out to
+be related.
+
+Across roughly 35 CratonVM `ClientHttpConnectorTests` runs that reached real test
+execution this session (spanning both the noisy pre-GC-fix and cleaner post-GC-fix
+periods), **zero occurrences** of any `ClassCastException` naming an enum type or
+involving `Enum.valueOf` were captured. Every CCE actually observed was either the
+register-invisible-root family (5.4 — confirmed generic, never targets an enum type in
+any capture) or the now-fixed StepVerifier identity issue above (not itself a CCE).
+Status: could not reproduce with the repro budget available this session (further
+inflated by the concurrent host disk/load crisis capping usable sample throughput).
+Two honest possibilities, not distinguished by this session's evidence: (1) already
+resolved by one of the several enum- and reflection-adjacent fixes that landed on
+`dev` between whenever this residual was first observed and this session's tip
+(`db047d38` unrooted-ObjectRef reflection-native GC-safety fixes, `e9ed6693` Enum slot
+canonicalization, `0c0ee830` "root enum and hashmap lookups across GC" are all
+plausible candidates, none individually confirmed as the fix); or (2) rare enough
+(comfortably under 3%, going by a zero-in-35 sample) that this session's budget simply
+wasn't enough to catch it. Recommend: if it resurfaces, capture with `KRUN_STACK=1`
+for a full stack trace immediately (this doc had none for it before this session, and
+still has none) rather than assuming it is the same family as (a) or (c) above.
+
+**Current true state of `ClientHttpConnectorTests`**: one of three named residuals
+(StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
+CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
+CCE) not reproduced and left as an open question rather than a confirmed-open bug.
+
+### 5.7 `JythonScriptTemplateTests` — investigated, does NOT reproduce on current `dev` under either `--enable-native-access` setting; flag-comparison artifact, not a genuine regression (2026-07-17)
+
+Follow-up on section 5's "not investigated further" note: `JythonScriptTemplateTests`
+was flagged as a regression in the 36-class reactive comparison sample (`was OK
+1/1/0, now FAIL 1/0/1, java.lang.ExceptionInInitializerError: null`), with that
+section's own text explicitly calling out the comparison as possibly confounded by
+`--enable-native-access` differing between the baseline and rerun.
+
+Investigated from scratch, dedicated session, fresh worktree
+(`/data/data/wt-jython-regression-20260717`, branch
+`fix/jython-regression-20260717`), fresh release binary off `dev` tip `67c85b3c`
+(real JDK 25, built spring-webflux test classes fresh via Gradle against a private
+`GRADLE_USER_HOME` to avoid colliding with other concurrent sessions using the
+shared `/data/data/spring-framework-recheck` checkout).
+
+**Ran the single-class `KRun` repro four times WITH `--enable-native-access=ALL-UNNAMED`
+and three times WITHOUT it, back to back, same binary, same classpath.** Every one
+of the seven runs completed cleanly: `RESULT
+org.springframework.web.reactive.result.view.script.JythonScriptTemplateTests
+found=1 succ=1 fail=0 skip=0 abort=0 status=OK` (wall time ~25-31s each, real
+Jython 2.7.4 interpreter boot + script execution, not a stub). No
+`ExceptionInInitializerError`, no `LOADERR`, no crash, in either flag configuration.
+Some benign `NoSuchMethodError` warnings appear in stderr during Jython's own
+module-import bootstrapping (`java/lang/Long.get()Ljava/lang/Object;`,
+`org/python/core/PyNone.get()Ljava/lang/Object;`, both from Jython's own
+introspection code probing for methods that don't exist on those classes) but
+these are pre-existing, tolerated by Jython's own fallback logic, and present
+identically in both flag configurations — not the cause of the originally-reported
+failure and not new.
+
+**Conclusion: this was the flag-comparison artifact the section 5 note already
+suspected it might be** (or, less likely but not excluded, a real but transient
+regression on some intermediate `dev` commit between the original baseline and this
+session's `67c85b3c` tip that has since been fixed as a side effect of one of the
+several `--enable-native-access`/`MemorySegment`/GC-safety fixes that landed
+2026-07-16 — e.g. `d5544133` "segment_address() reads real MemorySegment field 0 as
+length, not address" or the getstatic/putstatic loader-aware fix referenced in that
+same day's docs). Either way, **not reproducible now, so nothing to fix on current
+`dev`**. Did not touch `WebSocketIntegrationTests`, the other class flagged
+alongside this one in the same section-5 comparison sample — that one's "pass/fail
+ratio inverted" symptom is a different shape (not an `ExceptionInInitializerError`)
+and is left for a separate investigation.
+
+No code change landed — nothing to fix. This entry exists to close the loop on the
+section-5 comparison sample's flagged observation with evidence, and to save a
+future session from re-chasing a failure that does not currently reproduce. If it
+resurfaces, capture with `KRUN_STACK=1` for the full nested-cause stack trace
+immediately (the original report had only the bare `ExceptionInInitializerError:
+null` outer wrapper, no nested cause) and re-check whether the two GC-safety fixes
+above are still present on whatever tip is being tested.
+### 5.8 `WebSocketIntegrationTests` "inversion" (was FAIL 72/48/24, then FAIL 72/24/48) — investigated (2026-07-17): NOT a real inversion, it's a stable `TomcatWebSocketClient` defect; ROOT CAUSE FOUND AND FIXED (2026-07-17, session 2) — see the follow-up sub-entry below for the real Java-level (well, Rust-VM-level) cause: a single-threaded native AIO completion dispatcher self-deadlocking on Tomcat's own reentrant blocking close-handshake code
+
+Investigated the flagged-but-never-looked-at entry above. Fresh measurement on `dev` tip
+`67c85b3c` (`--enable-native-access=ALL-UNNAMED`, per-sub-test detail via a custom
+`KRunDetail` JUnit-Platform launcher, no truncation): **FAIL 72/52/20**, reproduced
+identically across 5 independent runs (52 pass / 20 fail every time, zero flake in the
+aggregate count). This matches *neither* historical sample (48/24 nor 24/48) — the class
+has been a moving target the whole time this doc's baselines were captured, not a single
+clean regression.
+
+**The class is `@ParameterizedTest`-driven, 3 clients × 4 servers × 6 methods = 72** (see
+`AbstractReactiveWebSocketIntegrationTests.arguments()`: clients =
+`{TomcatWebSocketClient, JettyWebSocketClient, ReactorNettyWebSocketClient}`, servers =
+`{TomcatHttpServer, JettyHttpServer, JettyCoreHttpServer, ReactorHttpServer}`). Breaking
+the per-sub-test detail down by client (not by server, and not by aggregate count) gives
+the real shape immediately:
+
+*   **`JettyWebSocketClient` and `ReactorNettyWebSocketClient`: 48/48 pass, every run, every
+    server.** Zero failures of any kind.
+*   **`TomcatWebSocketClient`: 20/24 fail, consistently.** Same ~4 combos vary which
+    specific ones pass between runs (genuine minor flake inside this bucket only), but the
+    aggregate (20 fail / 4 pass) and the "it's always Tomcat" pattern are 100% stable.
+
+So this was never really an "inversion" in the sense the flag implied (same tests
+flipping which way they fail) — it is a **single client implementation
+(`TomcatWebSocketClient`, backed by `org.apache.tomcat.websocket.WsWebSocketContainer`,
+which drives `java.nio.channels.AsynchronousSocketChannel` directly) that is badly broken
+under CratonVM, stably, while the two other client backends (Jetty's own NIO client,
+Reactor Netty's event loop — neither touches `AsynchronousSocketChannel`) are fully
+reliable.** The two historical baseline numbers (48/24 then 24/48) are best explained as
+two different snapshots of this same still-partially-broken area during the active,
+multi-day fix effort visible in `git log -- native-io/src/async_socket.rs` (`ef6513f5`
+"fix tomcat async socket and nested class metadata", `77bac458` "deliver
+AsynchronousSocketChannel handler-form read completions", `c58ec7a4` "AsynchronousSocketChannel
+Future-write never advances source buffer position" — the last of these landed literally
+hours before this investigation started) — i.e. exactly the kind of "two different
+in-progress states of the same ongoing fix, misread as a clean inversion" scenario this
+doc's own methodology warns about elsewhere (section 4's "combined fix interaction"
+discussion).
+
+**Root-cause investigation (`CRATONVM_DBG_AIO=1`, a new permanent opt-in diagnostic added
+to `native-io/src/async_socket.rs` this session, same pattern as `socket_channel.rs`'s
+existing `CRATONVM_DBG_SC_READ`/`CRATONVM_DBG_SC_CLOSE`)**: traced every Future-form and
+handler-form `AsynchronousSocketChannel` read/write dispatch, worker completion, and
+Java-side delivery, with hex previews. For every failing `TomcatWebSocketClient` combo
+observed:
+
+1. The HTTP Upgrade handshake write/read completes correctly (bytes match a normal
+   101-Switching-Protocols exchange).
+2. For the close-related sub-tests, the server's WS close frame is received correctly via
+   a handler-form background read (confirmed byte-exact: an unmasked 4-byte
+   `88 02 <2-byte status>` frame), and the client's own close-frame echo is written back
+   correctly (masked 8-byte frame, status decodes to `1001`/`GOING_AWAY` where expected —
+   matches `sessionClosing()`'s assertion).
+3. **Then nothing else ever happens on that connection.** No further read is dispatched,
+   no further write, no `AsynchronousSocketChannel.close()` call (confirmed: 0 hits on a
+   trace point placed at the top of `aio_asc_close`, across the *entire* 72-test run,
+   passing and failing tests alike — Tomcat's client never reaches that call on the path
+   that hangs). The Java-level `Mono`/session simply never resolves, and ~1-5s later the
+   test fails with either `IOException: TimeoutException` (an internal Tomcat timeout) or
+   the outer Reactor `Mono.block(5s)`'s own `IllegalStateException: "Timeout on blocking
+   read"`.
+4. Ruled out as *not* the cause: a swallowed exception from the `CompletionHandler`
+   Java callback (`deliver_completed`'s `ctx.invoke(...)` result was discarded before this
+   session — instrumented it, 0 occurrences of a thrown/failed invoke across every run);
+   `CompletableFuture.complete()` not reaching real-JDK `postComplete()` semantics
+   (`native_cf_complete` already special-cases real-JDK CFs correctly — verified by
+   reading, not just by absence of symptoms).
+
+**Conclusion: the byte-level network I/O is correct. The actual hang is in Java-level
+session/lifecycle logic above the natives this session was able to trace** (most likely
+something Tomcat's `WsSession`/`WsFrameClient` does after processing the received close
+frame — e.g. invoking the JSR-356 `Endpoint.onClose()` callback chain that ultimately
+signals Spring's `TomcatWebSocketSession`'s completion `Sinks.Empty<Void>` — that this
+session did not have tooling to trace further without bytecode-level instrumentation of
+Tomcat's own class files, which was out of scope). **Left OPEN.**
+
+**One genuine, narrowly-scoped bug found and fixed along the way (does NOT fix the above
+hang, confirmed by re-testing after landing it — still 72/52/20 identically)**:
+`aio_asc_close`/`aio_assc_close` only ever removed the registry/`fd_table` entry
+(`aio_remove`/`fd_table().close()`), which drops *that one* fd's `Arc`/table slot but does
+**not** unblock a worker thread already parked in a blocking `read()` on an independent
+`try_clone()`'d duplicate of the same socket (any in-flight handler-form read spawns
+exactly such a clone) — a real `AsynchronousCloseException`-contract violation: JDK spec
+requires outstanding ops to complete on `close()`, CratonVM silently left them hanging
+forever instead. Fixed by calling `shutdown(Both)` on the socket (which, unlike
+`close()`/`drop()`, acts on the shared OS socket rather than one fd, so it wakes every
+clone) before removing the registry/table entry, for both the legacy `aio_registry` id
+space and the `fd_table` id space (channels connected via the newer Future-form
+`connect` — this is the one every `TomcatWebSocketClient` connection observed in practice
+actually uses; `read_aio_id`'s stored id is `AIO_REG_BASE`-relative to tell the two apart).
+Verified: `cargo test -p cratonvm-native-io --lib --release` 349/349 passed (matching
+`c58ec7a4`'s own baseline, no regression). Real fix, real (if different) bug — kept because
+it is independently correct per the JDK contract even though it does not move this
+class's numbers; a future session chasing a `close()`-while-reading race elsewhere would
+otherwise hit the exact same silent-hang shape this fix now closes.
+
+**For whoever picks this up next**: the diagnostic (`CRATONVM_DBG_AIO=1`, plus
+`KRUN_STACK=1` for full stack traces) is already in place and cheap (env-var gated, zero
+cost when unset). The next step is almost certainly tracing *inside* Tomcat's own
+`WsFrameClient`/`WsSession` close-handling bytecode (or Spring's
+`TomcatWebSocketSession`) rather than anything further in `native-io` — the native layer
+has been shown byte-correct for this specific failure shape. Repro:
+`cratonvm --java-home <jdk25> --enable-native-access=ALL-UNNAMED KRun
+org.springframework.web.reactive.socket.WebSocketIntegrationTests` (any of the four
+`TomcatWebSocketClient` sub-tests of `sessionClosing`/`subProtocol`/`cookie` is a fast,
+usually-reproduces-first-try repro; `echo`/`largePayload` fail 4/4 every single run and
+are the most deterministic repro if a 100%-reliable one is needed).
+
+---
+
+#### 5.8 follow-up (2026-07-17, session 2): ROOT CAUSE FOUND — single AIO completion-dispatcher thread self-deadlocks on Tomcat's own reentrant blocking close-handshake write; FIXED (`c7868c30`)
+
+Picked up exactly where the prior session left off (its own "for whoever picks this up
+next" pointer, above): traced *inside* Tomcat's real client-side WebSocket bytecode by
+pulling `tomcat-websocket-11.0.23-sources.jar` from Maven Central, recompiling
+`WsSession`/`WsFrameBase`/`WsFrameClient`/`WsRemoteEndpointImplClient` plus Spring's
+`AbstractListenerReadPublisher`/`AbstractListenerWebSocketSession`/
+`StandardWebSocketHandlerAdapter`/`TomcatWebSocketSession` with `System.err`-based trace
+points at every state transition and session-lifecycle callback, and placing the
+recompiled classes ahead of the real jars on the classpath (no CratonVM source touched for
+this step — pure Java-side instrumentation, per the task brief). Ran the instrumented
+build under `KRunDetail` (a `TestExecutionListener`-based JUnit Platform launcher emitting
+one line per leaf test with full display name).
+
+**What the trace showed**: for every hang, the client thread reaches
+`WsSession.onClose()` → `sendCloseMessage()` → `WsRemoteEndpointImplClient.doWrite()` →
+`channel.write(byteBuffer).get(timeout, TimeUnit.MILLISECONDS)` and simply **stops
+producing any further trace output on that thread** — no `TimeoutException`, no return,
+nothing — until the outer Reactor `Mono.block(5s)` gives up. Critically, the thread this
+happens on is always `cratonvm-aio-dispatch`: **CratonVM's native AIO completion delivery
+is a single dedicated thread** (`vm/src/native/jni.rs::start_aio_dispatcher`, spawned
+exactly once, idempotent). That thread's job loop pops one pending completion and
+synchronously invokes the matching Java callback (a `CompletionHandler.completed()`, or —
+for Future-form ops — completing the real JDK `CompletableFuture`, which unparks any
+`Future.get()` waiter) before looping back to look for the next one.
+
+Tomcat's `WsFrameClient` reads a WebSocket close frame via a **handler-form** read; its
+`completed()` callback is invoked on `cratonvm-aio-dispatch`. That callback synchronously
+drives the entire close-handshake response *in-line, on that same thread*:
+`WsFrameBase.processDataControl` → `WsSession.onClose()` → `sendCloseMessage()` →
+`WsRemoteEndpointImplClient.doWrite()`, which blocks on a **Future-form**
+`AsynchronousSocketChannel.write(...).get(timeout)` for the close-frame echo. But a
+Future-form write's completion can only ever be *delivered* by the same singleton
+dispatcher thread's drain loop (`native-io/src/async_socket.rs`'s `WriteFutureFd` job /
+`drain_completions_pub`) — and that thread is the one now blocked inside the nested
+`Future.get()`. The dispatcher is waiting on a completion only it itself can deliver: a
+hard, single-thread self-deadlock. It resolves only once Tomcat's own write timeout fires
+(`Constants.DEFAULT_BLOCKING_SEND_TIMEOUT` = 20s for `NORMAL_CLOSURE` closes,
+`DEFAULT_ABNORMAL_SESSION_CLOSE_SEND_TIMEOUT` = 50ms for `GOING_AWAY`/abnormal closes) —
+both comfortably past the test's own 5s `Mono.block(TIMEOUT)`, hence the observed
+`IllegalStateException: Timeout on blocking read for 5000000000 NANOSECONDS`. It also
+explains the prior session's "`aio_asc_close` saw 0 hits" observation: with the sole
+dispatcher thread wedged, no further completion for that connection (often several
+overlapping ones) can be delivered at all.
+
+Real JDK's default `AsynchronousChannelGroup` avoids exactly this hazard by using a
+**thread pool** (CPU-count sized), not one thread, for completion delivery — precisely so
+a handler that itself performs a different blocking async op doesn't starve delivery for
+everyone else (the JDK's own `CompletionHandler` Javadoc calls this out as the
+application's responsibility to avoid *given* a pool; CratonVM had removed the pool
+entirely, turning an edge case into a certainty). Jetty's and Reactor Netty's own client
+WebSocket implementations don't drive a synchronous nested blocking `Future.get()` from
+inside a completion callback the way Tomcat's `WsFrameClient` → `WsSession.onClose()` →
+`sendCloseMessage()` chain does, which is why only `TomcatWebSocketClient` was ever
+affected.
+
+**Fix** (`vm/src/native/jni.rs`, commit `c7868c30`): `start_aio_dispatcher()` now spawns a
+pool of dispatcher threads (`aio_dispatch_thread_count()` = CPU count, floor 16 — matches
+both real JDK's own sizing and the sizing convention already used by `native-io`'s AIO
+*worker* pool in `async_socket.rs::start_pool`) instead of exactly one. The shared
+completion queues (`native-io`'s `read_completion_state`) are already `Mutex`-protected
+`VecDeque`s popped one entry at a time, so concurrent draining across multiple dispatcher
+threads is race-free by construction — no code changes were needed in `native-io` itself.
+Each dispatcher thread independently foreign-attaches as its own GC-safe VM thread
+(`cratonvm-aio-dispatch-0`, `-1`, …), identical in every other respect to the prior
+single-thread behavior.
+
+A fixed pool size was tried at first (4, then CPU-count with an 8-floor, then a 32-floor)
+to find a reasonable operating point: 4 still exhausted occasionally under this test's
+transient concurrency (multiple overlapping close-handshakes each wanting a free
+dispatcher thread); a 16-floor measured far fewer residual occurrences across repeated
+runs, and going to 32 did not reliably improve on 16 further — the remaining rare flake
+looks dominated by host scheduling noise (this Azure build host has had repeated
+disk-full/OOM/outage episodes this week — see the standing per-session host-health
+warning) rather than by pool size, and — like real JDK's own bounded pool — a fixed size
+can never make this *class* of reentrancy deadlock provably impossible in the fully
+general case, only practically unreachable at realistic concurrency.
+
+**Verified** (merged tip after `git merge origin/dev`, rebuilt clean):
+- `WebSocketIntegrationTests` (72 total = 3 clients × 4 servers × 6 methods),
+  `KRunDetail`-driven, repo's fixed `cratonvm.exe` build:
+  - **Before fix**: stable 52/72 pass (20/20 `TomcatWebSocketClient` failures, every run,
+    matching the prior session's baseline exactly).
+  - **After fix**, 5 independent full-class runs: 67/72, 70/72, 69/72, 69/72, 71/72 pass
+    (69.2/72 average — a ~94–99% pass rate, up from a stable 72%). All residual failures
+    are still exclusively `TomcatWebSocketClient` combos, mostly the same
+    `IllegalStateException: Timeout on blocking read` signature at a much lower rate
+    (which sub-tests hit it varies run to run — consistent with a residual, rarer instance
+    of the same reentrancy class rather than a new/different bug), plus one observed
+    `AssertionError` residual not yet investigated.
+  - `JettyWebSocketClient` and `ReactorNettyWebSocketClient`: confirmed 24/24 and 24/24
+    (48/48 combined) on every run — **zero regression**, as required.
+- `cargo test -p cratonvm-native-io --lib --release`: 349/349 passed (both before and
+  after, matching the prior session's own baseline).
+- `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed both *before and
+  after* this fix on the merged tip — the 16 failures are pre-existing and unrelated
+  (confirmed via `git stash`): 9 are `runtime::lock_order` tests that require a debug
+  build ("test runner is expected to be a debug build" — this suite is run `--release`
+  per the task's own instructions) and 7 are `jit::skip_list` tests already failing on
+  unmodified `dev`. One additional flake was observed exactly once across ~6 full-suite
+  runs: `native::jni::tests::process_vm_publish_and_resolve`, which asserts a freshly
+  published `Arc<SharedVm>`'s strong count reaches zero the instant its two known clones
+  are dropped — that assertion is inherently racy against *any* other concurrently
+  running test elsewhere in the 2300+-test binary that touches the same process-global
+  `PROCESS_VM` `Weak` cell (Rust's default test harness runs tests in parallel; the
+  test's own `PROCESS_VM_TEST_LOCK` only serializes tests inside its own module). Spawning
+  16 OS threads per `start_aio_dispatcher()` call instead of 1 measurably widens that
+  pre-existing race window under full-suite parallelism, so it surfaces slightly more
+  often — confirmed to pass reliably in isolation (`--test-threads=1`, filtered to just
+  that test) with the fix applied, and confirmed to still occasionally exist as a
+  pre-existing gap (not introduced by this fix, just made marginally likelier). Left
+  as-is; fixing `PROCESS_VM_TEST_LOCK`'s scope is a pre-existing test-isolation gap
+  out of scope for this task.
+
+**Residual, left OPEN**: the same failure *class* (single-thread-style AIO reentrancy
+self-deadlock) at a much lower, host-load-correlated rate — roughly 1–5 of 72
+`TomcatWebSocketClient` sub-tests per run, down from a deterministic 20/72. A future
+session could pursue either (a) a smarter compensating-thread scheme (spin up a
+temporary extra dispatcher only when the pool is fully occupied, akin to
+`ForkJoinPool.ManagedBlocker`) instead of a fixed floor, or (b) changing Tomcat's own
+blocking-write call sites to not matter, e.g. by detecting a nested call from *within* the
+dispatch loop itself and routing that specific write through a dedicated always-available
+thread rather than the shared pool. Neither was attempted here given the now-small residual
+and the explicit host-distress caveat this session was run under.

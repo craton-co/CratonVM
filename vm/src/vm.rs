@@ -2444,6 +2444,7 @@ mod tests {
         // Register a lambda proxy: applyAsInt(x) РІвЂ вЂ™ Math.abs(x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2499,6 +2500,7 @@ mod tests {
         // Register a lambda: applyAsInt(x) РІвЂ вЂ™ Math.max(captured_val, x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2562,6 +2564,7 @@ mod tests {
         // Register a lambda: accept(s) РІвЂ вЂ™ ps.println(s) via captured PrintStream
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: "java/util/function/Consumer".to_string(),
             sam_method_name: "accept".to_string(),
             sam_descriptor: "(Ljava/lang/Object;)V".to_string(),
@@ -2631,6 +2634,7 @@ mod tests {
         // Insert a Lambda call site
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = ResolvedCallSite::Lambda(LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: "java/lang/Runnable".to_string(),
             sam_method_name: "run".to_string(),
             sam_descriptor: "()V".to_string(),
@@ -2688,6 +2692,7 @@ mod tests {
         shared.lambda_proxies.write().insert(
             proxy1,
             LambdaCallSite {
+                functional_interface_id: None,
                 functional_interface: "java/lang/Runnable".to_string(),
                 sam_method_name: "run".to_string(),
                 sam_descriptor: "()V".to_string(),
@@ -2705,6 +2710,7 @@ mod tests {
         shared.lambda_proxies.write().insert(
             proxy2,
             LambdaCallSite {
+                functional_interface_id: None,
                 functional_interface: "java/util/function/Supplier".to_string(),
                 sam_method_name: "get".to_string(),
                 sam_descriptor: "()Ljava/lang/Object;".to_string(),
@@ -7435,6 +7441,7 @@ mod tests {
         use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
+                functional_interface_id: None,
             functional_interface: functional_interface.to_string(),
             sam_method_name: sam_name.to_string(),
             sam_descriptor: sam_desc.to_string(),
@@ -41541,6 +41548,42 @@ mod tests {
     }
 
     #[test]
+    fn process_handle_parent_is_present_p57() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
+        let handle = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle",
+            "current",
+            "()Ljava/lang/ProcessHandle;",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let parent = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/ProcessHandle",
+            "parent",
+            "()Ljava/util/Optional;",
+            &[handle],
+        )
+        .unwrap()
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .unwrap();
+        let parent_handle = shared
+            .heap
+            .get_field(parent, 0)
+            .as_object()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(shared.heap.get_field(parent_handle, 0), Value::Long(pid) if pid > 0));
+    }
+
+    #[test]
     fn decimal_format_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
@@ -65616,6 +65659,7 @@ mod tests {
                 proxies.insert(
                     cid,
                     crate::classloading::resolution::LambdaCallSite {
+                functional_interface_id: None,
                         functional_interface: "test/Func".to_string(),
                         sam_method_name: "apply".to_string(),
                         sam_descriptor: "()V".to_string(),

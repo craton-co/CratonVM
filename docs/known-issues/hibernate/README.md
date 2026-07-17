@@ -1,39 +1,45 @@
-# Hibernate ORM test suite — known issues index (2026-07-11 full-suite audit)
+# Hibernate ORM test suite — known issues index (2026-07-16 full-suite rerun)
 
-Source: full 4548-class Hibernate ORM 8.0 test suite run on the Azure remote
-host (`20.83.144.174`), `dev` merged to `44f16ee2`+ (see individual docs for
-exact commits), real-JDK, JIT on, 4 shards, `TIMEOUT=300`. Result:
-`PASS=4095 (90.0%) FAIL=267 HANG=90 NOTESTS=91 ABORTED=5 CRASH=0`. Zero
-crashes suite-wide — a strong signal the recent JIT `getfield` SIGSEGV
-regression fix ([hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md](../../internal/fixed-suite-bugs/hib-global-temptable-nondeterministic-sigsegv-20260710-RESOLVED.md))
-holds at full scale.
+Source: full 4548-class Hibernate ORM 8.0 test suite run on this local Windows
+host, `dev` merged to `2f02e939d`, real-JDK, JIT on, 4 shards, `TIMEOUT=1200`.
+Result: `PASS=4437 (97.6%) FAIL=10 HANG=1 CRASH=1 ABORTED=8 NOTESTS=91`. This is
+a large improvement over the 2026-07-11 audit baseline (`PASS=4095, 90.0%`),
+reflecting the large number of concurrent fix branches merged into `dev`
+since (statistics-counter cluster, sql.exec cluster, enhancement/setter
+cluster, ANTLR entity-graph NPE cluster, immutable-collection and
+cascade-multipath hang clusters, connections/proxy serialization cluster,
+boot-models XML/Jandex cluster, and the assertion-longtail catalog — see
+`docs/internal/fixed-suite-bugs/` for the individual write-ups). Every
+cluster from the 2026-07-11 audit is now archived there as FIXED/RESOLVED.
 
-The 453-class non-passed list is saved as the new canonical baseline at
-`apps/hib-suite-runner/nonpassed.txt` (also `nonpassed453.txt`) for future
+**Data-loss note:** the exact 2026-07-11 453-class and later 224-class
+non-passed baselines (`apps/hib-suite-runner/nonpassed*.txt`) were lost to
+local-disk-exhaustion file corruption discovered 2026-07-16 (511/683 files in
+`apps/hib-suite-runner`, including `rerun.sh`, `common.args`,
+`CratonRunner.java/.class`, and `testlist.txt`, were silently truncated to
+zero bytes). The harness driver files were recovered from an intact
+`hib-suite-runner.tar` backup (2026-06-28/29 vintage); the non-passed class
+*lists* themselves were not in that backup and could not be recovered. This
+full-suite rerun was run specifically to regenerate an accurate current
+baseline rather than trust a stale/partial list.
+
+The new 20-class non-passed list is saved as the canonical baseline at
+`apps/hib-suite-runner/nonpassed.txt` (also `nonpassed20.txt`) for future
 regression tracking — not committed (`apps/` is gitignored).
 
-A HotSpot baseline comparison on the same 453 classes was started
-(`out-hotspot453-20260711-231558` on the remote host) but ran very slowly
-under heavy concurrent host load; docs below note where HotSpot confirmation
-is still pending vs. already checked. Clusters whose symptom is a real
-Java-level dispatch/reflection/classloading error specific to CratonVM's
-implementation (not a Hibernate/H2 semantic gap) are treated as
-CratonVM-specific by inspection even without a completed HotSpot run, since
-these error shapes are not the kind of thing that would ever reproduce on a
-correct JVM.
+## Residual clusters (this rerun)
 
-## Clusters (this audit), ranked by class count
+- [hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md) — 7 classes, all failing with `TimeoutException ... timed out after 120 seconds` against Hibernate's own internal per-test `@Timeout(120)` JUnit annotation (not the outer harness timeout). One systemic cause suspected rather than 7 unrelated bugs — needs a HotSpot timing comparison to confirm CratonVM-specific slowness vs. genuine flakiness.
+- [hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) — remaining 13 non-passed classes not in the timeout cluster: `DefaultCatalogAndSchemaTest` (HANG, recurrence of a previously-investigated flaky class), `JarVisitorTest` (CRASH, rc=0/ms=0 harness-artifact shape), `LockTest` (real timing-sensitive AssertionFailedError), `CriteriaBuilderNonStandardFunctionsTest` (real `ConstraintViolationException`, not a timeout), `ManyToManyAssociationClassGeneratedIdTest` (new ABORTED entry, not previously catalogued), and the 6 already-known-expected ABORTED entries (`type.temporal.*` x5, `bytecode.enhancement.basic.*` x2 minus the new one) matching HotSpot per prior audits. **Update 2026-07-16 (follow-up session):** `ZonedDateTimeTest`/`LocalDateTimeTest`'s AQS `ConditionNode` stale-pointer livelock (a native `Executors.*` factory GC-relocation bug, not a root-scanning gap) is now FIXED — see [hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md](../../internal/fixed-suite-bugs/hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md). Both classes now complete solo; `ZonedDateTimeTest` surfaced a new, separate, still-OPEN residual (63/608 timezone-offset `AssertionFailedError`s not present on HotSpot) once it could finally run to completion. **Update 2026-07-16 (this session):** `DefaultCatalogAndSchemaTest`'s GC-corruption/discovery-crash family (the `found=0` `ClassCastException`/`AbstractMethodError`/`NullPointerException` shapes) is now CLOSED -- fixed by a `native-builtins/src/generics.rs` reflection-array GC-safety sweep (`0a1ec47b`) plus a concurrent session's `gc/src/gen_heap.rs` young-GC forwarding-walk fix (see [wildfly-cce0079-young-start-set-truncation-FIXED.md](../../internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md)). The class now discovers all 132 tests (up from 0) with zero corruption signatures, but does NOT pass yet: it exposes a new, distinct, previously-hidden `ArrayIndexOutOfBoundsException`/`InvalidMappingException` bug (106/132 failures), tracked as a fresh OPEN item in [hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md#update-2026-07-17-this-session-aioobeinvalidmappingexception-not-independently-reproduced-across-60132-real-executions-new-severe-whole-class-discovery-performance-cliff-found-blocking-full-confirmation). **Update 2026-07-17:** `ZonedDateTimeTest`'s 63/608 timezone-offset residual root-caused to a `ZoneId.systemDefault()` host-timezone-leak native bug (ignored every `TimeZone.setDefault(...)` call) — FIXED, 63->20/608 failures; the remaining 20 are a distinct, narrower pre-1911 `Europe/Paris` Local-Mean-Time offset precision gap, still OPEN — see [hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md](../../internal/fixed-suite-bugs/hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md) and the residuals doc's 2026-07-17 update section. **Update 2026-07-17 (this session):** the 106/132 AIOOBE/InvalidMappingException failures could NOT be independently reproduced on a later dev tip (732241c8) -- 60/132 real parameterized executions across 5 of the 11 @Test methods (entityPersister, createSchema_fromSessionFactory, updateSchema_fromSessionFactory, tableGenerator, sequenceGenerator) all pass cleanly with zero occurrences, most likely fixed incidentally by later unrelated GC/reflection correctness work. A NEW, separate, severe performance cliff was found instead: whole-class (DiscoverySelectors.selectClass, what the harness actually uses) discovery+execution never completed even test #0 in up to 11 minutes across 3 attempts, despite the same work completing in 60-140s per method when split via selectMethod -- tracked as a fresh OPEN item, not yet root-caused to a specific line, in the same doc section. **Update 2026-07-17 (follow-up session):** the remaining 20/608 `ZonedDateTimeTest` pre-1911 `Europe/Paris` Local-Mean-Time residual noted above is now FIXED -- `found=608 ok=404 failed=0 aborted=204`, matching HotSpot exactly; root cause was the legacy `java.util.TimeZone`/`Calendar` path (not `java.time`, which was already correct), see [hib-paris-lmt-precision-FIXED.md](../../internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md). **Update 2026-07-17 (scaling-investigation session):** the "severe whole-class-discovery performance cliff" noted above is REFUTED -- a clean re-run of the same selectClass-based whole-class invocation on a calmer host completed in 9.66 minutes (found=132 ok=70 failed=62), and a 132-execution growth-curve measurement showed flat, non-increasing per-test cost throughout -- it was a host-contention artifact from the prior session, not a CratonVM scaling defect. However, the AIOOBE that could not be reproduced two updates ago DOES reproduce -- reliably, at a ~47-52% rate -- once multiple different @Test methods run together in one process (the prior session's single-method-only probing missed the trigger condition); root-caused to a real java.math.BigInteger bug (not a Hibernate or mapping bug, and misattributed by the JVM's own stack trace to smallToString -- the real fault is in a JIT-compiled MutableBigInteger.divideMagnitude/mulsub call, per follow-up sessions), narrowed via --nojit bisection to be JIT-related but not yet pinned to a specific faulty line -- still OPEN, see the residuals doc's 2026-07-17 update sections. **Update 2026-07-17 (diagnostic-tooling session):** a new sub-second, Hibernate-free repro (`SmallDividendRepro.java`, ~88% failure rate) plus a new `CRATONVM_DBG_AIOOBE3` diagnostic (dumps the raw heap-object header at a JIT bounds-check failure) confirmed the mechanism is data corruption -- a wrong index or wrong array reference reaching a real, validly-allocated `int[2]` -- and NOT a moved/stale-pointer GC-root-tracking bug (the object's own `forwarding_ptr` is null). Re-localized the leading suspect to `divideMagnitude`'s "final-digit" `mulsub(...)` call site specifically. Still OPEN, not yet fixed -- see the residuals doc's newest update section for the exact next step. **Update 2026-07-17 (post-`f377eb69` GC-conservative-scan-fix session):** the hypothesis that the `LockTest`/`CriteriaBuilder` GC-conservative-scan fix (`f377eb69`) also incidentally fixed the `DefaultCatalogAndSchemaTest` BigInteger `smallToString`/`MutableBigInteger.divideMagnitude` AIOOBE is **REFUTED on git-ancestry grounds** — `f377eb69` (04:17 UTC) is a strict ancestor of `08808a57` (the exact tip where the one decisive `CRATONVM_DBG_AIOOBE3` live crash was captured at ~88%, 05:14 UTC), so the fix was already live when the bug last reproduced and cannot have fixed it. A fresh post-fix build was re-verified: ~930k `SmallDividendRepro`+`CRATONVM_DBG_GC_STRESS` trials and 5 whole-class `selectClass` end-to-end runs (all `found=132 ok=132 failed=0`) reproduced nothing — consistent with the prior two sessions, but that is non-reproduction of an extremely-rare heisenbug, not a fix. The BigInteger AIOOBE residual stays **OPEN** (root cause still un-pinned; the conservative-roots-scan subsystem is now eliminated as a suspect); everything else in the residuals doc is already closed. **Update 2026-07-17 (independent same-day session):** that non-reproduction did NOT replicate for a second, independently-built post-`f377eb69` binary against the same shared fixture -- this session got 7/7 full end-to-end `selectClass` runs FAILING consistently (66-72/132, ~50-55%), with fresh `CRATONVM_DBG_AIOOBE3` captures matching the original decisive signature, plus a new finding (`CRATONVM_NO_PRECISE_JIT_MAPS=1` doesn't change the failure rate either) that further rules out GC-root-tracking theories in favor of the arithmetic/codegen hypothesis. The refutation of `f377eb69` as a fix stands (now on three independent lines of evidence), but the bug itself is confirmed still very much alive -- and, for this session at least, the full harness run is a *reliable* ~50%-hit-rate repro, a large improvement over the isolated micro-repro tooling's 0-for-1.5M+ track record. Still OPEN; see the residuals doc's newest update section for the full writeup and the unresolved same-day reproducibility discrepancy this raised.
 
-- [hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md](hib-bytecode-enhancement-propertyaccessexception-setter-cluster.md) — 19 classes. Loader-faithful bytecode-enhancement setter/reflection gap.
-- [hib-entitygraph-antlr-rulenode-npe-cluster.md](hib-entitygraph-antlr-rulenode-npe-cluster.md) — 14 classes. ANTLR parse-tree NPE in legacy entity-graph string-syntax parsing.
-- [hib-immutable-entitywithmutablecollection-hang-cluster.md](hib-immutable-entitywithmutablecollection-hang-cluster.md) — 17 classes (+`ImmutableTest`), all HANG, 100% hit rate. Immutable entity + mutable collection interaction.
-- [hib-cascade-multipathcircle-hang-cluster.md](hib-cascade-multipathcircle-hang-cluster.md) — 12 classes, all HANG, 100% hit rate. Circular-cascade save/delete graph.
-- [hib-misc-singleton-failures.md](hib-misc-singleton-failures.md) — ~12 classes across several small independent clusters (`InvalidMappingException` XML-mapping parse, `SyntaxException` HQL boolean-negation, `SQLGrammarException` x2 including a possible in-process-javac regression, `UnknownNamedQueryException`, `CannotContainSubGraphException`, `FailureExpectedExtension$ExpectedFailureDidNotFail` — the latter is not a defect). The four serialization EOF residuals are fixed and archived with the related connection/proxy cluster.
-- [hib-generic-timeout-hang-longtail.md](hib-generic-timeout-hang-longtail.md) — 61 scattered HANG classes not in the two dedicated hang clusters. Likely a mix of genuine slowness and host-load artifacts; this session has repeatedly observed several of these flip between PASS/FAIL/HANG/CRASH across reruns — not individually triaged, needs a quiet-host recheck.
-- [hib-assertionfailederror-longtail-triage.md](hib-assertionfailederror-longtail-triage.md) — 110 scattered `AssertionFailedError`/`AssertionError` classes remaining after every other cluster was pulled out; catalogs visible sub-patterns (`InstantiationException` ×6, `sql.exec.*` ×9-11, likely-stats-cluster ×~15, generic-timeout ×13, `jpa.schemagen.*` ×4) but not individually root-caused.
+## Already tracked elsewhere (all FIXED/RESOLVED as of this rerun)
+
+See `docs/internal/fixed-suite-bugs/` for the full archive of the 2026-07-11
+audit clusters, all confirmed fixed or resolved by the time of this rerun:
+statistics-counters-zero, bytecode-enhancement-propertyaccessexception,
+entitygraph-antlr-rulenode-npe, immutable-entitywithmutablecollection-hang,
+cascade-multipathcircle-hang, boot-models-xml-qname-jandex,
+connections-proxy-serializationexception, generic-timeout-hang-longtail,
+assertionfailederror-longtail-triage, proxyclassreuse-loader-blind-class-resolution.
+
 - [hib-notests-abstract-baseclass-list.md](../../internal/hib-notests-abstract-baseclass-list.md) — 91 classes, NOT a bug (abstract base classes with 0 discoverable tests, matches HotSpot).
-
-## Already tracked elsewhere (not re-documented here)
-
-- `bootstrap.scanning.{JarVisitorTest,ScannerTest,PackagedEntityManagerTest}` jar-scanning `orm.xml doesn't exist` — [hib-proxyclassreuse-loader-blind-class-resolution.md](../hib-proxyclassreuse-loader-blind-class-resolution.md).
-- `type.temporal.*` ABORTED entries (`InstantTests`, `LocalDateTimeTest`) and `bytecode.enhancement.basic.{InheritedTest,MappedSuperclassTest}` ABORTED — expected `@CustomEnhancementContext`/dialect-gated partial skips, matches HotSpot per [hib-bytecode-enhancement-loader-faithful-linking.md](../hib-bytecode-enhancement-loader-faithful-linking.md).

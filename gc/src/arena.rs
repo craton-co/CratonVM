@@ -83,6 +83,22 @@ pub struct Arena {
     /// * [`Self::clear_free_list`] / [`Self::reset`] / [`Self::reset_no_zero`]
     ///   zero it alongside the list.
     max_free_upper: usize,
+    /// PERF (2026-07-15, round 2 of the RequestMappingMessageConversionIntegrationTests
+    /// investigation): monotonic counter bumped on every free-list CONTENT
+    /// change (a block added via `push_block_routed`, or removed/consumed by
+    /// `alloc`'s free-list fast path; NOT bumped by the `max_free_upper`
+    /// tightening on a failed scan, which doesn't touch list contents).
+    /// Pairs with `free_bytes_cache` below to make `free_list_bytes()` O(1)
+    /// on the (overwhelmingly common) case where nothing changed since the
+    /// last call.
+    free_list_epoch: u64,
+    /// Cached `(epoch, bytes)` from the last `free_list_bytes()` computation.
+    /// `Cell` (not a plain field) because the getter takes `&self`: `Arena`
+    /// is always accessed through an external `Mutex` (see e.g.
+    /// `GenerationalHeap::young_from`), so exclusive access is already
+    /// guaranteed and a `Cell` cache is sound despite the shared-reference
+    /// getter signature.
+    free_bytes_cache: std::cell::Cell<(u64, usize)>,
 }
 
 impl Arena {
@@ -97,6 +113,8 @@ impl Arena {
             free_small: Vec::new(),
             free_large: Vec::new(),
             max_free_upper: 0,
+            free_list_epoch: 0,
+            free_bytes_cache: std::cell::Cell::new((0, 0)),
         }
     }
 
@@ -114,6 +132,7 @@ impl Arena {
         } else {
             self.free_large.push(block);
         }
+        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
     }
 
     /// First-fit scan of ONE tier, visiting at most `max_scan` blocks. On a
@@ -210,6 +229,7 @@ impl Arena {
                 Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
             };
             if let Some((alloc_offset, remainders)) = hit {
+                self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
@@ -277,12 +297,35 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
+        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
     }
 
     /// Total bytes currently held on the free lists (reclaimed but unallocated).
+    ///
+    /// PERF (2026-07-15): this used to sum both tiers from scratch on EVERY
+    /// call. Its only caller, `GenerationalHeap::needs_gc`, runs on every
+    /// allocation attempt (not just ones that touch the free list), so a
+    /// live workload with many allocations between free-list-changing events
+    /// (sweeps, or an allocation actually consuming a free block) paid this
+    /// O(free-list-size) cost far more often than the list's contents
+    /// actually changed — and the list only grows over a session (the
+    /// non-moving young sweep reclaims into it without ever fully draining
+    /// it under steady churn). Measured contribution: `needs_gc` (which
+    /// inlines this) was 24.5% of ALL sampled CPU time during a live
+    /// `RequestMappingMessageConversionIntegrationTests` run — see
+    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md. The
+    /// epoch-gated cache below makes repeated calls between real changes
+    /// O(1); the summation itself is unchanged (same tiers, same order),
+    /// so a cache miss recomputes byte-identically to the old behavior.
     pub fn free_list_bytes(&self) -> usize {
-        self.free_small.iter().map(|b| b.size).sum::<usize>()
-            + self.free_large.iter().map(|b| b.size).sum::<usize>()
+        let (cached_epoch, cached_bytes) = self.free_bytes_cache.get();
+        if cached_epoch == self.free_list_epoch {
+            return cached_bytes;
+        }
+        let total = self.free_small.iter().map(|b| b.size).sum::<usize>()
+            + self.free_large.iter().map(|b| b.size).sum::<usize>();
+        self.free_bytes_cache.set((self.free_list_epoch, total));
+        total
     }
 
     /// Size of the largest single free-list block (0 if the free list is
@@ -404,6 +447,7 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
+        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
     }
 
     /// Reset the arena without zeroing memory.
@@ -427,6 +471,7 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
+        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
@@ -486,7 +531,11 @@ impl Arena {
             self.cursor,
         );
         let old_base = self.data.as_ptr();
+        let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
+        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+            eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
+        }
         old_base
     }
 

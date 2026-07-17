@@ -281,6 +281,16 @@ pub struct LambdaCallSite {
     pub capture_types: Vec<char>,
     /// Synthetic proxy ClassId allocated for this lambda form.
     pub proxy_class_id: ClassId,
+    /// Loader-resolved `ClassId` of `functional_interface`, captured at
+    /// bootstrap time through the HOST class's defining loader. Two loaders
+    /// can define the same interface name (e.g. Spring's
+    /// `@CompileWithForkedClassLoader` fork re-defines the whole framework);
+    /// resolving the name globally at dispatch time picks an arbitrary copy
+    /// and runs default methods in the wrong loader's context. `None` only
+    /// for construction sites with no loader context (reflective
+    /// metafactory, deserialization); consumers must then fall back to
+    /// name-based resolution.
+    pub functional_interface_id: Option<ClassId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1541,7 @@ mod tests {
                 num_params: 1,
                 is_synchronized: false,
                 is_static: false,
+                force_native_cache: std::sync::OnceLock::new(),
             })
         };
 
@@ -1599,6 +1610,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         let entry = CachedInvokeTarget::Bytecode {
             cached,
@@ -1632,6 +1644,7 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
         });
         cache.put(
             caller,
@@ -1736,6 +1749,7 @@ mod tests {
             class_id,
             10,
             ResolvedCallSite::Lambda(LambdaCallSite {
+                functional_interface_id: None,
                 functional_interface: Arc::from("java/lang/Runnable"),
                 sam_method_name: Arc::from("run"),
                 sam_descriptor: Arc::from("()V"),

@@ -356,6 +356,12 @@ impl NativeContext for MockNativeContext {
     fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
         None
     }
+    // Drive-by test fix (cce0079): the trait gained
+    // `resolve_field_index_by_class_id` without this mock being updated —
+    // the lib-test target did not compile on dev.
+    fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
+        None
+    }
     fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
         false
     }

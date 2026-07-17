@@ -7,10 +7,13 @@
 //! fields. To maintain correctness (no live object is missed), the SATB
 //! barrier logs the *old* value of a reference field before it is overwritten.
 //!
-//! Each application thread has its own `SatbBuffer`. When the buffer is full,
-//! it is flushed to a global queue for the marking threads to process.
+//! Each application thread buffers entries locally, partitioned per target
+//! [`SatbQueue`] (see [`SATB_BUFFER_REGISTRY`] — queue-id scoping). When a
+//! bucket is full, it is flushed to its owning queue for the marking threads
+//! to process. [`SatbBuffer`] remains as a standalone buffer type for callers
+//! that manage their own flushing.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
@@ -59,7 +62,7 @@ pub(crate) const SATB_INACTIVE: u8 = 0;
 pub(crate) const SATB_ACTIVE: u8 = 1;
 pub(crate) const SATB_DRAINING: u8 = 2;
 
-/// Process-global registry of every live per-thread SATB buffer.
+/// Process-global registry of every live per-thread SATB partition set.
 ///
 /// Round-11 gc HIGH (SATB completeness): the mutator fast path only flushes a
 /// thread's local buffer into the global [`SatbQueue`] when it fills (~256
@@ -71,37 +74,139 @@ pub(crate) const SATB_DRAINING: u8 = 2;
 /// object hidden behind an overwritten reference.
 ///
 /// The registry closes that gap: each thread registers a [`Weak`] handle to its
-/// own buffer on first use, and [`flush_all_thread_satb_buffers`] (invoked at
-/// the remark safepoint, before draining the shards) walks the registry and
-/// moves every thread-local buffer's pending entries into the global queue.
+/// own partition set on first use, and [`flush_all_thread_satb_buffers`]
+/// (invoked at the remark safepoint, before draining the shards) walks the
+/// registry and moves every thread's pending entries FOR THE CALLER'S QUEUE
+/// into that queue.
+///
+/// QUEUE-ID SCOPING (cross-queue steal fix, 2026-07-14): entries are
+/// partitioned per [`SatbQueue::id`], mirroring the card table's table-id
+/// scoping (`card_table.rs`, SECURITY FIX V6). The registry itself is
+/// process-global, so with more than one live queue in the process (parallel
+/// gc unit tests; any future multi-heap embedding) an unscoped
+/// `flush_all_thread_satb_buffers(queue_a)` drained entries a thread had
+/// logged against queue B into queue A — queue B's remark then missed those
+/// overwritten references, silently voiding its snapshot invariant (observed
+/// as the `deactivate_and_drain_includes_thread_local_buffer` flake under
+/// `--test-threads>1`; in a multi-heap embedding it would be a premature
+/// reclamation / use-after-free). Scoping the buckets by queue id makes every
+/// drain path consume exactly the entries that belong to the draining queue.
 ///
 /// `Weak` (rather than a raw pointer or `Arc`) is deliberate: a thread that has
 /// exited drops the only `Arc` (its thread-local), so its registry slot fails
-/// to `upgrade()` and is pruned in place — no dangling pointer, no leak, and
-/// the dead thread's buffer was already drained by `flush_thread_satb_buffer`
-/// on the way out (or, if not, its entries refer to objects that thread can no
-/// longer reach to overwrite, so dropping them is safe).
-static SATB_BUFFER_REGISTRY: Mutex<Vec<Weak<Mutex<SatbBuffer>>>> = Mutex::new(Vec::new());
+/// to `upgrade()` and is pruned in place — no dangling pointer, no leak.
+///
+/// Dying-thread completeness (2026-07-16, sibling of the card-table
+/// `DirtyBufferGuard` fix): a thread that exits with a NON-EMPTY buffer must
+/// not lose those entries. A buffered SATB entry is the OLD value of a HEAP
+/// reference overwritten during concurrent marking — it describes heap
+/// history, not thread state, and the marker needs it in the snapshot
+/// regardless of what became of the logging thread (the previous comment's
+/// "its entries refer to objects that thread can no longer reach to
+/// overwrite, so dropping them is safe" was exactly backwards: losing the
+/// entry hides the overwritten object from the mark closure and a live
+/// object can be freed mid-mark). Such buffers are parked in
+/// [`ORPHANED_SATB_BUFFERS`] by [`SatbBufferGuard::drop`] and drained/reaped
+/// by [`flush_all_thread_satb_buffers`] at the remark STW pause.
+static SATB_BUFFER_REGISTRY: Mutex<Vec<Weak<Mutex<ThreadSatbPartitions>>>> =
+    Mutex::new(Vec::new());
+
+/// Buffers of exited threads that still hold undrained SATB entries (see the
+/// dying-thread note on [`SATB_BUFFER_REGISTRY`]). Strong `Arc`s: the owning
+/// thread is gone, so these are the only handles keeping the entries alive
+/// until [`flush_all_thread_satb_buffers`] folds them into their queues and
+/// reaps the emptied buffer (a dead thread can never log again, so an
+/// emptied orphan stays empty).
+static ORPHANED_SATB_BUFFERS: Mutex<Vec<Arc<Mutex<ThreadSatbPartitions>>>> =
+    Mutex::new(Vec::new());
+
+/// RAII wrapper stored in TLS so thread exit can decide the fate of the
+/// buffer: an EMPTY buffer just dies (its registry `Weak` stops upgrading and
+/// is pruned as before), a NON-EMPTY one is parked in
+/// [`ORPHANED_SATB_BUFFERS`] so its heap-history entries survive until a
+/// collector drains them.
+struct SatbBufferGuard {
+    buffer: Arc<Mutex<ThreadSatbPartitions>>,
+}
+
+impl Drop for SatbBufferGuard {
+    fn drop(&mut self) {
+        if !self.buffer.lock().buckets.is_empty() {
+            ORPHANED_SATB_BUFFERS.lock().push(Arc::clone(&self.buffer));
+        }
+    }
+}
+
+/// Per-thread SATB storage: one bucket of pending entries per distinct
+/// [`SatbQueue`] this thread has logged against (see the queue-id scoping
+/// note on [`SATB_BUFFER_REGISTRY`]).
+///
+/// `buckets` is expected to hold a single-digit number of entries — one per
+/// live queue the thread has written barrier entries for (exactly one in a
+/// production VM) — so a linear id lookup is optimal, same as the card
+/// table's `DirtyPartitions`. A consumed bucket is removed outright
+/// (`swap_remove`) and lazily recreated on the next log, so a dropped queue's
+/// bucket cannot outlive its last drain.
+#[derive(Default)]
+struct ThreadSatbPartitions {
+    buckets: Vec<(u64, Vec<usize>)>,
+}
+
+impl ThreadSatbPartitions {
+    /// Append `addr` to `queue_id`'s bucket, creating it on first use. When
+    /// the bucket reaches the auto-flush threshold it is removed and returned
+    /// so the caller can spill it into the owning queue's shards.
+    fn log(&mut self, queue_id: u64, addr: usize) -> Option<Vec<usize>> {
+        for i in 0..self.buckets.len() {
+            if self.buckets[i].0 == queue_id {
+                self.buckets[i].1.push(addr);
+                if self.buckets[i].1.len() >= DEFAULT_SATB_CAPACITY {
+                    return Some(self.buckets.swap_remove(i).1);
+                }
+                return None;
+            }
+        }
+        let mut fresh = Vec::with_capacity(DEFAULT_SATB_CAPACITY);
+        fresh.push(addr);
+        self.buckets.push((queue_id, fresh));
+        None
+    }
+
+    /// Take (remove and return) all buffered entries for `queue_id`, leaving
+    /// other queues' buckets untouched. Returns an empty `Vec` when this
+    /// thread has nothing buffered for `queue_id`.
+    fn take(&mut self, queue_id: u64) -> Vec<usize> {
+        for i in 0..self.buckets.len() {
+            if self.buckets[i].0 == queue_id {
+                return self.buckets.swap_remove(i).1;
+            }
+        }
+        Vec::new()
+    }
+}
 
 thread_local! {
-    /// Per-thread SATB buffer for the write barrier fast path.
+    /// Per-thread SATB partition set for the write barrier fast path.
     ///
     /// The mutator write barrier appends overwritten reference values into
-    /// this buffer; on the common path it takes only this thread's *own*
-    /// (uncontended) buffer lock — no cross-thread shared lock. When the
-    /// buffer fills it auto-flushes into the global [`SatbQueue`]; the
-    /// collector also drains per-thread buffers at safepoints via
+    /// the bucket for the target queue; on the common path it takes only this
+    /// thread's *own* (uncontended) lock — no cross-thread shared lock. When
+    /// a bucket fills it auto-flushes into its owning [`SatbQueue`]; the
+    /// collector also drains per-thread buckets at safepoints via
     /// [`flush_thread_satb_buffer`] (this thread) and
-    /// [`flush_all_thread_satb_buffers`] (every thread, from the collector).
+    /// [`flush_all_thread_satb_buffers`] (every thread, from the collector) —
+    /// both scoped to the caller queue's bucket only.
     ///
-    /// The buffer lives behind `Arc<Mutex<…>>` so the collector can reach it
-    /// through [`SATB_BUFFER_REGISTRY`]; a plain `RefCell` is `!Sync` and could
-    /// not be shared cross-thread. The `Arc` is created and registered exactly
-    /// once per thread, on first access.
-    static THREAD_SATB_BUFFER: Arc<Mutex<SatbBuffer>> = {
-        let buf = Arc::new(Mutex::new(SatbBuffer::new()));
+    /// The partition set lives behind `Arc<Mutex<…>>` so the collector can
+    /// reach it through [`SATB_BUFFER_REGISTRY`]; a plain `RefCell` is `!Sync`
+    /// and could not be shared cross-thread. The `Arc` is created and
+    /// registered exactly once per thread, on first access.
+    /// Wrapped in [`SatbBufferGuard`] so thread exit parks a non-empty buffer
+    /// in [`ORPHANED_SATB_BUFFERS`] instead of silently dropping its entries.
+    static THREAD_SATB_BUFFER: SatbBufferGuard = {
+        let buf = Arc::new(Mutex::new(ThreadSatbPartitions::default()));
         register_thread_satb_buffer(&buf);
-        buf
+        SatbBufferGuard { buffer: buf }
     };
 }
 
@@ -112,65 +217,56 @@ thread_local! {
 /// registry from growing without bound in a churn of short-lived threads even
 /// if no collection runs to trigger the prune in
 /// [`flush_all_thread_satb_buffers`].
-fn register_thread_satb_buffer(buf: &Arc<Mutex<SatbBuffer>>) {
+fn register_thread_satb_buffer(buf: &Arc<Mutex<ThreadSatbPartitions>>) {
     let mut reg = SATB_BUFFER_REGISTRY.lock();
     reg.retain(|w| w.strong_count() > 0);
     reg.push(Arc::downgrade(buf));
 }
 
 /// Push an overwritten reference address into the calling thread's local
-/// SATB buffer. If the buffer is full, drain it into `queue` atomically.
+/// bucket for `queue`. If the bucket is full, drain it into `queue`
+/// atomically.
 ///
 /// This is the fast path called by the write barrier — no shared lock is
-/// taken unless the per-thread buffer fills (amortized one lock per 256
+/// taken unless the per-thread bucket fills (amortized one lock per 256
 /// reference stores).
 #[inline]
 pub fn satb_thread_local_log(queue: &SatbQueue, old_ref_addr: usize) {
     if old_ref_addr == 0 {
         return;
     }
-    let to_flush = THREAD_SATB_BUFFER.with(|buf| {
-        let mut b = buf.lock();
-        if b.log(old_ref_addr) {
-            Some(b.drain())
-        } else {
-            None
-        }
-    });
+    let to_flush = THREAD_SATB_BUFFER.with(|g| g.buffer.lock().log(queue.id(), old_ref_addr));
     if let Some(entries) = to_flush {
         queue.flush(entries);
     }
 }
 
-/// Drain the calling thread's SATB buffer into the global queue.
+/// Drain the calling thread's bucket for `queue` into that queue.
 ///
 /// Called by mutators at safepoint entry and by the collector at GC start
 /// to ensure all logged-but-unflushed entries reach the global queue
-/// before marker threads consume them.
+/// before marker threads consume them. Buckets this thread holds for OTHER
+/// queues are left untouched (queue-id scoping — see
+/// [`SATB_BUFFER_REGISTRY`]).
 pub fn flush_thread_satb_buffer(queue: &SatbQueue) {
-    let entries = THREAD_SATB_BUFFER.with(|buf| {
-        let mut b = buf.lock();
-        if b.is_empty() {
-            Vec::new()
-        } else {
-            b.drain()
-        }
-    });
+    let entries = THREAD_SATB_BUFFER.with(|g| g.buffer.lock().take(queue.id()));
     if !entries.is_empty() {
         queue.flush(entries);
     }
 }
 
-/// Drain **every** registered per-thread SATB buffer into the global queue.
+/// Drain every registered thread's bucket **for `queue`** into that queue.
 ///
 /// Round-11 gc HIGH (SATB completeness): the per-thread fast path only spills a
-/// thread's local buffer into `queue` when it fills or when that thread calls
+/// thread's local bucket into `queue` when it fills or when that thread calls
 /// [`flush_thread_satb_buffer`] itself. The collector has no other handle on
-/// those buffers, so at remark a thread's partially-full buffer holds
+/// those buckets, so at remark a thread's partially-full bucket holds
 /// references it overwrote since its last flush — references that must be in
 /// the snapshot. This walks [`SATB_BUFFER_REGISTRY`] and moves each live
-/// buffer's pending entries into `queue`, and prunes slots for threads that
-/// have exited (their `Weak` no longer upgrades).
+/// thread's pending entries for THIS queue into `queue` (entries logged
+/// against other queues stay put — see the queue-id scoping note on the
+/// registry), and prunes slots for threads that have exited (their `Weak` no
+/// longer upgrades).
 ///
 /// SAFETY / CORRECTNESS — this MUST be called at the remark **STW safepoint**.
 /// At a safepoint no mutator is executing the write-barrier fast path, so no
@@ -188,7 +284,7 @@ pub fn flush_all_thread_satb_buffers(queue: &SatbQueue) {
     // then release the registry lock before touching the global queue so we
     // never hold the registry lock across a `queue.flush` (which takes a shard
     // lock) — keeps the lock ordering registry-then-shard one-directional.
-    let live: Vec<Arc<Mutex<SatbBuffer>>> = {
+    let live: Vec<Arc<Mutex<ThreadSatbPartitions>>> = {
         let mut reg = SATB_BUFFER_REGISTRY.lock();
         let mut live = Vec::with_capacity(reg.len());
         reg.retain(|w| match w.upgrade() {
@@ -202,13 +298,33 @@ pub fn flush_all_thread_satb_buffers(queue: &SatbQueue) {
     };
 
     for buf in live {
-        let entries = {
+        let entries = buf.lock().take(queue.id());
+        if entries.is_empty() {
+            continue;
+        }
+        queue.flush(entries);
+    }
+
+    // Dying-thread completeness (see SATB_BUFFER_REGISTRY): drain buffers
+    // parked by exited threads, reaping each once nothing is left in ANY of
+    // its buckets (a dead thread can never log again, so an emptied orphan
+    // stays empty; a bucket for a DIFFERENT queue is left for that queue's
+    // own drain). Entries are collected under the orphan-registry + buffer
+    // locks and flushed after both are released, keeping the lock ordering
+    // one-directional (registry → buffer, never across a shard lock).
+    let mut orphan_entries: Vec<Vec<usize>> = Vec::new();
+    {
+        let mut orphans = ORPHANED_SATB_BUFFERS.lock();
+        orphans.retain(|buf| {
             let mut b = buf.lock();
-            if b.is_empty() {
-                continue;
+            let entries = b.take(queue.id());
+            if !entries.is_empty() {
+                orphan_entries.push(entries);
             }
-            b.drain()
-        };
+            !b.buckets.is_empty()
+        });
+    }
+    for entries in orphan_entries {
         queue.flush(entries);
     }
 }
@@ -337,6 +453,12 @@ const SHARDS: usize = 16;
 /// all shards once per cycle (or on demand), so the consumer side
 /// remains a single thread.
 pub struct SatbQueue {
+    /// Queue-id scoping (cross-queue steal fix): process-unique identifier
+    /// for this queue, assigned from [`NEXT_SATB_QUEUE_ID`] in
+    /// [`SatbQueue::new`]. Every entry a thread buffers locally is tagged
+    /// with the target queue's id so the drain paths are queue-scoped and
+    /// one queue can never steal another's buffered overwritten refs.
+    id: u64,
     /// Per-shard entry buckets.  Each mutator picks its shard by its
     /// thread id, so independent threads land on independent locks in
     /// the common case.
@@ -346,6 +468,11 @@ pub struct SatbQueue {
     /// state machine that closes the round-5 CRIT #4 TOCTOU.
     state: AtomicU8,
 }
+
+/// Monotonic source of process-unique [`SatbQueue::id`] values. Starts at 1
+/// so 0 can serve as a never-assigned sentinel in debugging. Wraparound
+/// after 2^64 queues is not a practical concern.
+static NEXT_SATB_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[inline]
 fn shard_for_current_thread() -> usize {
@@ -366,9 +493,19 @@ impl SatbQueue {
         // small helper so each shard gets its own Mutex.
         let shards: [Mutex<Vec<usize>>; SHARDS] = std::array::from_fn(|_| Mutex::new(Vec::new()));
         Self {
+            // Relaxed is sufficient: we only need uniqueness, not ordering
+            // relative to other memory.
+            id: NEXT_SATB_QUEUE_ID.fetch_add(1, Ordering::Relaxed),
             shards,
             state: AtomicU8::new(SATB_INACTIVE),
         }
+    }
+
+    /// Process-unique identity of this queue (see the queue-id scoping note
+    /// on [`SATB_BUFFER_REGISTRY`]).
+    #[inline]
+    fn id(&self) -> u64 {
+        self.id
     }
 
     /// Enable SATB logging (called at start of concurrent mark phase).
@@ -969,6 +1106,45 @@ mod tests {
     }
 
     #[test]
+    fn dying_thread_residual_satb_entries_survive_until_remark_drain() {
+        // Dying-thread completeness regression (2026-07-16, sibling of the
+        // card table's dying_thread_residual_offsets_survive_until_flush_all):
+        // a mutator that logs an SATB entry (below the auto-flush capacity)
+        // and EXITS without flushing must not lose the entry — it is the old
+        // value of a heap reference overwritten during concurrent marking,
+        // and losing it hides the overwritten object from the mark closure.
+        // Pre-fix, the thread's Arc dropped, the registry Weak died, and the
+        // entry was silently discarded.
+        let q = std::sync::Arc::new(SatbQueue::new());
+        q.activate();
+
+        const SENTINEL: usize = 0xDEAD_1234;
+        let q2 = std::sync::Arc::clone(&q);
+        std::thread::spawn(move || {
+            // One buffered entry, far below DEFAULT_SATB_CAPACITY; the thread
+            // exits immediately after, running SatbBufferGuard::drop.
+            satb_thread_local_log(&q2, SENTINEL);
+            assert!(q2.is_empty(), "entry must still be thread-local");
+        })
+        .join()
+        .unwrap();
+
+        // Remark STW drain: must recover the dead thread's entry from the
+        // orphan list and include it in the snapshot.
+        let snapshot = q.deactivate_and_drain();
+        assert!(
+            snapshot.contains(&SENTINEL),
+            "remark drain must include a dead thread's buffered refs, got {snapshot:?}"
+        );
+
+        // The emptied orphan was reaped: a second full drain sees nothing.
+        q.activate();
+        flush_all_thread_satb_buffers(&q);
+        assert!(q.is_empty(), "emptied orphan must have been reaped");
+        let _ = q.deactivate_and_drain();
+    }
+
+    #[test]
     fn registry_prunes_dead_weak_slots() {
         // A buffer whose owning thread has exited drops its only `Arc`, leaving
         // a dead `Weak` in the registry that must (a) not upgrade and (b) be
@@ -979,16 +1155,17 @@ mod tests {
         // other test threads running in parallel.
 
         // A dead Weak: create an Arc, downgrade, then drop the Arc.
-        let dead: Weak<Mutex<SatbBuffer>> = {
-            let arc = Arc::new(Mutex::new(SatbBuffer::new()));
+        let dead: Weak<Mutex<ThreadSatbPartitions>> = {
+            let arc = Arc::new(Mutex::new(ThreadSatbPartitions::default()));
             Arc::downgrade(&arc)
             // `arc` dropped here → `dead` can no longer upgrade.
         };
         assert!(dead.upgrade().is_none(), "weak must be dead after Arc drop");
 
-        // A live, registered buffer holding one staged entry.
-        let live = Arc::new(Mutex::new(SatbBuffer::new()));
-        live.lock().log(0xFEED_0001);
+        // A live, registered partition set holding one entry staged for `q`.
+        let q = SatbQueue::new();
+        let live = Arc::new(Mutex::new(ThreadSatbPartitions::default()));
+        assert!(live.lock().log(q.id(), 0xFEED_0001).is_none());
         let live_weak = Arc::downgrade(&live);
 
         // Inject both into the registry. Keep a clone of the dead Weak so we
@@ -1000,14 +1177,16 @@ mod tests {
             reg.push(live_weak);
         }
 
-        let q = SatbQueue::new();
         // Must not panic on the dead slot, and must process the live one.
         flush_all_thread_satb_buffers(&q);
 
-        // The live buffer's staged entry reached the queue and was drained out
-        // of the buffer (proves flush_all walked past the dead slot to it).
+        // The live partition set's staged entry reached the queue and was
+        // consumed (proves flush_all walked past the dead slot to it).
         assert!(q.drain().contains(&0xFEED_0001));
-        assert!(live.lock().is_empty(), "live buffer drained by flush_all");
+        assert!(
+            live.lock().take(q.id()).is_empty(),
+            "live bucket consumed by flush_all"
+        );
         // The dead slot never resurrects (deterministic, unaffected by other
         // parallel test threads) and the registry no longer holds *our* dead
         // Weak: a dead Weak has no strong refs, and after pruning the only
@@ -1016,5 +1195,45 @@ mod tests {
         // it visited is zero — verified via the live buffer having been the one
         // reached.
         assert!(dead_probe.upgrade().is_none(), "dead Weak must stay dead");
+    }
+
+    #[test]
+    fn thread_local_buffers_are_queue_scoped() {
+        // Cross-queue steal regression (2026-07-14): with two live queues in
+        // the process, draining ALL thread buffers on behalf of queue A must
+        // consume only the entries this thread logged against A — entries
+        // logged against queue B stay buffered for B's own remark. The
+        // pre-fix unscoped drain moved B's entries into A's queue, voiding
+        // B's SATB snapshot (observed as the
+        // `deactivate_and_drain_includes_thread_local_buffer` flake under
+        // parallel test threads).
+        let h = std::thread::spawn(|| {
+            let qa = SatbQueue::new();
+            let qb = SatbQueue::new();
+            qa.activate();
+            qb.activate();
+
+            const SA: usize = 0xAAAA_0001;
+            const SB: usize = 0xBBBB_0002;
+            satb_thread_local_log(&qa, SA);
+            satb_thread_local_log(&qb, SB);
+
+            // A remark on qa takes only qa's bucket...
+            flush_all_thread_satb_buffers(&qa);
+            let a = qa.drain();
+            assert!(a.contains(&SA), "qa must receive its own entry, got {a:?}");
+            assert!(
+                !a.contains(&SB),
+                "qa stole qb's thread-local entry: {a:?}"
+            );
+
+            // ...and qb's entry is still intact for qb's own remark.
+            let b = qb.deactivate_and_drain();
+            assert!(
+                b.contains(&SB),
+                "qb's entry lost after qa's flush_all: {b:?}"
+            );
+        });
+        h.join().unwrap();
     }
 }

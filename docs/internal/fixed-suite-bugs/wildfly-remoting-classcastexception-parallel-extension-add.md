@@ -137,3 +137,57 @@ separate, real "Family 1" stale-`ObjectRef` bug — see the new doc's "Separate 
 attempt instead), so this remains a code-analysis-based conclusion, not a fresh capture. Not fixed, per
 this bug family's established policy — see the new doc for full reasoning and the fresh "Family 1"
 finding, flagged separately as its own follow-up.
+
+**⚠️ The "JIT-required" reasoning in the paragraph above is SUPERSEDED — see 2026-07-15 update below.**
+The `AttributeAccess` doc's own later session disproved it with a live `--nojit` repro.
+
+## 2026-07-15 update: investigation chain continued, `AttributeAccess` CCE generalized to `WFLYCTL0079`/any extension, four more real (but non-closing) bugs fixed along the way
+
+The 2026-07-13 follow-up above was the start, not the end, of chasing this residual. Two further sessions
+(2026-07-14/15) continued the live-repro side of the investigation the 2026-07-13 session couldn't
+complete, on the same `docs/known-issues/wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`
+doc (now the authoritative, actively-maintained living doc for this whole failure family — read it directly
+for full detail rather than this summary). Headline findings, most-recent-first:
+
+- **The "JIT is required" claim is DISPROVED.** A `CRATONVM_DISABLE_JIT=1` repro batch hit the byte-for-byte
+  identical `ClassCastException: java.lang.Object cannot be cast to X` shape 4/8 times — with zero JIT
+  frames anywhere in the process. This directly contradicts the 2026-07-13 conclusion's central premise
+  ("Generational never relocates while any JIT frame is active, so a moving-GC mechanism is excluded *for a
+  JIT-required bug*") — since the bug isn't JIT-required, that exclusion doesn't apply. The residual is now
+  characterized as a likely **cross-thread GC-root-visibility/timing race** among `parallel-extension-add`'s
+  ~37-42 concurrently-executing mutator threads, not (solely) the JIT-specific `SB-CRASH-04` precise-oop-map
+  gap originally named. Confirmed NOT just "one more unpinned site": live diagnostic instrumentation showed
+  the panicking reads go through the codebase's own *pinned* path (`via_pin=true`) and still observe a stale
+  address.
+- **The bug is not `AttributeAccess`- or `remoting`-specific either** — it's the same generic
+  `parallel-extension-add`-time CCE this doc already generalized once (from `remoting`/`AttributeDefinition`
+  to "any extension/any target"). A later sighting surfaced as `WFLYCTL0079: Failed initializing module
+  org.wildfly.extension.io`; a 12-attempt batch hit it against seven different extensions (elytron, jaxrs,
+  undertow, infinispan, connector, plus `io` itself twice) with seven different cast targets. The failing
+  module/exception target is circumstantial — whichever thread reads a corrupted address first.
+- **Four separate, real, narrow bugs were found and fixed while chasing this residual — none of them close
+  it, but all are genuine, verified, merged fixes in their own right:**
+  1. TreeMap/TreeSet binary search, bulk ops, and submap/subset views held `owner`/`data`/`comparator`
+     `ObjectRef`s unpinned across user-`Comparator` dispatch (`native-collections/src/lib.rs`) — commit
+     `a4f3db9d`/`220ebb7d`.
+  2. Stream `map`/`flatMap`/`collect` accumulation and `Comparator.thenComparing`/`comparing` construction
+     had the same unpinned-across-dispatch pattern — commit `671c8df3`/`a969b18f`.
+  3. **A genuinely unrelated regression, not this bug family at all**: `d8092acb` (2026-07-14) accidentally
+     unmasked a previously-known-and-deliberately-shadowed gap where `ObjectName.getCanonicalKeyPropertyListString`
+     (and sibling pattern methods) ran real bytecode against a synthetic-object model that never populated
+     the fields those methods read, NPE-ing on the very first JMX MBean registration — this one **blocked
+     WildFly boot entirely**, before it could ever reach `parallel-extension-add`. Bisected and fixed;
+     `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md` (commit
+     `974c0838`/`32b6a2f1`, merged `78f17a93`/`317e4738`).
+  4. `invoke_virtual`'s lambda-dispatch decision point (`vm/src/vm/vm_exec.rs`) read `receiver`/lambda
+     `args` again after a SAM-compatibility check that can itself trigger class loading, without pinning
+     across it — `docs/internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`
+     (commit `d64fab85`/`2ba6d7f3`).
+- **Still OPEN.** Every fix above was verified not to change the residual's reproduction rate (matched
+  before/after batches, ~5/12 both times for the lambda-dispatch fix specifically). Per this bug family's
+  established policy, no further speculative per-site patch was attempted — the real fix is completing the
+  precise-oop-map/shadow-stack infrastructure (`docs/feature-designs/precise-jit-maps-default.md`) and/or
+  diagnosing the cross-thread pin-visibility race directly in the GC's cross-thread suspend/scan protocol.
+  Whoever picks this up next should start from the `via_pin=true` finding in the `AttributeAccess` doc's
+  2026-07-15 section, not re-chase individual unpinned-local sites — that avenue has now been tried
+  repeatedly and each time found real-but-non-closing bugs.

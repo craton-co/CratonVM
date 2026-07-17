@@ -233,6 +233,11 @@ struct ClassStoreHierarchy<'a> {
     loaded_classes: &'a LoadedClassesMap,
     /// The class currently being verified (not yet in `class_store`).
     in_flight: Option<&'a Class>,
+    /// The parsed direct-superclass name of the class currently being
+    /// verified. Its resolved ClassId can still refer to an incomplete
+    /// bootstrap placeholder, so constructor verification needs this exact
+    /// symbolic edge before the class is registered.
+    in_flight_super_name: Option<&'a str>,
     /// The defining/initiating loader of the class being verified, used to
     /// make `lookup` loader-aware (CL-CLASSMANAGER fix). When `Some`, a
     /// name is resolved by walking that loader's parent-delegation chain
@@ -497,6 +502,57 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
             return true;
         }
         false
+    }
+
+    fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+        if self
+            .in_flight
+            .is_some_and(|in_flight| in_flight.name.as_ref() == child)
+        {
+            return self.in_flight_super_name == Some(parent);
+        }
+        let Some(child_id) = self.lookup(child) else {
+            return false;
+        };
+        let Some(child_class) = self.class_for(child_id) else {
+            return false;
+        };
+        let Some(super_id) = child_class.superclass else {
+            return false;
+        };
+        // The hierarchy is queried while `child_class` is still in flight.
+        // Its direct parent can have a resolved ClassId before its Class
+        // record is materialized in this store (notably java/lang/Object for
+        // a freshly defined application class). Comparing the loader-aware
+        // resolved ids retains the exact direct edge without requiring the
+        // parent record itself to be present.
+        if self
+            .lookup(parent)
+            .is_some_and(|parent_id| parent_id == super_id)
+        {
+            return true;
+        }
+        // The parent may have been resolved by a different initiating loader
+        // and therefore not be returned by `lookup(parent)` for the current
+        // verifier context. The loaded-class index still retains the exact
+        // ClassId-to-binary-name association; use that reverse proof instead
+        // of weakening constructor verification to any ancestor.
+        if self
+            .loaded_classes
+            .iter()
+            .any(|((_, name), id)| *id == super_id && name.as_ref() == parent)
+        {
+            return true;
+        }
+        if let Some(super_class) = self.class_for(super_id) {
+            return super_class.name.as_ref() == parent;
+        }
+        // The bootstrap Object edge is represented by a reserved ClassId in
+        // a few early definition paths, before an Object Class record is
+        // materialized or indexed. A non-Object direct parent is loaded and
+        // therefore handled by one of the exact checks above; accept only
+        // this bootstrap representation, never a general ancestor lookup.
+        parent == "java/lang/Object"
     }
 
     fn common_superclass(&self, a: &str, b: &str) -> String {
@@ -1193,7 +1249,9 @@ pub struct ClassManager {
     /// Raw class file bytes for each loaded class, keyed by internal name.
     /// Populated during define_class() for CDS dump support, JVMTI
     /// `RetransformClasses`, and `getResourceAsStream("X.class")`.
-    /// T10.9.B: FxHashMap — keys are class-file internal names.
+    /// T10.9.B: FxHashMap — keys are the defining ClassId. A binary name is
+    /// not sufficient: two user-defined loaders may hold distinct enhanced
+    /// copies of the same class at once.
     ///
     /// **Round 4 audit fix (HIGH):** insertions go through
     /// [`Self::insert_class_bytes`], which tracks total bytes against
@@ -1203,14 +1261,14 @@ pub struct ClassManager {
     /// classes averaging 6 KB each). The default 16 MiB cap covers
     /// JVMTI agents (re-fetch typically targets recently-defined
     /// classes) without bounding the heap of an idle process.
-    pub class_bytes_cache: FxHashMap<String, Vec<u8>>,
+    pub class_bytes_cache: FxHashMap<ClassId, Vec<u8>>,
 
     /// Insertion-order tracker for [`Self::class_bytes_cache`] FIFO
     /// eviction. Deque front = oldest entry. Entries re-inserted
     /// (e.g. redefine) are re-pushed at the back: the FIFO ordering
     /// reflects most-recent-insert, not most-recent-access (a real
     /// LRU would need touch-on-read, which isn't worth the `&mut self`).
-    class_bytes_cache_fifo: std::collections::VecDeque<String>,
+    class_bytes_cache_fifo: std::collections::VecDeque<ClassId>,
 
     /// Running total bytes held by [`Self::class_bytes_cache`].
     class_bytes_cache_size: usize,
@@ -1802,6 +1860,55 @@ impl ClassManager {
     /// delegation order (Bootstrap → Extension → Application); custom
     /// loaders are then linearly scanned (rare path — only relevant once
     /// `URLClassLoader`-style user loaders are wired up).
+    /// Loader-faithful variant of [`Self::get_loaded_class_id`]: resolves
+    /// `name` as the given requesting loader would, mirroring
+    /// `ClassStoreHierarchy::lookup`. A user-defined loader that defines its
+    /// OWN copy of `name` (loader-aware gate on) resolves to that copy, not
+    /// to a same-named class from the built-in chain or an unrelated loader.
+    /// Use this whenever a requesting-class context exists; the bare
+    /// name-only lookup returns an arbitrary copy when names collide across
+    /// loaders.
+    pub fn get_loaded_class_id_for_requester(
+        &self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Option<ClassId> {
+        match requesting_loader {
+            ClassLoaderId::Bootstrap | ClassLoaderId::Extension | ClassLoaderId::Application => {
+                for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
+                    {
+                        return Some(id);
+                    }
+                    // A built-in loader never delegates DOWN to its children.
+                    if *loader_id == requesting_loader {
+                        break;
+                    }
+                }
+                None
+            }
+            ClassLoaderId::UserDefined(_) => {
+                // An overriding user loader's own definition wins (JVMS
+                // §5.4.3 initiating-loader semantics) — same order as
+                // `ClassStoreHierarchy::lookup`.
+                if loader_aware_resolution() {
+                    if let Some(id) =
+                        loaded_classes_probe(&self.loaded_classes, requesting_loader, name)
+                    {
+                        return Some(id);
+                    }
+                }
+                for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
+                    {
+                        return Some(id);
+                    }
+                }
+                loaded_classes_probe(&self.loaded_classes, requesting_loader, name)
+            }
+        }
+    }
+
     pub fn get_loaded_class_id(&self, name: &str) -> Option<ClassId> {
         // C34 audit fix (HIGH): zero-allocation probe via
         // `loaded_classes_probe` (hashbrown `raw_entry`). Previously this
@@ -2621,7 +2728,65 @@ impl ClassManager {
     /// 1. Check if already loaded by any loader
     /// 2. Ask bootstrap → extension → application to find the class
     /// 3. Parse, recursively load superclass/interfaces, and register
+    /// Loader-faithful fast-path lookup for the requester-less, pure
+    /// parent-delegation loaders (`load_class` / `SharedVm::load_class_concurrent`).
+    ///
+    /// Prefers [`Self::get_loaded_class_id_for_requester`] with `Application`
+    /// as the requester, which probes only the built-in delegation chain
+    /// (bootstrap -> extension -> application) -- exactly the set of
+    /// answers `find_class_bytes_delegated` (the real, from-classpath slow
+    /// path these callers fall back to) can itself ever produce.
+    ///
+    /// Runtime-package-identity bug fix: the bare [`Self::get_loaded_class_id`]
+    /// additionally falls back to an arbitrary lone user-defined loader's own
+    /// copy of `name` when no built-in loader has defined it (see that fn's
+    /// "context.groovy fix" doc comment) -- the right default for genuinely
+    /// requester-less reflection-style lookups, but unsound as this
+    /// function's PRIMARY answer: a class that legitimately exists on the
+    /// real classpath (so `find_class_bytes_delegated` would find it) must
+    /// resolve to its own freshly-loaded built-in-loader copy, never to an
+    /// unrelated user-defined loader's redefinition that happens to share
+    /// the name (JVMS §5.3: defining loader is part of a class's identity).
+    /// Concretely: Spring's `TestCompiler` (Application loader) executing
+    /// `new TestCompiler$Problems()` byte-code must resolve to the ordinary
+    /// Application-classpath `Problems`, never to a *different*
+    /// `TestCompiler$Problems` that some earlier, unrelated
+    /// `@CompileWithForkedClassLoader` test forked into its own
+    /// `DynamicClassLoader` in the same run.
+    ///
+    /// That said, the lone-user-loader fallback is also the ONLY way
+    /// purely in-memory, never-backed-by-a-`.class`-file classes (e.g.
+    /// `java.lang.reflect.Proxy`-generated annotation proxies) are ever
+    /// re-resolved by name after their first definition -- there is no
+    /// classpath scan that could find them. So the fallback is used here
+    /// too, but only as a LAST RESORT, gated on `find_class_bytes_delegated`
+    /// genuinely failing to find real bytes for `name` -- i.e. only when no
+    /// better, classpath-backed answer could possibly exist.
+    pub fn resolve_fast_path_class_id(&self, name: &str) -> Option<ClassId> {
+        if let Some(id) =
+            self.get_loaded_class_id_for_requester(name, ClassLoaderId::Application)
+        {
+            return Some(id);
+        }
+        let candidate = self.get_loaded_class_id(name)?;
+        let is_user_loader_answer = matches!(
+            self.class_store.get(candidate).map(|c| c.loader_id),
+            Some(ClassLoaderId::UserDefined(_))
+        );
+        if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
+            return Some(candidate);
+        }
+        None
+    }
+
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
+        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata") {
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!(
+                "[DBG_LOADCLASS] load_class({name}) already_loaded={:?}\n{bt}",
+                self.get_loaded_class_id(name)
+            );
+        }
         // RKC16N.3: Reference- and primitive-array classes (`[X`) are
         // *synthesised* by the bootstrap loader directly from the
         // resolved component class — JVMS §5.3.3 explicitly says no
@@ -2632,8 +2797,10 @@ impl ClassManager {
         if name.starts_with('[') {
             return self.synthesize_array_class(name);
         }
-        // Fast path: loader-aware lookup via loaded_classes
-        if let Some(id) = self.get_loaded_class_id(name) {
+        // Fast path: loader-aware lookup via loaded_classes. See
+        // `resolve_fast_path_class_id`'s doc comment for the runtime-
+        // package-identity bug this guards against.
+        if let Some(id) = self.resolve_fast_path_class_id(name) {
             // If the class is a synthetic stub (no methods, no bytecode), try
             // to upgrade it to a real class from the classpath. This handles
             // the case where wrapper types like java/lang/Boolean are created
@@ -3571,6 +3738,7 @@ impl ClassManager {
                 // in `class_store`; pass it explicitly so self-references
                 // (its own name / id) resolve during verification.
                 in_flight: Some(&class),
+                in_flight_super_name: class_file.super_class.as_deref(),
                 // CL-CLASSMANAGER fix: make type resolution loader-aware —
                 // referenced names resolve through this class's defining
                 // loader's delegation order, not a global first-match.
@@ -3634,7 +3802,7 @@ impl ClassManager {
         // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
         // this, every classfile would stay resident forever — ~90 MB on
         // a medium Spring app.
-        self.insert_class_bytes(name.to_string(), bytes.to_vec());
+        self.insert_class_bytes(id, bytes.to_vec());
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
         // during link-time so trusted hidden / generated classes
@@ -4416,7 +4584,7 @@ impl ClassManager {
         // from `class_bytes_cache`; if not present (synthetic stub or
         // old code path that never recorded them) we pass an empty
         // slice — JVMTI agents tolerate that.
-        let old_bytes_opt = self.class_bytes_cache.get(&existing_name).cloned();
+        let old_bytes_opt = self.class_bytes_cache.get(&class_id).cloned();
         let old_bytes_slice: &[u8] = old_bytes_opt.as_deref().unwrap_or(&[]);
         let class_id_u32 = class_id.as_u32();
         let effective_new_bytes: Vec<u8> = match fire_class_file_load_hook(
@@ -4923,6 +5091,7 @@ impl ClassManager {
                     // Redefine verifies a class already resident in the
                     // store (in-place mutation), so no in-flight class.
                     in_flight: None,
+                    in_flight_super_name: None,
                     // CL-CLASSMANAGER fix: the redefined class is resident
                     // at `class_id`; resolve referenced names through its
                     // own defining loader's delegation order so two loaders
@@ -4992,7 +5161,7 @@ impl ClassManager {
             // no unused-variable lint fires when the cache update is skipped.
             let _ = &effective_new_bytes;
         } else {
-            self.insert_class_bytes(existing_name.clone(), effective_new_bytes);
+            self.insert_class_bytes(class_id, effective_new_bytes);
         }
 
         // ---- Step 6: rebuild + re-install vtable descriptor snapshots ----
@@ -5066,27 +5235,31 @@ impl ClassManager {
     /// older entries (FIFO) once the cumulative byte budget exceeds
     /// [`Self::class_bytes_cache_cap`].
     ///
-    /// Re-inserts of the same `name` (e.g. JVMTI redefine) update the
+    /// Re-inserts of the same `ClassId` (e.g. JVMTI redefine) update the
     /// size accounting and move the entry to the tail of the FIFO so
     /// it is the *last* candidate for eviction — agents that redefine
     /// hot classes keep them in cache.
-    pub fn insert_class_bytes(&mut self, name: String, bytes: Vec<u8>) {
+    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: Vec<u8>) {
         let new_size = bytes.len();
-        // If we already had an entry for this name, subtract its size
+        // If we already had an entry for this class, subtract its size
         // and remove it from the FIFO before re-appending.
-        if let Some(prev) = self.class_bytes_cache.remove(&name) {
+        if let Some(prev) = self.class_bytes_cache.remove(&class_id) {
             self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_sub(prev.len());
             // Remove the existing FIFO entry (linear scan — the deque is
             // small relative to total bytes; a real LRU would need a
             // doubly-linked list. Acceptable here because redefines are
             // rare next to first-loads).
-            if let Some(pos) = self.class_bytes_cache_fifo.iter().position(|n| n == &name) {
+            if let Some(pos) = self
+                .class_bytes_cache_fifo
+                .iter()
+                .position(|id| *id == class_id)
+            {
                 self.class_bytes_cache_fifo.remove(pos);
             }
         }
         self.class_bytes_cache_size = self.class_bytes_cache_size.saturating_add(new_size);
-        self.class_bytes_cache.insert(name.clone(), bytes);
-        self.class_bytes_cache_fifo.push_back(name);
+        self.class_bytes_cache.insert(class_id, bytes);
+        self.class_bytes_cache_fifo.push_back(class_id);
 
         // Evict oldest entries until we fit under the cap. We always
         // keep at least the most-recently-inserted entry, so the cap
@@ -5157,6 +5330,7 @@ impl ClassManager {
     pub fn extend_bootstrap_classpath(&mut self, paths: &[String]) {
         for path in paths {
             self.bootstrap.add_path(path);
+            note_bootstrap_appended_jar(path);
         }
         // See [`Self::extend_application_classpath`]: a new bootstrap entry can
         // satisfy a name previously memoized as absent.
@@ -5319,6 +5493,16 @@ impl ClassManager {
         self.class_store
             .get(child_id)
             .is_some_and(|child| child.is_subclass_of(parent_id, &self.class_store))
+    }
+
+    /// Loader-identity-blind fallback for [`is_subclass_of`] -- see
+    /// `Class::is_subclass_of_by_name`'s doc comment for the full rationale
+    /// (exception-handler `catch_type` resolution needing to match a
+    /// same-named-but-different-`ClassId` exception class across loaders).
+    pub fn is_subclass_of_by_name(&self, child_id: ClassId, target_name: &str) -> bool {
+        self.class_store
+            .get(child_id)
+            .is_some_and(|child| child.is_subclass_of_by_name(target_name, &self.class_store))
     }
 
     /// Get a reference to the underlying class store.
@@ -5914,6 +6098,26 @@ impl ClassManager {
             class.bootstrap_methods = bootstrap_methods;
             class.annotations = annotations;
             class.signature = signature;
+            // JVMS 5.3 runtime-package identity bug fix: the synthetic
+            // stub this class started as was minted with SOME default
+            // `loader_id` (e.g. `ClassLoaderId::Bootstrap`, see
+            // `create_synthetic_stub`), which is frequently NOT the
+            // loader that actually supplied the real bytecode we just
+            // parsed -- `loader_id` (this fn's parameter) came straight
+            // out of `find_class_bytes_delegated`'s parent-delegation
+            // search (bootstrap -> extension -> application) and is
+            // authoritative for where these bytes were actually found.
+            // Every other field below is refreshed from the real class
+            // file on upgrade; `loader_id` was the one exception, left
+            // permanently wrong (e.g. stuck at `Bootstrap` for an
+            // ordinary Application-classpath class). That divergence
+            // was invisible until a same-runtime-package check
+            // (JVMS 5.3: defining loader + package name) started
+            // comparing `loader_id` across classes that are, from
+            // Java's perspective, defined by the very same
+            // `ClassLoader` object -- see `check_class_access` /
+            // `same_runtime_package` in `access_control.rs`.
+            class.loader_id = loader_id;
             class.is_synthetic_stub = false;
             // Reset *both* initialization representations so verification and
             // the real `<clinit>` run after a stub-to-bytecode upgrade.  The
@@ -6009,7 +6213,7 @@ impl ClassManager {
         fire_resolution_invalidate_hook(id.as_u32());
 
         // Cache the class bytes (FIFO-bounded helper).
-        self.insert_class_bytes(name.to_string(), bytes.to_vec());
+        self.insert_class_bytes(id, bytes.to_vec());
 
         Ok(())
     }
@@ -6631,6 +6835,16 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/Collections$EmptyEnumeration" => {
             &["java/util/Enumeration", "java/io/Serializable"]
         }
+        // RE.5 JDK-HttpClient reactive path: the one-shot replay subscription
+        // handed to a real `BodySubscriber` (`net_phase_e.rs::
+        // RE5_REPLAY_SUBSCRIPTION`). Real JDK bytecode checkcasts it —
+        // `ResponseSubscribers$PublishingBodySubscriber.onSubscribe` completes
+        // a `CompletableFuture<Flow.Subscription>` whose downstream stage casts
+        // the value — so the wrapper class must genuinely implement the
+        // interface or Spring's reactive `JdkClientHttpConnector` dies with
+        // "HttpBodyReplaySubscription cannot be cast to Flow$Subscription"
+        // (WebClientIntegrationTests "[2] JDK", 40 sub-tests).
+        "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
         "java/util/Dictionary" => &[],
@@ -11808,6 +12022,7 @@ mod tests {
             class_store: &cm.class_store,
             loaded_classes: &cm.loaded_classes,
             in_flight: None,
+            in_flight_super_name: None,
             requesting_loader: None,
         };
         use crate::vtype::ClassHierarchy;
@@ -12492,19 +12707,19 @@ mod tests {
     fn t10_9_b_class_manager_fxhash_swap_smoke() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
-        // class_bytes_cache: populate 50 entries, confirm round-trip.
+        // class_bytes_cache: populate 50 class identities, confirm round-trip.
         for i in 0..50u32 {
-            let name = format!("pkg/Cls{i}");
+            let class_id = ClassId::new(i);
             let bytes = vec![0xcafe_babeu32.to_be_bytes()[0]; i as usize + 4];
-            mgr.class_bytes_cache.insert(name, bytes);
+            mgr.class_bytes_cache.insert(class_id, bytes);
         }
         for i in 0..50u32 {
-            let name = format!("pkg/Cls{i}");
-            let got = mgr.class_bytes_cache.get(&name);
-            assert!(got.is_some(), "class_bytes_cache missing {name}");
+            let class_id = ClassId::new(i);
+            let got = mgr.class_bytes_cache.get(&class_id);
+            assert!(got.is_some(), "class_bytes_cache missing {class_id}");
             assert_eq!(got.unwrap().len(), i as usize + 4);
         }
-        assert!(mgr.class_bytes_cache.get("pkg/NotThere").is_none());
+        assert!(mgr.class_bytes_cache.get(&ClassId::new(99_999)).is_none());
 
         // cds_class_cache: populate and verify.
         for i in 0..25u32 {
@@ -13771,4 +13986,62 @@ mod tests {
         fire_jit_invalidate_hook(0);
         // No assertion beyond "doesn't panic".
     }
+}
+
+
+/// Internal names of classes provided by jars appended at runtime via
+/// `Instrumentation.appendToBootstrapClassLoaderSearch` (Mockito injects its
+/// `MockMethodDispatcher` this way and asserts a null defining loader).
+/// `ClassLoader.loadClass`'s native parent-first delegation consults this so
+/// an overriding user loader (e.g. Spring's `@CompileWithForkedClassLoader`
+/// fork, which re-defines every resolvable name from resources) still lets
+/// the BOOTSTRAP loader serve these classes -- exactly what HotSpot does,
+/// since parent delegation always runs before `findClass`.
+static BOOTSTRAP_APPENDED_CLASSES: std::sync::OnceLock<
+    std::sync::RwLock<FxHashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn bootstrap_appended_classes() -> &'static std::sync::RwLock<FxHashSet<String>> {
+    BOOTSTRAP_APPENDED_CLASSES.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))
+}
+
+/// Record every `.class` entry of an appended bootstrap-search jar.
+fn note_bootstrap_appended_jar(path: &str) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::BufReader::new(file)) else {
+        return;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index_raw(i) {
+            let name = entry.name();
+            if let Some(stripped) = name.strip_suffix(".class") {
+                if !stripped.starts_with("META-INF") {
+                    names.push(stripped.to_string());
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        return;
+    }
+    let mut set = bootstrap_appended_classes()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    for n in names {
+        set.insert(n);
+    }
+}
+
+/// Whether `internal` (slash-form) names a class made loadable by a jar
+/// appended to the BOOTSTRAP search at runtime.
+pub fn is_bootstrap_appended_class(internal: &str) -> bool {
+    let Some(lock) = BOOTSTRAP_APPENDED_CLASSES.get() else {
+        return false;
+    };
+    lock.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(internal)
 }

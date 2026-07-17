@@ -1389,9 +1389,15 @@ fn native_service_container_add_service(
         .add_service(name.clone(), Vec::new(), Mode::Active, service_obj)
         .map_err(|msg| MethodCallFailed::InternalError(VmError::Internal { message: msg }))?;
 
-    // Build the Java-side ServiceController mirror.
+    // Build the Java-side ServiceController mirror. `sn_obj` is held across
+    // this allocation, and `ctrl_obj` is held across the drive-to-completion
+    // call below (either branch can invoke real Java code and trigger a
+    // moving GC) — pin both and re-read before their next use.
+    let sn_pin = ctx.pin_native_root(sn_obj);
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
+    let sn_obj = ctx.read_native_pin(sn_pin, sn_obj);
+    let ctrl_pin = ctx.pin_native_root(ctrl_obj);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_obj)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(Mode::Active.ordinal()));
     ctx.set_field(
@@ -1415,12 +1421,17 @@ fn native_service_container_add_service(
         if !was_driving {
             let res = drive_starts(ctx, &container);
             DRIVING.with(|d| d.set(false));
-            res?;
+            if let Err(e) = res {
+                ctx.unpin_native_roots(sn_pin);
+                return Err(e);
+            }
         }
     } else {
         container.drain_tasks_locally();
     }
+    let ctrl_obj = ctx.read_native_pin(ctrl_pin, ctrl_obj);
     reflect_controller(ctx, ctrl_obj, &container, id);
+    ctx.unpin_native_roots(sn_pin);
 
     Ok(Some(Value::Object(Some(ctrl_obj))))
 }
@@ -2356,6 +2367,9 @@ fn native_service_container_await_stability_common(
         ctx.unpin_native_roots(base);
         return Err(e);
     }
+    // `copy_non_null_identity_hash_set` invokes `Set.add` and can trigger a
+    // moving GC — re-read the pinned dest before this second use.
+    let failed_dest_cur = failed_pin.map(|h| ctx.read_native_pin(h, failed_dest.unwrap()));
     if let Err(e) = remove_null_service_controller_from_set(ctx, failed_dest_cur, "failed") {
         ctx.unpin_native_roots(base);
         return Err(e);
@@ -2373,6 +2387,9 @@ fn native_service_container_await_stability_common(
         ctx.unpin_native_roots(base);
         return Err(e);
     }
+    // Same re-read requirement as `failed_dest_cur` above: the copy call
+    // above can move the destination set.
+    let problems_dest_cur = problems_pin.map(|h| ctx.read_native_pin(h, problems_dest.unwrap()));
     let cleanup = remove_null_service_controller_from_set(ctx, problems_dest_cur, "problems");
     ctx.unpin_native_roots(base);
     cleanup.map(|_| true)
@@ -2893,8 +2910,14 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
         _ => return,
     };
     let n = ctx.array_length(arr);
+    // `arr` (the outer requires-entries array) is read again at the top of
+    // every loop iteration, but a later iteration's own `toArray` hazard
+    // below can move it in the meantime — pin/re-read across the loop.
+    let arr_pin = ctx.pin_native_root(arr);
+    let mut arr_cur = arr;
     for i in 0..n {
-        let dep = match ctx.get_array_element(arr, i) {
+        arr_cur = ctx.read_native_pin(arr_pin, arr_cur);
+        let dep = match ctx.get_array_element(arr_cur, i) {
             Value::Object(Some(d)) => d,
             _ => continue,
         };
@@ -2906,10 +2929,21 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
             Value::Object(Some(l)) => l,
             _ => continue,
         };
+        // `reg` is stored into the persistent `dep_injections` root table
+        // below, but only AFTER the `toArray` call here — pin it across that
+        // call so a moving GC during `toArray` can't land a stale pointer in
+        // the table (the table's own remap only covers entries already
+        // present at move time).
+        let reg_pin = ctx.pin_native_root(reg);
         let inj_arr = match ctx.invoke_virtual(inj_list, "toArray", "()[Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(a)))) => a,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(reg_pin);
+                continue;
+            }
         };
+        let reg = ctx.read_native_pin(reg_pin, reg);
+        ctx.unpin_native_roots(reg_pin);
         let m = ctx.array_length(inj_arr);
         for j in 0..m {
             if let Value::Object(Some(inj)) = ctx.get_array_element(inj_arr, j) {
@@ -2923,6 +2957,7 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
             }
         }
     }
+    ctx.unpin_native_roots(arr_pin);
 }
 
 /// Real MSC's StartTask resolves every legacy-injected dependency's value
@@ -3025,15 +3060,31 @@ fn wire_provides_injectors(
         _ => return,
     };
     let n = ctx.array_length(arr);
+    // `arr` (the outer entries array) and `target` both live across every
+    // loop iteration's `getKey`/`getValue`/`getOrCreateRegistration` hazards;
+    // `entry`/`key`/`writable` are each held across a hazard within a single
+    // iteration too (`entry` across `getKey`, `key` across `getValue`,
+    // `writable` across `getOrCreateRegistration`) — pin everything and
+    // re-read right before each subsequent use.
+    let arr_pin = ctx.pin_native_root(arr);
+    let target_pin = target.map(|t| ctx.pin_native_root(t));
+    let mut arr_cur = arr;
     for i in 0..n {
-        let entry = match ctx.get_array_element(arr, i) {
+        arr_cur = ctx.read_native_pin(arr_pin, arr_cur);
+        let entry = match ctx.get_array_element(arr_cur, i) {
             Value::Object(Some(e)) => e,
             _ => continue,
         };
+        let entry_pin = ctx.pin_native_root(entry);
         let key = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(k)))) => k,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
+        let key_pin = ctx.pin_native_root(key);
+        let entry = ctx.read_native_pin(entry_pin, entry);
         // Every provided name that differs from the primary serviceId is an
         // alias — dependency resolution (`can_start`) and lookups
         // (`getService`) must find this service under it, matching real
@@ -3045,8 +3096,12 @@ fn wire_provides_injectors(
         }
         let writable = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(w)))) => w,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
+        let writable_pin = ctx.pin_native_root(writable);
         // Re-read the mirror from the GC-remapped side-table on every use —
         // the invoke_virtual calls above can trigger a moving collection, and
         // a stale local here is exactly the native stale-local root family.
@@ -3054,11 +3109,19 @@ fn wire_provides_injectors(
             let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
             match map.get(&id).and_then(|r| r.controller_mirror) {
                 Some(m) => m,
-                None => return,
+                None => {
+                    ctx.unpin_native_roots(entry_pin);
+                    return;
+                }
             }
         };
+        let writable = ctx.read_native_pin(writable_pin, writable);
         ctx.set_field_by_name(writable, "controller", Value::Object(Some(mirror)));
-        if let Some(t) = target {
+        if let Some(t_orig) = target {
+            let t = target_pin
+                .map(|h| ctx.read_native_pin(h, t_orig))
+                .unwrap_or(t_orig);
+            let key = ctx.read_native_pin(key_pin, key);
             match ctx.invoke_virtual(
                 t,
                 "getOrCreateRegistration",
@@ -3066,6 +3129,7 @@ fn wire_provides_injectors(
                 &[Value::Object(Some(key))],
             ) {
                 Ok(Some(Value::Object(Some(reg)))) => {
+                    let writable = ctx.read_native_pin(writable_pin, writable);
                     ctx.set_field_by_name(reg, "injector", Value::Object(Some(writable)));
                 }
                 other => {
@@ -3078,7 +3142,9 @@ fn wire_provides_injectors(
                 }
             }
         }
+        ctx.unpin_native_roots(entry_pin);
     }
+    ctx.unpin_native_roots(arr_pin);
 }
 
 /// Allocate a synthetic `StartContext` carrying `controller_id`, and root it.
@@ -3274,6 +3340,15 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
+    // `sn_obj` (when Some but its canonical name can't be decoded) survives
+    // across `read_provides_names`'s own `keySet`/`toArray` calls below,
+    // until it's used again to build the controller mirror further down —
+    // pin it now. Deliberately left pinned for the rest of this function
+    // (no explicit unpin): it is never the innermost pin, so unpinning any
+    // later batch here can't reach it without also discarding pins still in
+    // use; the call-dispatch wrapper truncates the whole pin stack when this
+    // native call returns regardless.
+    let sn_pin = sn_obj.map(|o| (ctx.pin_native_root(o), o));
     let name = sn_obj.and_then(|o| read_service_name_robust(ctx, o));
     // Anonymous install (`ServiceTarget.addService()` with no name): the
     // service is addressable only via its `provides(...)` names. Real MSC
@@ -3320,6 +3395,12 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
+    // `child_target` is stored into the persistent root map far below, only
+    // after `read_dep_names`, `add_service`, and the controller-mirror
+    // allocation all run — every one of which can move it first. Pin it
+    // alongside `service_pin` (pushed right after it here, unwound together
+    // via `service_pin`'s handle at the same points below).
+    let child_target_pin = child_target.map(|o| (ctx.pin_native_root(o), o));
     let deps = match ctx.get_field_by_name(builder, "requires") {
         Value::Object(Some(o)) => read_dep_names(ctx, Some(o)),
         _ => Vec::new(),
@@ -3330,7 +3411,12 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         name.clone(),
         deps.clone(),
         mode,
-        service_ref.map(|o| o.as_ptr() as usize).unwrap_or(0),
+        // Re-read via the pin: `service_ref` itself is not refreshed after
+        // `read_dep_names` above, which can move the object first.
+        service_pin
+            .as_ref()
+            .map(|(pin, original)| ctx.read_native_pin(*pin, *original).as_ptr() as usize)
+            .unwrap_or(0),
     ) {
         Ok(id) => id,
         Err(msg) => {
@@ -3353,7 +3439,9 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // primary name instead so getName()/diagnostics stay meaningful.
     // Allocated BEFORE the mirror: a GC triggered by this allocation would
     // otherwise stale the raw `ctrl_obj` local (it is only rooted later).
-    let sn_for_mirror = sn_obj.unwrap_or_else(|| alloc_java_service_name(ctx, &name));
+    let sn_for_mirror = sn_pin
+        .map(|(pin, original)| ctx.read_native_pin(pin, original))
+        .unwrap_or_else(|| alloc_java_service_name(ctx, &name));
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
@@ -3375,7 +3463,9 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
             .as_ref()
             .map(|(pin, original)| ctx.read_native_pin(*pin, *original));
         r.controller_mirror = Some(ctrl_obj);
-        r.child_target = child_target;
+        r.child_target = child_target_pin
+            .as_ref()
+            .map(|(pin, original)| ctx.read_native_pin(*pin, *original));
     }
     if let Some((pin, _)) = service_pin {
         ctx.unpin_native_roots(pin);
@@ -4152,30 +4242,13 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "org/jboss/msc/service/ServiceControllerImpl",
     );
 
-    // DelegatingServiceController is another concrete wrapper selected at
-    // dispatch sites such as the datasource parallel boot task. Its inherited
-    // ServiceController methods have no Code attribute, so it needs the same
-    // complete bridge as ServiceControllerImpl.
-    r.alias_class(
-        "org/jboss/msc/service/ServiceController",
-        "org/jboss/msc/service/DelegatingServiceController",
-    );
-    // DelegatingServiceController resolves these interface declarations under
-    // its own class key, so register them explicitly as well as aliasing the
-    // complete bridge above.
-    let delegating_controller = "org/jboss/msc/service/DelegatingServiceController";
-    r.register(
-        delegating_controller,
-        "getService",
-        "()Lorg/jboss/msc/service/Service;",
-        native_service_controller_get_service,
-    );
-    r.register(
-        delegating_controller,
-        "getName",
-        "()Lorg/jboss/msc/service/ServiceName;",
-        native_service_controller_get_name,
-    );
+    // Do not alias ServiceController natives onto DelegatingServiceController.
+    // It has real forwarding bytecode and a two-field wrapper layout; aliasing
+    // getState()/getService()/getName() bypasses that bytecode and makes the
+    // synthetic-controller natives read SC_FIELD_ID (slot 5) from the wrapper.
+    // OperationContextServiceController extends this type, so that misdispatch
+    // rolls back WildFly management services before domain inventory startup.
+    // Let the wrapper forward to its synthetic ServiceController delegate.
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
     r.set_category(__prev_cat);
@@ -4232,15 +4305,25 @@ fn jboss_logging_serviceloader_provider(ctx: &mut dyn NativeContext) -> Option<V
             return None;
         }
     };
+    // `it` is held across `hasNext()` before being used again for `next()` —
+    // same "Iterator receiver across its own hasNext/next" hazard already
+    // fixed at other call sites (`service_loader.rs`'s `drain_instances_to_stream`
+    // / `native_sl_find_first`); pin/re-read here too.
+    let it_pin = ctx.pin_native_root(it);
     let has = ctx.invoke_virtual(it, "hasNext", "()Z", &[]);
     if dbg {
         eprintln!("[LOGPROV] hasNext -> {has:?}");
     }
     match has {
         Ok(Some(Value::Int(1))) => {}
-        _ => return None,
+        _ => {
+            ctx.unpin_native_roots(it_pin);
+            return None;
+        }
     }
+    let it = ctx.read_native_pin(it_pin, it);
     let nx = ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]);
+    ctx.unpin_native_roots(it_pin);
     if dbg {
         match &nx {
             Ok(Some(Value::Object(Some(o)))) => {
@@ -4327,11 +4410,25 @@ mod tests {
         for class in [
             "org/jboss/msc/service/ServiceController",
             "org/jboss/msc/service/ServiceControllerImpl",
-            "org/jboss/msc/service/DelegatingServiceController",
         ] {
             assert!(
                 registry.find(class, "getService", descriptor).is_some(),
                 "{class}.getService must use the descriptor from jboss-msc 1.5"
+            );
+        }
+
+        // This class has real bytecode which forwards every ServiceController
+        // method to its delegate. It must never receive the synthetic mirror
+        // natives (whose slot-5 controller ID is not in its two-field layout).
+        let delegating = "org/jboss/msc/service/DelegatingServiceController";
+        for (method, descriptor) in [
+            ("getState", "()Lorg/jboss/msc/service/ServiceController$State;"),
+            ("getService", descriptor),
+            ("getName", "()Lorg/jboss/msc/service/ServiceName;"),
+        ] {
+            assert!(
+                registry.find(delegating, method, descriptor).is_none(),
+                "{delegating}.{method}{descriptor} must retain its Java forwarding bytecode"
             );
         }
     }

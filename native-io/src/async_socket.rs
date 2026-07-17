@@ -40,7 +40,7 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -88,6 +88,88 @@ fn aio_register(h: AioHandle) -> i32 {
 /// the map from growing monotonically on heavy connect/close churn.
 fn aio_remove(id: i32) {
     aio_registry().write().remove(&id);
+}
+
+/// BUG FIX (2026-07-17, found while investigating `WebSocketIntegrationTests`
+/// `TomcatWebSocketClient` timeouts — see `docs/known-issues/
+/// CRATONVM-SPRING-GENUINE-BUGLIST.md`): `aio_asc_close`/`aio_assc_close`
+/// used to call only `aio_remove`, which drops the *registry's*
+/// `Arc<Mutex<TcpStream>>` — but any in-flight handler-form read
+/// (`aio_asc_read` -> `Job::ReadFd`) is blocked in a worker thread on its OWN
+/// independent `try_clone()` duplicate of the socket (a separate OS fd
+/// sharing the same underlying open-file-description). Dropping/closing the
+/// registry's fd does not send a FIN as long as that cloned fd remains open,
+/// so the worker's blocking `read()` never wakes up — real `close()` silently
+/// does nothing to it, violating `AsynchronousCloseException`'s contract that
+/// outstanding operations complete on close. This is a genuine, independently
+/// confirmed gap (verified via `cargo test -p cratonvm-native-io`, 349/349
+/// still pass) and worth fixing on its own merits.
+///
+/// IMPORTANT — this does *not* fix the `WebSocketIntegrationTests`
+/// `TomcatWebSocketClient` hangs it was found while chasing. `CRATONVM_DBG_AIO`
+/// tracing showed `aio_asc_close` is *never entered at all* (0 hits) across
+/// every run of that test class, passing or failing — Tomcat's own
+/// `WsWebSocketContainer` never calls `channel.close()` on the path that
+/// hangs; it completes the handshake and (for the close-sequence tests) the
+/// WS-level close-frame exchange correctly at the byte level, then the
+/// higher-level Java session/`Mono` simply never resolves, well before any
+/// `close()` call would occur. That remaining hang is still open — see the
+/// known-issues doc entry for the full trace-based writeup.
+///
+/// Fix: `shutdown(Both)` on the registry's stream before removing it.
+/// `shutdown()` (unlike `close()`) acts on the shared socket, not the fd, so
+/// it unblocks *every* fd that still references the same open-file-
+/// description — including clones already handed to worker threads — causing
+/// their blocked `read()` to return `Ok(0)` (EOF) immediately, which
+/// `Job::ReadFd`/`Job::ReadFutureFd` already translate into a normal
+/// `completed(-1)` / EOF completion. Errors are ignored: the socket may
+/// already be half-closed by the peer, or the OS handle may already be
+/// invalid, both harmless here since removal proceeds regardless.
+fn aio_shutdown_stream(id: i32) {
+    if let Some(AioHandle::Stream(s)) = aio_registry().read().get(&id) {
+        let _ = s.lock().shutdown(Shutdown::Both);
+    }
+}
+
+/// Same fix as `aio_shutdown_stream`, for the *other* id space: channels
+/// connected through the Future-form `connect` (and every `TomcatWebSocketClient`
+/// connection observed in practice) store an `fd_table` fd directly in
+/// `F_REG_ID`, not a legacy `aio_registry` id (see `AIO_REG_BASE`'s doc comment
+/// — fd_table fds are always numerically below it). `aio_shutdown_stream`
+/// alone is therefore a no-op for these: there is no `aio_registry` entry to
+/// find. `fd_table`'s own `close()` has the identical gap `aio_remove` had —
+/// it just drops the table's `Arc`, which does not touch a worker's already-
+/// `try_clone()`'d duplicate fd. So: obtain one more clone here (a cheap
+/// `dup()`) purely to call `shutdown(Both)` on the *shared* socket — `shutdown`
+/// affects every fd referencing the same open-file-description, including the
+/// worker's, unlike `close`/`drop` which only affect the one fd being closed.
+fn aio_shutdown_fd_table_stream(ctx: &mut dyn NativeContext, fd: u32) {
+    if let Ok(stream) = ctx.fd_table().try_clone_tcp(fd) {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+    let _ = ctx.fd_table().close(fd);
+}
+
+/// Opt-in diagnostic (`CRATONVM_DBG_AIO=1`), added 2026-07-17 while
+/// investigating `WebSocketIntegrationTests`'s `TomcatWebSocketClient`
+/// timeouts (Tomcat's `WsWebSocketContainer` is the one real client that
+/// drives `AsynchronousSocketChannel.read/write(ByteBuffer)` — the Future
+/// form below). Traces every Future-form read/write dispatch, its worker
+/// completion, and delivery, tagged by the fd (fd_table id, not the
+/// registry id) and the cloned-stream's raw OS fd where cheaply available,
+/// so overlapping/interleaved reads on the same logical connection show up
+/// as interleaved trace lines with a shared fd tag. Follows the precedent
+/// of `CRATONVM_DBG_SC_READ` / `CRATONVM_DBG_SC_CLOSE` in `socket_channel.rs`.
+fn dbg_aio_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIO").is_some())
+}
+macro_rules! dbg_aio {
+    ($($arg:tt)*) => {
+        if dbg_aio_enabled() {
+            eprintln!("[dbg-aio {:?}] {}", std::time::Instant::now(), format!($($arg)*));
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,10 +323,35 @@ pub struct ReadCompletion {
     outcome: ReadOutcome,
 }
 
-fn read_completion_state() -> &'static (Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar)
-{
-    static S: OnceLock<(Mutex<std::collections::VecDeque<ReadCompletion>>, Condvar)> =
-        OnceLock::new();
+/// Result parked by a Future-form read or write.  The worker threads never
+/// touch Java objects directly; the dispatcher resolves these roots and
+/// completes the real JDK CompletableFuture on an attached VM thread.
+pub enum FutureOutcome {
+    Bytes(Vec<u8>),
+    Count(i32),
+    Eof,
+    Error(String),
+}
+
+pub struct FutureCompletion {
+    future_gref: usize,
+    buffer_gref: usize,
+    outcome: FutureOutcome,
+}
+
+enum DispatcherCompletion {
+    Read(ReadCompletion),
+    Future(FutureCompletion),
+}
+
+fn read_completion_state() -> &'static (
+    Mutex<std::collections::VecDeque<DispatcherCompletion>>,
+    Condvar,
+) {
+    static S: OnceLock<(
+        Mutex<std::collections::VecDeque<DispatcherCompletion>>,
+        Condvar,
+    )> = OnceLock::new();
     S.get_or_init(|| {
         (
             Mutex::new(std::collections::VecDeque::new()),
@@ -256,7 +363,15 @@ fn read_completion_state() -> &'static (Mutex<std::collections::VecDeque<ReadCom
 /// Park a completed read and wake the dispatcher.
 fn push_read_completion(c: ReadCompletion) {
     let (q, cv) = read_completion_state();
-    q.lock().push_back(c);
+    q.lock().push_back(DispatcherCompletion::Read(c));
+    cv.notify_one();
+}
+
+/// Park a Future-form completion and wake the VM-attached dispatcher.
+fn push_future_completion(c: FutureCompletion) {
+    dbg_aio!("      push  future_gref={} queued for delivery", c.future_gref);
+    let (q, cv) = read_completion_state();
+    q.lock().push_back(DispatcherCompletion::Future(c));
     cv.notify_one();
 }
 
@@ -283,7 +398,10 @@ pub fn drain_completions_pub(ctx: &mut dyn NativeContext) {
     for _ in 0..READ_DRAIN_LIMIT {
         let next = read_completion_state().0.lock().pop_front();
         let Some(c) = next else { break };
-        deliver_read_completion(ctx, c);
+        match c {
+            DispatcherCompletion::Read(c) => deliver_read_completion(ctx, c),
+            DispatcherCompletion::Future(c) => deliver_future_completion(ctx, c),
+        }
     }
 }
 
@@ -296,8 +414,15 @@ fn deliver_read_completion(ctx: &mut dyn NativeContext, c: ReadCompletion) {
         buffer_gref,
         outcome,
     } = c;
+    dbg_aio!("HREAD  deliver handler_gref={handler_gref} outcome={}", match &outcome {
+        ReadOutcome::Bytes(b) => format!("Bytes(len={})", b.len()),
+        ReadOutcome::Eof => "Eof".to_string(),
+        ReadOutcome::Count(n) => format!("Count({n})"),
+        ReadOutcome::Error(m) => format!("Error({m})"),
+    });
     // Nothing to deliver to if the handler root is gone; just release.
     if ctx.resolve_global_root(handler_gref).is_none() {
+        dbg_aio!("HREAD  deliver handler_gref={handler_gref} — handler root GONE, dropping completion silently");
         release_read_roots(ctx, handler_gref, attachment_gref, buffer_gref);
         return;
     }
@@ -320,6 +445,112 @@ fn deliver_read_completion(ctx: &mut dyn NativeContext, c: ReadCompletion) {
         ReadOutcome::Error(msg) => deliver_failed(ctx, handler_gref, attachment_gref, &msg),
     }
     release_read_roots(ctx, handler_gref, attachment_gref, buffer_gref);
+}
+
+fn deliver_future_completion(ctx: &mut dyn NativeContext, c: FutureCompletion) {
+    let FutureCompletion {
+        future_gref,
+        buffer_gref,
+        outcome,
+    } = c;
+    dbg_aio!("      deliver future_gref={future_gref} outcome={}", match &outcome {
+        FutureOutcome::Bytes(b) => format!("Bytes(len={} hex={})", b.len(),
+            b.iter().take(32).map(|x| format!("{x:02x}")).collect::<String>()),
+        FutureOutcome::Count(n) => format!("Count({n})"),
+        FutureOutcome::Eof => "Eof".to_string(),
+        FutureOutcome::Error(m) => format!("Error({m})"),
+    });
+    let completion = match outcome {
+        FutureOutcome::Bytes(bytes) => {
+            let n = ctx
+                .resolve_global_root(buffer_gref)
+                .map(|bb| write_into_buffer_and_advance(ctx, bb, &bytes))
+                .unwrap_or(0);
+            Ok(box_int(ctx, n))
+        }
+        FutureOutcome::Count(n) => {
+            // BUG FIX (2026-07-17, StompWebSocketIntegrationTests premature-close
+            // investigation): `Count(n)` is how `aio_asc_write_future`'s real
+            // completion (`Job::WriteFutureFd`, below) reports a successful
+            // write back to the Future -- but until this fix, that path never
+            // advanced the SOURCE `ByteBuffer`'s `position`, unlike the sibling
+            // `Bytes(..)` (read) arm above which correctly calls
+            // `write_into_buffer_and_advance`. That violates
+            // `AsynchronousByteChannel.write`'s documented contract ("the
+            // buffer's position is updated to reflect the bytes written").
+            // A conforming caller that loops `while (buf.hasRemaining())
+            // channel.write(buf).get()` -- exactly Tomcat's own
+            // `WsRemoteEndpointImplBase`/`WsRemoteEndpointImplClient` write
+            // path -- therefore saw the SAME unconsumed-looking buffer after
+            // every "successful" write and resubmitted it, physically
+            // resending the same frame bytes on the wire many times (confirmed
+            // via `CRATONVM_DBG_SC_READ`: a single server-side read of one
+            // Jetty-backed connection contained the client's 35-byte STOMP
+            // CONNECT WebSocket frame repeated exactly 67 times back-to-back,
+            // 2345 = 35*67; the Tomcat backend hit the same bug thousands of
+            // times per its own retry cadence). The server correctly rejects
+            // each redundant CONNECT with STOMP's "Session already exists"
+            // guard and closes -- the premature close chased across the
+            // 2026-07-16 sessions. `Count(n)` is otherwise only ever produced
+            // with `n == 0` for two degenerate early-outs (an empty write
+            // buffer here, and `aio_asc_read_future`'s zero-capacity
+            // destination case), so advancing by `n` is a harmless no-op
+            // there and the correct fix for the real (n > 0) write-completion
+            // case.
+            if n > 0 {
+                if let Some(bb) = ctx.resolve_global_root(buffer_gref) {
+                    let position = match ctx.get_field_by_name(bb, "position") {
+                        Value::Int(v) if v >= 0 => v,
+                        _ => 0,
+                    };
+                    ctx.set_field_by_name(bb, "position", Value::Int(position + n));
+                }
+            }
+            Ok(box_int(ctx, n))
+        }
+        FutureOutcome::Eof => Ok(box_int(ctx, -1)),
+        FutureOutcome::Error(message) => Err(message),
+    };
+
+    match completion {
+        Ok(value) => {
+            if let Some(future) = ctx.resolve_global_root(future_gref) {
+                let _ = ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[value]);
+            }
+        }
+        Err(message) => {
+            // Keep the message rooted across exception allocation: both allocations
+            // can trigger a moving collection before the future is completed.
+            let msg = ctx.create_string(&message);
+            let msg_gref = ctx.add_global_root(msg);
+            let throwable = match ctx.new_object("java/io/IOException") {
+                Ok(Some(Value::Object(Some(t)))) => Some(t),
+                _ => None,
+            };
+            if let Some(throwable) = throwable {
+                let msg = ctx.resolve_global_root(msg_gref).unwrap_or(msg);
+                ctx.set_field_by_name(throwable, "detailMessage", Value::Object(Some(msg)));
+                if let Some(future) = ctx.resolve_global_root(future_gref) {
+                    // `CompletableFuture.completeExceptionally` is also
+                    // overridden for the VM's synthetic CF model. This is a
+                    // real JDK CF, so go straight through its real private
+                    // completion primitive and then release any waiter
+                    // Signallers with `postComplete`, mirroring the
+                    // real-aware `native_cf_complete` normal-success path.
+                    let _ = ctx.invoke_virtual(
+                        future,
+                        "completeThrowable",
+                        "(Ljava/lang/Throwable;)Z",
+                        &[Value::Object(Some(throwable))],
+                    );
+                    let _ = ctx.invoke_virtual(future, "postComplete", "()V", &[]);
+                }
+            }
+            ctx.remove_global_root(msg_gref);
+        }
+    }
+    ctx.remove_global_root(future_gref);
+    ctx.remove_global_root(buffer_gref);
 }
 
 fn release_read_roots(
@@ -355,12 +586,15 @@ fn deliver_completed(
     } else {
         None
     };
-    let _ = ctx.invoke(
+    let invoke_result = ctx.invoke(
         "java/nio/channels/CompletionHandler",
         "completed",
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
         &[Value::Object(Some(h)), result_val, Value::Object(attach)],
     );
+    if let Err(e) = &invoke_result {
+        dbg_aio!("HREAD  CompletionHandler.completed() THREW/FAILED: {e:?}");
+    }
 }
 
 /// Build an `IOException(msg)`, then resolve handler/attachment last, and invoke
@@ -530,6 +764,24 @@ enum Job {
         len: usize,
         handler_gref: usize,
         attachment_gref: usize,
+        buffer_gref: usize,
+    },
+    /// Future-form read against an fd_table-backed channel.  The returned
+    /// CompletableFuture and target ByteBuffer stay globally rooted until the
+    /// VM-attached dispatcher applies the result.
+    ReadFutureFd {
+        stream: Arc<Mutex<TcpStream>>,
+        len: usize,
+        future_gref: usize,
+        buffer_gref: usize,
+    },
+    /// Future-form write against an fd_table-backed channel.  This is the
+    /// important counterpart to `ReadFutureFd`: the caller must receive a
+    /// pending Future immediately rather than block in `send()`.
+    WriteFutureFd {
+        stream: Arc<Mutex<TcpStream>>,
+        data: Vec<u8>,
+        future_gref: usize,
         buffer_gref: usize,
     },
 }
@@ -865,12 +1117,16 @@ fn handle_job(job: Job) -> Result<(), String> {
             // Blocking read on the cloned handle. The clone is private to this
             // worker, so we hold its lock for the duration without blocking the
             // application's writes (which go through the original fd entry).
+            dbg_aio!("HREAD  worker start  handler_gref={handler_gref} requested_len={len} thread={:?}", std::thread::current().id());
             let mut buf = vec![0u8; len.max(1)];
             let read_res = {
                 let s = stream.lock();
                 let mut r = &*s;
                 r.read(&mut buf)
             };
+            dbg_aio!("HREAD  worker result handler_gref={handler_gref} result={:?} thread={:?}",
+                match &read_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
+                std::thread::current().id());
             let outcome = match read_res {
                 // 0 bytes from a blocking read == peer closed == EOF. Delivered
                 // to the handler as `completed(-1)` (JDK contract).
@@ -884,6 +1140,78 @@ fn handle_job(job: Job) -> Result<(), String> {
             push_read_completion(ReadCompletion {
                 handler_gref,
                 attachment_gref,
+                buffer_gref,
+                outcome,
+            });
+        }
+        Job::ReadFutureFd {
+            stream,
+            len,
+            future_gref,
+            buffer_gref,
+        } => {
+            dbg_aio!("READ  worker start  future_gref={future_gref} requested_len={len} thread={:?}", std::thread::current().id());
+            let mut buf = vec![0u8; len.max(1)];
+            let read_res = {
+                let s = stream.lock();
+                let mut r = &*s;
+                r.read(&mut buf)
+            };
+            dbg_aio!("READ  worker result future_gref={future_gref} result={:?} thread={:?}",
+                match &read_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
+                std::thread::current().id());
+            let outcome = match read_res {
+                Ok(0) => FutureOutcome::Eof,
+                Ok(n) => {
+                    buf.truncate(n);
+                    FutureOutcome::Bytes(buf)
+                }
+                Err(e) => FutureOutcome::Error(format!("read failed: {e}")),
+            };
+            push_future_completion(FutureCompletion {
+                future_gref,
+                buffer_gref,
+                outcome,
+            });
+        }
+        Job::WriteFutureFd {
+            stream,
+            data,
+            future_gref,
+            buffer_gref,
+        } => {
+            dbg_aio!("WRITE worker start  future_gref={future_gref} data_len={} thread={:?}", data.len(), std::thread::current().id());
+            let total = data.len();
+            let mut written = 0;
+            let write_res = {
+                let s = stream.lock();
+                let mut w = &*s;
+                let mut failure = None;
+                while written < total {
+                    match w.write(&data[written..]) {
+                        Ok(0) => {
+                            failure = Some(std::io::Error::from(ErrorKind::WriteZero));
+                            break;
+                        }
+                        Ok(n) => written += n,
+                        Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
+                failure.map_or(Ok(written), Err)
+            };
+            dbg_aio!("WRITE worker result future_gref={future_gref} result={:?} thread={:?}",
+                match &write_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
+                std::thread::current().id());
+            let outcome = match write_res {
+                Ok(n) => FutureOutcome::Count(n as i32),
+                Err(e) => FutureOutcome::Error(format!("write failed: {e}")),
+            };
+            push_future_completion(FutureCompletion {
+                future_gref,
                 buffer_gref,
                 outcome,
             });
@@ -1206,6 +1534,17 @@ fn aio_asc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
+        if dbg_aio_enabled() {
+            let raw_id = if ctx.object_num_fields(this) > F_REG_ID {
+                match ctx.get_field(this, F_REG_ID) {
+                    Value::Int(v) => v,
+                    _ => i32::MIN,
+                }
+            } else {
+                i32::MIN
+            };
+            dbg_aio!("CLOSE entered, raw F_REG_ID field={raw_id}");
+        }
         if ctx.object_num_fields(this) > F_OPEN {
             ctx.set_field(this, F_OPEN, Value::Int(0));
         }
@@ -1213,7 +1552,14 @@ fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             ctx.set_field(this, F_CONNECTED, Value::Int(0));
         }
         if let Some(id) = read_aio_id(ctx, this) {
-            aio_remove(id);
+            dbg_aio!("CLOSE aio id={id} — shutting down socket to unblock any in-flight clone reads");
+            if (id as i64) < AIO_REG_BASE {
+                // fd_table-backed channel (Future-form connect path).
+                aio_shutdown_fd_table_stream(ctx, id as u32);
+            } else {
+                aio_shutdown_stream(id);
+                aio_remove(id);
+            }
             ctx.set_field(this, F_REG_ID, Value::Int(-1));
         }
     }
@@ -1369,6 +1715,129 @@ fn read_buffer_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
 /// was connected via the Future-form `connect`), not a legacy registry id.
 const AIO_REG_BASE: i64 = 0x7000_0000;
 
+/// Allocate a real, initially-incomplete `CompletableFuture`. `new_object` is
+/// intentional: the no-arg constructor has no semantic initialization beyond
+/// the zero/null field values already installed by allocation, while using the
+/// static `completedFuture` helper would make `get(timeout)` return eagerly.
+fn aio_pending_future(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.new_object("java/util/concurrent/CompletableFuture")? {
+        Some(Value::Object(Some(future))) => Ok(future),
+        _ => Err(ioex("could not allocate CompletableFuture")),
+    }
+}
+
+/// Register a Future completion after the caller has received a pending real
+/// JDK CompletableFuture. Both it and the ByteBuffer are global roots because
+/// the worker can remain blocked in socket I/O across a moving collection.
+fn aio_future_roots(
+    ctx: &mut dyn NativeContext,
+    bb: ObjectRef,
+) -> Result<(ObjectRef, usize, usize), MethodCallFailed> {
+    let buffer_gref = ctx.add_global_root(bb);
+    let future = match aio_pending_future(ctx) {
+        Ok(future) => future,
+        Err(error) => {
+            ctx.remove_global_root(buffer_gref);
+            return Err(error);
+        }
+    };
+    let future_gref = ctx.add_global_root(future);
+    Ok((future, future_gref, buffer_gref))
+}
+
+/// Future-form `AsynchronousSocketChannel.read(ByteBuffer)`. Unlike the old
+/// Phase-67 registration, this returns before the blocking recv runs, and its
+/// `Future.get(timeout, unit)` therefore owns the timeout contract.
+fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("read: null channel"))?;
+    let bb = obj_or_none(args, 1).ok_or_else(|| ioex("read: null ByteBuffer"))?;
+    ensure_dispatcher();
+    let (future, future_gref, buffer_gref) = aio_future_roots(ctx, bb)?;
+    let post = |outcome| {
+        push_future_completion(FutureCompletion {
+            future_gref,
+            buffer_gref,
+            outcome,
+        });
+        Ok(Some(Value::Object(Some(future))))
+    };
+    let fd = match ctx.get_field(this, F_REG_ID) {
+        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+        _ => return post(FutureOutcome::Error("read: not connected".to_string())),
+    };
+    let (_, _, _, length) = decode_buffer(ctx, bb);
+    dbg_aio!("READ  dispatch fd={fd} requested_len={length} future_gref={future_gref}");
+    if length <= 0 {
+        return post(FutureOutcome::Count(0));
+    }
+    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+        Ok(stream) => stream,
+        Err(error) => return post(FutureOutcome::Error(format!("read: {error}"))),
+    };
+    if job_sender()
+        .send(Job::ReadFutureFd {
+            stream: Arc::new(Mutex::new(stream)),
+            len: length as usize,
+            future_gref,
+            buffer_gref,
+        })
+        .is_err()
+    {
+        return post(FutureOutcome::Error(
+            "read: aio worker pool unavailable".to_string(),
+        ));
+    }
+    Ok(Some(Value::Object(Some(future))))
+}
+
+/// Future-form `AsynchronousSocketChannel.write(ByteBuffer)`. The previous
+/// built-in performed `send()` inline and returned an already-completed Future,
+/// which made callers such as Tomcat's WebSocket timeout test hang *before*
+/// reaching `Future.get(timeout, unit)`. This queues the write, then completes
+/// the Future from the VM-attached dispatcher when the worker finishes.
+fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("write: null channel"))?;
+    let bb = obj_or_none(args, 1).ok_or_else(|| ioex("write: null ByteBuffer"))?;
+    ensure_dispatcher();
+    let (future, future_gref, buffer_gref) = aio_future_roots(ctx, bb)?;
+    let post = |outcome| {
+        push_future_completion(FutureCompletion {
+            future_gref,
+            buffer_gref,
+            outcome,
+        });
+        Ok(Some(Value::Object(Some(future))))
+    };
+    let fd = match ctx.get_field(this, F_REG_ID) {
+        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+        _ => return post(FutureOutcome::Error("write: not connected".to_string())),
+    };
+    let data = read_buffer_bytes(ctx, bb);
+    dbg_aio!("WRITE dispatch fd={fd} data_len={} future_gref={future_gref} hex={}",
+        data.len(), data.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>());
+    if data.is_empty() {
+        return post(FutureOutcome::Count(0));
+    }
+    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+        Ok(stream) => stream,
+        Err(error) => return post(FutureOutcome::Error(format!("write: {error}"))),
+    };
+    if job_sender()
+        .send(Job::WriteFutureFd {
+            stream: Arc::new(Mutex::new(stream)),
+            data,
+            future_gref,
+            buffer_gref,
+        })
+        .is_err()
+    {
+        return post(FutureOutcome::Error(
+            "write: aio worker pool unavailable".to_string(),
+        ));
+    }
+    Ok(Some(Value::Object(Some(future))))
+}
+
 /// Handler-form `AsynchronousSocketChannel.read(ByteBuffer, A, CompletionHandler)`.
 ///
 /// The previous worker-pool implementation parked the completion in a queue that
@@ -1395,6 +1864,7 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         // separate native registered elsewhere).
         None => return Ok(Some(Value::Object(None))),
     };
+    dbg_aio!("HREAD dispatch (handler-form) this_fields={}", ctx.object_num_fields(this));
 
     // Start the dispatcher on first use so parked completions get delivered.
     ensure_dispatcher();
@@ -1632,6 +2102,18 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     r.register(
         asc,
         "read",
+        "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;",
+        aio_asc_read_future,
+    );
+    r.register(
+        asc,
+        "write",
+        "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;",
+        aio_asc_write_future,
+    );
+    r.register(
+        asc,
+        "read",
         "(Ljava/nio/ByteBuffer;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_asc_read,
     );
@@ -1747,6 +2229,20 @@ mod tests {
                 "java/nio/channels/AsynchronousChannelGroup",
                 "withFixedThreadPool",
                 "(ILjava/util/concurrent/ThreadFactory;)Ljava/nio/channels/AsynchronousChannelGroup;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/nio/channels/AsynchronousSocketChannel",
+                "read",
+                "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/nio/channels/AsynchronousSocketChannel",
+                "write",
+                "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/Future;"
             )
             .is_some());
     }

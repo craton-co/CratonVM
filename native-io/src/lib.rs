@@ -4806,6 +4806,15 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "([BII)I",
         native_fis_read_bytes,
     );
+    // The real JDK public bulk-read wrapper delegates to readBytes. Annotation
+    // scanning reaches this signature directly, so route it to the same native
+    // implementation when selected by the interpreter bridge policy.
+    registry.register(
+        "java/io/FileInputStream",
+        "read",
+        "([BII)I",
+        native_fis_read_bytes,
+    );
     registry.register("java/io/FileInputStream", "skip0", "(J)J", native_fis_skip);
     registry.register(
         "java/io/FileInputStream",
@@ -5511,7 +5520,7 @@ fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// chunks, same pattern as `native_is_transfer_to` below) — real
 /// `ZipInputStream`/`InflaterInputStream`/etc. already implement that
 /// overload efficiently (native inflate), so this just stops bypassing it.
-fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -8427,25 +8436,90 @@ fn dis_read_exact(
     this: ObjectRef,
     len: usize,
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let this_pin = ctx.pin_native_root(this);
-    let mut this = this;
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        let b = match dis_read_one(ctx, this) {
-            Ok(v) => v,
+    // PERF FIX (2026-07-13, STW-takeover-cluster residual investigation,
+    // Azure host follow-up): this used to loop `dis_read_one` (a full
+    // array-alloc + invoke_virtual dispatch) once per byte. It's the shared
+    // helper behind readByte/readShort/readUnsignedShort/readChar AND
+    // (found via multi-snapshot gdb on the Azure host, confirmed the same
+    // stuck frame 3 snapshots in a row 5s apart) `readUTF` — which calls it
+    // with `len` up to 65535 (the modified-UTF-8 payload length), and
+    // `readUTF` is exactly how class-file/JSP-compile constant-pool string
+    // entries get decoded, so this was the dominant cost in the
+    // TestJspConfig/TestELInterpreterTagSetters/TestEnvEntry/
+    // TestWsWebSocketContainerTimeoutClient hang residual left after the
+    // native_dis_read_bytes/dis_read_fully_impl/native_dis_skip_bytes fixes
+    // (see docs/known-issues/tomcat-08-07/elinjsp-socket-read-timeout.md).
+    // Bulk-read instead, preserving the same zero-progress-guard fallback
+    // `dis_read_one` had (a stream returning 0 for a non-empty request is a
+    // contract violation but tolerated here via a scalar `read()` retry).
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let inner = match ctx.get_field(this, DIS_FIELD_IN) {
+        Value::Object(Some(s)) => s,
+        _ => return Err(eof_exception()),
+    };
+    // Family-1 fix (cce0079): `inner` is dispatched repeatedly below — each
+    // `read` can trigger a moving GC, so refresh it per iteration like `buf`.
+    let inner_pin = ctx.pin_native_root(inner);
+    let mut inner = inner;
+    let buf = ctx.new_array(ArrayElementType::Byte, len);
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut buf = buf;
+    let mut total = 0usize;
+    while total < len {
+        let remaining = (len - total) as i32;
+        let n = match ctx.invoke_virtual(
+            inner,
+            "read",
+            "([BII)I",
+            &[
+                Value::Object(Some(buf)),
+                Value::Int(total as i32),
+                Value::Int(remaining),
+            ],
+        ) {
+            Ok(Some(Value::Int(n))) => n,
+            Ok(_) => -1,
             Err(e) => {
-                ctx.unpin_native_roots(this_pin);
+                ctx.unpin_native_roots(inner_pin);
                 return Err(e);
             }
         };
-        this = ctx.read_native_pin(this_pin, this);
-        if b < 0 {
-            ctx.unpin_native_roots(this_pin);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        inner = ctx.read_native_pin(inner_pin, inner);
+        if n == 0 {
+            // Contract-violating zero-progress read: fall back to a scalar
+            // single-byte read so a misbehaving stream still makes forward
+            // progress instead of spinning forever on remaining==0 never
+            // being satisfied.
+            let scalar = match ctx.invoke_virtual(inner, "read", "()I", &[]) {
+                Ok(Some(Value::Int(v))) if v >= 0 => v,
+                Ok(_) => -1,
+                Err(e) => {
+                    ctx.unpin_native_roots(inner_pin);
+                    return Err(e);
+                }
+            };
+            if scalar < 0 {
+                ctx.unpin_native_roots(inner_pin);
+                return Err(eof_exception());
+            }
+            buf = ctx.read_native_pin(buf_pin, buf);
+            inner = ctx.read_native_pin(inner_pin, inner);
+            ctx.set_array_element(buf, total, Value::Int(scalar));
+            total += 1;
+            continue;
+        }
+        if n < 0 {
+            ctx.unpin_native_roots(inner_pin);
             return Err(eof_exception());
         }
-        out.push(b as u8);
+        total += n as usize;
     }
-    ctx.unpin_native_roots(this_pin);
+    let mut out = vec![0u8; len];
+    ctx.read_byte_array_into(buf, 0, &mut out);
+    ctx.unpin_native_roots(inner_pin);
     Ok(out)
 }
 
@@ -8624,8 +8698,20 @@ fn native_dis_read_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let len_bytes = dis_read_exact(ctx, this, 2)?;
+    // Family-1 fix (cce0079): the first `dis_read_exact` dispatches
+    // `InputStream.read` (GC-capable) — refresh `this` before the second
+    // call (canary-caught live during WildFly `Currency.<clinit>`).
+    let this_pin = ctx.pin_native_root(this);
+    let len_bytes = match dis_read_exact(ctx, this, 2) {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(e);
+        }
+    };
     let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let bytes = dis_read_exact(ctx, this, len)?;
     let s = decode_modified_utf8(&bytes).map_err(|e| {
         cratonvm_types::error::RuntimeError::IOException {
@@ -9035,22 +9121,35 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
+/// Write one byte through the wrapped stream and bump `written`.
+///
+/// GC-safety (DOM18 stale-canary backtrace, 2026-07-15): the `write(I)V`
+/// invoke can run a moving GC. `this` is pinned across it and re-read for
+/// the `written` update, and the CURRENT address is returned — multi-byte
+/// writers MUST rebind their local to the returned ref before the next call
+/// (the pre-fix `writeUTF` loop handed a stale `this` to every iteration
+/// after a GC, tripping CRATONVM_DBG_STALE_OBJREF in the WildFly Host
+/// Controller).
 fn dos_write_one(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     b: i32,
-) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let inner = match ctx.get_field(this, DOS_FIELD_OUT) {
         Value::Object(Some(s)) => s,
-        _ => return Ok(()),
+        _ => return Ok(this),
     };
-    ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)])?;
+    let this_pin = ctx.pin_native_root(this);
+    let r = ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(b & 0xFF)]);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    r?;
     let written = match ctx.get_field_by_name(this, DOS_WRITTEN_FIELD) {
         Value::Int(w) => w,
         _ => 0,
     };
     ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(written + 1));
-    Ok(())
+    Ok(this)
 }
 
 fn native_dos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9091,7 +9190,13 @@ fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(None),
     };
     if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
+        // Family-1 fix (cce0079): the `flush` dispatch is GC-capable —
+        // refresh `inner` before the `close` dispatch, or close() runs on a
+        // stale/wrong stream (leaking the real one).
+        let inner_pin = ctx.pin_native_root(inner);
         let _ = ctx.invoke_virtual_declared("java/io/OutputStream", inner, "flush", "()V", &[]);
+        let inner = ctx.read_native_pin(inner_pin, inner);
+        ctx.unpin_native_roots(inner_pin);
         ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
     }
     Ok(None)
@@ -9114,12 +9219,22 @@ fn native_dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    for i in 0..len {
-        if let Value::Int(b) = ctx.get_array_element(buf, off + i) {
-            dos_write_one(ctx, this, b)?;
+    // GC-safety: each byte write can run a moving GC — rebind `this` to
+    // dos_write_one's returned (refreshed) ref and re-read `buf` through a
+    // pin every iteration.
+    let buf_pin = ctx.pin_native_root(buf);
+    let result = (|| -> MethodCallResult {
+        let mut this = this;
+        for i in 0..len {
+            let cur_buf = ctx.read_native_pin(buf_pin, buf);
+            if let Value::Int(b) = ctx.get_array_element(cur_buf, off + i) {
+                this = dos_write_one(ctx, this, b)?;
+            }
         }
-    }
-    Ok(None)
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(buf_pin);
+    result
 }
 
 fn native_dos_write_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9150,7 +9265,7 @@ fn native_dos_write_short(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
     dos_write_one(ctx, this, v & 0xFF)?;
     Ok(None)
 }
@@ -9164,9 +9279,9 @@ fn native_dos_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    dos_write_one(ctx, this, (v >> 24) & 0xFF)?;
-    dos_write_one(ctx, this, (v >> 16) & 0xFF)?;
-    dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 24) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 16) & 0xFF)?;
+    let this = dos_write_one(ctx, this, (v >> 8) & 0xFF)?;
     dos_write_one(ctx, this, v & 0xFF)?;
     Ok(None)
 }
@@ -9180,8 +9295,9 @@ fn native_dos_write_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    let mut this = this;
     for shift in (0..8).rev() {
-        dos_write_one(ctx, this, ((v >> (shift * 8)) & 0xFF) as i32)?;
+        this = dos_write_one(ctx, this, ((v >> (shift * 8)) & 0xFF) as i32)?;
     }
     Ok(None)
 }
@@ -9231,12 +9347,13 @@ fn native_dos_write_utf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .into());
     }
     let len = bytes.len();
-    // Write 2-byte big-endian length.
-    dos_write_one(ctx, this, ((len >> 8) & 0xFF) as i32)?;
-    dos_write_one(ctx, this, (len & 0xFF) as i32)?;
+    // Write 2-byte big-endian length. GC-safety: rebind `this` to each
+    // call's returned (refreshed) ref — see dos_write_one.
+    let this = dos_write_one(ctx, this, ((len >> 8) & 0xFF) as i32)?;
+    let mut this = dos_write_one(ctx, this, (len & 0xFF) as i32)?;
     // Write the encoded payload byte-by-byte.
     for &b in &bytes {
-        dos_write_one(ctx, this, b as i32)?;
+        this = dos_write_one(ctx, this, b as i32)?;
     }
     Ok(None)
 }

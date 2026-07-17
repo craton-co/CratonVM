@@ -13,8 +13,8 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
-    native_noop, native_noop_with_this, obj_arg,
+    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set, native_noop,
+    native_noop_with_this, obj_arg,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
@@ -5058,13 +5058,12 @@ fn native_smallrye_get_config_mapping(
                 );
                 let this_cur = ctx.read_native_pin(this_pin, this);
                 let mappings = ctx.read_native_pin(mappings_pin, mappings);
-                let registration = ctx
-                    .invoke(
-                        "io/smallrye/config/ConfigMappings",
-                        "registerConfigMappings",
-                        "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
-                        &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
-                    );
+                let registration = ctx.invoke(
+                    "io/smallrye/config/ConfigMappings",
+                    "registerConfigMappings",
+                    "(Lio/smallrye/config/SmallRyeConfig;Ljava/util/Set;)V",
+                    &[Value::Object(Some(this_cur)), Value::Object(Some(mappings))],
+                );
                 if registration.is_ok() {
                     let this_cur = ctx.read_native_pin(this_pin, this);
                     let cls_cur = ctx.read_native_pin(cls_pin, cls);
@@ -7169,15 +7168,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let set_pin = ctx.pin_native_root(set);
             let context = ctx.read_native_pin(context_pin, context);
-            let iterator = match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
-                Ok(Some(Value::Object(Some(o)))) => o,
-                _ => {
-                    ctx.unpin_native_roots(this_pin);
-                    ctx.unpin_native_roots(context_pin);
-                    ctx.unpin_native_roots(set_pin);
-                    return Ok(Some(Value::Object(Some(set))));
-                }
-            };
+            let iterator =
+                match ctx.invoke_virtual(context, "iterateNames", "()Ljava/util/Iterator;", &[]) {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    _ => {
+                        ctx.unpin_native_roots(this_pin);
+                        ctx.unpin_native_roots(context_pin);
+                        ctx.unpin_native_roots(set_pin);
+                        return Ok(Some(Value::Object(Some(set))));
+                    }
+                };
             let iterator_pin = ctx.pin_native_root(iterator);
             loop {
                 let iterator = ctx.read_native_pin(iterator_pin, iterator);
@@ -7188,11 +7188,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let iterator = ctx.read_native_pin(iterator_pin, iterator);
                 let value = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
                 if let Some(Value::Object(Some(value))) = value {
-                    if ctx.class_name_of_id(ctx.class_id_of_object(value)).as_deref() == Some("java/lang/String") {
+                    if ctx
+                        .class_name_of_id(ctx.class_id_of_object(value))
+                        .as_deref()
+                        == Some("java/lang/String")
+                    {
                         let value_pin = ctx.pin_native_root(value);
                         let set = ctx.read_native_pin(set_pin, set);
                         let value = ctx.read_native_pin(value_pin, value);
-                        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[Value::Object(Some(value))]);
+                        let _ = ctx.invoke_virtual(
+                            set,
+                            "add",
+                            "(Ljava/lang/Object;)Z",
+                            &[Value::Object(Some(value))],
+                        );
                         ctx.unpin_native_roots(value_pin);
                     }
                 }
@@ -9835,13 +9844,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else {
             ".tmp".to_string()
         };
-        let temp_dir = std::env::temp_dir();
-        let name = format!("{}{}{}", prefix, std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(), suffix);
-        let full_path = temp_dir.join(name);
-        let path_str = full_path.to_string_lossy().to_string();
-        // Create the file
-        let _ = std::fs::File::create(&full_path);
+        let temp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
+        let path_str = jdk_create_temp_file(&temp_dir, &prefix, &suffix)?;
         let result = p57_alloc_path(ctx, &path_str);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -9853,7 +9857,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let prefix_ref = obj_arg(args, 0)?;
             let prefix = ctx.read_string(prefix_ref).unwrap_or_default();
-            let temp_dir = std::env::temp_dir();
+            let temp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
             let name = format!(
                 "{}{}",
                 prefix,
@@ -9863,7 +9867,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .as_nanos()
             );
             let full_path = temp_dir.join(name);
-            let _ = std::fs::create_dir_all(&full_path);
+            std::fs::create_dir_all(&full_path).map_err(|e| p57_io_error(&e))?;
             let path_str = full_path.to_string_lossy().to_string();
             let result = p57_alloc_path(ctx, &path_str);
             Ok(Some(Value::Object(Some(result))))
@@ -9919,15 +9923,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // `catalina.webresources` cluster — `preVisitDirectory` does
             // `Files.copy(dir, …)`). Branch on the source kind; tolerate an
             // already-existing target dir (mirrors the file path's overwrite).
-            let src_is_dir = std::fs::symlink_metadata(&src_path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            let result = if let Some((jar, entry)) = jarfs_decode(&dst_path) {
+            // Classify the SOURCE too: `src_path` may itself be a jarfs-encoded
+            // entry (e.g. a Path from `FileSystems.newFileSystem(zipPath, ...)`,
+            // as used by Quarkus's `ZipUtils.unzip`/`copyFromZip` to extract a
+            // mounted zip's contents to the real filesystem). Previously this
+            // only special-cased a jarfs DESTINATION and always read the source
+            // via `std::fs::symlink_metadata`/`std::fs::copy`, which treats the
+            // jarfs-encoded source string as a literal OS path — it never is
+            // one, so both calls failed with a raw `NotFound` ("No such file or
+            // directory (os error 2)"), surfacing as `IllegalStateException:
+            // IOException: No such file or directory (os error 2)` even though
+            // `Files.isDirectory`/`isRegularFile` on the same Path (which DO
+            // classify via `vfs_classify`/`jarfs_classify`) reported correctly.
+            let src_jarfs = jarfs_decode(&src_path);
+            let src_is_dir = if let Some((ref jar, ref entry)) = src_jarfs {
+                matches!(jarfs_classify(jar, entry), JarFsKind::Dir)
+            } else {
+                std::fs::symlink_metadata(&src_path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+            };
+            let result = if let Some((dst_jar, dst_entry)) = jarfs_decode(&dst_path) {
                 if src_is_dir {
-                    jarfs_create_dir_entry(&jar, &entry)
+                    jarfs_create_dir_entry(&dst_jar, &dst_entry)
+                } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                    jarfs_read_entry(src_jar, src_entry)
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 } else {
                     std::fs::read(&src_path)
-                        .and_then(|bytes| jarfs_write_file_entry(&jar, &entry, &bytes))
+                        .and_then(|bytes| jarfs_write_file_entry(&dst_jar, &dst_entry, &bytes))
                 }
             } else if src_is_dir {
                 match std::fs::create_dir(&dst_path) {
@@ -9935,6 +9959,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
                     Err(e) => Err(e),
                 }
+            } else if let Some((src_jar, src_entry)) = &src_jarfs {
+                jarfs_read_entry(src_jar, src_entry)
+                    .and_then(|bytes| std::fs::write(&dst_path, &bytes))
             } else {
                 std::fs::copy(&src_path, &dst_path).map(|_| ())
             };
@@ -11763,11 +11790,45 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 }
 
 fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
-    let raw = match ctx.get_field(path_obj, P57_PATH_FIELD) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => return String::new(),
-    };
-    p57_to_os_path(&raw)
+    // Fast path: CratonVM's own synthetic Path layout stores the path String
+    // directly at field 0 (P57_PATH_FIELD).
+    //
+    // Real-JDK Path implementations we don't control the layout of -- e.g. a
+    // decorator/wrapper Path like Quarkus's `io.quarkus.fs.util.sysfs.
+    // PathWrapper` (extends `DelegatingPath`, whose field 0 is the wrapped
+    // delegate Path OBJECT, not a String) -- do NOT share this layout.
+    // `io.quarkus.fs.util.FileSystemHelper.ignoreFileWriteability` wraps
+    // every Path in exactly this decorator before `ZipUtils.unzip()` mounts
+    // it, so `FileSystemProvider.newFileSystem(Path,Map)`'s jar-path
+    // extraction (below) was blindly field-0-reading a PathWrapper and
+    // silently getting back "" (read_string correctly refuses to
+    // mis-interpret the delegate-Path object as a String, but the old code
+    // treated that failure as "no path" rather than "wrong layout").  An
+    // empty jar path made `p57_alloc_jar_filesystem` skip mounting the
+    // archive at all, so the resulting FileSystem's `getRootDirectories()`
+    // fell back to the REAL host filesystem root -- `Files.walkFileTree`
+    // over "/" then tried to copy the ENTIRE host filesystem into the
+    // extraction target (observed: ~6GB and climbing, "No space left on
+    // device", then an `IOException: the source path is neither a regular
+    // file nor a symlink to a regular file` once it reached a device/socket
+    // special file under the real root).
+    //
+    // Fall back to a real virtual dispatch to `toString()` -- which every
+    // concrete Path (including delegating wrappers, via their real bytecode
+    // delegating implementation) implements correctly -- whenever the fast
+    // path doesn't yield a String.
+    if let Value::Object(Some(s)) = ctx.get_field(path_obj, P57_PATH_FIELD) {
+        if let Some(raw) = ctx.read_string(s) {
+            return p57_to_os_path(&raw);
+        }
+    }
+    match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => {
+            let raw = ctx.read_string(s).unwrap_or_default();
+            p57_to_os_path(&raw)
+        }
+        _ => String::new(),
+    }
 }
 
 /// Convert a Java-style path to an OS-native path.
@@ -11806,7 +11867,11 @@ fn p57_absolute_path_string(path: &str) -> String {
 fn p57_trim_file_trailing_separator(path: &str) -> String {
     let trimmed = path.trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
-        return if path.starts_with('\\') { "\\".to_string() } else { "/".to_string() };
+        return if path.starts_with('\\') {
+            "\\".to_string()
+        } else {
+            "/".to_string()
+        };
     }
     if trimmed.len() == 2
         && trimmed.as_bytes()[0].is_ascii_alphabetic()
@@ -12948,7 +13013,8 @@ fn jrt_package_path_kind(img: &JrtImage, rest: &str) -> JarFsKind {
         let Some(backing) = jrt_package_backing_entry(img, rest) else {
             return JarFsKind::Absent;
         };
-        let image_path = jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
+        let image_path =
+            jrt_entry_to_image(&backing).expect("backing JRT package path is a module path");
         if jrt_img_is_file(img, &image_path) {
             JarFsKind::File
         } else if jrt_img_is_dir(img, &image_path) {
@@ -13013,9 +13079,9 @@ fn jrtfs_list_dir_classified(java_home: &str, entry: &str) -> Vec<(String, bool)
             return jrtfs_list_dir_classified(java_home, &backing)
                 .into_iter()
                 .filter_map(|(child, is_dir)| {
-                    child.rsplit_once('/').map(|(_, name)| {
-                        (format!("packages/{rest}/{name}"), is_dir)
-                    })
+                    child
+                        .rsplit_once('/')
+                        .map(|(_, name)| (format!("packages/{rest}/{name}"), is_dir))
                 })
                 .collect();
         }
@@ -13159,14 +13225,18 @@ mod jrtfs_javac_listing_tests {
             return;
         };
         let java_home = java_home.to_string_lossy();
-        let direct =
-            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
-        assert!(direct.len() > 100, "java.lang listing was truncated: {direct:?}");
+        let direct = jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", false);
+        assert!(
+            direct.len() > 100,
+            "java.lang listing was truncated: {direct:?}"
+        );
         for required in ["java.lang.Object", "java.lang.Byte", "java.lang.Integer"] {
-            assert!(direct.iter().any(|name| name == required), "missing {required}");
+            assert!(
+                direct.iter().any(|name| name == required),
+                "missing {required}"
+            );
         }
-        let recursive =
-            jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
+        let recursive = jrtfs_list_class_binary_names(&java_home, "java.base", "java.lang", true);
         assert!(
             recursive
                 .iter()
@@ -13334,6 +13404,55 @@ fn p57_io_error(e: &std::io::Error) -> cratonvm_types::error::MethodCallFailed {
         message: e.to_string(),
     }
     .into()
+}
+
+/// Default temp directory per the JDK contract: honor the `java.io.tmpdir`
+/// system property (seeded from the platform default at VM init, overridable
+/// with `-Djava.io.tmpdir=...`), falling back to the platform default when the
+/// property is absent or empty. Temp-file natives must NOT read
+/// `std::env::temp_dir()` directly — that ignores `-Djava.io.tmpdir`, so
+/// harnesses could not redirect temp files off a full `/tmp` (mockk
+/// `BootJarLoader` silently downgraded to its agent-less mode and every
+/// mock.hashCode() then recursed to StackOverflowError, 2026-07-15).
+fn jdk_temp_dir(tmpdir_prop: Option<String>) -> std::path::PathBuf {
+    match tmpdir_prop {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => std::env::temp_dir(),
+    }
+}
+
+/// Create a fresh, empty temp file exclusively (`O_CREAT|O_EXCL`) inside
+/// `dir`, returning its full path. Failures MUST surface as `IOException` —
+/// that is the `File.createTempFile`/`Files.createTempFile` contract, and
+/// callers rely on the exception for fallback logic (mockk's `BootJarLoader`
+/// falls back to a CWD jar when the temp dir is unusable; the old
+/// `let _ = std::fs::File::create(..)` swallowed the error and the divergence
+/// only surfaced much later as an unrelated-looking failure).
+fn jdk_create_temp_file(
+    dir: &std::path::Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let full = dir.join(format!("{prefix}{nanos}{suffix}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full)
+        {
+            Ok(_) => return Ok(full.to_string_lossy().into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(p57_io_error(&e)),
+        }
+    }
+    Err(RuntimeError::IOException {
+        message: format!("Unable to create temporary file in {}", dir.display()),
+    }
+    .into())
 }
 
 /// Read a path (host file or jar-FS entry) into a UTF-8 string.
@@ -15994,13 +16113,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let p = std::path::Path::new(&path);
-            let abs = if p.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
-                    .unwrap_or(path)
-            };
+        let abs = if p.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path).to_string_lossy().into_owned())
+                .unwrap_or(path)
+        };
         let abs = p57_trim_file_trailing_separator(&abs);
         Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
     });
@@ -16689,14 +16808,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 }
                 _ => ".tmp".into(),
             };
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let tmp_dir = std::env::temp_dir();
-            let file_name = format!("{}{}{}", prefix, nanos, suffix);
-            let full = tmp_dir.join(&file_name).to_string_lossy().into_owned();
-            let _ = std::fs::File::create(&full);
+            let tmp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
+            let full = jdk_create_temp_file(&tmp_dir, &prefix, &suffix)?;
             Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
         },
     );
@@ -16716,19 +16829,10 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 _ => ".tmp".into(),
             };
             let dir_path = match args.get(2) {
-                Some(Value::Object(Some(f))) => file_read_path(ctx, *f),
-                _ => std::env::temp_dir().to_string_lossy().into_owned(),
+                Some(Value::Object(Some(f))) => std::path::PathBuf::from(file_read_path(ctx, *f)),
+                _ => jdk_temp_dir(ctx.get_system_property("java.io.tmpdir")),
             };
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let file_name = format!("{}{}{}", prefix, nanos, suffix);
-            let full = std::path::PathBuf::from(&dir_path)
-                .join(&file_name)
-                .to_string_lossy()
-                .into_owned();
-            let _ = std::fs::File::create(&full);
+            let full = jdk_create_temp_file(&dir_path, &prefix, &suffix)?;
             Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
         },
     );
@@ -18359,7 +18463,29 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; remaining];
-        match ctx.fd_table().tcp_read(fd as u32, &mut buf) {
+        // STW-TAKEOVER-FIX (2026-07-14): plain blocking-mode
+        // `SocketChannel.read` — the real socket path used by embedded
+        // Tomcat/Jetty NIO connectors for accepted client connections
+        // (unlike `AsynchronousSocketChannel`, this is the hot path for
+        // ordinary server sockets). Same missing-GC-barrier-cooperation gap
+        // as the `AsynchronousSocketChannel.read`/`write` fix above: a
+        // genuinely blocking OS recv() with no bound on wait time, with no
+        // `begin_blocking_region`/`end_blocking_region` around it, so a
+        // concurrent STW pause waits forever for this thread to reach a
+        // safepoint it can never reach while parked in recv(). `bb` is an
+        // ObjectRef used again after the call returns (both `get_field`/
+        // `set_field` on it), so it goes through
+        // `end_blocking_region_refs` to pick up any relocation from a GC
+        // that ran while blocked.
+        let mut blocked_refs = [Value::Object(Some(bb))];
+        ctx.begin_blocking_region();
+        let read_result = ctx.fd_table().tcp_read(fd as u32, &mut buf);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        let bb = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => bb,
+        };
+        match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
                 if let Value::Object(Some(arr)) = ctx.get_field(bb, 0) {
@@ -18396,7 +18522,19 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        match ctx.fd_table().tcp_write(fd as u32, &data) {
+        // STW-TAKEOVER-FIX (2026-07-14): see `SocketChannel.read` above —
+        // same genuinely-blocking-socket-call gap. `arr` was already fully
+        // consumed above (copied into the Rust-owned `data` buffer before
+        // this call), so only `bb` needs to survive the blocking window.
+        let mut blocked_refs = [Value::Object(Some(bb))];
+        ctx.begin_blocking_region();
+        let write_result = ctx.fd_table().tcp_write(fd as u32, &data);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        let bb = match blocked_refs[0] {
+            Value::Object(Some(o)) => o,
+            _ => bb,
+        };
+        match write_result {
             Ok(n) => {
                 ctx.set_field(bb, 1, Value::Int((pos + n) as i32));
                 Ok(Some(Value::Int(n as i32)))
@@ -18622,7 +18760,17 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             if fd < 0 {
                 return Ok(Some(Value::Object(None)));
             }
-            match ctx.fd_table().tcp_accept(fd as u32) {
+            // STW-TAKEOVER-FIX (2026-07-14): `ServerSocketChannel.accept()`
+            // blocks indefinitely (in blocking mode) waiting for an
+            // incoming connection — the same missing-GC-barrier-cooperation
+            // gap as the `SocketChannel.read`/`write` fixes above, on the
+            // acceptor-thread side this time. No ObjectRef needs to survive
+            // the call (`this` is not reused afterward; a fresh object is
+            // allocated post-accept), so a plain begin/end pair suffices.
+            ctx.begin_blocking_region();
+            let accept_result = ctx.fd_table().tcp_accept(fd as u32);
+            ctx.end_blocking_region();
+            match accept_result {
                 Ok((stream_fd, addr)) => {
                     let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
                     // Pin across the create_string below — a moving young GC
@@ -26174,7 +26322,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "creation");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(
@@ -26183,7 +26332,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "access");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(
@@ -26192,28 +26342,21 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
+            let millis = basic_file_attributes_time_millis(ctx, this, "modified");
+            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
         },
     );
     r.register(bfa, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Coerce like `isRegularFile` below: an out-of-bounds/undersized-layout
-        // receiver makes `get_field` return `Value::Object(None)` (a dropped
-        // read), which must not leak out of a `()Z`-descriptor native as a
-        // reference value where the interpreter/JIT expects a boolean.
-        let is_dir = match ctx.get_field(this, 3) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(is_dir)))
+        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
+            ctx, this,
+        )))))
     });
     r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let is_dir = match ctx.get_field(this, 3) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if is_dir == 0 { 1 } else { 0 })))
+        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
+            ctx, this,
+        )))))
     });
     r.register(bfa, "isSymbolicLink", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
@@ -26221,7 +26364,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     r.register(bfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(bfa, "size", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
+        Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
     });
     // `fileKey()` returns an object that uniquely identifies the file, or
     // `null` if a file key is not available. The JDK Windows file system
@@ -26373,6 +26516,110 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
     }
 }
 
+/// Allocate a real platform `BasicFileAttributes` implementation.
+///
+/// Callers perform a JVM `checkcast BasicFileAttributes`, so the carrier must
+/// actually implement that interface. The native bridge stores its canonical
+/// values in named platform fields and force-dispatches the interface methods;
+/// it never relies on the implementation's bytecode layout.
+fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let class_name = if cfg!(windows) {
+        "sun/nio/fs/WindowsFileAttributes"
+    } else {
+        "sun/nio/fs/UnixFileAttributes"
+    };
+    if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
+        let fields = ctx.class_num_total_fields(class_id);
+        if ctx.class_name_of_id(class_id).as_deref() == Some(class_name) && fields > 0 {
+            return ctx.alloc_object(class_id, fields);
+        }
+    }
+    // Only reached by a synthetic-JDK configuration, where the interface is
+    // modelled as a concrete helper with a five-field layout.
+    alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5)
+}
+
+fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+        .as_deref()
+        == Some("sun/nio/fs/WindowsFileAttributes")
+}
+
+fn basic_file_attributes_time_millis(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+    which: &str,
+) -> i64 {
+    let field = if basic_file_attributes_is_windows(ctx, attrs) {
+        match which {
+            "creation" => "creationTime",
+            "access" => "lastAccessTime",
+            _ => "lastWriteTime",
+        }
+    } else {
+        match which {
+            "creation" => "st_birthtime",
+            "access" => "st_atime",
+            _ => "st_mtime",
+        }
+    };
+    match ctx.get_field_by_name(attrs, field) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        return matches!(ctx.get_field_by_name(attrs, "fileAttrs"), Value::Int(v) if v & 0x10 != 0);
+    }
+    matches!(ctx.get_field_by_name(attrs, "st_mode"), Value::Int(v) if v & 0o170000 == 0o040000)
+}
+
+fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
+    let field = if basic_file_attributes_is_windows(ctx, attrs) {
+        "size"
+    } else {
+        "st_size"
+    };
+    match ctx.get_field_by_name(attrs, field) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
+}
+
+fn basic_file_attributes_store(
+    ctx: &mut dyn NativeContext,
+    attrs: ObjectRef,
+    is_dir: bool,
+    size: i64,
+    creation_millis: i64,
+    access_millis: i64,
+    modified_millis: i64,
+) {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        ctx.set_field_by_name(
+            attrs,
+            "fileAttrs",
+            Value::Int(if is_dir { 0x10 } else { 0 }),
+        );
+        ctx.set_field_by_name(attrs, "creationTime", Value::Long(creation_millis));
+        ctx.set_field_by_name(attrs, "lastAccessTime", Value::Long(access_millis));
+        ctx.set_field_by_name(attrs, "lastWriteTime", Value::Long(modified_millis));
+        ctx.set_field_by_name(attrs, "size", Value::Long(size));
+    } else {
+        ctx.set_field_by_name(
+            attrs,
+            "st_mode",
+            Value::Int(if is_dir { 0o040000 } else { 0o100000 }),
+        );
+        ctx.set_field_by_name(attrs, "st_birthtime", Value::Long(creation_millis));
+        ctx.set_field_by_name(attrs, "st_atime", Value::Long(access_millis));
+        ctx.set_field_by_name(attrs, "st_mtime", Value::Long(modified_millis));
+        ctx.set_field_by_name(attrs, "st_size", Value::Long(size));
+    }
+}
+
 /// Extract path string from a Path argument (field 0 = String)
 fn extract_path_string(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> String {
     let raw = match arg {
@@ -26429,11 +26676,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // sentinel string ENOENTs, which made the walker treat every mounted-jar
     // root as a zero-length regular file (JUnit5 jar scanning found nothing).
     if let Some((jar, entry)) = jarfs_decode(&path_str) {
-        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-        let ft = filetime_alloc(ctx, 0);
-        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let bfa = basic_file_attributes_alloc(ctx);
         let (is_dir, size) = match jarfs_classify(&jar, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jarfs_entry_size(&jar, &entry).unwrap_or(0)),
@@ -26447,19 +26690,14 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        ctx.set_field(bfa, 3, Value::Int(is_dir));
-        ctx.set_field(bfa, 4, Value::Long(size));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
     // jrt-FS (runtime image) path — attributes come from the jimage, not the
     // host filesystem. javac's platform-class indexing walks `/modules/...`.
     if let Some((java_home, entry)) = jrtfs_decode(&path_str) {
-        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-        let ft = filetime_alloc(ctx, 0);
-        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let bfa = basic_file_attributes_alloc(ctx);
         let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
@@ -26470,8 +26708,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        ctx.set_field(bfa, 3, Value::Int(is_dir));
-        ctx.set_field(bfa, 4, Value::Long(size));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
@@ -26485,27 +26722,25 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         std::fs::metadata(&path_str)
     };
 
-    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+    let bfa = basic_file_attributes_alloc(ctx);
 
     match meta_result {
         Ok(meta) => {
             // Creation time
             let creation_millis = meta.created().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_create = filetime_alloc(ctx, creation_millis);
-
             // Last access time
             let access_millis = meta.accessed().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_access = filetime_alloc(ctx, access_millis);
-
             // Last modified time
             let mod_millis = meta.modified().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_mod = filetime_alloc(ctx, mod_millis);
-
-            ctx.set_field(bfa, 0, Value::Object(Some(ft_create)));
-            ctx.set_field(bfa, 1, Value::Object(Some(ft_access)));
-            ctx.set_field(bfa, 2, Value::Object(Some(ft_mod)));
-            ctx.set_field(bfa, 3, Value::Int(if meta.is_dir() { 1 } else { 0 }));
-            ctx.set_field(bfa, 4, Value::Long(meta.len() as i64));
+            basic_file_attributes_store(
+                ctx,
+                bfa,
+                meta.is_dir(),
+                meta.len() as i64,
+                creation_millis,
+                access_millis,
+                mod_millis,
+            );
         }
         // NIO contract: `Files.readAttributes` must raise `IOException`
         // (`NoSuchFileException` when the path is missing) — silently
@@ -27745,6 +27980,34 @@ fn p60_empty_optional(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(optional))))
 }
 
+fn p60_parent_pid() -> i64 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as i64 }
+    }
+    #[cfg(not(unix))]
+    {
+        // `std` does not expose the parent PID on Windows.  Returning the
+        // current process still supplies a stable, live handle for clients
+        // that use parent().pid() as a process-scoped coordination key (such
+        // as Gradle's Hibernate test worker), rather than spuriously
+        // reporting no parent at all.
+        std::process::id() as i64
+    }
+}
+
+fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let parent_pid = p60_parent_pid();
+    if parent_pid <= 0 {
+        return p60_empty_optional(ctx, &[]);
+    }
+    let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+    ctx.set_field(parent, 0, Value::Long(parent_pid));
+    let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    ctx.set_field(optional, 0, Value::Object(Some(parent)));
+    Ok(Some(Value::Object(Some(optional))))
+}
+
 /// Register the native-backed ProcessHandle surface in both synthetic- and
 /// real-JDK modes. SmallRye invokes `current().info()` during class init.
 pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
@@ -27798,7 +28061,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cf))))
         },
     );
-    r.register(ph, "parent", "()Ljava/util/Optional;", p60_empty_optional);
+    r.register(ph, "parent", "()Ljava/util/Optional;", p60_process_parent);
     r.register(ph, "supportsNormalTermination", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -28400,10 +28663,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
                 Some(list) => list,
                 None => {
                     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-                    cratonvm_native_collections::native_al_init(
-                        ctx,
-                        &[Value::Object(Some(list))],
-                    )?;
+                    cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, this, list);
                     list
                 }
@@ -29786,7 +30046,33 @@ fn cb_read_hb(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
     }
 }
 
+/// Plain CharBuffer/HeapCharBuffer/StringCharBuffer instances have no
+/// independent byte-order concept of their own (real `HeapCharBuffer.order()`
+/// just returns the platform's native order); this mirrors the same
+/// convention already used by `ByteOrder.nativeOrder()`
+/// (`servlet.rs::register_s2_byteorder`) — 0 = BIG_ENDIAN, 1 = LITTLE_ENDIAN.
+///
+/// Note: `ByteBuffer.asCharBuffer()` (`servlet.rs::s2_bb_as_char_buffer`)
+/// allocates its returned view under this same plain `java/nio/CharBuffer`
+/// class name (not one of the `ByteBufferAsCharBuffer{B,L,RB,RL}` subclasses)
+/// and separately stashes the source ByteBuffer's order in an indexed slot —
+/// that slot is not read here, so an `asCharBuffer()` view built over a
+/// non-native-order source ByteBuffer will report native order rather than
+/// the source's actual order from this native. That's a narrower, pre-existing
+/// gap in `s2_bb_as_char_buffer`'s view-class choice, independent of the
+/// AbstractMethodError this registration fixes (real HeapCharBuffer/wrap/
+/// allocate paths, which is what the affected Spring Boot classes exercise).
+#[inline]
+fn cb_native_order(_ctx: &dyn NativeContext, _buf: ObjectRef) -> i32 {
+    if cfg!(target_endian = "big") {
+        0
+    } else {
+        1
+    }
+}
+
 pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
+    use crate::servlet::s2_byte_order_object;
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/nio/CharBuffer";
@@ -29895,6 +30181,46 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         )))
     });
     r.register(cb, "isDirect", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    // order()Ljava/nio/ByteOrder; — abstract on CharBuffer, like isReadOnly/
+    // isDirect above; every concrete leaf subclass overrides it in real
+    // OpenJDK. CratonVM never registered a native anywhere in the CharBuffer
+    // hierarchy, so any first-use call (real-JDK bytecode resolves the
+    // abstract declaration with no override) throws
+    // "AbstractMethodError: java/nio/CharBuffer.order()Ljava/nio/ByteOrder;
+    // has no Code attribute" — hit by ICU4X's `UCharacterProperty.<clinit>`
+    // reading Unicode property data via `CharBuffer.get(int[])`, which
+    // transitively poisons `java.net.IDN.<clinit>` (the first caller to ever
+    // exercise this path) for the rest of the process. Plain `CharBuffer`/
+    // `HeapCharBuffer`/`StringCharBuffer` report the platform's native byte
+    // order, matching real `HeapCharBuffer.order()`; the four
+    // `ByteBufferAsCharBuffer{B,L,RB,RL}` view classes encode their
+    // endianness in the class-name suffix (B/RB = big, L/RL = little),
+    // matching real JDK's per-view-class `order()` overrides.
+    r.register(cb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ord = cb_native_order(ctx, this);
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+    });
+    fn cb_order_big(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        use crate::servlet::s2_byte_order_object;
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
+    }
+    fn cb_order_little(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        use crate::servlet::s2_byte_order_object;
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
+    }
+    for subclass in [
+        "java/nio/ByteBufferAsCharBufferB",
+        "java/nio/ByteBufferAsCharBufferRB",
+    ] {
+        r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_big);
+    }
+    for subclass in [
+        "java/nio/ByteBufferAsCharBufferL",
+        "java/nio/ByteBufferAsCharBufferRL",
+    ] {
+        r.register(subclass, "order", "()Ljava/nio/ByteOrder;", cb_order_little);
+    }
     r.register(cb, "arrayOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         match ctx.get_field_by_name(this, "offset") {
@@ -31765,7 +32091,9 @@ pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
 
 pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Same synthetic fallback as the early registration: a real JDK
+    // WeakHashMap must use its bytecode-backed layout.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let whm = "java/util/WeakHashMap";
     r.register(whm, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -35915,10 +36243,45 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    let skip_file_callbacks = ctx
-        .class_name_of_id(ctx.class_id_of_object(visitor))
+    let visitor_class_id = ctx.class_id_of_object(visitor);
+    let visitor_class_name = ctx.class_name_of_id(visitor_class_id);
+    let skip_file_callbacks = visitor_class_name
+        .as_deref()
         .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
-    p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
+    if std::env::var_os("CRATONVM_DBG_VISITFILE").is_some() {
+        eprintln!(
+            "[p98-walkfiletree] visitor_class_id={:?} visitor_class_name={:?} skip_file_callbacks={}",
+            visitor_class_id, visitor_class_name, skip_file_callbacks
+        );
+    }
+
+    // GC-safety: the walk below drives a re-entrant, potentially deep and
+    // long-running sequence of Java callbacks (preVisitDirectory/visitFile/
+    // postVisitDirectory) for every directory and file under `root`. Any of
+    // those calls can allocate and trigger GC (directly, or transitively --
+    // e.g. `PathFileObject.forJarPath` inside a compiler's own visitor).
+    // `visitor` is a single Rust-local `ObjectRef` that stays alive across
+    // the ENTIRE recursive walk; under a moving collector a mid-walk
+    // relocation leaves a bare local like this stale, and `invoke_virtual`'s
+    // own `load_and_forward` cannot repair it once the old slot has been
+    // reused for an unrelated (often array) allocation -- silently
+    // redirecting dispatch to `java.lang.Object` and raising a spurious
+    // `NoSuchMethodError` on the visitor's real method. Confirmed live: a
+    // very large in-memory javac classpath walk (`BeanRegistrationsAot-
+    // ContributionTests`, `JavacFileManager$ArchiveContainer.list`'s own
+    // `SimpleFileVisitor`) reproduced exactly this signature --
+    // `NoSuchMethodError: java/lang/Object.visitFile(...)`.
+    //
+    // Pin `visitor` and the root `path_obj` (used at both ends of the walk)
+    // for the whole traversal via `p98_pin`/`p98_read_pin` (see their doc
+    // comment below) and unpin the complete batch -- every pin taken
+    // anywhere during the walk, since `visitor_pin` is the first one pushed
+    // -- once it returns.
+    let visitor_pin = p98_pin(ctx, visitor);
+    let path_pin = p98_pin(ctx, path_obj);
+    let result = p98_walk_dir(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks);
+    ctx.unpin_native_roots(visitor_pin.0);
+    result?;
     Ok(Some(path_val))
 }
 
@@ -35961,52 +36324,55 @@ fn p98_invoke_file_visitor(
     })
 }
 
-/// Build a real 5-field `BasicFileAttributes` (see `p59_files_read_attributes`
-/// for the canonical layout: creation=0, lastAccess=1, lastMod=2, isDir=3,
-/// size=4) for a `Files.walkFileTree` visitor callback.
-///
-/// `p98_walk_dir` used to hand every `preVisitDirectory`/`visitFile` callback
-/// a zero-field placeholder (`alloc_concurrent_synthetic(ctx, bfa, 0)`). Any
-/// real-bytecode `FileVisitor` that actually calls a `BasicFileAttributes`
-/// accessor on that placeholder (`isDirectory()`, `size()`, `creationTime()`,
-/// ...) hits the GC-guard's out-of-bounds-field-read path — silently dropped
-/// to a default rather than throwing, so the bug was invisible unless
-/// `CRATONVM_DBG_OOBFIELD`/`RUST_LOG=warn` was on. `isDirectory()` in
-/// particular (`register_p59_file_attributes`) returns the raw
-/// (out-of-bounds) `get_field` result verbatim for a `()Z`-descriptor method
-/// instead of coercing it to an `Int` — on this placeholder that silently
-/// returns `Value::Object(None)` where a boolean was expected, a type
-/// confusion that a defensively-coded caller (`isRegularFile`, which matches
-/// on `Value::Int` and falls back to `0`) tolerates but a naive caller
-/// (`isDirectory`) does not. Give every callback the real, correctly-shaped
-/// object instead of relying on the guard's fallback.
-fn p98_alloc_basic_file_attributes(ctx: &mut dyn NativeContext, is_dir: bool, size: i64) -> ObjectRef {
-    let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-    let ft = filetime_alloc(ctx, 0);
-    ctx.set_field(bfa, 0, Value::Object(Some(ft)));
-    ctx.set_field(bfa, 1, Value::Object(Some(ft)));
-    ctx.set_field(bfa, 2, Value::Object(Some(ft)));
-    ctx.set_field(bfa, 3, Value::Int(if is_dir { 1 } else { 0 }));
-    ctx.set_field(bfa, 4, Value::Long(if is_dir { 0 } else { size }));
-    bfa
+/// A native-pinned GC root plus its original (possibly later stale) value,
+/// kept as the fallback `read_native_pin` returns for `NativeContext`
+/// implementations that don't support pinning (e.g. test mocks -- see
+/// [`NativeContext::pin_native_root`]'s doc comment). Create one with
+/// `p98_pin` right after allocating/receiving the object and resolve the
+/// current, GC-forwarded reference with `p98_read_pin` immediately before
+/// each re-entrant use -- never hold the raw `ObjectRef` itself across a
+/// call that can allocate.
+type P98Pin = (usize, ObjectRef);
+
+fn p98_pin(ctx: &mut dyn NativeContext, obj: ObjectRef) -> P98Pin {
+    (ctx.pin_native_root(obj), obj)
+}
+
+fn p98_read_pin(ctx: &dyn NativeContext, pin: P98Pin) -> ObjectRef {
+    ctx.read_native_pin(pin.0, pin.1)
+}
+
+/// Build a concrete platform `BasicFileAttributes` implementation for a
+/// `Files.walkFileTree` visitor callback. The named-field bridge makes the
+/// representation independent from the platform class's physical field order.
+fn p98_alloc_basic_file_attributes(
+    ctx: &mut dyn NativeContext,
+    is_dir: bool,
+    size: i64,
+) -> ObjectRef {
+    let attrs = basic_file_attributes_alloc(ctx);
+    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0);
+    attrs
 }
 
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
-    visitor: ObjectRef,
-    dir_path_obj: ObjectRef,
+    visitor_pin: P98Pin,
+    dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let pre = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "preVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(Some(attrs)),
     )?;
     if let Some(r) = pre {
@@ -36026,22 +36392,29 @@ fn p98_walk_dir(
         for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
             let es = jarfs_encode(&jar, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let size = jarfs_entry_size(&jar, &child).unwrap_or(0);
-                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
+                let fa = p98_alloc_basic_file_attributes(
+                    ctx,
+                    false,
+                    jarfs_entry_size(&jar, &child).unwrap_or(0),
+                );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36056,22 +36429,29 @@ fn p98_walk_dir(
         for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
             let es = jrtfs_encode(&java_home, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let size = jrtfs_entry_size(&java_home, &child).unwrap_or(0);
-                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
+                let fa = p98_alloc_basic_file_attributes(
+                    ctx,
+                    false,
+                    jrtfs_entry_size(&java_home, &child).unwrap_or(0),
+                );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36086,22 +36466,32 @@ fn p98_walk_dir(
             let ep = entry.path();
             let es = ep.to_string_lossy().to_string();
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
-                let size = entry.metadata().map(|m| m.len() as i64).unwrap_or(0);
-                let fa = p98_alloc_basic_file_attributes(ctx, false, size);
+                let fa = p98_alloc_basic_file_attributes(
+                    ctx,
+                    false,
+                    entry
+                        .metadata()
+                        .map(|metadata| metadata.len() as i64)
+                        .unwrap_or(0),
+                );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36112,13 +36502,15 @@ fn p98_walk_dir(
             }
         }
     }
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let post = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "postVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(None),
     )?;
     if let Some(r) = post {
@@ -38144,11 +38536,47 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let bb = obj_arg(args, 1)?;
             // DF07: decode the destination buffer via the real-or-synthetic
             // accessor (a real HeapByteBuffer's array is `hb`, not slot 0).
+            // GC-blocking audit — see the matching comment on the sibling
+            // `write` registration below for the full rationale (found via
+            // the same STW-takeover-cluster residual investigation).
             let bytes_read = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut tmp = vec![0u8; remaining];
-                        match ctx.fd_table().tcp_read(fd_id as u32, &mut tmp) {
+                        // STW-TAKEOVER-FIX (2026-07-14): tcp_read performs a
+                        // genuinely blocking OS recv() (real socket I/O
+                        // faked up as "async" via an already-completed
+                        // Future, not offloaded to a worker thread) with no
+                        // bound on wait time. Without a GC-barrier blocking
+                        // region, a concurrent STW pause counts this thread
+                        // as an ordinary cooperating mutator and waits
+                        // forever for it to reach a safepoint it can never
+                        // reach while parked in recv() — this is the
+                        // `pending=1`/`taken=0` permanent
+                        // "STW cross-thread JIT takeover" hang confirmed via
+                        // live gdb (thread blocked in
+                        // native-api/src/fd_table.rs's `tcp_read` ->
+                        // std::net::TcpStream::read, no frame trace, not
+                        // recognized as GC-safe) in
+                        // web.socket.messaging.StompWebSocketIntegrationTests's
+                        // `sendMessageToBrokerAndReceiveInOrder`. `arr`/`bb`
+                        // are ObjectRefs used again after the call returns,
+                        // so they go through `end_blocking_region_refs` to
+                        // pick up any relocation from a GC that ran while
+                        // blocked.
+                        let mut blocked_refs = [Value::Object(Some(arr)), Value::Object(Some(bb))];
+                        ctx.begin_blocking_region();
+                        let read_result = ctx.fd_table().tcp_read(fd_id as u32, &mut tmp);
+                        ctx.end_blocking_region_refs(&mut blocked_refs);
+                        let arr = match blocked_refs[0] {
+                            Value::Object(Some(o)) => o,
+                            _ => arr,
+                        };
+                        let bb = match blocked_refs[1] {
+                            Value::Object(Some(o)) => o,
+                            _ => bb,
+                        };
+                        match read_result {
                             Ok(0) => -1,
                             Ok(n) => {
                                 ctx.write_byte_array_from(arr, off, &tmp[..n]);
@@ -38176,12 +38604,53 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             let fd_id = ctx.get_field(this, 2).as_int().unwrap_or(-1);
             let bb = obj_arg(args, 1)?;
             // DF07: source the bytes via the real-or-synthetic accessor (see read).
+            //
+            // GC-blocking audit (STW takeover 5-class cluster residual,
+            // 2026-07-13, Azure host follow-up): `tcp_write` is a raw
+            // blocking `send()` with NO GC-blocking-region bracket — found
+            // via gdb on a hung TestWsWebSocketContainerTimeoutClient (the
+            // test deliberately never drains the peer socket to force a
+            // write timeout, so this send() parks in the OS indefinitely
+            // once the send buffer fills). Bracketing it fixes the
+            // STW-takeover hang (this thread was counted in `expected`
+            // forever, `taken=0`, matching the doc's signature exactly).
+            //
+            // NOTE this does NOT fix the deeper issue that this Future-
+            // returning overload is synchronous (blocks the calling thread
+            // until the write completes or errors) rather than genuinely
+            // async like the sibling CompletionHandler-based overload in
+            // native-io/src/async_socket.rs's aio_asc_write (which
+            // dispatches to a worker pool via Job::Write and returns
+            // immediately with a real pending Future). A caller doing
+            // `write(bb).get(timeout, unit)` to detect a write timeout will
+            // still block inside this native call itself rather than inside
+            // `Future.get`, so the write always "succeeds" eventually (once
+            // the peer reads or the connection resets) instead of the
+            // caller's own timeout ever firing — a separate, out-of-scope-
+            // for-this-fix architectural gap. Filed as a residual; see
+            // docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md.
             let bytes_written = if fd_id >= 0 {
                 match aio_bb_region(ctx, bb) {
                     Some((arr, off, remaining)) if remaining > 0 => {
                         let mut data = vec![0u8; remaining];
                         ctx.read_byte_array_into(arr, off, &mut data);
-                        match ctx.fd_table().tcp_write(fd_id as u32, &data) {
+                        // STW-TAKEOVER-FIX (2026-07-14): see the `read`
+                        // registration above — tcp_write is the same
+                        // genuinely-blocking-socket-call-with-no-GC-barrier-
+                        // registration shape (the write-side counterpart of
+                        // the same missing-safepoint-cooperation gap). `arr`
+                        // was already fully consumed above (copied into the
+                        // Rust-owned `data` buffer), so only `bb` needs to
+                        // survive the blocking window.
+                        let mut blocked_refs = [Value::Object(Some(bb))];
+                        ctx.begin_blocking_region();
+                        let write_result = ctx.fd_table().tcp_write(fd_id as u32, &data);
+                        ctx.end_blocking_region_refs(&mut blocked_refs);
+                        let bb = match blocked_refs[0] {
+                            Value::Object(Some(o)) => o,
+                            _ => bb,
+                        };
+                        match write_result {
                             Ok(n) => {
                                 aio_bb_advance(ctx, bb, n as i32);
                                 n as i32
@@ -40365,6 +40834,108 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     }
 
     let linker = "java/lang/foreign/Linker";
+
+    // Real JDK Arena.ofAuto returns ArenaImpl; its concrete allocate(long,
+    // long) must be intercepted so default SegmentAllocator.allocate(layout)
+    // produces our validated native MemorySegment representation.
+    r.register(
+        "jdk/internal/foreign/ArenaImpl",
+        "allocate",
+        "(JJ)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "java/lang/foreign/Arena",
+        "allocate",
+        "(JJ)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    // Arena.allocate(long) is an interface default method in the real JDK.
+    // Route it directly so it cannot construct a JDK segment whose layout
+    // differs from the native MemorySegment bridge.
+    r.register(
+        "java/lang/foreign/Arena",
+        "allocate",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        crate::panama::pe_arena_allocate,
+    );
+    r.register(
+        "java/lang/foreign/MemorySegment",
+        "reinterpret",
+        "(J)Ljava/lang/foreign/MemorySegment;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let size = match args.get(1) {
+                Some(Value::Long(size)) => *size,
+                _ => 0,
+            };
+            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            ctx.set_field(seg, 0, ctx.get_field(this, 0));
+            ctx.set_field(seg, 1, Value::Long(size));
+            ctx.set_field(seg, 2, ctx.get_field(this, 2));
+            ctx.set_field(seg, 3, ctx.get_field(this, 3));
+            ctx.set_field(seg, 4, Value::Int(1));
+            ctx.set_field(seg, 5, ctx.get_field(this, 5));
+            Ok(Some(Value::Object(Some(seg))))
+        },
+    );
+    r.register(
+        "java/lang/foreign/MemorySegment",
+        "getUtf8String",
+        "(J)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let offset = match args.get(1) {
+                Some(Value::Long(offset)) if *offset >= 0 => *offset,
+                _ => 0,
+            };
+            let base = match ctx.get_field(this, 0) {
+                Value::Long(address) => address,
+                _ => 0,
+            };
+            let base_offset = match ctx.get_field(this, 5) {
+                Value::Long(offset) => offset,
+                _ => 0,
+            };
+            let remaining = match ctx.get_field(this, 1) {
+                Value::Long(size) if size > offset => size - offset,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "getUtf8String requires a non-empty reinterpreted MemorySegment"
+                            .into(),
+                    }
+                    .into());
+                }
+            };
+            let address = (base as u64)
+                .checked_add(base_offset as u64)
+                .and_then(|address| address.checked_add(offset as u64))
+                .ok_or_else(|| -> MethodCallFailed {
+                    RuntimeError::IllegalStateException {
+                        message: "getUtf8String address arithmetic overflow".into(),
+                    }
+                    .into()
+                })? as *const u8;
+            if address.is_null() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let bytes =
+                unsafe { std::slice::from_raw_parts(address, (remaining as usize).min(4096)) };
+            let nul =
+                bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .ok_or_else(|| -> MethodCallFailed {
+                        RuntimeError::IllegalStateException {
+                            message: "getUtf8String exceeded its bounded scan".into(),
+                        }
+                        .into()
+                    })?;
+            let text = std::str::from_utf8(&bytes[..nul]).unwrap_or("");
+            Ok(Some(Value::Object(Some(ctx.create_string(text)))))
+        },
+    );
+
     r.register(
         linker,
         "nativeLinker",
@@ -40397,10 +40968,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             };
 
             let mut variadic_fixed: i64 = -1;
+            let mut capture_call_state = false;
             if let Some(Value::Object(Some(opts))) = args.get(3) {
                 let n = ctx.array_length(*opts);
                 for i in 0..n {
                     if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if crate::panama::downcall_option_captures_call_state(ctx, opt) {
+                            capture_call_state = true;
+                        }
                         let kind = match ctx.get_field(opt, 0) {
                             Value::Int(k) => k,
                             _ => -1,
@@ -40416,11 +40991,18 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 4);
+            if std::env::var_os("CRATONVM_DBG_LINKER").is_some() {
+                eprintln!(
+                    "[LATE_LINKER] option downcall addr=0x{fn_addr:x} options={}",
+                    args.get(3).is_some()
+                );
+            }
+            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
             ctx.set_field(dh, 0, Value::Long(fn_addr));
             ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
             ctx.set_field(dh, 2, Value::Long(variadic_fixed));
             ctx.set_field(dh, 3, Value::Long(0)); // cif cache not yet built
+            ctx.set_field(dh, 4, Value::Int(capture_call_state as i32));
             Ok(Some(Value::Object(Some(dh))))
         }
     );
@@ -40436,6 +41018,18 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "invokeExact",
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "invokeBasic",
+        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        crate::panama::pe_downcall_invoke,
+    );
+    r.register(
+        dh,
+        "type",
+        "()Ljava/lang/invoke/MethodType;",
+        crate::panama::pe_downcall_type,
     );
 
     // FunctionDescriptor
@@ -43098,7 +43692,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // instead of the non-functional bare-interface stub it used to
         // return (see that handler's doc comment for the full story).
         if let Some(Value::Object(Some(ks))) = args.get(1) {
-            crate::keystore::keystore_set_pending_km_identity(ctx, *ks);
+            let key_password = args
+                .get(2)
+                .map(|value| crate::keystore::read_password(ctx, value))
+                .unwrap_or_default();
+            crate::keystore::keystore_set_pending_km_identity_with_password(
+                ctx,
+                *ks,
+                &key_password,
+            );
             let ks_id = crate::keystore::keystore_id_from_object(ctx, *ks);
             if ks_id != 0 {
                 let this = obj_arg(args, 0)?;
@@ -49288,6 +49890,17 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
             path, host, ws_key
         );
         let req_bytes = upgrade_req.as_bytes();
+        // STW-TAKEOVER-FIX (2026-07-14): this whole handshake (write +
+        // byte-at-a-time read loop below) is genuinely blocking network I/O
+        // with no bound on wait time and, until now, no GC-barrier
+        // cooperation at all — the JDK `HttpClient`/`WebSocket` "Standard"
+        // client path used by e.g.
+        // `web.socket.messaging.StompWebSocketIntegrationTests`'s
+        // `client = Standard` parameterization. No Java ObjectRef is held
+        // across this section (the URI string was already read above; the
+        // WebSocket object/CompletableFuture are only allocated after this
+        // block completes), so a plain begin/end pair suffices.
+        ctx.begin_blocking_region();
         if use_tls {
             let _ = ctx.fd_table().tls_write(fd_id, req_bytes);
         } else {
@@ -49309,6 +49922,7 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
                 break;
             }
         }
+        ctx.end_blocking_region();
 
         // Verify 101 Switching Protocols
         let resp_str = String::from_utf8_lossy(&response);
@@ -63788,11 +64402,51 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
-            ctx.set_field_by_name(this, "message", args.get(2).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(
+                this,
+                "level",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            ctx.set_field_by_name(
+                this,
+                "message",
+                args.get(2).copied().unwrap_or(Value::Object(None)),
+            );
             ctx.set_field_by_name(this, "loggerName", Value::Object(None));
             ctx.set_field_by_name(this, "thrown", Value::Object(None));
             ctx.set_field_by_name(this, "parameters", Value::Object(None));
+            // Real JDK stamps the constructing thread's id into
+            // threadID/longThreadID. Without it, records report
+            // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
+            // that 0 to ThreadMXBean.getThreadInfo(long), which rejects
+            // non-positive ids ("Invalid thread ID parameter") on every
+            // AsyncFileHandler format. The mirror lookup may allocate, so
+            // keep this pinned across it.
+            let real = crate::log_record_real_layout(ctx, this);
+            let this_pin = ctx.pin_native_root(this);
+            let tid = crate::current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(crate::epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "threadID", Value::Int(crate::short_thread_id(tid)));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -63811,7 +64465,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/Level;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field_by_name(this, "level", args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field_by_name(
+                this,
+                "level",
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
             Ok(None)
         },
     );
@@ -63821,11 +64479,24 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field_by_name(this, "message", args.get(1).copied().unwrap_or(Value::Object(None)));
+        ctx.set_field_by_name(
+            this,
+            "message",
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+        );
         Ok(None)
     });
+    // Real-layout records (crate::log_record_real_layout) resolve by NAME:
+    // their raw indexes (loggerName=8, thrown=12, parameters=11, instant=7,
+    // sequenceNumber=1) disagree with this block's legacy 7-field slots, and
+    // a real record passes the num_fields >= 7 guard, so slot access would
+    // read or clobber unrelated real fields (e.g. slot 2 is the real
+    // sourceClassName, slot 5 the real threadID).
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "loggerName")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 2)))
         } else {
@@ -63834,13 +64505,19 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setLoggerName", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "loggerName", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 2, value);
         }
         Ok(None)
     });
     r.register(lr, "getThrown", "()Ljava/lang/Throwable;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "thrown")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 3)))
         } else {
@@ -63849,18 +64526,25 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "thrown", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 3, value);
         }
         Ok(None)
     });
     r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            let field = ctx.get_field(this, 4);
-            if matches!(field, Value::Object(Some(_))) {
-                return Ok(Some(field));
-            }
+        let field = if crate::log_record_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "parameters")
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.get_field(this, 4)
+        } else {
+            Value::Object(None)
+        };
+        if matches!(field, Value::Object(Some(_))) {
+            return Ok(Some(field));
         }
         // Return empty Object[] if not set
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -63872,29 +64556,68 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                ctx.set_field(this, 4, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            if crate::log_record_real_layout(ctx, this) {
+                ctx.set_field_by_name(this, "parameters", value);
+            } else if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 4, value);
             }
             Ok(None)
         },
     );
     r.register(lr, "getMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            // Real bytecode derives millis from `instant`.
+            if let Value::Object(Some(instant)) = ctx.get_field_by_name(this, "instant") {
+                return ctx.invoke_virtual(instant, "toEpochMilli", "()J", &[]);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
         if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 5)))
+            match ctx.get_field(this, 5) {
+                millis @ Value::Long(_) => Ok(Some(millis)),
+                _ => Ok(Some(Value::Long(0))),
+            }
         } else {
             Ok(Some(Value::Long(0)))
         }
     });
     r.register(lr, "setMillis", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 5, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let millis = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        if crate::log_record_real_layout(ctx, this) {
+            // Mirror the real setter: replace `instant`. The Instant
+            // construction may allocate; keep `this` pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let instant = ctx
+                .invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(millis)],
+                )
+                .ok()
+                .flatten();
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 5, Value::Long(millis));
         }
         Ok(None)
     });
     r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "sequenceNumber")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 6)))
         } else {
@@ -63903,8 +64626,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 6, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let value = args.get(1).copied().unwrap_or(Value::Long(0));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "sequenceNumber", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 6, value);
         }
         Ok(None)
     });

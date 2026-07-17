@@ -983,16 +983,15 @@ pub fn verify_instruction(
                 match &receiver {
                     VType::UninitializedThis => {
                         // The invoked constructor's owner must be either the
-                        // current class or its (direct) superclass. We can only
-                        // prove the relationship via the hierarchy: accept if
-                        // the owner == current class, or current class is a
-                        // subclass of the owner (i.e. owner is an ancestor —
-                        // for a well-formed class the `super()` target is the
-                        // direct superclass).
+                        // current class or its directly linked superclass.
+                        // Use the linked direct-superclass edge rather than a
+                        // generic ancestry lookup: the latter can resolve a
+                        // different loader-visible copy and would also accept
+                        // an invalid grandparent constructor invocation.
                         if let Some((owner, _, _)) = resolve_method_owner_name_and_type(cp, *index)
                         {
                             let ok = owner == current_class_name
-                                || hierarchy.is_subclass(current_class_name, &owner);
+                                || hierarchy.is_direct_superclass(current_class_name, &owner);
                             if !ok {
                                 return Err(verify_err(&format!(
                                     "invokespecial <init>: uninitializedThis receiver requires \
@@ -2416,5 +2415,89 @@ mod tests {
             VType::ObjectRef(Arc::from("java/lang/Object")),
             "uninitialized slot must be replaced with the initialized owner type"
         );
+    }
+
+    #[test]
+    fn invokespecial_init_on_uninitialized_this_accepts_direct_superclass() {
+        struct DirectSuperclassHierarchy;
+
+        impl ClassHierarchy for DirectSuperclassHierarchy {
+            fn is_subclass(&self, _child: &str, _parent: &str) -> bool {
+                false
+            }
+
+            fn is_direct_superclass(&self, child: &str, parent: &str) -> bool {
+                child == "Example" && parent == "java/lang/Object"
+            }
+
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+
+            fn is_interface(&self, _name: &str) -> bool {
+                false
+            }
+        }
+
+        let cp = init_cp();
+        let h = DirectSuperclassHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        frame.push(VType::UninitializedThis).unwrap();
+
+        verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect("uninitializedThis must be allowed to invoke its direct superclass constructor");
+
+        assert_eq!(frame.locals[0], VType::ObjectRef(Arc::from("Example")));
+    }
+
+    #[test]
+    fn invokespecial_init_on_uninitialized_this_rejects_indirect_superclass() {
+        struct IndirectSuperclassHierarchy;
+
+        impl ClassHierarchy for IndirectSuperclassHierarchy {
+            fn is_subclass(&self, child: &str, parent: &str) -> bool {
+                child == "Example" && parent == "java/lang/Object"
+            }
+
+            fn common_superclass(&self, _a: &str, _b: &str) -> String {
+                "java/lang/Object".to_string()
+            }
+
+            fn is_interface(&self, _name: &str) -> bool {
+                false
+            }
+        }
+
+        let cp = init_cp();
+        let h = IndirectSuperclassHierarchy;
+        let mut frame = make_frame(1, 4);
+        frame.locals[0] = VType::UninitializedThis;
+        frame.push(VType::UninitializedThis).unwrap();
+
+        let error = verify_instruction(
+            &Instruction::Invokespecial(6),
+            0,
+            &mut frame,
+            &cp,
+            "Example",
+            "<init>",
+            "()V",
+            &h,
+        )
+        .expect_err("uninitializedThis must not invoke an indirect superclass constructor");
+
+        assert!(error
+            .to_string()
+            .contains("uninitializedThis receiver requires the constructor owner"));
     }
 }

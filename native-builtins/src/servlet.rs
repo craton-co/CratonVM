@@ -220,7 +220,13 @@ fn jython_pyobject_finditem_string(
     target: ObjectRef,
     key: &str,
 ) -> Option<ObjectRef> {
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `target` (the receiver of the following `invoke_virtual`);
+    // pin it and re-read the forwarded reference before that call.
+    let target_pin = ctx.pin_native_root(target);
     let key_obj = ctx.create_string(key);
+    let target = ctx.read_native_pin(target_pin, target);
+    ctx.unpin_native_roots(target_pin);
     match ctx.invoke_virtual(
         target,
         "__finditem__",
@@ -238,7 +244,21 @@ fn jython_pyobject_setitem_string(
     key: &str,
     value: Value,
 ) -> Result<(), MethodCallFailed> {
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `target` and/or the object (if any) wrapped by `value`;
+    // pin both and re-read the forwarded references before `invoke_virtual`.
+    let target_pin = ctx.pin_native_root(target);
+    let value_pin = match value {
+        Value::Object(Some(v)) => Some((ctx.pin_native_root(v), v)),
+        _ => None,
+    };
     let key_obj = ctx.create_string(key);
+    let target = ctx.read_native_pin(target_pin, target);
+    let value = match value_pin {
+        Some((pin, v)) => Value::Object(Some(ctx.read_native_pin(pin, v))),
+        None => value,
+    };
+    ctx.unpin_native_roots(target_pin);
     let _ = ctx.invoke_virtual(
         target,
         "__setitem__",
@@ -255,7 +275,13 @@ fn jython_module_dict(
     if let Value::Object(Some(dict)) = ctx.get_field_by_name(module, "__dict__") {
         return Ok(dict);
     }
+    // GC-safety: `jython_new_pystringmap` below allocates and can trigger a
+    // collection that relocates `module`; pin it and re-read the forwarded
+    // reference before the `set_field_by_name` that uses it as receiver.
+    let module_pin = ctx.pin_native_root(module);
     let dict = jython_new_pystringmap(ctx)?;
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(module_pin);
     ctx.set_field_by_name(module, "__dict__", Value::Object(Some(dict)));
     Ok(dict)
 }
@@ -279,7 +305,13 @@ fn jython_new_module(
             .into())
         }
     };
+    // GC-safety: `jython_module_dict` below can itself allocate (a fresh
+    // module has no `__dict__` yet); pin `module` and re-read before
+    // returning it.
+    let module_pin = ctx.pin_native_root(module);
     let _ = jython_module_dict(ctx, module)?;
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(module_pin);
     Ok(module)
 }
 
@@ -334,7 +366,15 @@ fn jython_pymodule_package_lookup(
     let Some(package_manager) = package_manager else {
         return Ok(Some(Value::Object(None)));
     };
+    // GC-safety: `package_manager` is the receiver of the `invoke_virtual`
+    // right below `create_string`, and `module` is only consumed much later
+    // (past several more GC-triggering calls); pin both up front. `found`
+    // is re-pinned each time it's (re)bound and re-read right before its
+    // final uses. Unpin once at the end via the earliest handle.
+    let package_manager_pin = ctx.pin_native_root(package_manager);
+    let module_pin = ctx.pin_native_root(module);
     let full_name_obj = ctx.create_string(&full_name);
+    let package_manager = ctx.read_native_pin(package_manager_pin, package_manager);
     let mut found = match ctx.invoke_virtual(
         package_manager,
         "lookupName",
@@ -344,17 +384,22 @@ fn jython_pymodule_package_lookup(
         Some(Value::Object(Some(obj))) => obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let mut found_pin = ctx.pin_native_root(found);
 
     if let Some(Value::Object(Some(state))) = jython_py_get_or_create_system_state(ctx)? {
         if let Ok(modules) = jython_system_modules(ctx, state) {
             if let Some(existing) = jython_pyobject_finditem_string(ctx, modules, &full_name) {
                 found = existing;
+                found_pin = ctx.pin_native_root(found);
             }
         }
     }
 
+    let module = ctx.read_native_pin(module_pin, module);
     let dict = jython_module_dict(ctx, module)?;
+    let found = ctx.read_native_pin(found_pin, found);
     jython_pyobject_setitem_string(ctx, dict, attr, Value::Object(Some(found)))?;
+    ctx.unpin_native_roots(package_manager_pin);
     Ok(Some(Value::Object(Some(found))))
 }
 
@@ -362,6 +407,12 @@ fn jython_pymodule_findattr_ex(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let module = obj_arg(args, 0)?;
     let attr_obj = obj_arg(args, 1)?;
     let attr = ctx.read_string(attr_obj).unwrap_or_default();
+
+    // GC-safety: `module` is passed into several more GC-triggering helper
+    // calls below (`jython_pymodule_name`, `jython_ensure_sre_module_attrs`,
+    // `jython_module_dict`, `jython_pymodule_package_lookup`); pin it up
+    // front and re-read the forwarded reference before each use.
+    let module_pin = ctx.pin_native_root(module);
 
     match ctx.invoke_special(
         "org/python/core/PyObject",
@@ -374,17 +425,23 @@ fn jython_pymodule_findattr_ex(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         value => return Ok(value),
     }
 
+    let module = ctx.read_native_pin(module_pin, module);
     let module_name = jython_pymodule_name(ctx, module);
     if module_name.as_deref() == Some("_sre")
         && matches!(attr.as_str(), "MAGIC" | "MAXREPEAT" | "CODESIZE")
     {
+        let module = ctx.read_native_pin(module_pin, module);
         jython_ensure_sre_module_attrs(ctx, module)?;
+        let module = ctx.read_native_pin(module_pin, module);
         let dict = jython_module_dict(ctx, module)?;
         if let Some(found) = jython_pyobject_finditem_string(ctx, dict, &attr) {
+            ctx.unpin_native_roots(module_pin);
             return Ok(Some(Value::Object(Some(found))));
         }
     }
 
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(module_pin);
     match module_name {
         Some(name) => jython_pymodule_package_lookup(ctx, module, &attr, &name),
         None => Ok(Some(Value::Object(None))),
@@ -414,17 +471,30 @@ fn jython_ensure_builtin_module(
 ) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(module) = jython_pyobject_finditem_string(ctx, modules, "__builtin__") {
         if jython_object_class_is(ctx, module, "org/python/core/PyModule") {
+            // GC-safety: `jython_module_dict` can allocate; pin `module`
+            // and re-read before returning it.
+            let module_pin = ctx.pin_native_root(module);
             let _ = jython_module_dict(ctx, module)?;
+            let module = ctx.read_native_pin(module_pin, module);
+            ctx.unpin_native_roots(module_pin);
             return Ok(module);
         }
     }
 
+    // GC-safety: `modules` is only used again after `jython_new_pystringmap`/
+    // `jython_new_module` (both allocate); pin it across them and re-read
+    // before the final `jython_pyobject_setitem_string` call.
+    let modules_pin = ctx.pin_native_root(modules);
     let dict = match ctx.get_field_by_name(state, "builtins") {
         Value::Object(Some(obj)) => Value::Object(Some(obj)),
         _ => Value::Object(Some(jython_new_pystringmap(ctx)?)),
     };
     let module = jython_new_module(ctx, "__builtin__", dict)?;
+    let module_pin = ctx.pin_native_root(module);
+    let modules = ctx.read_native_pin(modules_pin, modules);
     jython_pyobject_setitem_string(ctx, modules, "__builtin__", Value::Object(Some(module)))?;
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(modules_pin);
     Ok(module)
 }
 
@@ -440,25 +510,43 @@ fn jython_imp_add_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into())
         }
     };
+    // GC-safety: `state`/`modules`/`module`/`module_dict` are all read again
+    // after later GC-triggering calls in this function (module lookup,
+    // dict/builtin-module construction, dict population); pin each right
+    // after it's bound and re-read before its next use. Unpin once at the
+    // end via the earliest handle (`state_pin`).
+    let state_pin = ctx.pin_native_root(state);
     let modules = jython_system_modules(ctx, state)?;
+    let modules_pin = ctx.pin_native_root(modules);
 
     if let Some(module) = jython_pyobject_finditem_string(ctx, modules, &name) {
         if jython_object_class_is(ctx, module, "org/python/core/PyModule") {
+            let module_pin = ctx.pin_native_root(module);
             let _ = jython_module_dict(ctx, module)?;
+            let mut module = ctx.read_native_pin(module_pin, module);
             if name == "_sre" {
                 jython_ensure_sre_module_attrs(ctx, module)?;
+                module = ctx.read_native_pin(module_pin, module);
             }
+            ctx.unpin_native_roots(state_pin);
             return Ok(Some(Value::Object(Some(module))));
         }
     }
 
     let module = jython_new_module(ctx, &name, Value::Object(None))?;
+    let module_pin = ctx.pin_native_root(module);
+    let mut module = module;
     if name == "_sre" {
         jython_ensure_sre_module_attrs(ctx, module)?;
+        module = ctx.read_native_pin(module_pin, module);
     }
     let module_dict = jython_module_dict(ctx, module)?;
+    let module_dict_pin = ctx.pin_native_root(module_dict);
+    let modules = ctx.read_native_pin(modules_pin, modules);
+    let state = ctx.read_native_pin(state_pin, state);
     let builtins = jython_ensure_builtin_module(ctx, modules, state)?;
     let builtins_dict = jython_module_dict(ctx, builtins)?;
+    let module_dict = ctx.read_native_pin(module_dict_pin, module_dict);
     jython_pyobject_setitem_string(
         ctx,
         module_dict,
@@ -466,8 +554,13 @@ fn jython_imp_add_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Object(Some(builtins_dict)),
     )?;
     let py_none = jython_py_none(ctx);
+    let module_dict = ctx.read_native_pin(module_dict_pin, module_dict);
     jython_pyobject_setitem_string(ctx, module_dict, "__package__", py_none)?;
+    let modules = ctx.read_native_pin(modules_pin, modules);
+    let module = ctx.read_native_pin(module_pin, module);
     jython_pyobject_setitem_string(ctx, modules, &name, Value::Object(Some(module)))?;
+    let module = ctx.read_native_pin(module_pin, module);
+    ctx.unpin_native_roots(state_pin);
     Ok(Some(Value::Object(Some(module))))
 }
 
@@ -668,6 +761,11 @@ fn jython_find_module_getattr(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => "",
     };
     if !exposer_class.is_empty() {
+        // GC-safety: `create_string` and `new_object_initialized` below can
+        // each trigger a collection that relocates `receiver` (used as an
+        // argument to `bind` only after both complete); pin it and re-read
+        // the forwarded reference before that call.
+        let receiver_pin = ctx.pin_native_root(receiver);
         let method_name = ctx.create_string(&name);
         let exposer = match ctx.new_object_initialized(
             exposer_class,
@@ -677,6 +775,8 @@ fn jython_find_module_getattr(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             Some(Value::Object(Some(obj))) => obj,
             value => return Ok(value),
         };
+        let receiver = ctx.read_native_pin(receiver_pin, receiver);
+        ctx.unpin_native_roots(receiver_pin);
         return ctx.invoke_virtual(
             exposer,
             "bind",
@@ -909,6 +1009,10 @@ fn script_engine_manager_create_engine(
     manager: ObjectRef,
     factory: ObjectRef,
 ) -> MethodCallResult {
+    // GC-safety: `getScriptEngine` can trigger a collection that relocates
+    // `manager` (read again right after); `engine` (the result) is likewise
+    // read again after the later `setBindings` call. Pin both.
+    let manager_pin = ctx.pin_native_root(manager);
     let engine = match ctx.invoke_virtual(
         factory,
         "getScriptEngine",
@@ -918,9 +1022,12 @@ fn script_engine_manager_create_engine(
         Ok(Some(Value::Object(Some(engine)))) => engine,
         Ok(_) | Err(_) => return Ok(Some(Value::Object(None))),
     };
+    let manager = ctx.read_native_pin(manager_pin, manager);
+    let engine_pin = ctx.pin_native_root(engine);
 
     if let Value::Object(Some(_)) = ctx.get_field_by_name(manager, "globalScope") {
         let bindings = ctx.get_field_by_name(manager, "globalScope");
+        let engine = ctx.read_native_pin(engine_pin, engine);
         if ctx
             .invoke_virtual(
                 engine,
@@ -930,10 +1037,13 @@ fn script_engine_manager_create_engine(
             )
             .is_err()
         {
+            ctx.unpin_native_roots(manager_pin);
             return Ok(Some(Value::Object(None)));
         }
     }
 
+    let engine = ctx.read_native_pin(engine_pin, engine);
+    ctx.unpin_native_roots(manager_pin);
     Ok(Some(Value::Object(Some(engine))))
 }
 
@@ -1021,6 +1131,13 @@ fn script_engine_manager_get_engine(
     let manager = obj_arg(args, 0)?;
     let key = obj_arg(args, 1)?;
 
+    // GC-safety: `manager`/`key` are both read again after several
+    // GC-triggering calls below (map lookup, factory-list retrieval, the
+    // per-factory match/try calls); pin both for the whole function.
+    // `factories`/`factory` get their own per-scope pins.
+    let manager_pin = ctx.pin_native_root(manager);
+    let key_pin = ctx.pin_native_root(key);
+
     if let Value::Object(Some(map)) = ctx.get_field_by_name(manager, association_field) {
         if let Ok(Some(Value::Object(Some(factory)))) = ctx.invoke_virtual(
             map,
@@ -1028,31 +1145,47 @@ fn script_engine_manager_get_engine(
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(key))],
         ) {
+            let manager = ctx.read_native_pin(manager_pin, manager);
             if let Some(engine) = script_engine_manager_try_factory(ctx, manager, factory)? {
+                ctx.unpin_native_roots(manager_pin);
                 return Ok(Some(Value::Object(Some(engine))));
             }
         }
     }
 
+    let manager = ctx.read_native_pin(manager_pin, manager);
     let factories =
         match ctx.invoke_virtual(manager, "getEngineFactories", "()Ljava/util/List;", &[])? {
             Some(Value::Object(Some(factories))) => factories,
-            _ => return Ok(Some(Value::Object(None))),
+            _ => {
+                ctx.unpin_native_roots(manager_pin);
+                return Ok(Some(Value::Object(None)));
+            }
         };
+    let factories_pin = ctx.pin_native_root(factories);
     let Some(size) = java_list_size(ctx, factories) else {
+        ctx.unpin_native_roots(manager_pin);
         return Ok(Some(Value::Object(None)));
     };
     for index in 0..size {
+        let factories = ctx.read_native_pin(factories_pin, factories);
         let Some(factory) = java_list_get(ctx, factories, index) else {
             continue;
         };
+        let factory_pin = ctx.pin_native_root(factory);
+        let key = ctx.read_native_pin(key_pin, key);
         if script_engine_manager_factory_matches(ctx, factory, key, list_method) {
+            let manager = ctx.read_native_pin(manager_pin, manager);
+            let factory = ctx.read_native_pin(factory_pin, factory);
             if let Some(engine) = script_engine_manager_try_factory(ctx, manager, factory)? {
+                ctx.unpin_native_roots(manager_pin);
                 return Ok(Some(Value::Object(Some(engine))));
             }
         }
+        ctx.unpin_native_roots(factory_pin);
     }
 
+    ctx.unpin_native_roots(manager_pin);
     Ok(Some(Value::Object(None)))
 }
 
@@ -2188,7 +2321,13 @@ const S2DC_SOCK_ID: usize = 4;
 fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     use cratonvm_types::ArrayElementType;
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
+    // GC-safety: `alloc_concurrent_synthetic` below allocates and can
+    // trigger a collection that relocates `arr` (read again by
+    // `bb_write_hb` immediately after); pin it and re-read.
+    let arr_pin = ctx.pin_native_root(arr);
     let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
     buf
 }
@@ -2575,7 +2714,7 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
 /// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
 /// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
 /// only when the real class/statics are unavailable (synthetic-jdk mode).
-fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
+pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
         .ok()
@@ -3586,7 +3725,13 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         };
         ctx.set_array_element(chars_arr, i, Value::Int(ch));
     }
+    // GC-safety: `alloc_concurrent_synthetic` below allocates and can
+    // trigger a collection that relocates `chars_arr` (written into the
+    // new CharBuffer's fields further below); pin it and re-read.
+    let chars_arr_pin = ctx.pin_native_root(chars_arr);
     let vb = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 6);
+    let chars_arr = ctx.read_native_pin(chars_arr_pin, chars_arr);
+    ctx.unpin_native_roots(chars_arr_pin);
     // Write to BOTH indexed slot 0 (synthetic-mode layout used by our
     // own CharBuffer natives) AND the real-JDK `hb` field by name (so
     // JDK bytecode reading `hb` / `hasArray` / `array` sees the char[]).
@@ -3597,13 +3742,19 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field_by_name(vb, "limit", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "capacity", Value::Int(rem_chars as i32));
     ctx.set_field_by_name(vb, "mark", Value::Int(-1));
-    // Synthetic-mode fallback (older paths still indexed-slot based).
-    ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
-    ctx.set_field(vb, BB_POS, Value::Int(0));
-    ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
-    ctx.set_field(vb, BB_MARK, Value::Int(-1));
-    ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    // Heap CharBuffers use ARRAY_CHAR_BASE_OFFSET (16) as their address.
+    // Do not unconditionally write the old indexed overlay: in real-JDK
+    // layout its slot 4 is Buffer.address, so BB_MARK=-1 made bulk get()
+    // call Unsafe.copyMemory with an invalid source offset.
+    ctx.set_field_by_name(vb, "address", Value::Long(16));
+    if s2_bb_synthetic_layout(ctx, vb) {
+        ctx.set_field(vb, BB_ARRAY, Value::Object(Some(chars_arr)));
+        ctx.set_field(vb, BB_POS, Value::Int(0));
+        ctx.set_field(vb, BB_LIMIT, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_CAP, Value::Int(rem_chars as i32));
+        ctx.set_field(vb, BB_MARK, Value::Int(-1));
+        ctx.set_field(vb, BB_ORDER, Value::Int(order));
+    }
     Ok(Some(Value::Object(Some(vb))))
 }
 
@@ -5799,16 +5950,24 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
     let channel = args.first().copied().unwrap_or(Value::Object(None));
     let selector = args.get(1).copied().unwrap_or(Value::Object(None));
     let ops = args.get(2).copied().unwrap_or(Value::Int(0));
-    let key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
+    let mut key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
     ctx.set_field(key, 0, channel);
     ctx.set_field(key, 1, selector);
     ctx.set_field(key, 2, ops);
     ctx.set_field(key, 3, Value::Int(0)); // readyOps = 0
                                           // Add key to selector's key list
-    if let Value::Object(Some(sel)) = selector {
+    if let Value::Object(Some(mut sel)) = selector {
+        // GC-safety: `new_ref_array` below allocates and can trigger a
+        // collection that relocates `key`/`sel` (both read again after);
+        // pin both and re-read the forwarded references.
+        let key_pin = ctx.pin_native_root(key);
+        let sel_pin = ctx.pin_native_root(sel);
         let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
         let new_cap = (n + 1).max(8);
         let new_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), new_cap);
+        key = ctx.read_native_pin(key_pin, key);
+        sel = ctx.read_native_pin(sel_pin, sel);
+        ctx.unpin_native_roots(key_pin);
         if let Value::Object(Some(old_arr)) = ctx.get_field(sel, S2SEL_KEYS) {
             for i in 0..n {
                 let k = ctx.get_array_element(old_arr, i);
@@ -5824,7 +5983,13 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bool) -> Value {
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    // GC-safety: `alloc_concurrent_synthetic`/`new_ref_array` below allocate
+    // and can trigger a collection that relocates `sel`/`set` (both read
+    // again after); pin both for the whole function.
+    let sel_pin = ctx.pin_native_root(sel);
+    let mut set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let set_pin = ctx.pin_native_root(set);
+    let sel = ctx.read_native_pin(sel_pin, sel);
     let keys_v = ctx.get_field(sel, S2SEL_KEYS);
     if let Value::Object(Some(keys_arr)) = keys_v {
         let mut ready: Vec<ObjectRef> = Vec::new();
@@ -5836,17 +6001,25 @@ fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bo
                 }
             }
         }
+        // GC-safety: `ready`'s elements were captured before `new_ref_array`
+        // below (which allocates); pin each and re-read the forwarded
+        // reference before writing it into the fresh array.
+        let ready_pins: Vec<_> = ready.iter().map(|&k| ctx.pin_native_root(k)).collect();
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ready.len());
-        for (i, k) in ready.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*k)));
+        set = ctx.read_native_pin(set_pin, set);
+        for (i, (&k, &pin)) in ready.iter().zip(ready_pins.iter()).enumerate() {
+            let k = ctx.read_native_pin(pin, k);
+            ctx.set_array_element(arr, i, Value::Object(Some(k)));
         }
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(ready.len() as i32));
     } else {
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+        set = ctx.read_native_pin(set_pin, set);
         ctx.set_field(set, 0, Value::Object(Some(arr)));
         ctx.set_field(set, 1, Value::Int(0));
     }
+    ctx.unpin_native_roots(sel_pin);
     Value::Object(Some(set))
 }
 

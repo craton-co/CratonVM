@@ -250,7 +250,11 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: boo
 /// anonymous classes — a top-level class with literal `$` characters in its
 /// binary name (dynamically-generated proxies) has no such entry. Same
 /// lookup `native_class_get_simple_binary_name` uses.
-fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, class_name: &str) -> bool {
+fn has_own_inner_classes_entry(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    class_name: &str,
+) -> bool {
     ctx.inner_classes(class_id)
         .iter()
         .any(|(inner_class, _, _, _)| inner_class == class_name)
@@ -258,16 +262,36 @@ fn has_own_inner_classes_entry(ctx: &mut dyn NativeContext, class_id: ClassId, c
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
 /// Cached per `ClassId`.
-pub(crate) fn canonical_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
+pub(crate) fn canonical_class_name(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    slashed: &str,
+) -> Arc<str> {
     if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
         Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default())
-    } else if slashed.contains('/') || slashed.contains('$') {
-        Arc::from(slashed.replace(['/', '$'], "."))
+    } else if let Some((_, outer_class, inner_name, _)) = ctx
+        .inner_classes(class_id)
+        .into_iter()
+        .find(|(inner_class, _, _, _)| inner_class == slashed)
+    {
+        if !outer_class.is_empty() && !inner_name.is_empty() {
+            let outer_name = ctx
+                .declaring_class(class_id)
+                .and_then(|outer_id| {
+                    ctx.class_name_of_id(outer_id).map(|outer_slashed| {
+                        canonical_class_name(ctx, outer_id, &outer_slashed).to_string()
+                    })
+                })
+                .unwrap_or_else(|| outer_class.replace(['/', '$'], "."));
+            Arc::from(format!("{outer_name}.{inner_name}"))
+        } else {
+            Arc::from(slashed.replace(['/', '$'], "."))
+        }
     } else {
-        Arc::from(slashed)
+        Arc::from(slashed.replace('/', "."))
     };
     cache_insert(&CANONICAL_CLASS_NAME_CACHE, class_id, canonical)
 }
@@ -1722,14 +1746,40 @@ pub(crate) fn native_class_for_name(
         let lookup_loader = if loader_class_name_debug
             == "org/springframework/core/test/tools/DynamicClassLoader"
         {
-            match ctx.get_field_by_name(loader, "parent") {
-                Value::Object(Some(parent)) => parent,
-                _ => loader,
+            // Only reroute when the parent is the FORKED test loader: in that
+            // configuration DynamicClassLoader's constructor defines every
+            // generated class into the fork (defineDynamicClass), so the
+            // fork's namespace is authoritative. A plain per-compile
+            // DynamicClassLoader (parent = app/test loader) defines classes
+            // ITSELF — both its lazily-defined generated classes and classes
+            // third parties (CGLIB's ReflectUtils.defineClass fallback) push
+            // into it — and rerouting to the app parent hid those,
+            // CNFE-failing the Class.forName(name, true, loader) that CGLIB
+            // issues right after a successful define.
+            let parent_is_fork = match ctx.get_field_by_name(loader, "parent") {
+                Value::Object(Some(parent)) => {
+                    let pid = ctx.class_id_of_object(parent);
+                    ctx.class_name_of_id(pid).is_some_and(|n| {
+                        n == "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"
+                    })
+                }
+                _ => false,
+            };
+            if parent_is_fork {
+                match ctx.get_field_by_name(loader, "parent") {
+                    Value::Object(Some(parent)) => parent,
+                    _ => loader,
+                }
+            } else {
+                loader
             }
         } else {
             loader
         };
-        let invoke_args = [Value::Object(Some(lookup_loader)), Value::Object(Some(name_obj))];
+        let invoke_args = [
+            Value::Object(Some(lookup_loader)),
+            Value::Object(Some(name_obj)),
+        ];
         match ctx.invoke_virtual(
             lookup_loader,
             "loadClass",
@@ -1754,11 +1804,29 @@ pub(crate) fn native_class_for_name(
                 if initialize {
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mirror_ref) {
-                            if let Some(bin_name) = ctx.class_name_of_id(cid) {
-                                // Propagate ExceptionInInitializerError / linkage
-                                // errors raised by `<clinit>`, matching HotSpot.
-                                ctx.ensure_class_initialized(&bin_name)?;
-                            }
+                            // `loadClass` has already resolved this exact class through
+                            // the requested loader.  Initializing it by name again loses
+                            // that loader identity and falls back to the flat application
+                            // store, which cannot see a freshly defined CGLIB proxy in a
+                            // filtered/user loader.  Initialize the resolved ClassId
+                            // directly, as Class.forName0 does on the JVM.
+                            //
+                            // HIB-CV-26 fix (2026-07-16): `initialize_class`
+                            // now returns the real `MethodCallFailed` instead
+                            // of a flattened `String`, so a `<clinit>`
+                            // exception propagates as-is here — already
+                            // wrapped as a catchable
+                            // `ExceptionInInitializerError`/
+                            // `NoClassDefFoundError` by
+                            // `ensure_class_initialized_shared` per JVMS
+                            // §5.5. Previously every nested clinit failure
+                            // (e.g. `MemorySegment.<clinit>` throwing
+                            // `IllegalCallerException` without
+                            // `--enable-native-access`) was re-wrapped as an
+                            // unrecoverable `VmError::Internal` here, which
+                            // aborted the whole VM instead of letting Java
+                            // code catch the exception.
+                            ctx.initialize_class(cid)?;
                         }
                     }
                 }
@@ -2844,6 +2912,17 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some((_, _, inner_name, _)) = ctx
+                .inner_classes(class_id)
+                .into_iter()
+                .find(|(inner_class, _, _, _)| inner_class == &name)
+            {
+                if !inner_name.is_empty() {
+                    let simple = cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
+                    let result = ctx.create_string(&simple);
+                    return Ok(Some(Value::Object(Some(result))));
+                }
+            }
             let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
             let simple = simple_class_name(class_id, &name, is_real_inner);
             let result = ctx.create_string(&simple);
@@ -3024,8 +3103,14 @@ fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_t
         }
     };
     let mirror = ctx.alloc_object(class_class_id, num_fields);
-    ctx.set_field(mirror, 0, Value::Object(None));
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `mirror`; pin it and re-read the forwarded reference before
+    // the `set_field` calls that populate it (mirrors `create_field_object`).
+    let mirror_pin = ctx.pin_native_root(mirror);
     let name_str = ctx.create_string(name);
+    let mirror = ctx.read_native_pin(mirror_pin, mirror);
+    ctx.unpin_native_roots(mirror_pin);
+    ctx.set_field(mirror, 0, Value::Object(None));
     ctx.set_field(mirror, 1, Value::Object(Some(name_str)));
     ctx.set_field(mirror, 12, Value::Int(0)); // classRedefinedCount
     mirror
@@ -3479,7 +3564,13 @@ pub(crate) fn illegal_arg_exc_null_to_primitive(
         Ok(Some(Value::Object(Some(obj)))) => obj,
         _ => return illegal_arg_exc(msg),
     };
+    // GC-safety: `create_string` below can trigger a collection that
+    // relocates `npe`; pin it and re-read the forwarded reference before it
+    // is embedded as the IAE's cause.
+    let npe_pin = ctx.pin_native_root(npe);
     let msg_obj = ctx.create_string(&msg);
+    let npe = ctx.read_native_pin(npe_pin, npe);
+    ctx.unpin_native_roots(npe_pin);
     match ctx.new_object_initialized(
         "java/lang/IllegalArgumentException",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
@@ -3545,17 +3636,30 @@ pub(crate) fn wrap_as_invocation_target_exception(
     // list does not model JDK 7+ `InvocationTargetException(Throwable)`.
     let target_class = "java/lang/reflect/InvocationTargetException";
     if ctx.is_class_synthetic_stub(target_class) {
+        // GC-safety: `new_object` can trigger a collection that relocates
+        // `original` (materialized well before this point); pin it before
+        // allocating `wrapper`.
+        let original_pin = ctx.pin_native_root(original);
         let new_result = ctx.new_object(target_class);
+        let original = ctx.read_native_pin(original_pin, original);
         let wrapper = match new_result {
             Ok(Some(Value::Object(Some(obj)))) => obj,
             _ => return MethodCallFailed::ExceptionThrown(original),
         };
+        // `invoke_special` runs a real Java `<init>` body, which can itself
+        // allocate; pin `wrapper` too (the earlier `original_pin` handle
+        // still covers it once released together below) and re-read both
+        // forwarded references before their next use.
+        let wrapper_pin = ctx.pin_native_root(wrapper);
         let _ = ctx.invoke_special(
             "java/lang/ReflectiveOperationException",
             "<init>",
             "()V",
             &[Value::Object(Some(wrapper))],
         );
+        let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+        let original = ctx.read_native_pin(original_pin, original);
+        ctx.unpin_native_roots(original_pin);
         let _ = ctx.set_field_by_name(wrapper, "target", Value::Object(Some(original)));
         return MethodCallFailed::ExceptionThrown(wrapper);
     }
@@ -3563,19 +3667,33 @@ pub(crate) fn wrap_as_invocation_target_exception(
     // Attempt to allocate and initialise
     // `java.lang.reflect.InvocationTargetException(Throwable)`. If any step
     // fails, fall back to the original exception rather than masking it.
+    //
+    // GC-safety: `new_object` below can relocate `original`; pin it first
+    // and re-read the forwarded reference before it's used as the `invoke`
+    // argument / fallback return value.
+    let original_pin = ctx.pin_native_root(original);
     let new_result = ctx.new_object(target_class);
+    let original = ctx.read_native_pin(original_pin, original);
     let wrapper = match new_result {
         Ok(Some(Value::Object(Some(obj)))) => obj,
         _ => return MethodCallFailed::ExceptionThrown(original),
     };
 
     // Preferred path: InvocationTargetException(Throwable target).
+    // GC-safety: `invoke` runs the exception's real Java `<init>`, which can
+    // itself allocate; pin `wrapper` across it too and re-read both
+    // forwarded references before their next use (both are read again in
+    // the `match` below).
+    let wrapper_pin = ctx.pin_native_root(wrapper);
     let init_result = ctx.invoke(
         target_class,
         "<init>",
         "(Ljava/lang/Throwable;)V",
         &[Value::Object(Some(wrapper)), Value::Object(Some(original))],
     );
+    let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
+    let original = ctx.read_native_pin(original_pin, original);
+    ctx.unpin_native_roots(original_pin);
     match init_result {
         Ok(_) => MethodCallFailed::ExceptionThrown(wrapper),
         // If the two-arg constructor is unavailable, fall back to the
@@ -6276,7 +6394,26 @@ pub(crate) fn native_method_invoke(
             }
         }
     } else {
-        match ctx.invoke(&class_name, &method_name, &descriptor, &invoke_args) {
+        // Use the Method object's OWN already-resolved declaring ClassId
+        // when available, instead of re-resolving `class_name` by name.
+        // Name-based resolution goes through the loader-blind global lookup,
+        // which is unsound (reports "not found") once 2+ different
+        // user-defined loaders each register their own distinct class under
+        // this identical simple name — an ordinary occurrence for harnesses
+        // that mint a fresh ClassLoader + identically-named generated class
+        // per invocation (Spring's TestCompiler/@CompileWithForkedClassLoader
+        // — see `invoke_by_class_id_shared`'s doc comment). This matters most
+        // for STATIC methods (never virtually dispatched, always reaching
+        // this branch), which is exactly the reflective-invoke shape
+        // Method.invoke() takes right after successfully loading the
+        // generated class via a specific ClassLoader.
+        let dispatch_result = match mirror_class_id(ctx, declaring_mirror) {
+            Some(cid) => {
+                ctx.invoke_by_class_id(cid, &class_name, &method_name, &descriptor, &invoke_args)
+            }
+            None => ctx.invoke(&class_name, &method_name, &descriptor, &invoke_args),
+        };
+        match dispatch_result {
             Ok(v) => v,
             Err(failure) => {
                 return Err(wrap_as_invocation_target_exception(ctx, failure));
@@ -8109,21 +8246,20 @@ pub(crate) fn native_constructor_new_instance(
     // `<clinit>`, and reflective construction otherwise throws
     // `InterpreterError: Unititialized class: no static`.
     if let Some(cid) = declaring_cid {
-        ctx.initialize_class(cid).map_err(|message| {
-            cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Internal {
-                    message: format!("Constructor.newInstance: class init failed: {message}"),
-                },
-            )
-        })?;
+        // HIB-CV-26 fix (2026-07-16): propagate the real `<clinit>` failure
+        // (already a catchable `ExceptionInInitializerError`/
+        // `NoClassDefFoundError` per JVMS §5.5, or a genuine internal error)
+        // instead of re-wrapping it as an unrecoverable `VmError::Internal`.
+        // Matches real JDK `Constructor.newInstance` semantics, which
+        // throws `ExceptionInInitializerError` for a failed initializer.
+        ctx.initialize_class(cid)?;
     }
 
     // Parse parameter types
     let (param_descs, _) = parse_descriptor_param_and_return(&descriptor);
 
     // Extract arguments from Object[] (args[1])
-    let args_array = args_array_pin
-        .map(|(pin, arr)| ctx.read_native_pin(pin, arr));
+    let args_array = args_array_pin.map(|(pin, arr)| ctx.read_native_pin(pin, arr));
     let actual_arg_count = match args_array {
         Some(arr) => ctx.array_length(arr),
         None => 0,
@@ -8310,15 +8446,30 @@ pub(crate) fn native_class_get_declared_constructor(
 // ---------------------------------------------------------------------------
 
 /// Collect all public fields from the class hierarchy (this class +
-/// superclasses + interfaces). Mirrors `Class.privateGetPublicFields()`.
+/// superclasses + interfaces) and materialize them as a `Field[]` array.
+/// Mirrors `Class.privateGetPublicFields()`.
 ///
 /// Per JDK semantics: for an interface, the superclass walk is skipped
 /// (matches `collect_public_methods`).
+///
+/// GC-safety (2026-07-16): the hierarchy walk only accumulates plain
+/// `FieldMetadata` values (no GC objects, nothing a moving collector can
+/// invalidate). Object materialization happens in one final pass through
+/// `build_mirror_array`, which pins the destination array across every
+/// allocating `create_field_object` call. The previous version pushed
+/// freshly-created `ObjectRef`s straight into an ordinary (unrooted) `Vec`
+/// *during* the walk -- on a class with many public fields/properties (e.g.
+/// JAXB's `ClassInfoImpl` walking a Hibernate entity hierarchy), a GC
+/// triggered by the Nth `create_field_object` call could relocate/reclaim
+/// the first N-1 already-created Field mirrors, since that Vec was not a
+/// GC root. This is the exact residual gap flagged (but never swept) in
+/// `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
+/// ("collect_public_fields/methods (getFields/getMethods Vec-build)").
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> Vec<cratonvm_types::ObjectRef> {
-    let mut result = Vec::new();
+) -> cratonvm_types::ObjectRef {
+    let mut metas: Vec<FieldMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
 
@@ -8327,10 +8478,10 @@ fn collect_public_fields(
             continue;
         }
         let fields = ctx.declared_fields(cid);
-        for meta in &fields {
+        for meta in fields {
             if (meta.access_flags & 0x0001) != 0 {
                 // PUBLIC
-                result.push(create_field_object(ctx, meta));
+                metas.push(meta);
             }
         }
         // Walk superclass вЂ” skipped for interfaces (see
@@ -8345,7 +8496,9 @@ fn collect_public_fields(
             stack.push(iface_id);
         }
     }
-    result
+    build_mirror_array(ctx, metas.len(), |ctx, i| {
+        create_field_object(ctx, &metas[i])
+    })
 }
 
 /// Collect all public methods from the class hierarchy.
@@ -8369,8 +8522,8 @@ fn collect_public_fields(
 fn collect_public_methods(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> Vec<cratonvm_types::ObjectRef> {
-    let mut result = Vec::new();
+) -> cratonvm_types::ObjectRef {
+    let mut metas: Vec<MethodMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
 
@@ -8382,13 +8535,13 @@ fn collect_public_methods(
         // walk the public method table on a synthetic-stub class (e.g.
         // java/lang/ClassLoader) still see the JDK-contracted methods.
         let methods = declared_methods_with_synthetic(ctx, cid);
-        for meta in &methods {
+        for meta in methods {
             if meta.name == "<init>" || meta.name == "<clinit>" {
                 continue;
             }
             if (meta.access_flags & 0x0001) != 0 {
                 // PUBLIC
-                result.push(create_method_object(ctx, meta));
+                metas.push(meta);
             }
         }
         // G2-fix: only walk the superclass chain for non-interface classes.
@@ -8403,7 +8556,11 @@ fn collect_public_methods(
             stack.push(iface_id);
         }
     }
-    result
+    // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
+    // same fix, same residual-gap doc reference.
+    build_mirror_array(ctx, metas.len(), |ctx, i| {
+        create_method_object(ctx, &metas[i])
+    })
 }
 
 pub(crate) fn native_class_get_fields(
@@ -8426,11 +8583,7 @@ pub(crate) fn native_class_get_fields(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let field_objs = collect_public_fields(ctx, class_id);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), field_objs.len());
-    for (i, fobj) in field_objs.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*fobj)));
-    }
+    let arr = collect_public_fields(ctx, class_id);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -8562,11 +8715,7 @@ pub(crate) fn native_class_get_methods(
                 return Ok(Some(Value::Object(Some(arr))));
             }
         };
-        let method_objs = collect_public_methods(ctx, class_id);
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), method_objs.len());
-        for (i, mobj) in method_objs.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Object(Some(*mobj)));
-        }
+        let arr = collect_public_methods(ctx, class_id);
         Ok(Some(Value::Object(Some(arr))))
     })();
     GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
@@ -9916,9 +10065,7 @@ fn make_type_not_present_exception(
     crate::lang_misc::write_throwable_detail_message(ctx, exc, Value::Object(Some(msg_obj)));
     let exc = ctx.read_native_pin(pin, exc);
     if let Some(c) = cause {
-        let c = cause_pin
-            .map(|p| ctx.read_native_pin(p, c))
-            .unwrap_or(c);
+        let c = cause_pin.map(|p| ctx.read_native_pin(p, c)).unwrap_or(c);
         crate::lang_misc::write_throwable_cause(ctx, exc, Value::Object(Some(c)));
     }
     let exc = ctx.read_native_pin(pin, exc);
@@ -10035,13 +10182,22 @@ fn create_annotation_proxy(
     ann: &cratonvm_native_api::AnnotationData,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
-    let proxy = alloc_concurrent_synthetic(
+    let mut proxy = alloc_concurrent_synthetic(
         ctx,
         "java/lang/annotation/AnnotationProxy",
         ANN_PROXY_FIELDS,
     );
+    // GC-safety (2026-07-16): `proxy` is a freshly-allocated object that is
+    // not yet reachable from any Java-visible root (it isn't returned to the
+    // interpreter until this function's end) -- every allocating call below
+    // (`create_string`, class loading/mirror resolution, `declared_methods`,
+    // annotation-element conversion) can trigger a GC that relocates it. Pin
+    // it for the whole function and re-read the forwarded reference before
+    // every use, matching the already-pinned `names_arr`/`values_arr` below.
+    let proxy_pin = ctx.pin_native_root(proxy);
     let desc_str = ctx.create_string(&ann.type_descriptor);
     let mut child_roots = vec![desc_str];
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
     ctx.set_field(proxy, ANN_PROXY_TYPE_DESC, Value::Object(Some(desc_str)));
 
     let mut ann_class_id_opt = None;
@@ -10080,6 +10236,7 @@ fn create_annotation_proxy(
         if let Some((cid, mirror)) = cid_mirror {
             ann_class_id_opt = Some(cid);
             child_roots.push(mirror);
+            proxy = ctx.read_native_pin(proxy_pin, proxy);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
         } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
@@ -10208,6 +10365,7 @@ fn create_annotation_proxy(
     names_arr = ctx.read_native_pin(names_pin, names_arr);
     values_arr = ctx.read_native_pin(values_pin, values_arr);
     ctx.unpin_native_roots(names_pin);
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(
         proxy,
@@ -10220,13 +10378,21 @@ fn create_annotation_proxy(
     // Real annotations: hand back a real `$ProxyN` proxy that wraps
     // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
     // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
-    if real_annotations_enabled() {
+    // A real proxy needs the VM-owned loader and generated-class namespace.
+    // The lightweight native unit-test context deliberately does not model
+    // that global state, so retain the valid AnnotationProxy representation
+    // there instead of reusing a loader ObjectRef from another mock VM.
+    proxy = ctx.read_native_pin(proxy_pin, proxy);
+    if ctx.supports_real_proxy_generation() && real_annotations_enabled() {
         if let Some(ann_cid) = ann_class_id_opt {
             if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
+                ctx.unpin_native_roots(proxy_pin);
                 return real;
             }
+            proxy = ctx.read_native_pin(proxy_pin, proxy);
         }
     }
+    ctx.unpin_native_roots(proxy_pin);
     remember_annotation_proxy_child_roots(proxy, child_roots);
     proxy
 }
@@ -10330,8 +10496,18 @@ pub(crate) fn annotation_element_to_java_typed(
                 ctx.class_id_by_name(class_name)
             });
             if let Some(enum_cid) = enum_cid_opt {
+                // GC-safety (2026-07-16): this is the "enum builder" residual
+                // gap flagged (but never swept) in
+                // docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+                // — `class_mirror` is held in a Rust local across the
+                // allocating `create_string` call (and the `Enum.valueOf`
+                // invocation itself, which can allocate/classload) before
+                // being used as an invoke argument. Pin it and re-read the
+                // forwarded reference right before use.
                 let class_mirror = ctx.get_class_mirror(enum_cid);
+                let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let name_str = ctx.create_string(const_name);
+                let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
                 let invoke_res = ctx.invoke(
                     "java/lang/Enum",
                     "valueOf",
@@ -10341,6 +10517,7 @@ pub(crate) fn annotation_element_to_java_typed(
                         Value::Object(Some(name_str)),
                     ],
                 );
+                ctx.unpin_native_roots(class_mirror_pin);
                 if iae_trace {
                     eprintln!(
                         "ANN-ENUM class={class_name} const={const_name} ok={}",
@@ -10813,15 +10990,33 @@ fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
+    build_annotation_array_for(ctx, None, annotations)
+}
+
+/// Like [`build_annotation_array`] but resolves each annotation TYPE through
+/// the declaring class's defining loader (HotSpot `AnnotationParser`'s
+/// "container"). Under classloader isolation (Spring's
+/// `@CompileWithForkedClassLoader` fork re-defines the whole framework), the
+/// member's declaring class and the framework code comparing annotation types
+/// live in the SAME loader; resolving the annotation type globally instead
+/// yields the app loader's copy and every `annotationType()` identity
+/// comparison silently fails (e.g. `@Autowired` detection returning no
+/// injection metadata).
+fn build_annotation_array_for(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: Option<ClassId>,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
     let comp = annotation_component_class_id(ctx);
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
+    let container_loader = declaring_class_id
+        .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    // No container class here (non-cached array path) в†’ global Class resolution.
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], None)
+        create_annotation_proxy(ctx, resolvable[i], container_loader)
     })
 }
 
@@ -11427,7 +11622,7 @@ pub(crate) fn native_field_get_annotations(
         }
     };
     let annotations = ctx.field_annotations(class_id, &field_name);
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11542,7 +11737,7 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11680,14 +11875,27 @@ pub(crate) fn native_method_get_parameter_annotations(
     let param_annotations = ctx.method_parameter_annotations(class_id, &method_name, &method_desc);
     let aligned_annotations =
         align_parameter_annotations(ctx, class_id, &method_name, &method_desc, param_annotations);
-    let outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    // GC-safety (2026-07-16): `outer` used to be filled by a loop whose body
+    // (`build_annotation_array_for`) allocates (each inner `Annotation[]` +
+    // its proxies) *before* `set_array_element` ran -- a GC triggered inside
+    // that call left the un-pinned `outer` `ObjectRef` stale, corrupting the
+    // whole `Annotation[][]` result. Pin `outer` across the loop and re-read
+    // the forwarded reference each iteration, matching `build_mirror_array`'s
+    // established pattern. This is the "getParameterAnnotations" residual gap
+    // flagged in
+    // `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`.
+    let mut outer = ctx.new_ref_array(outer_comp, aligned_annotations.len());
+    let outer_pin = ctx.pin_native_root(outer);
     for i in 0..aligned_annotations.len() {
         let anns = aligned_annotations
             .get(i)
-            .map(|a| build_annotation_array(ctx, a))
+            .map(|a| build_annotation_array_for(ctx, Some(class_id), a))
             .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
+        outer = ctx.read_native_pin(outer_pin, outer);
         ctx.set_array_element(outer, i, Value::Object(Some(anns)));
     }
+    outer = ctx.read_native_pin(outer_pin, outer);
+    ctx.unpin_native_roots(outer_pin);
     Ok(Some(Value::Object(Some(outer))))
 }
 
@@ -11835,12 +12043,22 @@ pub(crate) fn native_class_get_type_parameters(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
+    // GC-safety (2026-07-16): `arr` is freshly-allocated and not yet
+    // reachable from any Java-visible root; each `type_param_to_java` call
+    // allocates a TypeVariable (+ bounds array + name string) and can
+    // trigger a GC that relocates `arr` mid-loop. Pin it across the fill
+    // loop and re-read the forwarded reference before every store, matching
+    // the `build_mirror_array` contract.
+    let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
         // genericDeclaration = the declaring Class mirror (`this`).
         let tv = crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }
+    arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12033,10 +12251,19 @@ pub(crate) fn native_class_get_generic_interfaces(
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             if !class_sig.interfaces.is_empty() {
+                // GC-safety (2026-07-16): both `class_mirror` (re-consulted
+                // every iteration via `GenericDeclScope`) and `arr` (filled
+                // by the allocating `typesig_to_real_type` per interface)
+                // are held in Rust locals across allocating calls without
+                // being GC roots. Pin both and re-read the forwarded
+                // reference before each use, matching `build_mirror_array`.
                 let class_mirror = ctx.get_class_mirror(class_id);
+                let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let raw_interfaces = ctx.class_interfaces(class_id);
-                let arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
+                let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, iface) in class_sig.interfaces.iter().enumerate() {
+                    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
                     // Type-variable uses in an interface type refer to THIS
                     // class's type parameters.
                     let _gscope =
@@ -12057,8 +12284,11 @@ pub(crate) fn native_class_get_generic_interfaces(
                     } else {
                         val
                     };
+                    arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, val);
                 }
+                arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(class_mirror_pin);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -12130,20 +12360,31 @@ pub(crate) fn native_method_get_generic_param_types(
             // Declaration scope for type-variable uses: a generic method's own
             // type parameters (`<T> ... toArray(T[])`) declare to the METHOD;
             // otherwise the uses (`Iterator<E>`) refer to the declaring CLASS.
-            let decl = if method_sig.type_params.is_empty() {
-                Value::Object(Some(ctx.get_class_mirror(class_id)))
+            // GC-safety (2026-07-16): `decl_obj` (when it's a freshly
+            // fetched class mirror) and `arr` are both held across the
+            // allocating `typesig_to_real_type` calls in this loop without
+            // being GC roots. Pin both and re-read the forwarded reference
+            // before each use, matching `build_mirror_array`.
+            let decl_obj = if method_sig.type_params.is_empty() {
+                ctx.get_class_mirror(class_id)
             } else {
-                Value::Object(Some(this))
+                this
             };
-            let arr = ctx.new_ref_array(ClassId::new(0), method_sig.param_types.len());
+            let decl_pin = ctx.pin_native_root(decl_obj);
+            let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.param_types.len());
+            let arr_pin = ctx.pin_native_root(arr);
             for (i, pt) in method_sig.param_types.iter().enumerate() {
-                let _gscope = crate::generics::GenericDeclScope::new(decl);
+                let decl_obj = ctx.read_native_pin(decl_pin, decl_obj);
+                let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(decl_obj)));
                 // SB-02b-#3: real ParameterizedTypeImpl for parameterized parameter
                 // types (the firing path for synthetic Method objects; real Method
                 // objects already run the JDK reifier bytecode).
                 let val = crate::generics::typesig_to_real_type(ctx, pt);
+                arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, val);
             }
+            arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(decl_pin);
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -12182,6 +12423,39 @@ pub(crate) fn native_method_get_generic_return_type(
     Ok(Some(method_return_type_value(ctx, this)))
 }
 
+/// Process-global cache for `Method`/`Constructor.getTypeParameters()`
+/// arrays, keyed by (VM instance, declaring class, method name+descriptor)
+/// -- NOT by the `this` mirror's own `ObjectRef`, since distinct reflective
+/// Method objects for the same method must still resolve to the SAME
+/// `TypeVariable` instances (see below).
+///
+/// HotSpot's `Executable.getTypeParameters()` is backed by a `genericInfo`
+/// field memoized once per Method object, so repeated calls -- including
+/// calls made *indirectly*, e.g. by something resolving a `TypeVariable`'s
+/// `getGenericDeclaration().getTypeParameters()` back to itself -- return
+/// identity-stable `TypeVariableImpl`s. Without this cache, every call here
+/// built a brand-new synthetic `TypeVariable`, so a type variable handed out
+/// by `getGenericReturnType()`/`getGenericParameterTypes()` (which resolves
+/// its own uses via `resolve_declared_type_variable` re-invoking
+/// `getTypeParameters()`, see `generics.rs`) was never identity-equal to the
+/// "official" one this method itself returns. ByteBuddy's
+/// `TypeVariableSource.AbstractBase.findVariable` walk (used when generating
+/// a Mockito mock's overriding methods) filters `getTypeVariables()` and can
+/// fail this resolution when identity/consistency assumptions elsewhere in
+/// its pipeline are violated -- surfacing as `IllegalArgumentException:
+/// Cannot resolve T from class ...$MockitoMock$...` for any interface with a
+/// generic method (e.g. `jakarta.persistence.EntityManagerFactory.<T> T
+/// unwrap(Class<T>)`).
+///
+/// The array itself is kept alive and remapped across moving GCs via the
+/// existing `register_var_handle_root`/`read_var_handle_root` permanent
+/// native-root mechanism (generic over any `ObjectRef` despite the
+/// VarHandle-specific name).
+fn method_type_params_cache() -> &'static Mutex<FxHashMap<(usize, ClassId, String, String), i32>> {
+    static C: OnceLock<Mutex<FxHashMap<(usize, ClassId, String, String), i32>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
 /// Method.getTypeParameters() вЂ” returns TypeVariable[] from method signature.
 pub(crate) fn native_method_get_type_parameters(
     ctx: &mut dyn NativeContext,
@@ -12201,16 +12475,43 @@ pub(crate) fn native_method_get_type_parameters(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    let cache_key = (
+        ctx.vm_identity(),
+        class_id,
+        method_name.clone(),
+        method_desc.clone(),
+    );
+    if let Some(&ident) = method_type_params_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+    {
+        if let Some(cached) = ctx.read_var_handle_root(ident) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &method_desc) {
         if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
             if !method_sig.type_params.is_empty() {
-                let arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
+                // GC-safety (2026-07-16): same unrooted-`arr`-across-
+                // allocating-fill pattern as `native_class_get_type_parameters`.
+                let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, tp) in method_sig.type_params.iter().enumerate() {
                     // genericDeclaration = the declaring Method/Constructor (`this`).
                     let tv =
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+                    arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, tv);
                 }
+                arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
+                ctx.register_var_handle_root(arr);
+                let ident = ctx.identity_hash_code(arr);
+                method_type_params_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cache_key, ident);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -13516,7 +13817,7 @@ pub(crate) fn native_class_get_canonical_name(
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            let canonical = canonical_class_name(class_id, &name);
+            let canonical = canonical_class_name(ctx, class_id, &name);
             return Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))));
         }
     }
@@ -13734,7 +14035,20 @@ pub(crate) fn native_class_get_class_loader(
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
     if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
-        return Ok(Some(Value::Object(Some(loader))));
+        // Defining-loader entries live in a Rust side table.  Reject a stale
+        // object reference before returning it as a ClassLoader; otherwise a
+        // reused String slot reaches ServiceLoader as `findResources()`.
+        let is_loader = ctx
+            .class_id_by_name("java/lang/ClassLoader")
+            .map(|loader_class_id| {
+                let actual_class_id = ctx.class_id_of_object(loader);
+                actual_class_id == loader_class_id
+                    || ctx.is_subclass(actual_class_id, loader_class_id)
+            })
+            .unwrap_or(false);
+        if is_loader {
+            return Ok(Some(Value::Object(Some(loader))));
+        }
     }
     let loader_type = ctx.loader_id_of_class(class_id);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
@@ -13880,6 +14194,18 @@ pub(crate) fn native_class_get_declaring_class(
         None => return Ok(Some(Value::Object(None))),
     };
 
+    // Loader-aware path FIRST: a nested class redefined under an isolating
+    // loader must resolve ITS OWN loader's copy of its enclosing class, not
+    // whichever loader's copy of the same-named outer class the flat global
+    // store happens to already hold (see `declaring_class_loader_aware`'s
+    // doc comment). Only consulted for classes with a registered, eligible
+    // defining loader -- every ordinary class falls straight through to the
+    // unchanged fast/slow paths below.
+    if let Some(outer_id) = declaring_class_loader_aware(ctx, class_id) {
+        let mirror = ctx.get_class_mirror(outer_id);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+
     // Fast path: the enclosing class is already loaded, so the VM's
     // `find_class_by_name`-backed `declaring_class` resolves it directly.
     if let Some(outer_id) = ctx.declaring_class(class_id) {
@@ -13924,6 +14250,65 @@ pub(crate) fn native_class_get_declaring_class(
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// Isolating-loader carve-out for `Class.getEnclosingClass()`/
+/// `getDeclaringClass()`. Returns `None` (falls through to the existing
+/// global-lookup fast/slow paths, unchanged) unless `class_id` has a
+/// registered defining loader (`defining_loader_for`) that's eligible per
+/// `is_loader_aware_resolution_eligible`, AND `class_id` genuinely has an
+/// `InnerClasses` self-entry naming an outer class. When both hold, resolves
+/// the outer-class NAME by invoking that loader's OWN `loadClass()`
+/// (mirrors `drive_defining_loader_load`'s re-entrant-call pattern in
+/// `vm::runtime::interpreter`) so the returned `ClassId` is the SAME
+/// loader's copy as `class_id` itself -- never a stale, different-loader
+/// copy from CratonVM's flat global store.
+fn declaring_class_loader_aware(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> Option<cratonvm_types::ClassId> {
+    let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())?;
+
+    // Cheap short-circuit FIRST: if the VM's existing global-lookup answer
+    // already belongs to the SAME defining loader as `class_id`, it's
+    // already correct -- skip the eligibility check and the expensive
+    // re-entrant `loadClass()` call below entirely. This keeps the fix's
+    // cost near-zero for the overwhelming common case (a single loader, no
+    // same-named-outer-class collision) and only pays for loader-driven
+    // resolution when there's a genuine mismatch worth fixing.
+    if let Some(existing) = ctx.declaring_class(class_id) {
+        if let Some(existing_loader) = crate::classloader::defining_loader_for(existing.as_u32()) {
+            if existing_loader.as_ptr() == loader_obj.as_ptr() {
+                return None;
+            }
+        }
+        // `existing` has no registered loader (a built-in/app-loader class)
+        // or a DIFFERENT registered loader than `class_id` -- a genuine
+        // potential mismatch, worth checking further below.
+    }
+
+    if !crate::classloader::is_loader_aware_resolution_eligible(ctx, loader_obj) {
+        return None;
+    }
+    let class_name = ctx.class_name_of_id(class_id)?;
+    let outer_class = ctx
+        .inner_classes(class_id)
+        .into_iter()
+        .find(|(inner, outer, inner_name, _)| {
+            inner == &class_name && !outer.is_empty() && !inner_name.is_empty()
+        })
+        .map(|(_, outer, _, _)| outer)?;
+    let dotted = outer_class.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    match ctx.invoke_virtual(
+        loader_obj,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    ) {
+        Ok(Some(Value::Object(Some(mirror_obj)))) => ctx.class_id_from_mirror(mirror_obj),
+        _ => None,
+    }
 }
 
 /// `java/lang/Class.getSimpleBinaryName0()Ljava/lang/String;`
@@ -14375,6 +14760,38 @@ pub(crate) fn native_class_get_record_components(
 /// `java/lang/Class.getPermittedSubclasses0()[Ljava/lang/Class;`
 ///
 /// Returns the permitted subclasses of a sealed class, or null if not sealed.
+///
+/// WEBCLIENTEXT-SEALED-20260717: each permitted-subclass NAME comes straight
+/// from the classfile's `PermittedSubclasses` attribute (always correct --
+/// see `is_sealed_class`/`permitted_subclasses`, both backed by the same
+/// parsed field), but resolving those names to `ClassId`s used to go through
+/// `ctx.class_id_by_name`, a PASSIVE cache lookup that never triggers
+/// classloading. A permitted subclass that simply hasn't been loaded yet
+/// (a very common ordering -- reflective code, e.g. kotlin-reflect's
+/// `KClass.sealedSubclasses` behind mockk's `ProxyMaker`, routinely probes a
+/// sealed interface's metadata before the app ever touches its concrete
+/// subclasses) silently produced a `null` array slot instead of the resolved
+/// `Class`. Real JDK's own `Class.getPermittedSubclasses()` Java wrapper then
+/// filters out any entry that doesn't verifiably extend/implement `this`
+/// (`c.getSuperclass() == this || asList(c.getInterfaces()).contains(this)`)
+/// -- a `null` element fails that check, so the whole array silently
+/// collapsed to empty (confirmed via a live probe: `getPermittedSubclasses0()`
+/// returned `[null, null]` for `org.springframework.http.HttpStatusCode`,
+/// and the public wrapper reduced that to `[]`), which is exactly the
+/// `IllegalStateException: Unable to create proxy for sealed class ...,
+/// no subclasses available` mockk throws when `sealedSubclasses` comes back
+/// empty. Same root-cause family as the `getEnclosingClass`/
+/// `getDeclaringClass` loader-identity fix (`aca7f635`): resolve ACTIVELY,
+/// not passively. Mirrors `declaring_class_loader_aware`'s re-entrant
+/// `loadClass()` pattern -- safe here because this is an ordinary native
+/// method call boundary (like `Class.forName`'s native, which already does
+/// the same re-entrant `loadClass()` call routinely), not the interpreter's
+/// raw opcode-dispatch fast path (where an earlier, unrelated attempt at a
+/// similar re-entrant fix for `getstatic`/`putstatic` caused heap corruption
+/// and was reverted -- see docs/known-issues, ImportHttpServiceRegistrarTests
+/// entry). Falls back to the passive cache lookup first (cheap, handles the
+/// overwhelming common case where the subclass is already loaded) and only
+/// pays for the active `loadClass()` round-trip on a genuine cache miss.
 pub(crate) fn native_class_get_permitted_subclasses(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -14391,8 +14808,38 @@ pub(crate) fn native_class_get_permitted_subclasses(
 
     let subs = ctx.permitted_subclasses(class_id);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, subs.len());
+    // Lazily resolved on first cache miss: the same ClassLoader that defines
+    // `this` sealed class is authoritative for resolving its own permitted
+    // subclasses (they are compiled together, always visible to that
+    // loader). Reuses `native_class_get_class_loader`'s existing
+    // defining-loader / app-loader-fallback resolution so both plain
+    // single-loader apps (the common case) and isolating/forked test
+    // loaders get the SAME loader's copy as `this`.
+    let mut loader_obj: Option<ObjectRef> = None;
+    let mut loader_resolved = false;
     for (i, sub_name) in subs.iter().enumerate() {
-        if let Some(sub_id) = ctx.class_id_by_name(sub_name) {
+        let resolved = ctx.class_id_by_name(sub_name).or_else(|| {
+            if !loader_resolved {
+                loader_resolved = true;
+                loader_obj = match native_class_get_class_loader(ctx, args) {
+                    Ok(Some(Value::Object(Some(l)))) => Some(l),
+                    _ => None,
+                };
+            }
+            let loader = loader_obj?;
+            let dotted = sub_name.replace('/', ".");
+            let name_obj = ctx.create_string(&dotted);
+            match ctx.invoke_virtual(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(mirror_obj)))) => ctx.class_id_from_mirror(mirror_obj),
+                _ => None,
+            }
+        });
+        if let Some(sub_id) = resolved {
             let mirror = ctx.get_class_mirror(sub_id);
             ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
         }
@@ -14548,6 +14995,11 @@ pub(crate) fn native_type_variable_get_annotated_bounds(
 /// BASE_LOCATION by real-JDK code) and `allOnSameTargetTypeAnnotations` with an
 /// empty array so `getTypeAnnotations()` never returns null either.
 fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    // GC-SAFETY: `ensure_class_initialized` (via `base_loc`'s computation)
+    // and `new_ref_array` below can each trigger a moving GC; `obj` (the
+    // caller-supplied AnnotatedType instance) is used both before and
+    // after both. Pin up front and re-read before each use.
+    let obj_pin = ctx.pin_native_root(obj);
     let base_loc = ctx
         .ensure_class_initialized("sun/reflect/annotation/TypeAnnotation$LocationInfo")
         .ok()
@@ -14556,13 +15008,16 @@ fn annotated_type_fill_bookkeeping(ctx: &mut dyn NativeContext, obj: ObjectRef) 
                 .map(|idx| ctx.get_static_field(cid, idx))
         })
         .unwrap_or(Value::Object(None));
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field_by_name(obj, "location", base_loc);
     let empty_ta = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field_by_name(
         obj,
         "allOnSameTargetTypeAnnotations",
         Value::Object(Some(empty_ta)),
     );
+    ctx.unpin_native_roots(obj_pin);
 }
 
 /// Which real-JDK `sun.reflect.annotation.AnnotatedTypeFactory` impl class
@@ -14631,6 +15086,15 @@ fn make_annotated_type(
     // `annotated_type_impl_class_name`); fall back to the interface name
     // (synthetic-mode placeholder) if the impl class can't be loaded.
     let impl_name = annotated_type_impl_class_name(ctx, backing_type);
+    // GC-SAFETY: `ensure_class_initialized`, `alloc_object`,
+    // `new_ref_array`, and (in the `else` branch) `annotated_type_fill_
+    // bookkeeping`'s own internal allocations can each trigger a moving
+    // GC; `backing_type` (the caller-supplied Type mirror) and `obj` (the
+    // freshly-allocated AnnotatedType, also the return value) are each
+    // used again after one of these. Pin `backing_type` up front and
+    // `obj` as soon as it's allocated, and re-read both before each
+    // subsequent use.
+    let backing_pin = ctx.pin_native_root(backing_type);
     let cid = ctx
         .ensure_class_initialized(impl_name)
         .or_else(|_| ctx.ensure_class_initialized("java/lang/reflect/AnnotatedType"))
@@ -14639,9 +15103,12 @@ fn make_annotated_type(
     let layout_fields = ctx.class_num_total_fields(cid);
     let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
     let obj = ctx.alloc_object(cid, num_fields);
+    let obj_pin = ctx.pin_native_root(obj);
 
     // empty Annotation[] for `annotations`
     let empty_anns = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
+    let obj = ctx.read_native_pin(obj_pin, obj);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(empty_anns)));
@@ -14651,6 +15118,8 @@ fn make_annotated_type(
     } else {
         annotated_type_fill_bookkeeping(ctx, obj);
     }
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(backing_pin);
     obj
 }
 
@@ -14666,9 +15135,19 @@ fn make_annotated_type_with_anns(
     backing_type: ObjectRef,
     anns: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
+    // GC-SAFETY: `build_annotation_array`, `ensure_class_initialized`,
+    // `alloc_object`, and (in the `else` branch) `annotated_type_fill_
+    // bookkeeping`'s own internal allocations can each trigger a moving
+    // GC. `backing_type` (the caller-supplied Type mirror) is used again
+    // after several of these, and `ann_arr`/`obj` (also the return value)
+    // are each used again after later ones. Pin everything as it's
+    // produced and re-read before each subsequent use.
+    let backing_pin = ctx.pin_native_root(backing_type);
     // Build the proxy array first (it allocates) before we allocate the
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
     let ann_arr = build_annotation_array(ctx, anns);
+    let ann_pin = ctx.pin_native_root(ann_arr);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
 
     // Select the real-JDK impl class matching the backing Type's kind (see
     // `annotated_type_impl_class_name`); fall back to the interface name
@@ -14682,6 +15161,10 @@ fn make_annotated_type_with_anns(
     let layout_fields = ctx.class_num_total_fields(cid);
     let num_fields = if layout_fields >= 2 { layout_fields } else { 2 };
     let obj = ctx.alloc_object(cid, num_fields);
+    let obj_pin = ctx.pin_native_root(obj);
+    let backing_type = ctx.read_native_pin(backing_pin, backing_type);
+    let ann_arr = ctx.read_native_pin(ann_pin, ann_arr);
+    let obj = ctx.read_native_pin(obj_pin, obj);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));
     ctx.set_field_by_name(obj, "annotations", Value::Object(Some(ann_arr)));
@@ -14691,6 +15174,8 @@ fn make_annotated_type_with_anns(
     } else {
         annotated_type_fill_bookkeeping(ctx, obj);
     }
+    let obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(backing_pin);
     obj
 }
 
@@ -15215,8 +15700,34 @@ pub(crate) fn populate_protection_domain_fields(
     codesource: Value,
     classloader: Value,
 ) {
+    // GC-SAFETY: `build_empty_permissions`/`new_array` below can each
+    // trigger a moving GC; `pd` (the receiver) and the caller-supplied
+    // `codesource`/`classloader` are all used again afterward. Pin
+    // everything up front and re-read before use.
+    let pd_pin = ctx.pin_native_root(pd);
+    let cs_obj = match codesource {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let cs_pin = cs_obj.map(|o| ctx.pin_native_root(o));
+    let cl_obj = match classloader {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let cl_pin = cl_obj.map(|o| ctx.pin_native_root(o));
+
     let perms = build_empty_permissions(ctx);
     let principals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+
+    let pd = ctx.read_native_pin(pd_pin, pd);
+    let codesource = match (cs_obj, cs_pin) {
+        (Some(o), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        _ => codesource,
+    };
+    let classloader = match (cl_obj, cl_pin) {
+        (Some(o), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+        _ => classloader,
+    };
     let perms_v = Value::Object(Some(perms));
     let principals_v = Value::Object(Some(principals));
 
@@ -15230,6 +15741,7 @@ pub(crate) fn populate_protection_domain_fields(
     ctx.set_field_by_name(pd, "permissions", perms_v);
     ctx.set_field_by_name(pd, "classloader", classloader);
     ctx.set_field_by_name(pd, "principals", principals_v);
+    ctx.unpin_native_roots(pd_pin);
 }
 
 /// `java/lang/Class.getClassFileVersion0()I`
@@ -15358,10 +15870,22 @@ pub(crate) fn native_class_get_protection_domain0(
     // Do **not** call `url_parse` here: our 6-field `URL_FIELD_FULL` index
     // collides with `authority`, corrupting `URL.toString()` / `toURI()` for
     // Spring Boot's launcher.
+    //
+    // GC-SAFETY: this whole tail allocates a long chain of objects
+    // (url_obj -> path_obj/proto_obj/host_obj -> cs -> location_str ->
+    // cert arrays -> pd) and reuses several of them well after later
+    // allocations in the same chain -- pin each as it's produced and
+    // re-read immediately before every subsequent use.
     let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+    let url_pin = ctx.pin_native_root(url_obj);
     let path_obj = ctx.create_string(&path);
+    let path_pin = ctx.pin_native_root(path_obj);
     let proto_obj = ctx.create_string("file");
+    let proto_pin = ctx.pin_native_root(proto_obj);
     let host_obj = ctx.create_string("");
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
+    let path_obj = ctx.read_native_pin(path_pin, path_obj);
+    let proto_obj = ctx.read_native_pin(proto_pin, proto_obj);
     ctx.set_field(url_obj, 0, Value::Object(Some(proto_obj)));
     ctx.set_field(url_obj, 1, Value::Object(Some(host_obj)));
     ctx.set_field(url_obj, 2, Value::Int(-1));
@@ -15373,6 +15897,8 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let cs_num_fields = ctx.class_num_total_fields(cs_cid).max(2);
     let cs = ctx.alloc_object(cs_cid, cs_num_fields);
+    let cs_pin = ctx.pin_native_root(cs);
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
     // Slot-based writes cover the synthetic layout; name-based writes
     // cover the real-JDK-loaded layout. At least one lands on the right
     // slot for each mode.
@@ -15382,6 +15908,8 @@ pub(crate) fn native_class_get_protection_domain0(
     // callers and the T19.N1 test read). Populate it with the real code base
     // URL (`location_url`) instead of leaving it empty / a bare URL object.
     let location_str = ctx.create_string(&location_url);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    let url_obj = ctx.read_native_pin(url_pin, url_obj);
     ctx.set_field(cs, 0, Value::Object(Some(location_str)));
     // Real-JDK `CodeSource.location` is typed `java.net.URL`; the name-based
     // write targets that layout with the constructed URL object.
@@ -15391,16 +15919,21 @@ pub(crate) fn native_class_get_protection_domain0(
     let certs = ctx.class_code_source_certs(class_id);
     if !certs.is_empty() {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, certs.len());
+        let arr_pin = ctx.pin_native_root(arr);
         for (i, cert) in certs.iter().enumerate() {
             let cert_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cert.len());
             for (j, &b) in cert.iter().enumerate() {
                 ctx.set_array_element(cert_arr, j, Value::Int(b as i8 as i32));
             }
+            let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(cert_arr)));
         }
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let cs = ctx.read_native_pin(cs_pin, cs);
         ctx.set_field(cs, 1, Value::Object(Some(arr)));
         ctx.set_field_by_name(cs, "certs", Value::Object(Some(arr)));
     }
+    let cs = ctx.read_native_pin(cs_pin, cs);
 
     // Build ProtectionDomain(codesource=cs, permissions=<empty>,
     // classloader=<defining loader>, principals=empty).  SBR-13: populate the
@@ -15412,12 +15945,17 @@ pub(crate) fn native_class_get_protection_domain0(
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let pd_num_fields = ctx.class_num_total_fields(pd_cid).max(4);
     let pd = ctx.alloc_object(pd_cid, pd_num_fields);
+    let pd_pin = ctx.pin_native_root(pd);
+    let cs = ctx.read_native_pin(cs_pin, cs);
     // Resolve the class's defining loader exactly like `Class.getClassLoader()`
     // (bootstrap в†’ null, app classpath в†’ the singleton AppClassLoader).
     let classloader = native_class_get_class_loader(ctx, args)
         .ok()
         .flatten()
         .unwrap_or(Value::Object(None));
+    let pd = ctx.read_native_pin(pd_pin, pd);
+    let cs = ctx.read_native_pin(cs_pin, cs);
+    ctx.unpin_native_roots(url_pin);
     populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
 
     Ok(Some(Value::Object(Some(pd))))
@@ -16105,6 +16643,43 @@ mod tests {
             other => panic!("expected Object, got {other:?}"),
         };
         assert_eq!(ctx.read_string(obj).unwrap(), "Entry");
+    }
+
+    #[test]
+    fn class_get_canonical_name_preserves_literal_dollar_in_member_name() {
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("org/apache/el/TesterFunctions$Inner$Class")
+            .unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "org/apache/el/TesterFunctions$Inner$Class".to_string(),
+                "org/apache/el/TesterFunctions".to_string(),
+                "Inner$Class".to_string(),
+                0,
+            )],
+        );
+        let mirror = make_class_mirror(
+            &mut ctx,
+            cid.as_u32(),
+            "org/apache/el/TesterFunctions$Inner$Class",
+        );
+        let result = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(obj).unwrap(),
+            "org.apache.el.TesterFunctions.Inner$Class"
+        );
+        let result = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match result.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(obj).unwrap(), "Inner$Class");
     }
 
     #[test]
@@ -18388,11 +18963,12 @@ mod tests {
 
         let methods = collect_public_methods(&mut ctx, iface_cid);
         // Only `doIt` from the interface вЂ” Object methods are skipped.
+        let n = ctx.array_length(methods);
         assert_eq!(
-            methods.len(),
+            n,
             1,
             "G2: collect_public_methods on an interface must skip Object's superclass methods (got {} methods)",
-            methods.len(),
+            n,
         );
     }
 

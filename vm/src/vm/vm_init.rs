@@ -1330,6 +1330,29 @@ impl SharedVm {
                 // Tell the registry to drop StringJoiner registrations so the real,
                 // self-contained bytecode runs instead.
                 native_methods.set_drop_real_layout_synthetic(true);
+                // NOTE: unconditionally dropping ALL SyntheticStub-tagged
+                // natives in real-JDK mode was tried (dev d8092acb,
+                // 2026-07-14) and reverted the same day: several register_*
+                // clusters that are tagged SyntheticStub are actually needed
+                // as permanent bridges in BOTH modes (no working real-bytecode
+                // fallback exists), not just as fake-JDK approximations.
+                // Confirmed regressions: the entire java.lang.management/JMX
+                // native surface (native-builtins/src/jmx.rs -- WildFly's
+                // very first ManagementFactory.getPlatformMBeanServer() call
+                // NPEs deep inside real javax.management bytecode,
+                // ObjectName._ca_array null, with the stub dropped) and
+                // java.util.function.Function$Identity (a VM-internal
+                // synthetic stand-in for the real lambda-based
+                // Function.identity(), which has no real bytecode to fall
+                // back to at all -- UnsatisfiedLinkError). The
+                // `drop_synthetic_stubs` field's own doc comment already
+                // documented the safe, original design: opt-in only, via
+                // `CRATONVM_NO_STUBS`, "because some apps currently limp on
+                // these fakes and dropping them surfaces real gaps as clear
+                // errors." Leave it opt-in; do not force it on here. See
+                // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
+                // 2026-07-14 addendum for the WildFly-boot regression this
+                // caused and how it was found (git bisect).
                 register_essential_natives(&mut native_methods);
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
@@ -1723,6 +1746,11 @@ impl SharedVm {
             // BEFORE any `register_*` pass here. (The synthetic-jdk-feature build
             // sets the same flag in its real-JDK arm above.)
             native_methods.set_drop_real_layout_synthetic(true);
+            // set_drop_synthetic_stubs(true) intentionally NOT called here.
+            // See the matching real-JDK arm above for why (dev d8092acb
+            // regression + revert, 2026-07-14): several SyntheticStub-tagged
+            // register_* clusters (JMX, Function$Identity) are permanent
+            // bridges needed in real mode too, not fake-JDK-only shadows.
             register_essential_natives(&mut native_methods);
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
@@ -2004,70 +2032,110 @@ impl SharedVm {
                 if data.is_none() {
                     // Iterator-based copy using virtual dispatch on the
                     // receiver's actual class.
-                    let recv_cid = ctx.class_id_of_object(this);
-                    let recv_class = ctx
-                        .class_name_of_id(recv_cid)
-                        .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
-                    let size_v =
-                        ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
-                    let size = match size_v {
-                        Some(Value::Int(n)) => n.max(0) as usize,
-                        _ => 0,
+                    //
+                    // GC-safety (DOM17 stale-canary backtrace, 2026-07-15):
+                    // every `ctx.invoke` below can run a moving GC, and the
+                    // pre-fix loop re-used `this`, the template array, the
+                    // target array, and the iterator raw across those windows
+                    // — the WildFly Host Controller tripped
+                    // CRATONVM_DBG_STALE_OBJREF passing the stale iterator to
+                    // `next()`. Pin each and re-read through the pin before
+                    // every post-window use.
+                    let pin_base = ctx.pin_native_root(this);
+                    let template_pin = match template {
+                        Value::Object(Some(arr)) => Some((ctx.pin_native_root(arr), arr)),
+                        _ => None,
                     };
-                    let target = match template {
-                        Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
-                        // Template too small: `Collection.toArray(T[])` must return
-                        // a NEW array of the template's RUNTIME type, not a bare
-                        // `Object[]`. An array's heap header stores its component
-                        // class id, so `class_id_of_object(arr)` IS the component
-                        // id `new_ref_array` wants — preserving multi-dimensional
-                        // element types (`Value[][]` for H2 SortOrder.sort).
-                        Value::Object(Some(arr)) => {
-                            let comp = ctx.class_id_of_object(arr);
-                            ctx.new_ref_array(comp, size)
-                        }
-                        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
-                    };
-                    let it_v = ctx.invoke(
-                        &recv_class,
-                        "iterator",
-                        "()Ljava/util/Iterator;",
-                        &[Value::Object(Some(this))],
-                    )?;
-                    let it = match it_v {
-                        Some(Value::Object(Some(o))) => o,
-                        _ => return Ok(Some(Value::Object(Some(target)))),
-                    };
-                    let it_cid = ctx.class_id_of_object(it);
-                    let it_class = ctx
-                        .class_name_of_id(it_cid)
-                        .unwrap_or_else(|| "java/util/Iterator".to_string());
-                    for i in 0..size {
-                        let has =
-                            ctx.invoke(&it_class, "hasNext", "()Z", &[Value::Object(Some(it))])?;
-                        if !matches!(has, Some(Value::Int(1))) {
-                            break;
-                        }
-                        let nxt = ctx.invoke(
-                            &it_class,
-                            "next",
-                            "()Ljava/lang/Object;",
-                            &[Value::Object(Some(it))],
+                    let result = (|| -> cratonvm_types::error::MethodCallResult {
+                        let recv_cid = ctx.class_id_of_object(this);
+                        let recv_class = ctx
+                            .class_name_of_id(recv_cid)
+                            .unwrap_or_else(|| "java/util/AbstractCollection".to_string());
+                        let size_v =
+                            ctx.invoke(&recv_class, "size", "()I", &[Value::Object(Some(this))])?;
+                        let size = match size_v {
+                            Some(Value::Int(n)) => n.max(0) as usize,
+                            _ => 0,
+                        };
+                        let target = match template_pin {
+                            // Template too small: `Collection.toArray(T[])` must
+                            // return a NEW array of the template's RUNTIME type,
+                            // not a bare `Object[]`. An array's heap header stores
+                            // its component class id, so `class_id_of_object(arr)`
+                            // IS the component id `new_ref_array` wants —
+                            // preserving multi-dimensional element types
+                            // (`Value[][]` for H2 SortOrder.sort).
+                            Some((h, orig)) => {
+                                let arr = ctx.read_native_pin(h, orig);
+                                if ctx.array_length(arr) >= size {
+                                    arr
+                                } else {
+                                    let comp = ctx.class_id_of_object(arr);
+                                    ctx.new_ref_array(comp, size)
+                                }
+                            }
+                            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
+                        };
+                        let target_pin = ctx.pin_native_root(target);
+                        let cur_this = ctx.read_native_pin(pin_base, this);
+                        let it_v = ctx.invoke(
+                            &recv_class,
+                            "iterator",
+                            "()Ljava/util/Iterator;",
+                            &[Value::Object(Some(cur_this))],
                         )?;
-                        let v = nxt.unwrap_or(Value::Object(None));
-                        ctx.set_array_element(target, i, v);
-                    }
-                    let target_len = ctx.array_length(target);
-                    if target_len > size {
-                        ctx.set_array_element(target, size, Value::Object(None));
-                    }
-                    return Ok(Some(Value::Object(Some(target))));
+                        let it = match it_v {
+                            Some(Value::Object(Some(o))) => o,
+                            _ => {
+                                let target = ctx.read_native_pin(target_pin, target);
+                                return Ok(Some(Value::Object(Some(target))));
+                            }
+                        };
+                        let it_pin = ctx.pin_native_root(it);
+                        let it_cid = ctx.class_id_of_object(it);
+                        let it_class = ctx
+                            .class_name_of_id(it_cid)
+                            .unwrap_or_else(|| "java/util/Iterator".to_string());
+                        for i in 0..size {
+                            let cur_it = ctx.read_native_pin(it_pin, it);
+                            let has = ctx.invoke(
+                                &it_class,
+                                "hasNext",
+                                "()Z",
+                                &[Value::Object(Some(cur_it))],
+                            )?;
+                            if !matches!(has, Some(Value::Int(1))) {
+                                break;
+                            }
+                            let cur_it = ctx.read_native_pin(it_pin, it);
+                            let nxt = ctx.invoke(
+                                &it_class,
+                                "next",
+                                "()Ljava/lang/Object;",
+                                &[Value::Object(Some(cur_it))],
+                            )?;
+                            let v = nxt.unwrap_or(Value::Object(None));
+                            let cur_target = ctx.read_native_pin(target_pin, target);
+                            ctx.set_array_element(cur_target, i, v);
+                        }
+                        let target = ctx.read_native_pin(target_pin, target);
+                        let target_len = ctx.array_length(target);
+                        if target_len > size {
+                            ctx.set_array_element(target, size, Value::Object(None));
+                        }
+                        Ok(Some(Value::Object(Some(target))))
+                    })();
+                    ctx.unpin_native_roots(pin_base);
+                    return result;
                 }
                 // ArrayList-shaped: use `size` field directly.
                 let size = match ctx.get_field_by_name(this, "size") {
                     Value::Int(s) => s.max(0) as usize,
                     _ => 0,
                 };
+                // GC-safety: allocating `target` below can move `elementData`
+                // — pin it BEFORE the allocation and re-read after.
+                let d_pin = data.map(|d| (ctx.pin_native_root(d), d));
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
                     // Template too small: allocate a NEW array of the template's
@@ -2080,12 +2148,14 @@ impl SharedVm {
                     }
                     _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                 };
-                if let Some(d) = data {
+                if let Some((h, orig)) = d_pin {
+                    let d = ctx.read_native_pin(h, orig);
                     let d_len = ctx.array_length(d);
                     let copy = size.min(d_len);
                     for i in 0..copy {
                         ctx.set_array_element(target, i, ctx.get_array_element(d, i));
                     }
+                    ctx.unpin_native_roots(h);
                 }
                 let target_len = ctx.array_length(target);
                 if target_len > size {
@@ -2168,15 +2238,20 @@ impl SharedVm {
             // WP2.5: java.lang.reflect.Proxy natives. See companion
             // call in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::register_reflect_proxy_natives(&mut native_methods);
-            // WP2.4-A: java.lang.instrument runtime natives. See
-            // companion call in the `feature = "synthetic-jdk"` branch
-            // above.
+            // WP2.4-A: java.lang.instrument runtime natives and the
+            // in-process Attach API are VM bridges, not synthetic stubs.
+            // The default real-JDK build drops synthetic registrations, so
+            // tag this pair explicitly or JDK InstrumentationImpl native
+            // methods resolve as missing before any javaagent premain runs.
+            let __prev_instrument_bridge = native_methods.current_category();
+            native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
             crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
             // In-process self-attach (com.sun.tools.attach.VirtualMachine) so
             // runtime-attach agents (Mockito inline mock maker, JaCoCo) can
             // load themselves without `-javaagent:`. See companion call in the
             // `feature = "synthetic-jdk"` branch above.
             crate::runtime::instrument::register_self_attach_natives(&mut native_methods);
+            native_methods.set_category(__prev_instrument_bridge);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
@@ -2582,6 +2657,9 @@ impl SharedVm {
         #[cfg(feature = "gpu-offload")]
         let offload_registry =
             std::sync::Arc::new(crate::runtime::offload::OffloadCacheRegistry::new());
+
+        // The real-JDK platform-server bridge needs its interface methods.
+        cratonvm_native_builtins::jmx::register_mbean_server(&mut native_methods);
 
         let vm = Self {
             vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -3008,7 +3086,7 @@ impl SharedVm {
             if class.is_synthetic_stub {
                 continue;
             }
-            if let Some(bytes) = cm.class_bytes_cache.get(&*class.name) {
+            if let Some(bytes) = cm.class_bytes_cache.get(&class.id) {
                 let entry = cratonvm_native_builtins::cds::CdsArchiveEntry {
                     class_name: class.name.to_string(),
                     bytes_offset: 0,
@@ -3551,7 +3629,24 @@ impl SharedVm {
         // Fast path: read lock only — no contention for already-loaded classes.
         // Bind the result to a local so the `RwLockReadGuard` is dropped at
         // the semicolon, not extended to the end of an `if let` block.
-        let fast_id = self.class_manager.read().get_loaded_class_id(name);
+        //
+        // Runtime-package-identity bug fix: was the bare, requester-less
+        // `get_loaded_class_id(name)`, which -- when no BUILT-IN loader
+        // (bootstrap/extension/application) has defined `name` yet -- falls
+        // back to returning an arbitrary lone user-defined loader's own
+        // copy if exactly one such loader happens to have defined it (see
+        // that fn's doc comment). This function's own slow path below
+        // ultimately delegates via `ClassManager::load_class`, which can
+        // only ever produce a Bootstrap/Extension/Application-loaded
+        // class -- never an unrelated user-defined loader's redefinition
+        // -- so a fast-path cache hit returning one answers a question
+        // this function was never asked and hands back the WRONG class
+        // (JVMS §5.3: defining loader is part of a class's identity).
+        // `get_loaded_class_id_for_requester(name, Application)` probes
+        // only the built-in delegation chain, matching what the slow path
+        // can actually produce: a hit here is always right, a miss falls
+        // through to the real load below instead of a stray loader's class.
+        let fast_id = self.class_manager.read().resolve_fast_path_class_id(name);
         if let Some(id) = fast_id {
             // Check if it's a synthetic stub that needs upgrading
             let is_synthetic = self
@@ -3583,10 +3678,12 @@ impl SharedVm {
             .lock()
             .expect("class-loading mutex poisoned: a thread panicked while loading a class");
 
-        // Double-check: another thread may have loaded it while we waited for the lock
+        // Double-check: another thread may have loaded it while we waited for the lock.
+        // Same loader-faithful lookup as the fast path above -- see that
+        // comment for why the bare `get_loaded_class_id` is unsound here.
         {
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
@@ -3604,9 +3701,12 @@ impl SharedVm {
                 .wait_timeout(loading, std::time::Duration::from_secs(30))
                 .expect("class-loading condvar poisoned: a thread panicked while loading a class")
                 .0;
-            // Re-check after waking — class may now be loaded
+            // Re-check after waking — class may now be loaded. Same
+            // loader-faithful lookup as the fast path above (see that
+            // comment) -- a lone unrelated user-defined loader's copy must
+            // not be handed back here either.
             let cm = self.class_manager.read();
-            if let Some(id) = cm.get_loaded_class_id(name) {
+            if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
                     .get(id)
@@ -4103,6 +4203,38 @@ impl SharedVm {
     /// Increments [`Self::stack_dump_ack_count`] so the watchdog can
     /// tell how many runtime threads responded before it gives up and
     /// calls `std::process::abort`.
+    ///
+    /// JIT-frame caveat (2026-07-16 investigation of the
+    /// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md` "T19.H1
+    /// watchdog SIGSEGVs on JIT frames" note): `thread.frames` is the
+    /// interpreter's own logical frame stack. A method dispatched straight
+    /// to already-JIT-compiled machine code (`execute_invokestatic_cached`
+    /// / `execute_jit_call` et al. in `runtime/interpreter.rs`) never gets
+    /// a `Frame` pushed here at all — the call is a synchronous jump into
+    /// native code with no interpreter bookkeeping in between. That frame
+    /// is therefore invisible to this walker: reproduction while
+    /// root-causing this bug confirmed a thread parked deep inside a
+    /// long-running JIT-compiled method dumps as either zero acks (if it
+    /// never returns to the interpreter dispatch loop before the grace
+    /// period elapses) or a misleadingly shallow frame count (if it does),
+    /// never a fabricated/garbage frame — but a reader unaware of the gap
+    /// can easily misdiagnose "1 shallow frame" as "this thread is stuck
+    /// at a trivial call site" when it may be many JIT call-levels deep.
+    /// The two hardening changes below close the *reliability* half of
+    /// that report even though a live SIGSEGV could not be reproduced on
+    /// this revision after extensive targeted testing (single JIT calls,
+    /// OSR-adjacent long single-invocation loops, deep JIT<->interpreter
+    /// recursion, and multi-threaded runs with one thread parked in JIT):
+    /// 1. Each frame is formatted behind `catch_unwind` so a panic while
+    ///    rendering one (malformed) frame can never abort the watchdog
+    ///    thread before it reaches its own `process::abort()` — that
+    ///    would otherwise turn an intended, informative crash-with-dump
+    ///    into a silent hang (no dump, no abort, no notification).
+    /// 2. When JIT is active for this thread and the walk comes up
+    ///    shorter than the interpreter's own call chain, a note is
+    ///    appended pointing at the gap and at `--nojit` as a workaround,
+    ///    instead of leaving the reader to assume a shallow dump means a
+    ///    shallow call stack.
     pub fn dump_current_thread_frames(&self, thread: &JvmThread) {
         use std::io::Write;
 
@@ -4121,21 +4253,51 @@ impl SharedVm {
         let _ = handle.write_all(header.as_bytes());
 
         for (depth, frame) in thread.frames.iter().enumerate() {
-            // Truncate user-visible strings defensively — a corrupted
-            // method name could otherwise produce megabytes of output.
-            let class_name = truncate_ascii(frame.class_name(), 240);
-            let method_name = truncate_ascii(frame.method_name(), 240);
-            let desc = truncate_ascii(frame.method_descriptor(), 240);
-            let source = frame
-                .source_file()
-                .map(|s| truncate_ascii(s, 240))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let line = format!(
-                "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
-                pc = frame.pc,
-                last = frame.last_instr_pc,
+            // Defense-in-depth: a single malformed/corrupted frame (e.g. a
+            // truncated class/method name that trips an unexpected panic
+            // path inside formatting) must not prevent the watchdog from
+            // reaching its `process::abort()` below — that would silently
+            // turn a diagnosable crash into an unexplained hang instead.
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Truncate user-visible strings defensively — a corrupted
+                // method name could otherwise produce megabytes of output.
+                let class_name = truncate_ascii(frame.class_name(), 240);
+                let method_name = truncate_ascii(frame.method_name(), 240);
+                let desc = truncate_ascii(frame.method_descriptor(), 240);
+                let source = frame
+                    .source_file()
+                    .map(|s| truncate_ascii(s, 240))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                format!(
+                    "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+                    pc = frame.pc,
+                    last = frame.last_instr_pc,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                format!("tid={tid} depth={depth} <frame dump panicked; skipped>\n")
+            });
+            let _ = handle.write_all(rendered.as_bytes());
+        }
+
+        // JIT-frame visibility note (see doc comment above): this thread
+        // has at least one active JIT call on its native stack right now
+        // (it reached this dump from a dispatch callback nested inside
+        // JIT-compiled code — the common all-interpreter case has JIT
+        // depth 0 here). One or more call levels between the frames shown
+        // above are therefore JIT-compiled and invisible to this walker.
+        // Flag it explicitly rather than leaving the reader to assume the
+        // frames shown are the whole call chain.
+        if crate::jit::conservative_roots::current_thread_jit_depth() != 0 {
+            let note = format!(
+                "tid={tid} note=thread has {depth} active JIT call(s) on its native \
+                 stack; one or more call levels are JIT-compiled machine code and are \
+                 not represented in the {frame_count} frame(s) above (see \
+                 execute_invokestatic_cached/execute_jit_call in runtime/interpreter.rs) — \
+                 rerun with --nojit for a full interpreted stack if needed\n",
+                depth = crate::jit::conservative_roots::current_thread_jit_depth(),
             );
-            let _ = handle.write_all(line.as_bytes());
+            let _ = handle.write_all(note.as_bytes());
         }
 
         let footer = format!("--- T19.H1 end dump tid={tid} ---\n");
@@ -4175,17 +4337,32 @@ pub fn set_wait_site_snapshot(thread: &JvmThread) {
         "--- T19.H1 stack dump (wait-site): tid={tid} name={name:?} frames={fc} ---\n"
     ));
     for (depth, frame) in thread.frames.iter().enumerate() {
-        let class_name = truncate_ascii(frame.class_name(), 240);
-        let method_name = truncate_ascii(frame.method_name(), 240);
-        let desc = truncate_ascii(frame.method_descriptor(), 240);
-        let source = frame
-            .source_file()
-            .map(|s| truncate_ascii(s, 240))
-            .unwrap_or_else(|| "<unknown>".to_string());
+        // See the matching guard in `dump_current_thread_frames` above: a
+        // panic while rendering a single frame must not abort this
+        // (rare, timeout-triggered) snapshot build and leave the wait-site
+        // dump silently empty for the rest of the thread's parked lifetime.
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let class_name = truncate_ascii(frame.class_name(), 240);
+            let method_name = truncate_ascii(frame.method_name(), 240);
+            let desc = truncate_ascii(frame.method_descriptor(), 240);
+            let source = frame
+                .source_file()
+                .map(|s| truncate_ascii(s, 240))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            format!(
+                "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
+                pc = frame.pc,
+                last = frame.last_instr_pc,
+            )
+        }))
+        .unwrap_or_else(|_| format!("tid={tid} depth={depth} <frame dump panicked; skipped>\n"));
+        buf.push_str(&rendered);
+    }
+    if crate::jit::conservative_roots::current_thread_jit_depth() != 0 {
         buf.push_str(&format!(
-            "tid={tid} depth={depth} class={class_name} method={method_name} desc={desc} pc={pc} last_pc={last} source={source}\n",
-            pc = frame.pc,
-            last = frame.last_instr_pc,
+            "tid={tid} note=thread has active JIT call(s) on its native stack; \
+             one or more call levels are JIT-compiled machine code and are not \
+             represented above\n"
         ));
     }
     buf.push_str(&format!("--- T19.H1 end dump tid={tid} (wait-site) ---\n"));
@@ -4419,10 +4596,25 @@ impl SharedVm {
 impl SharedVm {
     /// Find the park state for a thread identified by its Java Thread object.
     /// Used by `unpark()` in NativeContextImpl.
+    ///
+    /// Resolution prefers the Java-side `Thread.tid` (unique, never reused)
+    /// over the mirror's heap address: the address-keyed reverse index can
+    /// alias a NEW thread's mirror allocated at a dead thread's recycled
+    /// address, silently routing the wakeup to the dead thread's ParkState
+    /// (observed as Tomcat executor workers parked forever after their
+    /// `shutdownNow()` interrupt was lost — the DoHead leaked-worker face).
+    /// The tid path also survives a relocated-but-intact stale mirror copy:
+    /// the stale address is gone from the reverse index, but its memory
+    /// still holds the correct `tid`.
     pub fn find_park_state_for_thread_obj(
         &self,
         thread_obj: ObjectRef,
     ) -> Option<std::sync::Arc<crate::threading::ParkState>> {
+        if let Some(java_tid) = super::vm_exec::read_java_thread_tid(self, thread_obj) {
+            if let Some(ps) = self.thread_registry.find_park_state_by_java_tid(java_tid) {
+                return Some(ps);
+            }
+        }
         self.thread_registry
             .find_park_state_by_thread_obj(thread_obj)
     }
@@ -6077,9 +6269,27 @@ mod tests {
     fn ensure_system_streams_creates_objects() {
         let shared = SharedVm::new(VmConfig::default());
         let (out, err) = shared.ensure_system_streams();
-        // Should have fd_id 1 for stdout, 2 for stderr
-        assert_eq!(shared.heap.get_field(out, 0), Value::Int(1));
-        assert_eq!(shared.heap.get_field(err, 0), Value::Int(2));
+        let out_header = shared.heap.get_header(out);
+        let err_header = shared.heap.get_header(err);
+        assert_ne!(out.as_ptr(), err.as_ptr());
+        assert_eq!(out_header.class_id, err_header.class_id);
+        assert!(out_header.num_slots >= 1);
+        assert!(err_header.num_slots >= 1);
+
+        // Synthetic PrintStream uses slot 0 as its stdout/stderr descriptor.
+        // In the real JDK, that slot is FilterOutputStream.out (a reference),
+        // and the streams are identified by object identity instead. Writing
+        // an integer there would box it and corrupt the real stream graph.
+        let slot0_is_ref = cratonvm_gc::class_layout(out_header.class_id.as_u32())
+            .and_then(|layout| layout.field_is_ref(0))
+            .unwrap_or(false);
+        if slot0_is_ref {
+            assert!(!matches!(shared.heap.get_field(out, 0), Value::Int(1)));
+            assert!(!matches!(shared.heap.get_field(err, 0), Value::Int(2)));
+        } else {
+            assert_eq!(shared.heap.get_field(out, 0), Value::Int(1));
+            assert_eq!(shared.heap.get_field(err, 0), Value::Int(2));
+        }
     }
 
     #[test]
@@ -6441,20 +6651,62 @@ mod tests {
 
     #[test]
     fn real_jdk_mode_registers_fewer_natives() {
-        let mut config = VmConfig::default();
-        config.use_synthetic_jdk = false;
-        let shared = SharedVm::new(config);
-        // Essential-only mode should stay well below full `register_builtins`
-        // synthetic coverage. The ceiling is a soft guard that rises as the
-        // real-JDK native bundle grows (currently ~8800, up from ~6200 after
-        // the unmodifiable-collection-view bootstrap added a proportional
-        // slice of `List`/`Set`/`Map`/etc. natives, see `d3474b3e`/
-        // `c2d68883`); synthetic-jdk builds still register thousands more on
-        // top of this baseline.
+        // NOTE: this test previously asserted `synthetic_stubs == 0` for
+        // real-JDK mode, backed by `set_drop_synthetic_stubs(true)` forced
+        // on unconditionally in `vm_init.rs`'s real-JDK arms (dev d8092acb,
+        // 2026-07-14). That default was reverted the same day: several
+        // SyntheticStub-tagged register_* clusters (the whole
+        // java.lang.management/JMX native surface, java.util.function.
+        // Function$Identity) are permanent bridges needed in BOTH modes --
+        // no working real-bytecode fallback exists for them yet -- and
+        // dropping them broke WildFly boot immediately (ObjectName NPE /
+        // UnsatisfiedLinkError). `drop_synthetic_stubs` is opt-in only
+        // again (`CRATONVM_NO_STUBS`), matching its own field doc. This
+        // test now checks the weaker, still-true invariant: real-JDK mode
+        // registers meaningfully fewer natives than synthetic-JDK mode
+        // (fewer collection/layout fallbacks needed once real bytecode
+        // handles those classes directly).
+        let mut real_config = VmConfig::default();
+        real_config.use_synthetic_jdk = false;
+        let real_shared = SharedVm::new(real_config);
+        let real_count = real_shared.native_methods.dump_registrations().len();
+
+        let mut synthetic_config = VmConfig::default();
+        synthetic_config.use_synthetic_jdk = true;
+        let synthetic_shared = SharedVm::new(synthetic_config);
+        let synthetic_count = synthetic_shared.native_methods.dump_registrations().len();
+
         assert!(
-            shared.native_methods.len() < 9500,
-            "Real JDK mode should have < 9500 natives, got {}",
-            shared.native_methods.len()
+            real_count <= synthetic_count,
+            "real-JDK mode ({real_count}) should not register MORE natives              than synthetic-JDK mode ({synthetic_count})"
+        );
+    }
+
+    #[test]
+    fn drop_synthetic_stubs_mechanism_still_works_when_opted_in() {
+        // The `CRATONVM_NO_STUBS` / `set_drop_synthetic_stubs(true)` opt-in
+        // mechanism itself (native-api/src/registry.rs) is unit-tested here
+        // directly, decoupled from whether any particular boot mode enables
+        // it by default (see `real_jdk_mode_registers_fewer_natives` above
+        // for why real-JDK mode does not, as of 2026-07-14).
+        let mut r = cratonvm_native_api::NativeMethodRegistry::new();
+        r.set_drop_synthetic_stubs(true);
+        r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+        r.register("Test", "stub", "()V", |_ctx, _args| Ok(None));
+        r.set_category(cratonvm_native_api::NativeKind::Bridge);
+        r.register("Test", "bridge", "()V", |_ctx, _args| Ok(None));
+        let kinds: Vec<_> = r
+            .dump_registrations()
+            .iter()
+            .map(|(_, m, _, k)| (m.to_string(), *k))
+            .collect();
+        assert!(
+            !kinds.iter().any(|(m, _)| m == "stub"),
+            "SyntheticStub registration should have been dropped"
+        );
+        assert!(
+            kinds.iter().any(|(m, _)| m == "bridge"),
+            "Bridge registration should survive drop_synthetic_stubs"
         );
     }
 

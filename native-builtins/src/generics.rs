@@ -256,7 +256,18 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // Note: this arm also fires when the inner has NO type args but an
             // owner is present (`type_args` empty, `owner` Some) — that still
             // reifies as a ParameterizedType on HotSpot, so build one here.
+            // GC-safety (2026-07-16): `pt` is a freshly-allocated object not
+            // yet reachable from any Java-visible root. Every allocating call
+            // below (`get_class_mirror`/`load_class` for `raw_val`, the
+            // per-element `type_arg_to_java` factory calls building
+            // `args_arr`, and the recursive `type_sig_to_java` for the owner
+            // type) can trigger a GC that relocates it — pin it for the
+            // whole arm and re-read the forwarded reference before every
+            // use, matching the established `create_annotation_proxy`
+            // pattern. `args_arr` gets the same treatment across its own
+            // fill loop (mirrors `build_mirror_array`).
             let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
+            let pt_pin = ctx.pin_native_root(pt);
             let raw_val = if let Some(cid) = class_id_in_generic_scope(ctx, name) {
                 let m = ctx.get_class_mirror(cid);
                 Value::Object(Some(m))
@@ -265,31 +276,40 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             } else {
                 Value::Object(None)
             };
+            let pt = ctx.read_native_pin(pt_pin, pt);
             if !matches!(raw_val, Value::Object(None)) {
                 ctx.set_field(pt, 0, raw_val);
             }
-            let args_arr = new_type_array(ctx, type_args.len());
-            for (i, arg) in type_args.iter().enumerate() {
-                let val = type_arg_to_java(ctx, arg);
-                // ParameterizedType arguments are never null in the JDK
-                // reflection contract. An absent optional dependency is
-                // represented by its erased Object type instead.
-                let val = if matches!(val, Value::Object(None)) {
-                    ctx.class_id_by_name("java/lang/Object")
-                        .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
-                        .unwrap_or(val)
-                } else {
-                    val
-                };
-                ctx.set_array_element(args_arr, i, val);
-            }
+            let args_arr = {
+                let mut args_arr = new_type_array(ctx, type_args.len());
+                let args_pin = ctx.pin_native_root(args_arr);
+                for (i, arg) in type_args.iter().enumerate() {
+                    let val = type_arg_to_java(ctx, arg);
+                    // ParameterizedType arguments are never null in the JDK
+                    // reflection contract. An absent optional dependency is
+                    // represented by its erased Object type instead.
+                    let val = if matches!(val, Value::Object(None)) {
+                        ctx.class_id_by_name("java/lang/Object")
+                            .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
+                            .unwrap_or(val)
+                    } else {
+                        val
+                    };
+                    args_arr = ctx.read_native_pin(args_pin, args_arr);
+                    ctx.set_array_element(args_arr, i, val);
+                }
+                ctx.read_native_pin(args_pin, args_arr)
+            };
+            let pt = ctx.read_native_pin(pt_pin, pt);
             ctx.set_field(pt, 1, Value::Object(Some(args_arr)));
             // Owner type (field 2): reify the enclosing type node, or null.
             let owner_val = match owner {
                 Some(o) => type_sig_to_java(ctx, o),
                 None => Value::Object(None),
             };
+            let pt = ctx.read_native_pin(pt_pin, pt);
             ctx.set_field(pt, 2, owner_val);
+            ctx.unpin_native_roots(pt_pin);
             Value::Object(Some(pt))
         }
         TypeSig::TypeVar(name) => {
@@ -335,17 +355,30 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // TypeVariable — field 0 = name, field 1 = bounds (Type[]),
             // field 2 = genericDeclaration. Always 3 fields so the
             // `getGenericDeclaration` native's slot-2 read is in bounds.
+            // GC-safety (2026-07-16): same unrooted-across-allocation pattern
+            // as the ParameterizedType arm above — pin `tv` immediately and
+            // re-read the forwarded reference after each allocating call
+            // (`create_string`, the `bounds_arr` allocation) before using it.
             let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
+            let tv_pin = ctx.pin_native_root(tv);
             let name_str = ctx.create_string(name);
+            let tv = ctx.read_native_pin(tv_pin, tv);
             ctx.set_field(tv, 0, Value::Object(Some(name_str)));
             // Bounds: default to Object if no bounds known
-            let bounds_arr = new_type_array(ctx, 1);
-            if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
-                let obj_mirror = ctx.get_class_mirror(obj_cid);
-                ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
-            }
+            let bounds_arr = {
+                let bounds_arr = new_type_array(ctx, 1);
+                let bounds_pin = ctx.pin_native_root(bounds_arr);
+                if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
+                    let obj_mirror = ctx.get_class_mirror(obj_cid);
+                    let bounds_arr = ctx.read_native_pin(bounds_pin, bounds_arr);
+                    ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
+                }
+                ctx.read_native_pin(bounds_pin, bounds_arr)
+            };
+            let tv = ctx.read_native_pin(tv_pin, tv);
             ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
             ctx.set_field(tv, 2, current_generic_decl());
+            ctx.unpin_native_roots(tv_pin);
             Value::Object(Some(tv))
         }
         TypeSig::Array(component) => {
@@ -368,9 +401,14 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 }
             }
             // Fallback: GenericArrayType for unresolvable / type-variable components.
+            // GC-safety: `gat` held across the recursive (allocating)
+            // `type_sig_to_java` call — pin/re-read as above.
             let gat = alloc_concurrent_synthetic(ctx, "java/lang/reflect/GenericArrayType", 1);
+            let gat_pin = ctx.pin_native_root(gat);
             let comp_val = type_sig_to_java(ctx, component);
+            let gat = ctx.read_native_pin(gat_pin, gat);
             ctx.set_field(gat, 0, comp_val);
+            ctx.unpin_native_roots(gat_pin);
             Value::Object(Some(gat))
         }
     }
@@ -416,42 +454,73 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
                 value
             }
         }
+        // GC-safety (2026-07-16): every arm below holds a freshly-allocated
+        // `wt`/`upper`/`lower` in a Rust local across further allocating
+        // calls (`new_type_array`, `get_class_mirror`, the recursive
+        // `typesig_to_real_type` bound resolution) before it becomes
+        // reachable via `set_field`/`set_array_element`. Pin each local
+        // immediately and re-read the forwarded reference before use,
+        // matching the established `pin_native_root` contract.
         TypeArg::Extends(sig) => {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
+            let upper_pin = ctx.pin_native_root(upper);
             let bound_val = typesig_to_real_type(ctx, sig);
+            let upper = ctx.read_native_pin(upper_pin, upper);
             ctx.set_array_element(upper, 0, bound_val);
+            let wt = ctx.read_native_pin(wt_pin, wt);
+            let upper = ctx.read_native_pin(upper_pin, upper);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 0);
+            let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
+            ctx.unpin_native_roots(wt_pin);
             Value::Object(Some(wt))
         }
         TypeArg::Super(sig) => {
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
+            let upper_pin = ctx.pin_native_root(upper);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
+                let upper = ctx.read_native_pin(upper_pin, upper);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
+            let wt = ctx.read_native_pin(wt_pin, wt);
+            let upper = ctx.read_native_pin(upper_pin, upper);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 1);
+            let lower_pin = ctx.pin_native_root(lower);
             let bound_val = typesig_to_real_type(ctx, sig);
+            let lower = ctx.read_native_pin(lower_pin, lower);
             ctx.set_array_element(lower, 0, bound_val);
+            let wt = ctx.read_native_pin(wt_pin, wt);
+            let lower = ctx.read_native_pin(lower_pin, lower);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
+            ctx.unpin_native_roots(wt_pin);
             Value::Object(Some(wt))
         }
         TypeArg::Unbounded => {
             // ? => WildcardType with upper=Object, lower=empty
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
+            let wt_pin = ctx.pin_native_root(wt);
             let upper = new_type_array(ctx, 1);
+            let upper_pin = ctx.pin_native_root(upper);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
+                let upper = ctx.read_native_pin(upper_pin, upper);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
+            let wt = ctx.read_native_pin(wt_pin, wt);
+            let upper = ctx.read_native_pin(upper_pin, upper);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
             let lower = new_type_array(ctx, 0);
+            let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
+            ctx.unpin_native_roots(wt_pin);
             Value::Object(Some(wt))
         }
     }
@@ -474,8 +543,18 @@ pub fn type_param_to_java(
     // their declaration is this same generic declaration.
     let _scope = GenericDeclScope::new(generic_decl);
     let _build_scope = TypeParamBuildScope::new(generic_decl);
+    // GC-safety (2026-07-16): this is the "enum/type-var builder" residual
+    // gap flagged (but never swept) in
+    // docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+    // — `tv` is freshly-allocated and not yet reachable from any Java-visible
+    // root; `create_string` and the `bounds_arr` construction below (which
+    // itself calls the allocating `typesig_to_real_type` per bound) can each
+    // trigger a GC that relocates it. Pin it for the whole function and
+    // re-read the forwarded reference before every use.
     let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
+    let tv_pin = ctx.pin_native_root(tv);
     let name_str = ctx.create_string(&tp.name);
+    let tv = ctx.read_native_pin(tv_pin, tv);
     ctx.set_field(tv, 0, Value::Object(Some(name_str)));
     ctx.set_field(tv, 2, generic_decl);
 
@@ -487,22 +566,29 @@ pub fn type_param_to_java(
     for ib in &tp.interface_bounds {
         bound_sigs.push(ib);
     }
-    if bound_sigs.is_empty() {
+    let bounds_arr = if bound_sigs.is_empty() {
         // Default bound is Object
-        let bounds_arr = new_type_array(ctx, 1);
+        let mut bounds_arr = new_type_array(ctx, 1);
+        let bounds_pin = ctx.pin_native_root(bounds_arr);
         if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
             let obj_mirror = ctx.get_class_mirror(obj_cid);
+            bounds_arr = ctx.read_native_pin(bounds_pin, bounds_arr);
             ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
         }
-        ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
+        ctx.read_native_pin(bounds_pin, bounds_arr)
     } else {
-        let bounds_arr = new_type_array(ctx, bound_sigs.len());
+        let mut bounds_arr = new_type_array(ctx, bound_sigs.len());
+        let bounds_pin = ctx.pin_native_root(bounds_arr);
         for (i, bs) in bound_sigs.iter().enumerate() {
             let val = typesig_to_real_type(ctx, bs);
+            bounds_arr = ctx.read_native_pin(bounds_pin, bounds_arr);
             ctx.set_array_element(bounds_arr, i, val);
         }
-        ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
-    }
+        ctx.read_native_pin(bounds_pin, bounds_arr)
+    };
+    let tv = ctx.read_native_pin(tv_pin, tv);
+    ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
+    ctx.unpin_native_roots(tv_pin);
     Value::Object(Some(tv))
 }
 
@@ -527,24 +613,35 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             owner,
         } if !type_args.is_empty() || owner.is_some() => {
             let slashed = name.replace('.', "/");
-            let raw = match class_id_in_generic_scope(ctx, &slashed).or_else(|| {
+            let raw_cid = class_id_in_generic_scope(ctx, &slashed).or_else(|| {
                 let _ = ctx.load_class(&slashed);
                 class_id_in_generic_scope(ctx, &slashed)
-            }) {
-                Some(cid) => Value::Object(Some(ctx.get_class_mirror(cid))),
+            });
+            // GC-safety (2026-07-16): `raw_mirror` is a resolved Class mirror
+            // held in a Rust local across every allocation below (`args` and
+            // its per-element `typearg_to_real_type` factory calls, the
+            // recursive `owner_val` build, and the final `pti` alloc)
+            // before it is written into `pti` via `set_field_by_name`. Pin
+            // it now and re-read the forwarded reference right before use.
+            let mut raw_mirror = match raw_cid {
+                Some(cid) => ctx.get_class_mirror(cid),
                 None => return type_sig_to_java(ctx, sig),
             };
+            let raw_pin = ctx.pin_native_root(raw_mirror);
             let pti_cid = match ctx.ensure_class_initialized(
                 "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl",
             ) {
                 Ok(c) => c,
                 Err(_) => return type_sig_to_java(ctx, sig),
             };
-            let args = new_type_array(ctx, type_args.len());
+            let mut args = new_type_array(ctx, type_args.len());
+            let args_pin = ctx.pin_native_root(args);
             for (i, a) in type_args.iter().enumerate() {
                 let v = typearg_to_real_type(ctx, a);
+                args = ctx.read_native_pin(args_pin, args);
                 ctx.set_array_element(args, i, v);
             }
+            args = ctx.read_native_pin(args_pin, args);
             // Owner type: reify the enclosing `Outer<...>` node (recursively a
             // real PTI when it is itself parameterized) so callers that walk
             // getOwnerType() — Spring's ResolvableType/GenericTypeResolver
@@ -556,11 +653,14 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 Some(o) => typesig_to_real_type(ctx, o),
                 None => Value::Object(None),
             };
+            args = ctx.read_native_pin(args_pin, args);
+            raw_mirror = ctx.read_native_pin(raw_pin, raw_mirror);
             let nfields = ctx.class_num_total_fields(pti_cid).max(3);
             let pti = ctx.alloc_object(pti_cid, nfields);
-            ctx.set_field_by_name(pti, "rawType", raw);
+            ctx.set_field_by_name(pti, "rawType", Value::Object(Some(raw_mirror)));
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
             ctx.set_field_by_name(pti, "ownerType", owner_val);
+            ctx.unpin_native_roots(raw_pin);
             Value::Object(Some(pti))
         }
         _ => type_sig_to_java(ctx, sig),
@@ -585,8 +685,22 @@ fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
             real_wildcard_type(ctx, vec![b], vec![])
         }
         TypeArg::Super(sig) => {
+            // GC-safety (2026-07-16): `b` is computed before `obj`
+            // (`object_class_mirror` can allocate a lazily-created mirror),
+            // so it sits unrooted in a Rust local across that call. Pin it
+            // immediately and re-read the forwarded reference before use.
             let b = typesig_to_real_type(ctx, sig);
+            let b_pin = match b {
+                Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
+                _ => None,
+            };
             let obj = object_class_mirror(ctx);
+            let b = match (b, b_pin) {
+                (Value::Object(Some(r)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, r)))
+                }
+                _ => b,
+            };
             real_wildcard_type(ctx, vec![obj], vec![b])
         }
         TypeArg::Unbounded => {
@@ -603,21 +717,65 @@ fn object_class_mirror(ctx: &mut dyn NativeContext) -> Value {
 }
 
 /// Build a REAL `WildcardTypeImpl` with the given (already-reified) bounds.
+///
+/// GC-safety (2026-07-16): `upper`/`lower` already hold freshly-built (and,
+/// for a recursive bound, freshly-allocated) `Type` objects handed in by the
+/// caller. Every one of them sits in a plain `Vec`, invisible to the GC root
+/// scan, across all the allocating calls below (`ensure_class_initialized`,
+/// two `new_type_array` calls, and the final `alloc_object`). Pin each
+/// element immediately on entry and re-read the forwarded reference right
+/// before it is stored into `up`/`lo`.
 fn real_wildcard_type(ctx: &mut dyn NativeContext, upper: Vec<Value>, lower: Vec<Value>) -> Value {
+    let upper_pins: Vec<Option<usize>> = upper
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(r)) => Some(ctx.pin_native_root(*r)),
+            _ => None,
+        })
+        .collect();
+    let lower_pins: Vec<Option<usize>> = lower
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(r)) => Some(ctx.pin_native_root(*r)),
+            _ => None,
+        })
+        .collect();
+
     let wti_cid = match ctx
         .ensure_class_initialized("sun/reflect/generics/reflectiveObjects/WildcardTypeImpl")
     {
         Ok(c) => c,
         Err(_) => return Value::Object(None),
     };
-    let up = new_type_array(ctx, upper.len());
+    let mut up = new_type_array(ctx, upper.len());
+    let up_pin = ctx.pin_native_root(up);
     for (i, v) in upper.iter().enumerate() {
-        ctx.set_array_element(up, i, *v);
+        let refreshed = match (v, upper_pins[i]) {
+            (Value::Object(Some(r)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, *r)))
+            }
+            _ => *v,
+        };
+        up = ctx.read_native_pin(up_pin, up);
+        ctx.set_array_element(up, i, refreshed);
     }
-    let lo = new_type_array(ctx, lower.len());
+    up = ctx.read_native_pin(up_pin, up);
+
+    let mut lo = new_type_array(ctx, lower.len());
+    let lo_pin = ctx.pin_native_root(lo);
     for (i, v) in lower.iter().enumerate() {
-        ctx.set_array_element(lo, i, *v);
+        let refreshed = match (v, lower_pins[i]) {
+            (Value::Object(Some(r)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, *r)))
+            }
+            _ => *v,
+        };
+        lo = ctx.read_native_pin(lo_pin, lo);
+        ctx.set_array_element(lo, i, refreshed);
     }
+    lo = ctx.read_native_pin(lo_pin, lo);
+    up = ctx.read_native_pin(up_pin, up);
+
     let nfields = ctx.class_num_total_fields(wti_cid).max(2);
     let wti = ctx.alloc_object(wti_cid, nfields);
     ctx.set_field_by_name(wti, "upperBounds", Value::Object(Some(up)));

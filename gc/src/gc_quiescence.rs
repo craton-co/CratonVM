@@ -303,6 +303,14 @@ pub fn request_major_gc() {
     MAJOR_GC_REQUESTED.with(|c| c.set(true));
 }
 
+/// True while this thread has an explicit `System.gc()` major-GC request
+/// pending. The root gatherer and Generational collector use this to choose
+/// the non-moving owner-propagating overlay marker for the requested full GC.
+#[inline]
+pub fn major_gc_requested() -> bool {
+    MAJOR_GC_REQUESTED.with(|c| c.get())
+}
+
 /// Check-and-clear: consumed exactly once by the collector's Phase 5 check,
 /// regardless of which branch of that check ends up true — so the request
 /// never leaks into a later, unrelated collection.

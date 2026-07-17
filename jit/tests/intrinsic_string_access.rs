@@ -105,6 +105,7 @@ fn helpers() -> JitRuntimeHelpers {
         throw_arithmetic: s,
         invoke_dispatch: s,
         invoke_virtual_mic: s,
+        lambda_int_to_double: s,
         write_barrier: s,
         satb_pre_write_barrier: s,
         uncommon_trap: recording_uncommon_trap as *const () as usize,

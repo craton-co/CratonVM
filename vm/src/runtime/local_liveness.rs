@@ -29,8 +29,22 @@
 //!
 //! Kill-switch: `CRATONVM_NO_LOCAL_LIVENESS=1` restores the unfiltered scan.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+// PERF (2026-07-15, round 2 of the RequestMappingMessageConversionIntegrationTests
+// bootstrap-slowness investigation): `live_locals_mask` runs on the per-native-call
+// GC root-snapshot path (`update_root_snapshot` -> `scan_frame_roots` ->
+// `scan_local_objects` -> here), so its two HashMap lookups (the code-blob cache
+// and the per-pc liveness table) are paid on essentially every native call. Both
+// used `std::collections::HashMap`'s default `RandomState` (SipHash-1-3) hasher —
+// the DoS-resistant hasher meant for untrusted external input, not an internal
+// lookup table keyed by small integers/pointers. Every other hot-path HashMap in
+// this codebase already uses `FxHashMap` for exactly this reason (see
+// `native-api/src/registry.rs`, `classloading/src/fx_hash.rs`, and the
+// `41cc90ef` "HashMap native-dispatch overhead" fix this mirrors). Swapping the
+// hasher is a pure, behavior-preserving perf change: same keys, same values,
+// same collision-correctness contract, just a cheaper hash function.
+use rustc_hash::FxHashMap as HashMap;
 
 use cratonvm_reader::attribute::ExceptionTableEntry;
 
@@ -58,7 +72,7 @@ type CacheVal = (Weak<[u8]>, Option<Arc<LivenessTable>>);
 
 fn cache() -> &'static Mutex<HashMap<CacheKey, CacheVal>> {
     static CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheVal>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
 /// Bound the cache; on overflow drop everything (entries are cheap to

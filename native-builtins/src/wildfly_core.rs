@@ -116,27 +116,50 @@ fn native_path_address_from_elements(
     args: &[Value],
 ) -> MethodCallResult {
     let arr = obj_arg(args, 0)?;
+    // GC-SAFETY: `arr` (the source elements array) is read on every loop
+    // iteration below, but `new_object_initialized` here and each
+    // iteration's own `add` dispatch can all trigger a moving GC before
+    // `arr` is read again. Pin it up front alongside `list` (already
+    // protected) and re-read before each array access. Confirmed live via
+    // CRATONVM_DBG_STALE_OBJREF (native_path_address_from_elements ->
+    // ctx.invoke("PathAddress.pathAddress") -> invoke_on_class_shared_inner
+    // dereferencing a stale receiver during WildFly parallel boot).
+    let arr_pin = ctx.pin_native_root(arr);
     let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
         Some(Value::Object(Some(list))) => list,
         _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
     };
-    for i in 0..ctx.array_length(arr) {
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    // `list` is a live ObjectRef that survives multiple GC-triggering calls
+    // below (the `add` calls in the loop, then the `pathAddress`/ctor
+    // dispatch); pin it across all of them and re-read before each use.
+    let list_pin = ctx.pin_native_root(list);
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        let arr = ctx.read_native_pin(arr_pin, arr);
         let elem = ctx.get_array_element(arr, i);
+        let list = ctx.read_native_pin(list_pin, list);
         ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[elem])?;
     }
-    match ctx.invoke(
+    let list = ctx.read_native_pin(list_pin, list);
+    let result = match ctx.invoke(
         "org/jboss/as/controller/PathAddress",
         "pathAddress",
         "(Ljava/util/List;)Lorg/jboss/as/controller/PathAddress;",
         &[Value::Object(Some(list))],
     ) {
         Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
-        _ => ctx.new_object_initialized(
-            "org/jboss/as/controller/PathAddress",
-            "(Ljava/util/List;)V",
-            &[Value::Object(Some(list))],
-        ),
-    }
+        _ => {
+            let list = ctx.read_native_pin(list_pin, list);
+            ctx.new_object_initialized(
+                "org/jboss/as/controller/PathAddress",
+                "(Ljava/util/List;)V",
+                &[Value::Object(Some(list))],
+            )
+        }
+    };
+    ctx.unpin_native_roots(arr_pin);
+    result
 }
 
 /// One deployment in flight.  `name` is the archive name as the WildFly

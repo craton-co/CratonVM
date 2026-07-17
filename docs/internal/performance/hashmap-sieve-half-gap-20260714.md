@@ -1,7 +1,8 @@
 # HashMap + Sieve gap reduction (2026-07-14)
 
 Status: merged; Sieve target met (gap cut by ~2/3), HashMap partial (gap cut
-by ~39%, residuals documented below).
+by ~39% in round 1, ~42% after round 2 — see the Round 2 section at the end;
+residuals documented below).
 
 ## Goal
 
@@ -140,3 +141,122 @@ thin prevalidated wrapper for the two exact map natives.
 - Hibernate ORM smoke (Linux harness, 2 real classes): 27/27 tests green.
 - QuickBench Arithmetic/Fibonacci/Matrix: no CratonVM-side regressions
   (4,161→4,109 / 4,283→4,231 / 5,909→5,583 ms).
+
+## Round 2 (2026-07-14, second session): 274 → 264 ms, plus the size sweep
+
+Same host/methodology, branch `perf/hashmap-round2-20260714` off dev
+`a80a0af9`. Two changes landed (isolated same-commit A/B, checksums
+identical, `HashMapSemanticsProbe` normal + GC-stress green, `BinT` 16/18
+byte-identical, QuickBench rows unchanged):
+
+1. `jit_integer_value_of_direct` allocates through a direct
+   `tlab_alloc_object` call (the same function `alloc_object`'s TLAB arm
+   uses, real field-count clamp resolved once per (vm, class)), skipping the
+   per-call clamp-cache scan, pool probes and context plumbing.
+2. `jit_invoke_dispatch` probes the cached exact-HashMap entry FIRST —
+   with `valueOf`/`intValue` now direct calls, the Integer-cache probe ahead
+   of every `Map.put/get` was a dead hash lookup.
+
+**Measured and REJECTED** — candidate (1) from the follow-up list, a
+per-map `Arc<Mutex<HmIntFastState>>` with a thread-local epoch-validated
+handle cache to bypass the global `hm_int_fast_table` mutex: on the same
+probe it measured **+18 ms** (274→282 while changes 1+2 alone hit 264).
+Uncontended, the global `std::sync::Mutex` + one FxHashMap probe of a
+1-entry table (~15-20 ns) is CHEAPER than the replacement's Arc refcount
+traffic + `RefCell` TLS bookkeeping + per-state mutex. The design (with the
+full lock-order/GC-walker analysis) is preserved in this session's notes;
+revisit only for a workload with real multi-thread map contention, and
+benchmark first.
+
+### Size sweep (fresh alternating pairs, default flags unless noted)
+
+| n (put+get pairs) | HotSpot | CratonVM | Ratio | Notes |
+|---|---:|---:|---:|---|
+| 1M | ~42 ms | 264 ms | ~6.3x | dense overlay path throughout |
+| 10M | 980 ms | 2,767 ms | **2.82x** | dense; live set ≈ young capacity |
+| 30M | 3,193 ms | 13,457 ms | 4.21x | both `-Xmx16g`; keys >16,777,216 spill to the overlay's SPARSE FxHashMap (`DenseIntEntries::MAX_DENSE_KEY`) |
+| 100M | 23,377 ms | **aborts** | — | pre-existing, see below |
+
+The ratio bottoms out near 10M: the fixed per-op dispatch/boxing tax
+amortizes against HotSpot's growing cache-miss cost, until (a) the 16M
+dense-key cap sends ~half the keys to the sparse map and (b) GC pressure
+rises.
+
+### Pre-existing finding: default-heap OOM abort at ≥ ~20M live wrappers
+
+`HashMapOnly 30000000` (and 100M) at default flags aborts on the DEV
+BASELINE binary as well:
+
+```
+FATAL: OutOfMemoryError: young gen exhausted — tried to allocate 56 bytes,
+from-space has 1073741824/1073741824 used
+```
+
+`-Xmx` scales young (12g → 3 GiB from-space) but 100M still aborts: the
+live wrapper set exceeds what young can hold and the panicking native
+allocation wrapper (`gen_heap::alloc_young_initialized`, used by the
+native `alloc_object`/`alloc_array` convenience path) `std::process::abort`s
+instead of triggering a collection/promotion and retrying like the
+interpreter's `gc_alloc_*` path. Not a round-2 regression; filed as a
+follow-up — the fix direction is routing the native wrapper through the
+fallible GC-and-retry allocator.
+
+**FIXED (2026-07-14, follow-up round — `fix/native-alloc-gc-retry-20260714`).**
+Root cause was TWO stacked gaps, confirmed with `--verbose:gc` showing
+**zero collections** before the abort:
+
+1. **No GC initiation point anywhere on the fully-native allocation path.**
+   The JIT'd benchmark loop's boxing (`Integer.valueOf` thin dispatch,
+   `call_integer_native_raw`) and the HashMap put/get natives all allocate
+   via `NativeContextImpl::alloc_object`, which deliberately never collects
+   (unrooted callback-local `ObjectRef`s); the interpreter's `maybe_gc` runs
+   only on interpreter allocation opcodes, and the JIT allocation helpers'
+   GC never runs because no `new` bytecode executes. Young filled once, old
+   absorbed every later allocation via the batch spill, then
+   `alloc_young_initialized` aborted a heap that was largely garbage.
+   Fix: young-exhaustion spills arm a `young_spill_pressure` flag
+   (gen_heap), consumed at the `safe_native_call` boundary — where every
+   argument is pinned in `native_pin_roots` and remappable, exactly like the
+   peer-STW `safepoint_check` — by the same orchestrated `maybe_gc_forced`
+   the interpreter uses (gated on `needs_gc()` + the GC-overhead limit; one
+   relaxed load on the hot path). The cached `Integer.valueOf` JIT fast path
+   (primitive-only args) gets the same hook. The flag is advisability-gated:
+   it only arms once old-gen headroom drops below one young semi + young/8
+   (promotion's worst-case demand), so spill-mode perf is preserved while
+   old gen has room — 30M @ `-Xmx16g` stays at ~14s (was 13.5s baseline;
+   an ungated first-exhaustion trigger cost 32.8s).
+2. **Selective promotion + survivor aging had gone inert**, so even with
+   GCs running, young could never drain (`freed=0` every cycle). The
+   unconditional side-marking hardening (Family-A write-through fix) removed
+   every mark-time header write; the promotion pass still required
+   `GC_FLAG_MARKED` on the header and nothing ever aged past
+   `PROMOTION_AGE`. Fix: the promotion pass accepts side-marked survivors
+   as candidates and performs the aging itself via deferred, anchor-verified
+   age bumps (same unwind discipline as the forwarding-pointer installs).
+   Also fixed the GC-overhead productivity metric: it now uses a young
+   free-list-aware live estimate (the non-moving sweep never retreats the
+   bump cursor, so `allocated_bytes` read every productive sweep as
+   "freed 0" and falsely latched the overhead limit) and credits promoted
+   bytes (a promotion-only cycle conserves live bytes but drains young; the
+   2%-of-capacity threshold still catches the genuine into-full-old-gen
+   death-spiral).
+
+Validation (Azure host, dev base 331b279e vs fix):
+
+| run | baseline | fixed |
+|---|---|---|
+| 30M default (4g) | abort @8s, old mostly unused | abort @65s at true capacity (live ≈3.4 GB > 3.0 GiB usable) |
+| 30M `-Xmx6g` | **abort @14s** | **66.7s, checksum 13949999745000000** |
+| 30M `-Xmx16g` | 13.5s | 14.4s (spill mode, no GCs — no regression) |
+| 100M `-Xmx12g` | abort | abort @4m17s at true capacity (live ≈11.2 GB > 9 GiB usable) |
+| 100M `-Xmx18g` | **abort @57s** | **8m22s, checksum 23031399494027136** |
+| bt16 / bt18 `-Xmx8g` | 0.27s / 1.90s, 14985902 / 68332206 | 0.27s / ~1.9s, 14985902 / 68332206 |
+
+The remaining aborts are genuine capacity exhaustion (each retained entry
+keeps BOTH boxes live via the int-fast overlay's `(ObjectRef, Value)`
+pairs ≈ 112 B/entry of Java heap, plus the native-side table — 100M also
+needs ~28 GB RSS, OOM-killed at `-Xmx20g` on the 31 GB host). A catchable
+`OutOfMemoryError` instead of the abort for the infallible
+`ctx.alloc_object` callers remains open (the trait method returns a bare
+`ObjectRef`; the fallible `try_*` siblings and the JIT helpers already
+throw).

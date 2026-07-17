@@ -45,6 +45,24 @@ pub struct CachedBytecodeMethod {
     pub num_params: u16,
     pub is_synchronized: bool,
     pub is_static: bool,
+    /// Perf (2026-07-15, `ClientHttpConnectorTests` interpreter-throughput
+    /// investigation): memoizes the pure/deterministic part of
+    /// `force_native_over_real_jdk_bytecode(class_name, method_name,
+    /// method_descriptor)` (a ~1400-line sequential string-comparison
+    /// special-case dispatcher in `vm/src/runtime/interpreter.rs`, already
+    /// documented as consuming ~51% of all executed instructions on
+    /// method-call-heavy workloads -- see
+    /// `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md`).
+    /// This entry is `Arc`-shared across every cache hit for its callsite,
+    /// so populating it once here and reading it thereafter turns an
+    /// O(~55 string comparisons) recheck on every cached
+    /// `invokevirtual`/`invokestatic` dispatch into an O(1) read after the
+    /// first hit. The redefine-dependent wrapper around this pure check
+    /// (`should_force_registered_native_over_bytecode`) is NOT cached here
+    /// -- it depends on mutable per-class redefine state that can change
+    /// after this entry is populated, so it is still re-evaluated on every
+    /// hit (cheap: a single generation-counter read plus a short allowlist).
+    pub force_native_cache: std::sync::OnceLock<bool>,
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -362,6 +380,12 @@ pub struct JitRuntimeHelpers {
     /// unconditional helper CALL. Appended at the END of the struct so all
     /// prior golden offsets stay stable.
     pub native_stack_floor_fn: usize,
+    /// Materializes an interned Java String for a compiled `ldc` site.
+    /// Signature: `extern "C" fn(vm_ptr, utf8_ptr, utf8_len) -> i64`.
+    /// The helper performs the string-pool lookup on every execution so the
+    /// returned reference remains valid after a relocating collection; JIT code
+    /// must never bake a managed-object address as an immediate.
+    pub ldc_string: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -504,6 +528,7 @@ helper_fields! {
     (region_bounds_addr,             FieldKind::Offset),
     // Leaf floor-query helper for the inline self-recursion check.
     (native_stack_floor_fn,          FieldKind::OptionalPtr),
+    (ldc_string,                     FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -529,7 +554,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 50,
+    JitRuntimeHelpers::NUM_FIELDS == 51,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );

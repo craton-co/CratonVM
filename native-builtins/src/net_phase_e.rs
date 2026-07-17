@@ -698,6 +698,11 @@ const HS_STARTED: usize = 1;
 const HS_CONTEXTS: usize = 2;
 const HS_SERVER_ID: usize = 3;
 const HS_PORT: usize = 4;
+const HS_IMPL_CLASS: &str = "sun/net/httpserver/HttpServerImpl";
+/// Executor supplied through `HttpServer.setExecutor`. It is retained so the
+/// public `getExecutor` contract is coherent even though the native server's
+/// VM dispatcher owns the actual request-draining threads.
+const HS_EXECUTOR: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1813,14 +1818,47 @@ pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
     Some(after_auth[..end].to_string())
 }
 
+/// Byte index of the scheme-terminating `:`, or `None` for a relative
+/// reference. Mirrors the real JDK parser (`uri_scheme_name_fail_index` in
+/// lib.rs): scan for the first stop char among `:/?#`; only a `:` counts,
+/// and the text before it must be a valid scheme name (ALPHA start,
+/// alphanum/`+`/`-`/`.` body). Without this rule a colon inside a relative
+/// path ("/redirect:account", Spring's view-name redirect tests) was taken
+/// as a scheme delimiter, corrupting scheme/ssp/path derivation.
+pub(crate) fn uri_scheme_colon(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut p = 0usize;
+    while p < bytes.len() {
+        match bytes[p] {
+            b'/' | b'?' | b'#' => return None,
+            b':' => break,
+            _ => p += 1,
+        }
+    }
+    if p == 0 || p >= bytes.len() {
+        return None;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    if !bytes[1..p]
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(p)
+}
+
 /// Raw scheme-specific part, excluding the fragment delimiter and fragment.
 /// `java.net.URI` treats `#fragment` as outside the SSP for both opaque
-/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs.
+/// (`mailto:a#b`) and hierarchical (`https://h/p#b`) URIs. For a relative
+/// reference (no valid scheme) the SSP is the whole input minus fragment.
 fn uri_raw_scheme_specific_part(raw: &str) -> String {
-    let Some(colon) = raw.find(':') else {
-        return raw.to_string();
+    let ssp = match uri_scheme_colon(raw) {
+        Some(colon) => &raw[colon + 1..],
+        None => raw,
     };
-    let ssp = &raw[colon + 1..];
     let end = ssp.find('#').unwrap_or(ssp.len());
     ssp[..end].to_string()
 }
@@ -2135,16 +2173,12 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 }
             }
         }
-        // Parse from raw string.
+        // Parse from raw string — JDK scheme rules (a colon inside a relative
+        // path is NOT a scheme delimiter, see `uri_scheme_colon`).
         let raw = uri_raw_string(ctx, this);
-        let scheme = raw
-            .find(':')
-            .map(|i| raw[..i].to_string())
-            .unwrap_or_default();
-        if scheme.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&scheme)))))
+        match uri_scheme_colon(&raw) {
+            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[..i]))))),
+            None => Ok(Some(Value::Object(None))),
         }
     });
 
@@ -2785,6 +2819,30 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let s = ctx.read_string(s_obj).unwrap_or_default();
+            // URI.create(String) translates URI(String) parse failures to
+            // IllegalArgumentException, but valid results must keep make_uri's
+            // field layout for the URI accessors used by Keycloak.
+            if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
+                return Err(iae(format!("{reason} at index {pos}: {s}")));
+            }
+            let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let illegal = if strict_uri_chars {
+                crate::uri_first_illegal_index(&s)
+            } else {
+                s.char_indices()
+                    .find(|(_, c)| (*c as u32) < 0x20 || (*c as u32) == 0x7f)
+                    .map(|(i, _)| i)
+            };
+            if let Some(pos) = illegal {
+                return Err(iae(format!("Illegal character in URI at index {pos}: {s}")));
+            }
+            if let Some(pos) = crate::uri_empty_ssp_fail_index(&s) {
+                return Err(iae(format!(
+                    "Expected scheme-specific part at index {pos}: {s}"
+                )));
+            }
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
         },
     );
@@ -2927,7 +2985,9 @@ fn re1_socket_write_stream(
                 Ok(Some(Value::Object(Some(exc)))) => {
                     let exc_pin = ctx.pin_native_root(exc);
                     let exc = ctx.read_native_pin(exc_pin, exc);
-                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                        exc,
+                    ))
                 }
                 _ => Err(ioex(format!("Socket write failed: {e}"))),
             };
@@ -2982,7 +3042,11 @@ fn native_socket_input_stream_read_one(
     let owner =
         stream_owner_get(ctx, this).ok_or_else(|| ioex("SocketInputStream has no owner"))?;
     let one = ctx.new_array(ArrayElementType::Byte, 1);
-    let r = re1_socket_read_stream(ctx, owner, one, 0, 1)?;
+    let one_pin = ctx.pin_native_root(one);
+    let r = re1_socket_read_stream(ctx, owner, one, 0, 1);
+    let one = ctx.read_native_pin(one_pin, one);
+    ctx.unpin_native_roots(one_pin);
+    let r = r?;
     match r {
         Some(Value::Int(-1)) => Ok(Some(Value::Int(-1))),
         Some(Value::Int(_)) => {
@@ -3844,6 +3908,10 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // This native bypasses ServerSocket's field initializers.  Preserve
+        // the real object's synchronization invariant before its bytecode
+        // options path reaches getImpl().
+        let this = re1_init_socket_locks(ctx, this);
         ss_set(ctx, this, |s| {
             s.port = -1;
             s.backlog = 50;
@@ -3855,6 +3923,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         re2_bind_listener(ctx, this, "0.0.0.0", port, 50)
     });
@@ -3867,6 +3936,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(II)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         re2_bind_listener(ctx, this, "0.0.0.0", port, backlog)
@@ -3874,6 +3944,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let this = re1_init_socket_locks(ctx, this);
         let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(50);
         let host = match args.get(3) {
@@ -3949,6 +4020,19 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
 
+    // The RE2 constructors own listener state outside the real ServerSocket
+    // implementation.  JGroups configures this option before bind, where it
+    // must be accepted without entering the real getImpl() bytecode path.
+    r.register(ss, "setReceiveBufferSize", "(I)V", |_ctx, args| {
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size <= 0 {
+            return Err(iae(format!("negative receive buffer size: {size}")));
+        }
+        Ok(None)
+    });
+    r.register(ss, "getReceiveBufferSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(8192)))
+    });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
     r.register(ss, "isBound", "()Z", |ctx, args| {
@@ -4746,6 +4830,10 @@ fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+fn re5_dbg() -> bool {
+    std::env::var_os("CRATONVM_DBG_RE5").is_some()
+}
+
 fn http_exchange_plain(
     host: &str,
     port: u16,
@@ -4754,13 +4842,54 @@ fn http_exchange_plain(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<HttpResponse> {
-    let mut stream = TcpStream::connect((host, port))?;
+    let dbg = re5_dbg();
+    let t0 = if dbg { Some(Instant::now()) } else { None };
+    if dbg {
+        eprintln!("[RE5-DBG] {method} {host}:{port}{path} connecting...");
+    }
+    let connect_result = TcpStream::connect((host, port));
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} connect -> {:?} ({:?} elapsed)",
+            connect_result.as_ref().map(|_| "OK").map_err(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    let mut stream = connect_result?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let req = http_build_request(method, host, port, path, headers, body, 80);
-    stream.write_all(&req)?;
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} writing {} bytes (body {} bytes): {:?}",
+            req.len(),
+            body.len(),
+            String::from_utf8_lossy(&req[..req.len().min(200)])
+        );
+    }
+    let write_result = stream.write_all(&req);
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} write_all -> {:?} ({:?} elapsed)",
+            write_result.as_ref().map(|_| "OK").map_err(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    write_result?;
     stream.flush()?;
-    http_read_response(stream, method.eq_ignore_ascii_case("HEAD"))
+    if dbg {
+        eprintln!("[RE5-DBG] {method} {host}:{port}{path} flushed, reading response...");
+    }
+    let read_result = http_read_response(stream, method.eq_ignore_ascii_case("HEAD"));
+    if dbg {
+        eprintln!(
+            "[RE5-DBG] {method} {host}:{port}{path} read_response -> status={:?} err={:?} ({:?} elapsed)",
+            read_result.as_ref().ok().map(|r| r.status),
+            read_result.as_ref().err().map(|e| e.kind()),
+            t0.map(|t| t.elapsed())
+        );
+    }
+    read_result
 }
 
 fn http_exchange_tls(
@@ -5506,9 +5635,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         ctx.set_field(stream, 1, Value::Int(0)); // pos
         ctx.set_field(stream, 2, Value::Int(0)); // mark
         ctx.set_field(stream, 3, Value::Int(len)); // count
-        // The constructor dispatch can allocate as well.  Pin the newly
-        // allocated stream alongside its backing array, then return the
-        // post-GC stream address rather than the stale Rust local.
+                                                   // The constructor dispatch can allocate as well.  Pin the newly
+                                                   // allocated stream alongside its backing array, then return the
+                                                   // post-GC stream address rather than the stale Rust local.
         let stream_pin = ctx.pin_native_root(stream);
         let stream = ctx.read_native_pin(stream_pin, stream);
         let body = ctx.read_native_pin(body_pin, body);
@@ -6716,120 +6845,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // Round 60 — bypass StandardContext init/start failure.
-    //
-    // After getWebServer() succeeds, Spring Boot calls TomcatWebServer.start()
-    // which drives the Tomcat lifecycle: Engine → Host → Context. The Context
-    // (TomcatEmbeddedContext extends StandardContext) fails during init/start
-    // with a chain of LifecycleException → ExecutionException → … with no
-    // root cause preserved (Tomcat's ContainerBase wraps child failures as
-    // bare LifecycleException with only a message). The original failure is
-    // most likely a missing servlet/filter init resource or a NullPointerException
-    // from real-JDK gaps in our environment (JNDI / annotation scanning / etc.).
-    //
-    // Pragmatic fix: no-op StandardContext.initInternal()V and startInternal()V.
-    // LifecycleBase wraps these calls in state transitions
-    // (INITIALIZING → INITIALIZED, STARTING_PREP → STARTING → STARTED), so a
-    // successful no-op lets the lifecycle complete cleanly. The servlet
-    // container itself won't dispatch requests, but the boot succeeds past
-    // the LifecycleException and the demo can advance.
-    fn ctx_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    // 2026-06-11 — REMOVED the base `org/apache/catalina/core/StandardContext`
-    // initInternal/startInternal no-ops. They were a Spring-Boot-era shim, but
-    // `StandardContext` is the concrete context the *Tomcat test suite* (and
-    // standalone Tomcat) uses, so no-opping it stopped every embedded server
-    // from actually starting its web application — the real bytecode runs fine
-    // here (verified via the apps/tomcat suite). Spring Boot stays short-
-    // circuited at `TomcatWebServer.start`/`initialize` (below) and via the
-    // `TomcatEmbeddedContext` subclass no-ops kept here, so this is Spring-Boot
-    // neutral while unblocking the Tomcat suite. See CRATONVM_BUGS/BUG-C-*.
-    // Spring Boot's TomcatEmbeddedContext overrides startInternal — cover both
-    // common package locations so the dispatch hits the native regardless of
-    // which subclass the SB version uses.
-    r.register(
-        "org/springframework/boot/tomcat/TomcatEmbeddedContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatEmbeddedContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
-
-    // Round 60 cont. — short-circuit ContainerBase$StartChild.call() which
-    // wraps `child.start()` in a Callable submitted to an executor. The
-    // failure surfaces as ExecutionException chained into a LifecycleException
-    // ("A child container failed during start") with the original cause
-    // discarded. By making the Callable a no-op that returns null, the
-    // Future completes successfully and the engine/host advance.
-    // 2026-06-11 — REMOVED the `ContainerBase$StartChild.call` no-op. It made
-    // every child-container start (Engine→Host→Context) a no-op when Tomcat
-    // uses the parallel start-stop executor, so the context/connector never
-    // actually started under the Tomcat test suite. The real Callable runs the
-    // child's lifecycle, which works under CratonVM. (Was a Spring-Boot shim;
-    // Spring Boot remains short-circuited at TomcatWebServer.start/initialize.)
-
-    // 2026-05-28 — REMOVED synthetic Connector.startInternal / AbstractProtocol.start
-    // no-op stubs that violated the no-synthetic-stubs policy
-    // (`memory/feedback_no_synthetic_stubs.md`). The previous shims returned
-    // Ok(None) without advancing the lifecycle state, which then caused
-    // LifecycleBase.start() to throw "invalid Lifecycle transition [after_start]
-    // ... in state [STARTING_PREP]" — the exact symptom we were trying to mask.
-    //
-    // The real Tomcat bytecode must run; bugs are fixed at their root in the VM.
-
-    // Round 60 cont. — short-circuit TomcatWebServer.start() entirely.
-    // We've already constructed the TomcatWebServer in getWebServer(), and
-    // start() drives the full Catalina lifecycle which our environment can't
-    // complete (Thread.holder.group is null, NamingResources native lookups
-    // fail, etc.). Replacing start() with a no-op returns control to Spring
-    // Boot's ServletWebServerApplicationContext.startWebServer with no
-    // exception so the demo advances past the embedded-Tomcat phase.
-    fn tomcat_web_server_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    r.register(
-        "org/springframework/boot/tomcat/TomcatWebServer",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatWebServer",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    // initialize() is the one that actually drives Tomcat.start() and the
-    // protocol-handler chain — make it a no-op too. (Spring Boot calls
-    // initialize() from the constructor before returning the WebServer.)
-    r.register(
-        "org/springframework/boot/tomcat/TomcatWebServer",
-        "initialize",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    r.register(
-        "org/springframework/boot/web/embedded/tomcat/TomcatWebServer",
-        "initialize",
-        "()V",
-        tomcat_web_server_noop,
-    );
-    // 2026-06-11 — REMOVED the `org/apache/catalina/startup/Tomcat.start()`
-    // no-op. This is the Catalina-root entry point the *Tomcat test suite*
-    // (`TomcatBaseTest`) and standalone Tomcat call directly; no-opping it made
-    // `tomcat.start()` return without starting the server/service/engine/
-    // connector (all stayed in lifecycle state NEW), so every embedded-server
-    // test hung connecting to a server that never bound. Spring Boot does not
-    // call `Tomcat.start()` (it drives `TomcatWebServer`, still no-op'd above),
-    // so removing this is Spring-Boot neutral. The real lifecycle runs fine
-    // under CratonVM. See CRATONVM_BUGS/BUG-C-*.
-
     // residual-4 fix: the two `AbstractFileResolvingResource.customizeConnection`
     // no-ops above were REMOVED. They made `customizeConnection` a complete
     // no-op for every caller — including `AbstractFileResolvingResource.exists()`/
@@ -7242,6 +7257,21 @@ struct Re5PublisherBodyState {
     bytes: Vec<u8>,
     completed: bool,
     error: Option<String>,
+    // Identity-preserving companion to `error`: a global GC root for the
+    // ORIGINAL Throwable the Flow.Subscriber's onError delivered (set
+    // alongside `error` by `re5_body_collector_on_error`, which runs on a
+    // different Java thread than the one waiting in
+    // `re5_collect_publisher_body`, hence a global root rather than a pin).
+    // Real HotSpot propagates a request-body-publisher failure through
+    // `HttpClient.sendAsync()`'s CompletableFuture as the SAME exception
+    // object the publisher threw (confirmed empirically: `ClientHttpConnectorTests
+    // .errorInRequestBody`'s `assertThat(throwable).isSameAs(error)` passes
+    // 3/3 clean under real JDK 25). Without this, `re5_collect_publisher_body`
+    // could only reconstruct a brand-new synthetic `IOException` from a text
+    // message, which can never satisfy an identity (`isSameAs`) assertion --
+    // not a timing flake, a structural identity loss for every request that
+    // fails this way on the `Jdk` connector.
+    error_obj_root: Option<usize>,
 }
 
 #[derive(Default)]
@@ -7400,12 +7430,28 @@ fn re5_body_collector_on_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn re5_body_collector_on_error(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let msg = re5_throwable_text(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let throwable_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let msg = re5_throwable_text(ctx, throwable_val);
+    // Root the actual Throwable object (if any) so `re5_collect_publisher_body`
+    // -- woken on a different thread, possibly after a GC moves it -- can
+    // rethrow the SAME object instead of only a text description. A global
+    // root (not a pin) is required: `on_error` and the collect/wait side run
+    // on different Java threads, so there is no shared native-call frame to
+    // pin against.
+    let error_obj_root = match throwable_val {
+        Value::Object(Some(obj)) => Some(ctx.add_global_root(obj)),
+        _ => None,
+    };
     if let Some(collector) = re5_lookup_body_collector(ctx, this) {
         let mut state = collector.state.lock().unwrap();
         state.error = Some(msg);
+        state.error_obj_root = error_obj_root;
         state.completed = true;
         collector.done.notify_all();
+    } else if let Some(handle) = error_obj_root {
+        // No collector (already timed out / removed) to hand the root to --
+        // avoid leaking it.
+        ctx.remove_global_root(handle);
     }
     Ok(None)
 }
@@ -7451,7 +7497,19 @@ fn re5_collect_publisher_body(
         return Err(e);
     }
 
+    // STW cross-thread JIT-takeover deadlock fix, same family as the
+    // http_perform_request fix in re5_do_request (see that comment for the
+    // full mechanism): re5_collect_publisher_body's condvar wait blocks this
+    // thread for up to RE5_PUBLISHER_WAIT waiting for a notify delivered by
+    // a DIFFERENT Java thread (the Reactor scheduler thread driving the
+    // Publisher, calling back into re5_body_collector_on_next/on_complete).
+    // That signalling thread cooperates normally with an STW pause (it's
+    // ordinary bytecode, hits interpreter safepoints); this thread, stuck in
+    // a raw Rust condvar wait, does not -- so a concurrent STW request
+    // starves waiting on THIS thread while the notify THIS thread needs
+    // waits on the OTHER thread's own cooperation with that same pause.
     let deadline = Instant::now() + RE5_PUBLISHER_WAIT;
+    ctx.begin_blocking_region();
     let mut state = collector.state.lock().unwrap();
     while !state.completed && state.error.is_none() {
         let now = Instant::now();
@@ -7465,9 +7523,11 @@ fn re5_collect_publisher_body(
             break;
         }
     }
+    ctx.end_blocking_region();
 
     let timed_out = !state.completed && state.error.is_none();
     let error = state.error.clone();
+    let error_obj_root = state.error_obj_root.take();
     let out = state.bytes.clone();
     drop(state);
     re5_body_collectors().lock().remove(&id);
@@ -7475,10 +7535,32 @@ fn re5_collect_publisher_body(
         ctx.remove_global_root(sub_global);
     }
 
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_collect_publisher_body id={id} timed_out={timed_out} bytes={} error={:?}",
+            out.len(), error
+        );
+    }
     if timed_out {
+        if let Some(handle) = error_obj_root {
+            ctx.remove_global_root(handle);
+        }
         return Err(ioex("HttpRequest body publisher did not complete"));
     }
-    if let Some(msg) = error {
+    if error.is_some() {
+        // Prefer rethrowing the ORIGINAL Throwable (identity-preserving,
+        // matching real JDK's observed behaviour) over synthesizing a new
+        // IOException from just its text. Resolution can fail if the root
+        // somehow never got set; fall back to the old text-only wrapping
+        // rather than silently swallowing the failure.
+        if let Some(handle) = error_obj_root {
+            let resolved = ctx.resolve_global_root(handle);
+            ctx.remove_global_root(handle);
+            if let Some(orig) = resolved {
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(orig));
+            }
+        }
+        let msg = error.unwrap();
         return Err(ioex(format!("HttpRequest body publisher failed: {msg}")));
     }
     Ok(out)
@@ -7516,6 +7598,9 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let handler_tag = re5_handler_tag(ctx, handler_val);
     let method = read_field_string_or(ctx, req, 0, "GET");
     let uri = read_field_string_or(ctx, req, 1, "");
+    if re5_dbg() {
+        eprintln!("[RE5-DBG] re5_do_request ENTER method={method} uri={uri}");
+    }
     let body_val = ctx.get_field(req, 2);
     let body = re5_request_body_bytes(ctx, body_val)?;
     let hdrs_val = ctx.get_field(req, 3);
@@ -7530,8 +7615,54 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         (None, Some(Value::Object(Some(h)))) => Some((ctx.pin_native_root(h), h)),
         _ => None,
     };
-    let resp = http_perform_request(&method, &uri, &headers, &body, 10)
-        .map_err(|e| ioex(format!("HttpClient request failed: {e}")))?;
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_do_request method={method} uri={uri} body_len={} calling http_perform_request...",
+            body.len()
+        );
+    }
+    // STW cross-thread JIT-takeover deadlock fix (found investigating
+    // reactive ClientHttpConnectorTests intermittent hangs, 2026-07-15): the
+    // raw TcpStream connect/write/read cycle inside `http_perform_request`
+    // blocks this thread in a genuine OS syscall for up to 30s (its own
+    // socket-level read timeout) without cooperating with a concurrent
+    // Stop-The-World pause -- unlike every OTHER blocking native I/O call in
+    // this file (see `re1_socket_read_stream`/`re1_socket_write_stream`
+    // above), which correctly brackets the syscall with
+    // `begin_blocking_region`/`end_blocking_region` so the GC barrier
+    // excludes this thread from `expected` while it cannot reach a
+    // safepoint. Without that, a concurrent STW request (e.g. a JIT
+    // recompile or GC pause triggered by unrelated activity in the SAME
+    // process) waits up to its full round budget for this thread to
+    // cooperate -- while the STW pause is simultaneously what freezes the
+    // real Java thread on the OTHER end of the socket (MockWebServer's own
+    // response-writing dispatcher, ordinary bytecode running in this same
+    // JVM process) that this thread is blocked waiting to hear from. Live
+    // capture: `CRATONVM_DBG_RE5=1` showed a `DELETE` request's `write_all`
+    // succeed in under 200us, then `read_response` block for the full 30s
+    // socket timeout and fail with `WouldBlock`, with a
+    // "STW cross-thread JIT takeover is still waiting for cooperative
+    // mutators rounds=64 pending=1 taken=0" warning firing mid-block --
+    // confirmed HotSpot-only-divergent (8/8 clean runs of the identical
+    // 32-request sequential-MockWebServer-cycle probe on HotSpot; CratonVM
+    // hit it on ~2/13 attempts, always on this JDK-connector code path,
+    // never on the Reactor-Netty/Jetty/HttpComponents connectors that don't
+    // route through this raw-socket implementation).
+    ctx.begin_blocking_region();
+    let perform_result = http_perform_request(&method, &uri, &headers, &body, 10);
+    ctx.end_blocking_region();
+    let resp = perform_result.map_err(|e| {
+        if re5_dbg() {
+            eprintln!("[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request FAILED: {e}");
+        }
+        ioex(format!("HttpClient request failed: {e}"))
+    })?;
+    if re5_dbg() {
+        eprintln!(
+            "[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request OK status={}",
+            resp.status
+        );
+    }
     let out = match real_handler {
         None => {
             let tag = handler_tag.unwrap_or_else(|| "inputstream".to_string());
@@ -8371,14 +8502,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ctx_cls,
         "setDefault",
         "(Ljavax/net/ssl/SSLContext;)V",
-        |_ctx, args| {
-            match args.first().copied() {
-                Some(Value::Object(Some(ctx_obj))) => {
-                    crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
-                    Ok(None)
-                }
-                _ => Err(npe("context")),
+        |_ctx, args| match args.first().copied() {
+            Some(Value::Object(Some(ctx_obj))) => {
+                crate::t27_tls::set_runtime_default_ssl_context(ctx_obj);
+                Ok(None)
             }
+            _ => Err(npe("context")),
         },
     );
     r.register(
@@ -8432,23 +8561,13 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
-            // getSocketFactory() is a CLIENT-side call (the server uses
-            // createSSLEngine / getServerSocketFactory), so if this context
-            // carries a per-context identity it is the client cert. Install it
-            // as the default client identity for the native HttpsURLConnection
-            // client (`http_url_connection::perform`), which can't route through
-            // the synthetic factory. This is the reliable capture point —
-            // overriding the concrete `setDefaultSSLSocketFactory` bytecode does
-            // not work (real JDK method body wins over a native override).
-            if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, this) {
-                crate::t27_tls::set_huc_default_client_identity(Some((cert, key)));
-            }
-            // Likewise remember this context's captured KeyManager objects
-            // (if any — see `SSLContext.init` above) so the native
-            // HttpsURLConnection client can consult a real
-            // `KeyManager.chooseClientAlias` mid-handshake instead of only
-            // ever presenting one fixed identity.
-            crate::t27_tls::capture_huc_key_managers_ctx_key(ctx, this);
+            // getSocketFactory() is a client-side call (the server uses
+            // createSSLEngine / getServerSocketFactory). Capture the complete
+            // context for native HttpsURLConnection, including anonymous
+            // client contexts: its ClientConfig owns the TLS ticket cache.
+            // This is the reliable capture point because the real JDK
+            // setDefaultSSLSocketFactory bytecode cannot be overridden here.
+            crate::t27_tls::capture_huc_ssl_context(ctx, this);
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -8571,7 +8690,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
             if let Ok(sslctx) = obj_arg(args, 0) {
-                if let Some((cert, key)) = crate::t27_tls::ctx_identity(ctx, sslctx) {
+                let identity = crate::t27_tls::ctx_identity(ctx, sslctx);
+                // A client context commonly has only trust material. Capture
+                // its roots before the next context creation can replace the
+                // thread-local selection used by the rustls engine.
+                crate::t27_tls::set_engine_trust_roots_override(eng);
+                if let Some((cert, key)) = identity {
                     crate::t27_tls::set_engine_identity_override(eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
@@ -8582,6 +8706,20 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(eng))))
         });
     }
+    // Netty's JdkSslClientContext reads this immediately after SSLContext.init.
+    // Our bridged real-JDK SSLContext has no contextSpi, so the Java method
+    // would otherwise dereference null despite the usable native TLS context.
+    // The synthetic facade matches the server session-context contract below.
+    r.register(
+        ctx_cls,
+        "getClientSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+
     // getServerSessionContext() — Tomcat caches it and may set cache size /
     // timeout; return a synthetic SSLSessionContext (setters are no-ops).
     r.register(
@@ -8659,6 +8797,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let cfg = crate::t27_tls::build_engine_client_config_with_identity(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+                None,
                 None,
             )
             .map_err(|e| ioex(format!("client TLS config: {e}")))?;
@@ -10417,6 +10556,9 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
 
 fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
+    // The JDK factory contract returns this concrete implementation, not the
+    // abstract public API class. Native bridges are aliased to it after all
+    // registrations below so virtual dispatch retains the concrete receiver.
 
     // VM-thread dispatch loop runner (see re10_spawn_dispatcher).
     r.register(HS_LOOP_CLASS, "run", "()V", re10_serve_loop_run);
@@ -10447,7 +10589,10 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
                 bound_port: AtomicI32::new(bound_port),
             });
             server_registry().lock().insert(server_id, state);
-            let srv = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpServer", 5);
+            // The public class is abstract, but this native-backed server owns
+            // the concrete implementation. Keep state for every abstract
+            // method we bridge below, including the optional Executor.
+            let srv = alloc_concurrent_synthetic(ctx, HS_IMPL_CLASS, 6);
             // Fully-resolved echo (matches HotSpot: `getAddress()` returns
             // the socket's ACTUAL bound address, not the caller's original
             // hostname string) — see `alloc_inet_socket_address_resolved`.
@@ -10459,8 +10604,44 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             ctx.set_field(srv, HS_CONTEXTS, Value::Object(None));
             ctx.set_field(srv, HS_SERVER_ID, Value::Int(server_id));
             ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
+            ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
             let _ = backlog;
             Ok(Some(Value::Object(Some(srv))))
+        },
+    );
+
+    // `HttpServer` declares these methods abstract. `create` returns the
+    // native-backed receiver above, so both calls must be registered here;
+    // otherwise virtual dispatch resolves the abstract declaration and throws
+    // `AbstractMethodError: ... has no Code attribute` before a server can
+    // start (Keycloak's shared startHttpServer helper exercises this path).
+    r.register(
+        hs,
+        "setExecutor",
+        "(Ljava/util/concurrent/Executor;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.get_field(this, HS_STARTED).as_int().unwrap_or(0) != 0 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "server already started".to_string(),
+                }
+                .into());
+            }
+            ctx.set_field(
+                this,
+                HS_EXECUTOR,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(None)
+        },
+    );
+    r.register(
+        hs,
+        "getExecutor",
+        "()Ljava/util/concurrent/Executor;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, HS_EXECUTOR)))
         },
     );
 
@@ -10584,9 +10765,16 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
     r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let s = ctx.get_field(this, 1);
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
-        ctx.set_field(uri, 0, s);
+        // The exchange stores the request target as a String. Do not place it
+        // in a guessed URI field slot: in the real JDK layout slot 0 is the
+        // scheme, not the full external form, which made toString()/getPath()
+        // observe an empty URI. `make_uri` writes the canonical URI fields by
+        // name and therefore works for both synthetic and real-JDK layouts.
+        let raw = match ctx.get_field(this, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let uri = make_uri(ctx, &raw);
         Ok(Some(Value::Object(Some(uri))))
     });
     // Request/response headers are stored on the exchange as REAL
@@ -10773,6 +10961,11 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     });
     r.register(rb, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(rb, "close", "()V", |_ctx, _args| Ok(None));
+
+    // Native dispatch is keyed by the receiver class rather than Java
+    // inheritance. Mirror the complete public HttpServer bridge surface onto
+    // the concrete class returned by the factory, including set/getExecutor.
+    r.alias_class(hs, HS_IMPL_CLASS);
 }
 
 // ---------------------------------------------------------------------------
@@ -11528,6 +11721,24 @@ mod tests {
     }
 
     #[test]
+    fn re6_ssl_context_session_accessors_are_registered() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re6_ssl_context(&mut registry);
+        for method in ["getClientSessionContext", "getServerSessionContext"] {
+            assert!(
+                registry
+                    .find(
+                        "javax/net/ssl/SSLContext",
+                        method,
+                        "()Ljavax/net/ssl/SSLSessionContext;",
+                    )
+                    .is_some(),
+                "missing {method} native"
+            );
+        }
+    }
+
+    #[test]
     fn re5_real_jdk_http_client_builder_fluent_methods_are_registered() {
         let mut registry = NativeMethodRegistry::new();
         register_re5_http_client(&mut registry);
@@ -11567,6 +11778,29 @@ mod tests {
                     .find("java/net/http/HttpClient$Builder", method, descriptor)
                     .is_some(),
                 "missing {method}{descriptor}"
+            );
+        }
+    }
+
+    #[test]
+    fn re10_http_server_executor_bridges_are_concrete_receiver_registrations() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re10_http_server(&mut registry);
+        for class in [
+            "com/sun/net/httpserver/HttpServer",
+            "sun/net/httpserver/HttpServerImpl",
+        ] {
+            assert!(
+                registry
+                    .find(class, "setExecutor", "(Ljava/util/concurrent/Executor;)V")
+                    .is_some(),
+                "missing {class}.setExecutor bridge"
+            );
+            assert!(
+                registry
+                    .find(class, "getExecutor", "()Ljava/util/concurrent/Executor;")
+                    .is_some(),
+                "missing {class}.getExecutor bridge"
             );
         }
     }

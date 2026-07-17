@@ -4,6 +4,123 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-16 WildFly boot CCE family ROOT CAUSE FIXED — moving young GC's object-start walk truncated at the first TLAB gap, mass-dangling references (was misattributed for weeks as "register-invisible JIT roots" / per-site missed pins)
+
+FIXED (full writeup): [`wildfly-cce0079-young-start-set-truncation-FIXED.md`](../internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md)
+— the `WFLYCTL0079` / `ClassCastException: java.lang.Object cannot be cast to X` family during
+`parallel-extension-add` (`AttributeAccess`/`AttributeDefinition`/`Comparable`/`Function`/`Map`/…
+cast targets), the `via_pin=true` mystery, and a swath of "silent wedge" boot failures all traced
+to ONE defect: `collect_garbage_inner`'s moving-path `young_object_starts` walk `break`'d at the
+first free-list/TLAB/GAP-filler gap (warning present in 100% of baseline logs) and
+`forward_object` then refused to evacuate every young object above the breakout — for precise
+roots and native pins included. Fixed with a gap-aware walk + a skip-cycle fail-safe (measured:
+diverting to the non-moving sweep instead reclaims live objects on the precise-root path —
+HIB-CV-22/32/33). Standalone CCE rate 0/14 post-fix vs ~50% baseline. Landed alongside: ~35
+audited Family-1 stale-at-store fixes (native-collections TreeMap/PriorityQueue/ArrayDeque/
+LinkedList/COWAL/HashSet-bulk/LinkedHashMap-eviction + lookup family), XNIO conduit/worker
+fixes (listener dispatch, channel-alloc registry keys), DataInput/OutputStream fixes, an
+always-on RETURN-value `load_and_forward` healing barrier at the native-call funnel, and new
+diagnostics (`CRATONVM_DBG_STALE_OBJREF_CYCLES` quarantine ring, `CRATONVM_DBG_CCE_BT`,
+store-funnel stale-value checks). A narrow domain-no-JIT long-tail residual remains OPEN in
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
+(2026-07-16 section); the JIT SIGSEGV bucket stays with the SB-CRASH-04/precise-maps roadmap.
+Timeline correction (merge-time finding): the truncating walk itself was introduced the same
+morning by `1c4aaa06`, so the 100%-rate collapse was a same-day regression amplifier on top of
+the older lower-rate family (which the ~35 pin fixes + the return barrier address); `fb15be63`
+independently landed the GAP-filler stride portion — this branch adds the free-list/TLAB merge,
+walk-completeness tracking, and the skip-cycle fail-safe on top. Details in the FIXED writeup.
+
+RETIRED with the same wave:
+[`wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md`](../internal/fixed-suite-bugs/wildfly-domain-hc0053-server-inventory-timeout-RESOLVED.md)
+— the multi-session WildFly domain-boot record (inventory transport → StreamDecoder →
+async-future/XNIO AB-BA deadlock → blocked on this CCE family) captured its final closing
+artifact: BOTH managed servers reaching `WFLYSRV0025` in one clean run (`DM_001`: server-one
+70.1s, server-two 84.2s, zero failure markers in the domain console log).
+
+## 2026-07-15 Keycloak `WelcomePageTest` zipfs `Files.copy` bug FIXED (two stacked path-layout bugs); teardown hang re-verified NOT reproducing
+
+FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`zipfs-files-copy-wrapped-path-FIXED.md`](../internal/fixed-suite-bugs/zipfs-files-copy-wrapped-path-FIXED.md)
+-- closes item 3 of [`keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`](keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md)
+("`Files.copy()` from a non-default `FileSystemProvider` path fails"), which blocked Quarkus's
+`ZipUtils.unzip()` (used by `DistributionKeycloakServer.createInstallation()` to extract the Keycloak
+distribution for every `tests/base` integration test that needs a running server). Two independent
+`native-builtins/src/phases_late.rs` bugs stacked: (1) `Files.copy`'s native didn't classify a
+jarfs-encoded *source* path, only the destination; (2) `p57_read_path()` silently mis-read a Quarkus
+`PathWrapper` decorator Path (used by `ZipUtils`'s `ignoreFileWriteability` before every zip mount) as
+an empty string, which made the zip mount silently fall back to the *real host filesystem root* --
+`Files.walkFileTree` then tried to copy the entire host disk into the extraction target. Fixed +
+merged to `dev`: `e38d6f60`/`90cc7e73` (bug 1), `a43436fc`/`882395cd` (bug 2). With both fixed, the
+Keycloak 26.6.1 test server now boots successfully under `WelcomePageTest`, and the previously-reported
+~27-minute post-test-completion teardown hang was re-run end-to-end and did NOT reproduce (process now
+exits cleanly ~183s after starting, well under a second after the last test method finishes). The tests
+themselves still fail for unrelated, already-tracked reasons (item 2's Selenium/Stream bug, and a newly
+observed Maven artifact-resolution failure) -- see the known-issues doc's 2026-07-15 update section for
+detail.
+
+## 2026-07-15 `WFLYCTL0079` (any extension) during `parallel-extension-add`: generalized to the existing `AttributeAccess` CCE doc; "JIT required" DISPROVED; one real site FIXED, residual re-characterized
+
+With the 2026-07-14 ObjectName fix below and the prior session's stale-`ObjectRef` fixes in place,
+WildFly standalone boot progresses well past `parallel-extension-add` into "Building security domain"
+before hitting `WFLYCTL0079: Failed initializing module org.wildfly.extension.io` (or, non-deterministically,
+almost any other extension). Investigation found this is **the same bug** as
+[`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)'s
+`ClassCastException: java.lang.Object cannot be cast to X` family, just generalized: repro batches hit it
+against `org.wildfly.extension.elytron`, `org.jboss.as.jaxrs`, `org.wildfly.extension.undertow`,
+`org.jboss.as.clustering.infinispan`, and `org.wildfly.extension.io` itself (twice), with cast targets
+`AttributeAccess`, `AttributeDefinition`, `Comparable`, `RegistrationPoint`, `CapabilityRegistration`,
+`Predicate`, and an `AttributeAccess$Flag[]` array — confirming the originally-reported module name is
+circumstantial (whichever of the ~37-42 concurrent `parallel-extension-add` worker threads reads a
+just-corrupted address first), not diagnostic. That doc's own "JIT is required" conclusion is **disproved**:
+the identical crash reproduces under `--nojit` (4/8 attempts). One genuine, narrow contributing site was
+found and FIXED —
+[`../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md`](../internal/fixed-suite-bugs/wildfly-invoke-virtual-lambda-sam-compat-stale-locals-FIXED.md):
+`vm/src/vm/vm_exec.rs::invoke_virtual`'s lambda-dispatch decision point read `receiver`/`args` again,
+unpinned, after its own `.filter()` predicate's `lambda_args_sam_compatible` call (which can trigger class
+loading) — fixed by pinning both across that window. Verified via `cargo test -p cratonvm-vm --lib`
+(2202 passed / 9 pre-existing `--release`-only failures, identical before/after via `git stash`), zero
+regressions. **Does not close the residual**: matched before/after repro batches show the same overall
+`WFLYCTL0079` rate (5/12 both). A live diagnostic (temporary instrumentation, not landed) proved the
+remaining stale reads go through the codebase's existing pin-protection path (`via_pin=true`) and are
+*still* stale — ruling out "yet another missed-pin site" and pointing instead at a cross-thread
+GC-root-visibility/timing race across WildFly's ~37-42 concurrently-executing worker threads, a
+meaningfully different (though related) characterization than the original doc's JIT-only
+`SB-CRASH-04` attribution. See that doc's own 2026-07-15 follow-up section for the full evidence chain;
+still OPEN, deliberately not further patched (deep GC/threading infrastructure work).
+
+## 2026-07-14 Stream/ArrayList heap corruption under extreme small-heap GC pressure - FIXED 2026-07-16
+
+The 24-thread 32 MB Stream/ArrayList repro is fixed and archived at docs/internal/fixed-suite-bugs/stream-arraylist-gc-pressure-heap-corruption-FIXED.md. The closure combines an old-to-young remembered-set fallback, terminal-worker STW publication, exact containment for conservative interior roots, a lazy-Stream pin, and a fail-closed non-moving JIT-active young-GC policy. Azure validation: two JIT and two no-JIT runs all reported RESULT=OK, plus 791 of 791 GC unit tests.
+
+## 2026-07-14 WildFly standalone boot ObjectName `_ca_array` NPE FIXED (100% boot blocker, open since 2026-07-10's "Bug 3a")
+
+- FIXED (moved to `docs/internal/fixed-suite-bugs/`): [`wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md`](../internal/fixed-suite-bugs/wildfly-standalone-boot-objectname-ca-array-npe-FIXED.md) -- bisected regression (introduced by `d8092acb`, the same "fix-tests-real-jdk-contracts" commit responsible for the `String.getBytes()`/`java.util.Properties`/JMX-native-surface regressions in this file) that blocked 100% of WildFly-standalone-boot attempts on real JDK25, on the very first JMX MBean registration. Root cause: `d8092acb` correctly stopped `MBeanServerFactory.createMBeanServer` from being unconditionally shadowed by a synthetic server in real-JDK mode, which let real bytecode reach `Repository.addNewDomMoi` -> `ObjectName.getCanonicalKeyPropertyListString()` for the first time -- a method never natively covered against the synthetic 1-field `ObjectName` model (already known and deliberately left unfixed as "Bug 3a" in `managerwebapp-deploy-bare-assertion-FIXED.md`, 2026-07-10, when the synthetic-server shadow was still masking it). Fixed by adding `getCanonicalKeyPropertyListString`/`isPattern`/`isDomainPattern`/`isPropertyPattern`/`isPropertyListPattern` natives derived from the same canonical-string text model the rest of `ObjectName`'s natives already use. Note: a concurrent same-day fix below (`6a0eedd8`) independently re-masks `getPlatformMBeanServer()` (fixing its own, broader JMX-native-surface regression), so the *specific* WildFly boot path no longer exercises this fix either -- but the underlying `ObjectName` defect is now genuinely closed, not just re-masked, closing Bug 3a for good.
+
+## 2026-07-14 (cont'd) String.getBytes(), Locale bootstrap, and HttpExchange URI regressions FIXED
+
+- FIXED (moved to `docs/internal/`): [`string-getbytes-empty-real-jdk-mode-FIXED.md`](../internal/string-getbytes-empty-real-jdk-mode-FIXED.md) -- same failure class as the `java.util.Properties` fix (`f62d2073`): `register_real_charset_natives` (`native-builtins/src/charset.rs`) never set its own registry category, so its real-JDK-mode call sites inherited the default `SyntheticStub` and got silently dropped by `d8092acb`'s hardening. Fixed by wrapping the whole function body in `with_category(Bridge, ...)`. This was also the true root cause of the `com.sun.net.httpserver.HttpServer` "always empty body" symptom noted in the URLClassLoader fix above.
+- FIXED (moved to `docs/internal/`, found already fixed on `dev` by a concurrent session): [`locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md`](../internal/locale-real-jdk-bootstrap-noclassdeffounderror-FIXED.md) -- same root mechanism, fixed via `f62d2073`'s `java.util.Properties` bridge-pinning (the `Locale`/`BaseLocale`/`StaticProperty` chain bottoms out in the same `System.getProperties()` read that fix restored).
+- FIXED (moved to `docs/internal/`): [`httpserver-exchange-requesturi-getpath-empty-FIXED.md`](../internal/httpserver-exchange-requesturi-getpath-empty-FIXED.md) -- `HttpExchange.getRequestURI()` was writing the request target into a guessed synthetic `URI` slot (real-JDK slot 0 is `scheme`), leaving `toString()`/`getPath()` empty. It now uses the shared field-name-safe URI constructor; a live server probe verified the full target, decoded/raw path, and query.
+
+## 2026-07-14 TestClassServerTest URLClassLoader isolation FIXED; severe new String.getBytes() regression found
+
+- FIXED (moved to `docs/internal/`): [`keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md`](../internal/keycloak-testclassserver-invalidpackage-classnotfound-FIXED.md) -- root cause was the same underlying defect as `spring-boot-probe-sweep/SBR-14-urlclassloader-parent-null-bypassed.md`: a null-parent `URLClassLoader` never consulted its own URL/HTTP classpath at all, resolving through CratonVM's flat global class store instead (breaking isolation AND making `testInvalidPackage`'s expected `ClassNotFoundException` never fire). Fixed in `native-builtins/src/classloader.rs`/`classloader_real.rs` (defer-to-`findClass` gate now covers bare `URLClassLoader`, not just subclasses) plus a genuine HTTP(S) fetch path added for URLClassLoader entries (`http_client.rs`). Verified via an isolated A/B repro against a real external HTTP server; the literal upstream test still can't run end-to-end due to the new bug below.
+- 🔴 NEW, severe: [`string-getbytes-empty-real-jdk-mode.md`](string-getbytes-empty-real-jdk-mode.md) -- `String.getBytes()` (all overloads) returns an empty byte array in real-JDK mode, confirmed pre-existing (present on unmodified `dev` HEAD, not introduced by the fix above). Suspected fallout from the same-day commit `d8092acb`'s new synthetic-native-stub-dropping hardening silently dropping a genuine bridge native that was never re-categorized. Broad blast radius suspected (anything doing String-to-bytes: I/O, hashing, HTTP bodies) -- likely under-detected because failures land on higher-layer symptoms. Not yet fixed.
+
+## 2026-07-14 Spring Boot `crashfail-20260714` rerun; 9 new bug clusters filed under `springboot/`
+
+Full-suite rerun after the 7 clusters from 07-11/07-13 were fixed (see
+[`springboot/README.md`](springboot/README.md) for the full table). While the
+8-shard run was still in progress, triaged the CRASH set (8 fatal
+process-aborts) and the clearest FAIL log-signature clusters, dispatching 8
+parallel investigation agents. Two crashes have precise, high-confidence root
+causes with concrete fix directions:
+
+- [`springboot/charbuffer-order-missing-native-idn-clinit-cluster.md`](springboot/charbuffer-order-missing-native-idn-clinit-cluster.md) — `CharBuffer.order()` has no native registration; poisons `java.net.IDN`'s `<clinit>` for the rest of the process on first use (6 FAIL classes + 1 fatal CRASH).
+- [`springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md`](springboot/structured-logging-map-entry-getkey-lambda-dispatch-precedence.md) — `Map.Entry::getKey`/`getValue` method references over a synthetic wrapper entry resolve to the wrong native override (interface-level generic beats the wrapper's own delegating native); confirmed with a standalone repro (5 classes).
+- [`springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md`](springboot/applicationcontextrunnertests-lazy-cglib-classnotfound-crash.md) — Spring's `@Lazy`-injection CGLIB proxy naming (`$$SpringCGLIB$$`) isn't recognized as a recoverable classloading miss, so an expected `ClassNotFoundException` escapes as an internal error and aborts the whole process (3 fatal CRASH classes; likely affects `@Lazy` injection broadly, not just these 3).
+
+The remaining five are OPEN with strong, evidence-backed hypotheses not yet confirmed by live bisection: `jit-dispatch-depth-guard-shallow-stackoverflow-cluster.md`, `comparable-classcast-lambda-proxy-unknown-class.md`, `collectionbindertests-classcast-testdescriptor-crash.md`, `jsonvaluewritertests-nesting-depth-guard-stack-overflow.md` (a genuine native `EXCEPTION_STACK_OVERFLOW`, not a caught Java one), and `reactor-nettyhttpclient-httpclientsecure-null-provider-crash.md`. The Logback `LoggerContext` final-field cluster was fixed 2026-07-15 by restoring real constructor invocation; its archive is [`internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md`](../internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md). None overlap with previously-retired clusters.
+
 ## 2026-07-13 WildFly `AttributeAccess` CCE confirmed as register-invisible-JIT-root family; NEW "Family 1" stale-ObjectRef residual found alongside it
 
 - 🔴 NEW: [`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`](wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md)
@@ -31,7 +148,7 @@ angles**; this index is the consolidated map. Read it first.
 ## 2026-07-13 Keycloak quarkus/runtime SmallRye Config resolution mismatches FIXED (3/4); PicocliTest hang split out as separate open bug
 
 - FIXED (moved to `docs/internal/`): [`fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md`](../internal/fixed-suite-bugs/keycloak-quarkus-runtime-config-resolution-mismatches.md) вЂ” landed on `dev` via commit `10a561f21` earlier the same day this doc's investigation resumed. 3 of 4 original symptoms confirmed fixed by rerun: `DatasourcesConfigurationTest` (host-env-leak into `propagatedPropertyNames`, plus the interceptor-context `NoSuchMethodError`), `TracingConfigurationTest` (hardcoded-wrong `isTracingEnabled` native stub removed), `IgnoredArtifactsTest`. A narrower residual remains OPEN and is tracked inline in that doc rather than as a separate file: `ConfigurationTest::testDatabaseProperties` intermittently (~80% of runs) throws a `ClassCastException: Object cannot be cast to String` from `SmallRyeConfig$ConfigSources$PropertyNames.latest()` вЂ” confirmed genuinely racy (diagnostic instrumentation that merely reads extra class-name info per stream iteration made it disappear 6/6 vs failing 5/5 without it), not reproducible in a clean standalone repro (needs accumulated state from ~72 prior tests in the class), root cause not pinned down (leading suspect: `PropertyMappingInterceptor.iterateNames()`'s `mappersWithoutValues.stream()...` combined with `hasInferredValue`'s reentrant `context.restart()` call, but not confirmed).
-- OPEN, newly filed: [`quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md`](keycloak/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md) вЂ” the config-resolution doc's 2026-07-13 update had speculated `PicocliTest`'s 27/107 failures "may share a root cause" with the config-mismatch bugs above; that hypothesis is REFUTED. Confirmed via CPU-time flatlining + a `--stack-dump-on-timeout` thread dump that `PicocliTest` genuinely hangs 58 frames deep inside picocli's own `ArgGroupSpec`/`ColorScheme`/`Text` CLI-help-synopsis text building вЂ” entirely unrelated to SmallRye config sources/interceptors, and not touched by the `10a561f21` fix.
+- FIXED (moved to `docs/internal/`, 2026-07-14): [`fixed-suite-bugs/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713-FIXED.md`](../internal/fixed-suite-bugs/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713-FIXED.md) — the full 107-test `PicocliTest` class now runs to completion with no hang (verified twice, including at the true current `dev` tip), and the doc's own exponential-fan-out theory (N possibly 30-40) is refuted by direct measurement (real N=3). A separate, distinct correctness issue (26/107 assertion failures, newly visible now that the class runs to completion) is being triaged independently and is not part of this closure.
 ## 2026-07-13 DoHead 64-class family sweep GREEN + new sporadic Thread.start() finding
 
 Full-family validation of all 64 `TestHttpServletDoHeadInvalidWrite*`
@@ -52,7 +169,7 @@ throws `IllegalThreadStateException`, ~1/5000 Tomcat boots).
 
 ## 2026-07-13 `OnClassCondition` NPE-cast-to-`String[]` cluster FIXED (largest single Spring Boot cluster, 75 classes)
 
-- FIXED/RETIRED (moved to `docs/internal/`): [`springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md) вЂ” `annotation_element_to_java_typed`'s `Class`-typed-element resolution returned a bare Java `null` instead of a deferred `TypeNotPresentException` sentinel for an unresolvable class outside the (rare) classloader-isolation path вЂ” the common case for `@ConditionalOnClass(SomeOptionalClass.class)`. Spring's own `@ConditionalOnClass` machinery is specifically written to catch that exception; the `null` instead let a `classValuesAsString` conversion NPE, surfacing as `OnClassCondition.addAll`'s `ClassCastException: java.lang.NullPointerException cannot be cast to [Ljava.lang.String;` across 75 classes. Fixed by building the sentinel in that path too. Verified against all 75/75 originally-affected classes вЂ” zero residual. Along the way, applying the fix appeared to expose an unrelated heap-corruption bug in 3 classes; that turned out to already be independently fixed on `dev` the same day (`e7e3bb91f`, for a Flyway/CGLIB SIGSEGV) вЂ” this fix's new code path was just exercising that same pre-existing `read_string`-misidentifies-arrays-as-Strings bug far more often. One small, separate, non-memory-unsafe residual remains: [`springboot/brave-baggagefields-classcast-summary-printing.md`](springboot/brave-baggagefields-classcast-summary-printing.md).
+- FIXED/RETIRED (moved to `docs/internal/`): [`springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md) вЂ” `annotation_element_to_java_typed`'s `Class`-typed-element resolution returned a bare Java `null` instead of a deferred `TypeNotPresentException` sentinel for an unresolvable class outside the (rare) classloader-isolation path вЂ” the common case for `@ConditionalOnClass(SomeOptionalClass.class)`. Spring's own `@ConditionalOnClass` machinery is specifically written to catch that exception; the `null` instead let a `classValuesAsString` conversion NPE, surfacing as `OnClassCondition.addAll`'s `ClassCastException: java.lang.NullPointerException cannot be cast to [Ljava.lang.String;` across 75 classes. Fixed by building the sentinel in that path too. Verified against all 75/75 originally-affected classes вЂ” zero residual. Along the way, applying the fix appeared to expose an unrelated heap-corruption bug in 3 classes; that turned out to already be independently fixed on `dev` the same day (`e7e3bb91f`, for a Flyway/CGLIB SIGSEGV) вЂ” this fix's new code path was just exercising that same pre-existing `read_string`-misidentifies-arrays-as-Strings bug far more often. The separate Brave summary-printing residual is now also **FIXED/RETIRED**: [`springboot/brave-baggagefields-classcast-summary-printing-FIXED.md`](../internal/springboot/brave-baggagefields-classcast-summary-printing-FIXED.md).
 
 ## 2026-07-12 Spring Boot HANG-rerun follow-up: 2 more clusters filed (both now fixed)
 
@@ -119,7 +236,7 @@ bean-registration TIMEOUT cluster (all hard-hang at the 120s ceiling), an
 WebFlux reactive FAIL/EMPTY cluster, and 6 ABEND crashes with `found=0`
 (crash before test discovery, distinct from the mid-run HIB-CV-32 crash
 shape). See
-[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
+[`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md)
 for full detail.
 
 ## 2026-07-11 `HashMap` native-dispatch overhead вЂ” FIXED/RETIRED
@@ -608,7 +725,7 @@ surfaced three distinct, layered issues:
 
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)
 
-- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](../internal/CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
+- [`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`](CRATONVM-SPRING-GENUINE-BUGLIST-125.md) вЂ” full per-test-method detail for 125 CratonVM-unique Spring failures (HotSpot passes, CratonVM doesn't), cross-referenced against a clean HotSpot baseline with the classpath-dump gap fixed (spring-websocket/oxm/jms/orm/core-test jars were never built вЂ” `./gradlew jar testFixturesJar testClasses` fixed it). Down from 159 two dev commits ago: 65 newly fixed (entire SpEL cluster + spring-jms module), 31 "newly broken" are **not** new regressions вЂ” root-caused to the already-tracked HIB-CV-32 batch/load-dependent heap-corruption family (25/31 SIGSEGV, one test confirmed passing standalone but ABEND under full-suite load).
 
 ## 2026-07-09 BC-java `asn1-regression` X9Test SIGSEGV retired
 
@@ -937,12 +1054,10 @@ now **also FIXED** (2026-07-06); the historical JIT-only decode-error note is
 retired, the current open follow-up is the `RealmModelTest` Liquibase-phase
 timeout, and the sibling `--nojit` STW shutdown hang is fixed and retired to
 [`docs/internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`](../internal/fixed-suite-bugs/keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md).
-Not CratonVM bugs: 543 FAILs (`testsuite/integration-arquillian/tests/base`
-+ `tests/other/sssd`, exhaustively confirmed - 543/544 exact match, the 544th
-is the System Rules finding above) are "Not found frontend container:
-auth-server-undertow" - an Arquillian environment/container-provisioning gap
-in this harness, not a VM defect (would fail identically on real HotSpot run
-the same way). 25 additional CRASHes (`scim/core`, `ssf/*`,
+The former Arquillian `auth-server-undertow` container-provisioning gap is
+fixed in the per-class runner: it now forwards the effective Maven Surefire
+bootstrap configuration. See the [retired record](../internal/fixed-suite-bugs/keycloak-arquillian-auth-server-undertow-container-not-found-FIXED.md).
+25 additional CRASHes (`scim/core`, `ssf/*`,
 `test-framework/*`, `tests/webauthn`, 2x`tests/clustering`) were a harness
 classpath gap (missing `junit:junit`, fixed alongside the JUnit Platform
 launcher fix above), not a VM bug.
@@ -1041,8 +1156,8 @@ it under `docs/internal`.
   [`abstractajpprocessor-socket-not-connected-FIXED.md`](../internal/tomcat-08-07/abstractajpprocessor-socket-not-connected-FIXED.md).
   The AJP secret residual is now fixed and retired; see
   [`ajp-testsecret-secret-attribute-not-enforced-FIXED.md`](../internal/tomcat-08-07/ajp-testsecret-secret-attribute-not-enforced-FIXED.md).
-  The one independently tracked remaining residual is
-  [`ajp-testnoheaders-response-body-not-empty.md`](tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md).
+  The AJP no-headers residual is also fixed and retired; see
+  [`ajp-testnoheaders-response-body-not-empty-FIXED.md`](../internal/tomcat-08-07/ajp-testnoheaders-response-body-not-empty-FIXED.md).
 
 ## How many distinct bugs are here?
 
