@@ -765,6 +765,145 @@ Probe sources (all Hibernate-free except `HashedNameProbe.java`) left at
 (isolated `Arrays.copyOfRange` check, clean/not the cause),
 `HashedNameProbe.java` (real production call, reused from the prior session).
 
+## Update 2026-07-17 (diagnostic-tooling session): new `CRATONVM_DBG_AIOOBE3` probe decisively rules out the moved/stale-pointer hypothesis from the entry above (mechanism is data corruption, not GC-root tracking); re-localizes the leading suspect to the **`mulsub` "final-digit" call site** in `divideMagnitude`, which the prior entry's mulsub exoneration did not cover — still not fixed
+
+Picked up this doc's own "next step" #2 (resolve stale-pointer-vs-out-of-bounds-write)
+using a new, durable diagnostic instead of the suggested reflection-based
+identity-hash probe: added `CRATONVM_DBG_AIOOBE3` (env-gated, behavior-neutral
+when unset; landed this session, `jit_throw_aioobe`'s x64 stub now also passes
+the array pointer -- `RAX`, already live and unused at that point -- as a 3rd
+argument) which dumps the raw `ObjectHeader` (`class_id`, `kind`,
+`element_type`, `array_length`, `num_slots`, `gc_age`, **`forwarding_ptr`**) at
+the exact pointer the JIT's bounds check compared against, at the moment
+`jit_throw_aioobe` fires. This directly answers "did GC move this object out
+from under a stale JIT-held pointer" without needing a live debugger or a
+reflection probe.
+
+**Repro used:** the prior entry's `SmallDividendRepro.java` (still present at
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`,
+unchanged, still reproduces at ~88% on `dev@08808a57` -- confirmed not fixed by
+anything landed between `dev@3e74dd5a` and `dev@08808a57`) under
+`CRATONVM_DBG_GC_STRESS=65536` (turns the silent-wrong-result failure into an
+immediate, deterministic `ArrayIndexOutOfBoundsException`, per the prior
+entry's finding #6) plus `CRATONVM_DBG_AIOOBE3=1`. Fires reliably on the first
+stressed run:
+
+```
+[AIOOBE3-DIAG] jit-reported index=2 length=2 array_ptr=0x20040408cd0
+header: class_id=0 kind=1 elem_ty=10 ident_hash=403 array_length_field=2
+num_slots=2 gc_age=1 gc_flags=0 forwarding_ptr=0x0
+```
+
+`kind=1` = `ObjectKind::Array`, `elem_ty=10` = `ArrayElementType::Int` (per
+`types/src/heap_types.rs`). **This is decisive:**
+
+1. **`forwarding_ptr=0x0`** -- the object was never evacuated/relocated. Combined
+   with the prior entry's own observation that `CRATONVM_MOVING_YOUNG` is off by
+   default, this closes out hypothesis (a) from the prior entry's finding #6
+   outright: this is **not** a moved-object/stale-root-tracking bug. No G1
+   evacuation-pointer-staleness fix is needed here.
+2. **The header is fully self-consistent** (`array_length_field=2` matches
+   `num_slots=2`, plausible `gc_age`/`ident_hash`, no garbage bit patterns) --
+   this is a real, validly-allocated `int[2]` object, not heap corruption
+   smearing garbage across an unrelated address. The JIT's bounds check itself
+   (RAX->header->length compare->RCX index) is doing exactly what it's supposed
+   to do; the bug is upstream of it, in *which* index or *which* array
+   reference reached that check.
+3. This confirms the prior entry's hypothesis (b): the mechanism is a genuine
+   **wrong value** -- either an out-of-bounds *index* computed one too high, or
+   a live reference that's pointing at the wrong (but validly-allocated)
+   `int[2]` object -- not a stale/moved pointer. Per the same MD5-digest-shaped
+   input distribution reasoning used throughout this doc's history, a real
+   `int[2]` with this exact shape can only plausibly be `divisor` (or the `a`
+   parameter it's passed as) inside `MutableBigInteger.divideMagnitude`/
+   `mulsub` -- `final int dlen = div.intLen;` is genuinely `2` for the
+   production divisor (`longRadix[35]` ~= 61.7 bits) and for
+   `SmallDividendRepro`'s fixed `35^12` divisor alike.
+
+**Re-examined the prior entry's finding #3 ("not mulsub") against
+`SmallDividendRepro`'s own stated shape and found a gap in it.** Finding #3
+correctly shows the main Knuth `for (j=0; j<limit-1; j++)` loop runs zero
+iterations for `SmallDividendRepro` (`limit-1 == 0`, small dividend). But
+`divideMagnitude`'s real JDK source (`jdk25/lib/src.zip`, confirmed by direct
+read) calls `mulsub` a **second, unconditional time outside that loop**, for
+the final digit:
+
+```java
+// D4 Multiply and subtract  (this is OUTSIDE the `for (j=0; j<limit-1; ...)` loop)
+rem.value[limit - 1 + rem.offset] = 0;
+if (needRemainder)
+    borrow = mulsub(rem.value, divisor, qhat, dlen, limit - 1 + rem.offset);
+```
+
+This call is reached exactly once per `divideMagnitude` invocation whenever
+`qhat != 0` (the overwhelmingly common case), **independent of how many times
+the main loop ran** -- so `SmallDividendRepro` (limit=1, main loop skipped)
+still calls `mulsub` exactly once, through this "final-digit" call site.
+Finding #3's manual trace verified `mulsub`'s *own* compiled bytecode-to-asm
+translation is internally correct for whatever `len`/`a`/`offset` it is
+*given* (confirmed independently this session -- full disassembly of
+`mulsub([I[IIII)I`, `CRATONVM_DBG_JIT_DISASM=mulsub`, shows a structurally
+sound `for (j=len-1; j>=0; j--)` decrement loop with the loop bound (`r13`,
+loaded once from the `len` argument register `r8` at entry and never
+reloaded) driving both the loop init and the `a[j]` bounds check
+consistently). That trace did **not**, and could not by itself, verify that
+the *value* arriving in `r8`/`len` at the call site is actually `dlen` -- i.e.
+it rules out a bug **inside** `mulsub`, not a bug in **what `divideMagnitude`
+passes to it**. Given `mulsub` is a private instance method invoked via
+`invokespecial` with `this`+5 params = exactly 6 Java-level arguments, filling
+*every* SysV integer argument register (`ARG_REGS = [RDI,RSI,RDX,RCX,R8,R9]`,
+`jit/src/x64.rs`) with none left over for stack-arg fallback -- a boundary
+condition ("call site needs exactly all 6 registers, no more, no fewer") that
+is inherently less exercised/tested than calls with 1-4 args, is a strictly
+narrower and more plausible target than a bug shared by every array access in
+the method.
+
+**Not fixed this session** -- did not pin the exact faulty instruction (the
+divideMagnitude-side call-argument marshaling for the final-digit `mulsub`
+call specifically, as opposed to the loop's repeated calls to the same
+callee, was not yet isolated by disassembly; `divideMagnitude`'s compiled body
+is 24KB and the two call sites are not textually adjacent). Declined to
+speculatively patch `emit_stack_arg_setup`/the invokespecial 6-arg direct-call
+path (`jit/src/x64.rs` ~line 24505-24525) without first confirming which of
+`len` (R8) vs the `divisor` reference itself (RDX, arg index 2) arrives wrong
+-- per this doc's own standing guidance, both are equally consistent with the
+`AIOOBE3` evidence above, and a wrong fix to shared invoke-dispatch codegen
+used far beyond `BigInteger` would be worse than no fix.
+
+**Next step for a follow-up session, in order of expected cost/payoff:**
+1. Reuse `SmallDividendRepro.java` + `CRATONVM_DBG_GC_STRESS=65536` +
+   `CRATONVM_DBG_AIOOBE3=1` (this session's addition, already on `dev`) for an
+   instant, reliable repro/diagnostic loop -- no Hibernate, sub-second, fires
+   on the first run.
+2. Isolate the two `mulsub` call sites from each other directly: temporarily
+   force `SmallDividendRepro`'s divisor/dividend so that `limit >= 2` (main
+   loop runs >=1 iteration, exercising the *loop's* `mulsub` call site) vs.
+   `limit == 1` (main loop never runs, only the *final-digit* call site is
+   exercised, as today) and compare failure rates. If only one shape fails,
+   that pins which of the two (textually distinct, separately-codegen'd)
+   `mulsub(...)` call sites in `divideMagnitude`'s compiled body is at fault,
+   without needing to read the full 24KB disassembly.
+3. Once the offending call site is isolated, get its `CRATONVM_DBG_JIT_DISASM`
+   output specifically (grep the compiled `divideMagnitude` body around that
+   call site's argument-register loads -- `ARG_REGS[4]`=R8=`len`,
+   `ARG_REGS[2]`=RDX=`a`/`divisor` per `emit_stack_arg_setup`,
+   `jit/src/x64.rs` ~line 11130) and check whether the value loaded into R8
+   before the `CALL` genuinely traces back to `dlen`, or whether it's been
+   aliased with something else live at that specific program point (e.g. the
+   `qhat`/`qrem`/`borrow` locals computed just above it in source, which *are*
+   reused/redefined repeatedly right before this call).
+4. If the call-argument marshaling turns out clean, fall back to the prior
+   entry's step 4 (audit `primitiveLeftShift`'s inlined tail store /
+   `remarr[intLen+1]` write) -- note this session found the 3-argument
+   `primitiveLeftShift(int, int[], int)` overload that actually fills
+   `divisor` (`div.primitiveLeftShift(shift, divisor, 0)`) does **not** appear
+   in `CRATONVM_DBG_JIT_DISASM=primitiveLeftShift` output for this repro (only
+   the 1-arg `primitiveLeftShift(I)V` overload compiles) -- i.e. it stays
+   **interpreted**, which combined with `--nojit` being clean makes this
+   overload a low-probability suspect on its own, but does not rule out
+   `divisor`'s *header/reference* being corrupted by something else before
+   `mulsub` reads it.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`

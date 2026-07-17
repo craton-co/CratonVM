@@ -16345,17 +16345,29 @@ impl Compiler {
         // R10D = array_length (loaded in the bounds check)
         // We need to pass (index, length) to jit_throw_aioobe
 
-        // Set up args for jit_throw_aioobe(index: i64, length: i64)
+        // Set up args for jit_throw_aioobe(index: i64, length: i64, array_ptr: i64)
+        //
+        // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
+        // 2026-07-17): RAX still holds the array pointer at this point (the
+        // bounds check only reads through it into R10D; nothing in this
+        // stub clobbers RAX before the CALL), so pass it as a 3rd arg for
+        // `CRATONVM_DBG_AIOOBE3` diagnostics. Behavior-neutral when unset.
         #[cfg(target_os = "windows")]
         {
-            // Windows: arg1=RCX, arg2=RDX
+            // Windows: arg1=RCX, arg2=RDX, arg3=R8
             // RCX already contains the index
+            // MOV R8, RAX (move array pointer to arg3)
+            self.buf.emit(&[0x49, 0x89, 0xC0]); // REX.WB + MOV r/m64, r64 (R8 <- RAX)
             // MOV RDX, R10 (move length to arg2)
             self.buf.emit(&[0x4C, 0x89, 0xD2]); // REX.WR + MOV r/m64, r64
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // SysV: arg1=RDI, arg2=RSI
+            // SysV: arg1=RDI, arg2=RSI, arg3=RDX
+            // MOV RDX, RAX (move array pointer to arg3)
+            self.rex_w();
+            self.buf.emit_byte(0x8B);
+            self.modrm_reg(RDX, RAX);
             // MOV RDI, RCX (move index to arg1)
             self.rex_w();
             self.buf.emit_byte(0x8B);
