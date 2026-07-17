@@ -243,7 +243,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
-| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-16 re-triage: FAIL 8/2/6** (was briefly hidden behind an unrelated GC crash, see below — now the SAME shape as before, 1 pre-existing cold-attach + 5 narrowed ByteBuddy-generics residual) |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-17 re-triage: FAIL 8/3/5** — the two previously-documented failure modes ((a) cold-attach, (b) ByteBuddy "Cannot resolve T") are CONFIRMED GONE on current dev tip; a third, distinct, NOT-yet-root-caused AssertJ reflection residual now blocks the remaining 5, see below |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
 
@@ -434,6 +434,115 @@ the WRONG same-named copy. Eight fixes landed on
     `TypeDescription.Generic.Visitor.Substitutor`) round-trips a method-scoped
     (not class-scoped) type variable, a narrower and more specific target than
     this doc's original "(b)" description.
+
+    **2026-07-17 re-triage: (a) and (b) above are BOTH CONFIRMED RESOLVED on
+    current dev tip — no longer reproduce at all.** Fresh isolated
+    worktree/binary (`/data/data/wt-persistannobpp-bb2-20260717`, Azure
+    host), rebuilt twice: once at dev tip `56728b1a` and again after
+    fast-forwarding to `3cb39d87` (which pulled in the same-day
+    `0a1ec47b` "fix(gc): close remaining unrooted-ObjectRef gaps in
+    generics.rs (enum/type-var builders)" — a highly relevant-looking
+    candidate given (b)'s generics/TypeVariable machinery, checked
+    explicitly, see below). Both binaries gave the **same** result.
+
+    Root-cause dead ends explored first (both refuted the "still needs a
+    fix" hypothesis before the real end-to-end run was attempted): a
+    standalone `EMFTypeVarProbe.java` comparing reflective
+    `Method.getTypeParameters()` vs ByteBuddy `TypeDescription.ForLoadedType`
+    vs ByteBuddy `TypePool` (bytecode-parsed) views of
+    `EntityManagerFactory.unwrap` all agreed (1 type variable each, matching
+    HotSpot exactly — the TypePool-vs-reflection divergence hypothesis from
+    the "Next step" note above is REFUTED); a standalone `EMFMockProbe`/
+    `EMFMockLoopProbe`/`EMFForkProbe.java` (the last replicating Spring's
+    real `CompileWithForkedClassLoaderClassLoader` delegation policy exactly,
+    verified line-for-line against
+    `spring-core-test/src/main/java/org/springframework/core/test/tools/
+    CompileWithForkedClassLoaderClassLoader.java`) ran `Mockito.mock
+    (EntityManagerFactory.class)` 6× across 6 fresh fork loaders with **zero
+    failures** — neither the cold-attach IllegalStateException nor the
+    "Cannot resolve T" ByteBuddy crash reproduced in isolation.
+
+    The real end-to-end confirmation: built the actual `spring-orm` test
+    module (real JDK 25 at `/data/jdk25-real-20260717`, Gradle 9.6.1 via a
+    shared `GRADLE_USER_HOME` at `/data/gradle-home-baseline-20260716` —
+    the host's root filesystem was at 100% full/0 bytes free for most of
+    this session, which breaks a bare `~/.gradle` build outright; routing
+    `GRADLE_USER_HOME`/`TMPDIR` to the separate, non-full `/data` mount
+    worked around it) and ran
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` for real
+    through `KRun` against both binaries: **`found=8 succ=3 fail=5`,
+    identical on both.** None of the 5 failures are (a) or (b) — the
+    cold-attach `IllegalStateException` and the ByteBuddy `Cannot resolve T`
+    crash are simply **gone**; 3 methods now pass outright (previously all
+    were folded into the 2/6 fail/other bucket in the pre-this-session
+    baseline). Most likely explanation: one or more of the loader-identity
+    and reflection fixes that landed between the last dedicated re-triage
+    and now (`aca7f635` declaring-class loader-aware,
+    `4cb070e5`/`b50c3d54` `getTypeParameters()` identity-stability,
+    `19d7f417` getstatic/putstatic loader-aware, `d5544133` panama
+    `segment_address()`, `0a1ec47b` generics.rs GC-rooting, or some
+    combination) fixed this as a side effect; not independently
+    re-attributed to a single commit since neither (a) nor (b) reproduce in
+    isolation anymore to bisect against.
+
+    **A third, DIFFERENT, NOT-yet-root-caused residual now blocks the
+    remaining 5/8.** All 5 fail with the identical shape —
+    `org.assertj.core.util.introspection.IntrospectionError: No getter for
+    property '<name>'` — thrown from AssertJ's own
+    `PropertyOrFieldSupport.getSimpleValue()` (`extracting("fieldName")`):
+    AssertJ tries the JavaBean getter first (expected to fail — none of
+    these fields have public getters, that's normal/by design), then falls
+    back to direct reflective field access, and **the field fallback also
+    throws**, so AssertJ re-raises the original (misleading) "No getter"
+    message rather than a field-specific one. Two of the five are on
+    ordinary test-fixture nested classes (`DefaultPersistenceUnitMethod`,
+    `DefaultPersistenceContextField`, `SeveralPersistenceContextField`,
+    `DefaultPersistenceUnitField` — private fields `emf`/`entityManager`/
+    `customEntityManager`), and one is on a real, non-test-fixture
+    application class (`org.springframework.orm.jpa.
+    SharedEntityManagerCreator$SharedEntityManagerInvocationHandler`,
+    private field `properties`) — ruling out "only synthetic test fixtures
+    are affected". All 5 fire from inside the `Invoker.accept()` callback,
+    i.e. **after** `TestCompiler.compile()` has done a real in-process javac
+    compile of the AOT-generated bean-registration code and invoked its
+    generated static `apply(RegisteredBean, Object)` method reflectively on
+    the target instance — the same GC/allocation-heavy real-javac-compile
+    choke point flagged elsewhere in this doc as the trigger for the
+    unrelated `fb15be63` GC young-walk bug and the `0a1ec47b` generics.rs
+    unrooted-ObjectRef fix.
+
+    Three targeted standalone repro attempts to isolate this in a minimal
+    probe **all failed to reproduce it** (i.e. all passed cleanly on
+    CratonVM): (1) a bare private field + `Field.get()` on a nested static
+    class, no forking; (2) the same field access from **inside** a
+    `ForkFieldProbe`-style forked classloader (private field defined by the
+    fork loader, read via real `org.assertj.core.api.Assertions.assertThat
+    (...).extracting(...)` loaded by the parent/system loader — i.e. a
+    genuine cross-classloader reflective field read); (3) a reflective
+    `Field.set()` (simulating what AOT-generated injection code does)
+    immediately followed by an `extracting()` read of the same field, single
+    classloader. None reproduced, so the trigger needs the **combination**
+    of forked classloader + a real dynamically-`javac`-compiled-and-loaded
+    third classloader layer (`TestCompiler`'s own `DynamicClassLoader`) +
+    the GC pressure from that real compile — a minimal isolated repro was
+    not achieved this session. Rebuilding at `0a1ec47b` (the freshest
+    landed generics/GC-rooting fix, the most obviously relevant candidate)
+    made **no difference** — identical `found=8 succ=3 fail=5` with the
+    same 5 property names, so this is confirmed to be a genuinely different
+    bug from the ones `0a1ec47b` closed, not a partial/incomplete fix of it.
+
+    **OPEN — not fixed, not fully root-caused.** Next step for whoever picks
+    this up: reproduce with `CRATONVM_DBG_STALE_OBJREF=1` and/or
+    `CRATONVM_DBG_GC_STRESS` set for a run of just this class (mirroring the
+    technique that cracked `0a1ec47b`/`fb15be63`) to check whether this is
+    another instance of the same stale-ObjectRef-after-real-javac-compile
+    family rather than a distinct reflection/access-control gap; if that's
+    negative, instrument `Class.getDeclaredField()`/`Field.setAccessible()`/
+    `Field.get()` (`native-builtins/src/lang_class.rs`) specifically for
+    calls made against a class loaded by a `CompileWithForkedClassLoader`-
+    style loader from calling code loaded by a *different* loader in the
+    same process, since the one common thread across all 5 failures is that
+    exact cross-loader-reflection shape post-real-compile.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,
