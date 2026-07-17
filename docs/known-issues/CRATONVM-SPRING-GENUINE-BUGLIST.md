@@ -875,14 +875,29 @@ the WRONG same-named copy. Eight fixes landed on
 
 ## 3. Untriaged Clusters & Per-Class Details
 
-*Note: this section was accidentally truncated in the 2026-07-14 rewrite; the
-full 1013-line per-class detail lives in git history as
-`CRATONVM-SPRING-GENUINE-BUGLIST-125.md` (deleted in `ccab25c6`). 21 classes
-related to `HIB-CV-32` heap corruption remain filtered out as load-dependent
-side-effects tracked separately. The still-open non-AOT clusters from that
-list (WebFlux backend failures, Groovy scripting cluster, WebFlux
-EMPTY-discovery family, 6 found=0 ABENDs, and the per-class FAIL details)
-are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
+**Recovered 2026-07-16/17.** The truncated 1013-line historical detail
+(`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`, deleted in `ccab25c6`) was pulled
+back from git history (`git show ccab25c6~1:docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST-125.md`,
+full 1013 lines, still available at that path in git history) and
+cross-referenced class-by-class against the ~310 commits and the extensive
+AOT (§2) and reactive-cluster (§4) investigations that landed on `dev` since
+that 2026-07-14 snapshot. Two of the four named clusters turn out to be
+**already fully covered/resolved elsewhere in this document**; the other two
+are **still genuinely open and were NOT previously tracked anywhere** — the
+placeholder's claim that all 21 HIB-CV-32-filtered classes were "tracked
+separately" was only true for 12 of them. Live re-run of the still-open
+classes on a fresh `dev`-tip binary was attempted this session but blocked
+by a severe, host-wide disk-full crisis on the Azure build host's root
+filesystem (repeatedly hit 0 bytes free, corrupting several other sessions'
+scratch files and pruning ~20 concurrent git worktrees including this
+investigation's own two build worktrees mid-session) which also wiped every
+surviving pre-built `spring-framework` test classpath on the host — rebuilding
+one from scratch (`./gradlew jar testFixturesJar testClasses`) was out of
+scope for the remaining time budget. The status below is therefore the most
+accurate currently-available synthesis of doc + git evidence, but the
+"still open, unconfirmed" classes marked below need a live rerun as the
+concrete next step, once a `spring-framework` test classpath exists on the
+host again.
 
 ### WebFlux Backend-Specific Failures
 (`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`)
@@ -911,6 +926,115 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     CPU) — an already-documented, deliberately-deferred architectural item (see `gc/src/arena.rs`'s
     `Arena::reset` doc comment), not a quick-fix bug. Full detailed writeup, all numbers, and the
     concrete next step further down in this document, section 2, same bullet.
+
+### WebFlux EMPTY-discovery family — RESOLVED (superseded by §4's 2026-07-15 reactive sweep)
+
+The historical doc characterized (2026-07-11, dev `9948295e`) a cluster of `web.reactive.result.method.annotation.*`
+and `web.reactive.result.view.*` classes that loaded (`found=1`) but discovered **zero runnable
+test methods** — a JUnit-discovery/filtering gap specific to WebFlux's reactive test style, distinct
+from ordinary FAILs. Named examples: `GlobalCorsConfigIntegrationTests`, `MessageReaderArgumentResolverTests`,
+`ProtobufIntegrationTests`, `FreeMarkerMacroTests`.
+
+**§4's full 295-class reactive sweep (2026-07-15) supersedes this with a direct, explicit finding**: after
+that session's 7 (then 8) VM fixes, "the only EMPTY classes are the same 4 abstract classes HotSpot
+reports EMPTY" — i.e. the WebFlux-specific EMPTY-discovery anomaly is gone; every previously-EMPTY
+concrete WebFlux test class now discovers and runs its real test methods, matching HotSpot's own
+EMPTY set (legitimately-abstract base classes only) exactly. Treated as **FIXED/RETIRED** — no
+separate tracking needed; see §4 for the full fix list and verification detail.
+
+### HIB-CV-32-filtered 21-class list — reconciled
+
+The historical doc filtered 21 classes out of its main "still open" count as exclusively-ABEND,
+`rc=139`-SIGSEGV crashes carrying the generic `gen_heap::read_slot: corrupt Value cell` guard message
+— informally shorthanded "the HIB-CV-32 family" — on the theory they were a shared, load-dependent
+batch-corruption artifact rather than 21 independent bugs. Two important corrections from this
+session's research:
+
+1. **The name is a red herring.** The literal `HIB-CV-32` defect (`docs/internal/hibernate-bugs/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`)
+   — a GC-corruptor triggered by `promotion_oom_risk` diverting `--nojit` young collections into a
+   corrupting non-moving sweep — was already root-caused and **fixed weeks earlier, 2026-06-23,
+   commit `c9258e17`**, well before the 2026-07-09 Spring 125-class baseline even existed. What the
+   Spring doc calls "the HIB-CV-32 family" is really every crash that trips the *diagnostic guard*
+   that fix's defense-in-depth left behind (`read_value_checked`/`gen_heap::read_slot`'s "corrupt
+   Value cell" log line) — a generic heap-integrity tripwire, not evidence of one shared root cause.
+   §4's Round 3 investigation independently confirms this guard is "pre-existing, deliberately-built
+   forensic instrumentation... a conservative-scan heuristic that sometimes misclassifies a live
+   region as corrupt... a SAFE recovery path by design, not silent data corruption" — consistent with
+   different classes in this 21-class list having entirely different underlying causes.
+
+2. **Only 12 of the 21 are actually accounted for elsewhere in this document; 9 are not tracked
+   anywhere and are genuinely still open/untriaged.**
+
+   | # | Class | Current status |
+   |---|---|---|
+   | 1-9 | `web.reactive.function.client.support.WebClientProxyRegistryIntegrationTests`, `web.reactive.function.server.InvalidHttpMethodIntegrationTests`, `web.reactive.config.WebFluxConfigurationSupportTests`, `web.reactive.config.WebFluxViewResolutionIntegrationTests`, `web.reactive.result.method.annotation.GlobalCorsConfigIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingDataBindingIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingViewResolutionIntegrationTests`, `web.reactive.result.view.LocaleContextResolverIntegrationTests`, `web.reactive.result.view.freemarker.FreeMarkerMacroTests` | **FIXED** — covered by §4's 295-class reactive sweep (reached HotSpot parity for the whole `web.reactive.*` scope) |
+   | 10 | `messaging.rsocket.RSocketBufferLeakTests` | **FIXED** — same §4 sweep (`messaging.rsocket.*` explicitly in scope) |
+   | 11 | `test.web.reactive.server.samples.JsonContentTests` | **FIXED** — same §4 sweep (`test.web.reactive.*` explicitly in scope) |
+   | 12 | `web.socket.WebSocketHandshakeTests` | **STILL OPEN, but no longer ABEND** — confirmed via this session's own STOMP investigation (§3 "STOMP Message Hang" note): no longer crashes, now `FAIL 4/6` on real "Blocking write timeout" failures, "not investigated further this session." Genuine progress, not closed. |
+   | 13 | `cache.jcache.JCacheEhCacheAnnotationTests` | **UNKNOWN / genuinely untracked** — zero mentions anywhere in current `dev`, no dedicated fix commit found (`git log --grep`). Not reactive, not AOT — outside every investigation that has landed since 2026-07-09. Needs a live rerun. |
+   | 14 | `http.client.JettyClientHttpRequestFactoryTests` | **UNKNOWN / genuinely untracked** — same reasoning; this is the blocking `http.client` module, not `http.client.reactive` (which §4 covered), so it fell outside every session's scope. Needs a live rerun. |
+   | 15 | `jdbc.config.JdbcNamespaceIntegrationTests` | **UNKNOWN / genuinely untracked** — original crash signature was an out-of-bounds field read on `org/hsqldb/RangeGroup$RangeGroupEmpty` (`real_field_count=Some(0)`), a shape plausibly touched by the broad `fb15be63` GC exact-walk fix (see below) but never re-verified. Needs a live rerun. |
+   | 16-21 | `test.context.groovy.AbsolutePathGroovySpringContextTests`, `DefaultScriptDetectionGroovySpringContextTests`, `GroovySpringContextTests`, `MixedXmlAndGroovySpringContextTests`, `RelativePathGroovySpringContextTests`, `test.context.web.BasicGroovyWacTests` | **LIKELY STILL OPEN** — see "Groovy scripting cluster" below; same family as the 8-9 already-characterized Groovy classes, no dedicated fix landed for any of it. |
+
+   Net: **12/21 resolved or improved** (11 fixed outright via the reactive sweep, 1 improved from
+   crash to ordinary FAIL), **9/21 remain open and, contrary to the previous placeholder text, were
+   never actually "tracked separately" anywhere** — 3 are entirely unique untracked classes and 6
+   belong to the Groovy cluster below.
+
+### Groovy scripting cluster — STILL OPEN (no dedicated fix has landed)
+
+The historical doc (2026-07-11 characterization) named 8 classes as a systemic Groovy-script-loading
+gap (high per-method failure ratios, e.g. `GroovyBeanDefinitionReaderTests` 35/36 methods failing),
+plus 6 more in the HIB-CV-32-filtered list that share the same root area (`test.context.groovy.*`,
+`test.context.web.BasicGroovyWacTests`) — 10 distinct classes total once de-duplicated:
+
+- `scripting.groovy.GroovyAspectTests` — ABEND `rc=139` (2026-07-09 baseline; dumped core)
+- `scripting.groovy.GroovyAspectIntegrationTests` — ABEND `rc=139` (dumped core)
+- `scripting.groovy.GroovyScriptFactoryTests` — ABEND `rc=139` / TIMEOUT (dumped core)
+- `scripting.config.ScriptingDefaultsTests` — ABEND `rc=139` (dumped core; part of the "6 found=0 ABENDs" cluster below, same family)
+- `context.groovy.GroovyBeanDefinitionReaderTests` — ABEND `rc=139` (dumped core)
+- `test.context.groovy.AbsolutePathGroovySpringContextTests` / `DefaultScriptDetectionGroovySpringContextTests` / `GroovySpringContextTests` / `MixedXmlAndGroovySpringContextTests` / `RelativePathGroovySpringContextTests` — all ABEND `rc=139`
+- `test.context.web.BasicGroovyWacTests` — ABEND `rc=139`
+
+**No dedicated fix for this cluster has landed on `dev`** — `git log --oneline ccab25c6..origin/dev
+-i --grep=groovy` across the ~310 commits since the historical snapshot turns up only incidental
+touches (a ByteBuddy field-lookup fix, an enclosing-class loader-awareness fix), nothing that
+addresses Groovy script/classloader integration directly.
+
+**Stronger evidence it's still broken, found this session**: the AOT cluster's 2026-07-16 re-triage of
+`TestContextAotGeneratorIntegrationTests` (§2) independently hit a **new, different, unfixed Groovy
+defect** in the exact same area — `processAheadOfTimeWithXmlTests` throws `ExceptionInInitializerError`
+from `GroovyBeanDefinitionReader.<init>`, caused by an `ArrayStoreException: arraycopy: source element
+at index 1 is not assignable to destination component type` inside `groovy/lang/GroovySystem`'s
+`<clinit>` — explicitly documented as **NOT** the already-fixed `GroovySystem.<clinit>` NPE
+(`docs/internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`, a `Module`-descriptor-null
+issue referenced in this doc's Executive Summary), a different exception type and mechanism, "newly
+observed; not investigated further." This directly implicates `GroovyBeanDefinitionReader` — the same
+class `context.groovy.GroovyBeanDefinitionReaderTests` exercises — and is consistent with the whole
+cluster still being broken, just with the crash shape likely shifted from a hard `rc=139` SIGSEGV
+(2026-07-09 baseline) to a catchable `ExceptionInInitializerError`/`ArrayStoreException` now, given
+the general heap-corruption-guard fixes (`fb15be63`, HIB-CV-26 `Class.forName` fix) that have landed
+in between. **Not confirmed via live rerun this session** (blocked by the host disk crisis and the
+loss of the `spring-framework` test classpath, see the section-3 recovery note above) — flagged as
+the highest-value next step: re-run these 10 classes on a fresh binary and characterize the current
+crash/fail shape before attempting a fix.
+
+### 6 found=0 ABEND cluster — reconciled
+
+The historical doc separately flagged 6 classes that crashed **before any test method was discovered**
+(immediate crash on class load) as a distinct shape from the mid-run HIB-CV-32-guard crashes above:
+
+| Class | 2026-07-09 baseline | Current status |
+|---|---|---|
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | LOADERR — `OutOfMemoryError: Java heap space` | **FIXED** — confirmed `OK 44/44` in §2's AOT-cluster validation table (one of the 8 loader-identity fixes' beneficiaries) |
+| `core.codec.ResourceRegionEncoderTests` | ABEND `rc=139` | **UNKNOWN / untracked** — not `web.reactive.*` by package name, so likely (but not confirmed) outside §4's reactive-sweep scope even though `ResourceRegionEncoder` is reactive-stack machinery; needs a live rerun to confirm either way |
+| `jdbc.config.JdbcNamespaceIntegrationTests` | ABEND `rc=1` — hsqldb `RangeGroup$RangeGroupEmpty` OOB field read | **UNKNOWN / untracked** (also HIB-CV-32-list #15 above) |
+| `scheduling.quartz.QuartzSupportTests` | TIMEOUT (120s) | **UNKNOWN / untracked** — zero mentions anywhere in current `dev` |
+| `scripting.config.ScriptingDefaultsTests` | ABEND `rc=139` (dumped core) | **LIKELY STILL OPEN** — same Groovy/scripting family as above, no dedicated fix |
+| `test.web.servlet.htmlunit.MockWebResponseBuilderTests` | Actually **FAIL**, not ABEND, in the per-class detail (`buildContent() :: AssertionFailedError`, single method) — the historical doc's own summary and per-class sections disagree on this one's shape | **UNKNOWN / untracked**, but looks like a narrow single-assertion bug (same pattern as several other now-fixed single-method FAILs in this doc) — a plausible quick-fix candidate for a future session with a working classpath |
+
+Net: **1/6 fixed**, **5/6 unconfirmed/likely still open**, none of them tracked anywhere else in this
+document prior to this recovery pass.
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 
