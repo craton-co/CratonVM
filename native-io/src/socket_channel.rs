@@ -249,9 +249,9 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
         }
         .into(),
         ErrorKind::AddrInUse => ioex(format!("BindException: Address already in use: {ctx}: {e}")),
-        ErrorKind::AddrNotAvailable => {
-            ioex(format!("BindException: Cannot assign requested address: {ctx}: {e}"))
-        }
+        ErrorKind::AddrNotAvailable => ioex(format!(
+            "BindException: Cannot assign requested address: {ctx}: {e}"
+        )),
         ErrorKind::PermissionDenied => {
             ioex(format!("BindException: Permission denied: {ctx}: {e}"))
         }
@@ -379,8 +379,13 @@ enum Syn {
     Null,
 }
 
-fn chan_fields() -> &'static RwLock<HashMap<i32, [Syn; N_FIELDS]>> {
-    static T: OnceLock<RwLock<HashMap<i32, [Syn; N_FIELDS]>>> = OnceLock::new();
+struct ChanState {
+    object: ObjectRef,
+    fields: [Syn; N_FIELDS],
+}
+
+fn chan_fields() -> &'static RwLock<HashMap<i32, Vec<ChanState>>> {
+    static T: OnceLock<RwLock<HashMap<i32, Vec<ChanState>>>> = OnceLock::new();
     T.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -400,8 +405,17 @@ fn cf_set(ctx: &mut dyn NativeContext, obj: ObjectRef, idx: usize, v: Value) {
     };
     let key = ctx.identity_hash_code(obj);
     let mut t = chan_fields().write();
-    let arr = t.entry(key).or_insert_with(default_syn);
-    arr[idx] = slot;
+    let bucket = t.entry(key).or_default();
+    if let Some(state) = bucket.iter_mut().find(|state| state.object == obj) {
+        state.fields[idx] = slot;
+    } else {
+        let mut fields = default_syn();
+        fields[idx] = slot;
+        bucket.push(ChanState {
+            object: obj,
+            fields,
+        });
+    }
 }
 
 /// Default synthetic state for a channel object before its `open()`/`accept()`
@@ -419,7 +433,12 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
         return Value::Int(0);
     }
     let key = ctx.identity_hash_code(obj);
-    match chan_fields().read().get(&key).map(|a| &a[idx]) {
+    match chan_fields()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|state| state.object == obj))
+        .map(|state| &state.fields[idx])
+    {
         Some(Syn::I(i)) => Value::Int(*i),
         _ => Value::Int(0),
     }
@@ -429,7 +448,16 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
 /// does not grow without bound across short-lived connections.
 fn cf_clear(ctx: &dyn NativeContext, obj: ObjectRef) {
     let key = ctx.identity_hash_code(obj);
-    chan_fields().write().remove(&key);
+    let mut table = chan_fields().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|state| state.object != obj);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
 }
 
 /// Cross-module accessor: the `tcp_registry` id backing a synthetic
@@ -447,16 +475,41 @@ pub fn channel_net_fd(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<i32> {
 fn cf_remote(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, i32)> {
     let key = ctx.identity_hash_code(obj);
     let t = chan_fields().read();
-    let arr = t.get(&key)?;
-    let host = match &arr[F_REMOTE] {
+    let state = t.get(&key)?.iter().find(|state| state.object == obj)?;
+    let host = match &state.fields[F_REMOTE] {
         Syn::S(s) => s.clone(),
         _ => return None,
     };
-    let port = match arr[F_REMOTE_PORT] {
+    let port = match state.fields[F_REMOTE_PORT] {
         Syn::I(p) => p,
         _ => 0,
     };
     Some((host, port))
+}
+
+pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
+    let table = chan_fields().read();
+    for bucket in table.values() {
+        roots.extend(bucket.iter().map(|state| state.object));
+    }
+}
+
+pub fn channel_fields_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut table = chan_fields().write();
+    for bucket in table.values_mut() {
+        for state in bucket {
+            let old = state.object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                state.object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
 }
 
 fn read_reg_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
@@ -901,9 +954,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                eprintln!(
-                    "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
-                );
+                eprintln!("[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}");
                 // 2026-07-16 follow-up: pin the exact Java call site issuing
                 // this close(). `NativeContext::capture_stack_trace` needs no
                 // `Thread` object handle -- it walks the CURRENT thread's live
@@ -914,7 +965,10 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 // conventional stack-trace reading order -- `capture_stack_trace`
                 // itself returns outer->inner, so reverse it here.
                 let raw_trace = ctx.capture_stack_trace(0);
-                eprintln!("[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)", raw_trace.len());
+                eprintln!(
+                    "[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)",
+                    raw_trace.len()
+                );
                 for entry in raw_trace.iter().rev() {
                     let file = entry.source_file.as_deref().unwrap_or("?");
                     eprintln!(
@@ -1408,22 +1462,33 @@ fn fnv1a64(data: &[u8]) -> u64 {
 
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.read(buf) {
-        Ok(0) => Ok(Some(-1)),
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.read(buf) {
+            Ok(0) => return Ok(Some(-1)),
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return Ok(None)
+            }
+            // EINTR consumes no bytes. Retrying is required instead of
+            // reporting a short/zero channel operation or aborting a Tomcat
+            // response. Some Linux wrappers preserve it only as raw errno 4.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
 fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.write(data) {
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.write(data) {
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+            // Like read(), a signal interruption has not written any bytes;
+            // retry so a header/body gathering write cannot be abandoned.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -1543,10 +1608,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 .unwrap_or(0);
             let hash = fnv1a64(&buf[..n as usize]);
             let dump_len = (n as usize).min(64);
-            let hex: String = buf[..dump_len]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
+            let hex: String = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
             eprintln!(
                 "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
             );
@@ -1739,19 +1801,30 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         data.extend_from_slice(bytes);
     }
 
+    // A gathering write can block for exactly the same reason as a scalar
+    // SocketChannel.write. The copied payload and every Java source buffer are
+    // rooted above, so make this a GC-cooperative blocking region as well.
+    // Without this bracket, a full send buffer can leave a mutator in native
+    // I/O while a concurrent moving collection waits for it to reach a
+    // safepoint; that is the remaining transport-pressure hole in this path.
+    ctx.begin_blocking_region();
     let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))
+                let r = try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e));
+                ctx.end_blocking_region();
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }
                 return Ok(Some(Value::Long(0)));
             }
             _ => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }
@@ -2199,7 +2272,11 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             .unwrap_or(0);
         eprintln!(
             "[SC_ACCEPT] t={ms} listener_id={id:#x} peer={peer} source={}",
-            if preaccepted_used { "preaccepted" } else { "fresh" }
+            if preaccepted_used {
+                "preaccepted"
+            } else {
+                "fresh"
+            }
         );
     }
 

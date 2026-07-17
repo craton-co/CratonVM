@@ -1119,15 +1119,23 @@ fn read_io_err(prefix: &str, e: std::io::Error) -> String {
 /// TLS close_notify"). For an HTTP client that is a normal end-of-stream, so map
 /// it to `Ok(0)` (EOF) rather than a hard error.
 fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
-    match stream.read(buf) {
-        Ok(n) => Ok(n),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::UnexpectedEof
-                || e.to_string().contains("close_notify") =>
-        {
-            Ok(0)
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            // EINTR is a transient interruption, not a peer disconnect.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.to_string().contains("close_notify") =>
+            {
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -1246,9 +1254,8 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             if let Some(pos) = find_subslice(prefix, b"\r\n") {
                 break pos;
             }
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|e| format!("chunked size: {e}"))?;
+            let n =
+                read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked size", e))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-header".into());
             }
@@ -1265,9 +1272,8 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             return Ok(out);
         }
         while prefix.len() < size + 2 {
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|e| format!("chunked body: {e}"))?;
+            let n =
+                read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked body", e))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-body".into());
             }
@@ -3052,6 +3058,31 @@ mod http_url_connection_tests {
         let mut empty: &[u8] = &[];
         let body = read_chunked(&mut data, &mut empty).unwrap();
         assert_eq!(body, b"Wikipedia in \r\nchunks.");
+    }
+
+    #[test]
+    fn test_read_chunked_retries_raw_eintr() {
+        struct InterruptOnce<'a> {
+            interrupted: bool,
+            remaining: &'a [u8],
+        }
+
+        impl Read for InterruptOnce<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::from_raw_os_error(4));
+                }
+                self.remaining.read(buf)
+            }
+        }
+
+        let mut prefix = b"4\r\n".to_vec();
+        let mut stream = InterruptOnce {
+            interrupted: false,
+            remaining: b"Wiki\r\n0\r\n\r\n",
+        };
+        assert_eq!(read_chunked(&mut prefix, &mut stream).unwrap(), b"Wiki");
     }
 
     #[test]
