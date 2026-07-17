@@ -1739,19 +1739,30 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         data.extend_from_slice(bytes);
     }
 
+    // A gathering write can block for exactly the same reason as a scalar
+    // SocketChannel.write. The copied payload and every Java source buffer are
+    // rooted above, so make this a GC-cooperative blocking region as well.
+    // Without this bracket, a full send buffer can leave a mutator in native
+    // I/O while a concurrent moving collection waits for it to reach a
+    // safepoint; that is the remaining transport-pressure hole in this path.
+    ctx.begin_blocking_region();
     let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))
+                let r = try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e));
+                ctx.end_blocking_region();
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }
                 return Ok(Some(Value::Long(0)));
             }
             _ => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }

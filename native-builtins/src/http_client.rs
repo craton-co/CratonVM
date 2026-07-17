@@ -448,15 +448,33 @@ pub(crate) struct WireResponse {
     pub(crate) keep_alive: bool,
 }
 
+fn read_retry<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
 /// Read and parse an HTTP/1.1 response head + body using `httparse`.
 fn read_http1_response<S: Read>(stream: &mut S) -> Result<WireResponse, String> {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
     let head_end;
     loop {
-        let n = stream
-            .read(&mut tmp)
-            .map_err(|e| format!("response read: {e}"))?;
+        // A signal may interrupt a blocking recv without consuming a byte.
+        // POSIX requires callers to retry that transient EINTR rather than
+        // converting it into an HTTP transport failure. Under the DoHead
+        // start/stop pressure this otherwise escaped as a sporadic
+        // `HttpURLConnection response failed: response read: Interrupted
+        // system call`.
+        let n = loop {
+            match read_retry(stream, &mut tmp) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result.map_err(|e| format!("response read: {e}"))?,
+            }
+        };
         if n == 0 {
             return Err("connection closed before response head".into());
         }
@@ -521,8 +539,7 @@ fn read_http1_response<S: Read>(stream: &mut S) -> Result<WireResponse, String> 
     if let Some(target) = target {
         let target = target.min(MAX_RESPONSE_BODY);
         while body_buf.len() < target {
-            let n = stream
-                .read(&mut tmp)
+            let n = read_retry(stream, &mut tmp)
                 .map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
@@ -533,8 +550,7 @@ fn read_http1_response<S: Read>(stream: &mut S) -> Result<WireResponse, String> 
     } else {
         // Read until close.
         loop {
-            let n = stream
-                .read(&mut tmp)
+            let n = read_retry(stream, &mut tmp)
                 .map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
@@ -571,8 +587,7 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             if prefix.len() > MAX_CHUNK_LINE {
                 return Err("chunked: size line exceeds MAX_CHUNK_LINE".into());
             }
-            let n = stream
-                .read(&mut tmp)
+            let n = read_retry(stream, &mut tmp)
                 .map_err(|e| format!("chunked size: {e}"))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-header".into());
@@ -603,8 +618,7 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
                 if prefix.len() > MAX_CHUNK_LINE {
                     return Err("chunked: trailer exceeds MAX_CHUNK_LINE".into());
                 }
-                let n = stream
-                    .read(&mut tmp)
+                let n = read_retry(stream, &mut tmp)
                     .map_err(|e| format!("chunked trailer: {e}"))?;
                 if n == 0 {
                     break;
@@ -621,8 +635,7 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
         }
         // Read `size` bytes of chunk data + trailing CRLF.
         while prefix.len() < size + 2 {
-            let n = stream
-                .read(&mut tmp)
+            let n = read_retry(stream, &mut tmp)
                 .map_err(|e| format!("chunked body: {e}"))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-body".into());

@@ -1119,15 +1119,19 @@ fn read_io_err(prefix: &str, e: std::io::Error) -> String {
 /// TLS close_notify"). For an HTTP client that is a normal end-of-stream, so map
 /// it to `Ok(0)` (EOF) rather than a hard error.
 fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
-    match stream.read(buf) {
-        Ok(n) => Ok(n),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::UnexpectedEof
-                || e.to_string().contains("close_notify") =>
-        {
-            Ok(0)
+    loop {
+        match stream.read(buf) {
+            Ok(n) => return Ok(n),
+            // EINTR is a transient interruption, not a peer disconnect.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.to_string().contains("close_notify") =>
+            {
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => Err(e),
     }
 }
 
