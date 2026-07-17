@@ -4985,3 +4985,148 @@ baseline, zero regressions. `cargo test -p cratonvm-gc --lib --release`:
 Files: `vm/src/vm/vm_exec.rs` (fix, `contended` branch of the
 thread-termination "notify waiting joiners" block), `vm/src/runtime/interpreter.rs`
 (tripwire, `stw_take_over_and_wait`'s `WARN_AFTER_ROUNDS` block).
+
+
+---
+
+#### 5.8 follow-up #6 (2026-07-18, session 7): `get_or_create_main_thread_group` TOCTOU race (flagged OPEN in follow-up #4) ROOT-CAUSED (two independent bugs) and FIXED — claim/wait/notify singleton + missing GC root
+
+Picked up the residual explicitly left OPEN by follow-up #4: a confirmed
+check-then-act race in `NativeContextImpl::get_or_create_main_thread_group`
+(`vm/src/vm/vm_exec.rs:2310`, called from
+`build_thread_field_holder`/`current_thread_object`). Follow-up #4's own
+evidence (2 live `gdb` captures during its own post-fix verification, 3 more
+from the stock pre-session binary) had already root-caused the *shape*:
+`get_or_create_main_thread_group` read `*shared.main_thread_group.read()`
+once, and if `None`, ran a long *unguarded* sequence of allocations and
+`<init>` invokes (building the "system" and "main" `ThreadGroup` objects)
+before writing the result back — with no lock held across the build.
+
+**Repro**: reused follow-up #4's own harness — `KRunDetail2` +
+`WebSocketIntegrationTests` under `--enable-native-access=ALL-UNNAMED`,
+looped with `CRATONVM_DBG_STALE_OBJREF=1`/`RUST_BACKTRACE=1`, cores captured
+via `core_pattern=core.%e.%p.%t` (bucketing by crashing-thread `comm`) and
+inspected with `gdb -q -batch -ex 'thread apply all bt'`. A **stock
+pre-session binary** (the follow-up #4 session's own post-`b3db96f8`
+verification binary, `cratonvm-aiofix-verify` — i.e. it already has the
+`ForeignCallGuard` fix but predates this session's change) reproduced the
+exact documented signature **3 times live in a single 40-run batch**
+(`class_id`/call-chain identical across all 3 captures):
+
+```
+Thread 1 (Thread 0x... (LWP ...)):
+#0  is_forwarded () at types/src/heap_types.rs:411
+#1  get_header () at gc/src/gen_heap.rs:1558
+#2  set_field () at gc/src/gen_heap.rs:2092
+#3  <a FieldHolder.<init> field-setter native> (native-builtins/src/lib.rs:31368)
+...
+#15 build_thread_field_holder () at vm/src/vm/vm_exec.rs:2280
+#16 current_thread_object () at vm/src/vm/vm_exec.rs:5986
+#17 native_thread_current_thread () at native-builtins/src/lang_system.rs:478
+...
+#40 aio_dispatcher_main () at vm/src/native/jni.rs:702
+```
+
+confirming this is a genuine, reproducible bug (not just the doc's prior
+inference) — a `cratonvm-aio-dispatch-N` thread building its own `Thread`
+mirror for the first time, crashing while its `FieldHolder.<init>` writes
+the `group` field.
+
+**Two independent bugs, both required a fix — this is the key finding of
+the session:**
+
+1. **TOCTOU race** (the one follow-up #4 named): `get_or_create_main_thread_group`
+   had no serialization at all — a plain read-then-unguarded-build-then-write.
+   Fixed by mirroring the codebase's own established JVMS §5.5
+   class-initialization claim/wait/notify idiom
+   (`vm_util::ensure_class_initialized_shared` / `SharedVm::class_init_waiters`)
+   rather than inventing a new locking scheme: a new
+   `SharedVm::main_thread_group_init: parking_lot::Mutex<MainThreadGroupInit>`
+   (`MainThreadGroupInit::{Idle, InProgress { owner_thread, waiter }}`,
+   `vm/src/vm/vm_init.rs`) lets exactly one thread transition `Idle ->
+   InProgress` and perform the build; every other concurrent caller blocks on
+   the `InProgress` claim's condvar using the *identical* GC-safe
+   blocked-region protocol class-init waiters use (`tlab.retire()` →
+   `deposit_root_snapshot()` → `gc_barrier.enter_blocked()` →
+   `arrive_and_wait_auto()` if a STW is already in flight → bounded
+   `cvar.wait_for(30s)` → `check_post_block_gc()`), so a concurrent moving GC
+   is never stalled waiting on an uncooperatively-parked thread. An RAII
+   `FinishGuard` installed immediately after claiming resets
+   `InProgress -> Idle` and notifies all waiters on every exit path (success,
+   an early `None` return via `?`, or a panic unwind), so a builder that
+   bails out (e.g. `ThreadGroup` class-init failure) can never leave waiters
+   blocked for the full 30s timeout. A same-thread re-entrant call (a nested
+   `currentThread()` triggered from inside `ThreadGroup`'s own
+   `<clinit>`/`<init>`) returns `None` immediately instead of self-deadlocking
+   on its own claim — JVMS §5.5's "release LC and complete normally" rule for
+   recursive init requests, applied to this singleton.
+
+   **This fix ALONE did NOT eliminate the crash** — confirmed live: with only
+   this change landed, a fresh stress batch on the TOCTOU-only binary still
+   hit the identical `is_forwarded`/`get_header:1558` signature once in ~24
+   runs before the session moved to investigate why.
+
+2. **Missing GC root (the actual proximate cause)**: unlike
+   `system_out`/`system_err`/`system_in`/`singleton_oom` (all four already
+   have a matching pair of a root-scan entry in `memory/roots.rs` and a
+   post-GC remap entry in `memory/gc.rs::update_all_roots`),
+   `SharedVm::main_thread_group` had **neither** — grep-confirmed absent from
+   both files. Once the singleton is published (`*shared.main_thread_group.write()
+   = Some(main_tg)`), nothing keeps the GC's root scan or its post-move remap
+   aware of it: any moving GC that fires afterward can relocate `main_tg`, and
+   the cached `ObjectRef` (plus any bare Rust-local `Copy` of it, e.g.
+   `build_thread_field_holder`'s `group` — a second, compounding
+   "native-stale-local" gap of the kind this doc has documented repeatedly
+   elsewhere) is left pointing at from-space. This — not a leftover TOCTOU
+   window — is what the live captures were actually hitting: a genuinely
+   dangling/reclaimed reference (hence NOT caught by
+   `CRATONVM_DBG_STALE_OBJREF`'s forwarded-pointer assertion, which fires on
+   a still-forwardable stale pointer, not a fully dangling one — matching
+   follow-up #4's own observation that this crash was never caught by that
+   flag). Fixed by adding the standard scan/remap pair
+   (`memory/roots.rs` step 8d, `memory/gc.rs::update_all_roots` step 6d,
+   `try_read`/`try_write` mirroring the system-streams convention to avoid a
+   self-deadlock against `get_or_create_main_thread_group`'s own brief write-lock
+   hold), plus defensively pinning `build_thread_field_holder`'s `group` local
+   into `native_pin_roots` across the `FieldHolder.<init>` invoke (the same
+   pin/read/unpin idiom already used for `holder` two lines above it).
+
+No new mechanism was invented for either fix — both are "use the existing,
+already-audited discipline instead of an unguarded/unrooted ad hoc path."
+
+**Verified**:
+- Pre-fix baseline (stock binary, same as follow-up #4 used): 3 confirmed
+  live `gdb` captures of the exact signature in a 40-run
+  `WebSocketIntegrationTests` stress batch (plus the already-documented,
+  unrelated, still-OPEN `tg_slot`/`ThreadGroup.enumerate()` SIGSEGV
+  crashing far more often on the same workload — filtered out by crashing-
+  thread family, `core.main-vm.*` vs `core.cratonvm-aio-di*`, and by gdb
+  backtrace).
+- TOCTOU-fix-only binary: 1 confirmed live recurrence of the identical
+  signature in ~24 runs — proof the missing-GC-root fix was independently
+  necessary, not just belt-and-suspenders.
+- Both fixes together: **100/100** `WebSocketIntegrationTests` stress runs,
+  **zero** recurrence of the `is_forwarded`/`get_header:1558` signature (and,
+  incidentally, zero `tg_slot` crashes either in this particular 100-run
+  batch — that bug remains open and unrelated; not claiming credit for it,
+  noting it as this batch's observation only).
+- `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed on
+  the final rebased tip (one rerun momentarily showed 2200/17 — the extra
+  failure, `runtime::instrument::tests::remap_transformer_refs_empty_map_is_noop`,
+  passed in isolation and on a clean rerun, confirming a pre-existing
+  test-parallelism flake unrelated to this change, not a regression). The
+  16 are the same documented pre-existing baseline (7 `jit::skip_list` + 9
+  `runtime::lock_order`, both debug-assertion-gated).
+- `cargo test -p cratonvm-gc --lib --release`: 791/791, matching the
+  documented baseline exactly.
+
+Files: `vm/src/vm/vm_exec.rs` (`get_or_create_main_thread_group` claim/wait/
+notify rewrite + `build_thread_field_holder`'s `group` pin), `vm/src/vm/vm_init.rs`
+(`MainThreadGroupInit` enum + `SharedVm::main_thread_group_init` field),
+`vm/src/memory/roots.rs` (root-scan step 8d), `vm/src/memory/gc.rs` (remap
+step 6d). Landed on `dev` as `b4ab3ad3`.
+
+**Net assessment**: closes the last OPEN item from follow-up #4. The
+still-open, unrelated items from earlier follow-ups (`tg_slot`/
+`ThreadGroup.enumerate()` SIGSEGV from follow-ups #2/#3) are untouched by
+this session and remain OPEN.
