@@ -2607,3 +2607,185 @@ prevent a future session from re-opening a hunt for a bug that no longer
 reproduces. If it resurfaces, re-check first whether `19a5025f`/`9850617b`
 are still present on whatever tip is being tested before assuming a
 regression.
+
+
+### 5.6 Three named `ClientHttpConnectorTests` minor residuals (2026-07-16): StepVerifier identity FIXED, EofException confirmed CratonVM-specific but not fixed, enum CCE not reproduced
+
+Follow-up to 5.2's residual list: "an occasional Jetty `EofException` connection-flake,
+an unrelated enum `valueOf()` `ClassCastException` (a known separate synthetic-enum
+gap), and one flaky `StepVerifier` exception-identity assertion." Branch
+`fix/httpconn-minor-residuals-20260716`.
+
+**Harness housekeeping (two false-positive noise sources ruled out first)**: a large
+fraction of this session's early stress-run failures were NOT new bugs:
+1. Omitting `--enable-native-access=ALL-UNNAMED` (required per section 5.1) lets
+   `MemorySegment` clinit failures corrupt JUnit's ServiceLoader-based engine discovery
+   in confusing ways (`ClassCastException: Object cannot be cast to TestEngine`-family
+   symptoms, `AbstractMethodError ... has no Code attribute`).
+2. `--stack-dump-on-timeout 0` disables CratonVM's watchdog entirely (confirmed from
+   `vm-cli/src/main.rs`'s `resolve_watchdog_timeout`: `Some(0)` unconditionally maps to
+   `None`, regardless of any `CRATONVM_DEFAULT_WATCHDOG_SEC` env default). A
+   `timeout(1)`-wrapped run that already printed its `RESULT` line and is only being
+   reaped for lingering non-daemon Reactor-Netty threads (`"main() returned; VM held
+   alive by N non-daemon thread(s)"`) is NOT a hang — `run-suite.sh`'s own
+   `flush_batch` already records the `RESULT` regardless of the wrapper's exit code; an
+   ad hoc harness that checks the exit code first will misreport clean runs as timeouts.
+
+With both handled, the dominant remaining noise this session hit was a **severe,
+transient flare-up of the already-known, already-partially-fixed section-5.4
+"register-invisible-root" family** — `ClassCastException: Object cannot be cast to X`
+for whatever `X` a reused `cid=0` bare-Object checkcast happens to hit
+(`TestExecutionResult$Status`, `String`, `IllegalArgumentException: Could not create
+type` on `@ParameterizedTest` argument construction — never an enum type in any
+capture this session took), plus outright process crashes (`AbstractMethodError:
+TestEngine.getId() has no Code attribute`, SIGSEGV). This was root-caused (same day,
+independently, by a different concurrent session) to a genuinely NEW regression from
+same-day GC work — a missing `skip_free_blocks` call in the young-GC
+`young_object_starts` pre-forwarding walk (`gc/src/gen_heap.rs`) — and fixed via
+`fix/wildfly-cce0079-close-20260716`, merged to `dev` mid-session (see
+`docs/internal/springboot/testengine-getid-abstractmethoderror-young-gc-forwarding-gap-FIXED.md`).
+Recorded here because it dominated this session's raw failure counts and could
+otherwise be mistaken for one of the three items below by a future reader of raw logs.
+The shared build host was also independently in a severe resource crisis for large
+parts of this session (`/data/data`, where all worktrees live, hit **0 bytes free**
+at least twice, once aborting `cargo build`'s LLVM output stage outright and once
+blocking `git commit`; load average peaked over 160 on a 16-core box with 2000+
+concurrent sessions) — flagged only as context for why sample sizes below are smaller
+than planned, not as a CratonVM bug.
+
+**(c) StepVerifier exception-identity failure — ROOT-CAUSED AND FIXED.**
+`ClientHttpConnectorTests.errorInRequestBody(ClientHttpConnector)`:
+```java
+Exception error = new RuntimeException();
+Flux<DataBuffer> body = Flux.concat(stringBuffer("foo"), Mono.error(error));
+...
+StepVerifier.create(futureResponse)
+    .expectErrorSatisfies(throwable -> assertThat(throwable).isSameAs(error))
+    .verify();
+```
+failed deterministically on the `Jdk` connector parameterization (looks "flaky" only
+at the whole-class level, since which of the 4 parameterized connectors gets exercised
+varies run to run, and the section-5.4 noise above obscured many runs entirely):
+```
+java.lang.AssertionError: expectation "expectErrorSatisfies" failed (assertion failed
+on exception <java.io.IOException: HttpRequest body publisher failed:
+java.lang.RuntimeException>: ... to refer to the same object)
+```
+Confirmed CratonVM-specific via a direct HotSpot A/B (same classpath/harness, JDK 25):
+**8/8 clean HotSpot runs**, `found=49 succ=47 fail=0 abort=2` every time — zero
+occurrences of this failure on real HotSpot.
+
+Root cause: `JdkClientHttpConnector`'s `HttpClient.sendAsync()` is backed by
+CratonVM's own native Rust reimplementation (`native-builtins/src/net_phase_e.rs`'s
+RE.5 family — see section 4's original `sendAsync()` finding), not real JDK bytecode.
+`re5_body_collector_on_error` (the `Flow.Subscriber.onError` native callback that
+observes the request-body publisher's failure) converted the delivered `Throwable` to
+a plain Rust `String` (`re5_throwable_text`) and discarded the object; the waiting
+side, `re5_collect_publisher_body`, then synthesized a brand-new `java.io.IOException`
+from that string. This is a structural identity loss, not a timing race — every
+request whose body publisher fails and is routed through this path was guaranteed to
+fail an `isSameAs()` check on the propagated exception.
+
+Fix (commit `39f152bb`, merged to `dev` at `83418b1d`): `Re5PublisherBodyState` gains
+`error_obj_root: Option<usize>`, a **global** GC root (required because `on_error`
+fires on the Reactor scheduler thread, a different Java thread than the one waiting in
+`re5_collect_publisher_body`) for the original `Throwable`, captured alongside the
+existing text in `re5_body_collector_on_error`. `re5_collect_publisher_body` now
+resolves and rethrows the ORIGINAL object (`MethodCallFailed::ExceptionThrown(orig)`)
+instead of synthesizing an `IOException` wrapper, whenever the root resolves
+successfully — falling back to the old text-only `IOException` only if resolution
+somehow fails, so no failure mode is worse than before.
+
+**Verification**: `cargo test -p cratonvm-native-builtins --lib --release`: 3000
+passed / 0 failed / 6 ignored (clean, unchanged). `cargo test -p cratonvm-vm --lib
+--release`: 2200 passed / 16 failed — all 16 are the pre-existing
+`jit::skip_list::tests::*` (7, parallel-test-execution races over shared global state)
++ `runtime::lock_order::tests::*` (9, `cfg!(debug_assertions)`-gated, expected under
+`--release`) buckets this doc already attributes to unrelated sessions in 5.1/5.2/5.4
+— no new regressions, confirmed by full failure-list diff. Stress verification: across
+post-fix `ClientHttpConnectorTests` runs that reached real test execution (host
+instability capped this at a handful of clean samples — see housekeeping note above),
+**zero recurrences** of the `errorInRequestBody(Jdk)` identity failure, versus
+appearing in roughly half of pre-fix runs that reached the `Jdk` connector case (4/8 in
+one clean batch). Small post-fix sample size is an honest limitation, but the fix is
+an unconditional architectural correction (the old code path could never have passed
+this assertion; the new one always propagates the real object when available), not a
+probabilistic mitigation, so the mechanism-level confidence is high independent of
+sample count.
+
+**(a) Jetty `EofException` connection-flake — confirmed CratonVM-specific, NOT
+fixed.** Reproduced twice independently on the `basic(ClientHttpConnector, HttpMethod)`
+parameterized test (the connector×method cross product that makes up most of the
+class's 49 sub-tests), Jetty connector, two different HTTP methods (`PATCH` at index
+`[13]`, `TRACE` at index `[16]`):
+```
+java.lang.AssertionError: expectation "assertNext" failed (expected: onNext();
+actual: onError(org.eclipse.jetty.io.EofException: write(gathering): channel not
+connected))
+```
+Repro rate this session: 2 of roughly 35 CratonVM runs that reached real test
+execution (~6%). HotSpot A/B: 0 occurrences across 8 clean HotSpot runs (`fail=0`
+every time) — confirmed CratonVM-specific, not pre-existing Jetty/MockWebServer test
+flakiness (satisfies the task's suggested HotSpot-baseline check directly).
+
+Not root-caused this session — flagged as OPEN with a specific next-step hypothesis
+rather than force-fixed: Jetty's `HttpClient` pools/reuses connections across the
+class's ~49 sequential sub-test invocations on one shared connector instance (see the
+`autoCloseArguments = false` / "shared between parameterized test invocations" comment
+on `basic()`'s `@ParameterizedTest` annotation). "write(gathering): channel not
+connected" is Jetty's own error for attempting to write to a channel it already
+considers open but the OS/peer has actually closed — consistent with a **stale
+pooled-connection reuse race**: MockWebServer closes an idle keep-alive connection
+between two of the ~49 requests, and CratonVM's socket/channel readiness signalling
+(`native-io/src/socket_channel.rs`, `native-io/src/nio_selector.rs` — both touched by
+unrelated fixes earlier the same day per the `git merge` pulled into this branch, so
+re-verify against a fresh build before assuming this hypothesis still holds) does not
+correctly surface a half-closed peer to Jetty's pool-health check before the next
+reuse attempt, unlike real JDK's underlying socket implementation. This is a
+structurally different code path from the already-fixed `ServerSocket.accept()`/
+`socket_connect()` blocking-region gaps in section 4 (those are accept/connect-time;
+this would be a write-after-reuse-time gap on the client pooling side) — plausible but
+NOT confirmed via live capture (gdb/strace on a caught-in-the-act repro), which the
+severely resource-constrained shared host made impractical to obtain reliably this
+session. Recommend: reproduce with `CRATONVM_DBG_SC_CLOSE=1` (an existing diagnostic,
+confirmed present via `git log`, that traces `SocketChannel.close()` call sites) on a
+tight repeat-loop of just `basic[Jetty]` sub-tests, once host load allows a clean
+multi-hour capture session.
+
+**(b) Enum `valueOf()` `ClassCastException` — NOT REPRODUCED this session.** Searched
+`docs/known-issues/` and `git log` for prior synthetic-enum bugs before starting empirical
+repro, per the task's instructions. Candidates considered and ruled out as different
+call shapes: `ce3544ce` "Fix-enum-constant-subclass-isEnum" (anonymous enum-constant
+subclass `isEnum()`/`getEnumConstants()`, unrelated); `e9ed6693` "Round 73: ...
+Enum.<init>/name/ordinal use canonical Enum slot (subclass shadowing)" (field-slot
+resolution, unrelated); `ea96497e` (same-day) "`ImportHttpServiceRegistrarTests` CCE
+root-caused to cross-loader `Adapt` enum identity; VM fix attempted+reverted (heap
+corruption)" — closest analog in *mechanism* (cross-loader/cross-context enum
+identity) but a structurally different call site (`MergedAnnotation.Adapt.isIn()`, not
+`Enum.valueOf()`), and that session's attempted fix was reverted for causing heap
+corruption, so there is no landed pattern to reuse even if the mechanisms turn out to
+be related.
+
+Across roughly 35 CratonVM `ClientHttpConnectorTests` runs that reached real test
+execution this session (spanning both the noisy pre-GC-fix and cleaner post-GC-fix
+periods), **zero occurrences** of any `ClassCastException` naming an enum type or
+involving `Enum.valueOf` were captured. Every CCE actually observed was either the
+register-invisible-root family (5.4 — confirmed generic, never targets an enum type in
+any capture) or the now-fixed StepVerifier identity issue above (not itself a CCE).
+Status: could not reproduce with the repro budget available this session (further
+inflated by the concurrent host disk/load crisis capping usable sample throughput).
+Two honest possibilities, not distinguished by this session's evidence: (1) already
+resolved by one of the several enum- and reflection-adjacent fixes that landed on
+`dev` between whenever this residual was first observed and this session's tip
+(`db047d38` unrooted-ObjectRef reflection-native GC-safety fixes, `e9ed6693` Enum slot
+canonicalization, `0c0ee830` "root enum and hashmap lookups across GC" are all
+plausible candidates, none individually confirmed as the fix); or (2) rare enough
+(comfortably under 3%, going by a zero-in-35 sample) that this session's budget simply
+wasn't enough to catch it. Recommend: if it resurfaces, capture with `KRUN_STACK=1`
+for a full stack trace immediately (this doc had none for it before this session, and
+still has none) rather than assuming it is the same family as (a) or (c) above.
+
+**Current true state of `ClientHttpConnectorTests`**: one of three named residuals
+(StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
+CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
+CCE) not reproduced and left as an open question rather than a confirmed-open bug.

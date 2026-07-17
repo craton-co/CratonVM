@@ -485,66 +485,69 @@ dialect-gated partial skips:
 
 One exception: `org.hibernate.orm.test.type.temporal.ZonedDateTimeTest` —
 investigated 2026-07-16 against the frozen `dev@dcb24161` baseline (shared
-Azure Linux host). **Not yet confirmed same-mechanism; keep OPEN, and a
-separate, more severe defect surfaced during the attempt.**
+Azure Linux host), then the **livelock blocking it was root-caused and
+FIXED the same day** (follow-up session, same date). Both this class and
+`LocalDateTimeTest` now complete; see the new residual noted below before
+assuming this section's "matches HotSpot" framing still fully applies.
 
-**HotSpot comparison** (`/home/victor/jdk25/bin/java`, identical classpath/
-props via `common.args`): solo run completes cleanly in 29.2s — 608 found /
-404 ok / 204 aborted / 0 failed, the identical shape reported for CratonVM.
-A full-text scan of the entire raw output (all WARN/INFO Hibernate logging
-included, via `-Dcraton.trace=1`) contains **zero** occurrences of
-"exception" (case-insensitive) anywhere. HotSpot's 204 aborted tests here
-are 100% silent assumption-based skips, exactly like the other
-`@CustomEnhancementContext`/dialect-gated entries in this list — there is no
-HotSpot-side message of any kind to compare against.
+**Livelock: FIXED.** Full writeup:
+[hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md](../../internal/fixed-suite-bugs/hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md).
+Root cause was **not** a GC root-scanning gap in the usual sense: the
+`Executors.newSingleThreadExecutor()`/`newFixedThreadPool`/
+`newCachedThreadPool` native factory shims
+(`native-builtins/src/phases_early.rs`) correctly construct the real
+`ThreadPoolExecutor` via `invoke_special` and correctly pin/re-read the
+object across that construction's own nested allocations — but then
+discarded the (possibly GC-relocated) result on return, so the outer
+factory closure kept returning its own pre-construction, now-stale Rust
+`ObjectRef`. That stale address has no Java frame slot for the GC's root-
+remap machinery to fix up (it exists only as a native value until the
+interpreter stores the returned `Value` into a bytecode local), so once the
+GC's semispace flip reused the stale from-space memory, the first
+`invokevirtual` on the "constructed" executor read an all-zero header —
+manifesting as the sustained `ConditionNode` stale-pointer livelock under
+this pair of classes' unusually heavy per-iteration `ExecutorService`
+churn (`Timezones.withDefaultTimeZone()`, called on every one of the
+class's ~608/162 parameterized iterations). Fixed by having
+`initialize_real_thread_pool_executor` return the current (possibly
+relocated) object instead of discarding it, and updating its four factory
+call sites to use that returned value.
 
-**CratonVM comparison: could not obtain a completed run on this host.** 4
-independent solo attempts — JIT-on, JIT-on with `RUST_LOG=error`, `--nojit`,
-and `nice -n 19` — all deterministically hit a severe livelock instead of
-completing: tens of millions of repeated `Stale pointer detected in
-invokevirtual receiver (ptr=..., all-zero header) — falling back to CP class
-java/util/concurrent/locks/AbstractQueuedSynchronizer$ConditionNode`
-warnings (`vm/src/runtime/interpreter.rs`), against **the same object
-address sustained across checks taken minutes apart** — ruling out ordinary
-slow-but-progressing execution across the class's 608 parameterized
-iterations, which would churn through many different addresses. None of the
-4 attempts reached a single `@@RESULT` within bounded timeouts up to 300s
-(30-40M+ log lines emitted, no forward progress). A 5th attempt pinned to a
-single core (`taskset -c 0`) avoided the livelock but hit a different,
-unrelated harness bug instead (NPE: "Cannot invoke
-`EngineExecutionListener.getClass()` because `listener` is null" during
-JUnit class discovery/loading, found=0).
+This is a **different** bug from the GC forwarding-walk-truncation family
+also fixed 2026-07-16
+(`docs/internal/springboot/basiccontroller-stale-pointer-invokevirtual-aqs-conditionnode-crash-FIXED.md`) —
+that family drops objects that are never forwarded at all during a moving
+collection; this bug's object *was* correctly forwarded, but the native
+caller never learned the new address. Both produce the identical
+`Stale pointer detected ... ConditionNode` log signature, which is why they
+looked like the same bug at first glance.
 
-This reproduces identically on the sibling `LocalDateTimeTest` (also in this
-same "already-expected" list, sharing the same `AbstractJavaTimeTypeTests`
-base): same livelock signature, same non-terminating spam, no `@@RESULT`.
-Both classes' shared `Timezones.withDefaultTimeZone()` helper
-(`hibernate-core/src/test/java/.../type/temporal/Timezones.java`) creates a
-brand-new `Executors.newSingleThreadExecutor()` + submits a `Future` on
-**every one of the class's ~608 iterations**, which is far heavier
-AQS/`ConditionNode`/thread-pool churn per run than any other class
-currently tracked in this doc — the likely reason this specific livelock
-only manifests for this pair of classes.
+**Verification (fixed binary, `--nojit`, real-JDK, solo runs):**
+`ZonedDateTimeTest` `found=608 started=608 ok=341 failed=63 aborted=204
+skipped=0` (2/2 clean full runs, byte-identical; a 3rd run was cut short by
+unrelated severe host memory exhaustion from other concurrent sessions on
+this shared box, no stale-pointer signature in the partial log).
+`LocalDateTimeTest` `found=162 started=162 ok=90 failed=0 aborted=72
+skipped=0` (3/3 clean, byte-identical). Broader regression check
+(`OptimizerConcurrencyUnitTest`, `Executors.newFixedThreadPool(10)`, real
+concurrent multi-tenant ID generation) showed zero stale-pointer warnings.
 
-**Conclusion so far:** since HotSpot's abort mechanism for this class is
-provably silent, the original hedge ("same expected-skip mechanism
-surfacing a different message") cannot be literally correct — there is no
-HotSpot message to be "the same" as. Whatever produced the original
-`InternalError: CloneNotSupportedException` capture in CratonVM must be a
-CratonVM-only artifact, not shared HotSpot behavior; it is **not** confirmed
-to belong in this "matches HotSpot, not a defect" section, and
-`ZonedDateTimeTest` should be treated as OPEN, not closed, until it can
-actually be re-verified. Root-causing the original signature itself was not
-possible this session because CratonVM never got far enough to reproduce it
-(the livelock above pre-empts it entirely on this host).
-
-**Separately flagged:** the livelock itself (AQS `ConditionNode`
-stale-pointer detection never resolving under heavy `ExecutorService`/
-`Future` churn) is a distinct, newly-discovered, clearly-reproducible defect
-in its own right — 4/4 reproduction rate, unrelated to JIT-vs-interpreter
-choice — that blocks any solo verification of this whole temporal-test pair
-on a contended host, and needs its own dedicated investigation (in the
-spirit of this project's existing "stale-objref"/root-coverage-gap bug
-family) with the `CRATONVM_DBG_SWEEP_ZERO`/`CRATONVM_DBG_STALE_RECV` probes
-already built into `interpreter.rs` for this exact scenario, ideally on a
-quiet host to get an uncontaminated signal.
+**New residual surfaced by the fix — OPEN, needs its own investigation:**
+now that `ZonedDateTimeTest` can complete, it shows 63 genuine
+`AssertionFailedError`s HotSpot does not have for the identical classpath
+(`found=608 ok=341 failed=63 aborted=204` for CratonVM vs. HotSpot's
+`found=608 ok=404 failed=0 aborted=204`, confirmed via
+`/home/victor/jdk25/bin/java` direct run, 29.2s, zero exceptions in the
+full raw log). All 63 failures are timezone-offset value mismatches, e.g.
+`Values written by Hibernate ORM should match the original value ... ==>
+expected: <2017-11-06 09:19:01.0> but was: <2017-11-06 01:19:01.0>` — a
+consistent 8-hour skew matching `Timezones.ZONE_UTC_MINUS_8`. This is a
+previously-invisible defect (the livelock pre-empted ever seeing it), not
+investigated further this session since it's unrelated to the GC/native
+construction bug above. `LocalDateTimeTest`'s `failed=0` suggests the
+discrepancy is specific to zone-*offset* handling (`ZoneOffset`/`UTC-8`
+literal parsing or storage), not a general Hibernate/H2 timestamp bug —
+worth a dedicated follow-up starting from `Timezones.toTimeZone`/
+`ZONE_UTC_MINUS_8` and whichever `java.time`/H2 conversion path handles
+fixed-offset (non-region) zones differently from `LocalDateTimeTest`'s
+zone-less values.

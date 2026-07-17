@@ -8563,7 +8563,9 @@ pub(crate) fn initialize_real_thread_pool_executor(
         let this = ctx.read_native_pin(pin_base, this);
         stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
         ctx.unpin_native_roots(pin_base);
-        return Ok(None);
+        // Return the (possibly GC-relocated) object so factory-style callers
+        // (see below) don't hand back a stale pre-relocation address.
+        return Ok(Some(Value::Object(Some(this))));
     };
     let queue_pin = ctx.pin_native_root(queue);
 
@@ -8573,7 +8575,7 @@ pub(crate) fn initialize_real_thread_pool_executor(
         stpe_legacy_slot_init(ctx, this, core_pool_size.max(1));
         ctx.set_field_by_name(this, "workQueue", Value::Object(Some(queue)));
         ctx.unpin_native_roots(pin_base);
-        return Ok(None);
+        return Ok(Some(Value::Object(Some(this))));
     };
     let unit_pin = ctx.pin_native_root(unit);
 
@@ -8613,8 +8615,28 @@ pub(crate) fn initialize_real_thread_pool_executor(
         )
     };
 
+    // BUG FIX (GC-relocation-during-construction, 2026-07-16): `this` may have
+    // been relocated by a moving-GC collection triggered by one of the
+    // allocations above (queue/unit/ThreadFactory construction, or the real
+    // <init> itself allocating mainLock/workers/a Worker+Thread). This
+    // function's OWN uses of `this` are safe (always re-fetched via
+    // `read_native_pin`), but factory-style callers below (newFixedThreadPool
+    // etc.) hold their OWN pre-construction copy of the object with no Java
+    // frame slot for the GC to fix up (the object exists only as a native Rust
+    // value until the interpreter stores the returned Value into a local) --
+    // if this function discarded the relocated address, those callers
+    // returned a stale, already-freed from-space pointer that the interpreter
+    // would read as an all-zero header on first use (AbstractMethodError /
+    // stale-pointer livelock under java/util/concurrent/ExecutorService
+    // dispatch; see
+    // docs/known-issues/hibernate/hib-misc-residuals-20260716.md,
+    // ZonedDateTimeTest/LocalDateTimeTest). Always hand back the CURRENT
+    // address so every caller (both the <init> dispatch, which ignores this
+    // for void methods, and the factory shims, which do not) sees the live
+    // object.
+    let this = ctx.read_native_pin(pin_base, this);
     ctx.unpin_native_roots(pin_base);
-    result.map(|_| None)
+    result.map(|_| Some(Value::Object(Some(this))))
 }
 
 pub(crate) fn initialize_real_scheduled_thread_pool_executor(
@@ -8995,7 +9017,10 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 _ => 1,
             };
             let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-            initialize_real_thread_pool_executor(
+            // Use the function's returned (possibly GC-relocated) object,
+            // not `sv` directly -- see the BUG FIX comment on
+            // `initialize_real_thread_pool_executor`'s return path.
+            let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
                 ps,
@@ -9005,7 +9030,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 TpeQueueKind::Linked,
                 None,
             )?;
-            Ok(Some(Value::Object(Some(sv))))
+            Ok(result.or(Some(Value::Object(Some(sv)))))
         },
     );
     r.register(
@@ -9014,7 +9039,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-            initialize_real_thread_pool_executor(
+            let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
                 0,
@@ -9024,7 +9049,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 TpeQueueKind::Synchronous,
                 None,
             )?;
-            Ok(Some(Value::Object(Some(sv))))
+            Ok(result.or(Some(Value::Object(Some(sv)))))
         },
     );
     r.register(
@@ -9037,7 +9062,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 _ => None,
             };
             let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-            initialize_real_thread_pool_executor(
+            let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
                 0,
@@ -9047,7 +9072,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 TpeQueueKind::Synchronous,
                 factory,
             )?;
-            Ok(Some(Value::Object(Some(sv))))
+            Ok(result.or(Some(Value::Object(Some(sv)))))
         },
     );
     r.register(
@@ -9056,7 +9081,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
             let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-            initialize_real_thread_pool_executor(
+            let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
                 1,
@@ -9066,7 +9091,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 TpeQueueKind::Linked,
                 None,
             )?;
-            Ok(Some(Value::Object(Some(sv))))
+            Ok(result.or(Some(Value::Object(Some(sv)))))
         },
     );
     r.set_category(__prev_cat);
