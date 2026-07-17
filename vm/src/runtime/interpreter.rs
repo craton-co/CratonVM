@@ -9863,6 +9863,11 @@ fn find_exception_handler_pc_unknown(
         else {
             continue;
         };
+        // Owned copy, independent of `cm_guard`'s current borrow, so it
+        // survives the lock drop/reacquire below and stays usable in the
+        // loader-identity-blind fallback match (see
+        // `Class::is_subclass_of_by_name`).
+        let catch_class_name_owned = catch_class_name.to_string();
         let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
             None => {
@@ -9876,7 +9881,9 @@ fn find_exception_handler_pc_unknown(
                 }
             }
         };
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
@@ -9931,6 +9938,11 @@ fn find_exception_handler_impl(
         else {
             continue;
         };
+        // Owned copy for the loader-identity-blind fallback below (see
+        // `Class::is_subclass_of_by_name`) — independent of `cm_guard`'s
+        // current borrow so it stays valid across the lock drop/reacquire
+        // in the lazy-load branch just below.
+        let catch_class_name_owned = catch_class_name.to_string();
 
         // Try to find the catch type class on the held lock — `&str`,
         // no allocation.
@@ -9952,7 +9964,9 @@ fn find_exception_handler_impl(
             }
         };
 
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
@@ -10050,6 +10064,11 @@ fn route_jit_exception_through_method(
         let Some(catch_class_name) = class.constant_pool.get_class_name(entry.catch_type) else {
             continue;
         };
+        // Owned copy for the loader-identity-blind fallback below (see
+        // `Class::is_subclass_of_by_name`) — independent of `cm_guard`'s
+        // current borrow so it stays valid across the lock drop/reacquire
+        // in the lazy-load branch just below.
+        let catch_class_name_owned = catch_class_name.to_string();
         let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
             None => {
@@ -10063,7 +10082,9 @@ fn route_jit_exception_through_method(
                 }
             }
         };
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             handler_pc = Some(entry.handler_pc as usize);
             break;
