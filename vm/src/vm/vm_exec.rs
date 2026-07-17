@@ -9681,12 +9681,46 @@ pub fn invoke_or_native(
 
     // For real (non-synthetic) classes, dispatch via invoke_on_class_shared
     // which handles ACC_NATIVE methods and bytecode execution.
+    //
+    // jit-invokestatic-clinit-gap fix (2026-07-17): fourth and final
+    // occurrence of the JVMS 5.5 class-init gap this session's sibling
+    // fixes have been closing (see jit_getstatic/jit_putstatic_*
+    // /jit_new_object in vm/src/jit/helpers.rs, and the
+    // callee_compiler/resolve_inline_site/try_jit_compile_callee_slow
+    // gates in vm/src/runtime/interpreter.rs) -- and the one that
+    // actually explained a synthetic repro (a JIT-compiled static method
+    // whose first-ever call reached, via a rare branch, an invokestatic
+    // to a static method of a class loaded-but-not-yet-initialized) that
+    // kept observing the bug even after all three JIT-side gates above
+    // were in place and correctly refusing their own fast paths: every
+    // one of them falls back, one way or another, to invoke_or_native --
+    // and THIS shortcut, taken whenever the target class is already
+    // LOADED (as opposed to not-yet-loaded, which the invoke_shared tail
+    // below handles correctly), calls straight into
+    // invoke_on_class_shared with no ensure_class_initialized_shared
+    // anywhere in between.
+    //
+    // Class.forName(name, false, loader) (JLS-sanctioned load-without-
+    // initialize) is the sharpest way to hit this -- LOADED but not yet
+    // INITIALIZED -- but it is not the only one. execute_invokestatic
+    // and execute_invoke_kind (this crate's own interpreter dispatch)
+    // both already call ensure_class_initialized_shared BEFORE reaching
+    // invoke_or_native, which is exactly why the plain-interpreted
+    // (CRATONVM_DISABLE_JIT=1) form of the repro was unaffected --
+    // masking this gap for every caller that happens to check first.
+    // Any caller that does NOT -- jit_invoke_dispatch's slow-path
+    // fallback being the concrete one found this session -- silently
+    // skips <clinit> for a call whose target class merely happens to
+    // already be loaded. Class-init state is monotonic, so this call is
+    // cheap (a single atomic load) once initialized and can never
+    // regress an already-initialized class back to needing the check.
     {
         let cm = shared.class_manager.read();
         if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
                     drop(cm);
+                    super::ensure_class_initialized_shared(shared, thread, class_id)?;
                     return invoke_on_class_shared(
                         shared,
                         thread,

@@ -822,16 +822,51 @@ impl ForeignCallGuard {
                 }
             }
         };
-        // Publish the idle->running transition atomically with the barrier
-        // census. A separate leave followed by a flag store can let a new STW
-        // exclude an already-running foreign mutator.
-        shared.gc_barrier.mark_blocked_region_leave_after(|| {
-            with_foreign_thread(|jt| {
-                jt.gc_block_state
-                    .in_blocked_region
-                    .store(false, std::sync::atomic::Ordering::Release);
-                jt.root_snapshot.lock().clear();
-            });
+        // BUG FIX (2026-07-18, aio-dispatch-sigsegv): this used to combine
+        // the counter-based leave (`mark_blocked_region_leave_after`) with a
+        // bare `in_blocked_region.store(false)` + `root_snapshot.lock().clear()`
+        // done "atomically" under the barrier lock. That closed the identity-
+        // census race its own comment describes, but it is NOT the same
+        // operation as the canonical "done blocking, about to run Java again"
+        // idiom every other blocking native in this codebase uses
+        // (`NativeContextImpl::end_blocking_region`, `vm/src/vm/vm_exec.rs`):
+        // `mark_blocked_region_leave()` (counter) followed by
+        // `check_post_block_gc()` (identity-flag clear via
+        // `GcBarrier::leave_blocked_region_flagged`, which independently
+        // closes the same back-to-back-pause race by looping under its own
+        // lock — no atomic combination with the counter needed). Critically,
+        // `check_post_block_gc()` also APPLIES the accumulated cross-GC
+        // `fixup` map to every persistent per-thread field — `java_thread_obj`,
+        // `native_pin_roots`, `native_alloc_pool`, `native_pending_return`,
+        // `scoped_values`, `pending_async_exception`, JNI locals — before
+        // depositing a fresh snapshot. The old bare clear here skipped that
+        // fixup application entirely: any GC that ran while this dispatcher
+        // thread sat idle correctly relocated (not reclaimed — its snapshot
+        // now correctly includes `java_thread_obj`, see `Drop` below) this
+        // thread's own `java_thread_obj`, but nothing ever copied the new
+        // post-move address back into `JvmThread.java_thread_obj` itself, so
+        // the NEXT `Thread.currentThread()` call on this thread (directly, or
+        // transitively — e.g. `ThreadLocal.get()`'s inherited-value drain)
+        // handed back the stale pre-move address. That is the confirmed root
+        // cause of the `cratonvm-aio-dispatch-N` "arbitrary call site" SIGSEGV
+        // class (Result 3, docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md
+        // 5.8 follow-up #2) — reproduced live with
+        // `CRATONVM_DBG_STALE_OBJREF=1`: `current_thread_object` ->
+        // `identity_hash_code` -> `get_header` panics "stale ObjectRef ...
+        // this object was evacuated by a moving GC to <addr> ... but
+        // native/interpreter code dereferenced the OLD address" on exactly
+        // this thread family, from `drain_inherited_for_current_thread`
+        // (`native-builtins/src/phases_early.rs`). Using the two established
+        // helper methods instead of reimplementing a partial version of them
+        // closes the gap and keeps this transition in sync with any future
+        // change to the canonical blocking-region discipline.
+        shared.gc_barrier.mark_blocked_region_leave();
+        with_foreign_thread(|jt| {
+            crate::vm::NativeContextImpl {
+                shared: shared.as_ref(),
+                thread: jt,
+            }
+            .check_post_block_gc();
         });
         // A fresh local-ref frame scopes this call's JNI local refs (freed on
         // return, per JNI semantics) so the thread holds none across the idle
@@ -852,10 +887,55 @@ impl Drop for ForeignCallGuard {
             // Retire the TLAB while still a counted mutator: a STW requested now
             // is still waiting for us to arrive (its collector has not started),
             // so writing the TLAB tail filler cannot race the moving collector.
-            // Then deposit an empty snapshot and re-enter the idle blocked region.
+            // Then deposit a REAL root snapshot (not a bare clear) and re-enter
+            // the idle blocked region.
+            //
+            // BUG FIX (2026-07-18, aio-dispatch-sigsegv): this used to be
+            // `jt.root_snapshot.lock().clear()` — correct for the *frame*
+            // portion (frames are indeed empty once the outermost call has
+            // returned) but wrong for everything else `deposit_root_snapshot`
+            // captures: `java_thread_obj`, `pending_async_exception`, any
+            // straggling JNI local refs, and JIT/shadow-stack roots. A
+            // foreign-attached AIO dispatcher thread's `java_thread_obj` is
+            // lazily allocated the first time Java code on this thread calls
+            // `Thread.currentThread()` (directly, or transitively — e.g.
+            // `ThreadLocal.get()`'s inherited-value drain calls
+            // `ctx.current_thread_object()`) and then PERSISTS on `JvmThread`
+            // across every subsequent completion this dispatcher thread ever
+            // services. This idle transition runs after EVERY delivered
+            // completion, so a bare `.clear()` made that persistent mirror
+            // object GC-invisible for the entire idle window between
+            // completions (the dispatcher's dominant time-in-state, since it
+            // parks on a condvar in `wait_for_pending` between wakeups) —
+            // exactly the "the deposited snapshot is the ONLY view a
+            // cross-thread STW collector has of a parked thread's roots"
+            // hazard `deposit_root_snapshot`'s own doc comment (and the
+            // `interpreter::update_root_snapshot` mirror of it) describes.
+            // Any GC that ran while this thread sat idle could relocate or
+            // reclaim `java_thread_obj` without ever updating this thread's
+            // copy, so the NEXT completion's `Thread.currentThread()` (or any
+            // other read of the same persistent field) handed back a
+            // stale/dangling `ObjectRef` — dereferenced at whatever call site
+            // happened to touch it next (`identity_hash_code`, a `get_field`,
+            // an array-bounds check, ...). That is the "essentially arbitrary
+            // native/interpreter call site" `cratonvm-aio-dispatch-N` SIGSEGV
+            // class documented as Result 3 in
+            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's 5.8
+            // follow-up #2 — confirmed live via `CRATONVM_DBG_STALE_OBJREF=1`,
+            // which turns the segfault into a clean panic naming
+            // `current_thread_object` -> `identity_hash_code` -> `get_header`
+            // ("stale ObjectRef ... evacuated by a moving GC") on exactly this
+            // thread family. `deposit_root_snapshot` is the established,
+            // already-audited "about to block" discipline every other
+            // idle/parked transition in this codebase uses (see its own doc
+            // comment); this call site simply never adopted it.
             with_foreign_thread(|jt| {
                 jt.tlab.retire();
-                jt.root_snapshot.lock().clear();
+                crate::vm::NativeContextImpl {
+                    shared: shared.as_ref(),
+                    thread: jt,
+                }
+                .deposit_root_snapshot();
                 jt.gc_block_state
                     .in_blocked_region
                     .store(true, std::sync::atomic::Ordering::Release);

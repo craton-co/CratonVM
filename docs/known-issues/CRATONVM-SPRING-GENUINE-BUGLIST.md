@@ -1538,6 +1538,180 @@ the WRONG same-named copy. Eight fixes landed on
        requirement that a class be initialized before instantiation). Spun
        off as a follow-up task.
 
+       **2026-07-17 addendum #3 -- follow-up task closed: putstatic/new/
+       invokestatic siblings FIXED (7 sites across 4 files), one narrower
+       residual documented.** Picked up the follow-up flagged in addendum
+       #2 directly above, on the same worktree
+       (`/data/data/wt-javapoet-linewrapper-20260717`, branch
+       `fix/javapoet-linewrapper-20260717`).
+
+       **`jit_putstatic_int`/`_long`/`_float`/`_double`/`_object` -- FIXED.**
+       Confirmed real via a targeted repro (`PutstaticRepro`/`PSInit`:
+       `static void touch(boolean w, int v) { if (w) { PSInit.VALUE = v; }
+       else { dummy++; } }`, `PSInit` force-loaded-but-not-initialized via
+       `Class.forName(name, false, loader)`, `touch` tiered up to JIT via
+       ~20,000 calls on the `dummy++` arm before the one real write).
+       Fix: all five helpers now call `ensure_class_initialized_shared`
+       (via a shared `jit_putstatic_class_init_guard`) before writing.
+       Because `putstatic` is `void`-returning, the helpers were changed to
+       return `i64` (`0` normally, `i64::MIN` on a stashed `<clinit>`
+       exception) and the two `0xb3` codegen arms in `jit/src/x64.rs` gained
+       `emit_post_invoke_exception_check(b'V')` after the call --
+       structurally identical to the `getstatic`/`0xb2` fix above.
+       `set_static_shared`'s own hazard (lazily creates the class's static
+       `Vec` on first write, independent of `<clinit>` having run -- a
+       *later* `<clinit>` run would otherwise silently clobber an
+       early JIT write) makes running `<clinit>` first, not just
+       eventually, load-bearing here, not merely a JVMS technicality.
+
+       **`jit_new_object` -- FIXED.** Confirmed real via a targeted repro
+       (`NewObjectRepro`/`NCtor`: `static void touch(boolean w) { if (w) {
+       lastObj = new NCtor(); } else { dummy++; } }`, `NCtor`'s `<clinit>`
+       sets a static `TAG` its constructor reads). Buggy build: `tag=0`
+       (the constructor ran before `<clinit>`, and nothing ever re-triggers
+       it since the object already escaped into a static field). Fixed
+       build: `tag=777`. Fix: `jit_new_object` now calls
+       `ensure_class_initialized_shared` before any allocation-capacity
+       probing, returning the existing `0`/null OOM sentinel on failure --
+       the codegen's pre-existing `emit_post_alloc_oom_check()` guard
+       (already emitted after every call site of this helper) already
+       recognized that sentinel, so **no `jit/src/x64.rs` codegen change was
+       needed** for this one, unlike `getstatic`/`putstatic`. Scope note: a
+       `new` site the JIT's scalar-replacement optimizer proves
+       non-escaping elides the call to `jit_new_object` entirely (fields
+       kept in frame slots, no heap object, no helper call) and is **not**
+       covered by this fix -- flagged as a narrower residual below.
+
+       **`invokestatic` -- had the gap, FOUR separate fix sites needed.**
+       This was the one genuinely surprising part of this session: getting
+       an end-to-end repro (`InvokeStaticRepro`/`ISInit`: `ISInit.<clinit>`
+       unconditionally throws; `ISInit.compute(int)` touches none of its
+       own class's statics so it cannot "self-heal" the way an inlined
+       getstatic/putstatic would; `touch`'s rare branch calls
+       `ISInit.compute` inside a try/catch, tiered up via the always-taken
+       `dummy++` arm) to actually turn green required finding and fixing
+       **four** distinct code paths that all independently route a
+       JIT-reached `invokestatic` around class initialization -- three in
+       `vm/src/runtime/interpreter.rs`, one in `vm/src/vm/vm_exec.rs`:
+
+       1. `callee_compiler` (the closure `try_jit_upgrade_with_gate` hands
+          to `jit::try_compile` for cross-method direct calls) -- builds a
+          raw machine-code `CALL` straight into a callee's compiled entry
+          (`direct_calls` in `jit/src/lib.rs`), bypassing both the
+          interpreter's `execute_invokestatic` and the JIT dispatch
+          helper's own checked fallback. Fix: only take the direct-call
+          fast path for a `static` callee when its declaring class is
+          *already* initialized (`is_class_initialized_fast`, a lock-free
+          read of the embedded per-`Class` atomic); otherwise return `None`
+          and drop the site to the checked generic dispatch. Class-init
+          state is monotonic, so a check made once, here, at the caller's
+          compile time, is sound for the entire lifetime of the resulting
+          direct-call site.
+       2. `resolve_inline_site` -- when the JIT inlines a callee's bytecode
+          directly into the caller (`CRATONVM_JIT_MAIN_INLINE=1` for the
+          synchronous compiler, and *unconditionally* for the background
+          tiered compiler, which passes `callee_compiler = None` but always
+          wires an `inline_resolver`), there is no call boundary
+          whatsoever -- not even a raw `CALL` -- so a callee whose own body
+          never touches its class's statics (the existing "conservative
+          default: do NOT inline getstatic/putstatic-bearing callees" gate
+          only excludes the *opposite* shape) gave the JIT no code-level
+          opportunity at all to run `<clinit>`. Same fix shape: refuse to
+          admit a `static` callee for inlining unless its declaring class
+          is already initialized.
+       3. `try_jit_compile_callee_slow` -- the runtime-side counterpart of
+          (1), invoked from `jit_invoke_dispatch` (`vm/src/jit/helpers.rs`)
+          the first time a generic-dispatch `invokestatic` call site
+          actually executes and decides to eagerly compile+cache its
+          callee. Same fix shape again; on refusal, `*cache_negative` is
+          left `false` so a not-yet-initialized class doesn't get
+          permanently negative-cached (it may initialize very soon, at
+          which point this path should start succeeding).
+       4. `invoke_or_native` (`vm/src/vm/vm_exec.rs`) -- the actual root
+          cause of why the repro kept failing even after (1)-(3) were all
+          in place and correctly refusing their own fast paths: every one
+          of them falls back, one way or another, to `invoke_or_native`,
+          and its "real (non-synthetic) class" shortcut calls straight into
+          `invoke_on_class_shared` with **no** `ensure_class_initialized_shared`
+          anywhere in between -- for any class that merely happens to
+          already be *loaded* (as opposed to not-yet-loaded, which the
+          `invoke_shared` tail a few lines down handles correctly).
+          `Class.forName(name, false, loader)` (JLS-sanctioned
+          load-without-initialize -- exactly how the repro force-loads
+          `ISInit`) is the sharpest way to hit this, but any code path
+          that reaches `invoke_or_native` without its own prior check can.
+          `execute_invokestatic`/`execute_invoke_kind` (the interpreter's
+          own bytecode dispatch) both already check before ever reaching
+          `invoke_or_native`, which is exactly why the plain-interpreted
+          (`CRATONVM_DISABLE_JIT=1`) form of the repro was unaffected by
+          any of this -- masking the gap for every caller that happens to
+          check first. Fix: call `ensure_class_initialized_shared` right
+          before the `invoke_on_class_shared` shortcut. This is the
+          broadest-reaching fix of the four -- `invoke_or_native` is used
+          far beyond JIT dispatch -- but is unconditionally correct per
+          JVMS and cheap (one atomic load) once a class is initialized.
+
+       A second, related but architecturally separate gap was found and
+       fixed along the way: `has_dispatch` (`jit/src/x64.rs`,
+       `compile_with_param_slots`) did not account for
+       `static_field_info`/`new_info` at all. A compiled method whose ONLY
+       JIT-relevant content was a getstatic/putstatic/`new` site -- no
+       invoke, no direct call, no bounds check, nothing else already on
+       that trigger list -- compiled with `has_dispatch=false` and was
+       entered through `execute_jit_call`'s fast arm
+       (`vm/src/runtime/interpreter.rs`), which skips `set_jit_thread`
+       entirely. Every one of `jit_getstatic`/`jit_putstatic_*`/
+       `jit_new_object`'s new `ensure_class_initialized_shared` calls
+       depends on `jit_thread_mut()` resolving a live thread -- exactly
+       the `JIT_THREAD` TLS this flag exists to guarantee (its own doc
+       comment already names this exact failure shape: "otherwise the
+       callee's dispatch helper sees a null thread and silently returns
+       0", from the pre-existing `Character.getType` fix for
+       `direct_calls`). Without this, the putstatic/new_object repros
+       above initially reproduced the ORIGINAL bug even against the fixed
+       helpers, because the class-init check silently no-op'd on a null
+       thread. Fix: added `!compiler.static_field_info.is_empty() ||
+       !compiler.new_info.is_empty()` to the `has_dispatch` computation.
+       This is a real, previously-latent bug independent of this session's
+       other fixes -- it would equally have affected the already-landed
+       `jit_getstatic` fix for any method whose only JIT-relevant content
+       was getstatic sites, which the original verification's real-world
+       repro (`LineWrapper.append`, which also calls `flush()` via
+       `invokevirtual`) never happened to isolate.
+
+       **Verified:** all four repros above (`PutstaticRepro`, `NewObjectRepro`,
+       `InvokeStaticRepro`, plus a `GetstaticInvokestaticRepro` sanity check
+       confirming the already-landed `getstatic` fix is unaffected) pass
+       consistently across 3 reruns each against a from-scratch rebuild.
+       The original `LineWrapper$FlushType` repro (`MRun` against
+       `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithBasicTests`)
+       was re-run against the final binary and still reaches the same
+       distinct, unrelated, pre-existing QDox parser NPE noted in addendum
+       #2 -- confirming no regression. Regression-checked against a
+       from-scratch build: `cargo test -p cratonvm-jit --lib --release`
+       906/0 (0 failed) -- unchanged; `cargo test -p cratonvm-vm --lib
+       --release` 2201 passed/16 failed -- the same 16 pre-existing
+       `lock_order`/`jit::skip_list` release-mode names as addendum #2's
+       baseline, unchanged; `cargo test -p cratonvm-native-builtins --lib
+       --release` 3000 passed/0 failed, 6 ignored -- unchanged. Perf
+       spot-check: a tight 20M-iteration `new` + `putstatic` hot loop
+       (steady-state, both classes already initialized, so every added
+       `ensure_class_initialized_shared` call is on its already-initialized
+       fast path) measured ~32.4s on both a pre-session baseline binary and
+       the fully-fixed binary (two runs each; the fixed binary's two runs
+       bracketed the baseline's, 30.4s-34.4s vs 32.4s-32.5s) -- no
+       measurable per-call overhead added to either hot bytecode.
+
+       **Residual (not fixed this session, narrower than the above):**
+       scalar-replacement-elided `new` sites (JIT-proven non-escaping
+       objects, `jit/src/x64.rs`'s `self.scalar_replaced` map in the `0xbb`
+       codegen) never call `jit_new_object` at all -- no helper call, no
+       code-level opportunity to run `<clinit>`. Lower real-world severity
+       than the four fixed sites (scalar replacement requires the object to
+       provably never escape the compiling method, a narrow subset of all
+       `new` sites), but the same class of bug in principle. Flagged for a
+       future follow-up.
+
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
@@ -4333,3 +4507,347 @@ have left. Verified via `cargo test -p cratonvm-native-io --lib --release`
 failed, all 16 the same pre-existing debug-build-only `lock_order` +
 already-broken `jit::skip_list` failures documented in the prior follow-up —
 zero regressions either run).
+
+
+---
+
+#### 5.8 follow-up #3 (2026-07-17/18, session 4): d82a18d6 stress-verified clean across ~200 targeted runs; root-caused why concurrent relocation is structurally impossible mid-walk; found and live-captured a SEPARATE, genuine GC-barrier accounting livelock
+
+Picked up the explicit open item from follow-up #2: `d82a18d6`'s
+`pin_native_root`/`read_native_pin` hardening of `tg_enumerate_threads`/
+`tg_matches_thread`/`tg_slot`/`tg_get_field`/`tg_of_thread` was landed as
+"hardening, not a closed fix" because the crash reproduced once more (at the
+same `tg_slot`/`class_id_of_object` site) even after two increasingly
+careful pinning passes. This session's brief was to either close it for
+real or precisely characterize what remains open.
+
+**Method**: built fresh debug + release binaries off a new worktree at dev
+tip (`d82a18d6` already included). Rather than reproducing via the full
+Tomcat/WebSocket suite (unavailable standalone in this checkout), wrote a
+standalone `TgEnumStress.java` harness that directly hammers the same code
+path: N "churn" threads continuously spawn short-lived `Thread`s nested 4
+`ThreadGroup` levels deep (to exercise `tg_matches_thread`'s parent-ancestry
+walk), M "enumerator" threads call `group.enumerate(arr, true)` in a loop
+and dereference every returned `Thread` (`getName()`, forcing a real heap
+touch through the handed-back `ObjectRef`), and K "alloc" threads
+continuously allocate small garbage under a tiny heap (`-Xmx 20-24m`) to
+force very frequent young-gen GC — sustained hundreds of GC cycles per
+second (observed `gen=0` → `gen=30` within ~150ms in one capture). Ran under
+`CRATONVM_DBG_STALE_OBJREF=1` (turns a stale-`ObjectRef` read into a clean,
+self-identifying panic instead of a raw SIGSEGV — the same technique
+follow-up #2 used) with `ulimit -c unlimited` for any raw-SIGSEGV fallback.
+
+**Result 1 — root-caused why NO concurrent relocation can happen during a
+single `tg_enumerate_threads` call, closing the "deeper native_pin_roots gap"
+hypothesis follow-up #2 left open**: traced the full cooperative-safepoint +
+cross-thread-takeover protocol end to end.
+`safe_native_call_impl` (`vm/src/vm/vm_exec.rs`) checks `stw_pending`
+exactly ONCE, at native-call entry, before invoking the callback — a native
+that itself never re-enters Java (confirmed: none of the `tg_*` helpers call
+back into bytecode) never checks in again until it returns. The GC-barrier's
+cross-thread takeover (`stw_take_over_and_wait`, BUG-03 machinery) exists
+specifically for JIT-compiled peers that can't reach a cooperative safepoint
+— `xt_root_scan.rs`'s `try_take` explicitly does NOT forcibly freeze a peer
+whose RIP is outside known JIT code ranges ("Interpreter / native / already
+parked → let it arrive cooperatively", `xt_root_scan.rs:441`). A thread
+executing plain Rust native code (like `tg_enumerate_threads`) is therefore
+*never* taken over: the GC initiator's `wait_for_all`/`wait_for_all_timeout`
+loop simply blocks until this thread's own next `safepoint_check`, which by
+construction cannot happen until the enumerate call fully returns. Since
+none of `tg_slot`/`tg_get_field`/`tg_of_thread`/`tg_matches_thread`/
+`tg_enumerate_threads` allocate or trigger `maybe_gc` internally either, no
+GC — on this thread or any other — can physically relocate an object while
+this walk is in flight. Also traced `ThreadRegistry::collect_all_root_snapshots`
+(rooting every alive entry's `java_thread_obj`, not gated on `stw_ready`) and
+`update_thread_objs_after_gc` (the registry's own post-GC remap, called from
+every `update_all_roots` completion path, single- and multi-threaded) and
+confirmed both are unconditionally correct for any entry `tg_enumerate_threads`
+could observe.
+
+**Result 2 — ~200 stress runs, zero reproductions of the target crash**: ran
+two configurations to completion or a substantial partial sample (stopped
+early both times to avoid piling more load onto a shared host mid-way
+through an independently-observed distress episode — `uptime` load1 peaked
+at 68.99 from other concurrent sessions' builds, unrelated to this work):
+a "light" config (≤40 live threads, 6/3/3 churn/enumerate/alloc threads,
+6s/run) reached 102/150 planned runs — 101 clean, 1 non-target livelock (see
+Result 3); an "amped" config (≤160 live threads, 4-level `ThreadGroup`
+nesting, 10/5/4 threads) reached 102/150 planned runs, all clean. Neither
+configuration reproduced the `tg_slot`/`class_id_of_object` SIGSEGV or a
+`CRATONVM_DBG_STALE_OBJREF` panic. This is a materially larger negative
+sample than follow-up #2's own reproduction context (which needed the full
+WebSocketIntegrationTests suite under real Tomcat/socket/JIT load to hit it
+even once in ~25 verification runs) — consistent with either (a) `d82a18d6`
+having actually closed the gap and follow-up #2's one post-fix reproduction
+being attributable to a difference this synthetic harness doesn't capture
+(real JIT-compiled Tomcat connector call sites, real socket I/O interleaving,
+or the different — and separately confirmed buggy, see Result 3 — thread
+churn pattern used there), or (b) the residual rate being low enough
+(≤1/~100–200 under this harness's conditions) that this sample still can't
+distinguish "closed" from "very rare." Not reclassifying the doc entry to
+FIXED without an actual reproduction+fix cycle; keeping it OPEN but
+substantially better-evidenced.
+
+**Result 3 — a separate, genuine, newly-discovered livelock in the GC
+barrier's `expected`/`arrived` accounting under rapid thread churn**: an
+early, more naive version of the stress harness (kid threads with a single
+allocation-only body, joined via `Thread.join()` by their spawner)
+reproduced a reliable hang — NOT a crash — where the GC initiator gets stuck
+forever in `stw_take_over_and_wait`/`wait_for_all_timeout`
+(`vm/src/runtime/interpreter.rs`) with `pending=1` and never progresses.
+Live-captured via `gdb` (launch under `gdb -batch -ex run -ex 'thread apply
+all bt' --args …`, external `kill -INT <gdb-pid>` after the stall to break
+in and let the queued backtrace command run — `ptrace_scope=1` on this host
+blocks attaching to an unrelated PID, so the process must be gdb's own
+child from the start): `thread apply all bt` showed every live thread
+correctly parked (`arrive_and_wait_auto`, `arrive_and_wait_excluded`, or
+`wait_out_pause_locked` after leaving a blocked region / thread-termination)
+— i.e. the barrier's `expected` count itself must be stale, counting a
+thread that already fully exited without its slot ever being satisfied.
+Extensively traced the candidate races (`enter_blocked`/
+`mark_blocked_region_enter` vs. `request_stw_counted_locked`'s snapshot,
+`run_if_no_stw_requested`'s startup-ready gate, the termination path's
+`deposit_root_snapshot` → `enter_blocked` → `finish_after(mark_dead)`
+sequence) — all are correctly serialized under the barrier's own `inner`
+lock in every ordering checked, so the exact gap was NOT isolated this
+session. Reduced the reproduction rate from "reliable" to ~1/70 by (a)
+giving spawned threads a small real workload instead of a single-statement
+body (so they pass through at least one ordinary interpreter safepoint
+before exiting) and (b) removing the spawner's `Thread.join()` (avoiding the
+contended-termination-monitor + `enter_blocked` path that pattern forced).
+This is a DIFFERENT bug from the `tg_slot` SIGSEGV (a hang, not a crash; no
+stale `ObjectRef` involved; reproduces with plain `Thread`/`ThreadGroup`
+churn, no `enumerate()` calls needed) but is in the exact same subsystem
+(`vm/src/threading/gc_barrier.rs`, thread-lifecycle-vs-STW-accounting) and
+plausibly explains why this whole area has needed so many "xt-hardening"/
+"GCAUDIT" fixes historically. Left OPEN, flagged for a dedicated future
+session — see the spawned follow-up task.
+
+**Verification**: `cargo test -p cratonvm-gc --lib --release` 791/791.
+`cargo test -p cratonvm-vm --lib --release`: 2200 passed / 17 failed on the
+first run under the same host distress episode noted above; the 17th
+failure beyond the documented 16-test baseline
+(`native::jni::tests::process_vm_publish_and_resolve`) was confirmed a
+load-induced flake by rerunning it alone (`cargo test … -- --exact`, passed
+immediately) — zero real regressions. `cargo test -p cratonvm-native-builtins
+--lib --release`: see below.
+
+
+---
+
+#### 5.8 follow-up #4 (2026-07-18, session 5): Result 3 (`cratonvm-aio-dispatch-N` arbitrary-site SIGSEGV) ROOT-CAUSED and FIXED (`b3db96f8`); a second, independent, pre-existing race found in the same crash class, left OPEN
+
+Picked up Result 3 from follow-up #2 (2026-07-17, session 3) — the
+`cratonvm-aio-dispatch-N`-specific SIGSEGV class, distinct from both the
+`tg_slot`/`ThreadGroup.enumerate()` SIGSEGV (follow-ups #2/#3, above) and the
+GC-barrier livelock (follow-up #3, above); this session did not touch
+either of those and can independently confirm both are still reproducible
+(see "Confounder" below).
+
+**Repro**: `cratonvm --enable-native-access=ALL-UNNAMED` running
+`WebSocketIntegrationTests` in a loop under a `release-with-debug` build
+(`debuginfo=line-tables-only`, `strip=none`, same profile as prior
+sessions) reproduces a SIGSEGV roughly every 4-6 runs. `ulimit -c unlimited`
++ `/proc/sys/kernel/core_pattern` → `core.%e.%p.%t` (already configured on
+this host from a prior session) captures a core on every crash; `%e`
+reflects the *crashing thread's own* `comm`, not the process name — cores
+land as `core.main-vm.*` for a main-thread crash and (truncated to 15
+chars) `core.cratonvm-aio-di.*` for a dispatcher-thread crash, which turned
+out to be the single most useful piece of free triage signal this session
+had: it let a script bucket incoming cores by crashing-thread family without
+opening `gdb` on each one (`ls /data/tmp/cores | grep aio-di`).
+
+**Confounder discovered early**: an unscoped stress loop's first ~20 crashes
+were *all* on the main thread at `tg_slot`/`class_id_of` — i.e. the
+already-documented, still-open `ThreadGroup.enumerate()` bug from follow-ups
+#2/#3, not Result 3 at all. It is by far the more frequent crash of the two
+on this exact test class (Tomcat's WebSocket close-handshake path calls
+`ThreadGroup.enumerate()` during connector shutdown on nearly every run).
+Filtering became necessary: `CRATONVM_DBG_STALE_OBJREF=1` + `RUST_BACKTRACE=1`
+turns *both* bug families into a named panic instead of a bare segfault,
+and Rust's default panic hook prints the OS thread name (`thread
+'cratonvm-aio-dispatch-14' panicked at …`) — grepping panic logs for
+`cratonvm-aio-dispatch` next to `STALE_OBJREF` cheaply separates the two
+families without a single `gdb` invocation. Once filtered, roughly 40-60%
+of raw-segfault runs were genuinely Result 3 (i.e. this is not a rare
+crash on this workload — the multi-threaded dispatcher pool makes it
+routine, not exceptional).
+
+**Root cause**: `ForeignCallGuard` (`vm/src/native/jni.rs`) brackets every
+JNI callback a `cratonvm-aio-dispatch-N` thread makes into a delivered
+completion's `CompletionHandler` — one bracket per completion, so this runs
+extremely often over a dispatcher thread's lifetime. It is meant to
+implement the same "about to block" / "done blocking, resume running Java"
+transition every other blocking native in this codebase goes through
+(`NativeContextImpl::begin_blocking_region`/`end_blocking_region`,
+`vm/src/vm/vm_exec.rs`), but it reimplemented a **partial** version of that
+protocol instead of calling the two canonical helper methods
+(`deposit_root_snapshot()` / `check_post_block_gc()`):
+
+- Going idle (`Drop for ForeignCallGuard`) did a bare
+  `jt.root_snapshot.lock().clear()` instead of `deposit_root_snapshot()`.
+  Clearing to *empty* is correct for the interpreter-frame portion of the
+  snapshot (this thread's Java frames are genuinely empty once the
+  outermost call has returned) but wrong for everything else a real deposit
+  captures — most importantly `JvmThread.java_thread_obj`, the cached
+  `java.lang.Thread` mirror `Thread.currentThread()` hands back. That
+  mirror is lazily allocated the *first* time Java code on this OS thread
+  calls (or transitively triggers, e.g. `ThreadLocal.get()`'s
+  inherited-value drain calling `ctx.current_thread_object()`)
+  `Thread.currentThread()`, and then persists on `JvmThread` across every
+  later completion this same dispatcher thread ever services. With the
+  snapshot wiped to empty on every idle transition, that persistent mirror
+  was GC-invisible for the thread's entire idle window between
+  completions — the dispatcher's dominant time-in-state, since it parks on
+  a condvar (`wait_for_pending`) between wakeups.
+- Becoming running again (`ForeignCallGuard::enter()`) cleared
+  `in_blocked_region` with a bare atomic store and never called
+  `check_post_block_gc()` — the method that applies the *accumulated
+  cross-GC pointer fixup* (`gc_block_state.fixup`, composed by every GC
+  that ran while a thread sat blocked) back onto `java_thread_obj` (and
+  `native_pin_roots` / `native_alloc_pool` / `native_pending_return` /
+  `scoped_values` / `pending_async_exception` / JNI locals).
+
+Net effect, once only the `Drop`-side half is considered: even after fixing
+the deposit so a GC correctly *marks* `java_thread_obj` live and relocates
+it (rather than reclaiming it outright), nothing ever copied the object's
+*new*, post-move address back onto `JvmThread.java_thread_obj` itself — that
+remap only happens inside `check_post_block_gc()`, which `enter()` never
+called. So the mirror object always survived any GC that ran while the
+thread was idle, just at the *wrong* (pre-move) address on the Rust side.
+The next `Thread.currentThread()` call on that same dispatcher thread handed
+back the stale pointer, and it was dereferenced at whatever native or
+interpreter call site happened to touch it next — `identity_hash_code`, a
+`get_field`, an array-bounds check, a `set_field` deep in an unrelated
+callback — which is exactly the "essentially arbitrary call site" shape
+follow-up #2 flagged and could not explain.
+
+**Confirmed live** via `CRATONVM_DBG_STALE_OBJREF=1`: the segfault turns
+into a clean, reproducible panic —
+
+```
+thread 'cratonvm-aio-dispatch-9' panicked at gc/src/gen_heap.rs:1575:13:
+CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at 0x2011484dee8 —
+this object was evacuated by a moving GC to 0x2014b705ea0 (class_id=29
+kind=Object), but native/interpreter code dereferenced the OLD address.
+```
+
+with `RUST_BACKTRACE=1` naming the exact call chain every single time this
+family reproduced (8+ independent captures, always the same site):
+`identity_hash_code` (`gc/src/gen_heap.rs:1616` → `gc/src/vm_heap.rs:213` →
+`vm/src/vm/vm_exec.rs:2990`) ← `drain_inherited_for_current_thread`
+(`native-builtins/src/phases_early.rs:3494`, `ThreadLocal`'s
+first-access-drains-inherited-values path) ← `native_tl_get` ←
+`safe_native_call`. `drain_inherited_for_current_thread` calls
+`ctx.current_thread_object()` then immediately `ctx.identity_hash_code()`
+on the result — i.e. the very first read of the (stale) `java_thread_obj`
+field on that dispatcher thread's next completion.
+
+**Fix** (`vm/src/native/jni.rs`, commit `b3db96f8`): replaced both halves of
+`ForeignCallGuard`'s bespoke transition with the two canonical helper calls
+— `Drop` now calls `NativeContextImpl::deposit_root_snapshot()` (which also
+raises `in_blocked_region` itself, matching `begin_blocking_region`'s own
+sequence) instead of a bare clear; `enter()` now calls
+`GcBarrier::mark_blocked_region_leave()` (counter side) followed by
+`NativeContextImpl::check_post_block_gc()` (identity-flag clear + fixup
+application + fresh snapshot deposit) instead of a bare
+`in_blocked_region.store(false)` + clear, mirroring
+`end_blocking_region()` exactly. No new mechanism was invented — the fix is
+entirely "use the existing, already-audited discipline instead of a
+partial reimplementation of it."
+
+**Verified**:
+- 80 stress runs of `WebSocketIntegrationTests` post-fix
+  (`CRATONVM_DBG_STALE_OBJREF=1` + `RUST_BACKTRACE=1`, same harness as the
+  pre-fix characterization): **zero** occurrences of the
+  `drain_inherited_for_current_thread`/`identity_hash_code` signature on
+  any `cratonvm-aio-dispatch-N` thread — down from being the dominant
+  dispatcher-thread crash pre-fix (roughly 40-60% of stress-run crashes in
+  earlier batches, ~12 of ~20 raw segfaults in one representative batch).
+  All 33 `STALE_OBJREF` panics captured in the 80-run post-fix batch were
+  on `main-vm`, matching the still-open `tg_slot` signature from
+  follow-ups #2/#3 (untouched this session, expected).
+- `cargo test -p cratonvm-native-io --lib --release`: 349/349, both before
+  and after.
+- `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed,
+  identical before and after — the 16 are the same documented pre-existing
+  baseline (9 `runtime::lock_order` tests requiring a debug build, 7
+  `jit::skip_list` tests already failing on unmodified `dev`) from
+  follow-up #2.
+
+**Result — a second, independent, pre-existing race in the same crash
+class, left OPEN**: while hunting for the above, 5 additional cores
+surfaced (2 during this session's own post-fix verification, 3 recovered
+from an earlier pre-fix stress batch — all 5 gdb-confirmed identical) with
+a *different* signature, also on `cratonvm-aio-dispatch-N` threads, **not
+caught by `CRATONVM_DBG_STALE_OBJREF`** (a raw, uncaught SIGSEGV even with
+the flag set):
+
+```
+#0  is_forwarded () at types/src/heap_types.rs:411
+#1  get_header () at gc/src/gen_heap.rs:1558
+#2  set_field () at gc/src/gen_heap.rs:2092
+#3  <a FieldHolder.<init> field-setter native> (native-builtins/src/lib.rs:31368)
+#4  safe_native_call → invoke_on_class_shared → build_thread_field_holder
+    (vm/src/vm/vm_exec.rs:2280) → current_thread_object (vm_exec.rs:5986)
+    → native_thread_current_thread (native-builtins/src/lang_system.rs:478)
+```
+
+i.e. this crashes not from a *stale-but-still-valid-forwarded* pointer (the
+family this session fixed, and the family `CRATONVM_DBG_STALE_OBJREF` is
+designed to catch) but from dereferencing a header at what appears to be
+genuinely unmapped/garbage memory while a dispatcher thread is *lazily
+constructing its own `Thread` mirror for the very first time*
+(`current_thread_object()` → `build_thread_field_holder()` →
+`FieldHolder.<init>`). `build_thread_field_holder()` itself correctly pins
+its own intermediate objects across GC-capable calls (`native_pin_roots`,
+the documented "BUG-03 concurrent-spawn" fix), but the sibling function it
+calls, `get_or_create_main_thread_group()` (`vm/src/vm/vm_exec.rs:2310`),
+has a classic check-then-act race: it reads
+`*self.shared.main_thread_group.read()` once, and if `None` proceeds
+through a long *unguarded* sequence of allocations and `<init>` invokes
+(building the "system" and "main" `ThreadGroup` objects) before finally
+writing the result back — with no lock held across the build. Two threads
+that both observe `None` at the same instant both redundantly execute the
+entire build concurrently. **Confirmed pre-existing**: 3 of the 5 captured
+cores are from the *stock, unmodified pre-session binary* (timestamps
+predate this session's fix), so this is not something this session's
+change introduced — like Result 3's own second data point in follow-up #2,
+it plausibly already existed with a single dispatcher thread but is far
+more exposed now that up to 16 dispatcher threads can genuinely call
+`Thread.currentThread()` for the first time within the same instant (e.g.
+when a burst of completions fires across the whole pool simultaneously at
+test start), a scenario a single dispatcher thread, or the more gradual
+spawn cadence of ordinary `Thread.start()` workers, essentially never
+triggers.
+
+**Not fixed this session**: a correct fix (turning
+`get_or_create_main_thread_group()`, and possibly the sibling
+`build_thread_field_holder()`, into a properly-guarded lazy singleton —
+e.g. holding `main_thread_group`'s write lock across the whole build
+instead of just the final store, or a dedicated one-shot init lock) is a
+different kind of change than this session's — it touches concurrent
+lazy-initialization discipline rather than GC root-tracking, carries real
+deadlock/perf risk if rushed (this exact function already re-acquires
+`class_manager`'s read lock multiple times internally; holding
+`main_thread_group`'s write lock across allocations and nested `<init>`
+invokes needs the same care the existing `native_pin_roots` pinning in
+this function got, not a five-minute patch), and was only confirmed via
+2 live captures during this session's own verification (i.e. genuinely
+rare relative to the bug that was fixed — roughly 1 in 40 runs vs. roughly
+1 in 2). Flagged for a dedicated future session. The known-issue signature
+to search for: `is_forwarded` / `get_header:1558` (not `:1575`, which is
+the `CRATONVM_DBG_STALE_OBJREF` assertion site the FIXED bug hit) crashing
+from inside `build_thread_field_holder`/`get_or_create_main_thread_group`
+on a `cratonvm-aio-dispatch-N` thread.
+
+**Net assessment**: the `cratonvm-aio-dispatch-N` "arbitrary call site"
+SIGSEGV class documented as Result 3 in follow-up #2 was actually (at
+least) two independent bugs sharing a thread family and a superficially
+similar "stale/bad pointer read at a native or interpreter call site"
+shape. The dominant one (a genuine, well-evidenced GC-root-tracking gap in
+`ForeignCallGuard`'s idle/running transitions) is now root-caused, fixed,
+and verified with real rigor (80 stress runs, zero recurrence, two
+regression suites unchanged). The second (a concurrent lazy-init race,
+confirmed pre-existing) remains open, is rarer, and needs its own
+dedicated session.
