@@ -3131,3 +3131,54 @@ still has none) rather than assuming it is the same family as (a) or (c) above.
 (StepVerifier identity) fixed and landed; one (Jetty `EofException`) confirmed
 CratonVM-specific and precisely characterized but not fixed; one (enum `valueOf()`
 CCE) not reproduced and left as an open question rather than a confirmed-open bug.
+
+### 5.7 `JythonScriptTemplateTests` — investigated, does NOT reproduce on current `dev` under either `--enable-native-access` setting; flag-comparison artifact, not a genuine regression (2026-07-17)
+
+Follow-up on section 5's "not investigated further" note: `JythonScriptTemplateTests`
+was flagged as a regression in the 36-class reactive comparison sample (`was OK
+1/1/0, now FAIL 1/0/1, java.lang.ExceptionInInitializerError: null`), with that
+section's own text explicitly calling out the comparison as possibly confounded by
+`--enable-native-access` differing between the baseline and rerun.
+
+Investigated from scratch, dedicated session, fresh worktree
+(`/data/data/wt-jython-regression-20260717`, branch
+`fix/jython-regression-20260717`), fresh release binary off `dev` tip `67c85b3c`
+(real JDK 25, built spring-webflux test classes fresh via Gradle against a private
+`GRADLE_USER_HOME` to avoid colliding with other concurrent sessions using the
+shared `/data/data/spring-framework-recheck` checkout).
+
+**Ran the single-class `KRun` repro four times WITH `--enable-native-access=ALL-UNNAMED`
+and three times WITHOUT it, back to back, same binary, same classpath.** Every one
+of the seven runs completed cleanly: `RESULT
+org.springframework.web.reactive.result.view.script.JythonScriptTemplateTests
+found=1 succ=1 fail=0 skip=0 abort=0 status=OK` (wall time ~25-31s each, real
+Jython 2.7.4 interpreter boot + script execution, not a stub). No
+`ExceptionInInitializerError`, no `LOADERR`, no crash, in either flag configuration.
+Some benign `NoSuchMethodError` warnings appear in stderr during Jython's own
+module-import bootstrapping (`java/lang/Long.get()Ljava/lang/Object;`,
+`org/python/core/PyNone.get()Ljava/lang/Object;`, both from Jython's own
+introspection code probing for methods that don't exist on those classes) but
+these are pre-existing, tolerated by Jython's own fallback logic, and present
+identically in both flag configurations — not the cause of the originally-reported
+failure and not new.
+
+**Conclusion: this was the flag-comparison artifact the section 5 note already
+suspected it might be** (or, less likely but not excluded, a real but transient
+regression on some intermediate `dev` commit between the original baseline and this
+session's `67c85b3c` tip that has since been fixed as a side effect of one of the
+several `--enable-native-access`/`MemorySegment`/GC-safety fixes that landed
+2026-07-16 — e.g. `d5544133` "segment_address() reads real MemorySegment field 0 as
+length, not address" or the getstatic/putstatic loader-aware fix referenced in that
+same day's docs). Either way, **not reproducible now, so nothing to fix on current
+`dev`**. Did not touch `WebSocketIntegrationTests`, the other class flagged
+alongside this one in the same section-5 comparison sample — that one's "pass/fail
+ratio inverted" symptom is a different shape (not an `ExceptionInInitializerError`)
+and is left for a separate investigation.
+
+No code change landed — nothing to fix. This entry exists to close the loop on the
+section-5 comparison sample's flagged observation with evidence, and to save a
+future session from re-chasing a failure that does not currently reproduce. If it
+resurfaces, capture with `KRUN_STACK=1` for the full nested-cause stack trace
+immediately (the original report had only the bare `ExceptionInInitializerError:
+null` outer wrapper, no nested cause) and re-check whether the two GC-safety fixes
+above are still present on whatever tip is being tested.
