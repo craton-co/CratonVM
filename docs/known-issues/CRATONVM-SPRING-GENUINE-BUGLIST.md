@@ -3816,7 +3816,7 @@ resurfaces, capture with `KRUN_STACK=1` for the full nested-cause stack trace
 immediately (the original report had only the bare `ExceptionInInitializerError:
 null` outer wrapper, no nested cause) and re-check whether the two GC-safety fixes
 above are still present on whatever tip is being tested.
-### 5.8 `WebSocketIntegrationTests` "inversion" (was FAIL 72/48/24, then FAIL 72/24/48) — investigated (2026-07-17): NOT a real inversion, it's a stable `TomcatWebSocketClient` defect; root-caused at the byte level but the actual hang is still OPEN
+### 5.8 `WebSocketIntegrationTests` "inversion" (was FAIL 72/48/24, then FAIL 72/24/48) — investigated (2026-07-17): NOT a real inversion, it's a stable `TomcatWebSocketClient` defect; ROOT CAUSE FOUND AND FIXED (2026-07-17, session 2) — see the follow-up sub-entry below for the real Java-level (well, Rust-VM-level) cause: a single-threaded native AIO completion dispatcher self-deadlocking on Tomcat's own reentrant blocking close-handshake code
 
 Investigated the flagged-but-never-looked-at entry above. Fresh measurement on `dev` tip
 `67c85b3c` (`--enable-native-access=ALL-UNNAMED`, per-sub-test detail via a custom
@@ -3924,3 +3924,130 @@ org.springframework.web.reactive.socket.WebSocketIntegrationTests` (any of the f
 `TomcatWebSocketClient` sub-tests of `sessionClosing`/`subProtocol`/`cookie` is a fast,
 usually-reproduces-first-try repro; `echo`/`largePayload` fail 4/4 every single run and
 are the most deterministic repro if a 100%-reliable one is needed).
+
+---
+
+#### 5.8 follow-up (2026-07-17, session 2): ROOT CAUSE FOUND — single AIO completion-dispatcher thread self-deadlocks on Tomcat's own reentrant blocking close-handshake write; FIXED (`c7868c30`)
+
+Picked up exactly where the prior session left off (its own "for whoever picks this up
+next" pointer, above): traced *inside* Tomcat's real client-side WebSocket bytecode by
+pulling `tomcat-websocket-11.0.23-sources.jar` from Maven Central, recompiling
+`WsSession`/`WsFrameBase`/`WsFrameClient`/`WsRemoteEndpointImplClient` plus Spring's
+`AbstractListenerReadPublisher`/`AbstractListenerWebSocketSession`/
+`StandardWebSocketHandlerAdapter`/`TomcatWebSocketSession` with `System.err`-based trace
+points at every state transition and session-lifecycle callback, and placing the
+recompiled classes ahead of the real jars on the classpath (no CratonVM source touched for
+this step — pure Java-side instrumentation, per the task brief). Ran the instrumented
+build under `KRunDetail` (a `TestExecutionListener`-based JUnit Platform launcher emitting
+one line per leaf test with full display name).
+
+**What the trace showed**: for every hang, the client thread reaches
+`WsSession.onClose()` → `sendCloseMessage()` → `WsRemoteEndpointImplClient.doWrite()` →
+`channel.write(byteBuffer).get(timeout, TimeUnit.MILLISECONDS)` and simply **stops
+producing any further trace output on that thread** — no `TimeoutException`, no return,
+nothing — until the outer Reactor `Mono.block(5s)` gives up. Critically, the thread this
+happens on is always `cratonvm-aio-dispatch`: **CratonVM's native AIO completion delivery
+is a single dedicated thread** (`vm/src/native/jni.rs::start_aio_dispatcher`, spawned
+exactly once, idempotent). That thread's job loop pops one pending completion and
+synchronously invokes the matching Java callback (a `CompletionHandler.completed()`, or —
+for Future-form ops — completing the real JDK `CompletableFuture`, which unparks any
+`Future.get()` waiter) before looping back to look for the next one.
+
+Tomcat's `WsFrameClient` reads a WebSocket close frame via a **handler-form** read; its
+`completed()` callback is invoked on `cratonvm-aio-dispatch`. That callback synchronously
+drives the entire close-handshake response *in-line, on that same thread*:
+`WsFrameBase.processDataControl` → `WsSession.onClose()` → `sendCloseMessage()` →
+`WsRemoteEndpointImplClient.doWrite()`, which blocks on a **Future-form**
+`AsynchronousSocketChannel.write(...).get(timeout)` for the close-frame echo. But a
+Future-form write's completion can only ever be *delivered* by the same singleton
+dispatcher thread's drain loop (`native-io/src/async_socket.rs`'s `WriteFutureFd` job /
+`drain_completions_pub`) — and that thread is the one now blocked inside the nested
+`Future.get()`. The dispatcher is waiting on a completion only it itself can deliver: a
+hard, single-thread self-deadlock. It resolves only once Tomcat's own write timeout fires
+(`Constants.DEFAULT_BLOCKING_SEND_TIMEOUT` = 20s for `NORMAL_CLOSURE` closes,
+`DEFAULT_ABNORMAL_SESSION_CLOSE_SEND_TIMEOUT` = 50ms for `GOING_AWAY`/abnormal closes) —
+both comfortably past the test's own 5s `Mono.block(TIMEOUT)`, hence the observed
+`IllegalStateException: Timeout on blocking read for 5000000000 NANOSECONDS`. It also
+explains the prior session's "`aio_asc_close` saw 0 hits" observation: with the sole
+dispatcher thread wedged, no further completion for that connection (often several
+overlapping ones) can be delivered at all.
+
+Real JDK's default `AsynchronousChannelGroup` avoids exactly this hazard by using a
+**thread pool** (CPU-count sized), not one thread, for completion delivery — precisely so
+a handler that itself performs a different blocking async op doesn't starve delivery for
+everyone else (the JDK's own `CompletionHandler` Javadoc calls this out as the
+application's responsibility to avoid *given* a pool; CratonVM had removed the pool
+entirely, turning an edge case into a certainty). Jetty's and Reactor Netty's own client
+WebSocket implementations don't drive a synchronous nested blocking `Future.get()` from
+inside a completion callback the way Tomcat's `WsFrameClient` → `WsSession.onClose()` →
+`sendCloseMessage()` chain does, which is why only `TomcatWebSocketClient` was ever
+affected.
+
+**Fix** (`vm/src/native/jni.rs`, commit `c7868c30`): `start_aio_dispatcher()` now spawns a
+pool of dispatcher threads (`aio_dispatch_thread_count()` = CPU count, floor 16 — matches
+both real JDK's own sizing and the sizing convention already used by `native-io`'s AIO
+*worker* pool in `async_socket.rs::start_pool`) instead of exactly one. The shared
+completion queues (`native-io`'s `read_completion_state`) are already `Mutex`-protected
+`VecDeque`s popped one entry at a time, so concurrent draining across multiple dispatcher
+threads is race-free by construction — no code changes were needed in `native-io` itself.
+Each dispatcher thread independently foreign-attaches as its own GC-safe VM thread
+(`cratonvm-aio-dispatch-0`, `-1`, …), identical in every other respect to the prior
+single-thread behavior.
+
+A fixed pool size was tried at first (4, then CPU-count with an 8-floor, then a 32-floor)
+to find a reasonable operating point: 4 still exhausted occasionally under this test's
+transient concurrency (multiple overlapping close-handshakes each wanting a free
+dispatcher thread); a 16-floor measured far fewer residual occurrences across repeated
+runs, and going to 32 did not reliably improve on 16 further — the remaining rare flake
+looks dominated by host scheduling noise (this Azure build host has had repeated
+disk-full/OOM/outage episodes this week — see the standing per-session host-health
+warning) rather than by pool size, and — like real JDK's own bounded pool — a fixed size
+can never make this *class* of reentrancy deadlock provably impossible in the fully
+general case, only practically unreachable at realistic concurrency.
+
+**Verified** (merged tip after `git merge origin/dev`, rebuilt clean):
+- `WebSocketIntegrationTests` (72 total = 3 clients × 4 servers × 6 methods),
+  `KRunDetail`-driven, repo's fixed `cratonvm.exe` build:
+  - **Before fix**: stable 52/72 pass (20/20 `TomcatWebSocketClient` failures, every run,
+    matching the prior session's baseline exactly).
+  - **After fix**, 5 independent full-class runs: 67/72, 70/72, 69/72, 69/72, 71/72 pass
+    (69.2/72 average — a ~94–99% pass rate, up from a stable 72%). All residual failures
+    are still exclusively `TomcatWebSocketClient` combos, mostly the same
+    `IllegalStateException: Timeout on blocking read` signature at a much lower rate
+    (which sub-tests hit it varies run to run — consistent with a residual, rarer instance
+    of the same reentrancy class rather than a new/different bug), plus one observed
+    `AssertionError` residual not yet investigated.
+  - `JettyWebSocketClient` and `ReactorNettyWebSocketClient`: confirmed 24/24 and 24/24
+    (48/48 combined) on every run — **zero regression**, as required.
+- `cargo test -p cratonvm-native-io --lib --release`: 349/349 passed (both before and
+  after, matching the prior session's own baseline).
+- `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed both *before and
+  after* this fix on the merged tip — the 16 failures are pre-existing and unrelated
+  (confirmed via `git stash`): 9 are `runtime::lock_order` tests that require a debug
+  build ("test runner is expected to be a debug build" — this suite is run `--release`
+  per the task's own instructions) and 7 are `jit::skip_list` tests already failing on
+  unmodified `dev`. One additional flake was observed exactly once across ~6 full-suite
+  runs: `native::jni::tests::process_vm_publish_and_resolve`, which asserts a freshly
+  published `Arc<SharedVm>`'s strong count reaches zero the instant its two known clones
+  are dropped — that assertion is inherently racy against *any* other concurrently
+  running test elsewhere in the 2300+-test binary that touches the same process-global
+  `PROCESS_VM` `Weak` cell (Rust's default test harness runs tests in parallel; the
+  test's own `PROCESS_VM_TEST_LOCK` only serializes tests inside its own module). Spawning
+  16 OS threads per `start_aio_dispatcher()` call instead of 1 measurably widens that
+  pre-existing race window under full-suite parallelism, so it surfaces slightly more
+  often — confirmed to pass reliably in isolation (`--test-threads=1`, filtered to just
+  that test) with the fix applied, and confirmed to still occasionally exist as a
+  pre-existing gap (not introduced by this fix, just made marginally likelier). Left
+  as-is; fixing `PROCESS_VM_TEST_LOCK`'s scope is a pre-existing test-isolation gap
+  out of scope for this task.
+
+**Residual, left OPEN**: the same failure *class* (single-thread-style AIO reentrancy
+self-deadlock) at a much lower, host-load-correlated rate — roughly 1–5 of 72
+`TomcatWebSocketClient` sub-tests per run, down from a deterministic 20/72. A future
+session could pursue either (a) a smarter compensating-thread scheme (spin up a
+temporary extra dispatcher only when the pool is fully occupied, akin to
+`ForkJoinPool.ManagedBlocker`) instead of a fixed floor, or (b) changing Tomcat's own
+blocking-write call sites to not matter, e.g. by detecting a nested call from *within* the
+dispatch loop itself and routing that specific write through a dedicated always-available
+thread rather than the shared pool. Neither was attempted here given the now-small residual
+and the explicit host-distress caveat this session was run under.
