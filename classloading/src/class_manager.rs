@@ -5505,6 +5505,16 @@ impl ClassManager {
             .is_some_and(|child| child.is_subclass_of(parent_id, &self.class_store))
     }
 
+    /// Loader-identity-blind fallback for [`is_subclass_of`] -- see
+    /// `Class::is_subclass_of_by_name`'s doc comment for the full rationale
+    /// (exception-handler `catch_type` resolution needing to match a
+    /// same-named-but-different-`ClassId` exception class across loaders).
+    pub fn is_subclass_of_by_name(&self, child_id: ClassId, target_name: &str) -> bool {
+        self.class_store
+            .get(child_id)
+            .is_some_and(|child| child.is_subclass_of_by_name(target_name, &self.class_store))
+    }
+
     /// Get a reference to the underlying class store.
     pub fn class_store(&self) -> &ClassStore {
         &self.class_store

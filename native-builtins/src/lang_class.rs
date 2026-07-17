@@ -14760,6 +14760,38 @@ pub(crate) fn native_class_get_record_components(
 /// `java/lang/Class.getPermittedSubclasses0()[Ljava/lang/Class;`
 ///
 /// Returns the permitted subclasses of a sealed class, or null if not sealed.
+///
+/// WEBCLIENTEXT-SEALED-20260717: each permitted-subclass NAME comes straight
+/// from the classfile's `PermittedSubclasses` attribute (always correct --
+/// see `is_sealed_class`/`permitted_subclasses`, both backed by the same
+/// parsed field), but resolving those names to `ClassId`s used to go through
+/// `ctx.class_id_by_name`, a PASSIVE cache lookup that never triggers
+/// classloading. A permitted subclass that simply hasn't been loaded yet
+/// (a very common ordering -- reflective code, e.g. kotlin-reflect's
+/// `KClass.sealedSubclasses` behind mockk's `ProxyMaker`, routinely probes a
+/// sealed interface's metadata before the app ever touches its concrete
+/// subclasses) silently produced a `null` array slot instead of the resolved
+/// `Class`. Real JDK's own `Class.getPermittedSubclasses()` Java wrapper then
+/// filters out any entry that doesn't verifiably extend/implement `this`
+/// (`c.getSuperclass() == this || asList(c.getInterfaces()).contains(this)`)
+/// -- a `null` element fails that check, so the whole array silently
+/// collapsed to empty (confirmed via a live probe: `getPermittedSubclasses0()`
+/// returned `[null, null]` for `org.springframework.http.HttpStatusCode`,
+/// and the public wrapper reduced that to `[]`), which is exactly the
+/// `IllegalStateException: Unable to create proxy for sealed class ...,
+/// no subclasses available` mockk throws when `sealedSubclasses` comes back
+/// empty. Same root-cause family as the `getEnclosingClass`/
+/// `getDeclaringClass` loader-identity fix (`aca7f635`): resolve ACTIVELY,
+/// not passively. Mirrors `declaring_class_loader_aware`'s re-entrant
+/// `loadClass()` pattern -- safe here because this is an ordinary native
+/// method call boundary (like `Class.forName`'s native, which already does
+/// the same re-entrant `loadClass()` call routinely), not the interpreter's
+/// raw opcode-dispatch fast path (where an earlier, unrelated attempt at a
+/// similar re-entrant fix for `getstatic`/`putstatic` caused heap corruption
+/// and was reverted -- see docs/known-issues, ImportHttpServiceRegistrarTests
+/// entry). Falls back to the passive cache lookup first (cheap, handles the
+/// overwhelming common case where the subclass is already loaded) and only
+/// pays for the active `loadClass()` round-trip on a genuine cache miss.
 pub(crate) fn native_class_get_permitted_subclasses(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -14776,8 +14808,38 @@ pub(crate) fn native_class_get_permitted_subclasses(
 
     let subs = ctx.permitted_subclasses(class_id);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, subs.len());
+    // Lazily resolved on first cache miss: the same ClassLoader that defines
+    // `this` sealed class is authoritative for resolving its own permitted
+    // subclasses (they are compiled together, always visible to that
+    // loader). Reuses `native_class_get_class_loader`'s existing
+    // defining-loader / app-loader-fallback resolution so both plain
+    // single-loader apps (the common case) and isolating/forked test
+    // loaders get the SAME loader's copy as `this`.
+    let mut loader_obj: Option<ObjectRef> = None;
+    let mut loader_resolved = false;
     for (i, sub_name) in subs.iter().enumerate() {
-        if let Some(sub_id) = ctx.class_id_by_name(sub_name) {
+        let resolved = ctx.class_id_by_name(sub_name).or_else(|| {
+            if !loader_resolved {
+                loader_resolved = true;
+                loader_obj = match native_class_get_class_loader(ctx, args) {
+                    Ok(Some(Value::Object(Some(l)))) => Some(l),
+                    _ => None,
+                };
+            }
+            let loader = loader_obj?;
+            let dotted = sub_name.replace('/', ".");
+            let name_obj = ctx.create_string(&dotted);
+            match ctx.invoke_virtual(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(mirror_obj)))) => ctx.class_id_from_mirror(mirror_obj),
+                _ => None,
+            }
+        });
+        if let Some(sub_id) = resolved {
             let mirror = ctx.get_class_mirror(sub_id);
             ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
         }

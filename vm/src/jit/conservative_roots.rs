@@ -199,6 +199,19 @@ thread_local! {
     /// it be unchanged — any new compilation invalidates the memo and forces
     /// a fresh scan. Reset to `(usize::MAX, 0)` so the very first check
     /// always scans.
+    ///
+    /// 2026-07-17: the same "nothing above our current stack pointer can
+    /// change while nested below it" argument also covers the opposite
+    /// direction — recursing DEEPER (`search_lo < verified_lo`) with an
+    /// unchanged `code_range_count`. The once-verified `[verified_lo,
+    /// stack_high)` band is unaffected by descending further below it, so
+    /// `scan_active_jit_frames` only needs to scan the new incremental band
+    /// `[search_lo, verified_lo)` in that case, not the whole
+    /// `[search_lo, stack_high)` range again. See the caller for the
+    /// rationale and the throughput evidence that motivated it (a
+    /// perpetually-growing recursion depth, as in Hibernate/JUnit5's nested
+    /// call chains, previously paid a full stack rescan on every single
+    /// per-native-call root snapshot).
     static UNREG_JIT_VERIFIED_LO: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((usize::MAX, 0)) };
 }
@@ -1426,11 +1439,68 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
             let already_clean = code_ranges == verified_ranges && search_lo >= verified_lo;
             if !already_clean {
                 let high = current_thread_stack_high();
-                if high > search_lo && native_stack_has_jit_frame(search_lo, high) {
-                    scan_one_frame(search_lo, high, heap, out);
-                    cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
-                } else {
-                    UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                if high > search_lo {
+                    // Incremental fast path (2026-07-17 throughput fix): when the
+                    // code-range set is unchanged and we have recursed DEEPER
+                    // since the last verification (`search_lo < verified_lo`),
+                    // the once-verified `[verified_lo, high)` band is still
+                    // guaranteed clean by the exact same invariant documented on
+                    // `UNREG_JIT_VERIFIED_LO` above ("nothing above our current
+                    // stack pointer can change while we are nested below it") —
+                    // that argument is symmetric in shallower-vs-deeper: it only
+                    // depends on `[verified_lo, high)` lying entirely above
+                    // (numerically) the deepest point reached since it was
+                    // proven clean, which `search_lo < verified_lo` establishes
+                    // just as validly as the already-handled `search_lo >=
+                    // verified_lo` case above. Only the NEW incremental band
+                    // `[search_lo, verified_lo)` can possibly contain content
+                    // that has changed since the last check, so only it needs
+                    // scanning; if it comes back clean, extend the verified
+                    // boundary down to `search_lo` exactly as the shallow path
+                    // already does.
+                    //
+                    // Without this, a workload whose interpreter call depth
+                    // keeps growing (rather than staying flat or shrinking) —
+                    // e.g. Hibernate/JUnit5/H2's deeply nested reflective call
+                    // chains — re-scans the ENTIRE live native stack (up to the
+                    // 8 MiB cap in `native_stack_has_jit_frame`) on every single
+                    // per-native-call root snapshot once any method has
+                    // compiled, which profiling found to be the dominant cost
+                    // (`cratonvm_gc::gen_heap::GenerationalHeap::is_object_address`
+                    // + `update_root_snapshot` together ~66% of total CPU in a
+                    // `perf record` capture; `CRATONVM_DBG_ROOTSNAP` showed
+                    // per-call cost climbing from ~13us to ~64us over a
+                    // 400k-call `LockTest` run, vs. a flat ~2us with `--nojit`
+                    // or with compilation never completing). See
+                    // docs/known-issues/hibernate/hib-misc-residuals-20260716.md's
+                    // `LockTest` section for the full investigation.
+                    //
+                    // Falls back to the original full-range `[search_lo, high)`
+                    // scan whenever the incremental argument can't be proven
+                    // safe: the very first check (`verified_lo == usize::MAX`),
+                    // a `search_lo` that is not strictly deeper than
+                    // `verified_lo`, or a new compilation since the last check
+                    // (`code_ranges != verified_ranges`) — identical to
+                    // pre-fix behavior in all of those cases.
+                    let scan_hi = if code_ranges == verified_ranges
+                        && search_lo < verified_lo
+                        && verified_lo <= high
+                    {
+                        verified_lo
+                    } else {
+                        high
+                    };
+                    if native_stack_has_jit_frame(search_lo, scan_hi) {
+                        // A hit anywhere in the checked band still conservatively
+                        // marks (and flags) the FULL `[search_lo, high)` span —
+                        // unchanged from pre-fix behavior. Only the detection
+                        // scan itself is narrowed above, never the marking scope
+                        // once something is actually found.
+                        scan_one_frame(search_lo, high, heap, out);
+                        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                    } else {
+                        UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                    }
                 }
             }
         }

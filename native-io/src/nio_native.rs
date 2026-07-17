@@ -1416,6 +1416,16 @@ fn t16_log_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
 
 fn t16_lr_get_sequence_number(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
+        // Real-JDK layout (identified by its by-name-resolvable private
+        // longThreadID long): sequenceNumber is a named field; the legacy
+        // raw slot 6 below is the REAL record's longThreadID, so the old
+        // read returned the thread id as the "sequence number".
+        Some(o) if matches!(ctx.get_field_by_name(o, "longThreadID"), Value::Long(_)) => {
+            match ctx.get_field_by_name(o, "sequenceNumber") {
+                v @ Value::Long(_) => Ok(Some(v)),
+                _ => Ok(Some(Value::Long(0))),
+            }
+        }
         Some(o) if ctx.object_num_fields(o) >= 7 => {
             let v = ctx.get_field(o, 6);
             match v {

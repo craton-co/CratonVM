@@ -834,6 +834,23 @@ fn cl_real_load_class(
     cl_real_load_class_base(ctx, this, class_name_obj)
 }
 
+/// Outcome of [`load_class_visible_to`].
+///
+/// Distinguishes "nothing found for the requested name" (caller should keep
+/// trying other resolution strategies, ultimately throwing
+/// `ClassNotFoundException`) from "the requested class file exists but a
+/// supertype/interface failed to resolve" (JVMS §5.3/§5.4: HotSpot throws
+/// `NoClassDefFoundError` naming the missing *dependency*, not a bare CNFE on
+/// the originally requested class). See `no_class_def_found_error` for the
+/// exception shape.
+enum ClassLookup {
+    Found(Value),
+    /// The requested class exists but `.0` (its supertype/interface, in
+    /// internal/slash form) could not be resolved.
+    DependencyMissing(String),
+    NotFound,
+}
+
 /// `ctx.load_class` resolves through CratonVM's flat global class store with no
 /// awareness of the requesting loader. Wrap it with the same JVMS §5.3
 /// defining-loader visibility check the synthetic-JDK path applies
@@ -846,19 +863,105 @@ fn load_class_visible_to(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     internal: &str,
-) -> Option<Value> {
+) -> ClassLookup {
     let mirror_val = match ctx.load_class(internal) {
         Ok(Some(v)) => v,
-        _ => return None,
+        Ok(None) => return ClassLookup::NotFound,
+        // `ClassManager::load_class` propagates a recursive supertype/
+        // interface load failure UNCHANGED (see `resolve_supertype` in
+        // classloading/src/class_manager.rs) -- so `class_name` here names
+        // whichever class in the hierarchy actually failed to resolve, not
+        // necessarily `internal`. When they differ, the requested class file
+        // itself was found; only a dependency is missing. Discovered
+        // 2026-07-17 debugging a Hibernate `LockTest` CNFE that was actually
+        // a missing-jar `EntityManagerFactoryBasedFunctionalTest` superclass
+        // -- this case used to be swallowed by a catch-all `_ => return
+        // None`, surfacing a message-less CNFE on the wrong class and
+        // costing significant time to root-cause.
+        Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ClassFile(
+                cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
+            ),
+        )) if class_name != internal => {
+            tracing::debug!(
+                requested = internal,
+                missing_dependency = %class_name,
+                "load_class_visible_to: requested class exists but a \
+                 dependency failed to resolve -- NoClassDefFoundError"
+            );
+            return ClassLookup::DependencyMissing(class_name);
+        }
+        Err(e) => {
+            // Genuinely-missing requested class, or some other internal
+            // error -- unchanged CNFE-eventually behavior, but keep the real
+            // cause visible in debug logs instead of fully discarding it.
+            tracing::debug!(
+                requested = internal,
+                error = %e,
+                "load_class_visible_to: ctx.load_class failed"
+            );
+            return ClassLookup::NotFound;
+        }
     };
     match mirror_val {
         Value::Object(Some(mirror_obj)) => match ctx.class_id_from_mirror(mirror_obj) {
             Some(cid) => crate::classloader::cid_visible_mirror(ctx, this, cid)
-                .map(|m| Value::Object(Some(m))),
-            None => Some(mirror_val),
+                .map(|m| ClassLookup::Found(Value::Object(Some(m))))
+                .unwrap_or(ClassLookup::NotFound),
+            None => ClassLookup::Found(mirror_val),
         },
-        other => Some(other),
+        other => ClassLookup::Found(other),
     }
+}
+
+/// Build a `NoClassDefFoundError` naming `missing_internal` (JVMS
+/// §5.3/§5.4 supertype/interface resolution failure), with a
+/// `ClassNotFoundException(missing_internal)` cause -- matching real JDK25's
+/// shape for this exact scenario (verified 2026-07-17 against `~/jdk25`: a
+/// class whose superclass' `.class` file is hidden throws
+/// `NoClassDefFoundError: pkg/Sup` -- internal/slash form message -- with
+/// `cause = java.lang.ClassNotFoundException: pkg.Sup` -- dotted form).
+///
+/// Follows the same alloc-and-pin idiom as sibling exception construction in
+/// this file (see the `ClassNotFoundException` throw in
+/// `cl_real_load_class_base` step 3, and `alloc_single_message_exception`) --
+/// `cause` is a fresh heap object that must stay rooted across the further
+/// allocations (`create_string`, the outer `new_object_initialized`) needed
+/// to build the final exception.
+pub(crate) fn no_class_def_found_error(ctx: &mut dyn NativeContext, missing_internal: &str) -> ObjectRef {
+    let dotted = missing_internal.replace('/', ".");
+    let cnfe_msg = ctx.create_string(&dotted);
+    let cause = match ctx.new_object_initialized(
+        "java/lang/ClassNotFoundException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(cnfe_msg))],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => Some(c),
+        _ => None,
+    };
+    if let Some(cause) = cause {
+        let cause_pin = ctx.pin_native_root(cause);
+        let ncdfe_msg = ctx.create_string(missing_internal);
+        let cause = ctx.read_native_pin(cause_pin, cause);
+        let result = ctx.new_object_initialized(
+            "java/lang/NoClassDefFoundError",
+            "(Ljava/lang/String;Ljava/lang/Throwable;)V",
+            &[Value::Object(Some(ncdfe_msg)), Value::Object(Some(cause))],
+        );
+        ctx.unpin_native_roots(cause_pin);
+        if let Ok(Some(Value::Object(Some(exc)))) = result {
+            return exc;
+        }
+    }
+    // Fallback (constructor dispatch unavailable for some reason): reuse the
+    // same message-only idiom the sibling `ClassNotFoundException` throw
+    // uses elsewhere in this file.
+    crate::jboss_module_loader::alloc_single_message_exception(
+        ctx,
+        "java/lang/NoClassDefFoundError",
+        1,
+        missing_internal,
+    )
 }
 
 /// Base `ClassLoader.loadClass` parent-first delegation for real-JDK mode
@@ -1000,8 +1103,15 @@ fn cl_real_load_class_base(
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
     //    or when the loader's chain cannot reach a built-in loader).
     if !defer_to_find_class && !scoped_user_chain {
-        if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
-            return Ok(Some(mirror));
+        match load_class_visible_to(ctx, this, &internal) {
+            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
+            ClassLookup::DependencyMissing(missing) => {
+                let exc = no_class_def_found_error(ctx, &missing);
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exc,
+                ));
+            }
+            ClassLookup::NotFound => {}
         }
         if let Some(mirror) =
             crate::jboss_module_loader::load_property_bridge_class(ctx, &class_name)
@@ -1047,8 +1157,15 @@ fn cl_real_load_class_base(
     //     the only source of application classes, so a findClass-overriding loader
     //     whose override legitimately misses still resolves here.
     if defer_to_find_class && !scoped_user_chain {
-        if let Some(mirror) = load_class_visible_to(ctx, this, &internal) {
-            return Ok(Some(mirror));
+        match load_class_visible_to(ctx, this, &internal) {
+            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
+            ClassLookup::DependencyMissing(missing) => {
+                let exc = no_class_def_found_error(ctx, &missing);
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exc,
+                ));
+            }
+            ClassLookup::NotFound => {}
         }
     }
 

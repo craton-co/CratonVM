@@ -587,23 +587,79 @@ static AIO_DISPATCH_STARTED: std::sync::atomic::AtomicBool =
 static AIO_DISPATCH_SHUTDOWN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Start the AIO completion dispatcher thread (idempotent).
+/// Number of AIO completion-dispatcher threads.
+///
+/// MUST be >1. A single dispatcher thread can self-deadlock: delivering one
+/// completion means synchronously invoking Java (a `CompletionHandler`, or
+/// completing a real JDK `CompletableFuture` which unparks its waiters), and
+/// that Java code is allowed — by the real `AsynchronousSocketChannel`
+/// contract this VM is emulating — to itself perform a *different* blocking
+/// async I/O call from within that callback (e.g. `Future.get()` on a write
+/// issued from inside a handler-form read's `completed()`). On real JDK this
+/// is safe because `AsynchronousChannelGroup`'s default group is a THREAD
+/// POOL (`Runtime.availableProcessors()` threads), so a different pool thread
+/// services the nested completion. With exactly one dispatcher thread, that
+/// nested completion can only ever be delivered by the very thread that is
+/// now blocked waiting for it — a hard deadlock (bounded only by whatever
+/// timeout, if any, the blocked Java call happens to pass).
+///
+/// Found via: Tomcat's own client-side WebSocket implementation
+/// (`org.apache.tomcat.websocket.WsFrameClient`) does exactly this on a
+/// received close frame — its handler-form read completion callback
+/// synchronously drives `WsSession.onClose()` -> `sendCloseMessage()` ->
+/// `WsRemoteEndpointImplClient.doWrite()`, which blocks on a *Future-form*
+/// `AsynchronousSocketChannel.write(...).get(timeout)` — all still on the
+/// single `cratonvm-aio-dispatch` thread. See
+/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8 for the
+/// full trace that root-caused this (Spring's `WebSocketIntegrationTests`,
+/// `TomcatWebSocketClient` parameterization).
+///
+/// A *fixed* pool still cannot make this class of reentrancy deadlock
+/// provably impossible in the general case (nor does real JDK's own default
+/// `AsynchronousChannelGroup`, which is also a fixed CPU-count-sized pool —
+/// see its `CompletionHandler` Javadoc caveat about handlers that themselves
+/// wait on another I/O operation in the same group). A fixed size of 4 was
+/// tried first and still exhausted occasionally under this same test's
+/// transient concurrency (multiple overlapping close-frame handshakes each
+/// wanting a free dispatcher thread); a floor of 16 measured far fewer
+/// residual occurrences across repeated runs (going as high as 32 did not
+/// reliably improve on 16 further, suggesting the small remaining flake rate
+/// is dominated by host scheduling noise rather than pool size — see
+/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8). Sized
+/// off CPU count with that floor, matching both real JDK's own approach and
+/// the sizing convention already used for `native-io`'s AIO worker pool
+/// (`async_socket.rs::start_pool`).
+fn aio_dispatch_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(16)
+}
+
+/// Start the AIO completion dispatcher thread pool (idempotent).
 ///
 /// `AsynchronousSocketChannel` handler-form reads run their blocking I/O on a
-/// non-VM worker pool that parks completions but cannot invoke Java. This
+/// non-VM worker pool that parks completions but cannot invoke Java. Each
 /// dispatcher is a *foreign-attached* VM thread: it sits idle in the GC-blocked
 /// region waiting on the completion condvar, and whenever a read completes it
 /// transitions to a running mutator (via [`ForeignCallGuard`]) just long enough
 /// to invoke the Java `CompletionHandler`, then returns to idle. This mirrors
-/// the dispatcher threads of a real `AsynchronousChannelGroup` pool. Wired up by
-/// `native-io`'s `set_dispatcher_launcher`, fired on the first handler-form read.
+/// the dispatcher thread POOL of a real `AsynchronousChannelGroup` (plural —
+/// see `aio_dispatch_thread_count`). Wired up by `native-io`'s
+/// `set_dispatcher_launcher`, fired on the first handler-form read. The
+/// shared completion queues (`native-io`'s `read_completion_state`) are
+/// `Mutex`-protected `VecDeque`s popped one entry at a time, so multiple
+/// dispatcher threads draining concurrently is race-free by construction —
+/// no two threads can pop the same completion.
 pub fn start_aio_dispatcher() {
     if AIO_DISPATCH_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    let _ = std::thread::Builder::new()
-        .name("cratonvm-aio-dispatch".into())
-        .spawn(aio_dispatcher_main);
+    for i in 0..aio_dispatch_thread_count() {
+        let _ = std::thread::Builder::new()
+            .name(format!("cratonvm-aio-dispatch-{i}"))
+            .spawn(aio_dispatcher_main);
+    }
 }
 
 fn aio_dispatcher_main() {
@@ -617,7 +673,11 @@ fn aio_dispatcher_main() {
     // `attach_current_thread_impl`). The empty deposited snapshot is published
     // before the TLS context, so there is no window where this thread is a
     // running mutator invisible to `request_stw`.
-    let raw = attach_foreign_thread(&shared, true, Some("cratonvm-aio-dispatch"));
+    let self_name = std::thread::current()
+        .name()
+        .map(str::to_string)
+        .unwrap_or_else(|| "cratonvm-aio-dispatch".to_string());
+    let raw = attach_foreign_thread(&shared, true, Some(&self_name));
     with_foreign_thread(|jt| {
         jt.gc_block_state
             .in_blocked_region

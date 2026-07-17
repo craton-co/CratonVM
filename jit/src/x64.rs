@@ -13856,13 +13856,30 @@ impl Compiler {
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
         // — no helper call, no per-alloc layout lookup. `class_layout` here runs
         // once at JIT-compile time, not per allocation.
-        let compact_body: Option<usize> = if cratonvm_types::compact_ref_fields_enabled() {
-            cratonvm_types::class_layout(class_id_raw)
-                .filter(|l| l.field_count() == num_fields)
-                .map(|l| l.body_size as usize)
-        } else {
-            None
-        };
+        // GROOVY-CLUSTER-20260717: class_layout(class_id_raw) is snapshotted
+        // ONCE here at JIT-compile time and its body_size/offsets get baked
+        // as immediate constants into the machine code below (bump-allocation
+        // size, array_length header write). Unlike the interpreter
+        // (vm/src/vm/vm_exec.rs) and the GC scan (gc/src/gen_heap.rs,
+        // gc/src/heap.rs), which both validate their own cached layout
+        // against layout_generation() before trusting it, this compile-time
+        // snapshot has no such check. When a class's registered compact
+        // layout is later replaced -- class_manager.rs's
+        // recompute_subclass_layouts / register_compact_layout_if_enabled,
+        // exercised whenever a synthetic-stub class gets upgraded to real
+        // bytecode with a different field count (the exact shape of ANTLR/
+        // Groovy-generated parser classes) -- any already-JIT-compiled new
+        // site keeps allocating objects at the OLD, now-wrong size while
+        // field-access code (correctly, dynamically, per-object) uses the
+        // CURRENT layout, corrupting the heap (confirmed via bisect +
+        // core-dump: SIGSEGV in JIT-generated code, RAX holding a garbage
+        // sign-extended int value used as a pointer). Disabling the fast
+        // inline-compact path here (falling back to the always-correct
+        // legacy-sized bump allocation, still avoiding the helper call) is
+        // the minimal safe fix; a full fix would thread layout_generation()
+        // through the JIT's compact-object fast paths the same way the
+        // interpreter/GC already do. See known-issues doc for detail.
+        let compact_body: Option<usize> = None;
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)
@@ -16328,17 +16345,29 @@ impl Compiler {
         // R10D = array_length (loaded in the bounds check)
         // We need to pass (index, length) to jit_throw_aioobe
 
-        // Set up args for jit_throw_aioobe(index: i64, length: i64)
+        // Set up args for jit_throw_aioobe(index: i64, length: i64, array_ptr: i64)
+        //
+        // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
+        // 2026-07-17): RAX still holds the array pointer at this point (the
+        // bounds check only reads through it into R10D; nothing in this
+        // stub clobbers RAX before the CALL), so pass it as a 3rd arg for
+        // `CRATONVM_DBG_AIOOBE3` diagnostics. Behavior-neutral when unset.
         #[cfg(target_os = "windows")]
         {
-            // Windows: arg1=RCX, arg2=RDX
+            // Windows: arg1=RCX, arg2=RDX, arg3=R8
             // RCX already contains the index
+            // MOV R8, RAX (move array pointer to arg3)
+            self.buf.emit(&[0x49, 0x89, 0xC0]); // REX.WB + MOV r/m64, r64 (R8 <- RAX)
             // MOV RDX, R10 (move length to arg2)
             self.buf.emit(&[0x4C, 0x89, 0xD2]); // REX.WR + MOV r/m64, r64
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // SysV: arg1=RDI, arg2=RSI
+            // SysV: arg1=RDI, arg2=RSI, arg3=RDX
+            // MOV RDX, RAX (move array pointer to arg3)
+            self.rex_w();
+            self.buf.emit_byte(0x8B);
+            self.modrm_reg(RDX, RAX);
             // MOV RDI, RCX (move index to arg1)
             self.rex_w();
             self.buf.emit_byte(0x8B);

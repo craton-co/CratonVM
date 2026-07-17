@@ -1470,13 +1470,48 @@ pub(crate) fn cid_visible_mirror(
     Some(ctx.get_class_mirror(cid))
 }
 
+/// Real-JDK-mode-analogue diagnostic (see `classloader_real::load_class_visible_to`
+/// / `no_class_def_found_error`, fixed 2026-07-17): `ensure_class_initialized`
+/// bottoms out in the same `ClassManager::load_class` that propagates a
+/// recursive supertype/interface load failure UNCHANGED, so a `ClassNotFound`
+/// naming something other than `internal` means the requested class file
+/// exists but a *dependency* is missing -- JVMS §5.3/§5.4:
+/// `NoClassDefFoundError`, not a bare CNFE on the requested class. Surfaced
+/// as an immediate `Err` (rather than folded into the `Ok(None)` "not
+/// found" case) so the caller throws it instead of silently returning a
+/// null `Class` (this native's genuine-miss contract -- see step 7 of
+/// `cl_load_class_base_delegation`).
 fn resolve_global_if_visible(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     internal: &str,
-) -> Option<ObjectRef> {
-    let cid = ctx.ensure_class_initialized(internal).ok()?;
-    cid_visible_mirror(ctx, this, cid)
+) -> Result<Option<ObjectRef>, cratonvm_types::error::MethodCallFailed> {
+    match ctx.ensure_class_initialized(internal) {
+        Ok(cid) => Ok(cid_visible_mirror(ctx, this, cid)),
+        Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ClassFile(
+                cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
+            ),
+        )) if class_name != internal => {
+            tracing::debug!(
+                requested = internal,
+                missing_dependency = %class_name,
+                "resolve_global_if_visible: requested class exists but a \
+                 dependency failed to resolve -- NoClassDefFoundError"
+            );
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                crate::classloader_real::no_class_def_found_error(ctx, &class_name),
+            ))
+        }
+        Err(e) => {
+            tracing::debug!(
+                requested = internal,
+                error = %e,
+                "resolve_global_if_visible: ensure_class_initialized failed"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Base-class `ClassLoader.loadClass` parent-first delegation, reimplemented in
@@ -1645,14 +1680,14 @@ fn cl_load_class_base_delegation(
         // For built-in parent loaders (bootstrap/platform/app), use standard delegation
         if parent_type != LOADER_CUSTOM && !defer_to_find_class && !scoped_user_chain {
             // Standard delegation handles bootstrap → extension → app
-            if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+            if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
                 return Ok(Some(Value::Object(Some(mirror))));
             }
         }
     } else if !defer_to_find_class && !scoped_user_chain {
         // No parent (or null parent) → delegate directly to bootstrap loader
         // Bootstrap delegation: use the standard class loading chain
-        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -1662,7 +1697,7 @@ fn cl_load_class_base_delegation(
     //    Skipped when deferring to a custom `findClass` override (HIB-CV-24) so
     //    the supplied loader runs before CratonVM's global store answers.
     if !defer_to_find_class && !scoped_user_chain {
-        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal) {
+        if let Some(mirror) = resolve_global_if_visible(ctx, this, &internal)? {
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
@@ -7816,7 +7851,9 @@ mod classloader_tests {
             "built-in loaders must not see app-namespace classes defined by a child loader"
         );
         assert!(
-            resolve_global_if_visible(&mut ctx, app_loader, "MyMessenger").is_none(),
+            resolve_global_if_visible(&mut ctx, app_loader, "MyMessenger")
+                .unwrap()
+                .is_none(),
             "base loadClass global fallback must apply the same child-loader visibility rule"
         );
     }

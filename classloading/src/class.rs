@@ -709,6 +709,76 @@ impl Class {
         false
     }
 
+    /// Loader-identity-blind fallback for [`is_subclass_of`]: walks this
+    /// class's superclass chain (exception `catch_type`s are always
+    /// classes, never interfaces, per JVMS SS4.7.3 / SS6.5.athrow, so the
+    /// interface walk that `is_subclass_of` performs is intentionally
+    /// skipped here) comparing each ancestor's OWN name to `target_name`
+    /// textually, ignoring `ClassId` identity entirely.
+    ///
+    /// Exists because exception-handler `catch_type` resolution
+    /// (`find_exception_handler*`/`route_jit_exception_through_method` in
+    /// `vm/src/runtime/interpreter.rs`) resolves the catch class via a flat,
+    /// global, name-only lookup (`ClassManager::find_class_by_name`) rather
+    /// than the loader-faithful `resolve_class_loader_aware` used for
+    /// `new`/`checkcast`/`instanceof`/`ldc X.class`. When a library class
+    /// (e.g. a third-party jar's exception type) ends up loaded under two
+    /// different `ClassId`s by two different loaders -- which legitimately
+    /// happens when a `ClassLoader` subclass has a `findClass` fallback that
+    /// (incorrectly, or as an artifact of CratonVM's simplified loader
+    /// model) re-defines a class its parent chain could already serve, e.g.
+    /// Spring's `CompileWithForkedClassLoaderClassLoader` forking a new
+    /// loader per test method -- a `throw` from code loaded by loader A can
+    /// carry an exception whose `ClassId` never equals the `ClassId` that
+    /// `find_class_by_name` deterministically returns for the same simple
+    /// name (typically whichever copy was registered first). The primary,
+    /// `ClassId`-based `is_subclass_of` check then wrongly reports "no
+    /// match" and the exception incorrectly escapes a `catch` block that
+    /// should have caught it (observed as AssertJ's `IntrospectionError`
+    /// escaping `PropertyOrFieldSupport.getSimpleValue`'s own
+    /// `catch (IntrospectionError e)`).
+    ///
+    /// This is an intentional simplification: two *genuinely* different
+    /// classes sharing the same fully-qualified name under different
+    /// loaders (deliberate sandboxing) would also match here. That mirrors
+    /// the same accepted tradeoff already made elsewhere in this codebase
+    /// (e.g. `native_class_get_declaring_class`'s loader-aware fallback) --
+    /// given CratonVM's flat global class store, treating identically-named
+    /// classes as "the same" for control-flow purposes is far less harmful
+    /// than silently letting a same-bytecode exception go uncaught.
+    pub fn is_subclass_of_by_name(&self, target_name: &str, store: &ClassStore) -> bool {
+        if &*self.name == target_name {
+            return true;
+        }
+        let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+        self.is_subclass_of_by_name_inner(target_name, store, 0, &mut visited)
+    }
+
+    fn is_subclass_of_by_name_inner(
+        &self,
+        target_name: &str,
+        store: &ClassStore,
+        depth: usize,
+        visited: &mut FxHashSet<ClassId>,
+    ) -> bool {
+        if depth > MAX_HIERARCHY_DEPTH {
+            return false;
+        }
+        if !visited.insert(self.id) {
+            return false;
+        }
+        let Some(super_id) = self.superclass else {
+            return false;
+        };
+        let Some(super_class) = store.get(super_id) else {
+            return false;
+        };
+        if &*super_class.name == target_name {
+            return true;
+        }
+        super_class.is_subclass_of_by_name_inner(target_name, store, depth + 1, visited)
+    }
+
     // ----- Access flag convenience -----------------------------------------
 
     #[inline]
