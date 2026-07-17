@@ -35,17 +35,23 @@
 > under `CrossOriginAnnotationIntegrationTests` (now 68/68 on all 4
 > backends).
 >
+> **Confirmed FIXED 2026-07-16 (later the same day):**
+> `web.service.registry.ImportHttpServiceRegistrarTests`'s `ClassCastException`
+> (cross-loader `MergedAnnotation$Adapt` enum-identity split) — the
+> `resolve_field_ref`/getstatic fix that was attempted and reverted earlier
+> the same day (see immediately below) was re-attempted from a fresh
+> `origin/dev` checkout and now builds and runs clean: the GC bug that caused
+> the earlier heap corruption (`fb15be63`, landed independently the same day)
+> is already fixed on `dev`. The class still doesn't reach 5/5 — the
+> remaining 2/5 fail on the same pre-existing `java.lang.classfile.ClassFile`
+> JDK24+ host gap noted below for the two "environmental, not a CratonVM bug"
+> items. Full verification detail in `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s
+> dedicated entry.
+>
 > **Still genuinely OPEN** (tracked as active tasks in this session,
 > 2026-07-16): `context.annotation.ImportSelectorTests` (Mockito `spy()`
 > `StackOverflowError`, root cause narrowed to `MockMethodAdvice
-> .isOverridden`); `web.service.registry.ImportHttpServiceRegistrarTests`
-> (`ClassCastException`, root-caused precisely 2026-07-16 to a cross-loader
-> `MergedAnnotation$Adapt` enum-identity split — NOT `AnnotationTypeMapping
-> .getMappedAnnotationValue`/`Method` identity as this doc and
-> `CRATONVM-SPRING-GENUINE-BUGLIST.md` previously said; a targeted VM fix in
-> `resolve_field_ref`/`getstatic` was attempted and REVERTED after it caused
-> heap corruption — see `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s dedicated
-> entry for the full narrative, repro assets, and next-step guidance);
+> .isOverridden`);
 > `web.socket.messaging
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
