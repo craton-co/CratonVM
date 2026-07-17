@@ -64353,11 +64353,30 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
             // non-positive ids ("Invalid thread ID parameter") on every
             // AsyncFileHandler format. The mirror lookup may allocate, so
             // keep this pinned across it.
+            let real = crate::log_record_real_layout(ctx, this);
             let this_pin = ctx.pin_native_root(this);
             let tid = crate::current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(crate::epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "threadID", Value::Int(crate::short_thread_id(tid)));
             ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
@@ -64398,8 +64417,17 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         );
         Ok(None)
     });
+    // Real-layout records (crate::log_record_real_layout) resolve by NAME:
+    // their raw indexes (loggerName=8, thrown=12, parameters=11, instant=7,
+    // sequenceNumber=1) disagree with this block's legacy 7-field slots, and
+    // a real record passes the num_fields >= 7 guard, so slot access would
+    // read or clobber unrelated real fields (e.g. slot 2 is the real
+    // sourceClassName, slot 5 the real threadID).
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "loggerName")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 2)))
         } else {
@@ -64408,13 +64436,19 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setLoggerName", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "loggerName", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 2, value);
         }
         Ok(None)
     });
     r.register(lr, "getThrown", "()Ljava/lang/Throwable;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "thrown")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 3)))
         } else {
@@ -64423,18 +64457,25 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "thrown", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 3, value);
         }
         Ok(None)
     });
     r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            let field = ctx.get_field(this, 4);
-            if matches!(field, Value::Object(Some(_))) {
-                return Ok(Some(field));
-            }
+        let field = if crate::log_record_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "parameters")
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.get_field(this, 4)
+        } else {
+            Value::Object(None)
+        };
+        if matches!(field, Value::Object(Some(_))) {
+            return Ok(Some(field));
         }
         // Return empty Object[] if not set
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -64446,29 +64487,68 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                ctx.set_field(this, 4, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            if crate::log_record_real_layout(ctx, this) {
+                ctx.set_field_by_name(this, "parameters", value);
+            } else if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 4, value);
             }
             Ok(None)
         },
     );
     r.register(lr, "getMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            // Real bytecode derives millis from `instant`.
+            if let Value::Object(Some(instant)) = ctx.get_field_by_name(this, "instant") {
+                return ctx.invoke_virtual(instant, "toEpochMilli", "()J", &[]);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
         if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 5)))
+            match ctx.get_field(this, 5) {
+                millis @ Value::Long(_) => Ok(Some(millis)),
+                _ => Ok(Some(Value::Long(0))),
+            }
         } else {
             Ok(Some(Value::Long(0)))
         }
     });
     r.register(lr, "setMillis", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 5, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let millis = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        if crate::log_record_real_layout(ctx, this) {
+            // Mirror the real setter: replace `instant`. The Instant
+            // construction may allocate; keep `this` pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let instant = ctx
+                .invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(millis)],
+                )
+                .ok()
+                .flatten();
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 5, Value::Long(millis));
         }
         Ok(None)
     });
     r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "sequenceNumber")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 6)))
         } else {
@@ -64477,8 +64557,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 6, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let value = args.get(1).copied().unwrap_or(Value::Long(0));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "sequenceNumber", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 6, value);
         }
         Ok(None)
     });

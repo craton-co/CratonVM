@@ -34530,11 +34530,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // non-positive ids ("Invalid thread ID parameter") on every
             // AsyncFileHandler format. The mirror lookup may allocate, so
             // keep this pinned across it.
+            let real = log_record_real_layout(ctx, this);
             let this_pin = ctx.pin_native_root(this);
             let tid = current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "threadID", Value::Int(short_thread_id(tid)));
             ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
@@ -46303,6 +46322,30 @@ pub(crate) fn short_thread_id(tid: i64) -> i32 {
     } else {
         i32::MAX / 2 + 1
     }
+}
+
+/// Wall-clock now in epoch millis, for stamping `LogRecord` creation time.
+pub(crate) fn epoch_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `rec` is a real-JDK-layout `java.util.logging.LogRecord`. The real
+/// class resolves its private `longThreadID` long by NAME (typed zero even
+/// before any write); synthetic WildFly/JBoss mirrors have no such field, so
+/// the lookup yields `Object(None)`. Slot-based accessor fallbacks are only
+/// valid on the synthetic layouts: the real JDK 25 declaration order
+/// (level=0, sequenceNumber=1, sourceClassName=2, sourceMethodName=3,
+/// message=4, threadID=5, longThreadID=6, instant=7, loggerName=8,
+/// resourceBundle=9, resourceBundleName=10, parameters=11, thrown=12)
+/// disagrees with the synthetic slots almost everywhere.
+pub(crate) fn log_record_real_layout(
+    ctx: &dyn NativeContext,
+    rec: cratonvm_types::ObjectRef,
+) -> bool {
+    matches!(ctx.get_field_by_name(rec, "longThreadID"), Value::Long(_))
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
