@@ -589,6 +589,182 @@ pre-existing ones. Reproduction harnesses (`MethodRunner.java`,
 `BigIntCtorProbe.java`/`BigIntCtorProbe2.java`, `HashedNameProbe.java`) left in
 `/data/hib-baseline-runner-20260716/` on the shared host for reuse.
 
+## Update 2026-07-17 (follow-up session): fast, minimal, Hibernate-free repro found (85-90% failure rate); JIT-only, GC-amplified, precisely localized to `divideMagnitude`'s `shift > 0` normalization path — root mechanism narrowed further but the exact faulty instruction NOT pinned; no fix landed this session
+
+Picked up this doc's own "next step" (disassemble the JIT-compiled `divideKnuth`/
+`divide`/`divideMagnitude` and compare against interpreter semantics). Built from
+`dev@3e74dd5a`, worktree `wt-hib-bigint-divideknuth-20260717`, branch
+`fix/hib-bigint-divideknuth-jit-20260717`; re-verified at the end of the session
+against `dev@8ef4d59b` (merged in mid-session, includes an unrelated
+`conservative_roots.rs` scan-cost fix, `f377eb69` — confirmed **not** related to
+this bug, repro behavior identical before/after that merge).
+
+**The isolated-loop repro from the previous entries (a raw
+`new BigInteger(1, digest).toString(35)` loop, 200,000 iterations, zero failures)
+was misleading — it never actually needed Hibernate, just the right operand
+shape.** A tighter repro,
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/SmallDividendRepro.java`,
+loops `BigInteger.divideAndRemainder(35^12)` (a fixed ~62-bit, 2-int-word
+divisor — exactly `NamingHelper.hashedName`'s `longRadix[35]`) against **small**
+random dividends (67-70 bits, only slightly bigger than the divisor, so
+`MutableBigInteger.divideMagnitude`'s main Knuth D2-D7 loop runs **zero**
+iterations and execution goes straight to the post-loop special-cased
+final-digit block), checking `q*b+r == a && 0<=r<b` directly instead of relying
+on the `smallToString` array-overflow side effect. This reproduces **85-90% of
+the time**, in well under a second, no Hibernate/JUnit/classloading involved:
+```
+@@RESULT bad=17686 of 20000
+```
+The real production call (`NamingHelper.hashedName` via
+`bigint-divideknuth-repros-20260717/HashedNameProbe.java`, unchanged from the
+prior session) was re-run against this same finding and throws the **identical,
+exact** original stack trace deterministically at the same trial number across 3
+repeat runs:
+```
+trial=771 ... FAILED: java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+```
+confirming the minimal repro and the production bug are the same defect.
+
+**Bisection chain (all against the same binary, `--nojit` vs default JIT-on
+unless noted):**
+1. **JIT-only, not a race, not compile-timing-dependent:** `--nojit` is 0/20000
+   clean every time. Lowering `CRATONVM_TIER_C1_THRESHOLD` makes the failure
+   onset track the threshold precisely (e.g. threshold=5 → onset around
+   invocation ~240 instead of ~1500) — this is a **deterministic compile-time
+   codegen defect**, not a background-compiler-thread race: a
+   `FixedValRepro.java` variant that calls `divideAndRemainder` on the exact
+   same fixed operands thousands of times in a row shows a **hard state
+   transition** — correct on every call before the relevant methods finish
+   compiling (`normalize`/`toBigInteger`/`divideKnuth`/`compare`/`divide`, all
+   enqueued together at the same invocation count, matching the previous
+   entry's tier-enqueue finding), then **consistently, identically wrong on
+   every call after**, not intermittent/flickering.
+2. **Localized to the `shift > 0` normalization path specifically.**
+   `ShiftZeroRepro.java` uses a divisor with its top bit forced set (so
+   `Integer.numberOfLeadingZeros(divisor.value[0]) == 0`, i.e. `shift == 0`),
+   which skips `divideMagnitude`'s entire D1 divisor/dividend
+   normalize-by-`shift` step and the D8 `rem.rightShift(shift)`
+   "unnormalize" step (both gated `if (shift > 0)`): **0/20000 failures.**
+   Reverting to the `shift == 2` divisor (`35^12`, i.e. the real
+   `NamingHelper` divisor) reintroduces the bug at the same ~88% rate. This
+   is the single most useful isolating fact found this session.
+3. **Not the main Knuth D2-D7 loop, not `mulsub`, not
+   `unsignedLongCompare`.** `SmallDividendRepro`'s small-dividend shape
+   proves the main loop doesn't even need to run (`limit-1 == 0`) for the bug
+   to fire at full rate. `mulsub([I[IIII)I` (1026 bytes compiled) and
+   `unsignedLongCompare(JJ)Z` (214 bytes) were each fully manually traced
+   instruction-by-instruction against their real-JDK source
+   (`jdk25/lib/src.zip`) and are byte-for-byte semantically correct, including
+   the unusual "three-way-compare-then-threshold" codegen idiom this JIT
+   uses for every `>`/`<` comparison (`setg`/`setl`/`sub`/`test` instead of a
+   direct `setg`) — correct here because both compared operands are
+   pre-masked to `[0, 0xFFFFFFFF]`, so signed vs. unsigned compare coincide.
+4. **Not which D1 sub-branch fires.** `BranchIsolateRepro.java` forces
+   either the `Integer.numberOfLeadingZeros(dividend.value[0]) >= shift`
+   branch (`this.primitiveLeftShift(shift, remarr, 1)`, a shared compiled
+   method) or the `else` branch (a hand-inlined shift-with-carry loop
+   directly in `divideMagnitude`'s own bytecode) — **both fail at ~85-90%**,
+   meaning the defect is in something common to both paths: most likely the
+   *divisor's* `div.primitiveLeftShift(shift, divisor, 0)` call (unconditional
+   whenever `shift > 0`, identical in both branches) or the D8
+   `rem.rightShift(shift)`/`rem.normalize()` step (also unconditional in both
+   branches). The full compiled body of the (non-unrolled) shift-with-carry
+   loop was manually traced instruction-by-instruction against source and is
+   also correct.
+5. **Not loop unrolling.** `CRATONVM_DISABLE_UNROLL=1` removes a confirmed,
+   real extra unrolled copy of the shift-loop body (verified via disassembly:
+   3 `shl`+2 `shr` instructions in the loop region drop to the source-correct
+   2 `shl`+1 `shr` once disabled) but the failure rate is **unchanged**
+   (17709/20000) — ruling out unroll-boundary/trip-count handling as the
+   cause.
+6. **GC-amplified, and this looks like the real mechanism, but is NOT fully
+   confirmed.** `CRATONVM_DBG_GC_STRESS=65536` turns the ~88%
+   "wrong-silent-result" rate into an outright, immediate, deterministic
+   `ArrayIndexOutOfBoundsException` crash (the exact production exception) on
+   the very first stressed run. `--nojit` + the same GC stress stays 0/3000
+   clean — ruling out a pure GC bug independent of JIT. `CRATONVM_DBG_VERIFY_OOP_MAPS=1`
+   under GC stress fires repeated `[VERIFY-OOP-MAPS] unmapped in-band oop`
+   warnings for JIT-compiled code at the frame addresses matching
+   `divideMagnitude` (and one caller), at very deep `[rbp-N]` offsets (up to
+   `-0x3ce0`) consistent with the single-pass backend's own internal
+   scratch/spill slots (used to evaluate nested sub-expressions like
+   `(b<<shift)|(c>>>n2)`) rather than the method's 28 named bytecode locals
+   (`javap` confirms `divideMagnitude` has `locals=28`, well under the 64-bit
+   `local_oop_masks` tracking width, so it is *not* a mask-width overflow).
+   **However**, this does not fully explain the mechanism: `moving_young`
+   (the moving Cheney young-gen collector) is **off by default**
+   (`CRATONVM_MOVING_YOUNG` unset), so plain "object relocated, stale pointer"
+   can't be the whole story under default settings, and — more importantly —
+   `CRATONVM_NO_PRECISE_JIT_MAPS=1` (forcing pure conservative frame
+   scanning, no precise maps at all) does **not** change the failure rate
+   either (17704/20000, same as with precise maps on). So either (a) the
+   conservative fallback scan also fails to cover these deep scratch-slot
+   addresses for a method this large/complex (a genuinely deeper root-tracking
+   gap than "just add missing precise-map entries" would fix), or (b) the
+   `VERIFY-OOP-MAPS` warnings are the diagnostic's own documented false-positive
+   case ("NB band may include nested-JIT-callee slots") and the GC-stress
+   sensitivity is actually a heap-layout/adjacency effect amplifying a
+   genuine **out-of-bounds write** bug (e.g. a one-element overflow past
+   `remarr`'s `intLen+2`-sized allocation, or past the 2-element local
+   `divisor` array) rather than a stale-read bug — under GC stress, allocation
+   adjacency changes what ends up next to the overflowing array, changing
+   whether the overflow corrupts something visible. **This distinction was
+   not resolved this session.**
+
+**Not fixed this session.** The investigation is narrowed further than any
+prior entry (a Hibernate-free, sub-second, 85-90%-reliable repro; JIT-only;
+localized to the D1/D8 `shift > 0` normalization code in `divideMagnitude`;
+`mulsub`/`unsignedLongCompare`/loop-unrolling/branch-choice all individually
+ruled out) but the exact faulty instruction or the precise
+stale-read-vs-out-of-bounds-write mechanism was not pinned down, despite an
+extensive full manual disassembly trace (`CRATONVM_DBG_JIT_DISASM`) of every
+individually-compiled method on the call path. Given this touches shared JIT
+codegen/GC-root-tracking infrastructure used far beyond `BigInteger`, landing a
+speculative fix without pinning the exact defect was judged too risky —
+per this doc's own standing guidance, a well-documented non-fix beats a risky
+guess here.
+
+**Next step for a follow-up session**, roughly in order of expected
+cost/payoff:
+1. Use `SmallDividendRepro`/`ShiftZeroRepro`/`BranchIsolateRepro` (all left at
+   `/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`) —
+   they reproduce in under a second, no Hibernate needed, and don't need
+   re-deriving.
+2. Resolve the "which mechanism" question directly: instrument
+   `divideMagnitude`'s local `divisor`/`rem`/`remarr` arrays with a
+   `System.identityHashCode`-based before/after check bracketing the
+   `div.primitiveLeftShift(shift, divisor, 0)` call and the final
+   `rem.rightShift(shift)` call (a small reflection-based probe in package
+   `java.math` can call these package-private methods directly without
+   `setAccessible`) to see whether the array's **address changes** (moving
+   GC relocated it — but `moving_young` is off by default, so this would
+   itself be a new finding) or the array's **contents become wrong without
+   changing identity** (favors an out-of-bounds write from a neighboring
+   compiled expression, or a genuine arithmetic bug this session's manual
+   trace missed).
+3. If (2) points at a stale/relocated reference: extend
+   `emit_oop_map_for_safepoint`'s Stage 1/2 tracking
+   (`jit/src/x64.rs`, ~line 9981) to also cover the single-pass backend's own
+   scratch/spill slots (the `[rbp-0x88]`/`[rbp-0x118]`-style temps used to
+   evaluate nested sub-expressions) when they hold live reference values
+   across a GC-capable call — not just operand-stack slots and the 28 named
+   bytecode locals.
+4. If (2) points at an out-of-bounds write: audit the exact bounds-check
+   emitted for the `remarr[intLen+1] = c << shift;` tail write and the
+   `divisor[dlen]`-sized array's fill in `primitiveLeftShift`'s inlined tail
+   store, for a one-element-too-generous bound.
+
+Probe sources (all Hibernate-free except `HashedNameProbe.java`) left at
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`:
+`MTBigIntDivRepro.java`, `FixedValRepro.java`, `SmallDividendRepro.java`,
+`ShiftZeroRepro.java`, `BranchIsolateRepro.java`, `CopyOfRangeMicro.java`
+(isolated `Arrays.copyOfRange` check, clean/not the cause),
+`HashedNameProbe.java` (real production call, reused from the prior session).
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
