@@ -73604,21 +73604,46 @@ fn native_md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // behaviour of NoSuchAlgorithmException being surfaced lazily.
     }
     let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2);
+    // GC-safety: `md` is a bare Rust local held across two further
+    // allocating calls (`create_string`, `new_array`) below. Either can
+    // trigger a moving GC that relocates `md`; without re-reading through a
+    // pin, the subsequent `set_field` writes land on `md`'s abandoned
+    // from-space copy and are silently lost, leaving the live instance's
+    // `algorithm`/`data` fields unset -- same unread-pin anti-pattern fixed
+    // in `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
+    let md_handle = ctx.pin_native_root(md);
     let algo_str = ctx.create_string(&algo);
+    let md = ctx.read_native_pin(md_handle, md);
     ctx.set_field(md, MD_FIELD_ALGO, Value::Object(Some(algo_str)));
     let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    let md = ctx.read_native_pin(md_handle, md);
     ctx.set_field(md, MD_FIELD_DATA, Value::Object(Some(data)));
+    ctx.unpin_native_roots(md_handle);
     Ok(Some(Value::Object(Some(md))))
 }
 
 fn md_append_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+    let this_handle = ctx.pin_native_root(this);
     let old_data = match ctx.get_field(this, MD_FIELD_DATA) {
         Value::Object(Some(o)) => o,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(this_handle);
+            return;
+        }
     };
+    let old_data_handle = ctx.pin_native_root(old_data);
     let old_len = ctx.array_length(old_data);
     let new_len = old_len + bytes.len();
     let new_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
+    // GC-safety re-read (mirrors `populate_real_thread_holder`'s
+    // GCBARRIER-CDLWAIT-FIX, 2026-07-17): the `new_array` call above can
+    // trigger a moving GC, relocating `this`/`old_data`, both captured as
+    // bare locals before this allocation. Without this re-read, the copy
+    // loop below reads through a stale `old_data` and the final `set_field`
+    // writes `this.data` on an abandoned from-space copy -- a silently lost
+    // update (this MessageDigest's accumulator never actually grows).
+    let old_data = ctx.read_native_pin(old_data_handle, old_data);
+    let this = ctx.read_native_pin(this_handle, this);
     for i in 0..old_len {
         let v = ctx.get_array_element(old_data, i);
         ctx.set_array_element(new_data, i, v);
@@ -73627,6 +73652,7 @@ fn md_append_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
         ctx.set_array_element(new_data, old_len + i, Value::Int(b as i8 as i32));
     }
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(new_data)));
+    ctx.unpin_native_roots(this_handle);
 }
 
 fn native_md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -74412,13 +74438,25 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
     let digest = compute_digest(&algo, &data);
+    // GC-safety: `this` is a bare Rust local (from `args.first()`) held
+    // across two further allocating calls below (`new_array` x2). Either
+    // can trigger a moving GC that relocates `this`; the final "reset"
+    // `set_field` must re-read through a pin or it silently lands on an
+    // abandoned from-space copy, leaving the live instance's accumulator
+    // un-reset -- same unread-pin anti-pattern fixed in
+    // `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
+    let this_handle = ctx.pin_native_root(this);
     let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
+    let result_handle = ctx.pin_native_root(result);
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }
     // Reset
     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    let this = ctx.read_native_pin(this_handle, this);
+    let result = ctx.read_native_pin(result_handle, result);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
+    ctx.unpin_native_roots(this_handle);
     Ok(Some(Value::Object(Some(result))))
 }
 
