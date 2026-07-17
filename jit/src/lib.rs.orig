@@ -3641,21 +3641,6 @@ impl JitMICSlot {
 
     /// Update all cached fields after a cache miss.
     pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
-        // cceres2: on a RETARGET (cached class X -> new class Y) a reader that
-        // already matched the old class_id can pair the NEW entry_ptr with the
-        // OLD needs_context (or call a different method's entry under the old
-        // guard). Invalidate the guard first so in-flight readers miss to the
-        // helper instead. This narrows (does not fully close — a reader past
-        // its guard load can still tear; the marshalling choke points now
-        // re-derive the ABI flag from the entry's own CompiledMethod) the
-        // window; first-install (0 -> X) keeps the BUG-24 publish order below.
-        let prev = self
-            .cached_class_id
-            .load(std::sync::atomic::Ordering::Acquire);
-        if prev != 0 && prev != class_id {
-            self.cached_class_id
-                .store(0, std::sync::atomic::Ordering::Release);
-        }
         // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
         // (which checks class_id first, then loads entry_ptr) can never observe
         // the new class id paired with a stale entry_ptr.

@@ -1083,12 +1083,24 @@ fn safe_native_call_impl(
                 {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let top = thread
+                        .frames
+                        .last()
+                        .map(|f| {
+                            format!(
+                                "{}.{}{}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor()
+                            )
+                        })
+                        .unwrap_or_default();
                     tracing::warn!(
-                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale \
-                         (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
+                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale                          (already-evacuated) ref 0x{:x} - healed to 0x{:x}                          (invoked from {})",
                         callee,
                         o.as_ptr() as usize,
                         healed.as_ptr() as usize,
+                        top,
                     );
                 }
                 *o = healed;
