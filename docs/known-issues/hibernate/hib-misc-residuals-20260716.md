@@ -889,3 +889,62 @@ investigation template), then chase the intermittent
 `CloneNotSupportedException` with `CRATONVM_DBG_STALE_OBJREF`/a targeted
 `Object.clone()` native-support audit if the micro-repro confirms a
 CratonVM-side (not test-data) defect.
+
+## Update 2026-07-17 (follow-up session): Europe/Paris pre-1911 LMT precision — FIXED, `ZonedDateTimeTest` now 608/608 matching HotSpot
+
+**Status: CLOSED.** The 20/608 residual above is fixed. Full root-cause +
+fix writeup:
+[hib-paris-lmt-precision-FIXED.md](../../internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+Fix commit: `31544c27` (branch `fix/hib-paris-lmt-precision-20260717`,
+merged to `dev` at `03d7e98f`).
+
+**Root cause, in short:** not a `java.time`/tzdata bug at all — a
+standalone HotSpot-comparison micro-repro proved CratonVM's
+`ZonedDateTime`/`ZoneId`/`ZoneRules` arithmetic for the pre-1911 LMT case
+is already byte-for-byte correct. The bug was in the **separate, legacy**
+`java.util.TimeZone`/`Calendar`/`SimpleTimeZone` API family that
+`java.sql.Timestamp`'s deprecated constructor and
+`GregorianCalendar.computeTime()`/`.computeFields()` use for the actual
+JDBC round-trip: CratonVM's real-JDK-mode `TimeZone` is synthesized
+(`alloc_synth_timezone` in `native-builtins/src/lib.rs`, a workaround for
+an unrelated `ZoneInfoFile`/`tzdb.dat` bootstrap gap) as a real
+`java.util.SimpleTimeZone` with the zone's *modern* standard offset plus
+an annual DST rule — structurally incapable of expressing a one-time
+historical cutover like Paris's 1911-03-11 LMT→WET switch, since
+`SimpleTimeZone.getOffsets(long, int[])` (the method
+`GregorianCalendar` actually calls) only ever consults the fixed
+`rawOffset` field, with no date parameter.
+
+**Fix:** a small explicit `historical_lmt_offset(zone_id)` table plus a
+native override of `SimpleTimeZone.getOffsets(long, int[])`, returning the
+historical LMT offset for instants strictly before a zone's cutover and
+deferring to the real bytecode (`invoke_virtual_bytecode_only`) otherwise.
+Deliberately limited to `Europe/Paris` — a `GeneralityRepro.java`
+HotSpot-comparison probe showed real HotSpot's own legacy Calendar path
+(not just `java.time`) correctly resolves Paris's LMT, but does **not**
+resolve the analogous `Europe/Amsterdam`/`Europe/Oslo` cutovers (their
+compiled legacy zoneinfo data apparently omits the pre-1892/1893 LMT rule
+even though `java.time`'s `ZoneRules` has it) — adding those would have
+made CratonVM diverge from real HotSpot instead of matching it. See the
+fix commit/writeup for why "real IANA tzdata has a cutover" doesn't imply
+"HotSpot's legacy Calendar path resolves it".
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=404
+failed=0 aborted=204 skipped=0` — matches real HotSpot's exact shape
+(`ok=404 failed=0 aborted=204`), stable across 5 independent solo reruns
+(pre-merge and post-merge onto `dev`, `--nojit`). `LocalDateTimeTest`
+(`found=162 ok=90 failed=0 aborted=72`) and `InstantTests` (`found=204
+ok=112 failed=0 aborted=92`): no regression, both re-verified against the
+merged-`dev` tip. The intermittent `CloneNotSupportedException` flagged in
+the update above did not reproduce in any of the 5 post-fix reruns
+(previously ~1-in-4) — plausibly a side effect of the same
+offset-miscomputation retry path, though not separately root-caused; flag
+if it resurfaces.
+
+A separate, unrelated, out-of-scope bug was found incidentally while
+probing generality: CratonVM's synthetic `SimpleTimeZone` construction
+retroactively applies the *modern* EU DST rule to 19th-century dates that
+predate real DST adoption in that region (e.g. `Europe/Amsterdam` at
+1892-04-01 returns +2:00 on CratonVM vs. real HotSpot's +1:00 — DST wasn't
+introduced there until 1916). Not investigated further (not blocking any
+known test), flagged for a future session.
