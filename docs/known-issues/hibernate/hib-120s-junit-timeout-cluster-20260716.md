@@ -25,14 +25,14 @@ itself* reports having exceeded a 120-second internal watchdog).
 
 | Class | Method | Elapsed (ms) | Notes |
 |---|---|---|---|
-| `org.hibernate.orm.test.batch.BatchTest` | `testBatchInsertUpdate` | 320518 | |
-| `org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest` | `testMultiLoad` | 270408 | |
-| `org.hibernate.orm.test.function.json.JsonArrayUnnestTest` | `testUnnest` | 523811 | |
+| `org.hibernate.orm.test.batch.BatchTest` | `testBatchInsertUpdate` | 320518 | Re-investigated 2026-07-16 (see below) — a prior *baseline* measurement (pre-`db047d38`) found this crashing with an NPE, not timing out; on the current `dev` tip it no longer crashes and shows genuine forward progress, but pass/fail is still unconfirmed (host contention). Left in this table pending confirmation. |
+| ~~`org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest`~~ | ~~`testMultiLoad`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
+| ~~`org.hibernate.orm.test.function.json.JsonArrayUnnestTest`~~ | ~~`testUnnest`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
 | ~~`org.hibernate.orm.test.id.uuid.rfc9562.UUidV6V7GeneratorTest`~~ | ~~`testMonotonicityUuid6`~~ | — | **FIXED — re-attributed, see below. Not a throughput/timeout member of this cluster.** |
-| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | |
-| `org.hibernate.orm.test.bootstrap.scanning.ScannerTest` | `testCustomScanner` | 134963 | |
-| `org.hibernate.orm.test.sql.exec.SmokeTests` | `testQueryConcurrency` | 193477 | Contradicts the 2026-07-14 "all sql.exec.* classes pass" note in the archived assertion-longtail doc — this specific concurrency-flavored test within `SmokeTests` still times out; the other 16 tests in the class pass. |
-| `org.hibernate.orm.test.type.contributor.LiteralRenderingTest` | `testIdVersionFunctions` | 347729 | |
+| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | Not re-investigated this session. |
+| ~~`org.hibernate.orm.test.bootstrap.scanning.ScannerTest`~~ | ~~`testCustomScanner`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family (confirmed *infinite livelock* on a prior baseline, not just a timeout), not a throughput issue.** |
+| ~~`org.hibernate.orm.test.sql.exec.SmokeTests`~~ | ~~`testQueryConcurrency`~~ | — | **FIXED when run standalone — see below. Was (at least partly) the reflection/GC-corruption family, not purely a throughput issue.** |
+| `org.hibernate.orm.test.type.contributor.LiteralRenderingTest` | `testIdVersionFunctions` | 347729 | Not re-investigated this session. |
 
 (`org.hibernate.orm.test.jpa.lock.LockTest` has a related but distinct
 symptom — `AssertionFailedError: execution exceeded timeout of 5000ms by
@@ -148,6 +148,53 @@ slower host), it could resurface as a *bona fide* timeout — in which case
 it would genuinely belong back in this cluster's throughput bucket. Not
 pursued further this session per the task's explicit scope (throughput is
 a separate, non-blocking concern once correctness is confirmed).
+
+## RESOLVED (2026-07-16, separate session): `ScannerTest`, `JsonArrayUnnestTest`, `DynamicBatchFetchTest` were never throughput/timeout members of this cluster — same GC-corruption family as `UUidV6V7GeneratorTest`/`DefaultCatalogAndSchemaTest`, now FIXED; `SmokeTests` fixed standalone, load-dependent residual open
+
+Follow-up to a baseline-measurement pass on this same host
+(`dev@dcb24161`) that found several of this cluster's classes don't
+actually reproduce as "slow but correct" at all — they crash or livelock
+with the same reflection/GC-corruption signature as
+`DefaultCatalogAndSchemaTest`/`UUidV6V7GeneratorTest` above:
+`ScannerTest#testCustomScanner` was a **confirmed infinite livelock**
+(identical warning repeating forever at the same microsecond timestamp, no
+forward progress); `BatchTest#testBatchInsertUpdate` and
+`JsonArrayUnnestTest#testUnnest` crashed with a `NullPointerException`
+inside JUnit Platform Launcher's `OutcomeDelayingEngineExecutionListener`
+after `gen_heap::get_field: out-of-bounds field read dropped` /
+`Stale pointer detected in invokevirtual receiver` warnings;
+`DynamicBatchFetchTest#testMultiLoad` and `SmokeTests#testQueryConcurrency`
+were suspected same-family but not fully confirmed.
+
+**Verified FIXED this session** against the `dev` tip built from
+`fix/hib-reflection-gc-sweep-20260716` (this session's `generics.rs` GC-safety
+sweep, merged with a concurrent session's `gen_heap.rs` young-object-start-walk
+fix — see
+[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md)'s
+`DefaultCatalogAndSchemaTest` entry for the full root-cause writeup, which
+applies identically here):
+
+| Class | Result | Notes |
+|---|---|---|
+| `ScannerTest` | **PASS** `found=2 started=2 ok=2 failed=0` (ms=264299) | Was a confirmed infinite livelock; now completes cleanly. Tested against this session's `generics.rs` fix alone (pre-merge with the `gen_heap.rs` fix). |
+| `JsonArrayUnnestTest` | **PASS** `found=5 started=5 ok=5 failed=0` (ms=412184) | All 5 tests in the class pass, including `testUnnest`. Tested against the `generics.rs` fix alone. |
+| `DynamicBatchFetchTest` | **PASS** `found=2 started=2 ok=2 failed=0` (ms=783098) | Both tests pass, including `testMultiLoad`. Tested against the `generics.rs` fix alone. |
+| `SmokeTests` | **PASS standalone** `found=17 started=16 ok=16 failed=0 aborted=0 skipped=1` (ms=190461) | All 16 started tests pass (including `testQueryConcurrency`), 1 expected skip. **But**: when run back-to-back with `JsonArrayUnnestTest` + `DynamicBatchFetchTest` in one JVM process (same list, same run), this class crashed at discovery with `AbstractMethodError` and the same broad `Stale pointer detected` cascade (touching `java/util/Optional`, `org/junit/platform/launcher/LauncherSession`, `java/util/List`) as `DefaultCatalogAndSchemaTest` pre-`gen_heap.rs`-fix — this run predates the `gen_heap.rs` merge, so it's very likely also fixed now, but was **not re-verified post-merge** (the shared Hibernate fixture's `target/` build output was wiped by unrelated host activity before a re-run could happen — see the `DefaultCatalogAndSchemaTest` entry in `hib-misc-residuals-20260716.md` for the rebuild command a follow-up session needs). Load-dependent/history-dependent presentation is consistent with this bug family's established "varying victim" hallmark (see `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`). |
+| `BatchTest` | **Not confirmed** | No longer crashes with the original NPE — a 780s solo run showed continuous, correct forward progress (JDBC batch inserts/updates on `DataPoint` rows climbing steadily into the thousands, matching the test's own workload) with **zero** stale-pointer/corruption warnings, but the run did not reach `@@RESULT` within the time available this session (this host was under extreme, highly variable contention throughout — load average observed ranging 10 to 230 across the session). Given no crash and real progress, this class most likely now genuinely belongs to this cluster's original "correct but too slow" throughput bucket rather than the corruption family — but that is inference, not a confirmed pass. Needs a clean re-run with a generous (15+ minute) timeout on a quieter host window. |
+
+Given 3 of these classes (`ScannerTest`, `JsonArrayUnnestTest`,
+`DynamicBatchFetchTest`) are unambiguously fixed and no longer belong in
+this cluster's table at all (removed above), and `SmokeTests` is fixed in
+the common case (standalone) with an unverified-but-likely-fixed
+batch-load residual, this cluster's original "7 classes, one systemic
+throughput cause" framing needs revision: at least 4 of the original 7 were
+never a throughput issue — they were mis-attributed instances of the same
+reflection/GC-corruption family documented in
+`hib-misc-residuals-20260716.md`. Only `InsertOrderingRCATest`,
+`LiteralRenderingTest`, and (pending re-confirmation) `BatchTest` remain
+plausible members of an actual throughput cluster; `SmokeTests`' load-only
+residual is tracked as a fixed-in-isolation, GC-corruption-family
+(not throughput) issue.
 
 ## Related finding (2026-07-16): CriteriaBuilderNonStandardFunctionsTest joins this shape, root cause narrowed to JIT compile-time tax
 

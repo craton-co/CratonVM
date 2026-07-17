@@ -10496,8 +10496,18 @@ pub(crate) fn annotation_element_to_java_typed(
                 ctx.class_id_by_name(class_name)
             });
             if let Some(enum_cid) = enum_cid_opt {
+                // GC-safety (2026-07-16): this is the "enum builder" residual
+                // gap flagged (but never swept) in
+                // docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
+                // — `class_mirror` is held in a Rust local across the
+                // allocating `create_string` call (and the `Enum.valueOf`
+                // invocation itself, which can allocate/classload) before
+                // being used as an invoke argument. Pin it and re-read the
+                // forwarded reference right before use.
                 let class_mirror = ctx.get_class_mirror(enum_cid);
+                let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let name_str = ctx.create_string(const_name);
+                let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
                 let invoke_res = ctx.invoke(
                     "java/lang/Enum",
                     "valueOf",
@@ -10507,6 +10517,7 @@ pub(crate) fn annotation_element_to_java_typed(
                         Value::Object(Some(name_str)),
                     ],
                 );
+                ctx.unpin_native_roots(class_mirror_pin);
                 if iae_trace {
                     eprintln!(
                         "ANN-ENUM class={class_name} const={const_name} ok={}",
@@ -12032,12 +12043,22 @@ pub(crate) fn native_class_get_type_parameters(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
+    // GC-safety (2026-07-16): `arr` is freshly-allocated and not yet
+    // reachable from any Java-visible root; each `type_param_to_java` call
+    // allocates a TypeVariable (+ bounds array + name string) and can
+    // trigger a GC that relocates `arr` mid-loop. Pin it across the fill
+    // loop and re-read the forwarded reference before every store, matching
+    // the `build_mirror_array` contract.
+    let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
         // genericDeclaration = the declaring Class mirror (`this`).
         let tv = crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+        arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }
+    arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12230,10 +12251,19 @@ pub(crate) fn native_class_get_generic_interfaces(
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
             if !class_sig.interfaces.is_empty() {
+                // GC-safety (2026-07-16): both `class_mirror` (re-consulted
+                // every iteration via `GenericDeclScope`) and `arr` (filled
+                // by the allocating `typesig_to_real_type` per interface)
+                // are held in Rust locals across allocating calls without
+                // being GC roots. Pin both and re-read the forwarded
+                // reference before each use, matching `build_mirror_array`.
                 let class_mirror = ctx.get_class_mirror(class_id);
+                let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let raw_interfaces = ctx.class_interfaces(class_id);
-                let arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
+                let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.interfaces.len());
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, iface) in class_sig.interfaces.iter().enumerate() {
+                    let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
                     // Type-variable uses in an interface type refer to THIS
                     // class's type parameters.
                     let _gscope =
@@ -12254,8 +12284,11 @@ pub(crate) fn native_class_get_generic_interfaces(
                     } else {
                         val
                     };
+                    arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, val);
                 }
+                arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(class_mirror_pin);
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -12327,20 +12360,31 @@ pub(crate) fn native_method_get_generic_param_types(
             // Declaration scope for type-variable uses: a generic method's own
             // type parameters (`<T> ... toArray(T[])`) declare to the METHOD;
             // otherwise the uses (`Iterator<E>`) refer to the declaring CLASS.
-            let decl = if method_sig.type_params.is_empty() {
-                Value::Object(Some(ctx.get_class_mirror(class_id)))
+            // GC-safety (2026-07-16): `decl_obj` (when it's a freshly
+            // fetched class mirror) and `arr` are both held across the
+            // allocating `typesig_to_real_type` calls in this loop without
+            // being GC roots. Pin both and re-read the forwarded reference
+            // before each use, matching `build_mirror_array`.
+            let decl_obj = if method_sig.type_params.is_empty() {
+                ctx.get_class_mirror(class_id)
             } else {
-                Value::Object(Some(this))
+                this
             };
-            let arr = ctx.new_ref_array(ClassId::new(0), method_sig.param_types.len());
+            let decl_pin = ctx.pin_native_root(decl_obj);
+            let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.param_types.len());
+            let arr_pin = ctx.pin_native_root(arr);
             for (i, pt) in method_sig.param_types.iter().enumerate() {
-                let _gscope = crate::generics::GenericDeclScope::new(decl);
+                let decl_obj = ctx.read_native_pin(decl_pin, decl_obj);
+                let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(decl_obj)));
                 // SB-02b-#3: real ParameterizedTypeImpl for parameterized parameter
                 // types (the firing path for synthetic Method objects; real Method
                 // objects already run the JDK reifier bytecode).
                 let val = crate::generics::typesig_to_real_type(ctx, pt);
+                arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, val);
             }
+            arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.unpin_native_roots(decl_pin);
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -12449,13 +12493,19 @@ pub(crate) fn native_method_get_type_parameters(
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &method_desc) {
         if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
             if !method_sig.type_params.is_empty() {
-                let arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
+                // GC-safety (2026-07-16): same unrooted-`arr`-across-
+                // allocating-fill pattern as `native_class_get_type_parameters`.
+                let mut arr = ctx.new_ref_array(ClassId::new(0), method_sig.type_params.len());
+                let arr_pin = ctx.pin_native_root(arr);
                 for (i, tp) in method_sig.type_params.iter().enumerate() {
                     // genericDeclaration = the declaring Method/Constructor (`this`).
                     let tv =
                         crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+                    arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, tv);
                 }
+                arr = ctx.read_native_pin(arr_pin, arr);
+                ctx.unpin_native_roots(arr_pin);
                 ctx.register_var_handle_root(arr);
                 let ident = ctx.identity_hash_code(arr);
                 method_type_params_cache()
