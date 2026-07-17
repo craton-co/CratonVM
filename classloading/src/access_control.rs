@@ -30,6 +30,12 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
         return Ok(());
     }
 
+    if std::env::var("CRATONVM_DBG_ACCESS").is_ok() {
+        eprintln!(
+            "[ACCESS-DBG] DENY accessor={} accessor.loader_id={:?} target={} target.loader_id={:?}",
+            accessor.name, accessor.loader_id, target.name, target.loader_id
+        );
+    }
     Err(LinkageError::IllegalAccessError {
         message: format!(
             "class {} cannot access class {} (not public, different package)",
