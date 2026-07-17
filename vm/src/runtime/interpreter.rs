@@ -3031,6 +3031,36 @@ pub(crate) fn apply_pointer_map_to_thread(
             }
         }
     }
+    // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
+    // catches a frame slot left stale right after a safepoint-arrival remap.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Step 5 GAP B (precise-JIT remap, non-initiator half). The GC initiator's
     // `update_all_roots` (memory/gc.rs:73) remaps this collection's precise JIT
     // oop-map slots via `remap_active_jit_frames`, but a thread that was PARKED at

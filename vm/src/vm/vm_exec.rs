@@ -1945,6 +1945,51 @@ impl<'a> NativeContextImpl<'a> {
             let trace = crate::runtime::stackwalker::capture_frames_no_lines(&self.thread.frames);
             *self.thread.frame_trace.lock() = trace;
         }
+        // DIAGNOSTIC-ONLY (cceres3): catch a frame slot that is ALREADY stale
+        // at block entry — the deposited snapshot then can never chain it
+        // (`fold_pointer_map_into_blocked` seeds only from snapshot
+        // addresses), so the wake-time fixup misses it forever. Needs both
+        // CRATONVM_DBG_BLOCKGC and the CRATONVM_DBG_STALE_OBJREF ring.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            let mut stale_n = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+            }
+            let pending = self.thread.gc_block_state.fixup.lock().len();
+            if stale_n > 0 || pending > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} raise={} frames={} fixup_pending={} stale={}",
+                    self.thread.thread_id.0,
+                    raise_blocked_flag,
+                    self.thread.frames.len(),
+                    pending,
+                    stale_n,
+                );
+            }
+        }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
@@ -2117,6 +2162,42 @@ impl<'a> NativeContextImpl<'a> {
         // cleared atomically above; transiently re-raising it here would
         // re-open the excluded-while-running census window.
         self.deposit_root_snapshot_no_flag();
+        // DIAGNOSTIC-ONLY (cceres3): verify no frame slot is left stale after
+        // the wake-time fixup application — catches both "chain key missing"
+        // (was_key=false) and "frame held an intermediate address" desyncs at
+        // the exact wake where they surface.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.

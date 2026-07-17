@@ -1912,6 +1912,25 @@ impl GenerationalHeap {
     /// "suspected false roots" whose computed extent runs off the end of the
     /// from-space arena, so the worst case is over-retention rather than a
     /// deref of garbage.
+    /// DIAGNOSTIC-ONLY (cceres3): see `VmHeap::debug_forwarded_target`.
+    pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
+        if !crate::stale_objref_debug::enabled() || addr % 8 != 0 {
+            return None;
+        }
+        self.is_heap_addr(addr)?;
+        // SAFETY: `is_heap_addr` confirmed containment in a mapped arena; the
+        // quarantine ring keeps evacuated from-space readable while the
+        // canary flag is on.
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        if header.is_forwarded() {
+            let fwd = header.forwarding_address() as usize;
+            if fwd != 0 {
+                return Some(fwd);
+            }
+        }
+        None
+    }
+
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;
