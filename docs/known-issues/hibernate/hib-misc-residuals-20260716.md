@@ -635,3 +635,82 @@ worth a dedicated follow-up starting from `Timezones.toTimeZone`/
 `ZONE_UTC_MINUS_8` and whichever `java.time`/H2 conversion path handles
 fixed-offset (non-region) zones differently from `LocalDateTimeTest`'s
 zone-less values.
+
+## Update 2026-07-17 (follow-up session): `ZoneId.systemDefault()` host-timezone-leak FIXED — 63→20/608, new narrower residual identified
+
+**Root cause found and fixed.** The 63 failures noted above were **not**
+"specific to `UTC-8`" or a general "zone-offset handling"/H2-conversion
+bug as speculated — they were a single, systemic native bug:
+`java.time.ZoneId.systemDefault()`, in CratonVM's real-JDK-mode boot path,
+was permanently intercepted to return a hardcoded synthetic UTC
+`ZoneOffset` (`native-builtins/src/lib.rs::register_essential_natives`,
+originally landed to fix an unrelated log4j boot-time NPE), **completely
+ignoring every `TimeZone.setDefault(...)` call the running program made**.
+`Timezones.withDefaultTimeZone()` (used by every `@Test` method in this
+class and `LocalDateTimeTest`) calls `TimeZone.setDefault(...)` then the
+test's own expected-value computation reads it back via
+`ZoneId.systemDefault()` directly — which always resolved to UTC
+regardless of what was set, producing an N-hour skew matching whichever
+zone the parameterized test happened to configure (`UTC-8`, `Europe/Paris`,
+`Pacific/Auckland` — not just `UTC-8`; the original doc's framing that it
+was "specific to `UTC-8`" was based on an incomplete sample of the 63
+failures' `@@FAIL` lines, which don't carry parameter values — a
+`DisplayNameRunner` JUnit5 launcher variant, capturing the live
+`TestPlan`'s `TestIdentifier` display names on `executionFinished`, was
+needed to see the actual per-parameter breakdown).
+
+Full root-cause + fix writeup:
+[hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md](../../internal/fixed-suite-bugs/hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md).
+Fix commit: `81c66806` (branch `fix/hib-zoneddatetime-offset-skew-20260716`,
+merged to `dev`).
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=384
+failed=20 aborted=204 skipped=0` — stable across 4 independent solo
+reruns (pre- and post-merge onto `dev`), down from `failed=63`.
+`LocalDateTimeTest` (`found=162 ok=90 failed=0 aborted=72`) and
+`InstantTests` (`found=204 ok=112 failed=0 aborted=92`): no regression.
+
+**New residual — OPEN, distinct bug, not fixed by the above:** the
+remaining 20/608 failures are **100% isolated** to one narrow parameter
+cluster: `env=Europe/Paris` combined with dates at the 1904-12-31/1905-01-01
+boundary (the test's own data comments call this out: "Also test dates
+around 1905-01-01, because the code behaves differently before and after
+1905"). Real pre-1911 `Europe/Paris` used Local Mean Time, UTC+00:09:21
+(9 minutes 21 seconds), not a flat-hour offset — real HotSpot's tzdb
+correctly applies this historical fractional offset; CratonVM instead
+produces a rounded flat-hour value:
+
+```
+expected: <1905-01-01T01:09:20+00:09:21[Europe/Paris]> but was: <1905-01-01T00:18:41+00:09:21[Europe/Paris]>
+expected: <1905-01-01 01:09:21.0> but was: <1905-01-01 02:00:00.0>
+```
+
+Notably the `+00:09:21` offset **is** present and correct in the
+`ZonedDateTime` zone/offset portion itself (confirming `ZoneId.of("Europe/Paris")`
+and the general zone-rules machinery, and this session's
+`ZoneId.systemDefault()` fix, correctly resolve the *zone identity* even
+for this historical case) — the bug is narrower, in the actual
+instant/local-time arithmetic applied for dates before the 1911
+standardization. This is the exact same underlying date range flagged as
+producing an unexplained `InternalError: CloneNotSupportedException` in
+this doc's original (pre-livelock-fix) investigation: with the
+`ZoneId.systemDefault()` fix now letting the class run far enough to
+reach these parameters reliably, that exception reproduces intermittently
+(1 of 4 reruns hit it on 4 of the 20 failing methods; the other 3 reruns
+produced plain `AssertionFailedError`/`AssertionError` for the exact same
+parameters instead) — timing/GC-dependent, consistent with a
+stale-object or clone-support gap rather than a deterministic value bug,
+though the flat-hour-rounding `AssertionFailedError` shape is the
+dominant/majority presentation. Not investigated further this session
+(distinct subsystem — historical tzdb rule precision / possible
+`Object.clone()` gap for a real JDK date class — from the
+`ZoneId.systemDefault()` fix above). **Next step for a follow-up
+session:** reproduce a bare (non-Hibernate) `ZonedDateTime.of(1905, 1, 1,
+0, 0, 0, 0, ZoneId.of("Europe/Paris")).withZoneSameInstant(ZoneId.of("Europe/Paris"))`-style
+micro-repro to confirm whether the `+00:09:21` LMT rule is applied
+correctly by bare `java.time` arithmetic outside Hibernate (narrowing
+core `java.time`/tzdb vs. Hibernate/JDBC layer, per this doc's original
+investigation template), then chase the intermittent
+`CloneNotSupportedException` with `CRATONVM_DBG_STALE_OBJREF`/a targeted
+`Object.clone()` native-support audit if the micro-repro confirms a
+CratonVM-side (not test-data) defect.
