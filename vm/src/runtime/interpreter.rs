@@ -33623,7 +33623,6 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
-        let declaring_class_id = entry.declaring_class_id;
         let is_native = entry.is_native;
         // Lock-order fix: drop the `vtable_manager` read guard BEFORE
         // taking `class_manager` below. `vtable_install_adapter` (called
@@ -33641,16 +33640,27 @@ fn execute_invokevirtual_vtable_fast(
         // invariant that the vtable must be queryable WITHOUT holding
         // class_manager - this restores it.
         drop(guard);
-        let declaring_name = shared
-            .class_manager
-            .read()
-            .get_class(cratonvm_types::ClassId::new(declaring_class_id as u32))
-            .map(|c| c.name.to_string())
-            .unwrap_or_else(|| cached.class_name.to_string());
-        if force_native_over_real_jdk_bytecode(&declaring_name, &method_name, &method_descriptor)
+        // `CachedBytecodeMethod` retains the resolved declaring method, so
+        // memoize this pure, 55-branch decision on that shared entry instead
+        // of reopening `class_manager` and re-evaluating it for every vtable
+        // hit. The native-registry probe remains live: registrations can
+        // differ between VM configurations, while the cache only avoids the
+        // deterministic name/descriptor classification work.
+        let force_native = *cached.force_native_cache.get_or_init(|| {
+            force_native_over_real_jdk_bytecode(
+                cached.class_name.as_ref(),
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+            )
+        });
+        if force_native
             && shared
                 .native_methods
-                .find(&declaring_name, &method_name, &method_descriptor)
+                .find(
+                    cached.class_name.as_ref(),
+                    cached.method_name.as_ref(),
+                    cached.method_descriptor.as_ref(),
+                )
                 .is_some()
         {
             return Ok(CachedCallResult::CacheMiss);

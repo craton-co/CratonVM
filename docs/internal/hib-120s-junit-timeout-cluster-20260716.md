@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | MOSTLY CLOSED (2026-07-17). 4 of 7 original classes were a mis-attributed reflection/GC-corruption bug, now fixed (see below). `LiteralRenderingTest` is effectively resolved (now ~1.6x HotSpot). `InsertOrderingRCATest` remains a confirmed generic architectural gap, now **~8.0x HotSpot** (re-measured post-`f377eb69`, down from ~9.7x — see the 2026-07-17 re-check update below) -- not independently fixable without broader interpreter/JIT throughput work; not a discrete bug. `BatchTest` is CONFIRMED FIXED and, on re-check, ~32% faster post-`f377eb69` (avg 104.3s vs the prior 153.9s reading) — see below. |
+| **Status** | **FIXED (2026-07-17).** All original timeout-cluster classes and the linked lock residual pass in one real-JDK combined-run acceptance test at current `dev`; see the final-resolution section. |
 | **Area** | Suspected: JIT/interpreter throughput, GC pause behavior, or native-call dispatch overhead under real-JDK+JIT-on mode. |
 | **Severity** | Medium — no crashes or wrong results, but a real perf/timing gap wide enough to blow through Hibernate's own generous internal timeouts. |
 
@@ -505,3 +505,38 @@ FIXED, now with a fresher and faster measurement.
 No doc-only environment issues this session -- `~/jdk25` symlink and the
 `/data/hibsrc-baseline-20260716` / `/data/hib-baseline-runner-20260716`
 fixtures were healthy and required no repair.
+
+## Final resolution (2026-07-17)
+
+**Status: FIXED.** A focused interpreter optimization removed a redundant
+class-manager lookup and repeated force-native dispatch classification from
+the vtable virtual-invoke fast path. The resolved method already owns an
+`Arc`-shared `OnceLock` for that deterministic decision, so the fast path now
+uses it while retaining the live native-registration and redefine guards.
+
+Fresh release binary:
+`/data/data/cratonvm-binaries/cratonvm-hib120s-vtablecache-20260717`
+(SHA-256 `94f1565b359c607f58fc90310d365e88dcd35ab8828576151ad5a7e5ca33aa87`),
+built from `dev@24e10084` plus this fix. Three focused
+`InsertOrderingRCATest` runs passed 1/1 in 64117ms, 65174ms, and 59202ms.
+
+The final real-JDK combined acceptance run used the normal `CratonRunner`
+harness and executed the complete original cluster plus the linked
+`LockTest` residual in one VM process. Every class completed cleanly:
+
+| Class | Result |
+|---|---|
+| `BatchTest` | 4/4 passed (126048ms) |
+| `DynamicBatchFetchTest` | 2/2 passed (98430ms) |
+| `JsonArrayUnnestTest` | 5/5 passed (201360ms) |
+| `UUidV6V7GeneratorTest` | 2/2 passed (135622ms) |
+| `InsertOrderingRCATest` | 1/1 passed (66486ms) |
+| `ScannerTest` | 2/2 passed (27928ms) |
+| `SmokeTests` | 16/16 started tests passed; 1 expected skip (161132ms) |
+| `LiteralRenderingTest` | 37/37 passed (10908ms) |
+| `LockTest` | 15/15 started tests passed; 8 expected skips (7065ms) |
+
+There were zero `TimeoutException`, stale-pointer, `AbstractMethodError`, or
+unexpected test-failure records. The historical cross-VM throughput ratio for
+the code-diverse insert-ordering workload remains an architectural benchmark
+topic, but it is no longer an open Hibernate timeout or correctness issue.
