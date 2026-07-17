@@ -36243,10 +36243,45 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    let skip_file_callbacks = ctx
-        .class_name_of_id(ctx.class_id_of_object(visitor))
+    let visitor_class_id = ctx.class_id_of_object(visitor);
+    let visitor_class_name = ctx.class_name_of_id(visitor_class_id);
+    let skip_file_callbacks = visitor_class_name
+        .as_deref()
         .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
-    p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
+    if std::env::var_os("CRATONVM_DBG_VISITFILE").is_some() {
+        eprintln!(
+            "[p98-walkfiletree] visitor_class_id={:?} visitor_class_name={:?} skip_file_callbacks={}",
+            visitor_class_id, visitor_class_name, skip_file_callbacks
+        );
+    }
+
+    // GC-safety: the walk below drives a re-entrant, potentially deep and
+    // long-running sequence of Java callbacks (preVisitDirectory/visitFile/
+    // postVisitDirectory) for every directory and file under `root`. Any of
+    // those calls can allocate and trigger GC (directly, or transitively --
+    // e.g. `PathFileObject.forJarPath` inside a compiler's own visitor).
+    // `visitor` is a single Rust-local `ObjectRef` that stays alive across
+    // the ENTIRE recursive walk; under a moving collector a mid-walk
+    // relocation leaves a bare local like this stale, and `invoke_virtual`'s
+    // own `load_and_forward` cannot repair it once the old slot has been
+    // reused for an unrelated (often array) allocation -- silently
+    // redirecting dispatch to `java.lang.Object` and raising a spurious
+    // `NoSuchMethodError` on the visitor's real method. Confirmed live: a
+    // very large in-memory javac classpath walk (`BeanRegistrationsAot-
+    // ContributionTests`, `JavacFileManager$ArchiveContainer.list`'s own
+    // `SimpleFileVisitor`) reproduced exactly this signature --
+    // `NoSuchMethodError: java/lang/Object.visitFile(...)`.
+    //
+    // Pin `visitor` and the root `path_obj` (used at both ends of the walk)
+    // for the whole traversal via `p98_pin`/`p98_read_pin` (see their doc
+    // comment below) and unpin the complete batch -- every pin taken
+    // anywhere during the walk, since `visitor_pin` is the first one pushed
+    // -- once it returns.
+    let visitor_pin = p98_pin(ctx, visitor);
+    let path_pin = p98_pin(ctx, path_obj);
+    let result = p98_walk_dir(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks);
+    ctx.unpin_native_roots(visitor_pin.0);
+    result?;
     Ok(Some(path_val))
 }
 
@@ -36289,6 +36324,24 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// A native-pinned GC root plus its original (possibly later stale) value,
+/// kept as the fallback `read_native_pin` returns for `NativeContext`
+/// implementations that don't support pinning (e.g. test mocks -- see
+/// [`NativeContext::pin_native_root`]'s doc comment). Create one with
+/// `p98_pin` right after allocating/receiving the object and resolve the
+/// current, GC-forwarded reference with `p98_read_pin` immediately before
+/// each re-entrant use -- never hold the raw `ObjectRef` itself across a
+/// call that can allocate.
+type P98Pin = (usize, ObjectRef);
+
+fn p98_pin(ctx: &mut dyn NativeContext, obj: ObjectRef) -> P98Pin {
+    (ctx.pin_native_root(obj), obj)
+}
+
+fn p98_read_pin(ctx: &dyn NativeContext, pin: P98Pin) -> ObjectRef {
+    ctx.read_native_pin(pin.0, pin.1)
+}
+
 /// Build a concrete platform `BasicFileAttributes` implementation for a
 /// `Files.walkFileTree` visitor callback. The named-field bridge makes the
 /// representation independent from the platform class's physical field order.
@@ -36305,19 +36358,21 @@ fn p98_alloc_basic_file_attributes(
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
-    visitor: ObjectRef,
-    dir_path_obj: ObjectRef,
+    visitor_pin: P98Pin,
+    dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let pre = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "preVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(Some(attrs)),
     )?;
     if let Some(r) = pre {
@@ -36337,10 +36392,12 @@ fn p98_walk_dir(
         for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
             let es = jarfs_encode(&jar, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36349,13 +36406,15 @@ fn p98_walk_dir(
                     false,
                     jarfs_entry_size(&jar, &child).unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36370,10 +36429,12 @@ fn p98_walk_dir(
         for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
             let es = jrtfs_encode(&java_home, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36382,13 +36443,15 @@ fn p98_walk_dir(
                     false,
                     jrtfs_entry_size(&java_home, &child).unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36403,10 +36466,12 @@ fn p98_walk_dir(
             let ep = entry.path();
             let es = ep.to_string_lossy().to_string();
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36418,13 +36483,15 @@ fn p98_walk_dir(
                         .map(|metadata| metadata.len() as i64)
                         .unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36435,13 +36502,15 @@ fn p98_walk_dir(
             }
         }
     }
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let post = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "postVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(None),
     )?;
     if let Some(r) = post {

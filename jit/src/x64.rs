@@ -13856,13 +13856,30 @@ impl Compiler {
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
         // — no helper call, no per-alloc layout lookup. `class_layout` here runs
         // once at JIT-compile time, not per allocation.
-        let compact_body: Option<usize> = if cratonvm_types::compact_ref_fields_enabled() {
-            cratonvm_types::class_layout(class_id_raw)
-                .filter(|l| l.field_count() == num_fields)
-                .map(|l| l.body_size as usize)
-        } else {
-            None
-        };
+        // GROOVY-CLUSTER-20260717: class_layout(class_id_raw) is snapshotted
+        // ONCE here at JIT-compile time and its body_size/offsets get baked
+        // as immediate constants into the machine code below (bump-allocation
+        // size, array_length header write). Unlike the interpreter
+        // (vm/src/vm/vm_exec.rs) and the GC scan (gc/src/gen_heap.rs,
+        // gc/src/heap.rs), which both validate their own cached layout
+        // against layout_generation() before trusting it, this compile-time
+        // snapshot has no such check. When a class's registered compact
+        // layout is later replaced -- class_manager.rs's
+        // recompute_subclass_layouts / register_compact_layout_if_enabled,
+        // exercised whenever a synthetic-stub class gets upgraded to real
+        // bytecode with a different field count (the exact shape of ANTLR/
+        // Groovy-generated parser classes) -- any already-JIT-compiled new
+        // site keeps allocating objects at the OLD, now-wrong size while
+        // field-access code (correctly, dynamically, per-object) uses the
+        // CURRENT layout, corrupting the heap (confirmed via bisect +
+        // core-dump: SIGSEGV in JIT-generated code, RAX holding a garbage
+        // sign-extended int value used as a pointer). Disabling the fast
+        // inline-compact path here (falling back to the always-correct
+        // legacy-sized bump allocation, still avoiding the helper call) is
+        // the minimal safe fix; a full fix would thread layout_generation()
+        // through the JIT's compact-object fast paths the same way the
+        // interpreter/GC already do. See known-issues doc for detail.
+        let compact_body: Option<usize> = None;
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)

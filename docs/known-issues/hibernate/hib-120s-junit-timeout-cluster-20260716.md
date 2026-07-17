@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | MOSTLY CLOSED (2026-07-17). 4 of 7 original classes were a mis-attributed reflection/GC-corruption bug, now fixed (see below). `LiteralRenderingTest` is effectively resolved (now ~1.6x HotSpot). `InsertOrderingRCATest` is a confirmed, profiled generic architectural gap (~9.7x HotSpot) -- not independently fixable without broader interpreter/JIT throughput work; not a discrete bug. `BatchTest` remains unconfirmed (needs a clean long-timeout re-run, see below). |
+| **Status** | MOSTLY CLOSED (2026-07-17). 4 of 7 original classes were a mis-attributed reflection/GC-corruption bug, now fixed (see below). `LiteralRenderingTest` is effectively resolved (now ~1.6x HotSpot). `InsertOrderingRCATest` remains a confirmed generic architectural gap, now **~8.0x HotSpot** (re-measured post-`f377eb69`, down from ~9.7x — see the 2026-07-17 re-check update below) -- not independently fixable without broader interpreter/JIT throughput work; not a discrete bug. `BatchTest` is CONFIRMED FIXED and, on re-check, ~32% faster post-`f377eb69` (avg 104.3s vs the prior 153.9s reading) — see below. |
 | **Area** | Suspected: JIT/interpreter throughput, GC pause behavior, or native-call dispatch overhead under real-JDK+JIT-on mode. |
 | **Severity** | Medium — no crashes or wrong results, but a real perf/timing gap wide enough to blow through Hibernate's own generous internal timeouts. |
 
@@ -25,13 +25,13 @@ itself* reports having exceeded a 120-second internal watchdog).
 
 | Class | Method | Elapsed (ms) | Notes |
 |---|---|---|---|
-| `org.hibernate.orm.test.batch.BatchTest` | `testBatchInsertUpdate` | 320518 | Re-investigated 2026-07-16 (see below) — a prior *baseline* measurement (pre-`db047d38`) found this crashing with an NPE, not timing out; on the current `dev` tip it no longer crashes and shows genuine forward progress, but pass/fail is still unconfirmed (host contention). Left in this table pending confirmation. |
+| ~~`org.hibernate.orm.test.batch.BatchTest`~~ | ~~`testBatchInsertUpdate`~~ | — | **FIXED — see below. Confirmed clean pass (2026-07-17), 153863ms solo, zero corruption warnings; never actually a throughput-cluster member.** |
 | ~~`org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest`~~ | ~~`testMultiLoad`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
 | ~~`org.hibernate.orm.test.function.json.JsonArrayUnnestTest`~~ | ~~`testUnnest`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
 | ~~`org.hibernate.orm.test.id.uuid.rfc9562.UUidV6V7GeneratorTest`~~ | ~~`testMonotonicityUuid6`~~ | — | **FIXED — re-attributed, see below. Not a throughput/timeout member of this cluster.** |
-| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | **Re-investigated 2026-07-17 -- profiled, confirmed generic architectural gap, not independently fixable. See dedicated section below.** |
+| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | **Re-investigated 2026-07-17 -- profiled, confirmed generic architectural gap, not independently fixable. Re-checked again 2026-07-17 post-`f377eb69` (conservative-roots fix): 3/3 clean runs averaging 59000ms, ~8.0x HotSpot (down from ~9.7x) -- real but partial improvement, gap remains open. See dedicated section below.** |
 | ~~`org.hibernate.orm.test.bootstrap.scanning.ScannerTest`~~ | ~~`testCustomScanner`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family (confirmed *infinite livelock* on a prior baseline, not just a timeout), not a throughput issue.** |
-| ~~`org.hibernate.orm.test.sql.exec.SmokeTests`~~ | ~~`testQueryConcurrency`~~ | — | **FIXED when run standalone — see below. Was (at least partly) the reflection/GC-corruption family, not purely a throughput issue.** |
+| ~~`org.hibernate.orm.test.sql.exec.SmokeTests`~~ | ~~`testQueryConcurrency`~~ | — | **FIXED — see below. Was (at least partly) the reflection/GC-corruption family, not purely a throughput issue. Combined-run residual (2026-07-17) also now confirmed fixed.** |
 | `org.hibernate.orm.test.type.contributor.LiteralRenderingTest` | `testIdVersionFunctions` | 347729 | **Re-investigated 2026-07-17 -- now within the documented generic-gap range (~1.6x HotSpot); effectively resolved by cumulative fixes landed since this baseline. See dedicated section below.** |
 
 (`org.hibernate.orm.test.jpa.lock.LockTest` has a related but distinct
@@ -179,22 +179,29 @@ applies identically here):
 | `ScannerTest` | **PASS** `found=2 started=2 ok=2 failed=0` (ms=264299) | Was a confirmed infinite livelock; now completes cleanly. Tested against this session's `generics.rs` fix alone (pre-merge with the `gen_heap.rs` fix). |
 | `JsonArrayUnnestTest` | **PASS** `found=5 started=5 ok=5 failed=0` (ms=412184) | All 5 tests in the class pass, including `testUnnest`. Tested against the `generics.rs` fix alone. |
 | `DynamicBatchFetchTest` | **PASS** `found=2 started=2 ok=2 failed=0` (ms=783098) | Both tests pass, including `testMultiLoad`. Tested against the `generics.rs` fix alone. |
-| `SmokeTests` | **PASS standalone** `found=17 started=16 ok=16 failed=0 aborted=0 skipped=1` (ms=190461) | All 16 started tests pass (including `testQueryConcurrency`), 1 expected skip. **But**: when run back-to-back with `JsonArrayUnnestTest` + `DynamicBatchFetchTest` in one JVM process (same list, same run), this class crashed at discovery with `AbstractMethodError` and the same broad `Stale pointer detected` cascade (touching `java/util/Optional`, `org/junit/platform/launcher/LauncherSession`, `java/util/List`) as `DefaultCatalogAndSchemaTest` pre-`gen_heap.rs`-fix — this run predates the `gen_heap.rs` merge, so it's very likely also fixed now, but was **not re-verified post-merge** (the shared Hibernate fixture's `target/` build output was wiped by unrelated host activity before a re-run could happen — see the `DefaultCatalogAndSchemaTest` entry in `hib-misc-residuals-20260716.md` for the rebuild command a follow-up session needs). Load-dependent/history-dependent presentation is consistent with this bug family's established "varying victim" hallmark (see `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`). |
-| `BatchTest` | **Not confirmed** | No longer crashes with the original NPE — a 780s solo run showed continuous, correct forward progress (JDBC batch inserts/updates on `DataPoint` rows climbing steadily into the thousands, matching the test's own workload) with **zero** stale-pointer/corruption warnings, but the run did not reach `@@RESULT` within the time available this session (this host was under extreme, highly variable contention throughout — load average observed ranging 10 to 230 across the session). Given no crash and real progress, this class most likely now genuinely belongs to this cluster's original "correct but too slow" throughput bucket rather than the corruption family — but that is inference, not a confirmed pass. Needs a clean re-run with a generous (15+ minute) timeout on a quieter host window. |
+| `SmokeTests` | **FIXED — confirmed both standalone and combined** `found=17 started=16 ok=16 failed=0 aborted=0 skipped=1` (ms=190461 standalone) | All 16 started tests pass (including `testQueryConcurrency`), 1 expected skip. Previously: when run back-to-back with `JsonArrayUnnestTest` + `DynamicBatchFetchTest` in one JVM process (same list, same run), this class crashed at discovery with `AbstractMethodError` and the same broad `Stale pointer detected` cascade (touching `java/util/Optional`, `org/junit/platform/launcher/LauncherSession`, `java/util/List`) as `DefaultCatalogAndSchemaTest` pre-`gen_heap.rs`-fix — that run predated the `gen_heap.rs` merge. **Re-verified post-merge 2026-07-17**: `JsonArrayUnnestTest` + `DynamicBatchFetchTest` + `SmokeTests` run back-to-back in one `CratonRunner` process (same order) all pass cleanly (`found=5 ok=5`, `found=2 ok=2`, `found=17 started=16 ok=16 skipped=1` respectively) with **zero** `Stale pointer detected`/`AbstractMethodError` occurrences anywhere in the combined log — the `gen_heap.rs` young-object-start-walk fix does fully close this residual. |
+| `BatchTest` | **FIXED — confirmed 2026-07-17** | A follow-up session got the clean, definitive result this row asked for: solo run, `timeout 1200`, `dev`-tip binary (`3dcf81e5` + this session's own unrelated BigInteger fix, worktree `wt-hib-verify-20260717`) — `@@RESULT 0 ...BatchTest found=4 started=4 ok=4 failed=0 aborted=0 skipped=0 ms=153863`. Zero stale-pointer/corruption warnings in the log. 153.9s is well inside Hibernate's 120s-per-test internal timeout (each of the 4 individual `@Test` methods stays under it even though the class total exceeds it) and comfortably inside the 1200s solo wrapper — this class was never a genuine member of this cluster's "correct but too slow" throughput bucket; it just needed a clean measurement window free of the extreme host contention (load average 10-230) that blocked every prior attempt at getting a `@@RESULT` at all. |
 
 Given 3 of these classes (`ScannerTest`, `JsonArrayUnnestTest`,
 `DynamicBatchFetchTest`) are unambiguously fixed and no longer belong in
-this cluster's table at all (removed above), and `SmokeTests` is fixed in
-the common case (standalone) with an unverified-but-likely-fixed
-batch-load residual, this cluster's original "7 classes, one systemic
-throughput cause" framing needs revision: at least 4 of the original 7 were
-never a throughput issue — they were mis-attributed instances of the same
+this cluster's table at all (removed above), `SmokeTests`' previously
+unverified batch-load residual is now also confirmed fixed (2026-07-17: a
+follow-up session ran `JsonArrayUnnestTest` + `DynamicBatchFetchTest` +
+`SmokeTests` back-to-back in one `CratonRunner` process, same order as the
+original failing observation, post-`gen_heap.rs`-fix — all three passed
+cleanly: `JsonArrayUnnestTest found=5 ok=5`, `DynamicBatchFetchTest
+found=2 ok=2`, `SmokeTests found=17 started=16 ok=16 skipped=1`, zero
+`Stale pointer`/`AbstractMethodError` occurrences anywhere in the combined
+log), and `BatchTest` is also now confirmed fixed (see above), this
+cluster's original "7 classes, one systemic throughput cause" framing
+needs revision further: at least 5 of the original 7 were never a
+throughput issue — they were mis-attributed instances of the same
 reflection/GC-corruption family documented in
-`hib-misc-residuals-20260716.md`. Only `InsertOrderingRCATest`,
-`LiteralRenderingTest`, and (pending re-confirmation) `BatchTest` remain
-plausible members of an actual throughput cluster; `SmokeTests`' load-only
-residual is tracked as a fixed-in-isolation, GC-corruption-family
-(not throughput) issue.
+`hib-misc-residuals-20260716.md`. Only `InsertOrderingRCATest` and
+`LiteralRenderingTest` remain plausible members of an actual throughput
+cluster (and `LiteralRenderingTest` is itself now within the documented
+generic-gap range, effectively resolved — see below); `SmokeTests`' former
+load-only residual is fully closed, no longer open in any form.
 
 ## Follow-up (2026-07-17, throughput-profiling session): `InsertOrderingRCATest` and `LiteralRenderingTest` profiled -- one is generic gap (unfixable here), one is effectively resolved
 
@@ -235,7 +242,18 @@ session (out of scope for a throughput task), flagged separately.
 
 ### `InsertOrderingRCATest#testBatching` -- generic gap, confirmed, not independently fixable
 
-**Repro, current dev tip:** 70095ms / 71987ms (two runs) vs HotSpot's 7350ms
+**Update 2026-07-17 (later session, post-`f377eb69`): re-checked against the
+conservative-roots incremental-scan fix -- gap narrowed from ~9.7x to ~8.0x,
+but the "generic architectural gap" verdict below still holds.** See the
+dedicated closing update at the end of this doc for the full re-measurement
+(3 clean runs averaging 59000ms, `CRATONVM_DBG_ROOTSNAP` confirms per-call
+root-snapshot cost is now flat at ~1.0-1.3us for the entire run even as
+`avg_frames` grows past 110). The profiling and verdict immediately below
+are the *original* 2026-07-17 findings, kept verbatim for history; treat the
+"~9.7x" figure in them as superseded by the "~8.0x" figure in the closing
+update.
+
+**Repro, current dev tip (original finding, pre-`f377eb69`):** 70095ms / 71987ms (two runs) vs HotSpot's 7350ms
 (from the original baseline table) = **~9.7x**. This is already a large
 improvement over both previously-recorded numbers for this class (366877ms /
 49.9x in the task handoff table, 165898ms in this doc's own 2026-07-16 table)
@@ -371,3 +389,119 @@ class's own previously-recorded elapsed time, using the new
 `CRATONVM_DBG_TIER_ENQUEUE` diagnostic (added by the fix, in
 `jit/src/tiered.rs`) to confirm compile activity directly rather than
 inferring it from pass/fail alone.
+
+## Update 2026-07-17: `LockTest`'s "JIT compile-time tax" was actually a GC conservative-scan cost — real fix landed, worth re-checking this cluster's remaining classes against it
+
+The `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` "JIT compile-time
+tax" mechanism referenced throughout this doc has been root-caused precisely
+and **fixed** — see the `LockTest` entry in
+[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) for the
+full writeup. Short version: the actual cost was never compilation itself
+(the background compiler thread measured ~0 CPU); it was
+`vm/src/jit/conservative_roots.rs`'s `scan_active_jit_frames` conservative
+native-stack scan, which — once *any* method anywhere in the process had
+successfully published a JIT-compiled body — re-scanned the ENTIRE live
+native call stack on every single per-native-call GC root snapshot for a
+process whose interpreter recursion depth kept growing (exactly the shape
+of Hibernate/JUnit5/H2's deeply nested call chains). Fixed on `dev` at
+`f377eb69`: the scan's existing "verified clean" memo now also covers the
+case of recursing *deeper* than the last check (previously only recursing
+shallower was cheap), turning an O(current total stack depth) rescan into
+an O(incremental depth since last check) one. `LockTest`: 0/5 → 5/5 clean
+(dev tip `f377eb69`, ~7-9s each, was failing its 5s internal timeout by
+12-19s every run). Validated against `vm/benches/vm_benchmarks.rs` with no
+regression on any benchmark that exercises real interpreter/JIT/GC code.
+
+This is directly relevant to this cluster's own working hypothesis (a
+single systemic JIT/GC/native-call throughput gap): `scan_active_jit_frames`
+runs on *every* object-returning native call, not just in short one-shot
+test processes, so any of this cluster's still-open classes
+(`InsertOrderingRCATest`, `BatchTest`, and re-checks of the "resolved"
+`LiteralRenderingTest`) that publish at least one JIT compile and also have
+growing/varying interpreter recursion depth could be paying the same
+pre-fix cost. `InsertOrderingRCATest` was previously profiled (this doc's
+2026-07-17 entry above) with `CRATONVM_DBG_TIER_ENQUEUE` showing 2260
+compile enqueues at C1 — worth re-profiling with `CRATONVM_DBG_ROOTSNAP`
+against the post-`f377eb69` binary to see whether any of its remaining
+~9.7x-vs-HotSpot gap was this same mechanism rather than the "method-
+diversity-bound, can't amortize JIT compilation" architectural-gap verdict
+that session reached (that verdict was reached via a `--nojit`-is-slower
+bisection, which rules out *net* JIT-tax dominance but not a smaller
+`scan_active_jit_frames` contribution underneath it). Not re-checked this
+session (out of scope/time for the session that landed the fix) — flagged
+here for whichever session next touches this cluster.
+
+## Update 2026-07-17 (follow-up session): re-checked `InsertOrderingRCATest`/`BatchTest` against `f377eb69` -- real, meaningful improvement, but the architectural-gap verdict for `InsertOrderingRCATest` still holds
+
+Picked up the exact "not re-checked this session" flag from the update
+immediately above. Built fresh from `origin/dev` at `b08d6390` (includes
+`f377eb69`; worktree `wt-hib-insertordering-reverify-20260717`, branch
+`probe/hib-insertordering-reverify-20260717`). Host was quiet this session
+(`uptime` load average 1.9-3.6 throughout, well below the 10-230 swings seen
+in earlier sessions), so these numbers should be more trustworthy than most
+prior readings on this cluster.
+
+**`InsertOrderingRCATest#testBatching`: 3 clean solo runs, 59254ms /
+58594ms / 59153ms (avg 59000ms), all `found=1 started=1 ok=1 failed=0`.**
+Versus HotSpot's 7350ms baseline (from the original baseline table), that's
+**~8.0x** (59000/7350) -- down from the pre-fix ~9.7x (70095-71987ms), a
+genuine ~17-18% wall-clock reduction and the tightest three-run cluster
+recorded for this class on this doc (a 660ms spread across 3 runs, vs the
+tens-of-seconds spread typical of contended-host readings). This confirms
+the conservative-roots fix **did** help this workload, consistent with the
+prior update's hypothesis that a method-diversity-bound, deep-call-stack
+workload would be exactly the shape hit by the pre-fix
+`scan_active_jit_frames` re-scan cost.
+
+**However, `CRATONVM_DBG_ROOTSNAP=1` on the fixed binary rules out a larger
+hidden contribution:** one instrumented run (ms=60314, consistent with the
+uninstrumented runs) shows root-snapshot cost **flat at ~1.0-1.3us/call for
+the entire run** -- sampled at `calls=200000` (avg_us=1.04, avg_frames=80.9)
+through `calls=2200000` (avg_us=1.23, avg_frames=108.7), i.e. exactly the
+"as cheap as `--nojit`" signature the `LockTest` writeup above uses to
+confirm the fix is working, even as this workload's interpreter recursion
+depth grows past 110 frames. Total `ROOTSNAP`-attributed cost across the
+whole run is ~2.7s out of ~60s (roughly 4.5% of wall time) -- a real but
+minority contributor. This directly answers the open question the prior
+update posed ("was InsertOrderingRCATest's ~9.7x gap partly this same
+mechanism?"): yes, partly (accounting for something in the neighborhood of
+the ~11-13s wall-clock delta between the pre-fix ~70-72s and post-fix ~59s
+readings), but not mostly -- the remaining ~8.0x-vs-HotSpot gap is not
+explained by conservative-root-scan cost, which is now demonstrably flat
+and cheap for this exact workload.
+
+**Conclusion: the original "generic architectural gap, not independently
+fixable" verdict for `InsertOrderingRCATest` still holds**, revised only in
+magnitude (~8.0x, not ~9.7x). The three original profiling angles (zero GC
+events, `--nojit` being *slower* not faster, compile-enqueue distribution
+showing wide C1-only diversity with no C2) were never contingent on the
+conservative-roots bug and remain valid: this is still a method-diversity-
+bound workload (184 distinct JDBC statement shapes for ~500 rows) whose
+cost is dominated by per-bytecode/per-call interpreter and C1 dispatch
+overhead spread across a wide code surface, not by any single discrete
+defect. No code change made this session; no regression risk.
+
+**`BatchTest#testBatchInsertUpdate`: 2 clean solo runs, 106946ms / 101601ms
+(avg 104273ms), both `found=4 started=4 ok=4 failed=0`.** No HotSpot
+baseline for this class is on record in either doc, so no ratio is given,
+but this is a ~32% wall-clock reduction from the prior session's 153863ms
+single reading (both readings are clean solo passes with zero real
+corruption warnings -- both logs do show the benign, already-documented
+`gen_heap::get_field: out-of-bounds field read dropped` guard messages
+against `org/junit/jupiter/engine/execution/InterceptingExecutableInvoker`/
+`InvocationInterceptorChain`/`net/bytebuddy/utility/Invoker$Dispatcher`,
+which are safely-dropped speculative probes with `num_slots=0`/
+`real_field_count=Some(0)`, not the `Stale pointer detected`-style
+corruption signature this doc's other entries treat as a real bug -- and
+both runs still passed 4/4). Consistent with `InsertOrderingRCATest`'s
+result: `BatchTest` is also a JDBC-batching-heavy workload with a deep
+JUnit5/Hibernate/H2 call stack, so it plausibly benefits from the same
+`f377eb69` fix, though this session did not run a `CRATONVM_DBG_ROOTSNAP`
+instrumented pass for this class specifically to confirm the mechanism
+directly (the `InsertOrderingRCATest` confirmation above is taken as
+representative of the same fix, same host, same fixture). Status remains
+FIXED, now with a fresher and faster measurement.
+
+No doc-only environment issues this session -- `~/jdk25` symlink and the
+`/data/hibsrc-baseline-20260716` / `/data/hib-baseline-runner-20260716`
+fixtures were healthy and required no repair.
