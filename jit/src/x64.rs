@@ -15336,6 +15336,12 @@ impl Compiler {
                         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getstatic);
+                        // jit-linewrapper-flushtype-npe fix (2026-07-17):
+                        // see the matching fix + comment at the top-level
+                        // 0xb2 arm -- same helper, same missing
+                        // post-invoke exception check for a `<clinit>`
+                        // failure surfaced via the deopt sentinel.
+                        self.emit_post_invoke_exception_check(type_tag);
                         // Volatile static: emit MFENCE after read (SeqCst acquire)
                         if is_volatile {
                             self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
@@ -20450,6 +20456,15 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                     self.emit_call_absolute(self.helpers.getstatic);
+                    // jit-linewrapper-flushtype-npe fix (2026-07-17): the
+                    // helper now runs `<clinit>` on first touch and, on
+                    // failure, stashes the Java exception and returns the
+                    // `i64::MIN` deopt sentinel instead of a field value.
+                    // Route that through the shared exception-check stub
+                    // (mirrors every other fallible JIT helper call) rather
+                    // than pushing the sentinel bits as if they were a
+                    // legitimate result.
+                    self.emit_post_invoke_exception_check(type_tag);
                     // Volatile static: emit MFENCE after read (SeqCst acquire)
                     if is_volatile {
                         self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE

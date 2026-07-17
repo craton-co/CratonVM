@@ -1434,6 +1434,110 @@ the WRONG same-named copy. Eight fixes landed on
        fewer failure than the `6599b898`-era baseline of 17, consistent with
        the independently-tracked `buffered_input_stream_real_jdk_uses_its_own_bytecode`
        flake having since been fixed by a concurrent session).
+
+       **2026-07-17 addendum #2 -- JIT-only residual FIXED.** Root-caused and
+       fixed on a fresh worktree (`/data/data/wt-javapoet-linewrapper-20260717`,
+       branch `fix/javapoet-linewrapper-20260717`, `origin/dev` tip `08c50579`
+       at start of session). Picked up exactly where the prior addendum left
+       off: `CRATONVM_DBG_JIT_DISASM` had already located the merge-point
+       machine code but not conclusively pinned why the `flush` argument
+       reads back null.
+
+       **Root cause:** `jit_getstatic` (`vm/src/jit/helpers.rs`) never called
+       `ensure_class_initialized_shared` before reading a class's static
+       storage -- unlike the interpreter's own `getstatic` bytecode handler
+       (`runtime/interpreter.rs`), which always does. `get_static_shared`
+       (`vm/src/vm/vm_object.rs`) returns the placeholder `Value::Int(0)`
+       for any class with no `statics` table entry yet -- i.e. whose
+       `<clinit>` hasn't run. `LineWrapper.append`'s bytecode computes
+       `flush(shouldWrap ? FlushType.WRAP : nextFlush)`: the `WRAP` arm is a
+       `getstatic` that is only actually *executed* the first time a line
+       genuinely needs wrapping, which in the AOT-generation workload happens
+       well after `append` has already been called (and JIT-compiled) many
+       times via the `nextFlush` arm alone. By the time `shouldWrap` first
+       flips true, `append` is running as JIT-compiled machine code, and its
+       inlined `getstatic FlushType.WRAP` is the FIRST-EVER touch of
+       `FlushType`'s statics anywhere in the process -- so it read the
+       zero-initialized placeholder instead of running `FlushType.<clinit>`
+       first. Decoded as a reference by the caller, `Value::Int(0)` becomes a
+       raw `0` -- `flushType` is null in `LineWrapper.flush`.
+
+       This explains both puzzling facts left open by the prior addendum:
+       why the standalone minimal repro (`LWRepro.java`, alternating
+       `shouldWrap` from iteration 0) never reproduced it -- its FIRST access
+       to the enum happens through the *interpreter* during JIT warm-up,
+       which initializes `FlushType` long before the method ever compiles --
+       and why the bug is deterministic-but-late within the real repro
+       (first several `flush` calls, taking the `nextFlush` arm, succeed;
+       the first call to take the `WRAP` arm fails). Confirmed empirically
+       with a one-off debug instrumentation build: `jit_getstatic` for
+       `FlushType` field 0 returned `Int(0)` on the failing call and
+       `Object(Some(...))` (the same pointer every time, as expected for a
+       static final field) once the fix was applied.
+
+       (There is an existing, more targeted mitigation for this general class
+       of bug -- `CompiledMethod::static_init_classes` / `static_inits_done`,
+       recorded by `x64::compile` from `static_field_info` and walked once
+       per artifact by `runtime/interpreter.rs`'s `execute()` loop just
+       before it hands off to a freshly-installed compiled entry. It did NOT
+       cover this case: it only runs at that one interpreter-driven entry
+       site, not on JIT-to-JIT call paths (`direct_calls` / MIC-cache-hit
+       dispatch, both used elsewhere in this exact compiled `append`), so a
+       method that starts getting invoked JIT-to-JIT before its rarer
+       branches ever execute can still hit an uninitialized class. Fixing
+       `jit_getstatic` itself, unconditionally, closes the gap regardless of
+       entry path; `ensure_class_initialized_shared`'s own fast path is a
+       single atomic load once initialized, so the added cost is negligible.)
+
+       **Fix** (`vm/src/jit/helpers.rs::jit_getstatic`): before reading,
+       obtain the current thread via `jit_thread_mut()` and call
+       `crate::vm::ensure_class_initialized_shared(vm, thread, class_id)`,
+       mirroring the interpreter. On failure (`<clinit>` threw --
+       `ExceptionInInitializerError` per JVMS), stash the exception via
+       `set_jit_pending_exception` (or wrap a non-`ExceptionThrown`
+       `MethodCallFailed` as a `java/lang/InternalError`, matching the
+       pattern in `handle_jit_dispatch_error`) and return the `i64::MIN`
+       deopt sentinel. Companion fix (`jit/src/x64.rs`, both `0xb2`
+       `getstatic` codegen arms -- the top-level handler and the
+       inlined-callee handler): added `self.emit_post_invoke_exception_check
+       (type_tag)` right after `self.emit_call_absolute(self.helpers.
+       getstatic)`, so the now-fallible helper's sentinel actually routes
+       through the method's exception table instead of being pushed as a
+       bogus field value (the call site previously had no post-call check at
+       all, since `getstatic` was assumed infallible).
+
+       **Verified:** the exact repro (`MRun` against
+       `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithBasicTests`,
+       real classpath, default settings -- JIT on, no `CRATONVM_JIT_BISECT_SKIP`
+       workaround, no `CRATONVM_COMPACT_REF_FIELDS=0`) no longer throws the
+       `LineWrapper$FlushType` NPE anywhere: 0/8 occurrences across 8 clean
+       reruns (`grep -c FlushType`), both with and without a debug-instrumented
+       build. The method now progresses further and fails on a distinct,
+       unrelated, pre-existing bug -- `NullPointerException` inside
+       `com.thoughtworks.qdox.parser.impl.Parser.yylex`, reached via
+       `TestCompiler.with(...)` -> `SourceFile.of(...)` -> QDox's own Java
+       source parser -- out of scope for this session, flagged here for
+       whoever picks it up next.
+
+       Regression-checked on the two-file diff (`vm/src/jit/helpers.rs` +49,
+       `jit/src/x64.rs` +15) against a from-scratch `origin/dev`-tip build:
+       `cargo test -p cratonvm-jit --lib --release` 906/0 (0 failed); `cargo
+       test -p cratonvm-vm --lib --release` 2201 passed/16 failed -- all 16
+       match the documented pre-existing `lock_order`/`jit::skip_list`
+       release-mode baseline exactly (same failing test names as the prior
+       addendum's baseline); `cargo test -p cratonvm-native-builtins --lib
+       --release` 3000 passed/0 failed, 6 ignored (matches baseline exactly).
+
+       **Related, out-of-scope finding (flagged, not fixed this session):**
+       the same class-initialization gap exists in the sibling JIT helpers
+       `jit_putstatic_int`/`_long`/`_float`/`_double`/`_object` and
+       `jit_new_object` (`vm/src/jit/helpers.rs`) -- none of them call
+       `ensure_class_initialized_shared` either, so a JIT-compiled `putstatic`
+       or `new` that happens to be the first-ever touch of its class could
+       exhibit the same class of bug (or, for `new`, run afoul of the JVMS
+       requirement that a class be initialized before instantiation). Spun
+       off as a follow-up task.
+
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
