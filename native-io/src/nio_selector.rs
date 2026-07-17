@@ -894,7 +894,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
-        if err.kind() == ErrorKind::Interrupted {
+        if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
             return Ok(0);
         }
         // Closing from another thread may invalidate the epoll fd while this
@@ -1386,7 +1386,7 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
-        if err.kind() == ErrorKind::Interrupted {
+        if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
             return Ok(0);
         }
         return Err(ioex(format!("poll: {err}")));
