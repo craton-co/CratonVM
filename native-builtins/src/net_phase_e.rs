@@ -6724,16 +6724,20 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // S111r57 — bypass MissingWebServerFactoryBeanException by overriding
-    // ServletWebServerApplicationContext.getWebServerFactory() to allocate a
-    // TomcatServletWebServerFactory directly instead of asking the bean factory.
+    // S111r57 — dispatch to Spring Boot's real generic
+    // ServletWebServerApplicationContext.getWebServerFactory() implementation.
+    // The generic context must select its own registered factory backend.
     //
     // In real Spring Boot, this protected method calls
     //   getBeanFactory().getBeanNamesForType(ServletWebServerFactory.class)
     // and throws MissingWebServerFactoryBeanException if zero matches. Under
     // CratonVM the auto-configuration that registers the Tomcat factory bean
     // never completes (Cglib/condition-evaluation issues upstream), so the
-    // lookup fails. We short-circuit by constructing the factory natively.
+    // lookup fails. The old native short-circuit constructed a Tomcat factory
+    // unconditionally, which is invalid for Jetty, Undertow, and generic modules:
+    // they legitimately do not have Spring Boot's Tomcat implementation on their
+    // class path. Execute the original bytecode body instead, which either finds
+    // the registered backend or throws Spring's normal Java exception.
     //
     // SB 2.x: context = org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext
     //         factory = org/springframework/boot/web/servlet/server/ServletWebServerFactory
@@ -6742,26 +6746,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // SB 4.x: context = org/springframework/boot/web/server/servlet/context/ServletWebServerApplicationContext
     //         factory = org/springframework/boot/web/server/servlet/ServletWebServerFactory
     //         impl    = org/springframework/boot/tomcat/servlet/TomcatServletWebServerFactory
-    fn alloc_tomcat_factory(ctx: &mut dyn NativeContext, impl_class: &str) -> MethodCallResult {
-        let obj_val = match ctx.new_object(impl_class) {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(Some(Value::Object(None))),
-            Err(e) => return Err(e),
-        };
-        // Try to run the no-arg constructor; if it fails, return the raw alloc.
-        let _ = ctx.invoke_special(impl_class, "<init>", "()V", &[obj_val]);
-        Ok(Some(obj_val))
-    }
 
     // SB 4.x
     r.register(
         "org/springframework/boot/web/server/servlet/context/ServletWebServerApplicationContext",
         "getWebServerFactory",
         "()Lorg/springframework/boot/web/server/servlet/ServletWebServerFactory;",
-        |ctx, _args| {
-            alloc_tomcat_factory(
-                ctx,
-                "org/springframework/boot/tomcat/servlet/TomcatServletWebServerFactory",
+        |ctx, args| {
+            ctx.invoke_special_bytecode_only(
+                "org/springframework/boot/web/server/servlet/context/ServletWebServerApplicationContext",
+                "getWebServerFactory",
+                "()Lorg/springframework/boot/web/server/servlet/ServletWebServerFactory;",
+                args,
             )
         },
     );
@@ -6771,10 +6767,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext",
         "getWebServerFactory",
         "()Lorg/springframework/boot/web/servlet/server/ServletWebServerFactory;",
-        |ctx, _args| {
-            alloc_tomcat_factory(
-                ctx,
-                "org/springframework/boot/web/embedded/tomcat/TomcatServletWebServerFactory",
+        |ctx, args| {
+            ctx.invoke_special_bytecode_only(
+                "org/springframework/boot/web/servlet/context/ServletWebServerApplicationContext",
+                "getWebServerFactory",
+                "()Lorg/springframework/boot/web/servlet/server/ServletWebServerFactory;",
+                args,
             )
         },
     );
