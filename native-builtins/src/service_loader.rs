@@ -207,7 +207,11 @@ fn native_sl_reload(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 /// camelCase/lowercase. We maintain a small known table for ES core modules and
 /// fall back to the first package component (lowercase) for unknown packages.
 ///
-/// Example: `org.elasticsearch.xcontent.spi.XContentProvider` → `["x-content"]`
+/// Example: `org.elasticsearch.xcontent.spi.XContentProvider` → `["x-content"]`.
+///
+/// The x-content archive also embeds Jackson and SnakeYAML. Those implementation
+/// classes do not share Elasticsearch's package prefix, but they must resolve
+/// through the same archive once an x-content provider links against them.
 pub(crate) fn derive_impl_jar_module_names(fqn: &str) -> Vec<String> {
     const KNOWN: &[(&str, &str)] = &[
         ("org.elasticsearch.xcontent", "x-content"),
@@ -220,6 +224,9 @@ pub(crate) fn derive_impl_jar_module_names(fqn: &str) -> Vec<String> {
         if fqn.starts_with(prefix) {
             return vec![module.to_string()];
         }
+    }
+    if fqn.starts_with("com.fasterxml.jackson.") || fqn.starts_with("org.yaml.snakeyaml.") {
+        return vec!["x-content".to_string()];
     }
     // Generic fallback: strip "org.elasticsearch.", take first component.
     if let Some(rest) = fqn.strip_prefix("org.elasticsearch.") {
@@ -250,6 +257,108 @@ pub(crate) fn try_read_from_inner_jar(
         .or_else(|| ctx.find_resource(&direct_path))
 }
 
+/// Return the non-JDK class references recorded in a class file's constant
+/// pool.  The embedded archive has no directory index, so these references
+/// are the bounded, loader-faithful way to discover the provider dependency
+/// closure without depending on the flat application class path.
+fn embedded_class_references(bytes: &[u8]) -> Vec<String> {
+    if bytes.len() < 10 || bytes[..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+        return Vec::new();
+    }
+    let mut pos = 8usize;
+    let read_u16 = |offset: &mut usize| -> Option<u16> {
+        let end = offset.checked_add(2)?;
+        let value = u16::from_be_bytes(bytes.get(*offset..end)?.try_into().ok()?);
+        *offset = end;
+        Some(value)
+    };
+    let Some(count) = read_u16(&mut pos).map(usize::from) else {
+        return Vec::new();
+    };
+    let mut utf8 = vec![None; count];
+    let mut class_name_indices = Vec::new();
+    let mut index = 1usize;
+    while index < count {
+        let Some(&tag) = bytes.get(pos) else {
+            return Vec::new();
+        };
+        pos += 1;
+        match tag {
+            1 => {
+                let Some(length) = read_u16(&mut pos).map(usize::from) else {
+                    return Vec::new();
+                };
+                let Some(end) = pos.checked_add(length) else {
+                    return Vec::new();
+                };
+                let Some(value) = bytes.get(pos..end) else {
+                    return Vec::new();
+                };
+                utf8[index] = Some(String::from_utf8_lossy(value).into_owned());
+                pos = end;
+            }
+            7 => {
+                let Some(name_index) = read_u16(&mut pos) else {
+                    return Vec::new();
+                };
+                class_name_indices.push(name_index as usize);
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => {
+                pos = match pos.checked_add(4) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                }
+            }
+            5 | 6 => {
+                pos = match pos.checked_add(8) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+                index += 1;
+            }
+            8 | 16 | 19 | 20 => {
+                pos = match pos.checked_add(2) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                }
+            }
+            15 => {
+                pos = match pos.checked_add(3) {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                }
+            }
+            _ => return Vec::new(),
+        }
+        index += 1;
+    }
+    class_name_indices
+        .into_iter()
+        .filter_map(|index| utf8.get(index).and_then(Clone::clone))
+        .filter(|name| {
+            !name.starts_with('[')
+                && !name.starts_with("java/")
+                && !name.starts_with("javax/")
+                && !name.starts_with("jdk/")
+                && !name.starts_with("sun/")
+                && !name.starts_with("org/w3c/")
+                && !name.starts_with("org/xml/")
+        })
+        .collect()
+}
+
+fn preload_embedded_dependencies(
+    ctx: &mut dyn NativeContext,
+    loader: cratonvm_types::ObjectRef,
+    bytes: &[u8],
+) {
+    for dependency in embedded_class_references(bytes) {
+        if !derive_impl_jar_module_names(&dependency.replace('/', ".")).is_empty() {
+            let _ = impl_jars_load_class(ctx, Some(loader), &dependency);
+        }
+    }
+}
+
 /// Try to load a class from the IMPL-JARS flat-directory layout.
 ///
 /// ES stores `IMPL-JARS/<module>/<jar_name>/<classfile>` as individual entries
@@ -259,10 +368,24 @@ pub(crate) fn try_read_from_inner_jar(
 ///
 /// Used from both `service_loader.rs` (load provider class) and
 /// `classloader.rs` (class resolution fallback for inner / helper classes).
-pub(crate) fn impl_jars_load_class(
+pub fn impl_jars_load_class(
     ctx: &mut dyn NativeContext,
+    defining_loader: Option<cratonvm_types::ObjectRef>,
     internal_name: &str,
 ) -> Option<cratonvm_types::ObjectRef> {
+    let mut visited = std::collections::HashSet::new();
+    impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)
+}
+
+fn impl_jars_load_class_inner(
+    ctx: &mut dyn NativeContext,
+    defining_loader: Option<cratonvm_types::ObjectRef>,
+    internal_name: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Option<cratonvm_types::ObjectRef> {
+    if !visited.insert(internal_name.to_owned()) {
+        return None;
+    }
     let dotted = internal_name.replace('/', ".");
     let class_file = format!("{internal_name}.class");
     for module_name in derive_impl_jar_module_names(&dotted) {
@@ -274,7 +397,10 @@ pub(crate) fn impl_jars_load_class(
         let Some(listing_bytes) = first_bytes.or_else(|| ctx.find_resource(&listing_path)) else {
             continue;
         };
-        if module_name == "x-content" {
+        // A caller that supplied an existing loader needs classes defined by
+        // that exact instance. Creating a fresh EmbeddedImplClassLoader here
+        // would split the provider and its dependencies across two namespaces.
+        if module_name == "x-content" && defining_loader.is_none() {
             let app_loader = crate::classloader::get_or_create_app_loader(ctx);
             // GC-safety: `create_string` below can trigger a moving GC;
             // `app_loader` (the shared application-classloader singleton) is
@@ -309,11 +435,44 @@ pub(crate) fn impl_jars_load_class(
             if let Some(class_bytes) =
                 try_read_from_inner_jar(ctx, &module_name, jar_name, &class_file)
             {
+                // Link the dependency closure before defining this class. The
+                // class manager resolves a superclass/interface as part of
+                // `define_class_full`; for example ESJsonFactoryBuilder needs
+                // Jackson's builder type before its own bytes can be accepted.
+                let defining_loader = if let Some(loader) = defining_loader {
+                    let loader_pin = ctx.pin_native_root(loader);
+                    for dependency in embedded_class_references(&class_bytes) {
+                        if dependency != internal_name
+                            && !derive_impl_jar_module_names(&dependency.replace('/', "."))
+                                .is_empty()
+                        {
+                            let current_loader = ctx.read_native_pin(loader_pin, loader);
+                            let _ = impl_jars_load_class_inner(
+                                ctx,
+                                Some(current_loader),
+                                &dependency,
+                                visited,
+                            );
+                        }
+                    }
+                    let loader = ctx.read_native_pin(loader_pin, loader);
+                    ctx.unpin_native_roots(loader_pin);
+                    Some(loader)
+                } else {
+                    None
+                };
                 let opts = cratonvm_native_api::DefineClassFull {
                     skip_verification: true,
                     ..Default::default()
                 };
-                if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, 0, opts) {
+                let loader_id = defining_loader
+                    .map(|loader| crate::classloader::get_or_assign_loader_id(ctx, loader))
+                    .unwrap_or(0);
+                if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts)
+                {
+                    if let Some(loader) = defining_loader {
+                        crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                    }
                     return Some(ctx.get_class_mirror(cid));
                 }
             }
@@ -411,7 +570,15 @@ fn load_provider_class_from_loader_jars(
                 skip_verification: true,
                 ..Default::default()
             };
-            if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, 0, opts) {
+            // This path is entered when the provider's own Java loader could
+            // not materialize its class.  It is still a definition *by that
+            // loader*, not by the application loader: the provider's nested
+            // classes and dependencies must subsequently resolve through the
+            // same EmbeddedImplClassLoader.
+            let loader_id = crate::classloader::get_or_assign_loader_id(ctx, loader);
+            if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, loader_id, opts) {
+                crate::classloader::register_defining_loader(cid.as_u32(), loader);
+                preload_embedded_dependencies(ctx, loader, &class_bytes);
                 return Some(ctx.get_class_mirror(cid));
             }
             if let Some(cid) = ctx.class_id_by_name(internal_name) {
@@ -477,12 +644,13 @@ fn load_provider_class(
         let loader_pin = ctx.pin_native_root(loader_r);
         let name2 = ctx.create_string(fqn);
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
-        if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
+        let load_result = ctx.invoke_virtual(
             loader_r,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name2))],
-        ) {
+        );
+        if let Ok(Some(Value::Object(Some(c)))) = load_result {
             ctx.unpin_native_roots(loader_pin);
             return Some(c);
         }
@@ -517,7 +685,7 @@ fn load_provider_class(
         return Some(c);
     }
     // Final fallback: IMPL-JARS nested-JAR scan.
-    impl_jars_load_class(ctx, &fqn.replace('.', "/"))
+    impl_jars_load_class(ctx, None, &fqn.replace('.', "/"))
 }
 
 /// Read provider FQNs for `sl.service` from every
@@ -2223,6 +2391,20 @@ mod tests {
         let raw = "com.acme.Foo  # comment";
         let token = raw.split('#').next().unwrap().trim();
         assert_eq!(token, "com.acme.Foo");
+    }
+
+    #[test]
+    fn embedded_x_content_dependencies_use_the_x_content_archive() {
+        assert_eq!(
+            derive_impl_jar_module_names(
+                "com.fasterxml.jackson.core.util.JsonRecyclerPools$ThreadLocalPool"
+            ),
+            vec!["x-content"]
+        );
+        assert_eq!(
+            derive_impl_jar_module_names("org.yaml.snakeyaml.Yaml"),
+            vec!["x-content"]
+        );
     }
 
     /// WP1.8-narrow: the descriptor parser strips comments and blanks,

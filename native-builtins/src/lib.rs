@@ -26749,6 +26749,28 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // Real-JDK `Module.getDescriptor()` is a field read, but Module mirrors
+    // produced by CratonVM do not carry the JDK's private descriptor field.
+    // The synthetic-JDK registration has a bridge for this already; install it
+    // here as well because this is the registration path used by the CLI.
+    registry.register(
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let module = match args.first() {
+                Some(Value::Object(Some(module))) => *module,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = match ctx.get_field_by_name(module, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let descriptor = build_synthetic_module_descriptor(ctx, &name);
+            Ok(Some(Value::Object(Some(descriptor))))
+        },
+    );
+
     // `java/lang/Module.addUses(Class)` — companion to `canUse` above, same
     // null-descriptor gap (real bytecode reads `this.descriptor` to decide
     // whether the module already implicitly "uses" everything as an
