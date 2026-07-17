@@ -36243,9 +36243,17 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    let skip_file_callbacks = ctx
-        .class_name_of_id(ctx.class_id_of_object(visitor))
+    let visitor_class_id = ctx.class_id_of_object(visitor);
+    let visitor_class_name = ctx.class_name_of_id(visitor_class_id);
+    let skip_file_callbacks = visitor_class_name
+        .as_deref()
         .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
+    if std::env::var_os("CRATONVM_DBG_VISITFILE").is_some() {
+        eprintln!(
+            "[p98-walkfiletree] visitor_class_id={:?} visitor_class_name={:?} skip_file_callbacks={}",
+            visitor_class_id, visitor_class_name, skip_file_callbacks
+        );
+    }
     p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
     Ok(Some(path_val))
 }

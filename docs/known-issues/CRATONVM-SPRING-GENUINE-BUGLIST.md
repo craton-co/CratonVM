@@ -180,6 +180,10 @@ This document tracks the **genuine remaining failures**.
 
       **Merge-time finding (unrelated, NOT caused by this fix):** post-merge with same-day `origin/dev`, `ImportHttpServiceRegistrarTests` intermittently instead shows `java.util.ServiceConfigurationError: Provider org.junit.support.testng.engine.TestNGTestEngine could not be instantiated` on the same two methods, and `cargo test -p cratonvm-vm --lib` shows one additional failure (`runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode`, "BufferedInputStream.read()I must keep its real-JDK bytecode") beyond the 16 pre-existing `lock_order`/`skip_list` ones. **Both A/B-isolated via `git revert --no-commit` of this fix's own commit on top of the same merge**: both reproduce identically with this fix present OR reverted — caused by one of the OTHER commits that landed on `dev` the same day (package-private access enforcement, `f62f1772`, is the leading suspect for both — TestNG's engine and `BufferedInputStream` dispatch both cross a loader/native-dispatch boundary), not by this change. Worth a follow-up investigation by whoever owns that area; out of scope here.
 
+      **2026-07-17 follow-up — `buffered_input_stream_real_jdk_uses_its_own_bytecode` root-caused and FIXED; `f62f1772` exonerated for this half of the finding.** Bisected with `git blame`/`git log -S` on `force_native_over_real_jdk_bytecode` (`vm/src/runtime/interpreter.rs`): the regression was introduced by `995ff48c7` ("Fix Tomcat silent-hang scanner and JIT residuals", landed 2026-07-16 19:09:33 -0300, well before `f62f1772`'s 23:17:35 UTC), which added a brand-new, unconditional `if class_name == "java/io/BufferedInputStream" && method_name == "read" && matches!(method_descriptor, "([BII)I" | "()I") { return true; }` block. This directly contradicts the pre-existing (2026-07-14, `d8092acb`) contract test, and also contradicts `native-builtins/src/lib.rs`'s own adjacent comment on the real `BufferedInputStream` native registrations ("Real JDK BufferedInputStream has a layout and close protocol that the old synthetic bridge cannot emulate safely ... Keep the bridge only for synthetic-JDK builds; real-JDK execution must use the class bytecode" — those natives are gated `if cfg!(feature = "synthetic-jdk")`, so in real-JDK mode nothing is even registered for `BufferedInputStream.read`, making the interpreter.rs force-native block a dead-end/behavior-change with no matching native, not an intentional fast path). `f62f1772` does not touch `force_native_over_real_jdk_bytecode`, `BufferedInputStream`, or any native-dispatch code at all (it only wires `check_class_access` into `Instruction::New` plus two JIT allocation-site resolvers) — it is not implicated in this half of the merge-time finding; the TestNG `ServiceConfigurationError` half remains open and unexplored.
+      **Fix**: removed the offending block (`vm/src/runtime/interpreter.rs`, was ~line 23500-23505, immediately after the Tomcat BCEL `Constant.readConstant` force-native check), restoring real-JDK bytecode dispatch for `BufferedInputStream.read()I`/`read([BII)I`. No native replacement needed since real-JDK mode never had one registered.
+      **Verified**: `runtime::interpreter::tests::buffered_input_stream_real_jdk_uses_its_own_bytecode` passes. `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed / 111 ignored — exactly the documented 9 `lock_order` + 7 `jit::skip_list` baseline, no new failures. `cargo test -p cratonvm-gc --lib --release`: 791/0. `cargo test -p cratonvm-native-builtins --lib --release`: 3000/0 (6 ignored).
+
       Verified regression-free: `cargo test -p cratonvm-vm --lib` 2200 passed/16 failed/111 ignored on the pre-merge branch, **byte-identical failing-test list with vs. without this fix** (`git stash`-isolated A/B). `cargo test -p cratonvm-native-builtins --lib`: 3000 passed/0 failed. Spot-checked `GroupsMetadataValueDelegateTests` and `ConfigurationClassPostProcessorAotContributionTests` (same loader-identity investigation cluster) — both are extremely slow AOT/compilation-heavy tests that don't complete within a 200s per-class ceiling on this host EITHER WAY (confirmed identical timeout behavior baseline vs. fixed, 2 runs each) — pre-existing host/AOT-overhead characteristic, not a regression.
 
       Repro assets at `/data/tmp/importhttpsvc-repro/` on the Azure host remain valid for any follow-up (binaries added this session: `cratonvm-baseline-20260716-192222` (pre-fix), `cratonvm-fixed-20260716-192222` (fix, pre-merge), `cratonvm-postmerge-20260716-192222`/`cratonvm-revertcheck-20260716-192222` (post-merge fix/no-fix pair used for the ServiceConfigurationError + BufferedInputStream A/B isolation above).
@@ -250,16 +254,71 @@ the WRONG same-named copy. Eight fixes landed on
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
 | `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-17 re-triage: FAIL 8/3/5** — the two previously-documented failure modes ((a) cold-attach, (b) ByteBuddy "Cannot resolve T") are CONFIRMED GONE on current dev tip; a third, distinct, NOT-yet-root-caused AssertJ reflection residual now blocks the remaining 5, see below |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
-| `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
+| `BeanRegistrationsAotContributionTests` | TIMEOUT | **FIXED (2026-07-17, commit `9af322e4`)** — **OK 14/14** |
 
 ### Remaining OPEN residuals in the AOT cluster
 
-*   `BeanRegistrationsAotContributionTests` — **TIMEOUT even at 1500 s**, 100%
-    CPU, steadily progressing (NOT a deadlock). Stack samples put the main
-    thread repeatedly in Mockito's inline-mock-maker constructor interception
-    (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC frame-root
-    scanning — an interpreter-throughput problem under constructor
-    instrumentation, needing perf work rather than a correctness fix.
+*   ~~`BeanRegistrationsAotContributionTests`~~ **FIXED (2026-07-17, commit
+    `9af322e4`).** Originally documented as **TIMEOUT even at 1500 s**, 100%
+    CPU, steadily progressing (NOT a deadlock), stack samples putting the
+    main thread repeatedly in Mockito's inline-mock-maker constructor
+    interception (`InlineDelegateByteBuddyMockMaker.lambda$new$2/3`) plus GC
+    frame-root scanning — characterized at the time as an interpreter-
+    throughput problem under constructor instrumentation, needing perf work
+    rather than a correctness fix.
+
+    **Re-measured on fresh dev tip** after this session's interpreter-
+    dispatch/GC fixes (`3d1449a7`, `4290124b`, `b7a1ed84`, `19a5025f`,
+    `9850617b`, `fb15be63`, …): the TIMEOUT is **gone**. The class now
+    completes in ~604 s with 12/14 passing — a completely different,
+    correctness-shaped failure: `NoSuchMethodError:
+    java/lang/Object.visitFile(...)`, thrown from inside javac's own
+    `JavacFileManager$ArchiveContainer.list()` while scanning a large
+    in-memory compilation classpath (2 methods:
+    `applyToAppliesContribution`, and
+    `applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles` via a
+    wrapping `AotBeanProcessingException`). The old "Mockito constructor
+    interception" throughput hypothesis no longer applies at all — this
+    session's dispatch fixes evidently resolved it.
+
+    **Root cause**: `native-builtins/src/phases_late.rs`'s
+    `Files.walkFileTree` implementation (`p98_walk_file_tree`/
+    `p98_walk_dir`) threads the visitor object and each directory's `Path`
+    object through a recursive walk as plain Rust-local `ObjectRef`s,
+    reused across the whole (potentially deep, long-running, re-entrant)
+    traversal. Any Java callback invocation along the way can allocate and
+    trigger a moving GC; the next iteration's use of the stale local
+    silently resolves to whatever the old slot was reused for (usually an
+    array) — exactly what `NativeContext::pin_native_root`'s doc comment
+    warns about: dispatch collapses to `java.lang.Object`, raising a
+    spurious `NoSuchMethodError` on the visitor's real method. Confirmed
+    live via a temporary `CRATONVM_DBG_VISITFILE` trace: the failing
+    visitor was `JavacFileManager$ArchiveContainer$2` (the `list()`-local
+    visitor that overrides `visitFile` — distinct from the constructor's
+    `$1` visitor, which has no `visitFile` override and was already
+    correctly skipped via a pre-existing class-name special case that
+    hard-codes `$1` — that pre-existing special case is what hid this bug
+    from ever firing for the *constructor's* visitor, but the `list()`
+    visitor was never covered by it).
+
+    **Fix**: pin the visitor and every directory-level `Path` object for
+    the whole walk via `pin_native_root`/`read_native_pin` (`P98Pin`
+    helper), and re-read the current, GC-forwarded reference immediately
+    before each re-entrant call site (`preVisitDirectory`/`visitFile`/
+    `postVisitDirectory`, plus the per-entry `Path` field write). Unpin
+    the entire batch once when `p98_walk_file_tree` returns.
+
+    **Verified**: both previously-failing methods now pass in isolation.
+    Full class: `found=14 succ=14 fail=0` (was `found=14 succ=12 fail=2`),
+    `ms=3242228` total (~54 min, dominated by the large-bean-defs stress
+    test, which now actually completes its real ~6000-bean workload
+    instead of failing fast partway through). `cratonvm-gc --lib`:
+    791/791 pass. `cratonvm-vm --lib`: 2200 passed / 17 failed, all 17
+    confirmed pre-existing via A/B `git stash` comparison against
+    unmodified dev tip (release-mode `debug_assert!` gaps in
+    `runtime::lock_order` tests, plus unrelated `jit::skip_list`
+    test-isolation issues) — none touch `native-builtins/phases_late.rs`
+    or this code path.
 *   ~~`ConfigurationClassPostProcessorAotContributionTests`~~ **FIXED
     (2026-07-15, commit `aca7f635`).** `BeanRegistrarTests`'
     `applyToWhenIsPackagePrivate`/`applyToWhenIsPackagePrivateAndImportAware`

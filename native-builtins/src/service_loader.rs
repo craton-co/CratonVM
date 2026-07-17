@@ -424,8 +424,8 @@ fn load_provider_class_from_loader_jars(
 
 /// Load a provider class by FQN. When a specific `loader` is known (the
 /// common case — JBoss Modules' `ModuleClassLoader`, Elasticsearch's
-/// `EmbeddedImplClassLoader`, etc.), try it FIRST via `loader.findClass`/
-/// `loader.loadClass`, falling back to the context-free flat
+/// `EmbeddedImplClassLoader`, etc.), try it FIRST via `loader.loadClass`/
+/// `loader.findClass`, falling back to the context-free flat
 /// `Class.forName(fqn)` scan only if the loader can't resolve it (or no
 /// loader was given at all).
 ///
@@ -443,6 +443,29 @@ fn load_provider_class_from_loader_jars(
 /// throws `NoClassDefFoundError` on first real use. Trying the correct
 /// loader first avoids ever touching the wrong-context path when we already
 /// know the right one.
+///
+/// `loadClass` MUST be tried before `findClass`, not after. Real
+/// `java.util.ServiceLoader` resolves each provider via
+/// `Class.forName(cn, false, loader)`, which is spec'd to invoke `loader`'s
+/// PUBLIC `loadClass(String)` — never the `protected findClass(String)`
+/// helper directly. `findClass` exists to be called BY a loader's own
+/// `loadClass()` algorithm (typically after parent delegation fails), not by
+/// external callers — a loader with custom `loadClass()` delegation logic
+/// (e.g. spring-core-test's `CompileWithForkedClassLoaderClassLoader`, whose
+/// `loadClass(String)` special-cases `org.junit`/`org.testng` names to load
+/// them through a DIFFERENT loader instance rather than itself) has that
+/// logic entirely in `loadClass()`; its `findClass()` override has no such
+/// special case and unconditionally defines the class into itself. Calling
+/// `findClass` first bypasses `loadClass()`'s delegation, so the SAME
+/// class name (e.g. `TestNGTestEngine`) ends up defined under two different
+/// loader identities depending on which internal path reached it first (one
+/// via this synthetic ServiceLoader's `findClass`-first probe, one via a
+/// later ordinary `Class.forName(name, false, loader)` that correctly went
+/// through `loadClass()`) — a same-name loader-identity split that then
+/// throws a spurious `IllegalAccessError: ... not public, different
+/// package` the moment the wrongly-self-defined copy's `<clinit>`
+/// cross-references a package-private sibling class resolved through the
+/// correct loader.
 fn load_provider_class(
     ctx: &mut dyn NativeContext,
     fqn: &str,
@@ -450,19 +473,8 @@ fn load_provider_class(
 ) -> Option<cratonvm_types::ObjectRef> {
     if let Some(loader_r) = loader {
         // Both create_string calls can collect, so pin the module or custom
-        // loader for the entire findClass/loadClass/fallback sequence.
+        // loader for the entire loadClass/findClass/fallback sequence.
         let loader_pin = ctx.pin_native_root(loader_r);
-        let find_name = ctx.create_string(fqn);
-        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
-        if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
-            loader_r,
-            "findClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[Value::Object(Some(find_name))],
-        ) {
-            ctx.unpin_native_roots(loader_pin);
-            return Some(c);
-        }
         let name2 = ctx.create_string(fqn);
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
@@ -470,6 +482,17 @@ fn load_provider_class(
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name2))],
+        ) {
+            ctx.unpin_native_roots(loader_pin);
+            return Some(c);
+        }
+        let find_name = ctx.create_string(fqn);
+        let loader_r = ctx.read_native_pin(loader_pin, loader_r);
+        if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
+            loader_r,
+            "findClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(find_name))],
         ) {
             ctx.unpin_native_roots(loader_pin);
             return Some(c);
