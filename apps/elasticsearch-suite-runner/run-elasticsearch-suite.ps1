@@ -20,6 +20,7 @@ param(
   [int]$Count = 0,
   [int]$Parallel = 1,
   [int]$TimeoutSec = 120,
+  [int]$KnownSlowClassTimeoutSec = 300,
 
   [string]$RunName = '',
   [string]$ModeName = '',
@@ -175,6 +176,24 @@ function ConvertFrom-InvariantString([string]$Value) {
     return $parsed
   }
   return 0.0
+}
+
+# These classes are known to perform finite, allocation-heavy HNSW graph
+# construction.  On CratonVM they can exceed the normal per-class timeout
+# under host contention while continuing to make progress; see
+# docs/internal/elasticsearch-suite/ES-HANG-FAMILY-20260710-vector-hnsw-bit-120s-timeout-FIXED.md.
+# Keep the exception exact and small so a timeout in every other class still
+# reports a diagnostic HANG promptly.
+$script:KnownSlowCratonClasses = @{
+  'org.elasticsearch.index.codec.vectors.ES815HnswBitVectorsFormatTests' = $true
+  'org.elasticsearch.index.codec.vectors.es93.ES93HnswBitVectorsFormatTests' = $true
+}
+
+function Get-ClassTimeoutSec([string]$Class) {
+  if ($Vm -eq 'craton' -and $script:KnownSlowCratonClasses.ContainsKey($Class)) {
+    return [Math]::Max($TimeoutSec, $KnownSlowClassTimeoutSec)
+  }
+  return $TimeoutSec
 }
 
 function Quote-WindowsArgument([string]$Argument) {
@@ -546,12 +565,14 @@ function New-ProcessRecord {
 
   $module = [string]$ClassRow.module
   $class = [string]$ClassRow.class
+  $classTimeoutSec = Get-ClassTimeoutSec $class
   $cp = Get-Classpath $module
   if (-not $cp) {
     return [pscustomobject]@{
       noCp = $true
       module = $module
       class = $class
+      timeoutSec = $classTimeoutSec
     }
   }
 
@@ -613,6 +634,7 @@ function New-ProcessRecord {
     stderrTask = $proc.StandardError.ReadToEndAsync()
     module = $module
     class = $class
+    timeoutSec = $classTimeoutSec
     start = Get-Date
     outFile = $outFile
     errFile = $errFile
@@ -755,7 +777,7 @@ function Wait-OneRunning {
 
       $elapsed = ((Get-Date) - $record.start).TotalSeconds
       $timedOut = $false
-      if (-not $record.proc.HasExited -and $elapsed -ge $TimeoutSec) {
+      if (-not $record.proc.HasExited -and $elapsed -ge $record.timeoutSec) {
         $timedOut = $true
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
       }
@@ -818,7 +840,7 @@ function Invoke-Mode {
   }
   $todo = @($Classes | Where-Object { -not $done.ContainsKey("$($_.module)`t$($_.class)") })
 
-  Write-Info "mode=$mode vm=$Vm jit=$Jit category=$Category selected=$($Classes.Count) todo=$($todo.Count) parallel=$Parallel timeout=${TimeoutSec}s"
+  Write-Info "mode=$mode vm=$Vm jit=$Jit category=$Category selected=$($Classes.Count) todo=$($todo.Count) parallel=$Parallel timeout=${TimeoutSec}s known-slow-timeout=${KnownSlowClassTimeoutSec}s"
   if ($Vm -eq 'craton') { Write-Info "craton exe=$craton" }
   Write-Info "logs/results=$modeOut"
 
@@ -965,6 +987,7 @@ New-Item -ItemType Directory -Force -Path $script:WorkRoot | Out-Null
 
 if ($Parallel -lt 1) { $Parallel = 1 }
 if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+if ($KnownSlowClassTimeoutSec -lt 1) { $KnownSlowClassTimeoutSec = 1 }
 
 if ($AllModes) {
   if ($RefreshLists -or -not (Test-Path (Join-Path $script:WorkRoot 'all-tests.tsv'))) {
