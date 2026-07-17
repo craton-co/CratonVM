@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — new finding, 2026-07-16 full-suite rerun. Not individually root-caused yet. |
+| **Status** | MOSTLY CLOSED (2026-07-17). 4 of 7 original classes were a mis-attributed reflection/GC-corruption bug, now fixed (see below). `LiteralRenderingTest` is effectively resolved (now ~1.6x HotSpot). `InsertOrderingRCATest` is a confirmed, profiled generic architectural gap (~9.7x HotSpot) -- not independently fixable without broader interpreter/JIT throughput work; not a discrete bug. `BatchTest` remains unconfirmed (needs a clean long-timeout re-run, see below). |
 | **Area** | Suspected: JIT/interpreter throughput, GC pause behavior, or native-call dispatch overhead under real-JDK+JIT-on mode. |
 | **Severity** | Medium — no crashes or wrong results, but a real perf/timing gap wide enough to blow through Hibernate's own generous internal timeouts. |
 
@@ -29,10 +29,10 @@ itself* reports having exceeded a 120-second internal watchdog).
 | ~~`org.hibernate.orm.test.batchfetch.DynamicBatchFetchTest`~~ | ~~`testMultiLoad`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
 | ~~`org.hibernate.orm.test.function.json.JsonArrayUnnestTest`~~ | ~~`testUnnest`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family, not a throughput issue.** |
 | ~~`org.hibernate.orm.test.id.uuid.rfc9562.UUidV6V7GeneratorTest`~~ | ~~`testMonotonicityUuid6`~~ | — | **FIXED — re-attributed, see below. Not a throughput/timeout member of this cluster.** |
-| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | Not re-investigated this session. |
+| `org.hibernate.orm.test.insertordering.InsertOrderingRCATest` | `testBatching` | 165898 | **Re-investigated 2026-07-17 -- profiled, confirmed generic architectural gap, not independently fixable. See dedicated section below.** |
 | ~~`org.hibernate.orm.test.bootstrap.scanning.ScannerTest`~~ | ~~`testCustomScanner`~~ | — | **FIXED — see below. Was the reflection/GC-corruption family (confirmed *infinite livelock* on a prior baseline, not just a timeout), not a throughput issue.** |
 | ~~`org.hibernate.orm.test.sql.exec.SmokeTests`~~ | ~~`testQueryConcurrency`~~ | — | **FIXED when run standalone — see below. Was (at least partly) the reflection/GC-corruption family, not purely a throughput issue.** |
-| `org.hibernate.orm.test.type.contributor.LiteralRenderingTest` | `testIdVersionFunctions` | 347729 | Not re-investigated this session. |
+| `org.hibernate.orm.test.type.contributor.LiteralRenderingTest` | `testIdVersionFunctions` | 347729 | **Re-investigated 2026-07-17 -- now within the documented generic-gap range (~1.6x HotSpot); effectively resolved by cumulative fixes landed since this baseline. See dedicated section below.** |
 
 (`org.hibernate.orm.test.jpa.lock.LockTest` has a related but distinct
 symptom — `AssertionFailedError: execution exceeded timeout of 5000ms by
@@ -195,6 +195,117 @@ reflection/GC-corruption family documented in
 plausible members of an actual throughput cluster; `SmokeTests`' load-only
 residual is tracked as a fixed-in-isolation, GC-corruption-family
 (not throughput) issue.
+
+## Follow-up (2026-07-17, throughput-profiling session): `InsertOrderingRCATest` and `LiteralRenderingTest` profiled -- one is generic gap (unfixable here), one is effectively resolved
+
+Session scope: the task doc handed off three suspected-generic-gap cases --
+`InsertOrderingRCATest#testBatching` and `LiteralRenderingTest#testIdVersionFunctions`
+from this cluster, plus `LockTest` (tracked in
+[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md), see that
+file's update below). Built fresh at `dev@33df5d3c` (worktree
+`wt-hib-throughput-profile-20260716`; this doc-update commit itself is from a
+second worktree, `wt-hib-throughput-docs-20260717`, at the later tip
+`dev@3cb39d87`, after the first worktree's git registration was lost to
+concurrent host activity -- see the environment note below).
+
+**Environment note for future sessions reusing `/data/hibsrc-baseline-20260716`
+/ `/data/hib-baseline-runner-20260716`:** at session start, the shared fixture's
+`hibernate-core/target/` and `hibernate-testing/target/` (plus every other
+module's `target/`) were **empty** -- wiped by unrelated host disk-pressure
+cleanup, and `~/jdk25` was a **dangling symlink** (its target,
+`/data/data/jdk25-real`, was gone too). Recovered by: downloading a fresh
+Temurin 25.0.3+9 JDK to `/data/jdk25-real-20260717` and repointing `~/jdk25`
+at it, then rebuilding the fixture with
+`JAVA_HOME=~/jdk25 GRADLE_USER_HOME=/data/gradle-home-baseline-20260716
+./gradlew :hibernate-core:testClasses :hibernate-testing:jar
+:hibernate-community-dialects:jar :hibernate-scan-jandex:jar :hibernate-ant:jar
+:hibernate-reveng:jar` (gradle's build cache made this a ~3-minute job, not a
+full rebuild). **Symptom if this recurs:** `Class.forName` on any Hibernate
+test class throws a bare `java.lang.ClassNotFoundException` with no message
+and no cause even though the `.class` file demonstrably exists and reads
+correctly -- the real failure is a missing *dependency* class (here,
+`hibernate-testing`'s `EntityManagerFactoryBasedFunctionalTest`/
+`ServiceRegistryProducer`, because only the `jar` artifact, not the `classes/`
+dir, is on `common.linux.args`'s classpath, and `:hibernate-core:testClasses`
+alone doesn't force-build sibling-module jars). This masking is itself a
+minor CratonVM diagnostics gap (real-JDK-mode `ClassLoader.loadClass`'s
+`load_class_visible_to` in `native-builtins/src/classloader_real.rs` discards
+the true underlying error and always reports a bare CNFE) -- not fixed this
+session (out of scope for a throughput task), flagged separately.
+
+### `InsertOrderingRCATest#testBatching` -- generic gap, confirmed, not independently fixable
+
+**Repro, current dev tip:** 70095ms / 71987ms (two runs) vs HotSpot's 7350ms
+(from the original baseline table) = **~9.7x**. This is already a large
+improvement over both previously-recorded numbers for this class (366877ms /
+49.9x in the task handoff table, 165898ms in this doc's own 2026-07-16 table)
+-- attributable to the cumulative reflection/GC-safety and JIT-policy fixes
+other sessions landed on `dev` this same day, not to anything done this
+session. The remaining ~9.7x gap is still above the documented ~2-5x
+allocation-heavy-tight-loop ceiling, so it warranted profiling rather than
+an assumed pass.
+
+**Profiling (three checks, each a clean bisection):**
+1. **`--verbose:gc`: zero GC events for the entire 65-82s run.** The test's
+   object graph (`DefaultTemplatesVault.getDefaultRCATemplates()`, a fixed
+   set of ~20 RCA templates with nested causes/expressions, ~500 total
+   persisted rows) is too small to trigger a single young collection. Rules
+   out GC pause overhead entirely -- this is not a memory-traffic-bound
+   workload despite superficially resembling one.
+2. **`--nojit` is *slower*, not faster** (82140ms vs 70-72s with JIT on).
+   This is the opposite signal from `LockTest`/
+   `CriteriaBuilderNonStandardFunctionsTest` (where `--nojit` fixes the
+   timeout and is faster) -- it rules out JIT compile-time tax as the
+   dominant mechanism here. JIT is net-beneficial on this workload; the
+   gap is not "JIT overhead exceeds payback," it's raw execution cost.
+3. **`CRATONVM_DBG_TIER_ENQUEUE`: 2260 distinct methods enqueued, all at
+   tier=C1, zero at C2**, spread across the *entire* 65-second run (first
+   enqueue at 267ms, last at 65685ms) rather than clustered at startup.
+   Each method crosses the c1_threshold (1500 invocations) only once, late,
+   from being called a modest, steady number of times across many different
+   code paths -- not from a tight hot loop. No method ever accumulates the
+   20000 invocations needed for C2. Combined with check 2, this means most
+   of the run's CPU time is spent in either the interpreter or
+   once-compiled-C1 code across a very *wide* set of methods, never in
+   fully-optimized C2 code.
+
+**Workload shape, from the JDBC trace log:** 184 distinct
+`Created JDBC batch` / `Executing JDBC batch` events (i.e. 184 separate
+`PreparedStatement` shapes) for ~500 total inserted rows -- averaging under 3
+rows per batch before Hibernate's insert-ordering switches to a different
+entity type. Each distinct statement shape drives H2's SQL parser/planner
+through code paths that are largely new/cold relative to the last one, so
+this workload is **method-diversity-bound**, not **iteration-count-bound**:
+it is close to a worst case for a JIT-reliant VM, because JIT amortizes its
+own overhead over repeated execution of the *same* compiled method, and this
+test deliberately maximizes the number of distinct entity/table types seen
+per transaction (that's the entire point of an insert-*ordering* test).
+
+**Verdict: generic architectural gap, not an isolated fixable bug.** All
+three profiling angles (GC, JIT-tax bisection, compile-enqueue distribution)
+point away from a discrete defect and toward CratonVM's per-bytecode/
+per-call execution cost across a wide, code-diverse workload -- exactly the
+documented interpreter/JIT throughput gap
+([`bt-throughput-levers-handoff.md`](../../internal/feature-designs/bt-throughput-levers-handoff.md)),
+just manifesting worse than the 2-5x ceiling measured on tight allocation
+loops because this workload's code-path diversity prevents the JIT from
+amortizing compilation the way a hot loop does. Closing this gap would mean
+improving CratonVM's baseline interpreter/C1 dispatch throughput broadly --
+out of scope for this session and not a targeted fix. No code change made;
+no regression risk.
+
+### `LiteralRenderingTest#testIdVersionFunctions` -- effectively resolved, within generic-gap range
+
+**Repro, current dev tip:** 12940ms vs HotSpot's 8018ms = **~1.6x**. Down
+from 21.2x (169769ms, task handoff table) and 347729ms (this doc's own
+2026-07-16 table). 1.6x is comfortably inside the documented ~2-5x
+allocation-heavy-tight-loop range and close to parity -- this class no
+longer represents a throughput problem worth further investigation. Like
+`InsertOrderingRCATest`, the improvement is attributable to cumulative
+fixes landed on `dev` by other sessions this same day (reflection/GC-safety
+sweep, JIT threshold raise), not to anything done this session. No
+profiling beyond the repro was needed given the result is already at
+target; no code change made.
 
 ## Related finding (2026-07-16): CriteriaBuilderNonStandardFunctionsTest joins this shape, root cause narrowed to JIT compile-time tax
 
