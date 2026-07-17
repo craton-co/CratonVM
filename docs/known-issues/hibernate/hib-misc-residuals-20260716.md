@@ -1173,6 +1173,109 @@ invoke-dispatch codegen used far beyond `BigInteger` would be worse than no
 fix, and this session could not even get to "which of the two hypotheses in
 finding #6 is right," let alone confirm a specific defective instruction).
 
+
+## Update 2026-07-17 (post-`f377eb69` GC-conservative-scan-fix session): the hypothesis that the `LockTest` conservative-roots GC-scan fix (`f377eb69`) also fixed this BigInteger AIOOBE is **REFUTED on git-ancestry grounds**; ~930k fresh trials + 5 clean end-to-end runs still 0 occurrences, but that is non-reproduction (consistent with the prior two sessions), not a fix. Still OPEN.
+
+A session was dispatched specifically to test the hypothesis that `f377eb69`
+(`fix(jit): incremental unregistered-JIT-frame scan when recursion deepens`,
+branch `fix/hib-jit-tiering-heuristic-20260717`, the `LockTest`/GC
+conservative-scan fix documented in the `LockTest` section below) had
+*incidentally* fixed — or shared a mechanism with — this BigInteger AIOOBE,
+on the grounds that both live in the same GC-root-scanning-near-JIT-frames
+subsystem (`vm/src/jit/conservative_roots.rs`).
+
+**The hypothesis is refuted by the commit graph, before any trial was run:**
+
+- `f377eb69` is dated **2026-07-17 04:17:45 UTC**.
+- It is a **strict ancestor of `08808a57`** (05:14 UTC) — the exact tip on
+  which the `CRATONVM_DBG_AIOOBE3` diagnostic session (entry above) captured
+  the **one decisive live crash** and reported the repro firing "at ~88% on
+  `dev@08808a57`."
+- It is likewise a strict ancestor of **`67db1afb`** (05:33 UTC), the
+  620,000-trial non-reproduction tip.
+- The exact incremental-band code `f377eb69` introduced (the
+  `search_lo < verified_lo` "recursing deeper" branch in
+  `scan_active_jit_frames`) is verified **present in the trees of both
+  `08808a57` and `67db1afb`**, and at the current `origin/dev` tip
+  (`git show <tip>:vm/src/jit/conservative_roots.rs | grep 'search_lo < verified_lo'`
+  → present in all three). It was not reverted; a later perf commit
+  (`b7a1ed84`) touched the same file but did not remove it.
+
+Therefore `f377eb69` was **already live in the binary that produced the one
+confirmed live crash**. A fix that predates the last confirmed reproduction
+of a bug cannot be what fixed it. This is corroborated independently by the
+`CRATONVM_DBG_AIOOBE3` entry's own wording — it states the repro was
+"confirmed not fixed by anything landed between `dev@3e74dd5a` and
+`dev@08808a57`," a commit range that **contains** `f377eb69`. The subsequent
+non-reproduction across 620k+ trials happened on binaries that also already
+contained `f377eb69` — same as the crash binary — so the fix explains
+neither the crash nor the later dormancy. It is orthogonal to this bug.
+
+The broader "maybe a *different* correctness bug lurks in the same
+conservative-scan subsystem" framing is also disfavored by pre-existing
+evidence, not just the specific-commit refutation: the `CRATONVM_DBG_AIOOBE3`
+entry's captured `ObjectHeader` dump showed `forwarding_ptr=0x0` on a
+fully self-consistent, non-relocated `int[2]` — i.e. the object was never
+moved and no GC-root/stale-pointer tracking was involved. That points at
+genuine value/index data corruption in the divide path, away from (not
+toward) any missed-root-during-scan mechanism. `f377eb69`'s change is
+purely to the *detection* scan's extent (it narrows how much stack is
+re-scanned; it never changes what gets marked once a frame is found), which
+cannot introduce or remove a data-corruption bug of this shape.
+
+**Empirical work this session (for completeness, against a fresh binary that
+includes `f377eb69` and ~30 later `dev` commits):**
+
+- Built a fresh `origin/dev` release binary in an isolated worktree
+  (`/data/data/wt-hib-biginteger-postgcfix-20260717`, `dev@394f9c93`,
+  `CARGO_PROFILE_RELEASE_LTO=off`), `f377eb69` confirmed present; frozen at
+  `/data/data/frozen-postgcfix-20260717-cratonvm`, md5
+  `a29c51eb3bf76b760b7acabe8dd1333e`.
+- **Stress sweep, ~930,000 combined trials, 0 failures / 0 `AIOOBE3-DIAG` /
+  0 crashes:** `SmallDividendRepro` (the sub-second, Hibernate-free repro
+  the `CRATONVM_DBG_AIOOBE3` entry reported firing "reliably on the first
+  stressed run") under `CRATONVM_DBG_GC_STRESS` at 65536 / 16384 / 4096,
+  `CRATONVM_DBG_AIOOBE3=1`, with and without `CRATONVM_TIER_C1_THRESHOLD=50`
+  to force early compilation. Split as: 540,000 trials (108×5000) against
+  the frozen confirmed-crash binary `cratonvm-biginteger-devtip-20260717`
+  **and** the pre-`f377eb69` control `cratonvm-biginteger-base-20260717`
+  (built 04:16, one minute before `f377eb69` — an explicit A/B: neither the
+  pre-fix nor the post-fix frozen binary reproduced), plus 390,000 trials
+  (78×5000) against the fresh post-fix build. Zero `@@BAD` wrong-quotient
+  results and zero AIOOBE across all of it.
+- **5 whole-class end-to-end runs** via the real harness (`CratonRunner`,
+  `DiscoverySelectors.selectClass`, `CRATONVM_DBG_AIOOBE3=1`) of
+  `DefaultCatalogAndSchemaTest` — the multi-`@Test`-method-in-one-process
+  condition the "scaling-investigation session" identified as the ~47-52%
+  whole-class trigger — 3 on the frozen post-fix `devtip` binary
+  (ms=649230/678809/680405) + 2 on the fresh build (ms=641071/673979):
+  **every run `found=132 started=132 ok=132 failed=0 aborted=0`**, matching
+  the recorded HotSpot baseline exactly. Zero
+  `ArrayIndexOutOfBoundsException` / `smallToString` / `AIOOBE3-DIAG` in any
+  run.
+- `cargo test --release -p cratonvm-jit --lib` on the documented tip:
+  **906/906 pass** (no regression; matches the `f377eb69` fix session's own
+  report for this target).
+
+**Conclusion: NOT closing.** The `f377eb69` hypothesis is refuted; this
+session's ~930k-trial + end-to-end non-reproduction is fully consistent with
+the immediately-preceding two sessions' non-reproduction (this is now the
+**third consecutive session** unable to reproduce, cumulative >1.5M trials
+across them) and, by this doc's own standing conclusion, absence of failure
+is not evidence of a fix while the `CRATONVM_DBG_AIOOBE3` artifact-based live
+capture stands. The one meaningful advance this session adds is **eliminating
+`f377eb69`/the conservative-roots-scan subsystem as the explanation**, so a
+future session should not re-test that angle. The concrete next step is
+unchanged from the two entries above: a genuinely long-running (many-hours,
+unattended) loop of the frozen crashing binary +
+`SmallDividendRepro`/`CRATONVM_DBG_GC_STRESS=65536`/`CRATONVM_DBG_AIOOBE3=1`
+to obtain a *second* live capture, then isolate `divideMagnitude`'s two
+`mulsub` call sites (`limit>=2` vs `limit==1`) and disassemble the
+final-digit call site's `R8`/`RDX` argument-register loads against a real
+failing process. No code change made this session (nothing reproduced to
+validate a fix against; the only candidate mechanism was refuted, not
+replaced).
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
