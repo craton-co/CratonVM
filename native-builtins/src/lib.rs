@@ -33784,18 +33784,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_snapshot_list_itr_previous_index,
     );
-    registry.register(array_list_itr, "remove", "()V", |_ctx, _args| Ok(None));
+    registry.register(
+        array_list_itr,
+        "remove",
+        "()V",
+        native_arraylist_list_itr_remove,
+    );
     registry.register(
         array_list_itr,
         "set",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_set,
     );
     registry.register(
         array_list_itr,
         "add",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_add,
     );
     for empty_iterator in [
         "java/util/Collections$EmptyIterator",
@@ -36471,6 +36476,96 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // HIB-DST-STARTYEAR (2026-07-17): historical DST-adoption year for
+    // zones in the `tz_dst_rule` "EU rule" branch above.
+    //
+    // `tz_dst_rule` only knows the zone's CURRENT/modern recurring DST
+    // rule and applies it to every date unconditionally — including dates
+    // long before the zone had daylight saving at all. Confirmed live
+    // (standalone repro against real HotSpot JDK 25, cross-checked with
+    // `sun.util.calendar.ZoneInfo`'s own legacy `TimeZone.getOffset(long)`
+    // path, not just `java.time`):
+    // `TimeZone.getTimeZone("Europe/Amsterdam").getOffset(epochMillisFor(
+    // "1892-04-01T00:00:00Z"))` returned 7200000ms (+2h, modern DST rule
+    // wrongly applied) on CratonVM vs 3600000ms (+1h, no DST — HotSpot's
+    // own zone data correctly has no DST that far back) on real HotSpot.
+    // This is a distinct bug from HIB-PARIS-LMT above: that one is a
+    // one-time historical rawOffset cutover (LMT precision); this one is
+    // the recurring DST *rule itself* being retroactively misapplied to
+    // an era before the zone had DST in any form.
+    //
+    // Each value below is the first year real HotSpot JDK 25's own legacy
+    // `TimeZone.getOffset(long)` path reports ANY winter/summer offset
+    // split for that zone at all — i.e. the smallest year where
+    // `getOffset()` at a fixed mid-January instant differs from
+    // `getOffset()` at a fixed mid-July instant of the same year — found
+    // by scanning year-by-year from 1850 against real HotSpot JDK 25
+    // directly (not derived from a general historical claim: per this
+    // project's own hard-won lesson from HIB-PARIS-LMT, HotSpot's compiled
+    // legacy tzdata does not always carry the textbook-historical answer;
+    // what this project targets is matching HotSpot, not the real world).
+    //
+    // `alloc_synth_timezone` gates the constructed `SimpleTimeZone` with
+    // real `setStartYear(int)` bytecode using this value — the exact
+    // real-JDK mechanism for exactly this purpose (`SimpleTimeZone`'s own
+    // `getOffset`/`getOffsets` bytecode checks `year < startYear` and
+    // returns `rawOffset` with no DST applied when it's before the start
+    // year — see `javap -c java.util.SimpleTimeZone`), so no calendar-math
+    // reimplementation is needed on the Rust side; the real class does the
+    // gating itself, exactly as it would for a real HotSpot-constructed
+    // `SimpleTimeZone`.
+    //
+    // SCOPE LIMIT: this is a single flip year per zone, not full
+    // historical tzdata. Real HotSpot's own zone data for every zone below
+    // has a much messier history AFTER this adoption year — WWI-era DST
+    // suspended again in some zones during the interwar years, WWII
+    // occupation-driven changes to the *winter* (raw) offset itself
+    // (independent of any DST rule), and a widespread POST-WWII
+    // suspension of DST across Europe not reintroduced until the 1970s
+    // oil-crisis era / the 1996 EU-wide harmonization that `tz_dst_rule`'s
+    // modern rule actually models. Gating on just the first-ever-adoption
+    // year does NOT make CratonVM match HotSpot for that entire messy
+    // 1916(ish)-1980(ish) middle era — it only removes the strictly-wrong
+    // "DST applied to a date before the zone had DST at all" case, which
+    // is this fix's actual target (pre-20th-century dates, and more
+    // generally any date before each zone's real first-ever DST year).
+    // That intermediate-era imperfection is pre-existing — CratonVM's flat
+    // modern-rule model could never have matched that era, gated or not —
+    // and is unchanged by this fix, not a new regression.
+    fn dst_start_year(zone_id: &str) -> Option<i32> {
+        match zone_id {
+            // Europe/Paris: real HotSpot's legacy path first shows a
+            // winter/summer offset split in 1911 — the same year as the
+            // HIB-PARIS-LMT LMT->WET rawOffset cutover above (France
+            // adopted WET, then DST, in short order).
+            "Europe/Paris" => Some(1911),
+            // WWI-era DST adoption block: CET, Germany, Italy, Norway,
+            // Netherlands, Belgium, Austria, Denmark, Sweden, Poland,
+            // Czechia, Hungary, UK all first show a winter/summer split
+            // in 1916 against real HotSpot.
+            "CET" | "Europe/Berlin" | "Europe/Rome" | "Europe/Oslo" | "Europe/Amsterdam"
+            | "Europe/Brussels" | "Europe/Vienna" | "Europe/Copenhagen" | "Europe/Stockholm"
+            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London"
+            | "GB" => Some(1916),
+            // Spain: real HotSpot's legacy path shows an earlier (1901)
+            // Madrid-Mean-Time -> WET rawOffset switch that is NOT a DST
+            // split (winter == summer that year); the first genuine
+            // winter/summer split is 1918.
+            "Europe/Madrid" => Some(1918),
+            "Europe/Helsinki" => Some(1921),
+            "Europe/Bucharest" => Some(1932),
+            // Switzerland: real HotSpot shows no DST split at all until
+            // the short-lived 1941 wartime DST.
+            "Europe/Zurich" => Some(1941),
+            // Greece: real HotSpot's legacy path shows an earlier (1917)
+            // LMT -> EET rawOffset switch that is NOT a DST split (winter
+            // == summer that year); the first genuine winter/summer split
+            // is 1943 (wartime).
+            "Europe/Athens" => Some(1943),
+            _ => None,
+        }
+    }
+
     // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
     // offsets for zones whose real IANA tzdata models a historical LMT-style
     // offset before their first modern standardization transition.
@@ -36563,6 +36658,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "(ILjava/lang/String;IIIIIIIIIII)V",
                 &args,
             ) {
+                // HIB-DST-STARTYEAR (2026-07-17): gate the just-constructed
+                // SimpleTimeZone's DST rule to real HotSpot's own historical
+                // adoption year for this zone via the real
+                // `SimpleTimeZone.setStartYear(int)` bytecode — see
+                // `dst_start_year` above for how these years were found and
+                // what this fix does/doesn't cover. Best-effort: any
+                // dispatch failure just leaves the SimpleTimeZone ungated
+                // (this project's pre-fix, DST-applied-year-round
+                // behavior) — never worse than before this fix.
+                if let Some(start_year) = dst_start_year(id_str) {
+                    let _ = ctx.invoke_virtual_bytecode_only(
+                        obj,
+                        "setStartYear",
+                        "(I)V",
+                        &[Value::Int(start_year)],
+                    );
+                }
                 return cratonvm_types::Value::Object(Some(obj));
             }
         }
@@ -76971,6 +77083,104 @@ fn native_arraylist_list_itr_list(
         Value::Object(Some(list)) => Some(list),
         _ => None,
     }
+}
+
+/// `ArrayList$ListItr.set(Object)` -- real live mutation against the
+/// backing `ArrayList` (found via `native_arraylist_list_itr_list`), NOT a
+/// no-op. Root-caused 2026-07-17: this class's `set`/`add`/`remove` were
+/// previously registered as hardcoded `|_ctx, _args| Ok(None)` stubs (a
+/// leftover from an earlier, genuinely-immutable "snapshot" design), but
+/// `native_arraylist_list_iterator` and the sibling `next`/`previous`
+/// natives above already carry a LIVE backing-list reference in the
+/// `this$0`-equivalent slot -- so the iterator is not actually a frozen
+/// snapshot, and silently dropping `set`/`add`/`remove` produced silent
+/// data loss for any real-JDK code using `List.listIterator()` mutators
+/// (e.g. ANTLR4's `IntervalSet.add(int)`, which merges adjacent intervals
+/// via `ListIterator.set`/`.previous`/`.remove` -- this exact bug corrupted
+/// Groovy's ANTLR4-generated parser ATN after `ATNDeserializer.optimizeSets`,
+/// producing spurious `Unexpected input` parse failures for basic numeric/
+/// string literals). Mirrors real-JDK `ArrayList$ListItr.set`'s
+/// `IllegalStateException` guard (`lastRet < 0`) and delegates the actual
+/// write to the already-correct `native_al_set`.
+fn native_arraylist_list_itr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (_, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "set".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_set(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret), e],
+    )?;
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.add(Object)` -- real live insertion at the cursor
+/// position. See `native_arraylist_list_itr_set` for the root-cause
+/// narrative; mirrors real-JDK `ArrayList$ListItr.add`'s cursor/lastRet
+/// bookkeeping (advance cursor past the inserted element, reset lastRet to
+/// -1 so a following `remove()`/`set()` correctly throws
+/// `IllegalStateException`).
+fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_add_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(cursor), e],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.remove()` -- real live removal of the last element
+/// returned by `next()`/`previous()`. See `native_arraylist_list_itr_set`
+/// for the root-cause narrative; mirrors real-JDK `ArrayList$Itr.remove`'s
+/// cursor rewind (`cursor = lastRet`) and `lastRet` reset.
+fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    cratonvm_native_collections::native_al_remove_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(last_ret));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
 }
 
 fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

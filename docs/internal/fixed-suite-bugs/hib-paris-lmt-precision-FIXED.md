@@ -218,3 +218,168 @@ test); flagged for a future session, e.g. via `SimpleTimeZone.setStartYear()`.
 
 Branch `fix/hib-paris-lmt-precision-20260717`, commit `31544c27`
 (`native-builtins/src/lib.rs`), merged to `dev` at `03d7e98f`.
+
+
+## Addendum (2026-07-17): retroactive-DST "related, out-of-scope finding" above — FIXED
+
+The "Related, out-of-scope finding" section above flagged a separate,
+pre-existing bug found while probing generality for the LMT fix:
+CratonVM's synthetic `SimpleTimeZone` construction (`alloc_synth_timezone`)
+retroactively applies the *modern* recurring EU DST rule
+(`tz_dst_rule`) to every date unconditionally, including dates from
+before the zone had any daylight-saving at all. That bug is now fixed.
+
+### Confirmed divergence (pre-fix)
+
+Standalone repro (`GeneralityRepro.java`, same technique as the LMT fix
+above), against real HotSpot JDK 25:
+
+```
+TimeZone.getTimeZone("Europe/Amsterdam").getOffset(epochMillisFor("1892-04-01T00:00:00Z"))
+  CratonVM (pre-fix): 7200000 ms (+2h, modern DST rule wrongly applied)
+  Real HotSpot:       3600000 ms (+1h, no DST — correct, DST didn't exist yet)
+```
+
+### Fix
+
+Added `dst_start_year(zone_id) -> Option<i32>` next to `tz_dst_rule` in
+`native-builtins/src/lib.rs`, and `alloc_synth_timezone` now calls the
+constructed `SimpleTimeZone`'s own real `setStartYear(int)` bytecode
+(via `ctx.invoke_virtual_bytecode_only`) whenever a zone has a
+`dst_start_year` entry. `SimpleTimeZone`'s real `getOffset`/`getOffsets`
+bytecode already checks `year < startYear` and forces no-DST when true
+(confirmed via `javap -c java.util.SimpleTimeZone`) — so this fix needs
+no calendar-math reimplementation on the Rust side; the real JDK class
+does the gating itself, exactly as it would for a real
+HotSpot-constructed `SimpleTimeZone`.
+
+### How the per-zone years were found
+
+Every zone in `tz_dst_rule`'s "EU rule" branch (20 zones: `CET`,
+`Europe/Paris`, `Europe/Berlin`, `Europe/Rome`, `Europe/Madrid`,
+`Europe/Oslo`, `Europe/Amsterdam`, `Europe/Brussels`, `Europe/Vienna`,
+`Europe/Copenhagen`, `Europe/Stockholm`, `Europe/Zurich`,
+`Europe/Warsaw`, `Europe/Prague`, `Europe/Budapest`, `Europe/London`,
+`GB`, `Europe/Athens`, `Europe/Bucharest`, `Europe/Helsinki`) was probed
+directly against real HotSpot JDK 25 (`ProbeFirstDst.java`): for each
+zone, scan year-by-year from 1850 for the first year where
+`TimeZone.getOffset()` at a fixed mid-January instant differs from
+`TimeZone.getOffset()` at a fixed mid-July instant of the *same* year
+(i.e. the first year real HotSpot's own legacy Calendar path ever shows
+a seasonal offset split at all). Per the LMT fix's own lesson above
+(HotSpot's compiled legacy tzdata does not always carry the
+textbook-historical answer), every value was found this way, not
+assumed from general historical claims — matching HotSpot is the goal,
+not matching the real world:
+
+| Zone | `dst_start_year` |
+| --- | --- |
+| `Europe/Paris` | 1911 |
+| `CET`, `Europe/Berlin`, `Europe/Rome`, `Europe/Oslo`, `Europe/Amsterdam`, `Europe/Brussels`, `Europe/Vienna`, `Europe/Copenhagen`, `Europe/Stockholm`, `Europe/Warsaw`, `Europe/Prague`, `Europe/Budapest`, `Europe/London`, `GB` | 1916 |
+| `Europe/Madrid` | 1918 |
+| `Europe/Helsinki` | 1921 |
+| `Europe/Bucharest` | 1932 |
+| `Europe/Zurich` | 1941 |
+| `Europe/Athens` | 1943 |
+
+Two zones (`Europe/Madrid`, `Europe/Athens`) have an *earlier* apparent
+offset change (1901 and 1917 respectively) that a naive "first summer
+offset change year-over-year" probe would misidentify as DST adoption —
+those are actually one-time *raw*-offset switches (Madrid: Madrid Mean
+Time → WET; Athens: LMT → EET), not DST, confirmed by checking that
+winter and summer offsets both moved together that year (no seasonal
+split). The winter-vs-summer-split methodology above correctly skips
+past those to each zone's real first DST year.
+
+### Scope limit (deliberate, documented, not a partial-fix apology)
+
+This is a single flip year per zone, not full historical tzdata. Real
+HotSpot's own zone data for every zone above has a much messier history
+**after** its adoption year — WWI-era DST suspended again in some zones
+during the interwar years, WWII occupation-driven changes to the
+*winter* (raw) offset itself (independent of any DST rule), and a
+widespread post-WWII suspension of DST across Europe not reintroduced
+until the 1970s oil-crisis era / the 1996 EU-wide harmonization that
+`tz_dst_rule`'s modern rule actually models. Gating on just the
+first-ever-adoption year does **not** make CratonVM match HotSpot for
+that entire messy 1911/1916-1980(ish) middle era. That imperfection is
+pre-existing — CratonVM's flat modern-rule model could never have
+matched that era, gated or not — and is unchanged by this fix, not a
+new regression (see verification below: zero regressions across 280
+probed data points, 72 newly fixed, 36 still off — all 36 either in
+that documented messy middle era, or the already-known/documented
+pre-1911 Paris very-far-past-LMT-cutover edge case below).
+
+One related pre-existing edge also surfaced during verification and is
+explicitly **not** addressed here: for very old dates well before even
+the LMT-era cutover this codebase already models (e.g. `Europe/Paris` at
+year 1750/1800), CratonVM's existing `historical_lmt_offset` table
+applies its single fixed LMT offset (561s) for *any* date before the
+1911 cutover, unconditionally, while real HotSpot's compiled legacy
+tzdata apparently reverts to the flat modern offset (3600s) for dates
+that old (presumably outside the range its compiled data actually
+carries). This is a scope limit of the existing (already-landed)
+`historical_lmt_offset` mechanism, not something this DST-start-year
+fix introduces or touches.
+
+### Verification
+
+- `GeneralityRepro.java`: post-fix, `Europe/Amsterdam` @
+  `1892-04-01T00:00:00Z` and `Europe/Oslo` @ `1893-03-01T00:00:00Z` both
+  now return the correct standard (no-DST) offset, matching real
+  HotSpot exactly. Modern dates (2020) and an unrelated zone
+  (`America/New_York`) are unchanged, still matching.
+- Comprehensive cross-check (`ComprehensiveDstProbe.java`): all 20
+  `tz_dst_rule` EU-rule zones, 7 years each (well before adoption, just
+  before adoption, just after adoption, and two modern sanity years),
+  winter + summer instant each — 280 data points total, diffed against
+  real HotSpot JDK 25 for both the pre-fix baseline binary and the
+  post-fix binary:
+  - **0 regressions** (no data point that matched HotSpot pre-fix now
+    mismatches).
+  - **72 data points newly fixed** (mismatched pre-fix, match post-fix)
+    — every one of these is a pre-adoption-year date that was wrongly
+    getting DST applied pre-fix.
+  - **36 data points still mismatched** — all in the documented
+    messy-middle-era / far-past-LMT scope limits above; most of these
+    also moved *closer* to the correct HotSpot value post-fix even
+    though not exact (e.g. `Europe/Madrid` 1917 summer: 7200s pre-fix →
+    3600s post-fix vs HotSpot's 0s; `Europe/Warsaw` 1915: 7200/3600s
+    pre-fix → 3600/3600s post-fix vs HotSpot's 5040/5040s).
+  - **172 data points already correct**, unchanged.
+- Regression re-check of this doc's own LMT fix and its test suite,
+  rebuilt with this DST-start-year change on top (same
+  `alloc_synth_timezone`/`SimpleTimeZone` construction path):
+  `ZonedDateTimeTest`: `found=608 started=608 ok=404 failed=0
+  aborted=204 skipped=0`; `LocalDateTimeTest`: `found=162 started=162
+  ok=90 failed=0 aborted=72 skipped=0`; `InstantTests`: `found=204
+  started=204 ok=112 failed=0 aborted=92 skipped=0` — all three
+  byte-for-byte identical to the pre-existing (pre-this-fix) results
+  documented above. No regression.
+
+### Does this unblock any currently-failing test?
+
+No, confirmed by inspection, not just assumption. Real Hibernate ORM's
+`ZonedDateTimeTest.testData()` *does* have parameterized cases at
+pre-adoption dates for the exact zones this fix targets (`Europe/Oslo`
+@ 1892, `Europe/Amsterdam` @ 1600/1900), but:
+- The `Europe/Oslo` @ 1892 and `Europe/Amsterdam` @ 1600 cases are both
+  explicitly `skippedForDialects(... hasOddDstBehavior() ...)` in the
+  test source itself, annotated `// Affected by HHH-13266
+  (JDK-8061577)` — a real, known HotSpot/JDK DST bug the test suite
+  already works around by skipping, independent of this project.
+- The `Europe/Amsterdam` @ 1900 cases use `2018-01-01`-style **January**
+  instants (outside the March-October DST window for every year), so
+  they never exercised the retroactive-DST bug in the first place —
+  correct on both sides of this fix.
+
+So this fix is a genuine correctness improvement (CratonVM now matches
+HotSpot for 72 more data points, zero regressions) but, as originally
+flagged, was not blocking any currently-passing-vs-failing test
+transition — consistent with the original "not currently blocking any
+known test" framing.
+
+## Commit (addendum)
+
+Branch `fix/hib-dst-retroactive-startyear-20260717`, commit TBD
+(`native-builtins/src/lib.rs`), merged to `dev`.
