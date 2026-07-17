@@ -494,8 +494,13 @@ pub fn marshal_arg(
     }
 }
 
-/// Read the absolute base address of a MemorySegment synthetic
-/// (field 0 + field 5 offset).
+/// Read the absolute address of a `MemorySegment`.
+///
+/// CratonVM-created segments use `[base@0, size@1, ..., offset@5]`; real
+/// JDK `NativeMemorySegmentImpl`/`MappedMemorySegmentImpl` instances instead
+/// store their absolute address in the inherited `min` field.  This is the
+/// one canonical conversion point for downcalls and for the Panama bridge
+/// methods that must accept either representation.
 pub fn segment_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
     // Real JDK-loaded NativeMemorySegmentImpl/MappedMemorySegmentImpl instances
     // do NOT share CratonVM's synthetic (base@0, offset@5) MemorySegment layout.
@@ -524,6 +529,21 @@ pub fn segment_address(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
     }
     match ctx.get_field(seg, 0) {
         Value::Long(n) => n,
+        _ => 0,
+    }
+}
+
+/// Read a `MemorySegment`'s declared byte size in either representation.
+///
+/// The real JDK implementation names this field `length`; the synthetic
+/// representation keeps it in field 1.  Prefer the name lookup so a real
+/// mapped segment can never be mistaken for the synthetic layout.
+pub fn segment_byte_size(ctx: &dyn NativeContext, seg: ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(seg, "length") {
+        return v;
+    }
+    match ctx.get_field(seg, 1) {
+        Value::Long(v) => v,
         _ => 0,
     }
 }

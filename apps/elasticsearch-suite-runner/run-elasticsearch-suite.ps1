@@ -153,6 +153,14 @@ function Start-RedirectedProcess {
     [string]$StderrPath
   )
 
+  # These paths are also used by `-AllModes` for the child PowerShell
+  # consoles.  Create their parents here instead of relying on a caller's
+  # sibling-directory side effect.
+  foreach ($path in @($StdoutPath, $StderrPath)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
+
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.FileName = $FilePath
   $psi.WorkingDirectory = $WorkingDirectory
@@ -184,6 +192,10 @@ function Complete-RedirectedProcess([object]$Record) {
   $stderr = ''
   try { $stdout = $Record.stdoutTask.Result } catch {}
   try { $stderr = $Record.stderrTask.Result } catch {}
+  foreach ($path in @($Record.stdoutPath, $Record.stderrPath)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
   [System.IO.File]::WriteAllText($Record.stdoutPath, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.stderrPath, $stderr, [System.Text.Encoding]::UTF8)
   $exitCode = $Record.proc.ExitCode
@@ -477,9 +489,26 @@ function New-ProcessRecord {
 
   $safe = Get-LogBaseName -Module $module -Class $class
   $logDir = Join-Path $ModeOut 'logs'
-  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
+  # Windows PowerShell 5.1/.NET Framework still hits MAX_PATH for a normal
+  # class name when callers use a long worktree, work directory, or run name.
+  # Keep the documented per-mode layout when it fits; otherwise use a compact
+  # deterministic subdirectory under the work root.  Include ModeOut in the
+  # hash so repeated runs retain separate logs instead of overwriting them.
+  if ($env:OS -eq 'Windows_NT' -and $outFile.Length -ge 240) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $key = [System.Text.Encoding]::UTF8.GetBytes("$ModeOut`t$module`t$class")
+      $hash = ([System.BitConverter]::ToString($sha.ComputeHash($key)) -replace '-', '').Substring(0, 16).ToLowerInvariant()
+    } finally {
+      $sha.Dispose()
+    }
+    $logDir = Join-Path (Join-Path $script:WorkRoot 'logs') $hash
+    $outFile = Join-Path $logDir "$safe.out.log"
+    $errFile = Join-Path $logDir "$safe.err.log"
+  }
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
@@ -603,6 +632,10 @@ function Complete-ProcessRecord {
   $stderr = ''
   try { $stdout = $Record.stdoutTask.Result } catch {}
   try { $stderr = $Record.stderrTask.Result } catch {}
+  foreach ($path in @($Record.outFile, $Record.errFile)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
   [System.IO.File]::WriteAllText($Record.outFile, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.errFile, $stderr, [System.Text.Encoding]::UTF8)
 
@@ -681,7 +714,11 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $javaName = if ($IsWindows) { 'bin\java.exe' } else { 'bin/java' }
+  # `$IsWindows` is only defined by PowerShell 6+.  This runner's documented
+  # invocation uses Windows PowerShell 5.1 (`powershell.exe`), where that
+  # unset variable silently selected the Unix `bin/java` path and prevented
+  # every local run before a JVM could start.
+  $javaName = if ($env:OS -eq 'Windows_NT') { 'bin\java.exe' } else { 'bin/java' }
   $java = Join-Path $jdk $javaName
   if (-not (Test-Path $java)) { Die "HotSpot java not found: $java" }
   $craton = ''
