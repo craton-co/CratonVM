@@ -249,9 +249,9 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
         }
         .into(),
         ErrorKind::AddrInUse => ioex(format!("BindException: Address already in use: {ctx}: {e}")),
-        ErrorKind::AddrNotAvailable => {
-            ioex(format!("BindException: Cannot assign requested address: {ctx}: {e}"))
-        }
+        ErrorKind::AddrNotAvailable => ioex(format!(
+            "BindException: Cannot assign requested address: {ctx}: {e}"
+        )),
         ErrorKind::PermissionDenied => {
             ioex(format!("BindException: Permission denied: {ctx}: {e}"))
         }
@@ -901,9 +901,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                eprintln!(
-                    "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
-                );
+                eprintln!("[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}");
                 // 2026-07-16 follow-up: pin the exact Java call site issuing
                 // this close(). `NativeContext::capture_stack_trace` needs no
                 // `Thread` object handle -- it walks the CURRENT thread's live
@@ -914,7 +912,10 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 // conventional stack-trace reading order -- `capture_stack_trace`
                 // itself returns outer->inner, so reverse it here.
                 let raw_trace = ctx.capture_stack_trace(0);
-                eprintln!("[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)", raw_trace.len());
+                eprintln!(
+                    "[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)",
+                    raw_trace.len()
+                );
                 for entry in raw_trace.iter().rev() {
                     let file = entry.source_file.as_deref().unwrap_or("?");
                     eprintln!(
@@ -1408,22 +1409,33 @@ fn fnv1a64(data: &[u8]) -> u64 {
 
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.read(buf) {
-        Ok(0) => Ok(Some(-1)),
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.read(buf) {
+            Ok(0) => return Ok(Some(-1)),
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return Ok(None)
+            }
+            // EINTR consumes no bytes. Retrying is required instead of
+            // reporting a short/zero channel operation or aborting a Tomcat
+            // response. Some Linux wrappers preserve it only as raw errno 4.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
 fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.write(data) {
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.write(data) {
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+            // Like read(), a signal interruption has not written any bytes;
+            // retry so a header/body gathering write cannot be abandoned.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -1543,10 +1555,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 .unwrap_or(0);
             let hash = fnv1a64(&buf[..n as usize]);
             let dump_len = (n as usize).min(64);
-            let hex: String = buf[..dump_len]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
+            let hex: String = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
             eprintln!(
                 "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
             );
@@ -2210,7 +2219,11 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             .unwrap_or(0);
         eprintln!(
             "[SC_ACCEPT] t={ms} listener_id={id:#x} peer={peer} source={}",
-            if preaccepted_used { "preaccepted" } else { "fresh" }
+            if preaccepted_used {
+                "preaccepted"
+            } else {
+                "fresh"
+            }
         );
     }
 
