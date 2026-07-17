@@ -21,6 +21,34 @@ This document tracks the **genuine remaining failures**.
     (`found=9 succ=9 fail=0`, all 9 methods including both previously-crashing ones now pass, zero
     corruption-signature log lines). Not this session's fix; attributing correctly rather than
     claiming credit. Full history of the original investigation kept below for context.
+  *   **2026-07-17 independent re-confirmation** (separate task, separate worktree, no code
+    changes): re-verified the FIXED status above from scratch rather than trusting the prior
+    session's self-report, per this codebase's own "verify merged state, not agent self-reports"
+    lesson. Deliberately used a **maximally independent setup** to rule out any shared-fixture
+    artifact: a brand-new `git clone` of upstream `spring-projects/spring-framework` (not a reused
+    worktree -- the host's disk-pressure cleanup had deleted every prior spring-framework checkout
+    on this host by the time this task started), built fresh via Gradle (`:spring-context:testClasses`,
+    version `7.1.0-SNAPSHOT`, single `byte-buddy-1.18.3`/`mockito-core-5.23.0` on the classpath),
+    against a from-scratch `cargo build --release` of CratonVM at `dev` tip `56728b1a` (confirmed via
+    `git merge-base --is-ancestor fb15be63 origin/dev` that the fix commit is an ancestor). Ran the
+    real `ImportSelectorTests` class (`MethodRun`/JUnit-Platform-launcher pattern), both individually
+    per previously-crashing method and as the full 9-method class, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`,
+    real JDK 25: **`RESULT started=9 succeeded=9 failed=0`, twice in a row, zero corruption-signature
+    log lines, zero `StackOverflowError`.** Confirms the FIXED status is real, not an artifact of a
+    stale/shared build. **Bonus finding for future sessions** (unrelated to this bug, cost real time
+    to diagnose): a `NoClassDefFoundError` on `StandardBeanExpressionResolver$1` reproduced
+    deterministically on the *first* Gradle-cache-restored build of `spring-context` (`FROM-CACHE`
+    task outputs) even though the `.class` file was verifiably present on disk -- traced to Gradle's
+    build-cache restore silently producing an incomplete `classes/java/main` tree, almost certainly
+    because this host's chronic root-filesystem (`/`) 100%-full episodes corrupted an in-progress
+    cache extraction earlier in the session. Forcing `--rerun-tasks --no-build-cache` on
+    `:spring-context:compileJava`/`testClasses`/`jar`/`testFixturesJar` produced a correct tree and
+    made the error disappear; this had nothing to do with the Mockito/GC bug and would be worth its
+    own throwaway-repro note if it recurs. Also note for reproducing on this host: `GRADLE_USER_HOME`
+    and `-Djava.io.tmpdir` both need to be redirected off `/` (e.g. to `/data/tmp`) -- Mockito's
+    self-attach boot-jar write and Gradle's own caches both fail with `IOException: No space left on
+    device` on the chronically-full root filesystem otherwise, which can otherwise be misread as a
+    CratonVM bug.
   *   **2026-07-16 pre-fix status (superseded above, kept for history)**: symptom shape changed
     2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
     original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
