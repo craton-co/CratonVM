@@ -81569,7 +81569,7 @@ fn simple_java_format(ctx: &mut dyn NativeContext, fmt: &str, args: &[Value]) ->
                     arg_idx += 1;
                 }
                 'n' => {
-                    result.push('\n');
+                    result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
                 }
                 '%' => {
                     result.push('%');
