@@ -5,7 +5,7 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — CLOSED (corruption); real, distinct `ArrayIndexOutOfBoundsException`/`InvalidMappingException` bug now exposed, NEW and OPEN (2026-07-16)
+## `DefaultCatalogAndSchemaTest` — GC-corruption family CLOSED; BigInteger AIOOBE/InvalidMappingException residual CONFIRMED real (2026-07-17 ObjectHeader diagnostic) but extremely fragile to trigger, root cause STILL OPEN
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
@@ -903,6 +903,116 @@ used far beyond `BigInteger` would be worse than no fix.
    overload a low-probability suspect on its own, but does not rule out
    `divisor`'s *header/reference* being corrupted by something else before
    `mulsub` reads it.
+
+## Update 2026-07-17 (follow-up session, concurrent with the `CRATONVM_DBG_AIOOBE3` session above): could NOT reproduce despite extensive re-verification — including with that session's own frozen crashing binary, run 80+ times — extremely fragile, process/environment-sensitive; still OPEN, no fix landed, no closure claimed
+
+Picked up this doc's own "next step" from the `fast, minimal, Hibernate-free
+repro found` entry (resolve stale-reference-vs-OOB-write via array-identity
+instrumentation, then fix `emit_inline_tlab_new`/JIT scratch-slot GC-root
+tracking). Ran concurrently with the `CRATONVM_DBG_AIOOBE3` diagnostic
+session above on the same shared host (worktree
+`wt-hib-bigint-divideknuth-20260717`, branch
+`fix/hib-bigint-divideknuth-jit-20260717`) — the two sessions' work is
+reconciled here rather than presented as sequential.
+
+**Before instrumenting anything, re-ran the prior entry's own fast repros as a
+sanity baseline on `dev@08808a57` (the tip at session start) — and got a
+surprising negative result: none of them reproduced.** `SmallDividendRepro`:
+0 failures across 570,000+ combined trials (20,000×6 default runs, 50,000
+under `CRATONVM_DBG_GC_STRESS=4096`/`65536`, 500,000 in one run, individual
+reruns with `CRATONVM_MOVING_YOUNG=1`, `CRATONVM_DISABLE_UNROLL=1`,
+`CRATONVM_TIER_C1_THRESHOLD=5`, `CRATONVM_NO_PRECISE_JIT_MAPS=1`,
+`CRATONVM_COMPACT_REF_FIELDS=0`, and an artificial 128-process/120+-load-average
+host-contention condition). `FixedValRepro`/`ShiftZeroRepro`/
+`BranchIsolateRepro`/`HashedNameProbe` (2000 real `NamingHelper.hashedName`
+trials): all 0 failures. Verified this wasn't explained by any code landing
+on `dev` since the prior entry's final verification point (`dev@8ef4d59b`):
+only two non-merge commits existed in that range (`76514940`, unrelated
+`Files.walkFileTree` fix, and `6599b898`, a real but unrelated
+`emit_inline_tlab_new` stale-compact-object-size fix for `NEW` object
+allocation, not `int[]` array allocation) — reverting `6599b898` in a scratch
+A/B build made no difference, and rebuilding `dev@8ef4d59b` **verbatim** in a
+clean (`env -i`) environment still did not reproduce (0 failures across the
+same battery of tests). A full real-Hibernate whole-class run via the actual
+harness driver (`CratonRunner`, `DiscoverySelectors.selectClass` — the same
+invocation a prior entry in this section could never get to complete under
+host contention) completed cleanly this session:
+```
+@@RESULT 0 org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest found=132 started=132 ok=132 failed=0 aborted=0 skipped=0 ms=597185
+```
+132/132, matching the recorded HotSpot baseline exactly, with zero
+`ArrayIndexOutOfBoundsException` occurrences. The 2-method interleaved
+`MultiMethodRunner` repro (`entityPersister` + `createSchema_fromSessionFactory`,
+which a prior entry explicitly reported as still failing) was also 24/24
+clean this session.
+
+**This was heading toward a "closed, does not reproduce" conclusion until
+`git fetch` picked up the concurrent `CRATONVM_DBG_AIOOBE3` session's push
+(commits `642fa3a5`/`87d14299`), which directly contradicts it: that session
+reports the identical `SmallDividendRepro` + `CRATONVM_DBG_GC_STRESS=65536`
+recipe "fires reliably on the first stressed run" on the identical
+`dev@08808a57`, with decisive diagnostic evidence (a raw `ObjectHeader` dump
+at the JIT bounds-check failure showing a fully self-consistent, non-relocated
+`int[2]` — `forwarding_ptr=0x0` — proving this is genuine data corruption,
+not a stale/moved pointer).** That finding is trusted over this session's own
+non-reproduction: it is artifact-based (an actual captured header dump from a
+live failure), not merely an absence of failure.
+
+**Went further to reconcile the two rather than just noting the conflict.**
+Merged the concurrent session's commits into this session's worktree,
+rebuilt, and reran the identical `SmallDividendRepro` +
+`CRATONVM_DBG_GC_STRESS=65536` + `CRATONVM_DBG_AIOOBE3=1` recipe against
+**three different binaries**: this session's own merged-tip build (0/3000,
+×3), a from-scratch `CARGO_PROFILE_RELEASE_LTO=off` build matching a sibling
+concurrent session's build flags (0/3000, ×3), and — most decisively — **the
+literal frozen binary the `CRATONVM_DBG_AIOOBE3` session itself used**
+(`/data/data/frozen-hib-biginteger-aioobe-20260717/cratonvm-biginteger-devtip-20260717`,
+byte-for-byte the exact executable that produced their `AIOOBE3-DIAG` dump):
+**80 consecutive process invocations (20 + 60), 0 failures, 0 `AIOOBE3-DIAG`
+lines fired.** Same binary, same repro source, same flags, same host — no
+crash. This rules out a build-configuration explanation (LTO on/off) and
+confirms the divergence is not "which commit" or "which build flags" but
+something about live process/runtime state at invocation time (heap/stack
+addresses under ASLR — confirmed enabled, `randomize_va_space=2` — ambient
+memory pressure, scheduling, or some other per-process-launch variable this
+session did not identify).
+
+**Conclusion: NOT closing this item.** The concurrent session's artifact-based
+evidence (an actual `ObjectHeader` dump from a live crash) is real and takes
+priority over this session's inability to reproduce it. What this session
+adds is a data point about just how fragile the trigger condition is: even
+the literal crashing binary, invoked the same way, on the same host, did not
+crash 80/80 times for this session's process launches. This is consistent
+with (and updates) the "heisenbug" framing from an earlier entry in this
+section (the "scaling-investigation session" finding that the bug required
+multi-method interleaving and oscillated pass/fail for identical inputs
+across different process runs) — the trigger condition is apparently
+sensitive to something below the level of "which code" or "which repro,"
+down to specific runtime/address-space conditions at process-launch time.
+This session's clean 132/132 whole-class run and clean 80/80 frozen-binary
+runs should **not** be read as evidence the bug is fixed or even rare in
+practice — only that this session's particular process launches did not hit
+the trigger window.
+
+**Handing off to the concurrent session's own next-step plan** (already
+documented in the `CRATONVM_DBG_AIOOBE3` entry immediately above: isolate
+`divideMagnitude`'s two `mulsub` call sites — the main-loop one vs. the
+unconditional final-digit one outside the loop — from each other by forcing
+`limit >= 2` vs. `limit == 1`, then get `CRATONVM_DBG_JIT_DISASM` output
+around the final-digit call site's `R8`/`RDX` argument-register loads to
+check whether the value reaching `mulsub` for `len`/`divisor` is genuinely
+`dlen`/the divisor reference, or aliased with something else live at that
+program point). Given this session could not get the bug to fire at all, it
+was not able to make further progress on that specific plan and defers to
+whichever session next gets a live reproduction — check for further updates
+from the `fix/hib-biginteger-smalltostring-aioobe-20260717`-lineage work
+(worktrees `wt-hib-mulsub-oldtip-20260717`/`wt-hib-mulsub-argmarshal-20260717`
+were both active on the shared host during this session, likely the same
+investigation continuing) before restarting from scratch.
+
+No code change made this session (nothing reproduced to validate a fix
+against, and this session's own would-be "closed" conclusion was itself
+superseded by better evidence before being finalized).
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
