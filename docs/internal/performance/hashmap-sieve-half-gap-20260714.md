@@ -1,0 +1,142 @@
+# HashMap + Sieve gap reduction (2026-07-14)
+
+Status: merged; Sieve target met (gap cut by ~2/3), HashMap partial (gap cut
+by ~39%, residuals documented below).
+
+## Goal
+
+Cut the two remaining slow README rows at least in half:
+
+- Sieve (100K x 20,000): README 16,711 ms / 6.10x → target ≤ ~8,353 ms.
+- HashMap (1M put/get, isolated): README 409.6 ms / 8.01x → target ≤ ~205 ms.
+
+Same-session fresh baselines on the benchmark host before any change
+(`taskset -c 14`, Temurin 25.0.3, alternating fresh processes):
+Sieve isolated kernel CratonVM 14,002/13,995 ms vs JDK 2,324/2,726 ms (~5.6x);
+HashMap CratonVM 443/448/446 ms vs JDK 43/45/43 ms (~10.2x measured that day).
+
+## Result
+
+Host: Azure Linux `20.83.144.174`, logical CPU 14, Temurin 25.0.3 C2, fresh
+alternating processes, default settings, medians of 3 (QuickBench) / 5
+(HashMap) runs. Checksums identical to the JDK in every run
+(`99414225882916859` / `701408733` / `9592` / `173943680`;
+HashMap `15499991500000`).
+
+| Row | HotSpot | CratonVM | Ratio | Was (2026-07-13 README) |
+|---|---:|---:|---:|---|
+| Arithmetic (2B) | 2,069 ms | 4,109 ms | 1.99x | 4,161 ms / 2.01x |
+| Fibonacci(44) | 1,438 ms | 4,231 ms | 2.94x* | 4,283 ms / 1.72x |
+| **Sieve (100Kx20K)** | 2,742 ms | **5,567 ms** | **2.03x** | 16,711 ms / 6.10x |
+| Matrix 1280x1280 | 2,085 ms | 5,583 ms | 2.68x | 5,909 ms / 2.82x |
+| QuickBench TOTAL | 8,330 ms | 19,491 ms | 2.34x | 31,064 ms / 3.31x |
+| **HashMap 1M put/get (isolated)** | 42 ms | **274 ms** | **6.52x** | 409.6 ms / 8.01x |
+
+\* Fibonacci: CratonVM improved slightly (4,283 → 4,231 ms); the ratio moved
+because this session's Temurin reference ran its fast mode (~1,440 ms) in all
+three runs, where the 2026-07-13 session's median was 2,486 ms. Same binary
+behavior, different JDK-side reference — see the raw runs in this doc's
+session log.
+
+HashMap additionally scales linearly (4M put/get: 1,087 ms vs JDK 315 ms =
+3.45x — the JDK's 1M advantage is partly cache-residency of the small case).
+
+## Root causes and fixes
+
+### Sieve (pure-bytecode kernel; fixes are general, not benchmark-keyed)
+
+1. **Tier bookkeeping starved the method-entry compile** (`jit/src/tiered.rs`).
+   A successful OSR compile stamped `current_tier = C2` even though the
+   artifact lives in the separate OSR cache; `should_compile` then refused
+   every later method-entry recommendation, so each of the 20,000 `sieve()`
+   calls re-entered the interpreter and re-OSR'd. Mirror image of the
+   cebfefde9 request-side decoupling. Fixed: OSR completions no longer touch
+   `current_tier` (queue flags/fail counters unchanged); regression test
+   `osr_completion_does_not_suppress_method_entry_tiering`.
+2. **Template-backend operand-stack round-trips** (`jit/src/x64.rs`):
+   every value flowed through `[rbp-…]` slots; the marking loop's
+   store→reload pair put ~5 cycles of store-forwarding latency on the
+   loop-carried dependency chain. Fixed with the `slot_mirror` adjacent
+   reload elision (opt-out `CRATONVM_JIT_NO_SLOT_MIRROR=1`): a reload of the
+   slot stored by the IMMEDIATELY preceding instruction (exact buffer-position
+   match ⇒ nothing emitted between ⇒ no clobber, no join) becomes a reg-reg
+   move or nothing. The store is never elided — frame slots stay canonical
+   for GC scans, OSR entries, deopt re-execution and the interpreter.
+   Invalidated at branch-target pcs; suppressed inside speculative inline
+   emission; cleared on inline rollback; unroll-safe (copies are raw bytes).
+3. **GPR local homes were default-off** (temporary safety gate pending
+   precise register oop-maps). Enabled for the provably-safe subset
+   (opt-out `CRATONVM_JIT_KERNEL_REG_LOCALS=0`): NON-reference locals of
+   method-entry bodies with no invokes, no field/static ops, no allocation,
+   no typechecks, no inline sites, no speculative-BCE guards. Reference
+   locals stay frame-homed (`regalloc::find_reference_locals`); kernel
+   bodies publish no OSR entries (the OSR pipeline compiles its own
+   memory-homed artifact), so the documented miscompile family (register
+   values across calls/OSR transitions) is structurally unreachable.
+
+Also relevant (found, not fixed here): the IR/C2 backend cannot compile any
+integer-array method (no `baload`/`bastore`/`iaload`/`iastore`/`arraylength`
+lowering — whole-method bail to single-pass), has no register allocation
+(spill-everything) and no BCE; single-pass BCE categorically refuses
+inclusive (`<=`) loops and non-`arr.length` bounds, so sieve keeps its
+per-element bounds checks. Both are follow-up candidates.
+
+### HashMap (native-dispatch residual after the 2026-07-11 overlay work)
+
+1. `jit_invoke_dispatch` paid three class-manager read locks + a recursive
+   method walk per `Map.put/get` interface call on a virtual-dispatch fast
+   path that can never install a compiled entry for a registered native
+   (~12% of runtime). The cached exact-HashMap check now runs right after
+   the recursion guard.
+2. `alloc_object` took a class-manager read lock per allocation for the
+   `num_total_fields` clamp (~3M autoboxed Integers). Now served from a
+   per-thread `(vm, class_id)` cache validated against the global layout
+   generation (the `compact_field_slot` contract); unregistered ids are
+   never cached.
+3. `invokestatic Integer.valueOf(I)` and (final-class, guard-free)
+   `invokevirtual Integer.intValue()` sites compile to direct CALLs of thin
+   helpers (`jit_integer_value_of_direct` / `jit_integer_int_value_direct`)
+   that preserve the identity cache, allocation path, pending-return
+   rooting, null-receiver NPE and error routing while skipping the generic
+   dispatch round trip. Recognized in `jit::try_compile` and both
+   interpreter-side direct-call construction sites (method-entry + OSR
+   tiers — the OSR site is the load-bearing one for single-invocation hot
+   loops).
+4. `safe_native_call_impl` allocated two Vecs per native call
+   (`args.to_vec()` + root-index buffer); both now use inline scratch
+   buffers for the ≤4-argument case.
+
+**Remaining HashMap residual (~274 ms ≈ 6.5x)**, per perf: `alloc_object`
+TLAB path ~17%, `safe_native_call` wrapper ~8%, remaining generic dispatch
+for the 2M map-native calls ~6%, map-native internals (global
+`hm_int_fast_table` mutex + double FxHashMap probe per op, `unbox_wrapper`
+per key) ~15%. Follow-up candidates: an inline TLAB fast path in the boxing
+helper, per-map overlay state reachable without the global mutex, and a
+thin prevalidated wrapper for the two exact map natives.
+
+## Correctness and regression coverage
+
+- `cargo test --release -p cratonvm-jit`: **all green** (904 lib tests +
+  ir_vs_singlepass differential + every intrinsic suite) — after fixing the
+  pre-existing compile breakage of the nine jit integration-test
+  `JitRuntimeHelpers` initializers (f2e9059f0 added `lambda_int_to_double`
+  without updating them; the whole jit test suite failed to compile at dev
+  tip).
+- `cargo test --release -p cratonvm-gc -p cratonvm-native-collections`:
+  all green.
+- `cargo test --release -p cratonvm-vm --lib`: 2,194 passed / 13 failed —
+  every failure verified pre-existing at dev tip 71f1516e (9× lock_order
+  release-mode environment mismatches, 2× vm_init bootstrap-count drift,
+  `hot_files_have_no_production_panics` — dev's x64.rs already scans to 17
+  sites vs the ratcheted 16 — and
+  `buffered_input_stream_force_native_covers_constructors_and_io_surface`,
+  reproduced verbatim on the pristine main checkout).
+- `HashMapSemanticsProbe`: passes normally and under
+  `CRATONVM_DBG_GC_STRESS=1048576`.
+- Binary Trees (`BinT` 16/18): byte-identical checksums and equal times vs
+  the dev-tip baseline binary (alloc/GC path untouched: 115→117 ms, 459→460
+  ms). The bench-dir `binarytrees.class` OOMs identically on baseline and
+  fixed binaries (pre-existing harness issue, not a regression).
+- Hibernate ORM smoke (Linux harness, 2 real classes): 27/27 tests green.
+- QuickBench Arithmetic/Fibonacci/Matrix: no CratonVM-side regressions
+  (4,161→4,109 / 4,283→4,231 / 5,909→5,583 ms).
