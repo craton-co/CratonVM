@@ -7,6 +7,23 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
+/// POSIX permits a blocking socket read to be interrupted before it consumes
+/// bytes. Retry that transient condition instead of exposing it as a Java EOF
+/// or a zero-length read. Some socket wrappers preserve Linux EINTR only as
+/// raw OS error 4, so accept both representations.
+fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
@@ -15265,7 +15282,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         };
         if let Some(stream) = stream {
             let mut stream_ref = &*stream;
-            match stream_ref.read(&mut buf) {
+            match read_retry_eintr(&mut stream_ref, &mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
@@ -15296,7 +15313,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             };
             if let Some(stream) = stream {
                 let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
+                match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -15333,7 +15350,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             };
             if let Some(stream) = stream {
                 let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
+                match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,

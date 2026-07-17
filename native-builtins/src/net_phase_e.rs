@@ -2903,8 +2903,18 @@ fn re1_socket_read_stream(
     let mut tmp = vec![0u8; ln];
     let mut blocked_refs = [Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let read_result = (&*stream).read(&mut tmp);
+    let read_result = loop {
+        match (&*stream).read(&mut tmp) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
+            result => break result,
+        }
+    };
     ctx.end_blocking_region_refs(&mut blocked_refs);
+
     let buf = match blocked_refs[0] {
         Value::Object(Some(o)) => o,
         _ => buf,
@@ -7557,7 +7567,9 @@ fn re5_collect_publisher_body(
             let resolved = ctx.resolve_global_root(handle);
             ctx.remove_global_root(handle);
             if let Some(orig) = resolved {
-                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(orig));
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    orig,
+                ));
             }
         }
         let msg = error.unwrap();
