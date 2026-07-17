@@ -1014,6 +1014,165 @@ No code change made this session (nothing reproduced to validate a fix
 against, and this session's own would-be "closed" conclusion was itself
 superseded by better evidence before being finalized).
 
+## Update 2026-07-17 (follow-up session, `wt-hib-mulsub-argmarshal-20260717`/`wt-hib-mulsub-oldtip-20260717`): picked up the isolation plan directly; STILL cannot reproduce (620,000+ combined trials, 3× clean full-class 132/132 runs) — but static analysis of the suspected `mulsub` register-marshaling path finds the specific clobber mechanism previously hypothesized does NOT apply to this call shape. Not closing (per this doc's own standing conclusion above); root cause remains genuinely unresolved.
+
+Picked up this doc's own concrete next step from the `CRATONVM_DBG_AIOOBE3`
+entry: isolate `divideMagnitude`'s two `mulsub` call sites (main-loop vs. the
+"final-digit" one) via `limit>=2` vs. `limit==1`, then inspect the
+final-digit call site's real register loads via `CRATONVM_DBG_JIT_DISASM`.
+
+**Build/verification setup.** Fresh isolated worktree
+(`wt-hib-mulsub-argmarshal-20260717`, branch
+`fix/hib-mulsub-argmarshal-20260717`, `dev@67db1afb` at start,
+`CARGO_PROFILE_RELEASE_LTO=off`), plus a second from-scratch build pinned
+to `dev@08808a57` (`wt-hib-mulsub-oldtip-20260717`) — the exact commit the
+`CRATONVM_DBG_AIOOBE3` entry above reports firing "reliably on the first
+stressed run."
+
+**Step 1 (limit isolation) could not be completed as planned — nothing
+reproduced to isolate.** Added a `BigDividendRepro.java` (~140-bit dividend
+against the same fixed `35^12` divisor, forcing `limit>=3` so the main D2-D7
+loop's own `mulsub` call site runs repeatedly) alongside the existing
+`SmallDividendRepro.java` (`limit==1`, final-digit call site only). Both
+variants, against **both** binaries (`dev@08808a57` and `dev@67db1afb`),
+under `CRATONVM_DBG_GC_STRESS` at 65536/16384/4096/2097152-byte thresholds,
+default settings, and `CRATONVM_TIER_C1_THRESHOLD=50` (to force `mulsub`/
+`divideMagnitude` to compile early — confirmed via
+`CRATONVM_DBG_JIT_DISASM=divideMagnitude,mulsub` that both methods really do
+get JIT-compiled in these runs, 23607/1029 bytes respectively, matching the
+`fast, minimal, Hibernate-free repro` entry's own byte counts): **0 failures
+across 620,000+ combined `SmallDividendRepro`/`BigDividendRepro` trials**
+(20 back-to-back 5000-trial runs alone accounted for 100,000 of these, all
+clean). `HashedNameProbe` (the real `NamingHelper.hashedName` call, 2000
+trials against the real Hibernate classpath): also clean on both binaries.
+**Three separate full real-harness `CratonRunner`/`selectClass` whole-class
+runs** (the exact harness invocation, `-Dcraton.trace=1`), all against the
+`dev@67db1afb` binary: `found=132 started=132 ok=132 failed=0 ms=700951`,
+`ms=722262`, `ms=642977` — three clean 132/132 runs in a row, zero
+`ArrayIndexOutOfBoundsException` anywhere in any of the three logs. This
+independently reproduces (and extends, via the `BigDividendRepro`
+limit-isolation attempt and a third-tip cross-check) the immediately-preceding
+entry's own non-reproduction finding — consistent with that entry's
+"extremely fragile, process/environment-sensitive" framing, not a
+contradiction of it.
+
+**Step 2 substitute: since no live failure was available to disassemble, did
+the next-best thing — a static code-path audit of the specific register-clobber
+mechanism this doc's `CRATONVM_DBG_AIOOBE3` entry flagged as the leading
+suspect** (`emit_stack_arg_setup` in `jit/src/x64.rs`, the loop that walks
+`arg_slots[0..reg_arg_count]` and writes each into `ARG_REGS[i+ctx_offset]`
+in ascending order). Two corrections/refinements to the prior entry's framing:
+
+1. **The two `mulsub` call sites in `divideMagnitude` are `invokevirtual`,
+   not `invokespecial`**, per direct `javap --system <jdk25> -c -p
+   java.math.MutableBigInteger` output (bytecode offsets 719 and 1084,
+   `invokevirtual #289 // Method mulsub:([I[IIII)I`). This doesn't change
+   the argument-count analysis (CratonVM's JIT still resolves `mulsub` as a
+   private, effectively-non-polymorphic method and takes the same
+   direct-call fast path used for `invokespecial`), but the doc's framing of
+   "invoked via `invokespecial`" should be read as CratonVM's internal
+   dispatch classification, not the literal bytecode opcode.
+2. **The specific `SCRATCH_REGS`/`ARG_REGS` aliasing clobber this doc's
+   `CRATONVM_DBG_AIOOBE3` entry flagged as the boundary condition to check
+   (R8/R9 double as both the last two `ARG_REGS` slots and the only two
+   `SCRATCH_REGS`, so overwriting one before reading the other as a call
+   argument's source could silently swap/corrupt the last two arguments)
+   does **not appear to be reachable for this call's actual bytecode shape**,
+   on direct code reading:
+   - `push_from_rax` (`jit/src/x64.rs`) — the path that materializes the
+     result of an arithmetic sub-expression like the final-digit call's
+     `limit - 1 + rem.offset` argument — **always spills to a `Frame` slot**,
+     never a `Scratch` register; the doc comment there explicitly records
+     that scratch-register caching for this path "was tested but showed
+     regressions" and was reverted. So a computed-expression argument (the
+     one most likely, on general principle, to still be sitting in a
+     register right before the call) is not actually a `Scratch`-sourced
+     value in this JIT's current implementation.
+   - The only two places in `jit/src/x64.rs` that push a `StackSlot::Scratch`
+     value onto the simulated operand stack at all are both inside `dup`/
+     `dup2` handling (`emit_dup_top_slot` and one `dup2`-form site) — i.e. a
+     value only becomes `Scratch` by being a duplicated copy of an
+     already-scratch top-of-stack. `divideMagnitude`'s two `mulsub` call
+     sites (per the `javap` bytecode: `aload_0; aload N; getfield value;
+     aload N; iload N; iload N; iload N; getfield offset; iadd; invokevirtual
+     mulsub`) don't contain a `dup`/`dup2` in the argument-pushing sequence,
+     so none of the 6 arguments should ever arrive as a `Scratch` slot for
+     this specific call shape.
+   - Net: the "last-two-of-six-registers-alias-the-only-two-scratch-regs"
+     clobber this doc flagged as the next thing to check is real code (and
+     could plausibly bite *some* 6-argument call site that does go through
+     `dup`), but does not look reachable for `divideMagnitude`'s `mulsub`
+     calls specifically. **This is a negative result from static reading
+     only** — without a live failing capture to disassemble (see Step 1),
+     it was not possible to empirically confirm what `arg_slots[4]`/
+     `arg_slots[5]` actually are at the real call site, only to audit the
+     general code paths that could produce a `Scratch` slot there. A future
+     session that does get a live capture should still verify this directly
+     via `CRATONVM_DBG_JIT_DISASM` rather than trust this static conclusion
+     alone.
+3. Also confirmed, as a byproduct of getting `mulsub`/`divideMagnitude` to
+   actually cross the (now-1500-invocation-default) JIT compile threshold
+   reliably: `CRATONVM_DBG_TIER_ENQUEUE`'s "enqueue" log line does **not**
+   fire for either method even when they demonstrably do get JIT-compiled
+   (confirmed via `CRATONVM_DBG_JIT_DISASM` showing real compiled bodies at
+   the expected byte sizes) — worth a note for any future session using that
+   diagnostic to gate on compilation state: it does not cover every compiled
+   method (plausibly an inlining or logging-coverage gap in `tiered.rs`
+   unrelated to this bug), so its absence should not be read as "never
+   compiled."
+
+**Regression check.** `cargo test --release -p cratonvm-jit --lib`:
+906/906 pass (the `cargo test` default target set separately fails to
+*compile* 6 pre-existing integration-test files over a `JitRuntimeHelpers`
+struct-literal/arg-count mismatch unrelated to this session's — or any
+recent — change; not investigated further, flagged here only so a future
+session doesn't mistake it for a regression from this entry).
+
+**Not closing this item.** This session's own non-reproduction (even
+extending the immediately-preceding entry's already-extensive battery with
+a third dev tip, a `limit>=2` variant, and 3 full clean end-to-end harness
+runs) does not outweigh the `CRATONVM_DBG_AIOOBE3` entry's artifact-based
+evidence (an actual `ObjectHeader` dump captured from a real, live crash) —
+per this doc's own standing guidance and the immediately-preceding entry's
+explicit reasoning, absence of failure is not evidence of a fix. The
+register-marshaling hypothesis is now better-understood (specific enough to
+mostly rule out on static grounds, for this exact call site) but not
+replaced with a confirmed alternative.
+
+**Next step for a follow-up session**, given two sessions now (this one and
+the immediately-preceding one) have burned significant time on
+process-at-a-time reproduction attempts without success:
+1. Stop trying single bounded runs. Given the trigger is "below
+   process-launch granularity" fragile (per the preceding entry), the next
+   session should set up a genuinely long-running (many-hours,
+   background/unattended) loop of the frozen crashing binary +
+   `SmallDividendRepro` + `CRATONVM_DBG_GC_STRESS=65536` +
+   `CRATONVM_DBG_AIOOBE3=1`, with the process configured to core-dump on the
+   `AIOOBE3-DIAG` firing (or, simpler, just redirect stdout/stderr to a file
+   and grep it periodically), and let it run far longer (hundreds to
+   thousands of process launches, or one very long-lived process doing
+   millions of trials with periodic forced GCs) than any session so far has
+   budgeted — both this session and the preceding one gave up after tens to
+   hundreds of thousands of trials, which may simply not be enough given how
+   rare the trigger apparently is.
+2. If/when a live capture is obtained, verify this entry's static
+   `Scratch`/`push_from_rax` analysis directly against the real compiled
+   `divideMagnitude` body for that specific process (does `arg_slots[4]`/
+   `arg_slots[5]` at the final-digit `mulsub` call site actually resolve to
+   `Frame`, as this entry's static reading predicts, or something else?)
+   before spending time on any speculative fix.
+3. If the register-marshaling theory is ruled out by (2), fall back to the
+   `fast, minimal, Hibernate-free repro` entry's own step 4 (audit the
+   `remarr[intLen+1]`/`primitiveLeftShift` inlined tail-store bounds) as the
+   next most promising concrete lead — not investigated by either this
+   session or the preceding one.
+
+No code change made this session (nothing reproduced to validate a fix
+against; per this doc's own standing guidance, a wrong fix to shared
+invoke-dispatch codegen used far beyond `BigInteger` would be worse than no
+fix, and this session could not even get to "which of the two hypotheses in
+finding #6 is right," let alone confirm a specific defective instruction).
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
