@@ -2769,6 +2769,191 @@ immediately before this edit confirms tip `cce6e1c6`; no other session has
 touched this doc's `DefaultCatalogAndSchemaTest` section since the entry
 above.
 
+## Update 2026-07-17 (native-call-chain audit session): found and FIXED a real unread-pin bug in `MessageDigest` natives (same anti-pattern as the `populate_real_thread_holder` fix), but mechanistic tracing shows it is very unlikely to be this bug's cause — BigInteger's own native overrides are confirmed DEAD CODE for the actual crash path. Still OPEN.
+
+Picked up this session's assigned lead: search `native-builtins/src/` for the
+exact anti-pattern just confirmed real in the same-day `CountDownLatch`/
+`Thread$FieldHolder` fix (`0e1a1fa2`,
+[countdownlatch-thread-fieldholder-unread-pin-FIXED.md](../../internal/fixed-suite-bugs/countdownlatch-thread-fieldholder-unread-pin-FIXED.md)):
+pin an object, make a nested allocating call, use the *un-re-read* pin
+afterward, so a GC landing in the gap silently writes to (or reads from) an
+abandoned from-space copy.
+
+### Mapped the real call chain first, and it changes the picture
+
+`NamingHelper.hashedName` is `MessageDigest.getInstance("MD5")` →
+`md.update(s.getBytes())` → `md.digest()` → `new BigInteger(1, digest)` →
+`.toString(35)`. Read every native registration touching this path
+(`native-builtins/src/lib.rs`, `grep`-swept for `MessageDigest`, `digest`,
+`BigInteger`, `sha`/`md5`) plus `force_native_over_real_jdk_bytecode`
+(`vm/src/runtime/interpreter.rs`) and `vm_exec.rs`'s `NativeContext` impl to
+determine, for each step, whether it actually runs as a native or as real
+bytecode:
+
+- **`MessageDigest.getInstance`/`update`/`digest` ARE native** (registered on
+  `java/security/MessageDigest`; the real bytecode delegates to an abstract
+  `MessageDigestSpi.engineDigest()` with no `Code` attribute, so there is no
+  bytecode alternative to prefer — the native is the only implementation).
+- **`new BigInteger(1, digest)` (the `(I[B)V` constructor) is NOT natively
+  registered anywhere** — only `(Ljava/lang/String;)V` and
+  `(Ljava/lang/String;I)V` are. It always runs real bytecode.
+- **`BigInteger.toString(int)` IS registered** (`native_bi_to_string_radix`,
+  `register_biginteger_natives`) — but per
+  [[invokespecial-native-always-wins-over-bytecode]] (this codebase's own
+  established, previously-recorded fact), `invokevirtual` defaults to
+  **preferring real bytecode** unless the exact `(class, method, descriptor)`
+  triple is explicitly allowlisted in
+  `force_native_over_real_jdk_bytecode` (`vm/src/runtime/interpreter.rs`).
+  Grepped that function (and its `vm_exec.rs` sibling gate) end to end:
+  **`java/math/BigInteger` has no entry anywhere in either allowlist.**
+  Despite the `RBIGDEC.1` comment at the registration site claiming these
+  overrides "run BEFORE the JDK bytecode (native dispatch takes priority)",
+  that claim is **only true for the allowlisted classes this codebase
+  actually gates that way** — for `BigInteger` specifically it is stale/
+  aspirational. Confirmed independently: the return-value healing comment
+  at `cce0079` in `safe_native_call_impl` and every element of this doc's
+  own 11-session evidence trail (the crash always carries **exact real JDK
+  source line numbers** — `BigInteger.java:4170`/`4223`/`4118` — which only
+  happens when real bytecode, not a native stub, actually executes) are
+  consistent with real bytecode running for `toString(int)`, never the
+  native.
+
+**Conclusion: the entire crash-adjacent path — `BigInteger(int,byte[])`
+construction, `toString(int)`, `smallToString`, and everything inside
+`MutableBigInteger.divide`/`divideKnuth`/`divideMagnitude`/`mulsub`/
+`primitiveLeftShift` — is 100% real, JIT-compiled bytecode with ZERO native-
+builtin touches on the object(s) actually involved in the crash.** This
+doesn't just fail to support Lead A's hypothesis — it structurally rules out
+"a native builtin's unread pin directly corrupts the `int[]` mag/value array
+used inside `divideMagnitude`" as a mechanism, independent of whatever else
+this session found, because no native builtin ever touches that array.
+
+### A real bug WAS found and fixed, one step upstream (MessageDigest itself)
+
+Despite the above, the exact anti-pattern this session was tasked to search
+for IS present, for real, in `native-builtins/src/lib.rs`'s `MessageDigest`
+support: `native_md_get_instance`, `md_append_bytes` (backing `update()`),
+and `native_md_digest` each capture `this`/`old_data` as bare `ObjectRef`
+locals and then call an allocating `ctx` op (`create_string`/`new_array`)
+before writing through those locals again — `md_append_bytes`'s final
+`ctx.set_field(this, MD_FIELD_DATA, Some(new_data))` and
+`native_md_digest`'s "reset" write are the clearest instances. Confirmed via
+direct inspection of `vm/src/vm/vm_exec.rs`'s `NativeContext` impl that
+`get_field`/`set_field`/`get_array_element`/`set_array_element` do **not**
+forward stale `ObjectRef`s themselves (only native-call **entry** arguments
+and the callback's final **return value** are healed, in
+`safe_native_call_impl`) — so a GC landing between the allocation and the
+write silently lands the write on an abandoned from-space copy. Worst-case
+effect: `update()`/`digest()`'s internal state mutation is silently lost
+under precise GC timing (e.g. a dropped `update()` call would make
+`digest()` compute the hash of less data than intended, or of nothing at
+all) — a real, distinct, novel correctness bug, but mechanistically a
+**silent wrong-value** failure mode, not an array-shape/AIOOBE failure mode,
+and it cannot reach `BigInteger`'s internals at all (the return value is
+already healed by the `cce0079` barrier before it reaches the real-bytecode
+`BigInteger(int,byte[])` constructor).
+
+**Fixed** (pin `this`/`old_data`/`result` immediately after allocation,
+re-read through the pin before every subsequent write — same discipline as
+`populate_real_thread_holder`). Commit `2071b77e`
+(`fix/messagedigest-unread-pin-20260717`), merged to `dev` at `0eaf3f80`.
+Full writeup:
+[messagedigest-unread-pin-FIXED.md](../../internal/fixed-suite-bugs/messagedigest-unread-pin-FIXED.md).
+
+### Empirical testing (weak, not conclusive either way)
+
+Given the mechanistic case above, did not expect this fix to change the
+AIOOBE's reproduction rate, but tested anyway per this doc's own standing
+practice of not trusting theory alone. Full-harness `CratonRunner`/
+`selectClass` against `DefaultCatalogAndSchemaTest`, plain settings:
+
+- **Post-fix** (pre-merge binary, `dev@6b515646` + fix): 3/3 clean
+  (`found=132 ok=132 failed=0`, `ms` 622902–681391). A 4th attempt was
+  OOM-killed by the kernel mid-run (`dmesg` confirmed
+  `oom-kill: ... task=cratonvm-native, pid=445298`) during a window where
+  several OTHER concurrent sessions on this shared host were running heavy
+  parallel workloads (a WildFly domain probe, multiple Spring
+  genuine-sweep shards) — not attributable to this fix, consistent with
+  this doc's own established "host contention casualty" bookkeeping.
+- **Post-merge** (`dev@0eaf3f80`, includes 41 unrelated files from the
+  intervening `origin/dev` merge): 1/1 clean (`found=132 ok=132 failed=0`,
+  `ms=1083347` — slow, again due to heavy host contention, not a code
+  issue).
+- **Pre-fix baseline** (`cratonvm-idxlen-20260717`, `dev@38192937`, this
+  doc's own previously-frozen crashing binary): 2 runs, `found=132
+  ok=131 failed=1` (one `InvalidMappingException` — this doc's title
+  bundles that failure mode into the same tracked residual, though it is
+  not the classic `ArrayIndexOutOfBoundsException` stack) and `found=132
+  ok=132 failed=0` (clean). A third pre-fix attempt under
+  `CRATONVM_DBG_GC_STRESS=65536` was abandoned after 19+ minutes CPU time
+  with no result (GC stress appears to make the FULL harness, as opposed
+  to the isolated `SmallDividendRepro`, prohibitively slow rather than
+  more likely to crash quickly — not investigated further).
+
+**This is not a real A/B**: this session never caught a live classic-AIOOBE
+crash on either binary to compare against, consistent with — not
+contradicting — this doc's own 11-session-documented bimodal/heisenbug
+reproduction pattern (several prior sessions independently got the "clean"
+polarity on demonstrably pre-fix binaries too). Given the strong mechanistic
+case above (zero native-builtin involvement in the actual crash path), this
+session does **not** claim the fix resolves the AIOOBE, and does **not**
+close this item.
+
+### Lead B (`gc_barrier.rs` multi-participant synchronization): touched briefly, not seriously pursued, no finding either way
+
+Given `vm/src/threading/gc_barrier.rs` had already yielded two real,
+independently-confirmed bugs earlier the same day (`cce6e1c6` and the
+`FieldHolder`/`0e1a1fa2` fix above), and given the time remaining in this
+session, did a short read of the `expected`/`arrived` barrier struct,
+`deposit_root_snapshot`, and `ThreadRegistry::collect_all_root_snapshots`/
+`root_snapshots_for_os_tids`. One concrete observation: root snapshots are
+stored **per-thread**, each `JvmThread` owning its own `Arc<Mutex<...>>`
+(not a shared, reusable, numerically-indexed slot array) — so this
+session's own prior "stale index into a per-thread snapshot array when
+thread slots are reused" hypothesis does not obviously map onto the actual
+data structure as read. **This is not a refutation** — the read was
+deliberately time-boxed and did not extend to the full STW takeover/release
+sequencing, `stw_take_over_and_wait`, or the interaction between
+`reduce_expected` and concurrent `enter_blocked`/`deposit_root_snapshot`
+calls. A future session with a full session's budget to spend specifically
+on this file (as the two successful same-day sessions had) is the right way
+to actually pursue Lead B — this session's brief look should not be read as
+having exhausted it.
+
+### Net assessment and recommendation for the next session
+
+- Lead A is **effectively closed as a candidate for this specific bug**: a
+  real anti-pattern bug was found and fixed in `MessageDigest`, but the
+  crash-adjacent path (`BigInteger` construction through
+  `divideMagnitude`/`mulsub`) is now confirmed, mechanistically, to involve
+  zero native builtins — nothing left in `native-builtins/` to blame for
+  this specific `int[]`-shape corruption.
+  A genuinely new, useful fact for future sessions: **`BigInteger`'s own
+  native arithmetic/`toString` overrides
+  (`register_biginteger_natives`/`register_biginteger_arithmetic_overrides`)
+  are dead code for ordinary `invokevirtual` calls** (no
+  `force_native_over_real_jdk_bytecode` allowlist entry) — this resolves an
+  apparent contradiction several prior sessions' notes brushed past (the
+  `RBIGDEC.1` comment's "native dispatch takes priority" claim vs. every
+  captured crash showing real JDK source line numbers) and confirms, with a
+  mechanism rather than just observation, that this whole saga's exhaustive
+  real-bytecode-focused analysis was always looking in the right place.
+- Lead B remains genuinely open — worth a dedicated session's full budget,
+  not a coda to another lead's session.
+- This doc's own long-standing recommendation stands: the concrete
+  mechanical next step, whenever a live hit lands, is still to correlate a
+  `CRATONVM_DBG_JIT_DISASM` capture against the live crash's `entry`/return
+  PC to pin the exact clobbered register/slot inside `divideMagnitude`'s D1
+  normalize path — no session has yet had the luck of a live capture to do
+  this.
+
+**This item remains OPEN.** `git fetch origin dev` immediately before this
+edit confirmed tip `0eaf3f80` (this session's own merge); no other session
+touched this doc's `DefaultCatalogAndSchemaTest` section since the entry
+above it. The rest of this doc's items are independently closed; this one
+still blocks declaring `hib-misc-residuals-20260716.md` fully closed.
+
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
