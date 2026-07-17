@@ -34530,11 +34530,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // non-positive ids ("Invalid thread ID parameter") on every
             // AsyncFileHandler format. The mirror lookup may allocate, so
             // keep this pinned across it.
+            let real = log_record_real_layout(ctx, this);
             let this_pin = ctx.pin_native_root(this);
             let tid = current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "threadID", Value::Int(short_thread_id(tid)));
             ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
@@ -36136,19 +36155,67 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and `withZone(null)` immediately NPEs, blowing up the entire
     // log4j logging stack and stalling WildFly bootstrap.
     //
-    // Until the underlying tzdb.dat read is fixed, intercept the call
-    // and return a synthetic UTC ZoneId object.  The returned value
-    // satisfies `withZone(non-null)` so log4j initialises cleanly.
-    // DST semantics are wrong, but log timestamps default to UTC,
-    // which is acceptable for boot diagnostics.
+    // HHH-10372 correctness fix (2026-07-17): the original version of this
+    // bypass (still present as the fallback below) *always* returned a
+    // hardcoded UTC ZoneOffset, ignoring any `TimeZone.setDefault(...)`
+    // call the running program had made — a host-timezone-leak that
+    // silently broke every caller relying on a *settable* JVM default,
+    // not just log4j's boot-time NPE guard. Concretely: Hibernate's
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` (`Timezones.withDefaultTimeZone()`
+    // test helper) call `TimeZone.setDefault(...)` then read it back via
+    // `ZoneId.systemDefault()` — with the old hardcoded-UTC bypass, that
+    // always resolved to UTC regardless of what was set, producing
+    // timezone-offset-sized value corruption (63/608 parameterized
+    // failures, e.g. `expected: <2017-11-06 09:19:01.0> but was:
+    // <2017-11-06 01:19:01.0>`, matching whatever offset `TimeZone.setDefault`
+    // was called with).
+    //
+    // Fix: first try to resolve the *actual current* default zone via
+    // `TimeZone.getDefault()` (also natively overridden below in the
+    // "Round 54" fix, and confirmed to correctly track `setDefault(...)`
+    // — it does not touch the broken ZoneInfoFile/tzdb.dat path) and hand
+    // its id to the real bytecode `ZoneId.of(String)` (unregistered/native-free
+    // in real-JDK mode, so it runs the actual JDK parsing+tzdb-rules logic,
+    // which already works correctly for explicit `ZoneId.of(...)` calls
+    // elsewhere in this same test suite — DST rules included). Only fall
+    // back to the original hardcoded synthetic UTC ZoneOffset (preserving
+    // the exact previous behavior) if that chain fails for any reason
+    // (e.g. too early in boot for TimeZone/ZoneId to be ready yet) — the
+    // log4j NPE guard this bypass exists for must never regress.
     registry.register(
         "java/time/ZoneId",
         "systemDefault",
         "()Ljava/time/ZoneId;",
         |ctx, _args| {
-            // Allocate a synthetic instance of ZoneOffset (a concrete
-            // ZoneId subclass with a single int totalSeconds field).
-            // Using the abstract ZoneId class directly may break
+            if let Ok(Some(Value::Object(Some(tz)))) = ctx.invoke(
+                "java/util/TimeZone",
+                "getDefault",
+                "()Ljava/util/TimeZone;",
+                &[],
+            ) {
+                if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
+                    "java/util/TimeZone",
+                    "getID",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(tz))],
+                ) {
+                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
+                    if has_id {
+                        if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                            "java/time/ZoneId",
+                            "of",
+                            "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                            &[Value::Object(Some(id_str))],
+                        ) {
+                            return Ok(Some(zone));
+                        }
+                    }
+                }
+            }
+            // Fallback: original hardcoded-UTC synthetic bypass (see doc
+            // comment above) — allocate a synthetic instance of ZoneOffset
+            // (a concrete ZoneId subclass with a single int totalSeconds
+            // field). Using the abstract ZoneId class directly may break
             // instanceof checks downstream; ZoneOffset.UTC is the
             // canonical way to get a non-null ZoneId without touching
             // ZoneInfoFile.
@@ -46255,6 +46322,30 @@ pub(crate) fn short_thread_id(tid: i64) -> i32 {
     } else {
         i32::MAX / 2 + 1
     }
+}
+
+/// Wall-clock now in epoch millis, for stamping `LogRecord` creation time.
+pub(crate) fn epoch_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `rec` is a real-JDK-layout `java.util.logging.LogRecord`. The real
+/// class resolves its private `longThreadID` long by NAME (typed zero even
+/// before any write); synthetic WildFly/JBoss mirrors have no such field, so
+/// the lookup yields `Object(None)`. Slot-based accessor fallbacks are only
+/// valid on the synthetic layouts: the real JDK 25 declaration order
+/// (level=0, sequenceNumber=1, sourceClassName=2, sourceMethodName=3,
+/// message=4, threadID=5, longThreadID=6, instant=7, loggerName=8,
+/// resourceBundle=9, resourceBundleName=10, parameters=11, thrown=12)
+/// disagrees with the synthetic slots almost everywhere.
+pub(crate) fn log_record_real_layout(
+    ctx: &dyn NativeContext,
+    rec: cratonvm_types::ObjectRef,
+) -> bool {
+    matches!(ctx.get_field_by_name(rec, "longThreadID"), Value::Long(_))
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
