@@ -19,7 +19,7 @@ convention rather than filing a duplicate doc:
 - `module/spring-boot-jdbc-test` | `TestDatabaseAutoConfigurationTests` — 1/3 (`whenUsingAotGeneratedArtifactsEmbeddedDataSourceFactoryBeanIsNotDefined`)
 - `module/spring-boot-flyway` | `FlywayEndpointTests` — 2/2
 - `module/spring-boot-flyway` | `FlywayAutoConfigurationTests` — 61/61 (entire class; the whole 180s run is this one signature repeated, not a mix of causes — confirmed via `grep -c "Cannot resolve method 'shutdown'"` == 61 == failed count). Note: this is a **different, unrelated symptom** from the already-`FIXED` `flyway-cglib-heap-corruption-sigsegv-crash` doc for the same class (that one was a fatal SIGSEGV; this is a clean FAIL) — not a discrepancy, just two distinct bugs sharing a class.
-- `module/spring-boot-batch-jdbc` | `BatchJdbcAutoConfigurationTests` — 24/26 (the other 2 are unrelated, see `batch-jdbc-mergedannotation-isdirectlypresent-abstractmethoderror.md`)
+- `module/spring-boot-batch-jdbc` | `BatchJdbcAutoConfigurationTests` — 24/26 in the original capture. The two formerly separate `MergedAnnotation.isDirectlyPresent()` failures are fixed; current focused JIT and `--nojit` reruns advance through annotation import and leave only this destroy-method signature (26/34 current test methods).
 - `module/spring-boot-integration` | `IntegrationAutoConfigurationTests` — 4/9 (`whenIntegrationJdbcDataSourceInitializerIsEnabledThenFlywayCanBeUsed`, `integrationJdbcDataSourceInitializerEnabledByDefaultWithEmbeddedDb`, `integrationJdbcDataSourceInitializerEnabled`, `integrationJdbcDataSourceInitializerDisabled`; the other 5 are unrelated, see `integration-mbeanserver-getdomains-missing-native-abstractmethoderror.md`)
 
 Every one of the new instances above is, byte-for-byte, the same
