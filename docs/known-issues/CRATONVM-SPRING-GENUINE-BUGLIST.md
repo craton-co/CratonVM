@@ -889,6 +889,30 @@ the WRONG same-named copy. Eight fixes landed on
     verification** addendum to the `ImportSelectorTests` section for the sibling
     `context.annotation.ImportSelectorTests` result (also fully clean, `9/9` pass).
 
+    **2026-07-17 third independent re-verification — still clean, no residual
+    doubt.** Assigned this class as this session's bug (before checking the doc,
+    per the standing "check already-fixed first" workflow). Rebuilt from
+    scratch at `origin/dev` tip `56728b1a` (`fb15be63` ancestor confirmed) in a
+    brand-new worktree/binary, plus an independently-built
+    `spring-context`/`spring-beans` test classpath (own `gradlew testClasses` +
+    `dumpTestCp`, not reused from any other session's possibly-stale or
+    disk-full-tainted artifacts — see the `BeanDefinitionMethodGeneratorTests`
+    entry above for why that mattered this session). Result: `found=40 succ=25
+    fail=15 status=FAIL`, ms=445465 — **identical shape** to the 2026-07-16
+    joint-verification result above (same found/succ/fail split, same 5
+    CGLIB-proxy `FAILCAUSE`s sampled), zero corruption-signature lines. Ran
+    `cargo test -p cratonvm-gc --lib --release` (791/791 passed, matches
+    baseline) and `cargo test -p cratonvm-vm --lib --release` (2200 passed, 17
+    failed — 16 match the documented pre-existing lock_order/skip_list release-
+    mode baseline exactly; the 17th, `runtime::interpreter::tests::
+    buffered_input_stream_real_jdk_uses_its_own_bytecode`, is a newly-observed,
+    unrelated failure already present on unmodified `origin/dev` — flagged
+    separately, not a GC issue, out of scope here). No code change made or
+    needed; this is the third independent confirmation (after the original
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` verification
+    and the 2026-07-16 joint-verification addendum above) that `fb15be63`
+    fully and durably closes this bug for both AOT-cluster classes.
+
     **`TestContextAotGeneratorIntegrationTests` — genuine improvement, still
     4/4 FAIL, 4 distinct causes, none newly fixed this session.** The doc's old
     "FAIL 4/0 @393 s" data point is stale on two counts: it now completes in
@@ -1008,6 +1032,43 @@ the WRONG same-named copy. Eight fixes landed on
        `ApplicationContextAotGeneratorTests` GC-corruption bug (§2, 2026-07-16
        re-triage) and appears to now also be reachable from this class under
        heavy host load; needs its own dedicated session, out of scope here.
+
+       **2026-07-17 dedicated re-triage — CONFIRMED FIXED, resolves the "needs
+       its own session" note above.** Picked up as the assigned bug for this
+       session (same class as the `fb15be63` GAP_FILLER_CLASS_ID fix's other
+       corroborating data points). First checked whether a stray same-day log
+       (`spot-bdmgt-2.log`, timestamped *after* `fb15be63` landed, from the
+       `wt-aotservices-loaderid-20260716` session) still showing the identical
+       corruption signature meant the fix was incomplete — but that build's own
+       logs (`build1.log`/`build2-postmerge.log`) show it ran under `database or
+       disk is full` conditions (the same host-wide root-filesystem exhaustion
+       hit again during this session, see below), so it was not trustworthy
+       evidence either way and needed independent reproduction. Built a
+       completely fresh binary at current `origin/dev` tip `56728b1a` (has
+       `fb15be63` as an ancestor) in a clean worktree
+       (`/data/data/wt-appctxaot-corruption-20260716`), plus a from-scratch
+       `spring-context`/`spring-beans` test-class build and `KRun` classpath
+       (`/data/data/appctxaot-repro`) independent of any other session's
+       possibly-corrupted artifacts. Result: `RESULT
+       org.springframework.beans.factory.aot.BeanDefinitionMethodGeneratorTests
+       found=34 succ=33 fail=1 skip=0 abort=0 status=FAIL` — full test discovery
+       (34/34, matches the HotSpot baseline count), zero corruption-signature
+       lines (`class_name=java/lang/Object`, `Stale pointer detected`, `LOADERR`
+       all absent from the run log). The 1 failure is an unrelated
+       `IllegalStateException: Unable to parse source file content` in
+       `generateBeanDefinitionMethodWhenPackagePrivateBean` — a real, separate
+       AOT-codegen gap, not VM-level corruption; not investigated further here.
+       **`fb15be63` does fix this class too** — the disk-full-tainted log was a
+       false alarm, not a residual. Combined with the `ApplicationContextAotGeneratorTests`
+       independent re-verification below (same session, same fresh-build
+       methodology, `found=40 succ=25 fail=15`, also zero corruption lines),
+       this closes out the `fb15be63` cross-cutting young-GC exact-walk family
+       for both AOT-cluster classes with no residual doubt. Host note: hit the
+       same root-filesystem-full condition mid-session (`~/.gradle`,
+       `/tmp/hsperfdata_victor` on `/`, unrelated to `/data`'s 240G+ free) —
+       worked around via `GRADLE_USER_HOME`/`TMPDIR` pointed at `/data/tmp`; did
+       not attempt to clean up the host-wide root-fs issue itself (out of scope,
+       affects many concurrent sessions).
 
     None of the other 3 `TestContextAotGeneratorIntegrationTests` failures are
     fixed by this change; #1 remains attributed to an existing tracked residual,
