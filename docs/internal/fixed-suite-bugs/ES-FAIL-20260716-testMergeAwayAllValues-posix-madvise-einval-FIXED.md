@@ -2,6 +2,27 @@
 
 **Status: FIXED.** `testMergeAwayAllValues` now passes reliably.
 
+## 2026-07-17 Windows host re-verification and residual closure
+
+The repair was re-verified from a clean, dev-based worktree with the uniquely
+named binary `cratonvm-es-posix-madvise-einval-20260717.exe`.  The full
+`IVFKnnFloatVectorQueryTests` class passed **3/3** under CratonVM JIT-on
+(28/28 tests each; 42.053 s, 38.382 s, and 32.663 s), and the same class
+passed on Temurin 25.0.3 HotSpot (28/28, 4.131 s).  This Windows fixture does
+not invoke Linux `posix_madvise`, but it exercises the same real mapped-segment
+and FFM bridge representations that caused the Linux failure.
+
+Residual audit extended the representation repair to every Panama bridge that
+can receive a real JDK MemorySegment: `byteSize`, `address`, `asSlice`,
+`reinterpret`, copy/fill/access and UTF-8 helpers, and Linker downcall-handle
+address extraction now share the named `min`/`length` resolution rather than
+reading synthetic field slots from real mapped instances.
+
+The re-verification also fixed three Windows runner defects: PowerShell 5.1
+now chooses `bin\\java.exe`; log parent directories are created at the write
+boundary; and overlong log paths use a compact deterministic work-root
+directory.  Those repairs were exercised by all four host runs above.
+
 ## Root cause, confirmed empirically
 
 A live `gdb` breakpoint on the real libc `posix_madvise` symbol (bypassing

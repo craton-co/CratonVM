@@ -63730,42 +63730,93 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
 // Legacy synthetic ThreadGroup = name=0, parent=1, daemon=2, maxPriority=3.
 // =============================================================================
 
+// Stale-ObjectRef hazard (2026-07-17, see
+// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8 follow-up
+// #2): `tg_enumerate_threads` walks `ThreadRegistry::alive_thread_objects()`
+// (every live Thread mirror) and, for each one, `tg_matches_thread` walks its
+// full ThreadGroup ancestry chain via repeated `tg_get_field(.., "parent",
+// ..)` calls. With many live threads (this native is reached by
+// `ThreadGroup.enumerate()`, which Tomcat/Reactor Netty's WebSocket client
+// connector churn calls heavily) the whole walk can run long enough in wall
+//-clock terms to overlap a concurrent moving-GC relocation pass on another
+// thread. Every `ObjectRef` these helpers juggle (`this`, `thread`, `group`,
+// `requested`, `arr`) was, before this fix, a bare native-local Rust variable
+// with no root registration of its own — invisible to the GC's move-fixup
+// pass, unlike `ThreadRegistry`'s own copy (which IS remapped, see
+// `ThreadRegistry::update_thread_objs_after_gc`). A relocation mid-walk left
+// the *local* copy dangling, and the next heap touch (observed at
+// `class_id_of_object` -> `gen_heap::class_id_of`'s header read) segfaulted —
+// exactly the "native stale-local" hazard class documented for other natives
+// in this file (see `Thread$State.values()` below for the same
+// pin_native_root/read_native_pin/unpin_native_roots pattern applied here).
+// Fix: pin every ObjectRef the instant it is obtained (loop element, field
+// read) and re-read through the pin before each subsequent heap touch, so a
+// relocation anywhere in the walk is transparently followed instead of left
+// dangling.
+
 fn tg_slot(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     this: ObjectRef,
     field: &str,
     legacy_fallback: usize,
 ) -> Option<usize> {
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    ctx.resolve_field_index(&class_name, field)
+    let this = ctx.read_native_pin(pin, this);
+    let result = ctx
+        .resolve_field_index(&class_name, field)
         .filter(|idx| *idx < ctx.object_num_fields(this))
-        .or_else(|| (legacy_fallback < ctx.object_num_fields(this)).then_some(legacy_fallback))
+        .or_else(|| (legacy_fallback < ctx.object_num_fields(this)).then_some(legacy_fallback));
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_get_field(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     this: ObjectRef,
     field: &str,
     legacy_fallback: usize,
 ) -> Value {
-    tg_slot(ctx, this, field, legacy_fallback)
-        .map(|idx| ctx.get_field(this, idx))
-        .unwrap_or(Value::Object(None))
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
+    let result = match tg_slot(ctx, this, field, legacy_fallback) {
+        Some(idx) => {
+            let this = ctx.read_native_pin(pin, this);
+            ctx.get_field(this, idx)
+        }
+        None => Value::Object(None),
+    };
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(thread, "holder") {
-        Value::Object(Some(holder)) => match ctx.get_field_by_name(holder, "group") {
-            Value::Object(group) => group,
-            _ => None,
-        },
-        _ => match ctx.get_field_by_name(thread, "group") {
-            Value::Object(group) => group,
-            _ => None,
-        },
-    }
+    let pin = ctx.pin_native_root(thread);
+    let thread = ctx.read_native_pin(pin, thread);
+    let result = match ctx.get_field_by_name(thread, "holder") {
+        Value::Object(Some(holder)) => {
+            let holder_pin = ctx.pin_native_root(holder);
+            let holder = ctx.read_native_pin(holder_pin, holder);
+            let r = match ctx.get_field_by_name(holder, "group") {
+                Value::Object(group) => group,
+                _ => None,
+            };
+            ctx.unpin_native_roots(holder_pin);
+            r
+        }
+        _ => {
+            let thread = ctx.read_native_pin(pin, thread);
+            match ctx.get_field_by_name(thread, "group") {
+                Value::Object(group) => group,
+                _ => None,
+            }
+        }
+    };
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_matches_thread(
@@ -63774,20 +63825,38 @@ fn tg_matches_thread(
     thread: ObjectRef,
     recurse: bool,
 ) -> bool {
+    let requested_pin = ctx.pin_native_root(requested);
+    let thread_pin = ctx.pin_native_root(thread);
+    let thread = ctx.read_native_pin(thread_pin, thread);
     let mut current = tg_of_thread(ctx, thread);
-    while let Some(group) = current {
+    ctx.unpin_native_roots(thread_pin);
+
+    // Pin the ancestry-walk cursor across the loop -- each iteration below
+    // makes at least one more native call (`tg_get_field(.., "parent", ..)`)
+    // that can span an intervening concurrent GC relocation pass.
+    let found = loop {
+        let Some(group) = current else {
+            break false;
+        };
+        let group_pin = ctx.pin_native_root(group);
+        let group = ctx.read_native_pin(group_pin, group);
+        let requested = ctx.read_native_pin(requested_pin, requested);
         if group == requested {
-            return true;
+            ctx.unpin_native_roots(group_pin);
+            break true;
         }
         if !recurse {
-            break;
+            ctx.unpin_native_roots(group_pin);
+            break false;
         }
         current = match tg_get_field(ctx, group, "parent", 1) {
             Value::Object(parent) => parent,
             _ => None,
         };
-    }
-    false
+        ctx.unpin_native_roots(group_pin);
+    };
+    ctx.unpin_native_roots(requested_pin);
+    found
 }
 
 fn tg_enumerate_threads(
@@ -63798,15 +63867,47 @@ fn tg_enumerate_threads(
 ) -> i32 {
     let arr_len = ctx.array_length(arr);
     let mut count = 0usize;
-    for obj in ctx.enumerate_threads(usize::MAX) {
+    // `group` and `arr` are held across the entire enumeration loop, which
+    // -- for every live thread mirror `ctx.enumerate_threads()` returns --
+    // makes one or more further native calls via `tg_matches_thread`. See
+    // the stale-ObjectRef doc comment above `tg_slot` for why this whole
+    // walk must stay pinned rather than holding bare native-local copies.
+    let group_pin = ctx.pin_native_root(group);
+    let arr_pin = ctx.pin_native_root(arr);
+    // `enumerate_threads()` hands back a point-in-time Vec snapshot (a copy
+    // out of `ThreadRegistry`'s own, separately-GC-remapped map) -- every
+    // element is fresh at the INSTANT this call returns, but the loop below
+    // can take many more native calls' worth of wall-clock time to work
+    // through the whole Vec (one `tg_matches_thread` ancestry walk per
+    // thread). Pinning lazily -- i.e. only once the loop body reaches a
+    // given element -- leaves every later element in the Vec unprotected
+    // for however long it takes to process every earlier one, which is
+    // exactly the window that let this bug reproduce even after the first
+    // round of pinning below was added (see
+    // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md 5.8 follow-up
+    // #2). Pin the *entire* snapshot in one tight pass immediately after
+    // capturing it instead, so every element is under a live pin before any
+    // further GC-unsafe native call has a chance to run.
+    let threads = ctx.enumerate_threads(usize::MAX);
+    let thread_pins: Vec<usize> = threads.iter().map(|&t| ctx.pin_native_root(t)).collect();
+    for (obj, &obj_pin) in threads.iter().zip(thread_pins.iter()) {
         if count >= arr_len {
             break;
         }
+        let obj = ctx.read_native_pin(obj_pin, *obj);
+        let group = ctx.read_native_pin(group_pin, group);
         if tg_matches_thread(ctx, group, obj, recurse) {
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             let _ = ctx.set_array_element(arr, count, Value::Object(Some(obj)));
             count += 1;
         }
     }
+    // Unpinning the earliest handle (`group_pin`) also unwinds every pin
+    // pushed after it -- `arr_pin` and the whole `thread_pins` batch -- see
+    // the LIFO `native_pin_roots` discipline used throughout this file
+    // (e.g. `Thread$State.values()` below).
+    ctx.unpin_native_roots(group_pin);
     count as i32
 }
 
@@ -63817,9 +63918,13 @@ fn tg_set_field(
     legacy_fallback: usize,
     value: Value,
 ) {
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
     if let Some(idx) = tg_slot(ctx, this, field, legacy_fallback) {
+        let this = ctx.read_native_pin(pin, this);
         ctx.set_field(this, idx, value);
     }
+    ctx.unpin_native_roots(pin);
 }
 
 pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {

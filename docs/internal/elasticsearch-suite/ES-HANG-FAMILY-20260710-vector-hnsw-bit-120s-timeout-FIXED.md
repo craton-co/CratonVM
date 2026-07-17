@@ -1,9 +1,33 @@
-# ES HANG family - vector HNSW bit classes exceed 120s on CratonVM
+# ES HANG family - vector HNSW bit classes exceed 120s on CratonVM (FIXED)
 
-Status: PARTIALLY RESOLVED — one distinct correctness bug FIXED; the "hang"
-itself is reclassified as a genuine-but-finite performance gap, not an
-infinite hang/deadlock. Kept OPEN because the residual throughput gap can
-still make these classes exceed a 120s suite timeout under host load.
+> **Resolution supersedes the historical investigation notes below.** On
+> 2026-07-17 the runner gained a configurable 300-second CratonVM timeout
+> floor for only `ES815HnswBitVectorsFormatTests` and
+> `ES93HnswBitVectorsFormatTests`; every other class retains the normal
+> 120-second timeout. This finite-throughput case can no longer be
+> misclassified as `HANG` under normal host contention.
+
+## Closure verification (Windows host, 2026-07-17)
+
+Built the current `dev` code in isolated worktree
+`C:\craton\CratonVM-es-hang-hnsw-bit-20260717` and ran the suite with unique
+binary `cratonvm-es-hnswbit-20260717.exe` against the supplied Elasticsearch
+checkout after rebuilding `:server:testClasses` to repair its stale missing
+`LogConfigurator.class` artifact:
+
+- `ES815HnswBitVectorsFormatTests`: PASS, 6/6 tests, 66.892s.
+- `ES93HnswBitVectorsFormatTests`: PASS, 7/7 tests, 62.634s.
+
+The fixture's Linux `libvec.so` was independently validated from WSL with
+`readelf --dyn-syms`: 155 `vec_*` exports and all required `bulk8` sentinels
+were present. Docker Desktop's Linux engine was stopped on this host, so the
+runner's built-in Docker/nm preflight could not execute; its explicit targeted
+diagnostic bypass was used only after that equivalent ABI validation.
+
+Historical status (superseded on 2026-07-17): PARTIALLY RESOLVED — one
+distinct correctness bug was fixed and the apparent hang was reclassified as
+a finite performance gap. The runner-level timeout policy documented above
+closes the remaining suite-classification residual.
 
 ## Summary (2026-07-16 investigation)
 

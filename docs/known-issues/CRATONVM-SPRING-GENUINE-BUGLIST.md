@@ -4329,3 +4329,181 @@ blocking-write call sites to not matter, e.g. by detecting a nested call from *w
 dispatch loop itself and routing that specific write through a dedicated always-available
 thread rather than the shared pool. Neither was attempted here given the now-small residual
 and the explicit host-distress caveat this session was run under.
+
+
+---
+
+#### 5.8 follow-up #2 (2026-07-17, session 3): large-sample residual characterization — NOT load-noise, two independent SIGSEGV crash classes found (one hardened, one open)
+
+Picked up the "residual, left OPEN" pointer from the prior follow-up (~1-5/72
+`TomcatWebSocketClient` sub-tests per run, flagged "host-load-correlated in
+the small sample gathered so far, but that's not confirmed with a real
+sample size"). This session's brief was specifically to get a much larger
+sample and either confirm/refute the load-noise hypothesis with real data.
+
+**Method**: built a standalone `cratonvm-wsresid` binary + a `KRunDetail2`
+JUnit-Platform launcher (an evolution of the prior session's `KRunDetail`
+that additionally prints each leaf test's `TestIdentifier.getUniqueId()` —
+the ordinary `getDisplayName()` alone collapses all 6 `@ParameterizedTest`
+methods' `[N] client=X, server=Y` invocations into indistinguishable
+strings, since JUnit's default parameterized display name is per-invocation,
+not per-method-path; the unique ID's `test-template:<method>(...)` segment
+is what actually identifies *which* of `sessionClosing`/`subProtocol`/
+`cookie`/`echo`/`largePayload`/`closeStatus` failed) plus a full exception
+stack + 3-level cause chain on every failure. Ran `WebSocketIntegrationTests`
+in a loop, recording `uptime`/`free -m` immediately before every single run.
+
+**Sample**: 80 total runs across 4 batches on the shared Azure host, spanning
+genuinely wide load conditions this session happened to catch live — from a
+quiet host (load1 as low as 1.3) through a real, independently-observable
+distress episode mid-session (load1 peaked at **93.4**, confirmed via `ps`
+to be a pile of concurrent `cargo`/`rustc`/`rustfmt` processes from other
+parallel sessions on this shared box, not anything this session started) and
+back down again. 70/80 runs completed within their 180s timeout; 5 timed out
+completely (`rc=124`, all at load1 ≥ 13, four of the five at load1 ≥ 20 —
+these are the host being outright overwhelmed, not the reentrancy bug); 5
+crashed (`SIGSEGV`, see below — a previously-undocumented, genuinely
+distinct failure mode from the known hang).
+
+**Result 1 — the known hang residual is real, not load-noise, but does have
+a weak positive load correlation**: of the 70 completed runs, only 2 were
+fully clean (0/72 failures) — the residual is *routine*, not "occasional",
+contradicting this doc's own prior "occasionally failing 1-5/72" framing
+(that framing came from a 5-run sample; every one of those 5 runs *did* in
+fact have 1-5 failures, so it was never actually "occasional" even then,
+just under-sampled). Mean failure count: 3.51/72 (range 0-9). Pearson
+correlation between `load1` and per-run failure count across all 70:
+**r = 0.30** (weak-to-moderate positive) — mean failure count at load1 < 10
+was 3.34/72 (n=53) vs. 4.06/72 at load1 ≥ 10 (n=17), and restricting to just
+the low-load subset the correlation nearly vanishes (r = 0.17). Interpretation:
+this is **not host-load noise** — the exact same `IllegalStateException:
+Timeout on blocking read` / `AssertionError: Expecting code not to raise a
+throwable but caught "...Timeout on blocking read..."` signature (the latter
+is `largePayload`'s and `echo`'s own `assertThatCode(...).doesNotThrowAnyException()`
+wrapper around the identical underlying timeout — not a new bug, a
+different test method's way of surfacing the same one) reproduces reliably
+even on a quiet host (e.g. one completed run at load1=1.44 still had 1/72
+fail; the single fully-clean run happened at load1=4.07, unremarkable). Real
+contention modestly widens the reentrancy race window (matches the pool
+architecture: more concurrent close-handshakes competing for the same
+16-thread dispatcher pool under load), but the bug's *existence* is a
+structural property of the fixed-size pool + reentrant-blocking-write design
+documented in the prior follow-up, not something a bigger host would make
+disappear. All observed failures were exclusively `TomcatWebSocketClient`
+combos; `JettyWebSocketClient`/`ReactorNettyWebSocketClient` were clean in
+every run except one single anomalous `[8] JettyWebSocketClient /
+ReactorHttpServer` `reactor.core.Exceptions$ReactiveException:
+org.eclipse.jetty.io.EofException: write(gathering): channel not connected`
+(1 occurrence out of 5,040 sub-test executions) — far too rare to
+investigate productively in this sample; noted for a future session if it
+recurs. Did **not** attempt the optional real-HotSpot-under-artificial-load
+comparison (step 4 of the task brief) — the evidence above was already
+sufficient to answer the load-noise question without it, and this session's
+time went to the two crash classes below instead.
+
+**Result 2 — a genuine, previously-undocumented `SIGSEGV` class in
+`ThreadGroup.enumerate()`'s native implementation, root-caused and
+partially hardened**: `tg_enumerate_threads`/`tg_matches_thread`/`tg_slot`
+(`native-builtins/src/phases_late.rs`) implement `ThreadGroup.enumerate()` —
+reached because Tomcat's `WsSession`/connector-shutdown machinery calls it
+during the same close-handshake activity as the hang above. Live-debugged
+via `gdb` on a captured core (`ulimit -c unlimited`, `/proc/sys/kernel/core_pattern`
+already pointed at a plain file template from an earlier session's setup):
+
+```
+#0 gc::gen_heap::class_id_of (gc/src/gen_heap.rs:1601)
+#1 vm_exec::class_id_of_object
+#2 native_builtins::phases_late::tg_slot
+#3 tg_get_field  #4 tg_matches_thread  #5 tg_enumerate_threads
+```
+
+Root cause: `tg_enumerate_threads` snapshots every live thread mirror via
+`ThreadRegistry::alive_thread_objects()`, then `tg_matches_thread` walks
+each one's `ThreadGroup` parent-ancestry chain — every `ObjectRef` touched
+along the way (`thread`, `group`, the loop's ancestry cursor, the
+`ThreadGroup` being matched against) was a bare native-local Rust copy held
+across further native calls, unprotected from a concurrent moving GC
+relocating (or fully reclaiming the from-space of) the referent mid-walk —
+the "native stale-local" hazard class this doc has documented repeatedly
+elsewhere, confirmed directly: re-running under `CRATONVM_DBG_STALE_OBJREF=1`
+turned the same crash into a clean, self-identifying panic ("stale ObjectRef
+detected... this object was evacuated by a moving GC... a raw ObjectRef
+local was held across a GC-triggering call without pin_native_root/
+read_native_pin") at the identical `tg_slot` call site, multiple independent
+times.
+
+Applied the codebase's own established `pin_native_root`/`read_native_pin`/
+`unpin_native_roots` discipline (same pattern as `Thread$State.values()`
+elsewhere in this file) throughout the whole `tg_*` call chain — first
+attempt pinned each `enumerate_threads()` snapshot element only once the
+loop reached it; **this measurably helped (1 crash / 25 verification runs,
+down from a baseline rate) but did not close the hole**, so a second attempt
+pinned the *entire* snapshot Vec in one tight pass immediately after capture
+instead (closing the "later elements in the snapshot sit unprotected for
+however long processing every earlier one takes" gap the first attempt
+left open). **Honest result: the crash still reproduced once more even
+after the second, more thorough pinning pass**, in a fresh verification run,
+at the exact same `tg_slot`/`class_id_of` site. Landed the hardening anyway
+(commit `d82a18d6`) because it is real, matches this codebase's own
+established idiom exactly, is verified non-regressing
+(`cratonvm-native-io` 349/349, `cratonvm-vm` 2201/16 — identical to the
+pre-existing baseline both before and after), and is strictly more correct
+than the original unpinned code — but it should be understood as
+**hardening, not a closed fix**. The persistence of the crash after two
+increasingly-careful pinning passes suggests the `native_pin_roots`
+mechanism itself has a deeper, not-yet-diagnosed gap specific to
+long-duration, read-only, high-object-count native walks under real
+concurrent GC pressure (as opposed to the short, allocation-driven,
+single-object sequences the existing `pin_native_root` call sites elsewhere
+in this file exercise) — worth a dedicated future session with the
+bandwidth to instrument the GC's own root-collection/remap pass
+(`vm/src/memory/roots.rs` / `vm/src/memory/gc.rs::update_all_roots`)
+directly, rather than treating this as a native-builtins-only bug.
+
+**Result 3 — a second, independent, pre-existing `SIGSEGV` class on
+`cratonvm-aio-dispatch-N` threads, NOT touched by this session**: while
+capturing cores for Result 2, two *other* crashes surfaced with completely
+different backtraces, both on a `cratonvm-aio-dispatch-N` thread (one of the
+16 pool threads added by `c7868c30`) rather than the main VM thread:
+
+- `array_descriptor_of` (`vm/src/runtime/interpreter.rs:15657`, an `ObjectKind`
+  comparison during array-access bytecode execution) — i.e. this crash is in
+  the *interpreter itself* executing a Java `CompletionHandler.completed()`
+  callback body on the dispatcher thread, not in any native builtin.
+- `gen_heap::set_field` reached from a `native-builtins/src/lib.rs`
+  `register_essential_natives` closure (a basic field-setter native) —
+  confirmed present in the **stock, pre-session `cratonvm-wsresid` binary**
+  (built straight off `dev` tip before any of this session's changes), so
+  this is not something introduced by this session's hardening attempt.
+
+Both are the same "stale ObjectRef dereferenced after a concurrent moving
+GC relocated or reclaimed it" shape as Result 2, but manifesting at
+essentially arbitrary native/interpreter call sites specifically on the AIO
+dispatcher threads, rather than one fixed location — consistent with a
+systemic gap in how a *foreign-attached* dispatcher thread's GC-root
+visibility interacts with the moving collector while it's mid-flight
+executing real Java bytecode (as opposed to a normal VM-owned thread). This
+is plausibly a genuinely *new* exposure from `c7868c30`'s pool-of-16 design
+(16x the concurrent foreign-attached-thread bytecode execution the old
+single-dispatcher-thread design never had to contend with simultaneously),
+though Result 3's second crash proves at least *a* version of this hazard
+already existed pre-`c7868c30` too. **Left entirely OPEN** — no fix
+attempted; flagged for a dedicated future session, likely the same one that
+picks up Result 2's deeper investigation, since both point at the same
+underlying GC-root-tracking gap.
+
+**Net assessment**: the residual is real (not noise), dominated overwhelmingly
+by the known, load-*insensitive* AIO-dispatcher reentrancy hang (unfixed,
+unchanged from the prior follow-up — a structural property of the
+fixed-pool-size + reentrant-blocking-write design), plus two rare (~7% of
+runs combined, well under the hang's ~97%-of-runs rate) but genuine SIGSEGV
+crash classes that are new findings from this session — one now partially
+hardened, one fully open. Neither crash class meaningfully changes the
+overall pass-rate picture (`TomcatWebSocketClient`'s failure rate is
+dominated by the hang either way), but both are real bugs worth fixing
+properly in a future session with GC-internals bandwidth this one didn't
+have left. Verified via `cargo test -p cratonvm-native-io --lib --release`
+(349/349) and `cargo test -p cratonvm-vm --lib --release` (2201 passed / 16
+failed, all 16 the same pre-existing debug-build-only `lock_order` +
+already-broken `jit::skip_list` failures documented in the prior follow-up —
+zero regressions either run).

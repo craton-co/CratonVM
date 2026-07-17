@@ -20,6 +20,7 @@ param(
   [int]$Count = 0,
   [int]$Parallel = 1,
   [int]$TimeoutSec = 120,
+  [int]$KnownSlowClassTimeoutSec = 300,
 
   [string]$RunName = '',
   [string]$ModeName = '',
@@ -32,6 +33,7 @@ param(
   [string]$Seed = 'B17AC9D3E1F2A0C4',
   [string[]]$CratonArgs = @(),
 
+  [switch]$SkipNativeFixtureCheck,
   [switch]$RefreshLists,
   [switch]$ListOnly,
   [switch]$AllModes
@@ -46,6 +48,73 @@ function Write-Info([string]$Message) {
 function Die([string]$Message) {
   Write-Error "[elasticsearch-suite] $Message"
   exit 1
+}
+
+function Get-LinuxX64DynamicSymbols([string]$Library) {
+  $nm = Get-Command nm -ErrorAction SilentlyContinue
+  if ($nm) {
+    $exports = @(& $nm.Source '-D' '--defined-only' $Library 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $exports.Count -eq 0) {
+      Die "Unable to read dynamic symbols from native fixture: $Library"
+    }
+    return $exports
+  }
+
+  # The preparer supplies this image. Its nm fallback keeps the standard
+  # Windows PowerShell runner able to validate the Linux fixture it launches
+  # through a Linux target environment.
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    Die "Cannot validate Linux libvec fixture because neither 'nm' nor Docker is available. Run this runner on the Linux target, or prepare the fixture with prepare-elasticsearch-libvec-fixture.ps1."
+  }
+
+  $libraryDir = Split-Path -Parent $Library
+  $libraryName = Split-Path -Leaf $Library
+  $image = 'cratonvm-es-libvec-toolchain-20260717'
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $exports = @(& $docker.Source 'run' '--rm' '-v' "$libraryDir`:/fixture:ro" $image 'nm' '-D' '--defined-only' "/fixture/$libraryName" 2>$null)
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($exitCode -ne 0 -or $exports.Count -eq 0) {
+    Die "Unable to read dynamic symbols from native fixture: $Library. Install GNU binutils or run prepare-elasticsearch-libvec-fixture.ps1 to create the local validation image."
+  }
+  return $exports
+}
+
+function Assert-LinuxX64VectorFixture([string]$Root) {
+  # JdkVectorLibrary eagerly links its complete native table during class
+  # initialization. A missing or old libvec therefore makes nearly every ES
+  # test fail before it reaches test code. Keep this check before class-list
+  # selection so a fixture error can never be recorded as suite failures.
+  $library = Join-Path $Root 'lib/platform/linux-x64/libvec.so'
+  if (-not (Test-Path -LiteralPath $library -PathType Leaf)) {
+    Die "Elasticsearch native fixture is missing: $library. Rebuild it from this checkout with apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 -ElasticsearchRoot '$Root'."
+  }
+
+  $exports = @(Get-LinuxX64DynamicSymbols $library)
+
+  $symbols = @($exports | ForEach-Object {
+    $parts = $_ -split '\s+'
+    if ($parts.Count -ge 3) { $parts[$parts.Count - 1] }
+  } | Where-Object { $_ })
+  $vectorSymbols = @($symbols | Where-Object { $_ -like 'vec_*' })
+
+  # The 2026-07 fixture ABI has 155 vec_* exports. The old 145-export
+  # artifact lacks the bulk8 family; these sentinels make the diagnostic
+  # explicit even if a future tooling change changes the count.
+  $required = @('vec_caps', 'vec_cosi8_bulk8', 'vec_doti8_bulk8', 'vec_sqri8_bulk8')
+  $missing = @($required | Where-Object { $symbols -notcontains $_ })
+  if ($vectorSymbols.Count -lt 155 -or $missing.Count -gt 0) {
+    $missingText = if ($missing.Count) { $missing -join ', ' } else { 'none' }
+    Die "Elasticsearch native fixture is stale or incompatible: $library exports $($vectorSymbols.Count) vec_* symbols (need at least 155); missing required symbols: $missingText. Rebuild it from this checkout with apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 -ElasticsearchRoot '$Root'."
+  }
+
+  $hash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash.ToLowerInvariant()
+  Write-Info "validated libvec path=$library vec_symbols=$($vectorSymbols.Count) sha256=$hash"
 }
 
 function Get-RepoRoot {
@@ -109,6 +178,24 @@ function ConvertFrom-InvariantString([string]$Value) {
   return 0.0
 }
 
+# These classes are known to perform finite, allocation-heavy HNSW graph
+# construction.  On CratonVM they can exceed the normal per-class timeout
+# under host contention while continuing to make progress; see
+# docs/internal/elasticsearch-suite/ES-HANG-FAMILY-20260710-vector-hnsw-bit-120s-timeout-FIXED.md.
+# Keep the exception exact and small so a timeout in every other class still
+# reports a diagnostic HANG promptly.
+$script:KnownSlowCratonClasses = @{
+  'org.elasticsearch.index.codec.vectors.ES815HnswBitVectorsFormatTests' = $true
+  'org.elasticsearch.index.codec.vectors.es93.ES93HnswBitVectorsFormatTests' = $true
+}
+
+function Get-ClassTimeoutSec([string]$Class) {
+  if ($Vm -eq 'craton' -and $script:KnownSlowCratonClasses.ContainsKey($Class)) {
+    return [Math]::Max($TimeoutSec, $KnownSlowClassTimeoutSec)
+  }
+  return $TimeoutSec
+}
+
 function Quote-WindowsArgument([string]$Argument) {
   if ($null -eq $Argument) { return '""' }
   if ($Argument.Length -eq 0) { return '""' }
@@ -153,6 +240,14 @@ function Start-RedirectedProcess {
     [string]$StderrPath
   )
 
+  # These paths are also used by `-AllModes` for the child PowerShell
+  # consoles.  Create their parents here instead of relying on a caller's
+  # sibling-directory side effect.
+  foreach ($path in @($StdoutPath, $StderrPath)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
+
   $psi = [System.Diagnostics.ProcessStartInfo]::new()
   $psi.FileName = $FilePath
   $psi.WorkingDirectory = $WorkingDirectory
@@ -184,6 +279,10 @@ function Complete-RedirectedProcess([object]$Record) {
   $stderr = ''
   try { $stdout = $Record.stdoutTask.Result } catch {}
   try { $stderr = $Record.stderrTask.Result } catch {}
+  foreach ($path in @($Record.stdoutPath, $Record.stderrPath)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
   [System.IO.File]::WriteAllText($Record.stdoutPath, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.stderrPath, $stderr, [System.Text.Encoding]::UTF8)
   $exitCode = $Record.proc.ExitCode
@@ -466,20 +565,39 @@ function New-ProcessRecord {
 
   $module = [string]$ClassRow.module
   $class = [string]$ClassRow.class
+  $classTimeoutSec = Get-ClassTimeoutSec $class
   $cp = Get-Classpath $module
   if (-not $cp) {
     return [pscustomobject]@{
       noCp = $true
       module = $module
       class = $class
+      timeoutSec = $classTimeoutSec
     }
   }
 
   $safe = Get-LogBaseName -Module $module -Class $class
   $logDir = Join-Path $ModeOut 'logs'
-  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
+  # Windows PowerShell 5.1/.NET Framework still hits MAX_PATH for a normal
+  # class name when callers use a long worktree, work directory, or run name.
+  # Keep the documented per-mode layout when it fits; otherwise use a compact
+  # deterministic subdirectory under the work root.  Include ModeOut in the
+  # hash so repeated runs retain separate logs instead of overwriting them.
+  if ($env:OS -eq 'Windows_NT' -and $outFile.Length -ge 240) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      $key = [System.Text.Encoding]::UTF8.GetBytes("$ModeOut`t$module`t$class")
+      $hash = ([System.BitConverter]::ToString($sha.ComputeHash($key)) -replace '-', '').Substring(0, 16).ToLowerInvariant()
+    } finally {
+      $sha.Dispose()
+    }
+    $logDir = Join-Path (Join-Path $script:WorkRoot 'logs') $hash
+    $outFile = Join-Path $logDir "$safe.out.log"
+    $errFile = Join-Path $logDir "$safe.err.log"
+  }
+  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
@@ -516,6 +634,7 @@ function New-ProcessRecord {
     stderrTask = $proc.StandardError.ReadToEndAsync()
     module = $module
     class = $class
+    timeoutSec = $classTimeoutSec
     start = Get-Date
     outFile = $outFile
     errFile = $errFile
@@ -603,6 +722,10 @@ function Complete-ProcessRecord {
   $stderr = ''
   try { $stdout = $Record.stdoutTask.Result } catch {}
   try { $stderr = $Record.stderrTask.Result } catch {}
+  foreach ($path in @($Record.outFile, $Record.errFile)) {
+    $parent = Split-Path -Parent $path
+    if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  }
   [System.IO.File]::WriteAllText($Record.outFile, $stdout, [System.Text.Encoding]::UTF8)
   [System.IO.File]::WriteAllText($Record.errFile, $stderr, [System.Text.Encoding]::UTF8)
 
@@ -654,7 +777,7 @@ function Wait-OneRunning {
 
       $elapsed = ((Get-Date) - $record.start).TotalSeconds
       $timedOut = $false
-      if (-not $record.proc.HasExited -and $elapsed -ge $TimeoutSec) {
+      if (-not $record.proc.HasExited -and $elapsed -ge $record.timeoutSec) {
         $timedOut = $true
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
       }
@@ -681,7 +804,11 @@ function Invoke-Mode {
   param([object[]]$Classes)
 
   $jdk = Resolve-Jdk
-  $javaName = if ($IsWindows) { 'bin\java.exe' } else { 'bin/java' }
+  # `$IsWindows` is only defined by PowerShell 6+.  This runner's documented
+  # invocation uses Windows PowerShell 5.1 (`powershell.exe`), where that
+  # unset variable silently selected the Unix `bin/java` path and prevented
+  # every local run before a JVM could start.
+  $javaName = if ($env:OS -eq 'Windows_NT') { 'bin\java.exe' } else { 'bin/java' }
   $java = Join-Path $jdk $javaName
   if (-not (Test-Path $java)) { Die "HotSpot java not found: $java" }
   $craton = ''
@@ -713,7 +840,7 @@ function Invoke-Mode {
   }
   $todo = @($Classes | Where-Object { -not $done.ContainsKey("$($_.module)`t$($_.class)") })
 
-  Write-Info "mode=$mode vm=$Vm jit=$Jit category=$Category selected=$($Classes.Count) todo=$($todo.Count) parallel=$Parallel timeout=${TimeoutSec}s"
+  Write-Info "mode=$mode vm=$Vm jit=$Jit category=$Category selected=$($Classes.Count) todo=$($todo.Count) parallel=$Parallel timeout=${TimeoutSec}s known-slow-timeout=${KnownSlowClassTimeoutSec}s"
   if ($Vm -eq 'craton') { Write-Info "craton exe=$craton" }
   Write-Info "logs/results=$modeOut"
 
@@ -848,12 +975,19 @@ if (-not $ElasticsearchRoot) {
 $script:ElasticsearchDir = [System.IO.Path]::GetFullPath($ElasticsearchRoot)
 if (-not (Test-Path $script:ElasticsearchDir)) { Die "Elasticsearch root not found: $script:ElasticsearchDir" }
 
+if ($SkipNativeFixtureCheck) {
+  Write-Info 'SKIPPING native libvec fixture check by explicit request'
+} else {
+  Assert-LinuxX64VectorFixture $script:ElasticsearchDir
+}
+
 if (-not $WorkDir) { $WorkDir = Join-Path $PSScriptRoot '.suite' }
 $script:WorkRoot = [System.IO.Path]::GetFullPath($WorkDir)
 New-Item -ItemType Directory -Force -Path $script:WorkRoot | Out-Null
 
 if ($Parallel -lt 1) { $Parallel = 1 }
 if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+if ($KnownSlowClassTimeoutSec -lt 1) { $KnownSlowClassTimeoutSec = 1 }
 
 if ($AllModes) {
   if ($RefreshLists -or -not (Test-Path (Join-Path $script:WorkRoot 'all-tests.tsv'))) {

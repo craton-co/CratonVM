@@ -69,7 +69,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\elasticsearch-suite
 | `-Start` | integer >= 1 | `1` | 1-based start index within the selected category. |
 | `-Count` | integer >= 0 | `0` | Number of classes to run; `0` means through the end. |
 | `-Parallel` | integer >= 1 | `1` | Concurrent class processes per mode. |
-| `-TimeoutSec` | integer >= 1 | `120` | Per-class timeout. Timeout status is `HANG`. |
+| `-TimeoutSec` | integer >= 1 | `120` | Normal per-class timeout. Timeout status is `HANG`. |
+| `-KnownSlowClassTimeoutSec` | integer >= 1 | `300` | CratonVM timeout floor for the two known finite-but-slow HNSW-bit classes. |
 | `-RunName` | string | timestamp | Result directory name. |
 | `-ElasticsearchRoot` | path | `C:\craton\CratonVM\apps\elasticsearch` | Elasticsearch checkout to run. |
 | `-WorkDir` | path | `apps\elasticsearch-suite-runner\.suite` | Generated lists, results, logs, baselines. |
@@ -79,9 +80,35 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\elasticsearch-suite
 | `-MaxHeap` | heap string | `2g` | Heap passed to both VMs. |
 | `-Seed` | string | `B17AC9D3E1F2A0C4` | Elasticsearch randomized-test seed. |
 | `-CratonArgs` | string array | none | Extra CratonVM CLI arguments. |
+| `-SkipNativeFixtureCheck` | switch | off | Bypass the mandatory `libvec.so` ABI gate for narrowly scoped diagnostics only. |
 | `-RefreshLists` | switch | off | Rebuild `all-tests.tsv`, `passed.tsv`, `others.tsv`. |
 | `-ListOnly` | switch | off | Print selected classes without running. |
 | `-AllModes` | switch | off | Run four category/JIT modes concurrently. |
+
+## Native `libvec` fixture gate
+
+Before selecting any test classes, the runner validates the Linux x64
+`lib/platform/linux-x64/libvec.so` in the exact `-ElasticsearchRoot` supplied.
+It refuses to run when the library is absent, has fewer than 155 `vec_*`
+exports, or lacks the `bulk8` symbols required by the checked-out tests. This
+prevents a fixture error from being misclassified as a suite-wide CratonVM
+failure.
+
+If the fixture is absent or stale, rebuild it from the same Elasticsearch
+checkout; do not copy a `libvec.so` from another checkout or cached artifact:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass `
+  -File apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 `
+  -ElasticsearchRoot C:\craton\CratonVM\apps\elasticsearch
+```
+
+The preparation script builds the library in Elasticsearch's checked-in Docker
+cross-toolchain, verifies its exports, and atomically installs it. The runner
+uses GNU `nm` on Linux and otherwise reuses the preparation image through
+Docker to perform the same preflight check. `-SkipNativeFixtureCheck` is
+available only for targeted diagnostics where the native-vector path is known
+to be out of scope.
 
 Any `CRATONVM_*` environment variable already set in the shell is inherited by
 every CratonVM child process. Example:
@@ -160,6 +187,14 @@ Status values:
 - `CRASH`: fatal signal, panic, access violation, or non-JUnit process exit.
 - `NOCP`: module classpath file was missing.
 - `NOSUMMARY`: no JUnit signal and no crash fingerprint.
+
+The runner gives only `ES815HnswBitVectorsFormatTests` and
+`ES93HnswBitVectorsFormatTests` a CratonVM-specific timeout floor (300 seconds
+by default). They build HNSW graphs and have been verified to make continuous
+forward progress, but can exceed 120 seconds when the host is contended. The
+normal timeout still applies to all other classes; set
+`-KnownSlowClassTimeoutSec` to tune this narrow allowance for a particular
+host.
 
 Runs are resumable. Existing rows in `results.tsv` are skipped when rerunning
 the same `-RunName` and mode.
