@@ -34530,11 +34530,30 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // non-positive ids ("Invalid thread ID parameter") on every
             // AsyncFileHandler format. The mirror lookup may allocate, so
             // keep this pinned across it.
+            let real = log_record_real_layout(ctx, this);
             let this_pin = ctx.pin_native_root(this);
             let tid = current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "threadID", Value::Int(short_thread_id(tid)));
             ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
@@ -36136,19 +36155,67 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and `withZone(null)` immediately NPEs, blowing up the entire
     // log4j logging stack and stalling WildFly bootstrap.
     //
-    // Until the underlying tzdb.dat read is fixed, intercept the call
-    // and return a synthetic UTC ZoneId object.  The returned value
-    // satisfies `withZone(non-null)` so log4j initialises cleanly.
-    // DST semantics are wrong, but log timestamps default to UTC,
-    // which is acceptable for boot diagnostics.
+    // HHH-10372 correctness fix (2026-07-17): the original version of this
+    // bypass (still present as the fallback below) *always* returned a
+    // hardcoded UTC ZoneOffset, ignoring any `TimeZone.setDefault(...)`
+    // call the running program had made — a host-timezone-leak that
+    // silently broke every caller relying on a *settable* JVM default,
+    // not just log4j's boot-time NPE guard. Concretely: Hibernate's
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` (`Timezones.withDefaultTimeZone()`
+    // test helper) call `TimeZone.setDefault(...)` then read it back via
+    // `ZoneId.systemDefault()` — with the old hardcoded-UTC bypass, that
+    // always resolved to UTC regardless of what was set, producing
+    // timezone-offset-sized value corruption (63/608 parameterized
+    // failures, e.g. `expected: <2017-11-06 09:19:01.0> but was:
+    // <2017-11-06 01:19:01.0>`, matching whatever offset `TimeZone.setDefault`
+    // was called with).
+    //
+    // Fix: first try to resolve the *actual current* default zone via
+    // `TimeZone.getDefault()` (also natively overridden below in the
+    // "Round 54" fix, and confirmed to correctly track `setDefault(...)`
+    // — it does not touch the broken ZoneInfoFile/tzdb.dat path) and hand
+    // its id to the real bytecode `ZoneId.of(String)` (unregistered/native-free
+    // in real-JDK mode, so it runs the actual JDK parsing+tzdb-rules logic,
+    // which already works correctly for explicit `ZoneId.of(...)` calls
+    // elsewhere in this same test suite — DST rules included). Only fall
+    // back to the original hardcoded synthetic UTC ZoneOffset (preserving
+    // the exact previous behavior) if that chain fails for any reason
+    // (e.g. too early in boot for TimeZone/ZoneId to be ready yet) — the
+    // log4j NPE guard this bypass exists for must never regress.
     registry.register(
         "java/time/ZoneId",
         "systemDefault",
         "()Ljava/time/ZoneId;",
         |ctx, _args| {
-            // Allocate a synthetic instance of ZoneOffset (a concrete
-            // ZoneId subclass with a single int totalSeconds field).
-            // Using the abstract ZoneId class directly may break
+            if let Ok(Some(Value::Object(Some(tz)))) = ctx.invoke(
+                "java/util/TimeZone",
+                "getDefault",
+                "()Ljava/util/TimeZone;",
+                &[],
+            ) {
+                if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
+                    "java/util/TimeZone",
+                    "getID",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(tz))],
+                ) {
+                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
+                    if has_id {
+                        if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                            "java/time/ZoneId",
+                            "of",
+                            "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                            &[Value::Object(Some(id_str))],
+                        ) {
+                            return Ok(Some(zone));
+                        }
+                    }
+                }
+            }
+            // Fallback: original hardcoded-UTC synthetic bypass (see doc
+            // comment above) — allocate a synthetic instance of ZoneOffset
+            // (a concrete ZoneId subclass with a single int totalSeconds
+            // field). Using the abstract ZoneId class directly may break
             // instanceof checks downstream; ZoneOffset.UTC is the
             // canonical way to get a non-null ZoneId without touching
             // ZoneInfoFile.
@@ -36404,6 +36471,74 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
+    // offsets for zones whose real IANA tzdata models a historical LMT-style
+    // offset before their first modern standardization transition.
+    // `tz_standard_offset_seconds`/`tz_dst_rule` above only know the
+    // CURRENT/modern standard offset and (for zones with a recurring annual
+    // DST rule) a `java.util.SimpleTimeZone`-representable rule — neither
+    // can express a ONE-TIME historical cutover, because SimpleTimeZone's
+    // `getOffsets(long, int[])` (what `GregorianCalendar.computeTime()`/
+    // `.computeFields()` actually call for a non-`ZoneInfo` zone — see
+    // `TimeZone.getOffsets`) only ever consults `rawOffset` (fixed at
+    // construction, no date parameter) plus the DST rule; there is no
+    // structural way to make `rawOffset` itself date-dependent. This table
+    // plus the `SimpleTimeZone.getOffsets` override below patches in the
+    // exact historical cutover(s) real HotSpot's tzdb encodes for the
+    // zones this project's Hibernate ORM suite exercises pre-standardization
+    // dates for (`ZonedDateTimeTest`'s 1904/1905 Europe/Paris boundary
+    // cases — see docs/known-issues/hibernate/hib-misc-residuals-20260716.md
+    // and docs/internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+    //
+    // Values cross-checked against real HotSpot JDK 25's
+    // `ZoneId.of(id).getRules().getTransitions()` — the earliest transition
+    // each zone's tzdb rule-set models, i.e. the exact instant HotSpot
+    // itself switches away from the zone's Local Mean Time. Returns
+    // `(cutover_epoch_millis, pre_cutover_offset_seconds)`: for any queried
+    // instant strictly before `cutover_epoch_millis`, the real/correct
+    // offset is `pre_cutover_offset_seconds`, not the zone's modern
+    // rawOffset/DST rule. This is intentionally a small, explicit table
+    // (not full historical tzdata) — it only covers zones actually
+    // exercised pre-cutover by this codebase's test suites; a zone not
+    // listed here simply keeps the existing (correct, post-standardization)
+    // rawOffset/DST-rule behavior for every date, unchanged from before this
+    // fix.
+    fn historical_lmt_offset(zone_id: &str) -> Option<(i64, i32)> {
+        match zone_id {
+            // Europe/Paris: Paris Mean Time (+00:09:21) until the
+            // 1911-03-11 00:00 local switch to WET (UTC+0). Confirmed via
+            // `GeneralityRepro.java` that real HotSpot JDK 25's OWN legacy
+            // `TimeZone.getOffset(long)`/`GregorianCalendar` path (not just
+            // `java.time`) correctly resolves this to 561s pre-cutover —
+            // i.e. adding this entry makes CratonVM MATCH real HotSpot.
+            //
+            // Deliberately NOT extended to Europe/Amsterdam (+00:17:30
+            // until 1892-05-01) or Europe/Oslo (+00:53:28 until
+            // 1893-03-31), even though those zones have an analogous
+            // historical LMT cutover in real IANA tzdata and in
+            // `java.time`'s `ZoneRules`: probed with the same
+            // `GeneralityRepro.java` against real HotSpot JDK 25, and
+            // unlike Paris, HotSpot's own *legacy* `TimeZone`/
+            // `GregorianCalendar` path returns the flat MODERN offset
+            // (3600s) for both zones even strictly before their cutover
+            // instant — real HotSpot's compiled legacy `ZoneInfo` binary
+            // tzdata apparently doesn't carry these zones' pre-1892/1893
+            // LMT rule at all, even though `java.time`'s separate,
+            // text-tzdata-backed `ZoneRules` does. Adding a table entry
+            // for these two would make CratonVM's legacy path *more
+            // textbook-correct than real HotSpot* — i.e. diverge from the
+            // reference JVM this project targets bug-for-bug compatibility
+            // with, not converge on it. If a future test genuinely needs
+            // one of these (or another zone's) legacy-path LMT precision
+            // matched, re-verify against real HotSpot with
+            // `GeneralityRepro.java`-style probing FIRST — do not assume
+            // "real IANA tzdata has a cutover" implies "HotSpot's legacy
+            // Calendar path resolves it".
+            "Europe/Paris" => Some((-1855958961_000, 9 * 60 + 21)),
+            _ => None,
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
         // current recurring DST rule is known (`tz_dst_rule`), construct a
@@ -36639,6 +36774,59 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    // HIB-PARIS-LMT (2026-07-17): SimpleTimeZone.getOffsets(long, int[]) —
+    // the package-private method GregorianCalendar.computeTime()/
+    // computeFields() actually call (via TimeZone.getOffsets / directly) for
+    // any zone that isn't a `sun.util.calendar.ZoneInfo` — which, per
+    // `alloc_synth_timezone` above, is every zone with a known
+    // `tz_dst_rule` (all the `Europe/*` zones the Hibernate ORM
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` suites exercise). For dates
+    // strictly before a zone's `historical_lmt_offset` cutover, return the
+    // historical LMT offset directly; otherwise defer to the real
+    // SimpleTimeZone bytecode (its existing, already-correct
+    // rawOffset/DST-rule computation) via `invoke_virtual_bytecode_only` —
+    // skipping the native-override check so this doesn't re-enter itself.
+    // See `historical_lmt_offset` for why this can't be expressed by
+    // overriding `getRawOffset()` instead (no date parameter to key off).
+    registry.register(
+        "java/util/SimpleTimeZone",
+        "getOffsets",
+        "(J[I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
+
+            let id = match ctx.get_field_by_name(this, "ID") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+
+            if let Some((cutover_millis, pre_offset_secs)) = historical_lmt_offset(&id) {
+                if date < cutover_millis {
+                    let offset_ms = pre_offset_secs.saturating_mul(1000);
+                    if let Value::Object(Some(arr)) = offsets_arr {
+                        ctx.set_array_element(arr, 0, Value::Int(offset_ms));
+                        ctx.set_array_element(arr, 1, Value::Int(0));
+                    }
+                    return Ok(Some(Value::Int(offset_ms)));
+                }
+            }
+
+            ctx.invoke_virtual_bytecode_only(
+                this,
+                "getOffsets",
+                "(J[I)I",
+                &[Value::Long(date), offsets_arr],
+            )
+        },
     );
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
@@ -46255,6 +46443,30 @@ pub(crate) fn short_thread_id(tid: i64) -> i32 {
     } else {
         i32::MAX / 2 + 1
     }
+}
+
+/// Wall-clock now in epoch millis, for stamping `LogRecord` creation time.
+pub(crate) fn epoch_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `rec` is a real-JDK-layout `java.util.logging.LogRecord`. The real
+/// class resolves its private `longThreadID` long by NAME (typed zero even
+/// before any write); synthetic WildFly/JBoss mirrors have no such field, so
+/// the lookup yields `Object(None)`. Slot-based accessor fallbacks are only
+/// valid on the synthetic layouts: the real JDK 25 declaration order
+/// (level=0, sequenceNumber=1, sourceClassName=2, sourceMethodName=3,
+/// message=4, threadID=5, longThreadID=6, instant=7, loggerName=8,
+/// resourceBundle=9, resourceBundleName=10, parameters=11, thrown=12)
+/// disagrees with the synthetic slots almost everywhere.
+pub(crate) fn log_record_real_layout(
+    ctx: &dyn NativeContext,
+    rec: cratonvm_types::ObjectRef,
+) -> bool {
+    matches!(ctx.get_field_by_name(rec, "longThreadID"), Value::Long(_))
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.

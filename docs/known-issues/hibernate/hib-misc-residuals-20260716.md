@@ -151,6 +151,759 @@ victim every time" pattern was actually pointing at.
 
 </details>
 
+
+## Update 2026-07-17 (this session): AIOOBE/InvalidMappingException NOT independently reproduced across 60/132 real executions; NEW severe whole-class-discovery performance cliff found, blocking full confirmation
+
+Picked up this doc's own "Next step" from the entry above (root-cause the
+`ArrayIndexOutOfBoundsException`/`InvalidMappingException` 106/132 failures
+now that the GC-corruption family is closed). Built a fresh binary from
+`dev` (worktree `wt-hib-defaultcatalog-hbmxml-20260717`, branch
+`fix/hib-defaultcatalog-hbmxml-20260717`, merged through `732241c8` — i.e.
+several commits later than the `a0c60214`-based baseline that produced the
+`found=132 ok=26 failed=106` result quoted above).
+
+**HotSpot baseline (this session, same classpath/props via `common.args`):**
+whole-class solo run, `132 found / 132 started / 132 ok / 0 failed`, `34.1s`
+flat. Confirms real HotSpot has no legitimate skips/failures here — any
+CratonVM failure is CratonVM-specific.
+
+**Whole-class run on CratonVM: could not obtain a completed result this
+session**, on an extremely contended shared host (`uptime` load average
+swinging 8 → 64 over the session; `free -m` down to <500MB available at one
+point; `dmesg` shows the host OOM-killing unrelated processes —
+`systemd`/`(sd-pam)`/`rustc` from other concurrent sessions, and once one of
+this session's own probe processes — throughout). Three separate whole-class
+attempts (`DiscoverySelectors.selectClass`, exactly what `CratonRunner`/the
+harness uses), JIT-on ×2 and `--nojit` ×1, **never produced a single
+`@@RESULT` line** — not even for the first of 132 tests — within 6-11
+minutes each (one bounded run was left to 600s and still hadn't produced a
+result when this update was written). This is *slower*, not hung: live
+`gdb -p <pid> -ex 'thread apply all bt'` snapshots taken several times
+during these stalls each landed in a **different**, legitimate code path —
+GC conservative-root scanning of JIT frames
+(`gc::gen_heap::is_object_address` via `scan_active_jit_frames`),
+`Throwable`-style full-stack-trace capture
+(`vm::runtime::stackwalker::capture_full_trace` walking `LazyAttribute`/line
+tables), and `HashMap.computeIfAbsent`-driven string hashing
+(`native_map_compute_if_absent` → `map_hash_key` → `read_string`) — ruling
+out a deadlock/livelock. Two of these whole-class attempts' processes were
+independently confirmed still alive and CPU-bound (98-100%) via `ps`
+immediately before being killed to free the host; RSS grew from ~1GB to
+5-8GB over each attempt's lifetime without ever finishing test #0.
+
+**To get a faster, more surgical signal, bypassed the whole-class
+`@ParameterizedClass` discovery** with two standalone Java probes compiled
+against the harness classpath and run through the real `cratonvm` binary
+(source kept at
+`/data/data/tmp/MiniProbe.java`/`/data/data/tmp/MethodProbeRunner.java` on
+the shared host; not committed, since they're throwaway diagnostic
+harnesses, not product code):
+
+- `MiniProbe.java` — calls `MetadataSources.buildMetadata()` →
+  `SessionFactoryBuilder.build()` → `SchemaExport.doExecution(CREATE, …)`
+  directly (no JUnit5 launcher at all), for 2 of the fixture's `xmlMapping`
+  variants (`null` and `implicit-global-catalog-and-schema.orm.xml`),
+  reproducing exactly the `addInputStream`/`addAnnotatedClasses` fixture
+  from `DefaultCatalogAndSchemaTest.produceModel()`. **Zero exceptions**,
+  both variants: metadata build 14.7s/3.9s (CratonVM) vs 2.0s/0.13s
+  (HotSpot); SessionFactory build 7.1s/1.4s vs 1.0s/0.08s; DDL-create export
+  129ms/112ms vs 21ms/3ms — a genuine but unremarkable ~7-20x CratonVM/
+  HotSpot ratio, consistent with this project's known general interpreter
+  overhead, not a correctness gap.
+- `MethodProbeRunner.java` — uses
+  `DiscoverySelectors.selectMethod(className, methodName, paramTypes)`
+  instead of `selectClass`, so the *real* JUnit5 launcher + Jupiter engine +
+  `@ParameterizedClass`/`@MethodSource("options")` + Hibernate's
+  `ServiceRegistryFunctionalTesting`/`DomainModelFunctionalTesting`/
+  `SessionFactoryFunctionalTesting` extensions still run exactly as they do
+  in a whole-class run — just scoped to **one** `@Test` method (still all
+  12 `Options` combos for that method).
+
+  Ran 5 of the class's 11 `@Test` methods this way — `entityPersister`
+  (127.7s), `createSchema_fromSessionFactory` (117.5s),
+  `updateSchema_fromSessionFactory` (140.3s), `tableGenerator` (64.7s),
+  `sequenceGenerator` (60.7s) — **60 of the 132 total parameterized test
+  executions, 60/60 passing** (`found=12 started=12 ok=12 failed=0` each),
+  matching HotSpot's per-method 12/12 pass shape exactly. This covers DDL
+  create-script generation via both the `SchemaManagementToolCoordinator`
+  path and (indirectly, via `MiniProbe`) the `SchemaExport` path,
+  entity-persister catalog/schema-qualifier resolution across every entity
+  variant in the fixture (annotations, `orm.xml`, `hbm.xml`, joined/
+  table-per-class inheritance, custom-SQL, identity/table/sequence/
+  increment/enhanced-sequence generators), and DDL update-script generation
+  against live `DatabaseMetaData`. **Zero
+  `ArrayIndexOutOfBoundsException`/`InvalidMappingException` anywhere**
+  across these 60 real, varied executions. (A 6th method,
+  `createSchema_fromMetadata`, was mid-run — already past 6 minutes,
+  further into its run than the other five typically needed to finish —
+  when the host ran out of memory entirely; `dmesg` confirms `Out of
+  memory: Killed process … (cratonvm-hbmxml)` for this probe's PID at the
+  same timestamp several unrelated processes on the host were also
+  OOM-killed. Inconclusive — not attributable to this class or this fix,
+  just lost to host contention.)
+
+**Assessment:** given (a) the sibling session's `found=132 ok=26 failed=106`
+capture was against an earlier `dev` tip than this session's binary, (b)
+several additional GC/reflection correctness fixes have landed on `dev` in
+the interim (this doc's own `Update` sections above/below this one catalog
+some of them), and (c) 60 of the 132 real parameterized executions —
+spanning DDL generation, entity-persister reflection, and three different
+ID-generator strategies — all pass cleanly on the current tip with zero
+occurrences of the reported exception, **the AIOOBE/InvalidMappingException
+bug most likely no longer reproduces on current `dev`**, probably fixed
+incidentally by later, unrelated correctness work rather than by anything
+landed this session. This is **not proven** with a full clean 132/132 run —
+the whole-class run itself could not complete this session, for the
+separate reason below, compounded by extreme host contention. Leaving this
+sub-item **OPEN but downgraded**: a follow-up session (ideally on a quiet
+host) should get one clean whole-class `found=132 … failed=0` run to close
+it formally, or, if it still reproduces, get a `-Dcraton.trace=1` stack
+trace for it — the `MethodProbeRunner.java` recipe above will get there
+much faster than a whole-class run (a fresh `git worktree`, one
+`cargo build --release -p cratonvm-cli`, then loop `MethodProbeRunner
+org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest
+<method> [paramType]` over the remaining 6 untested methods:
+`updateSchema_fromSessionFactory` done; still untested:
+`dropSchema_fromSessionFactory`, `createSchema_fromMetadata`,
+`dropSchema_fromMetadata`, `incrementGenerator`, `enhancedTableGenerator`,
+`enhancedSequenceGenerator`).
+
+**NEW finding this session: a severe, reproducible performance cliff
+specific to whole-class (`DiscoverySelectors.selectClass`) discovery, most
+likely the real reason full harness runs of this class have historically
+hung / timed out / exited silently with `rc=0` and no `@@RESULT`
+(previously misread as a hang or a harness artifact).** The arithmetic does
+not close: summing the five confirmed-clean per-method
+`MethodProbeRunner` runs above gives ~510s of CratonVM time for 60/132
+executions (~8.5s/execution average) — linear extrapolation to all 132
+suggests the whole class should complete in well under 20 minutes even on
+this contended host. Instead, three separate whole-class attempts never
+produced even one `@@RESULT` in up to 11 minutes (one left running 600s
+unresolved as of writing). The qualitative difference between "one
+`Launcher.execute()` covering 12 descriptors" (`selectMethod`, fast) and
+"one `Launcher.execute()` covering 132 descriptors" (`selectClass`, the
+harness's actual invocation, never seen to finish even test #0) points at
+JUnit5's `@ParameterizedClass` discovery/execution-tree bookkeeping scaling
+far worse than linearly with total descriptor count specifically on
+CratonVM. Two candidate contributing native hot paths were observed live
+but **not confirmed as the dominant cost** (no profiler available on this
+host this session):
+- A recurring `cratonvm::gc::guard` WARN, seen in every whole-class stall
+  this session: `gen_heap::get_field: out-of-bounds field read dropped
+  (caller used slot index past receiver's layout — … typically a
+  speculative collection-layout probe dispatched on a non-matching receiver
+  type) … class_name=org/junit/jupiter/engine/execution/
+  InterceptingExecutableInvoker … real_field_count=Some(0)` — some native
+  fast path is speculatively probing JUnit5's reflective method-invocation
+  wrapper as if it were a collection, on every reflective test/lifecycle
+  invocation. The guard fails safe (no correctness impact, the read is
+  dropped rather than corrupting anything) but the wasted speculative
+  attempt itself is pure overhead paid on every single reflective
+  invocation JUnit5 makes — and a whole-class run makes ~11x more of them
+  than a single-method run.
+- The already-documented, still-open, uncached
+  `al_slots_for`/`is_subclass_of` per-call `FxHashSet` allocation flagged in
+  this doc's `CriteriaBuilderNonStandardFunctionsTest` entry below (caught
+  live via gdb mid-stall in *that* investigation) is structurally the same
+  kind of "cheap-looking speculative check that isn't actually cheap"
+  waste, and worth checking whether it's the same code path.
+
+Next step for a follow-up session (ideally on a quiet host, so wall-clock
+numbers are trustworthy): profile a `selectClass`-based whole-class run
+directly (e.g. `perf record`/sampling, or `CRATONVM_DBG_TIER_ENQUEUE`-style
+targeted counters) to find the actual dominant cost, and/or run
+`MethodProbeRunner`-style probes selecting 2, 4, 6, 8, 11 methods together
+in one `Launcher.execute()` call (rather than 1 method 11 times) to
+empirically find the scaling exponent before attempting a fix — if it's
+genuinely superlinear in descriptor count, the fix likely belongs in a
+CratonVM-side cache/collection used by the JUnit5 reflection/invocation
+path (candidates above), not in Hibernate or in this test.
+
+No code change made this session — did not pin down a specific line to fix
+for either the (likely-already-resolved) AIOOBE or the (newly-found, real,
+but not yet root-caused to a specific line) performance cliff, and declined
+to fabricate a speculative fix for either. Probe sources left at
+`/data/data/tmp/MiniProbe.java` and `/data/data/tmp/MethodProbeRunner.java`
+on the shared host for the next session to reuse directly.
+
+## Update 2026-07-17 (scaling-investigation session): the "severe whole-class-discovery performance cliff" above is REFUTED — host-noise artifact, not a CratonVM defect. Growth curve is linear. But a real, previously-missed correctness bug was found and root-cause-narrowed in the process.
+
+Picked up this doc's own "next step" from the entry immediately above: empirically
+measure whether execution time scales linearly or superlinearly with the number of
+`@Test` methods run together in one process, to determine whether the "whole-class
+run never produces even one `@@RESULT` in 6-11 minutes" symptom is a real CratonVM
+scaling defect or host noise. Reused the prior session's
+`/data/data/tmp/MethodProbeRunner.java` recipe and added a new
+`/data/data/tmp/MultiMethodProbeRunner.java` (JUnit5 Platform Launcher,
+`DiscoverySelectors.selectMethod(...)` — one selector per requested `@Test` method,
+all in a single `LauncherDiscoveryRequest`/`Launcher.execute()` call, with a
+`TestExecutionListener` emitting a `@@PROGRESS n=... sinceStart_ms=... id=...` line
+on every individual test start/finish) against the same
+`wt-hib-defaultcatalog-hbmxml-20260717` binary (`dev@f0a74645`) used by the prior
+session, on the same shared host (load average 9-36 this session — calmer than the
+previous session's 8-64, but still real contention, not quiet).
+
+**Growth curve (from a single 132-execution run, all 11 `@Test` methods requested
+together — cumulative `sinceStart_ms` at each checkpoint):**
+
+| n (test #) | cumulative ms | ms/test so far | interval ms/test (prev 10) |
+|---|---|---|---|
+| 10 | 107,146 | 10.7k | 10.7k |
+| 20 | 175,250 | 8.8k | 6.8k |
+| 30 | 216,659 | 7.2k | 4.1k |
+| 40 | 250,508 | 6.3k | 3.4k |
+| 50 | 280,318 | 5.6k | 3.0k |
+| 60 | 329,946 | 5.5k | 5.0k |
+| 70 | 363,294 | 5.2k | 3.3k |
+| 80 | 413,958 | 5.2k | 5.1k |
+| 90 | 457,755 | 5.1k | 4.4k |
+| 100 | 513,245 | 5.1k | 5.5k |
+| 110 | 547,454 | 5.0k | 3.4k |
+| 120 | 611,256 | 5.1k | 6.4k |
+| 130 | 656,745 | 5.1k | 4.5k |
+| 132 | 668,923 (final `@@MMRESULT`) | 5.07k | — |
+
+Per-test cost **falls** from 10.7k ms/test (n=1-10, includes one-time JVM/JUnit
+warmup) to ~5k ms/test by n=40 and then stays flat (±30% noise band, consistent
+with host contention) all the way to n=132 — the opposite of a cliff. There is no
+inflection point, no monotonic growth, no point where forward progress stops. This
+directly falsifies the "superlinear/quadratic descriptor-count scaling" hypothesis
+from the prior entry.
+
+**Decisive check: the *actual* real-harness `selectClass`-based invocation
+(`CratonRunner`, exactly what the harness uses) was re-run standalone against this
+same class, same binary, same host, this session** — the earlier session's own
+recipe, just re-tried when host load happened to be lower (9-16 vs 8-64):
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=70 failed=62 aborted=0 skipped=0 ms=579598
+```
+**It completed in 579.6s (9.66 minutes)** — well inside the prior session's own
+"~20 minutes" linear-extrapolation estimate, and *faster* than this session's
+`selectMethod`-list run (668.9s) covering the identical 132 executions. `discover()`
+alone (no execution) for the same `selectClass` request was also separately timed:
+**696ms** — ruling out a discovery-phase bottleneck as well.
+
+**Conclusion: the "severe whole-class-discovery performance cliff" is CLOSED —
+refuted, not a CratonVM defect.** The prior session's 3 attempts that "never
+produced even one `@@RESULT` in 6-11 minutes" happened on a much more extremely
+contended host (load 8-64, active OOM-kills of unrelated processes, `free -m` under
+500MB at one point, per that session's own notes) — this session's clean,
+`selectClass`-based, real-harness-driver reproduction on a calmer host completed
+the exact same class in under 10 minutes with no anomaly. No CratonVM-side
+cache/collection scaling fix is needed. This resolves the prior entry's open
+"Next step" (profile `selectClass` to find the scaling exponent) — there is no
+scaling exponent to find; growth is linear.
+
+**However: a real, substantial, previously-missed correctness bug was found in
+the process, which is very likely the true, complete explanation for this doc's own
+"AIOOBE/InvalidMappingException NOT independently reproduced across 60/132"
+conclusion above being wrong.**
+
+Both the `selectClass` harness run and the `selectMethod`-list run above show the
+exact same signature, at a strikingly consistent rate (62/132 and 69/132
+respectively, ~47-52%):
+```
+java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+	at org.hibernate.boot.model.naming.NamingHelper.generateHashedFkName(...)
+	... (or generateHashedConstraintName)
+	at org.hibernate.boot.model.naming.ImplicitNamingStrategyJpaCompliantImpl...
+	at org.hibernate.boot.internal.InFlightMetadataCollectorImpl.secondPassCompileForeignKeys(...)
+	at org.hibernate.boot.model.process.spi.MetadataBuildingProcess.build(...)
+	at org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest.produceModel(DefaultCatalogAndSchemaTest.java:291)
+```
+This is `NamingHelper.hashedName`'s `new BigInteger(1, md5Digest).toString(35)` call
+(base-35 encoding of a 16-byte MD5 digest, used to generate implicit FK/unique-key
+constraint names) throwing inside real-JDK `BigInteger`'s own `smallToString`
+digit-group loop (`digitGroups[numGroups++] = r2.longValue();`, JDK25
+`BigInteger.java:4170` per `jdk25/lib/src.zip`) — i.e. a genuine CratonVM bug in
+`java.math.BigInteger`/`MutableBigInteger` execution, **not** a Hibernate or
+mapping bug, and unrelated to the GC-corruption family this section previously
+tracked.
+
+**Why the prior session's "0/60 failures across 5 individually-scoped methods"
+finding missed this:** that session always scoped `selectMethod` to exactly *one*
+`@Test` method at a time (looping the same single method through all 12 parameter
+combos). This session's finding is that the bug requires **multiple different
+`@Test` methods running together, interleaved, in the same process** — a minimal
+2-method repro (`tableGenerator` + `sequenceGenerator`, interleaved per parameter
+combo via `MultiMethodProbeRunner`, 24 total executions) reproduces it reliably
+(3/24 AIOOBE, onset around the 22nd-26th execution in every attempt), while either
+method alone (12 executions, previously verified in the prior session) never does.
+The failure pattern across a full 132-execution run is **not** a one-time
+corruption-then-stuck-broken-forever shape — it **oscillates**: a run of the same
+two methods showed SUCCESS for executions 1-21, FAILED for 22-24; the full
+132-execution run showed FAILED 26-36, SUCCESS 37-42, FAILED 43-54, SUCCESS 55+,
+etc. The same (method, parameter-combo) pair can pass in one process and fail in
+another, ruling out a purely input-dependent (deterministic on the MD5 digest
+bytes) explanation.
+
+**Root cause narrowed but not fully pinned — JIT-tiering-related, not GC-corruption,
+not a simple deterministic algorithm bug:**
+- **`--nojit` bisection on the minimal 2-method repro: 24/24 pass (zero failures)
+  vs JIT-on 21/24 (3 AIOOBE failures)**, otherwise identical — strong evidence the
+  bug requires the JIT to be involved (either a JIT-compiled miscompilation of
+  `BigInteger.smallToString`/`MutableBigInteger.divide`'s bytecode, or a
+  tier-up-timing-sensitive interaction).
+- **However, an isolated, Hibernate-free repro does NOT reproduce it**: a
+  standalone program (`/data/data/tmp/BigIntRepro.java`) looping
+  `new BigInteger(1, md5(input)).toString(35)` 200,000 times over varied inputs
+  (single-threaded, JIT-on, default binary) produced **zero** failures. This rules
+  out "any sufficiently long-running JIT-compiled call site of this exact method
+  eventually miscompiles" as the mechanism — the bug needs something about
+  Hibernate's broader concurrent allocation/GC/class-loading context that a tight
+  isolated loop doesn't reproduce, which combined with the `--nojit` result and the
+  oscillating (not input-deterministic) failure pattern is most consistent with a
+  **JIT-compilation-timing/GC-interaction bug** (a live-compiled version of
+  `smallToString`/`divide`/`MutableBigInteger` internals being installed or read at
+  a bad moment relative to a concurrent background-compiler or GC event) rather
+  than a static miscompilation of one method in isolation.
+- A live `CRATONVM_DBG_GC_STRESS=65536` / `CRATONVM_DBG_STALE_RECV=1` attempt
+  (the technique that closed this exact test class's earlier GC-corruption family)
+  was tried this session but did not complete within a reasonable bounded window —
+  the stress level made even the first test take minutes; not pursued further given
+  session time budget. A follow-up session should retry with a lower stress
+  divisor (e.g. `CRATONVM_DBG_GC_STRESS=2097152` / 2MB, tried but not completed
+  this session either — needs its own dedicated time budget) or a `perf`/sampling
+  profile of the JIT compiler thread during the minimal 2-method repro to catch
+  the actual bad compile/install event.
+- Checked `native-builtins/src/biginteger_intrinsics.rs` (the `T19_H13` native
+  overrides for `BigInteger`'s `@IntrinsicCandidate` methods `implSquareToLen`,
+  `mulAdd`, `addOne`, `primitiveLeftShift`/`shiftLeftImplWorker`,
+  `primitiveRightShift`/`shiftRightImplWorker`) as a candidate culprit, since these
+  are exactly the kind of hand-written Rust replacement that has caused subtle
+  bugs elsewhere in this codebase. Per JDK25's actual source
+  (`jdk25/lib/src.zip:java.base/java/math/BigInteger.java`), these specific methods
+  are used by `BigInteger.square()`/`shiftLeft()`/`shiftRight()`, **not** by
+  `smallToString()` or `MutableBigInteger.divide()` (the actual call path in the
+  crash) — so this module is very unlikely to be the direct culprit, though
+  `longRadix[35]`'s lazy static initialization (used by `smallToString`) may
+  itself be computed via `pow()`/`square()` and could theoretically be a shared
+  suspect; not confirmed either way this session.
+
+**Next step for a follow-up session:** get a `-Dcraton.trace=true` capture across
+several failures from the `MultiMethodProbeRunner tableGenerator sequenceGenerator`
+2-method repro (fast, ~2 min, reliable ~3/24 failure rate) plus a JIT compile-event
+trace (whatever this codebase's equivalent of `-XX:+PrintCompilation`/
+`CRATONVM_DBG_TIER_ENQUEUE` is) correlated against the exact executions that fail,
+to catch which JIT tier/compile event coincides with a failure vs a
+same-method-same-combo success elsewhere in the same run. Do **not** speculatively
+patch `biginteger_intrinsics.rs` without first confirming it's actually on the hot
+call path — it very likely is not, per the JDK source cross-check above.
+
+No code change made this session for the BigInteger bug (root cause narrowed, not
+pinned to a specific faulty line — declined to guess). Probe sources left at
+`/data/data/tmp/MultiMethodProbeRunner.java`, `/data/data/tmp/DiscoveryOnlyProbe.java`,
+and `/data/data/tmp/BigIntRepro.java` on the shared host for reuse.
+
+## Update 2026-07-17 (follow-up session): `longRadix`/`digitsPerLong` clinit gap FOUND and FIXED (real, distinct bug) — but does NOT resolve this AIOOBE; JIT-tier-enqueue evidence narrows the suspect list to `MutableBigInteger.divide`/`divideKnuth`/`normalize`/`compare`, still OPEN
+
+Picked up this doc's own "next step" (get `CRATONVM_DBG_TIER_ENQUEUE` correlated
+against failures) plus independently investigated the `longRadix`/`digitsPerLong`
+static-init angle the previous entry flagged but didn't confirm either way.
+
+**A real, distinct, now-FIXED bug was found first, before the JIT angle.**
+`vm/src/vm/vm_util.rs`'s `post_clinit_fixup` for `java/math/BigInteger` already
+force-populates `ZERO`/`ONE`/`TWO`/`NEGATIVE_ONE`/`TEN` because real-JDK
+`BigInteger.<clinit>` is documented (in that same function, comment predates this
+session) to not reliably complete under CratonVM. That fixup never touched
+`digitsPerLong`/`longRadix` — the 37-element radix-conversion tables
+`smallToString` indexes (`java.base/java/math/BigInteger.java`, extracted from
+this build's own `jdk25/lib/src.zip`: both are plain array-literal statics
+populated via `valueOf(0x...)` calls inside the same `<clinit>`, **not** lazily
+computed via `pow()`/`square()` as the previous entry speculated — direct source
+inspection settles that open question). Extended the existing fixup to also
+force-populate both tables with the real JDK's own constants, using the same
+`make_or_patch_bi`/`set_static_by_name` idiom already established for the five
+named constants. Landed as `f725589c` on `dev` (commit message has the full
+before/after detail).
+
+**This fix is real and necessary in general, but it is NOT what's causing
+`DefaultCatalogAndSchemaTest`'s residual AIOOBE — confirmed, not assumed:**
+- A reflection dump taken *immediately after* the AIOOBE fires (patched into a
+  `MultiMethodRunner` harness added this session) shows `longRadix.length=37` and
+  `longRadix[35]=3379220508056640625` (the correct JDK value) at the moment of
+  failure, on the *same run* that just threw. The table is not corrupted, wrong,
+  or truncated when the crash happens — directly answering the previous entry's
+  open question ("could `longRadix`'s static-init be a shared suspect?") with a
+  concrete no.
+- Three separate isolated probes — a raw `BigInteger.valueOf(...).toString(35)`
+  loop (up to 129-bit magnitudes), a `new BigInteger(1, digest).toString(35)` loop
+  matching Hibernate's exact construction (50 random 128-bit digests, then 3000
+  more in a single long-running process to force JIT tier-up), and 2000 calls
+  through the *real* `org.hibernate.boot.model.naming.NamingHelper.hashedName()`
+  — all pass 100% clean against the fixed binary. The fix is correct and
+  sufficient for every reproduction narrower than the full multi-method Hibernate
+  scenario.
+- The minimal 2-method repro this doc's previous entry established
+  (`entityPersister` + `createSchema_fromSessionFactory` interleaved across the
+  12 `@ParameterizedClass` options, via a `MultiMethodRunner` harness added this
+  session, similar in spirit to the previous entry's `MultiMethodProbeRunner`)
+  **still reproduces on the fixed binary**, byte-for-byte identical symptom
+  (`ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2` at
+  `BigInteger.smallToString`). This is the same conclusion the previous entry
+  already reached from a different angle (its 200,000-iteration standalone loop
+  also found zero failures) — two independent investigations, two different
+  probe styles, same result: the static radix tables are not the mechanism.
+
+**New, more specific lead for the actual (still open) bug.** Re-ran the minimal
+2-method repro under `CRATONVM_DBG_TIER_ENQUEUE=1`: `java/math/MutableBigInteger`'s
+`divide(...)`/`divide(...,Z)`/`divideKnuth(...)`/`normalize()`/`compare(...)`/
+`toBigInteger(I)` **all get enqueued for C1 compilation together, at the same
+invocation count (1524) and same instant (~72-94s into the run)**, shortly before
+the failure fires later in the run. This is the exact call chain `smallToString`'s
+digit-group loop drives (`MutableBigInteger.divide` → `divideKnuth` for the
+Knuth Algorithm-D long division that peels off each base-35 digit group). A
+`--nojit` rerun of the identical 2-method repro (same fixed binary) passes 24/24
+clean, confirming — as the previous entry's own `--nojit` bisection already
+showed on the unfixed binary — that JIT involvement is necessary for the failure
+to manifest, and now additionally pointing at `MutableBigInteger`'s Knuth-division
+family specifically as the tier-up event that immediately precedes it, rather than
+`smallToString`/`BigInteger.toString` themselves (which are comparatively trivial
+wrappers around the division loop).
+
+**Still not pinned to a specific line or confirmed as a genuine JIT codegen bug
+vs. a GC/compile-timing interaction** — consistent with the previous entry's own
+assessment that this needs either a JIT-compiler-thread trace during the exact
+failing compile/install event, or line-level disassembly of the compiled
+`divideKnuth`/`divide` to compare against the interpreter's semantics. Not
+pursued further this session given the time already spent reconciling the
+`longRadix` angle and this task's primary scope (BatchTest/SmokeTests
+re-verification, budgeted as this session's other two items). **Next step for a
+follow-up session:** disassemble the JIT-compiled `MutableBigInteger.divideKnuth`
+(this codebase's JIT disassembly diagnostic, e.g. `CRATONVM_DBG_JIT_DISASM`) for
+the specific method/tier combination logged above, and compare against the
+interpreter's array-bounds/loop-trip-count computation for the same inputs —
+`divideKnuth`'s array-index/loop-bound arithmetic (a complex multi-word Knuth
+Algorithm D implementation, `MutableBigInteger.java`) is the most promising
+concrete place to look for a register-allocation or loop-bound miscompilation,
+per this session's tier-enqueue correlation.
+
+**Verification of this session's own fix:** `cargo test --release -p cratonvm-vm
+--lib vm_util` — 39/39 pass, no regressions. Build clean, no new warnings beyond
+pre-existing ones. Reproduction harnesses (`MethodRunner.java`,
+`MultiMethodRunner.java`, `ResourceLoopProbe.java`, `BigIntRadixProbe.java`,
+`BigIntCtorProbe.java`/`BigIntCtorProbe2.java`, `HashedNameProbe.java`) left in
+`/data/hib-baseline-runner-20260716/` on the shared host for reuse.
+
+## Update 2026-07-17 (follow-up session): fast, minimal, Hibernate-free repro found (85-90% failure rate); JIT-only, GC-amplified, precisely localized to `divideMagnitude`'s `shift > 0` normalization path — root mechanism narrowed further but the exact faulty instruction NOT pinned; no fix landed this session
+
+Picked up this doc's own "next step" (disassemble the JIT-compiled `divideKnuth`/
+`divide`/`divideMagnitude` and compare against interpreter semantics). Built from
+`dev@3e74dd5a`, worktree `wt-hib-bigint-divideknuth-20260717`, branch
+`fix/hib-bigint-divideknuth-jit-20260717`; re-verified at the end of the session
+against `dev@8ef4d59b` (merged in mid-session, includes an unrelated
+`conservative_roots.rs` scan-cost fix, `f377eb69` — confirmed **not** related to
+this bug, repro behavior identical before/after that merge).
+
+**The isolated-loop repro from the previous entries (a raw
+`new BigInteger(1, digest).toString(35)` loop, 200,000 iterations, zero failures)
+was misleading — it never actually needed Hibernate, just the right operand
+shape.** A tighter repro,
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/SmallDividendRepro.java`,
+loops `BigInteger.divideAndRemainder(35^12)` (a fixed ~62-bit, 2-int-word
+divisor — exactly `NamingHelper.hashedName`'s `longRadix[35]`) against **small**
+random dividends (67-70 bits, only slightly bigger than the divisor, so
+`MutableBigInteger.divideMagnitude`'s main Knuth D2-D7 loop runs **zero**
+iterations and execution goes straight to the post-loop special-cased
+final-digit block), checking `q*b+r == a && 0<=r<b` directly instead of relying
+on the `smallToString` array-overflow side effect. This reproduces **85-90% of
+the time**, in well under a second, no Hibernate/JUnit/classloading involved:
+```
+@@RESULT bad=17686 of 20000
+```
+The real production call (`NamingHelper.hashedName` via
+`bigint-divideknuth-repros-20260717/HashedNameProbe.java`, unchanged from the
+prior session) was re-run against this same finding and throws the **identical,
+exact** original stack trace deterministically at the same trial number across 3
+repeat runs:
+```
+trial=771 ... FAILED: java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+```
+confirming the minimal repro and the production bug are the same defect.
+
+**Bisection chain (all against the same binary, `--nojit` vs default JIT-on
+unless noted):**
+1. **JIT-only, not a race, not compile-timing-dependent:** `--nojit` is 0/20000
+   clean every time. Lowering `CRATONVM_TIER_C1_THRESHOLD` makes the failure
+   onset track the threshold precisely (e.g. threshold=5 → onset around
+   invocation ~240 instead of ~1500) — this is a **deterministic compile-time
+   codegen defect**, not a background-compiler-thread race: a
+   `FixedValRepro.java` variant that calls `divideAndRemainder` on the exact
+   same fixed operands thousands of times in a row shows a **hard state
+   transition** — correct on every call before the relevant methods finish
+   compiling (`normalize`/`toBigInteger`/`divideKnuth`/`compare`/`divide`, all
+   enqueued together at the same invocation count, matching the previous
+   entry's tier-enqueue finding), then **consistently, identically wrong on
+   every call after**, not intermittent/flickering.
+2. **Localized to the `shift > 0` normalization path specifically.**
+   `ShiftZeroRepro.java` uses a divisor with its top bit forced set (so
+   `Integer.numberOfLeadingZeros(divisor.value[0]) == 0`, i.e. `shift == 0`),
+   which skips `divideMagnitude`'s entire D1 divisor/dividend
+   normalize-by-`shift` step and the D8 `rem.rightShift(shift)`
+   "unnormalize" step (both gated `if (shift > 0)`): **0/20000 failures.**
+   Reverting to the `shift == 2` divisor (`35^12`, i.e. the real
+   `NamingHelper` divisor) reintroduces the bug at the same ~88% rate. This
+   is the single most useful isolating fact found this session.
+3. **Not the main Knuth D2-D7 loop, not `mulsub`, not
+   `unsignedLongCompare`.** `SmallDividendRepro`'s small-dividend shape
+   proves the main loop doesn't even need to run (`limit-1 == 0`) for the bug
+   to fire at full rate. `mulsub([I[IIII)I` (1026 bytes compiled) and
+   `unsignedLongCompare(JJ)Z` (214 bytes) were each fully manually traced
+   instruction-by-instruction against their real-JDK source
+   (`jdk25/lib/src.zip`) and are byte-for-byte semantically correct, including
+   the unusual "three-way-compare-then-threshold" codegen idiom this JIT
+   uses for every `>`/`<` comparison (`setg`/`setl`/`sub`/`test` instead of a
+   direct `setg`) — correct here because both compared operands are
+   pre-masked to `[0, 0xFFFFFFFF]`, so signed vs. unsigned compare coincide.
+4. **Not which D1 sub-branch fires.** `BranchIsolateRepro.java` forces
+   either the `Integer.numberOfLeadingZeros(dividend.value[0]) >= shift`
+   branch (`this.primitiveLeftShift(shift, remarr, 1)`, a shared compiled
+   method) or the `else` branch (a hand-inlined shift-with-carry loop
+   directly in `divideMagnitude`'s own bytecode) — **both fail at ~85-90%**,
+   meaning the defect is in something common to both paths: most likely the
+   *divisor's* `div.primitiveLeftShift(shift, divisor, 0)` call (unconditional
+   whenever `shift > 0`, identical in both branches) or the D8
+   `rem.rightShift(shift)`/`rem.normalize()` step (also unconditional in both
+   branches). The full compiled body of the (non-unrolled) shift-with-carry
+   loop was manually traced instruction-by-instruction against source and is
+   also correct.
+5. **Not loop unrolling.** `CRATONVM_DISABLE_UNROLL=1` removes a confirmed,
+   real extra unrolled copy of the shift-loop body (verified via disassembly:
+   3 `shl`+2 `shr` instructions in the loop region drop to the source-correct
+   2 `shl`+1 `shr` once disabled) but the failure rate is **unchanged**
+   (17709/20000) — ruling out unroll-boundary/trip-count handling as the
+   cause.
+6. **GC-amplified, and this looks like the real mechanism, but is NOT fully
+   confirmed.** `CRATONVM_DBG_GC_STRESS=65536` turns the ~88%
+   "wrong-silent-result" rate into an outright, immediate, deterministic
+   `ArrayIndexOutOfBoundsException` crash (the exact production exception) on
+   the very first stressed run. `--nojit` + the same GC stress stays 0/3000
+   clean — ruling out a pure GC bug independent of JIT. `CRATONVM_DBG_VERIFY_OOP_MAPS=1`
+   under GC stress fires repeated `[VERIFY-OOP-MAPS] unmapped in-band oop`
+   warnings for JIT-compiled code at the frame addresses matching
+   `divideMagnitude` (and one caller), at very deep `[rbp-N]` offsets (up to
+   `-0x3ce0`) consistent with the single-pass backend's own internal
+   scratch/spill slots (used to evaluate nested sub-expressions like
+   `(b<<shift)|(c>>>n2)`) rather than the method's 28 named bytecode locals
+   (`javap` confirms `divideMagnitude` has `locals=28`, well under the 64-bit
+   `local_oop_masks` tracking width, so it is *not* a mask-width overflow).
+   **However**, this does not fully explain the mechanism: `moving_young`
+   (the moving Cheney young-gen collector) is **off by default**
+   (`CRATONVM_MOVING_YOUNG` unset), so plain "object relocated, stale pointer"
+   can't be the whole story under default settings, and — more importantly —
+   `CRATONVM_NO_PRECISE_JIT_MAPS=1` (forcing pure conservative frame
+   scanning, no precise maps at all) does **not** change the failure rate
+   either (17704/20000, same as with precise maps on). So either (a) the
+   conservative fallback scan also fails to cover these deep scratch-slot
+   addresses for a method this large/complex (a genuinely deeper root-tracking
+   gap than "just add missing precise-map entries" would fix), or (b) the
+   `VERIFY-OOP-MAPS` warnings are the diagnostic's own documented false-positive
+   case ("NB band may include nested-JIT-callee slots") and the GC-stress
+   sensitivity is actually a heap-layout/adjacency effect amplifying a
+   genuine **out-of-bounds write** bug (e.g. a one-element overflow past
+   `remarr`'s `intLen+2`-sized allocation, or past the 2-element local
+   `divisor` array) rather than a stale-read bug — under GC stress, allocation
+   adjacency changes what ends up next to the overflowing array, changing
+   whether the overflow corrupts something visible. **This distinction was
+   not resolved this session.**
+
+**Not fixed this session.** The investigation is narrowed further than any
+prior entry (a Hibernate-free, sub-second, 85-90%-reliable repro; JIT-only;
+localized to the D1/D8 `shift > 0` normalization code in `divideMagnitude`;
+`mulsub`/`unsignedLongCompare`/loop-unrolling/branch-choice all individually
+ruled out) but the exact faulty instruction or the precise
+stale-read-vs-out-of-bounds-write mechanism was not pinned down, despite an
+extensive full manual disassembly trace (`CRATONVM_DBG_JIT_DISASM`) of every
+individually-compiled method on the call path. Given this touches shared JIT
+codegen/GC-root-tracking infrastructure used far beyond `BigInteger`, landing a
+speculative fix without pinning the exact defect was judged too risky —
+per this doc's own standing guidance, a well-documented non-fix beats a risky
+guess here.
+
+**Next step for a follow-up session**, roughly in order of expected
+cost/payoff:
+1. Use `SmallDividendRepro`/`ShiftZeroRepro`/`BranchIsolateRepro` (all left at
+   `/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`) —
+   they reproduce in under a second, no Hibernate needed, and don't need
+   re-deriving.
+2. Resolve the "which mechanism" question directly: instrument
+   `divideMagnitude`'s local `divisor`/`rem`/`remarr` arrays with a
+   `System.identityHashCode`-based before/after check bracketing the
+   `div.primitiveLeftShift(shift, divisor, 0)` call and the final
+   `rem.rightShift(shift)` call (a small reflection-based probe in package
+   `java.math` can call these package-private methods directly without
+   `setAccessible`) to see whether the array's **address changes** (moving
+   GC relocated it — but `moving_young` is off by default, so this would
+   itself be a new finding) or the array's **contents become wrong without
+   changing identity** (favors an out-of-bounds write from a neighboring
+   compiled expression, or a genuine arithmetic bug this session's manual
+   trace missed).
+3. If (2) points at a stale/relocated reference: extend
+   `emit_oop_map_for_safepoint`'s Stage 1/2 tracking
+   (`jit/src/x64.rs`, ~line 9981) to also cover the single-pass backend's own
+   scratch/spill slots (the `[rbp-0x88]`/`[rbp-0x118]`-style temps used to
+   evaluate nested sub-expressions) when they hold live reference values
+   across a GC-capable call — not just operand-stack slots and the 28 named
+   bytecode locals.
+4. If (2) points at an out-of-bounds write: audit the exact bounds-check
+   emitted for the `remarr[intLen+1] = c << shift;` tail write and the
+   `divisor[dlen]`-sized array's fill in `primitiveLeftShift`'s inlined tail
+   store, for a one-element-too-generous bound.
+
+Probe sources (all Hibernate-free except `HashedNameProbe.java`) left at
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`:
+`MTBigIntDivRepro.java`, `FixedValRepro.java`, `SmallDividendRepro.java`,
+`ShiftZeroRepro.java`, `BranchIsolateRepro.java`, `CopyOfRangeMicro.java`
+(isolated `Arrays.copyOfRange` check, clean/not the cause),
+`HashedNameProbe.java` (real production call, reused from the prior session).
+
+## Update 2026-07-17 (diagnostic-tooling session): new `CRATONVM_DBG_AIOOBE3` probe decisively rules out the moved/stale-pointer hypothesis from the entry above (mechanism is data corruption, not GC-root tracking); re-localizes the leading suspect to the **`mulsub` "final-digit" call site** in `divideMagnitude`, which the prior entry's mulsub exoneration did not cover — still not fixed
+
+Picked up this doc's own "next step" #2 (resolve stale-pointer-vs-out-of-bounds-write)
+using a new, durable diagnostic instead of the suggested reflection-based
+identity-hash probe: added `CRATONVM_DBG_AIOOBE3` (env-gated, behavior-neutral
+when unset; landed this session, `jit_throw_aioobe`'s x64 stub now also passes
+the array pointer -- `RAX`, already live and unused at that point -- as a 3rd
+argument) which dumps the raw `ObjectHeader` (`class_id`, `kind`,
+`element_type`, `array_length`, `num_slots`, `gc_age`, **`forwarding_ptr`**) at
+the exact pointer the JIT's bounds check compared against, at the moment
+`jit_throw_aioobe` fires. This directly answers "did GC move this object out
+from under a stale JIT-held pointer" without needing a live debugger or a
+reflection probe.
+
+**Repro used:** the prior entry's `SmallDividendRepro.java` (still present at
+`/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`,
+unchanged, still reproduces at ~88% on `dev@08808a57` -- confirmed not fixed by
+anything landed between `dev@3e74dd5a` and `dev@08808a57`) under
+`CRATONVM_DBG_GC_STRESS=65536` (turns the silent-wrong-result failure into an
+immediate, deterministic `ArrayIndexOutOfBoundsException`, per the prior
+entry's finding #6) plus `CRATONVM_DBG_AIOOBE3=1`. Fires reliably on the first
+stressed run:
+
+```
+[AIOOBE3-DIAG] jit-reported index=2 length=2 array_ptr=0x20040408cd0
+header: class_id=0 kind=1 elem_ty=10 ident_hash=403 array_length_field=2
+num_slots=2 gc_age=1 gc_flags=0 forwarding_ptr=0x0
+```
+
+`kind=1` = `ObjectKind::Array`, `elem_ty=10` = `ArrayElementType::Int` (per
+`types/src/heap_types.rs`). **This is decisive:**
+
+1. **`forwarding_ptr=0x0`** -- the object was never evacuated/relocated. Combined
+   with the prior entry's own observation that `CRATONVM_MOVING_YOUNG` is off by
+   default, this closes out hypothesis (a) from the prior entry's finding #6
+   outright: this is **not** a moved-object/stale-root-tracking bug. No G1
+   evacuation-pointer-staleness fix is needed here.
+2. **The header is fully self-consistent** (`array_length_field=2` matches
+   `num_slots=2`, plausible `gc_age`/`ident_hash`, no garbage bit patterns) --
+   this is a real, validly-allocated `int[2]` object, not heap corruption
+   smearing garbage across an unrelated address. The JIT's bounds check itself
+   (RAX->header->length compare->RCX index) is doing exactly what it's supposed
+   to do; the bug is upstream of it, in *which* index or *which* array
+   reference reached that check.
+3. This confirms the prior entry's hypothesis (b): the mechanism is a genuine
+   **wrong value** -- either an out-of-bounds *index* computed one too high, or
+   a live reference that's pointing at the wrong (but validly-allocated)
+   `int[2]` object -- not a stale/moved pointer. Per the same MD5-digest-shaped
+   input distribution reasoning used throughout this doc's history, a real
+   `int[2]` with this exact shape can only plausibly be `divisor` (or the `a`
+   parameter it's passed as) inside `MutableBigInteger.divideMagnitude`/
+   `mulsub` -- `final int dlen = div.intLen;` is genuinely `2` for the
+   production divisor (`longRadix[35]` ~= 61.7 bits) and for
+   `SmallDividendRepro`'s fixed `35^12` divisor alike.
+
+**Re-examined the prior entry's finding #3 ("not mulsub") against
+`SmallDividendRepro`'s own stated shape and found a gap in it.** Finding #3
+correctly shows the main Knuth `for (j=0; j<limit-1; j++)` loop runs zero
+iterations for `SmallDividendRepro` (`limit-1 == 0`, small dividend). But
+`divideMagnitude`'s real JDK source (`jdk25/lib/src.zip`, confirmed by direct
+read) calls `mulsub` a **second, unconditional time outside that loop**, for
+the final digit:
+
+```java
+// D4 Multiply and subtract  (this is OUTSIDE the `for (j=0; j<limit-1; ...)` loop)
+rem.value[limit - 1 + rem.offset] = 0;
+if (needRemainder)
+    borrow = mulsub(rem.value, divisor, qhat, dlen, limit - 1 + rem.offset);
+```
+
+This call is reached exactly once per `divideMagnitude` invocation whenever
+`qhat != 0` (the overwhelmingly common case), **independent of how many times
+the main loop ran** -- so `SmallDividendRepro` (limit=1, main loop skipped)
+still calls `mulsub` exactly once, through this "final-digit" call site.
+Finding #3's manual trace verified `mulsub`'s *own* compiled bytecode-to-asm
+translation is internally correct for whatever `len`/`a`/`offset` it is
+*given* (confirmed independently this session -- full disassembly of
+`mulsub([I[IIII)I`, `CRATONVM_DBG_JIT_DISASM=mulsub`, shows a structurally
+sound `for (j=len-1; j>=0; j--)` decrement loop with the loop bound (`r13`,
+loaded once from the `len` argument register `r8` at entry and never
+reloaded) driving both the loop init and the `a[j]` bounds check
+consistently). That trace did **not**, and could not by itself, verify that
+the *value* arriving in `r8`/`len` at the call site is actually `dlen` -- i.e.
+it rules out a bug **inside** `mulsub`, not a bug in **what `divideMagnitude`
+passes to it**. Given `mulsub` is a private instance method invoked via
+`invokespecial` with `this`+5 params = exactly 6 Java-level arguments, filling
+*every* SysV integer argument register (`ARG_REGS = [RDI,RSI,RDX,RCX,R8,R9]`,
+`jit/src/x64.rs`) with none left over for stack-arg fallback -- a boundary
+condition ("call site needs exactly all 6 registers, no more, no fewer") that
+is inherently less exercised/tested than calls with 1-4 args, is a strictly
+narrower and more plausible target than a bug shared by every array access in
+the method.
+
+**Not fixed this session** -- did not pin the exact faulty instruction (the
+divideMagnitude-side call-argument marshaling for the final-digit `mulsub`
+call specifically, as opposed to the loop's repeated calls to the same
+callee, was not yet isolated by disassembly; `divideMagnitude`'s compiled body
+is 24KB and the two call sites are not textually adjacent). Declined to
+speculatively patch `emit_stack_arg_setup`/the invokespecial 6-arg direct-call
+path (`jit/src/x64.rs` ~line 24505-24525) without first confirming which of
+`len` (R8) vs the `divisor` reference itself (RDX, arg index 2) arrives wrong
+-- per this doc's own standing guidance, both are equally consistent with the
+`AIOOBE3` evidence above, and a wrong fix to shared invoke-dispatch codegen
+used far beyond `BigInteger` would be worse than no fix.
+
+**Next step for a follow-up session, in order of expected cost/payoff:**
+1. Reuse `SmallDividendRepro.java` + `CRATONVM_DBG_GC_STRESS=65536` +
+   `CRATONVM_DBG_AIOOBE3=1` (this session's addition, already on `dev`) for an
+   instant, reliable repro/diagnostic loop -- no Hibernate, sub-second, fires
+   on the first run.
+2. Isolate the two `mulsub` call sites from each other directly: temporarily
+   force `SmallDividendRepro`'s divisor/dividend so that `limit >= 2` (main
+   loop runs >=1 iteration, exercising the *loop's* `mulsub` call site) vs.
+   `limit == 1` (main loop never runs, only the *final-digit* call site is
+   exercised, as today) and compare failure rates. If only one shape fails,
+   that pins which of the two (textually distinct, separately-codegen'd)
+   `mulsub(...)` call sites in `divideMagnitude`'s compiled body is at fault,
+   without needing to read the full 24KB disassembly.
+3. Once the offending call site is isolated, get its `CRATONVM_DBG_JIT_DISASM`
+   output specifically (grep the compiled `divideMagnitude` body around that
+   call site's argument-register loads -- `ARG_REGS[4]`=R8=`len`,
+   `ARG_REGS[2]`=RDX=`a`/`divisor` per `emit_stack_arg_setup`,
+   `jit/src/x64.rs` ~line 11130) and check whether the value loaded into R8
+   before the `CALL` genuinely traces back to `dlen`, or whether it's been
+   aliased with something else live at that specific program point (e.g. the
+   `qhat`/`qrem`/`borrow` locals computed just above it in source, which *are*
+   reused/redefined repeatedly right before this call).
+4. If the call-argument marshaling turns out clean, fall back to the prior
+   entry's step 4 (audit `primitiveLeftShift`'s inlined tail store /
+   `remarr[intLen+1]` write) -- note this session found the 3-argument
+   `primitiveLeftShift(int, int[], int)` overload that actually fills
+   `divisor` (`div.primitiveLeftShift(shift, divisor, 0)`) does **not** appear
+   in `CRATONVM_DBG_JIT_DISASM=primitiveLeftShift` output for this repro (only
+   the 1-arg `primitiveLeftShift(I)V` overload compiles) -- i.e. it stays
+   **interpreted**, which combined with `--nojit` being clean makes this
+   overload a low-probability suspect on its own, but does not rule out
+   `divisor`'s *header/reference* being corrupted by something else before
+   `mulsub` reads it.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
@@ -182,7 +935,7 @@ class-init-failure-mishandling explanation for the separate `ScannerTest`
 open with its own cause). Full writeup + evidence:
 [hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md](../../internal/hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md).
 
-## `LockTest` — real timing-sensitive assertion failure (root mechanism isolated 2026-07-16, still OPEN)
+## `LockTest` — FIXED 2026-07-17 (root cause was a GC conservative-scan cost, not JIT compilation itself)
 
 `org.hibernate.orm.test.jpa.lock.LockTest`
 
@@ -392,7 +1145,145 @@ time budget allows. Filed here purely as evidence that the mechanism is
 stable across a large `dev` delta, so a future session picking this up can
 trust the existing root-cause writeup below without re-deriving it.
 
-## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
+## Update 2026-07-17 (session tasked with fixing the JIT compile-time-tax problem): FIXED — the real mechanism was never compilation cost, it was a GC conservative-scan cost gated on "any method has compiled"
+
+**Landed on `dev` at `f377eb69`** (branch `fix/hib-jit-tiering-heuristic-20260717`),
+built and validated from `dev@3dcf81e5` then rebased twice to keep up with a
+very active `dev` (final tip includes ~30 unrelated commits from concurrent
+sessions; none touched the changed file). **This entry supersedes the
+"JIT compile-time tax" framing** both this section and
+[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md)
+used for `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` since
+2026-07-16 — that framing was a reasonable inference from wall-clock
+bisection (`--nojit` / raised-threshold both "fixed" it) but the *mechanism*
+it implied (compilation itself burns CPU/wall-clock) turns out to be wrong.
+The real mechanism, found this session via direct profiling instead of
+inference:
+
+**Root cause.** `jit/src/tiered.rs`'s background compiler is genuinely
+async and lock-free on the mutator's hot path (confirmed: `/proc/<pid>/task/*/stat`
+CPU-tick sampling during a full JIT-on `LockTest` run showed the
+`cratonvm-jit-compiler` thread accumulating **~0 measured CPU ticks** despite
+340 compile-task enqueues, while `main-vm` alone accounted for essentially
+100% of wall-clock CPU — ruling out "compiling is slow" and "compiler thread
+steals cores from the mutator" as the mechanism). A `perf record`/`perf
+report` capture of the same run instead found **`cratonvm_gc::gen_heap::
+GenerationalHeap::is_object_address` (30.6%) + `cratonvm_vm::runtime::
+interpreter::update_root_snapshot` (26.0%) + `VmHeap::is_object_address`
+(9.2%) — ~66% of all CPU** — dominating, versus a combined <10% for the same
+symbols on a `--nojit` run of the identical workload.
+
+`CRATONVM_DBG_ROOTSNAP=1` pinned this precisely: `update_root_snapshot`'s
+per-call cost climbed from **~13.4us at 200k calls to ~63.8us at 400k calls**
+(same call count, `avg_frames` growing 49.9→79.3 in lockstep with the
+workload's naturally deepening interpreter recursion) on a default JIT-on
+run, while the *identical* workload under `--nojit` — or under JIT nominally
+on but with `CRATONVM_TIER_C1_THRESHOLD`/`_C2_THRESHOLD` raised so high no
+compile ever completes — stayed flat at **~1.8-2.0us for the entire run**,
+byte-for-byte matching each other. That last comparison is the key: it
+proves the cost is gated on **at least one method having successfully
+*published* a compiled body** (`cratonvm_jit::jit_code_range_count() > 0`),
+not on compilation *activity* — a class whose enqueued compiles all bail
+(skip-list, transient failure, etc.) never pays this cost at all no matter
+how many tasks get enqueued and retried (this is exactly why
+`CriteriaBuilderNonStandardFunctionsTest` no longer reproduced the failure
+even before this fix — see that entry below).
+
+Tracing into `vm/src/jit/conservative_roots.rs`'s `scan_active_jit_frames`
+(called from `update_root_snapshot` on every object-returning native call —
+see that function's own doc comments) found the exact mechanism: once
+`jit_code_range_count() > 0`, an "A5 fix" safety-net block conservatively
+scans the thread's native (Rust) call stack word-by-word for a stray return
+address into JIT-compiled code that the precise `JitEntryGuard` chain might
+have missed. A `UNREG_JIT_VERIFIED_LO` thread-local memoizes how much of
+`[search_lo, stack_high)` was already scanned clean, but **only helped when
+the current stack pointer was at or above (shallower than) the last verified
+point** — for a workload whose interpreter recursion depth keeps *growing*
+over the run's lifetime (deeply nested Hibernate/JUnit5/H2 call chains are
+exactly this shape), the memoized boundary was invalidated on almost every
+call, forcing a full linear rescan of the **entire currently-live native
+stack** (up to the 8 MiB cap in `native_stack_has_jit_frame`) on nearly
+every single root snapshot for the rest of the process's life, once any one
+method had compiled.
+
+**The fix** (`vm/src/jit/conservative_roots.rs`, in the `scan_active_jit_frames`
+block guarded by `!moving_young_enabled() && code_ranges > 0`): when
+`code_ranges` is unchanged since the last verification and the new
+`search_lo` is strictly *deeper* than the memoized `verified_lo`, only the
+new incremental band `[search_lo, verified_lo)` needs scanning — the
+once-verified `[verified_lo, stack_high)` band is provably still clean by
+the *same* invariant the existing memo already relies on ("nothing above our
+current stack pointer can change while we are nested below it"), which is
+symmetric with respect to which direction `search_lo` moved. On a clean
+incremental scan the verified boundary extends down to the new `search_lo`,
+exactly as the pre-existing shallower-or-equal case already did. Falls back
+to the original full-range scan whenever this can't be proven safe (first
+check, a shallower `search_lo`, or a new compile since the last check). The
+"found something" branch's marking scope (`scan_one_frame(search_lo, high,
+...)`) and GC-quiescence flag are byte-for-byte unchanged — only the
+*detection* scan is narrowed, never what gets conservatively marked once a
+frame is actually found.
+
+**Validation.**
+- `LockTest`: **5/5 clean passes** post-fix (dev tip `f377eb69`), consistently
+  7.0-9.3s total (vs. 0/5 pre-fix on the same tip — 4/5 failed the internal
+  5000ms timeout by 12.8-18.7s, the 5th didn't even finish inside a 90s
+  wrapper). `CRATONVM_DBG_ROOTSNAP` on the fixed binary stays flat at
+  ~1.06-1.94us/call for the entire run — as cheap as (or cheaper than)
+  `--nojit`, not just "less bad."
+- `CriteriaBuilderNonStandardFunctionsTest`: 5/5 clean both before and after
+  this fix on this dev tip (see its own entry below for why) — unaffected
+  either way by this specific class's workload, confirmed not regressed by
+  the fix.
+- `vm/src/jit/conservative_roots.rs`'s own 21 unit tests: 21/21 pass, both
+  pre- and post-rebase.
+- `jit::` module test sweep (125 tests): 118 passed either way; the same 7
+  failures (`jit::skip_list::tests::*`) reproduce byte-for-byte identically
+  on the unfixed binary too (confirmed via an explicit `git stash` A/B) —
+  pre-existing, unrelated to this fix (different file, JIT-eligibility
+  policy, not GC root scanning).
+- `vm/benches/vm_benchmarks.rs`: no regression on any benchmark that
+  actually exercises the interpreter/JIT/GC paths my fix touches
+  (`jit_hot_loop_dispatch` -14.1%, `specjvm_compiler_throughput` -6.2%,
+  `dacapo_avrora_100k_loop` -7.0%, `interpreter_fibonacci/{10,30,40}`
+  -22.5%/-13.3%/-10.7%, `shootout_binary_trees/{8,12}` -7.7%/-20.2% — all
+  "improved" per Criterion, though most of that delta is plausibly this
+  heavily-shared host settling down between runs rather than a genuine
+  effect of the fix on these particular short/tight-loop benchmarks, which
+  mostly don't run long enough to publish a JIT body inside the timed
+  window). Two benchmarks (`gc_write_barrier_lower_bound_touch_loop`,
+  `monitor_enter_exit_lower_bound_touch_loop`) showed a noisy, inconsistent
+  "regression" (+8-42% across two separate reruns) — traced to source and
+  confirmed these are explicitly-documented **placeholder** benchmarks
+  (`// Placeholder lower-bound benchmark` in `vm/benches/vm_benchmarks.rs`)
+  that call `black_box` on two pointers in a bare loop and touch *no*
+  interpreter, GC, or JIT code at all (verified by reading
+  `bench_gc_write_barrier`/`bench_monitor_enter_exit`'s source directly) —
+  structurally impossible for this fix to affect; a same-code-vs-itself
+  control rerun of the identical unfixed binary against its own saved
+  baseline showed comparable-magnitude noise (-2.5%/-7.4%) in the *opposite*
+  direction, confirming this host's nanosecond-scale measurement noise on a
+  ~250-300ns loop, not a real regression.
+- The full 4548-class Hibernate suite was **not** rerun this session (out of
+  time budget for a single-fix session) — a future session should fold this
+  fix into the next full-suite pass this repo's other sessions periodically
+  run.
+
+**Why this was missed by the earlier "JIT compile-time tax" sessions:**
+both prior sessions' bisections (`--nojit` fixes it; raising the threshold
+so nothing compiles fixes it) are *consistent* with either "compilation
+itself is the cost" or "the mere existence of one published compile flips on
+an expensive per-call GC scan" — both hypotheses predict the exact same
+bisection outcomes, since both require at least one method to actually
+compile. Distinguishing them needed the direct per-thread CPU-tick sampling
+and `perf record` profile this session ran, which neither prior session had
+time/tooling to do. The `CRATONVM_DBG_TIER_ENQUEUE` diagnostic those
+sessions added was necessary but not sufficient — it shows *enqueues*, not
+*publishes*, and (as this session's `CriteriaBuilderNonStandardFunctionsTest`
+finding below shows) a class can enqueue hundreds of compiles that all fail
+to publish and never pay this cost at all.
+
+## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, JIT-tax residual now FIXED too (2026-07-17)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
 
@@ -530,6 +1421,41 @@ validated, safe mitigation with no steady-state throughput regression, but
 it does **not** reliably fix this class's timeout either. Remains OPEN,
 tracked jointly with `LockTest` at the JIT-policy level.
 
+**Update 2026-07-17 (session that fixed `LockTest`'s JIT-tax mechanism,
+see that entry above for the full root-cause writeup): this class is now
+also RESOLVED, and the "OPEN" status above should no longer be trusted.**
+
+First, an important correction: **this class already passed reliably
+(5/5 clean, ~20-26s each) on `dev@3dcf81e5` — the base this session started
+from, *before* any code change.** `CRATONVM_DBG_TIER_ENQUEUE` showed 1695
+compile-task enqueues in a representative run, yet `CRATONVM_DBG_ROOTSNAP`
+stayed flat/cheap (~1.85-2.5us/call) for the entire run — meaning none of
+those 1695 enqueued tasks ever actually *published* a compiled body for this
+specific workload (all bailed via the skip-list or a transient failure), so
+`jit_code_range_count()` stayed 0 the whole run and the expensive
+`scan_active_jit_frames` path (see the `LockTest` entry above) never
+activated at all. This is presumably an incidental improvement from the
+cumulative reflection/GC-safety and JIT-policy fixes other sessions landed
+on `dev` between the 2026-07-16 baseline this doc's history was written
+against and `3dcf81e5` — not something traced to a single commit this
+session, and not something this session's own fix should get credit for.
+
+With this session's `scan_active_jit_frames` incremental-scan fix
+(`dev@f377eb69`) also applied: still **5/5 clean**, and modestly faster
+(12.4-16.9s vs. 13.0-26.0s pre-fix across the two sets of 5 reruns) —
+consistent with the fix being a pure win whenever it *does* activate (a
+different run of this same class, on a different day/host-load window,
+could plausibly publish at least one compile and hit the pre-fix pathology;
+this fix removes that risk going forward regardless of which specific
+methods happen to compile).
+
+**Reclassifying: no longer tracked as OPEN.** Both the original "real
+constraint violation" hypothesis (ruled out in the 2026-07-16 entry above)
+and the "JIT compile-time tax" residual (this update) are closed. If this
+class regresses again in a future full-suite run, re-open referencing this
+entry and the `LockTest` entry's root-cause writeup rather than re-deriving
+the JIT-tax bisection from scratch.
+
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 
 Per [hib-bytecode-enhancement-loader-faithful-linking.md](../../internal/fixed-suite-bugs/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md)
@@ -635,3 +1561,141 @@ worth a dedicated follow-up starting from `Timezones.toTimeZone`/
 `ZONE_UTC_MINUS_8` and whichever `java.time`/H2 conversion path handles
 fixed-offset (non-region) zones differently from `LocalDateTimeTest`'s
 zone-less values.
+
+## Update 2026-07-17 (follow-up session): `ZoneId.systemDefault()` host-timezone-leak FIXED — 63→20/608, new narrower residual identified
+
+**Root cause found and fixed.** The 63 failures noted above were **not**
+"specific to `UTC-8`" or a general "zone-offset handling"/H2-conversion
+bug as speculated — they were a single, systemic native bug:
+`java.time.ZoneId.systemDefault()`, in CratonVM's real-JDK-mode boot path,
+was permanently intercepted to return a hardcoded synthetic UTC
+`ZoneOffset` (`native-builtins/src/lib.rs::register_essential_natives`,
+originally landed to fix an unrelated log4j boot-time NPE), **completely
+ignoring every `TimeZone.setDefault(...)` call the running program made**.
+`Timezones.withDefaultTimeZone()` (used by every `@Test` method in this
+class and `LocalDateTimeTest`) calls `TimeZone.setDefault(...)` then the
+test's own expected-value computation reads it back via
+`ZoneId.systemDefault()` directly — which always resolved to UTC
+regardless of what was set, producing an N-hour skew matching whichever
+zone the parameterized test happened to configure (`UTC-8`, `Europe/Paris`,
+`Pacific/Auckland` — not just `UTC-8`; the original doc's framing that it
+was "specific to `UTC-8`" was based on an incomplete sample of the 63
+failures' `@@FAIL` lines, which don't carry parameter values — a
+`DisplayNameRunner` JUnit5 launcher variant, capturing the live
+`TestPlan`'s `TestIdentifier` display names on `executionFinished`, was
+needed to see the actual per-parameter breakdown).
+
+Full root-cause + fix writeup:
+[hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md](../../internal/fixed-suite-bugs/hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md).
+Fix commit: `81c66806` (branch `fix/hib-zoneddatetime-offset-skew-20260716`,
+merged to `dev`).
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=384
+failed=20 aborted=204 skipped=0` — stable across 4 independent solo
+reruns (pre- and post-merge onto `dev`), down from `failed=63`.
+`LocalDateTimeTest` (`found=162 ok=90 failed=0 aborted=72`) and
+`InstantTests` (`found=204 ok=112 failed=0 aborted=92`): no regression.
+
+**New residual — OPEN, distinct bug, not fixed by the above:** the
+remaining 20/608 failures are **100% isolated** to one narrow parameter
+cluster: `env=Europe/Paris` combined with dates at the 1904-12-31/1905-01-01
+boundary (the test's own data comments call this out: "Also test dates
+around 1905-01-01, because the code behaves differently before and after
+1905"). Real pre-1911 `Europe/Paris` used Local Mean Time, UTC+00:09:21
+(9 minutes 21 seconds), not a flat-hour offset — real HotSpot's tzdb
+correctly applies this historical fractional offset; CratonVM instead
+produces a rounded flat-hour value:
+
+```
+expected: <1905-01-01T01:09:20+00:09:21[Europe/Paris]> but was: <1905-01-01T00:18:41+00:09:21[Europe/Paris]>
+expected: <1905-01-01 01:09:21.0> but was: <1905-01-01 02:00:00.0>
+```
+
+Notably the `+00:09:21` offset **is** present and correct in the
+`ZonedDateTime` zone/offset portion itself (confirming `ZoneId.of("Europe/Paris")`
+and the general zone-rules machinery, and this session's
+`ZoneId.systemDefault()` fix, correctly resolve the *zone identity* even
+for this historical case) — the bug is narrower, in the actual
+instant/local-time arithmetic applied for dates before the 1911
+standardization. This is the exact same underlying date range flagged as
+producing an unexplained `InternalError: CloneNotSupportedException` in
+this doc's original (pre-livelock-fix) investigation: with the
+`ZoneId.systemDefault()` fix now letting the class run far enough to
+reach these parameters reliably, that exception reproduces intermittently
+(1 of 4 reruns hit it on 4 of the 20 failing methods; the other 3 reruns
+produced plain `AssertionFailedError`/`AssertionError` for the exact same
+parameters instead) — timing/GC-dependent, consistent with a
+stale-object or clone-support gap rather than a deterministic value bug,
+though the flat-hour-rounding `AssertionFailedError` shape is the
+dominant/majority presentation. Not investigated further this session
+(distinct subsystem — historical tzdb rule precision / possible
+`Object.clone()` gap for a real JDK date class — from the
+`ZoneId.systemDefault()` fix above). **Next step for a follow-up
+session:** reproduce a bare (non-Hibernate) `ZonedDateTime.of(1905, 1, 1,
+0, 0, 0, 0, ZoneId.of("Europe/Paris")).withZoneSameInstant(ZoneId.of("Europe/Paris"))`-style
+micro-repro to confirm whether the `+00:09:21` LMT rule is applied
+correctly by bare `java.time` arithmetic outside Hibernate (narrowing
+core `java.time`/tzdb vs. Hibernate/JDBC layer, per this doc's original
+investigation template), then chase the intermittent
+`CloneNotSupportedException` with `CRATONVM_DBG_STALE_OBJREF`/a targeted
+`Object.clone()` native-support audit if the micro-repro confirms a
+CratonVM-side (not test-data) defect.
+
+## Update 2026-07-17 (follow-up session): Europe/Paris pre-1911 LMT precision — FIXED, `ZonedDateTimeTest` now 608/608 matching HotSpot
+
+**Status: CLOSED.** The 20/608 residual above is fixed. Full root-cause +
+fix writeup:
+[hib-paris-lmt-precision-FIXED.md](../../internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+Fix commit: `31544c27` (branch `fix/hib-paris-lmt-precision-20260717`,
+merged to `dev` at `03d7e98f`).
+
+**Root cause, in short:** not a `java.time`/tzdata bug at all — a
+standalone HotSpot-comparison micro-repro proved CratonVM's
+`ZonedDateTime`/`ZoneId`/`ZoneRules` arithmetic for the pre-1911 LMT case
+is already byte-for-byte correct. The bug was in the **separate, legacy**
+`java.util.TimeZone`/`Calendar`/`SimpleTimeZone` API family that
+`java.sql.Timestamp`'s deprecated constructor and
+`GregorianCalendar.computeTime()`/`.computeFields()` use for the actual
+JDBC round-trip: CratonVM's real-JDK-mode `TimeZone` is synthesized
+(`alloc_synth_timezone` in `native-builtins/src/lib.rs`, a workaround for
+an unrelated `ZoneInfoFile`/`tzdb.dat` bootstrap gap) as a real
+`java.util.SimpleTimeZone` with the zone's *modern* standard offset plus
+an annual DST rule — structurally incapable of expressing a one-time
+historical cutover like Paris's 1911-03-11 LMT→WET switch, since
+`SimpleTimeZone.getOffsets(long, int[])` (the method
+`GregorianCalendar` actually calls) only ever consults the fixed
+`rawOffset` field, with no date parameter.
+
+**Fix:** a small explicit `historical_lmt_offset(zone_id)` table plus a
+native override of `SimpleTimeZone.getOffsets(long, int[])`, returning the
+historical LMT offset for instants strictly before a zone's cutover and
+deferring to the real bytecode (`invoke_virtual_bytecode_only`) otherwise.
+Deliberately limited to `Europe/Paris` — a `GeneralityRepro.java`
+HotSpot-comparison probe showed real HotSpot's own legacy Calendar path
+(not just `java.time`) correctly resolves Paris's LMT, but does **not**
+resolve the analogous `Europe/Amsterdam`/`Europe/Oslo` cutovers (their
+compiled legacy zoneinfo data apparently omits the pre-1892/1893 LMT rule
+even though `java.time`'s `ZoneRules` has it) — adding those would have
+made CratonVM diverge from real HotSpot instead of matching it. See the
+fix commit/writeup for why "real IANA tzdata has a cutover" doesn't imply
+"HotSpot's legacy Calendar path resolves it".
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=404
+failed=0 aborted=204 skipped=0` — matches real HotSpot's exact shape
+(`ok=404 failed=0 aborted=204`), stable across 5 independent solo reruns
+(pre-merge and post-merge onto `dev`, `--nojit`). `LocalDateTimeTest`
+(`found=162 ok=90 failed=0 aborted=72`) and `InstantTests` (`found=204
+ok=112 failed=0 aborted=92`): no regression, both re-verified against the
+merged-`dev` tip. The intermittent `CloneNotSupportedException` flagged in
+the update above did not reproduce in any of the 5 post-fix reruns
+(previously ~1-in-4) — plausibly a side effect of the same
+offset-miscomputation retry path, though not separately root-caused; flag
+if it resurfaces.
+
+A separate, unrelated, out-of-scope bug was found incidentally while
+probing generality: CratonVM's synthetic `SimpleTimeZone` construction
+retroactively applies the *modern* EU DST rule to 19th-century dates that
+predate real DST adoption in that region (e.g. `Europe/Amsterdam` at
+1892-04-01 returns +2:00 on CratonVM vs. real HotSpot's +1:00 — DST wasn't
+introduced there until 1916). Not investigated further (not blocking any
+known test), flagged for a future session.
