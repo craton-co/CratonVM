@@ -736,11 +736,11 @@ impl Drop for ExecutableBuffer {
 /// of the recorded entries exactly because safepoints are emitted
 /// immediately before the call-that-may-trigger-GC.
 ///
-/// `frame_slot_offsets` lists the byte offsets *relative to RBP* of each
-/// slot holding a live oop. Negative offsets index into the local
-/// variable + spill areas; `[rbp + offset]` dereferences to the oop.
-/// Exactly one qword per entry — the frame layout guarantees 8-byte
-/// alignment so smaller slots never appear.
+/// `frame_slot_offsets` lists the positive byte distances *below RBP* of each
+/// slot holding a live oop. A distance `off` addresses `[rbp - off]`; this is
+/// the same convention used by the x64 emitter's `local_offset` and by the
+/// relocation walker. Exactly one qword per entry — the frame layout
+/// guarantees 8-byte alignment so smaller slots never appear.
 ///
 /// The fields are `Vec<i16>` / `u32` to minimize the map's footprint.
 /// A typical method has 1–5 oop maps with ≤ 16 slots each; the total
@@ -1648,6 +1648,21 @@ impl CompiledMethod {
     /// falls back to the conservative scan for its active frame.
     pub fn has_precise_oop_maps(&self) -> bool {
         !self.oop_maps.is_empty()
+    }
+
+    /// Locate the map selected by the safepoint id stored in a live JIT frame.
+    ///
+    /// The x64 emitter records the bytecode PC of each GC-capable safepoint in
+    /// a dedicated frame slot immediately before its call. Unlike
+    /// [`Self::find_oop_map_for_pc`], this lookup is intentionally keyed by
+    /// bytecode PC: while a helper is active, the native return address belongs
+    /// to the helper, but the frame slot remains stable and identifies the
+    /// caller's exact safepoint map.
+    #[inline]
+    pub fn find_oop_map_for_safepoint_id(&self, bytecode_pc: u32) -> Option<&OopMapEntry> {
+        self.oop_maps
+            .iter()
+            .find(|map| map.bytecode_pc == bytecode_pc)
     }
 
     /// real-frame-deopt: locate the deopt point for an exact native PC offset.
