@@ -50,7 +50,7 @@ checkout this run points `-ElasticsearchRoot` at
 (`/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch`)
 still had the `libvec.so` fixture problem previously marked FIXED in a
 different worktree — see
-[ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence.md](ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence.md)
+[ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence-FIXED.md](../../internal/elasticsearch-suite/ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence-FIXED.md)
 for the two-stage fix applied (file missing, then wrong-version file). This
 means result rows recorded **before** ~21:54 on 2026-07-16 for this run may
 show `UnsatisfiedLinkError`/`vec_cosi8_bulk8 LinkageError` as an infra

@@ -9,7 +9,7 @@ failures from the `es-tmpfix-rerun-20260716` 8-shard rerun (see
 [ES-RUN-20260716-tmpdir-fix-in-progress.md](ES-RUN-20260716-tmpdir-fix-in-progress.md)
 for the overall run status), after fixing the `libvec.so` fixture recurrence
 documented in
-[ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence.md](ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence.md).
+[ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence-FIXED.md](../../internal/elasticsearch-suite/ES-FIXTURE-20260716-libvec-so-wrong-version-recurrence-FIXED.md).
 With that fixture fixed, a dedupe pass on the remaining FAIL rows' `note`
 column showed `java.lang.NoClassDefFoundError` (various inner classes) as
 the single largest remaining signature across `libs/core`, `libs/x-content`,

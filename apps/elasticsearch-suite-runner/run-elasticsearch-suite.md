@@ -79,9 +79,35 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\elasticsearch-suite
 | `-MaxHeap` | heap string | `2g` | Heap passed to both VMs. |
 | `-Seed` | string | `B17AC9D3E1F2A0C4` | Elasticsearch randomized-test seed. |
 | `-CratonArgs` | string array | none | Extra CratonVM CLI arguments. |
+| `-SkipNativeFixtureCheck` | switch | off | Bypass the mandatory `libvec.so` ABI gate for narrowly scoped diagnostics only. |
 | `-RefreshLists` | switch | off | Rebuild `all-tests.tsv`, `passed.tsv`, `others.tsv`. |
 | `-ListOnly` | switch | off | Print selected classes without running. |
 | `-AllModes` | switch | off | Run four category/JIT modes concurrently. |
+
+## Native `libvec` fixture gate
+
+Before selecting any test classes, the runner validates the Linux x64
+`lib/platform/linux-x64/libvec.so` in the exact `-ElasticsearchRoot` supplied.
+It refuses to run when the library is absent, has fewer than 155 `vec_*`
+exports, or lacks the `bulk8` symbols required by the checked-out tests. This
+prevents a fixture error from being misclassified as a suite-wide CratonVM
+failure.
+
+If the fixture is absent or stale, rebuild it from the same Elasticsearch
+checkout; do not copy a `libvec.so` from another checkout or cached artifact:
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass `
+  -File apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 `
+  -ElasticsearchRoot C:\craton\CratonVM\apps\elasticsearch
+```
+
+The preparation script builds the library in Elasticsearch's checked-in Docker
+cross-toolchain, verifies its exports, and atomically installs it. The runner
+uses GNU `nm` on Linux and otherwise reuses the preparation image through
+Docker to perform the same preflight check. `-SkipNativeFixtureCheck` is
+available only for targeted diagnostics where the native-vector path is known
+to be out of scope.
 
 Any `CRATONVM_*` environment variable already set in the shell is inherited by
 every CratonVM child process. Example:
