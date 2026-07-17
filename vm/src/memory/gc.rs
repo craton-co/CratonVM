@@ -67,10 +67,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// unconditionally: bounded by `class_mirrors.len()`, each entry a single
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
-pub fn rebuild_mirror_pins(
-    shared: &crate::vm::SharedVm,
-    pointer_map: &HashMap<usize, usize>,
-) {
+pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
     let class_mirrors = shared.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
@@ -478,6 +475,7 @@ pub fn update_all_roots(
     // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
     // early-returns when nothing moved (non-moving GC).
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
+    cratonvm_native_io::socket_channel::channel_fields_update_after_gc(pointer_map);
 
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {

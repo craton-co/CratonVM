@@ -379,8 +379,13 @@ enum Syn {
     Null,
 }
 
-fn chan_fields() -> &'static RwLock<HashMap<i32, [Syn; N_FIELDS]>> {
-    static T: OnceLock<RwLock<HashMap<i32, [Syn; N_FIELDS]>>> = OnceLock::new();
+struct ChanState {
+    object: ObjectRef,
+    fields: [Syn; N_FIELDS],
+}
+
+fn chan_fields() -> &'static RwLock<HashMap<i32, Vec<ChanState>>> {
+    static T: OnceLock<RwLock<HashMap<i32, Vec<ChanState>>>> = OnceLock::new();
     T.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -400,8 +405,17 @@ fn cf_set(ctx: &mut dyn NativeContext, obj: ObjectRef, idx: usize, v: Value) {
     };
     let key = ctx.identity_hash_code(obj);
     let mut t = chan_fields().write();
-    let arr = t.entry(key).or_insert_with(default_syn);
-    arr[idx] = slot;
+    let bucket = t.entry(key).or_default();
+    if let Some(state) = bucket.iter_mut().find(|state| state.object == obj) {
+        state.fields[idx] = slot;
+    } else {
+        let mut fields = default_syn();
+        fields[idx] = slot;
+        bucket.push(ChanState {
+            object: obj,
+            fields,
+        });
+    }
 }
 
 /// Default synthetic state for a channel object before its `open()`/`accept()`
@@ -419,7 +433,12 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
         return Value::Int(0);
     }
     let key = ctx.identity_hash_code(obj);
-    match chan_fields().read().get(&key).map(|a| &a[idx]) {
+    match chan_fields()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|state| state.object == obj))
+        .map(|state| &state.fields[idx])
+    {
         Some(Syn::I(i)) => Value::Int(*i),
         _ => Value::Int(0),
     }
@@ -429,7 +448,16 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
 /// does not grow without bound across short-lived connections.
 fn cf_clear(ctx: &dyn NativeContext, obj: ObjectRef) {
     let key = ctx.identity_hash_code(obj);
-    chan_fields().write().remove(&key);
+    let mut table = chan_fields().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|state| state.object != obj);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
 }
 
 /// Cross-module accessor: the `tcp_registry` id backing a synthetic
@@ -447,16 +475,41 @@ pub fn channel_net_fd(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<i32> {
 fn cf_remote(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, i32)> {
     let key = ctx.identity_hash_code(obj);
     let t = chan_fields().read();
-    let arr = t.get(&key)?;
-    let host = match &arr[F_REMOTE] {
+    let state = t.get(&key)?.iter().find(|state| state.object == obj)?;
+    let host = match &state.fields[F_REMOTE] {
         Syn::S(s) => s.clone(),
         _ => return None,
     };
-    let port = match arr[F_REMOTE_PORT] {
+    let port = match state.fields[F_REMOTE_PORT] {
         Syn::I(p) => p,
         _ => 0,
     };
     Some((host, port))
+}
+
+pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
+    let table = chan_fields().read();
+    for bucket in table.values() {
+        roots.extend(bucket.iter().map(|state| state.object));
+    }
+}
+
+pub fn channel_fields_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut table = chan_fields().write();
+    for bucket in table.values_mut() {
+        for state in bucket {
+            let old = state.object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                state.object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
 }
 
 fn read_reg_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
