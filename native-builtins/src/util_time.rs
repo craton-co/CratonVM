@@ -4984,7 +4984,7 @@ fn native_clock_system_default_zone(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let zone_id = os_default_zone_id();
+    let zone_id = jvm_default_zone_id(ctx);
     let zone = alloc_zone_id(ctx, &zone_id);
     Ok(Some(Value::Object(Some(alloc_clock(ctx, zone)))))
 }
@@ -5141,11 +5141,56 @@ fn os_default_zone_id() -> String {
     "UTC".to_string()
 }
 
+/// Resolve the JVM's *current* default zone id, honoring any
+/// `TimeZone.setDefault(...)` call the running program has made.
+///
+/// Real HotSpot's `ZoneId.systemDefault()`/`Clock.systemDefaultZone()`
+/// both delegate to `TimeZone.getDefault().toZoneId()` — i.e. they must
+/// reflect a *settable*, JVM-level default, not just the host OS's static
+/// timezone setting. `java.util.TimeZone` runs off real JDK bytecode (see
+/// `phases_early.rs::register_timezone_natives`) and correctly tracks a
+/// settable static default via its own `<clinit>`/`setDefault`/
+/// `getDefault` bytecode, so route through it first. Falling back straight
+/// to `os_default_zone_id()` unconditionally (as both callers of this
+/// helper used to do) silently ignored every `TimeZone.setDefault(...)`
+/// call made by Java code — e.g. Hibernate's
+/// `Timezones.withDefaultTimeZone()` test helper — producing a stale/
+/// host-leaked zone and, downstream, timezone-offset-sized value
+/// corruption (HHH-10372 `ZonedDateTimeTest`/`LocalDateTimeTest`:
+/// `writeThenNativeRead`/`nativeWriteThenRead` failing with an
+/// exactly-one-offset skew because the test's own expected-value
+/// computation calls `ZoneId.systemDefault()` directly while Hibernate's
+/// JDBC bind path goes through `TimeZone.getDefault()` — two different
+/// notions of "default zone" that must agree).
+fn jvm_default_zone_id(ctx: &mut dyn NativeContext) -> String {
+    if let Ok(Some(Value::Object(Some(tz)))) =
+        ctx.invoke("java/util/TimeZone", "getDefault", "()Ljava/util/TimeZone;", &[])
+    {
+        if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
+            "java/util/TimeZone",
+            "getID",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(tz))],
+        ) {
+            if let Some(id) = ctx.read_string(id_str) {
+                if !id.is_empty() {
+                    return id;
+                }
+            }
+        }
+    }
+    // Fallback: OS/env-level tzdata, used only if the real-JDK TimeZone
+    // class is unavailable or its getDefault()/getID() round-trip fails
+    // for some reason (should not happen in practice once bootstrap is
+    // complete, but keeps this call infallible).
+    os_default_zone_id()
+}
+
 fn native_zone_id_system_default_tzdata(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let id = os_default_zone_id();
+    let id = jvm_default_zone_id(ctx);
     Ok(Some(Value::Object(Some(alloc_zone_id(ctx, &id)))))
 }
 

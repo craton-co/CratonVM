@@ -36136,19 +36136,67 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and `withZone(null)` immediately NPEs, blowing up the entire
     // log4j logging stack and stalling WildFly bootstrap.
     //
-    // Until the underlying tzdb.dat read is fixed, intercept the call
-    // and return a synthetic UTC ZoneId object.  The returned value
-    // satisfies `withZone(non-null)` so log4j initialises cleanly.
-    // DST semantics are wrong, but log timestamps default to UTC,
-    // which is acceptable for boot diagnostics.
+    // HHH-10372 correctness fix (2026-07-17): the original version of this
+    // bypass (still present as the fallback below) *always* returned a
+    // hardcoded UTC ZoneOffset, ignoring any `TimeZone.setDefault(...)`
+    // call the running program had made — a host-timezone-leak that
+    // silently broke every caller relying on a *settable* JVM default,
+    // not just log4j's boot-time NPE guard. Concretely: Hibernate's
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` (`Timezones.withDefaultTimeZone()`
+    // test helper) call `TimeZone.setDefault(...)` then read it back via
+    // `ZoneId.systemDefault()` — with the old hardcoded-UTC bypass, that
+    // always resolved to UTC regardless of what was set, producing
+    // timezone-offset-sized value corruption (63/608 parameterized
+    // failures, e.g. `expected: <2017-11-06 09:19:01.0> but was:
+    // <2017-11-06 01:19:01.0>`, matching whatever offset `TimeZone.setDefault`
+    // was called with).
+    //
+    // Fix: first try to resolve the *actual current* default zone via
+    // `TimeZone.getDefault()` (also natively overridden below in the
+    // "Round 54" fix, and confirmed to correctly track `setDefault(...)`
+    // — it does not touch the broken ZoneInfoFile/tzdb.dat path) and hand
+    // its id to the real bytecode `ZoneId.of(String)` (unregistered/native-free
+    // in real-JDK mode, so it runs the actual JDK parsing+tzdb-rules logic,
+    // which already works correctly for explicit `ZoneId.of(...)` calls
+    // elsewhere in this same test suite — DST rules included). Only fall
+    // back to the original hardcoded synthetic UTC ZoneOffset (preserving
+    // the exact previous behavior) if that chain fails for any reason
+    // (e.g. too early in boot for TimeZone/ZoneId to be ready yet) — the
+    // log4j NPE guard this bypass exists for must never regress.
     registry.register(
         "java/time/ZoneId",
         "systemDefault",
         "()Ljava/time/ZoneId;",
         |ctx, _args| {
-            // Allocate a synthetic instance of ZoneOffset (a concrete
-            // ZoneId subclass with a single int totalSeconds field).
-            // Using the abstract ZoneId class directly may break
+            if let Ok(Some(Value::Object(Some(tz)))) = ctx.invoke(
+                "java/util/TimeZone",
+                "getDefault",
+                "()Ljava/util/TimeZone;",
+                &[],
+            ) {
+                if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
+                    "java/util/TimeZone",
+                    "getID",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(tz))],
+                ) {
+                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
+                    if has_id {
+                        if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                            "java/time/ZoneId",
+                            "of",
+                            "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                            &[Value::Object(Some(id_str))],
+                        ) {
+                            return Ok(Some(zone));
+                        }
+                    }
+                }
+            }
+            // Fallback: original hardcoded-UTC synthetic bypass (see doc
+            // comment above) — allocate a synthetic instance of ZoneOffset
+            // (a concrete ZoneId subclass with a single int totalSeconds
+            // field). Using the abstract ZoneId class directly may break
             // instanceof checks downstream; ZoneOffset.UTC is the
             // canonical way to get a non-null ZoneId without touching
             // ZoneInfoFile.
