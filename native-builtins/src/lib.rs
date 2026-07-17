@@ -33784,18 +33784,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_snapshot_list_itr_previous_index,
     );
-    registry.register(array_list_itr, "remove", "()V", |_ctx, _args| Ok(None));
+    registry.register(
+        array_list_itr,
+        "remove",
+        "()V",
+        native_arraylist_list_itr_remove,
+    );
     registry.register(
         array_list_itr,
         "set",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_set,
     );
     registry.register(
         array_list_itr,
         "add",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_add,
     );
     for empty_iterator in [
         "java/util/Collections$EmptyIterator",
@@ -76971,6 +76976,104 @@ fn native_arraylist_list_itr_list(
         Value::Object(Some(list)) => Some(list),
         _ => None,
     }
+}
+
+/// `ArrayList$ListItr.set(Object)` -- real live mutation against the
+/// backing `ArrayList` (found via `native_arraylist_list_itr_list`), NOT a
+/// no-op. Root-caused 2026-07-17: this class's `set`/`add`/`remove` were
+/// previously registered as hardcoded `|_ctx, _args| Ok(None)` stubs (a
+/// leftover from an earlier, genuinely-immutable "snapshot" design), but
+/// `native_arraylist_list_iterator` and the sibling `next`/`previous`
+/// natives above already carry a LIVE backing-list reference in the
+/// `this$0`-equivalent slot -- so the iterator is not actually a frozen
+/// snapshot, and silently dropping `set`/`add`/`remove` produced silent
+/// data loss for any real-JDK code using `List.listIterator()` mutators
+/// (e.g. ANTLR4's `IntervalSet.add(int)`, which merges adjacent intervals
+/// via `ListIterator.set`/`.previous`/`.remove` -- this exact bug corrupted
+/// Groovy's ANTLR4-generated parser ATN after `ATNDeserializer.optimizeSets`,
+/// producing spurious `Unexpected input` parse failures for basic numeric/
+/// string literals). Mirrors real-JDK `ArrayList$ListItr.set`'s
+/// `IllegalStateException` guard (`lastRet < 0`) and delegates the actual
+/// write to the already-correct `native_al_set`.
+fn native_arraylist_list_itr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (_, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "set".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_set(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret), e],
+    )?;
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.add(Object)` -- real live insertion at the cursor
+/// position. See `native_arraylist_list_itr_set` for the root-cause
+/// narrative; mirrors real-JDK `ArrayList$ListItr.add`'s cursor/lastRet
+/// bookkeeping (advance cursor past the inserted element, reset lastRet to
+/// -1 so a following `remove()`/`set()` correctly throws
+/// `IllegalStateException`).
+fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_add_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(cursor), e],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.remove()` -- real live removal of the last element
+/// returned by `next()`/`previous()`. See `native_arraylist_list_itr_set`
+/// for the root-cause narrative; mirrors real-JDK `ArrayList$Itr.remove`'s
+/// cursor rewind (`cursor = lastRet`) and `lastRet` reset.
+fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    cratonvm_native_collections::native_al_remove_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(last_ret));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
 }
 
 fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
