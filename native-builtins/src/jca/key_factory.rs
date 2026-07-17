@@ -258,7 +258,7 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> Method
     } else {
         "sun/security/ec/ECKeyPairGenerator"
     };
-    drive_ec_keypair_spi(ctx, this, spi_class)
+    drive_real_keypair_spi(ctx, this, spi_class)
 }
 
 /// Drive SunEC's curve-specific EdDSA key generators. Their public constructors
@@ -308,9 +308,13 @@ fn drive_real_eddsa_keyfactory(
     drive_keyspec_spi(ctx, spi_class, spec, engine, ret_desc)
 }
 
-/// Drive a real EC `KeyPairGenerator` SPI (SunEC or BouncyCastle) honouring the
-/// stored keysize / `ECGenParameterSpec` curve, returning a real `KeyPair`.
-fn drive_ec_keypair_spi(
+/// Drive a real JDK `KeyPairGenerator`, honouring the stored key size and an
+/// optional `AlgorithmParameterSpec`, then returning a real `KeyPair`.
+///
+/// SunEC needs direct allocation to avoid its no-argument constructor's
+/// default-curve initialization; other provider generators use their public
+/// no-argument constructor.
+fn drive_real_keypair_spi(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     spi_class: &'static str,
@@ -429,6 +433,22 @@ fn drive_real_dsa_keyfactory(
         spec,
         engine,
         ret_desc,
+    )
+}
+
+/// Drive the real JDK `sun.security.provider.DSAKeyPairGenerator$Current`.
+///
+/// DSA has no compatible synthetic key representation: consumers expect the
+/// concrete `DSAPublicKey` / `DSAPrivateKey` objects, including their domain
+/// parameters.  Use the same real-SPI path as EC so default generation and
+/// callers that explicitly initialize a key size both return genuine JDK keys.
+/// `Current` is the JDK 25 provider implementation selected for ordinary
+/// `KeyPairGenerator.getInstance("DSA")` calls.
+fn drive_real_dsa_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    drive_real_keypair_spi(
+        ctx,
+        this,
+        "sun/security/provider/DSAKeyPairGenerator$Current",
     )
 }
 
@@ -1301,7 +1321,7 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
     // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
     set_kpg_bcprov(kpg, is_bc);
-    let default_bits = if idx == ALGO_RSA {
+    let default_bits = if idx == ALGO_RSA || idx == ALGO_DSA {
         2048
     } else if idx == ALGO_EC {
         256
@@ -1486,6 +1506,10 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(alloc_keypair(
             ctx, pub_obj, priv_obj,
         )))));
+    }
+
+    if algo == ALGO_DSA && crate::route_dsa_to_real() {
+        return drive_real_dsa_keypair(ctx, this);
     }
 
     if crate::route_ec_to_real() && matches!(algo, ALGO_ED25519 | ALGO_ED448) {
@@ -2523,6 +2547,8 @@ mod tests {
         assert_eq!(algo_idx("Ed25519"), ALGO_ED25519);
         assert_eq!(algo_idx("Ed448"), ALGO_ED448);
         assert_eq!(algo_idx("RSASSA-PSS"), ALGO_RSA);
+        assert_eq!(algo_idx("DSA"), ALGO_DSA);
+        assert_eq!(algo_idx("DSS"), ALGO_DSA);
         assert_eq!(algo_idx("Garbage"), -1);
     }
 
@@ -2532,6 +2558,7 @@ mod tests {
         assert_eq!(algo_name(ALGO_EC), "EC");
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
         assert_eq!(algo_name(ALGO_ED448), "Ed448");
+        assert_eq!(algo_name(ALGO_DSA), "DSA");
         assert_eq!(algo_name(-1), "Unknown");
     }
 

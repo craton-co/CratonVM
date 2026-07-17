@@ -76,7 +76,7 @@ open each doc for the full picture):
 | [`batch-jdbc-mergedannotation-isdirectlypresent-abstractmethoderror.md`](batch-jdbc-mergedannotation-isdirectlypresent-abstractmethoderror.md) | OPEN — found 2026-07-17, root cause not pinned to a file:line |
 | [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) | OPEN — found 2026-07-17 |
 | [`cassandra-jni-thrownew-discards-payload-hang.md`](cassandra-jni-thrownew-discards-payload-hang.md) | OPEN — found 2026-07-17 |
-| [`certificatematchertests-dsa-keypairgenerator-gap.md`](certificatematchertests-dsa-keypairgenerator-gap.md) | OPEN — found 2026-07-17 |
+| [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
 | [`class-getmethods-override-shadowing-duplicate-close-cluster.md`](class-getmethods-override-shadowing-duplicate-close-cluster.md) | OPEN — found 2026-07-17 (refines/reopens a prior RESOLVED conclusion |
 | [`collections-singletonmap-hashmap-backed-not-real-class.md`](collections-singletonmap-hashmap-backed-not-real-class.md) | OPEN — found 2026-07-17 (confirmed at source level) |
 | [`conditionevaluationreport-capturedoutput-empty-cluster.md`](conditionevaluationreport-capturedoutput-empty-cluster.md) | OPEN — found 2026-07-17 |
