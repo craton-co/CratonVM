@@ -4631,3 +4631,223 @@ failure beyond the documented 16-test baseline
 load-induced flake by rerunning it alone (`cargo test … -- --exact`, passed
 immediately) — zero real regressions. `cargo test -p cratonvm-native-builtins
 --lib --release`: see below.
+
+
+---
+
+#### 5.8 follow-up #4 (2026-07-18, session 5): Result 3 (`cratonvm-aio-dispatch-N` arbitrary-site SIGSEGV) ROOT-CAUSED and FIXED (`b3db96f8`); a second, independent, pre-existing race found in the same crash class, left OPEN
+
+Picked up Result 3 from follow-up #2 (2026-07-17, session 3) — the
+`cratonvm-aio-dispatch-N`-specific SIGSEGV class, distinct from both the
+`tg_slot`/`ThreadGroup.enumerate()` SIGSEGV (follow-ups #2/#3, above) and the
+GC-barrier livelock (follow-up #3, above); this session did not touch
+either of those and can independently confirm both are still reproducible
+(see "Confounder" below).
+
+**Repro**: `cratonvm --enable-native-access=ALL-UNNAMED` running
+`WebSocketIntegrationTests` in a loop under a `release-with-debug` build
+(`debuginfo=line-tables-only`, `strip=none`, same profile as prior
+sessions) reproduces a SIGSEGV roughly every 4-6 runs. `ulimit -c unlimited`
++ `/proc/sys/kernel/core_pattern` → `core.%e.%p.%t` (already configured on
+this host from a prior session) captures a core on every crash; `%e`
+reflects the *crashing thread's own* `comm`, not the process name — cores
+land as `core.main-vm.*` for a main-thread crash and (truncated to 15
+chars) `core.cratonvm-aio-di.*` for a dispatcher-thread crash, which turned
+out to be the single most useful piece of free triage signal this session
+had: it let a script bucket incoming cores by crashing-thread family without
+opening `gdb` on each one (`ls /data/tmp/cores | grep aio-di`).
+
+**Confounder discovered early**: an unscoped stress loop's first ~20 crashes
+were *all* on the main thread at `tg_slot`/`class_id_of` — i.e. the
+already-documented, still-open `ThreadGroup.enumerate()` bug from follow-ups
+#2/#3, not Result 3 at all. It is by far the more frequent crash of the two
+on this exact test class (Tomcat's WebSocket close-handshake path calls
+`ThreadGroup.enumerate()` during connector shutdown on nearly every run).
+Filtering became necessary: `CRATONVM_DBG_STALE_OBJREF=1` + `RUST_BACKTRACE=1`
+turns *both* bug families into a named panic instead of a bare segfault,
+and Rust's default panic hook prints the OS thread name (`thread
+'cratonvm-aio-dispatch-14' panicked at …`) — grepping panic logs for
+`cratonvm-aio-dispatch` next to `STALE_OBJREF` cheaply separates the two
+families without a single `gdb` invocation. Once filtered, roughly 40-60%
+of raw-segfault runs were genuinely Result 3 (i.e. this is not a rare
+crash on this workload — the multi-threaded dispatcher pool makes it
+routine, not exceptional).
+
+**Root cause**: `ForeignCallGuard` (`vm/src/native/jni.rs`) brackets every
+JNI callback a `cratonvm-aio-dispatch-N` thread makes into a delivered
+completion's `CompletionHandler` — one bracket per completion, so this runs
+extremely often over a dispatcher thread's lifetime. It is meant to
+implement the same "about to block" / "done blocking, resume running Java"
+transition every other blocking native in this codebase goes through
+(`NativeContextImpl::begin_blocking_region`/`end_blocking_region`,
+`vm/src/vm/vm_exec.rs`), but it reimplemented a **partial** version of that
+protocol instead of calling the two canonical helper methods
+(`deposit_root_snapshot()` / `check_post_block_gc()`):
+
+- Going idle (`Drop for ForeignCallGuard`) did a bare
+  `jt.root_snapshot.lock().clear()` instead of `deposit_root_snapshot()`.
+  Clearing to *empty* is correct for the interpreter-frame portion of the
+  snapshot (this thread's Java frames are genuinely empty once the
+  outermost call has returned) but wrong for everything else a real deposit
+  captures — most importantly `JvmThread.java_thread_obj`, the cached
+  `java.lang.Thread` mirror `Thread.currentThread()` hands back. That
+  mirror is lazily allocated the *first* time Java code on this OS thread
+  calls (or transitively triggers, e.g. `ThreadLocal.get()`'s
+  inherited-value drain calling `ctx.current_thread_object()`)
+  `Thread.currentThread()`, and then persists on `JvmThread` across every
+  later completion this same dispatcher thread ever services. With the
+  snapshot wiped to empty on every idle transition, that persistent mirror
+  was GC-invisible for the thread's entire idle window between
+  completions — the dispatcher's dominant time-in-state, since it parks on
+  a condvar (`wait_for_pending`) between wakeups.
+- Becoming running again (`ForeignCallGuard::enter()`) cleared
+  `in_blocked_region` with a bare atomic store and never called
+  `check_post_block_gc()` — the method that applies the *accumulated
+  cross-GC pointer fixup* (`gc_block_state.fixup`, composed by every GC
+  that ran while a thread sat blocked) back onto `java_thread_obj` (and
+  `native_pin_roots` / `native_alloc_pool` / `native_pending_return` /
+  `scoped_values` / `pending_async_exception` / JNI locals).
+
+Net effect, once only the `Drop`-side half is considered: even after fixing
+the deposit so a GC correctly *marks* `java_thread_obj` live and relocates
+it (rather than reclaiming it outright), nothing ever copied the object's
+*new*, post-move address back onto `JvmThread.java_thread_obj` itself — that
+remap only happens inside `check_post_block_gc()`, which `enter()` never
+called. So the mirror object always survived any GC that ran while the
+thread was idle, just at the *wrong* (pre-move) address on the Rust side.
+The next `Thread.currentThread()` call on that same dispatcher thread handed
+back the stale pointer, and it was dereferenced at whatever native or
+interpreter call site happened to touch it next — `identity_hash_code`, a
+`get_field`, an array-bounds check, a `set_field` deep in an unrelated
+callback — which is exactly the "essentially arbitrary call site" shape
+follow-up #2 flagged and could not explain.
+
+**Confirmed live** via `CRATONVM_DBG_STALE_OBJREF=1`: the segfault turns
+into a clean, reproducible panic —
+
+```
+thread 'cratonvm-aio-dispatch-9' panicked at gc/src/gen_heap.rs:1575:13:
+CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at 0x2011484dee8 —
+this object was evacuated by a moving GC to 0x2014b705ea0 (class_id=29
+kind=Object), but native/interpreter code dereferenced the OLD address.
+```
+
+with `RUST_BACKTRACE=1` naming the exact call chain every single time this
+family reproduced (8+ independent captures, always the same site):
+`identity_hash_code` (`gc/src/gen_heap.rs:1616` → `gc/src/vm_heap.rs:213` →
+`vm/src/vm/vm_exec.rs:2990`) ← `drain_inherited_for_current_thread`
+(`native-builtins/src/phases_early.rs:3494`, `ThreadLocal`'s
+first-access-drains-inherited-values path) ← `native_tl_get` ←
+`safe_native_call`. `drain_inherited_for_current_thread` calls
+`ctx.current_thread_object()` then immediately `ctx.identity_hash_code()`
+on the result — i.e. the very first read of the (stale) `java_thread_obj`
+field on that dispatcher thread's next completion.
+
+**Fix** (`vm/src/native/jni.rs`, commit `b3db96f8`): replaced both halves of
+`ForeignCallGuard`'s bespoke transition with the two canonical helper calls
+— `Drop` now calls `NativeContextImpl::deposit_root_snapshot()` (which also
+raises `in_blocked_region` itself, matching `begin_blocking_region`'s own
+sequence) instead of a bare clear; `enter()` now calls
+`GcBarrier::mark_blocked_region_leave()` (counter side) followed by
+`NativeContextImpl::check_post_block_gc()` (identity-flag clear + fixup
+application + fresh snapshot deposit) instead of a bare
+`in_blocked_region.store(false)` + clear, mirroring
+`end_blocking_region()` exactly. No new mechanism was invented — the fix is
+entirely "use the existing, already-audited discipline instead of a
+partial reimplementation of it."
+
+**Verified**:
+- 80 stress runs of `WebSocketIntegrationTests` post-fix
+  (`CRATONVM_DBG_STALE_OBJREF=1` + `RUST_BACKTRACE=1`, same harness as the
+  pre-fix characterization): **zero** occurrences of the
+  `drain_inherited_for_current_thread`/`identity_hash_code` signature on
+  any `cratonvm-aio-dispatch-N` thread — down from being the dominant
+  dispatcher-thread crash pre-fix (roughly 40-60% of stress-run crashes in
+  earlier batches, ~12 of ~20 raw segfaults in one representative batch).
+  All 33 `STALE_OBJREF` panics captured in the 80-run post-fix batch were
+  on `main-vm`, matching the still-open `tg_slot` signature from
+  follow-ups #2/#3 (untouched this session, expected).
+- `cargo test -p cratonvm-native-io --lib --release`: 349/349, both before
+  and after.
+- `cargo test -p cratonvm-vm --lib --release`: 2201 passed / 16 failed,
+  identical before and after — the 16 are the same documented pre-existing
+  baseline (9 `runtime::lock_order` tests requiring a debug build, 7
+  `jit::skip_list` tests already failing on unmodified `dev`) from
+  follow-up #2.
+
+**Result — a second, independent, pre-existing race in the same crash
+class, left OPEN**: while hunting for the above, 5 additional cores
+surfaced (2 during this session's own post-fix verification, 3 recovered
+from an earlier pre-fix stress batch — all 5 gdb-confirmed identical) with
+a *different* signature, also on `cratonvm-aio-dispatch-N` threads, **not
+caught by `CRATONVM_DBG_STALE_OBJREF`** (a raw, uncaught SIGSEGV even with
+the flag set):
+
+```
+#0  is_forwarded () at types/src/heap_types.rs:411
+#1  get_header () at gc/src/gen_heap.rs:1558
+#2  set_field () at gc/src/gen_heap.rs:2092
+#3  <a FieldHolder.<init> field-setter native> (native-builtins/src/lib.rs:31368)
+#4  safe_native_call → invoke_on_class_shared → build_thread_field_holder
+    (vm/src/vm/vm_exec.rs:2280) → current_thread_object (vm_exec.rs:5986)
+    → native_thread_current_thread (native-builtins/src/lang_system.rs:478)
+```
+
+i.e. this crashes not from a *stale-but-still-valid-forwarded* pointer (the
+family this session fixed, and the family `CRATONVM_DBG_STALE_OBJREF` is
+designed to catch) but from dereferencing a header at what appears to be
+genuinely unmapped/garbage memory while a dispatcher thread is *lazily
+constructing its own `Thread` mirror for the very first time*
+(`current_thread_object()` → `build_thread_field_holder()` →
+`FieldHolder.<init>`). `build_thread_field_holder()` itself correctly pins
+its own intermediate objects across GC-capable calls (`native_pin_roots`,
+the documented "BUG-03 concurrent-spawn" fix), but the sibling function it
+calls, `get_or_create_main_thread_group()` (`vm/src/vm/vm_exec.rs:2310`),
+has a classic check-then-act race: it reads
+`*self.shared.main_thread_group.read()` once, and if `None` proceeds
+through a long *unguarded* sequence of allocations and `<init>` invokes
+(building the "system" and "main" `ThreadGroup` objects) before finally
+writing the result back — with no lock held across the build. Two threads
+that both observe `None` at the same instant both redundantly execute the
+entire build concurrently. **Confirmed pre-existing**: 3 of the 5 captured
+cores are from the *stock, unmodified pre-session binary* (timestamps
+predate this session's fix), so this is not something this session's
+change introduced — like Result 3's own second data point in follow-up #2,
+it plausibly already existed with a single dispatcher thread but is far
+more exposed now that up to 16 dispatcher threads can genuinely call
+`Thread.currentThread()` for the first time within the same instant (e.g.
+when a burst of completions fires across the whole pool simultaneously at
+test start), a scenario a single dispatcher thread, or the more gradual
+spawn cadence of ordinary `Thread.start()` workers, essentially never
+triggers.
+
+**Not fixed this session**: a correct fix (turning
+`get_or_create_main_thread_group()`, and possibly the sibling
+`build_thread_field_holder()`, into a properly-guarded lazy singleton —
+e.g. holding `main_thread_group`'s write lock across the whole build
+instead of just the final store, or a dedicated one-shot init lock) is a
+different kind of change than this session's — it touches concurrent
+lazy-initialization discipline rather than GC root-tracking, carries real
+deadlock/perf risk if rushed (this exact function already re-acquires
+`class_manager`'s read lock multiple times internally; holding
+`main_thread_group`'s write lock across allocations and nested `<init>`
+invokes needs the same care the existing `native_pin_roots` pinning in
+this function got, not a five-minute patch), and was only confirmed via
+2 live captures during this session's own verification (i.e. genuinely
+rare relative to the bug that was fixed — roughly 1 in 40 runs vs. roughly
+1 in 2). Flagged for a dedicated future session. The known-issue signature
+to search for: `is_forwarded` / `get_header:1558` (not `:1575`, which is
+the `CRATONVM_DBG_STALE_OBJREF` assertion site the FIXED bug hit) crashing
+from inside `build_thread_field_holder`/`get_or_create_main_thread_group`
+on a `cratonvm-aio-dispatch-N` thread.
+
+**Net assessment**: the `cratonvm-aio-dispatch-N` "arbitrary call site"
+SIGSEGV class documented as Result 3 in follow-up #2 was actually (at
+least) two independent bugs sharing a thread family and a superficially
+similar "stale/bad pointer read at a native or interpreter call site"
+shape. The dominant one (a genuine, well-evidenced GC-root-tracking gap in
+`ForeignCallGuard`'s idle/running transitions) is now root-caused, fixed,
+and verified with real rigor (80 stress runs, zero recurrence, two
+regression suites unchanged). The second (a concurrent lazy-init race,
+confirmed pre-existing) remains open, is rarer, and needs its own
+dedicated session.
