@@ -5,7 +5,7 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — GC-corruption family CLOSED; BigInteger AIOOBE/InvalidMappingException residual CONFIRMED real (2026-07-17 ObjectHeader diagnostic) but extremely fragile to trigger, root cause STILL OPEN
+## `DefaultCatalogAndSchemaTest` — GC-corruption family CLOSED; BigInteger AIOOBE/InvalidMappingException residual CONFIRMED real, reproducibility wildly environment-sensitive (near-unreproducible in some sessions, a reliable ~50% full-harness hit rate in others, same day), root cause STILL OPEN
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
@@ -1275,6 +1275,143 @@ final-digit call site's `R8`/`RDX` argument-register loads against a real
 failing process. No code change made this session (nothing reproduced to
 validate a fix against; the only candidate mechanism was refuted, not
 replaced).
+
+## Update 2026-07-17 (independent same-day session, run concurrently with/immediately after the "post-`f377eb69`" session above): the "0/6 clean" empirical finding above does NOT replicate -- this session got 7/7 full end-to-end runs FAILING consistently at ~50-55%, with fresh `CRATONVM_DBG_AIOOBE3` captures; hypothesis still REFUTED (agrees with the entry above), but flagging an unresolved same-day reproducibility discrepancy
+
+**Setup, independent of the entry immediately above.** Fresh worktree
+`wt-hib-biginteger-postgcfix-verify-20260717`, pinned to `origin/dev` at
+`fd7a241d` (fetched via `git show origin/dev:...` to confirm content, not a
+stale local checkout), confirmed via `git merge-base --is-ancestor f377eb69
+HEAD` before building. `CARGO_PROFILE_RELEASE_LTO=off cargo build --release
+-p cratonvm-cli`, frozen to
+`/data/data/frozen-hib-biginteger-postgcfix-verify-20260717/cratonvm-postgcfix-verify-20260717`
+(md5 `81946d8b512c93b937e56bbd0857176a`). Verified only 8 non-doc commits
+separate this tip from the current `origin/dev` tip
+(`7f18c4f1`/`7a8222eb`/`6882531a`/`ce78b92f`/`394f9c93`/`21ac1849`
+[`ArrayList$ListItr` no-op-stub fix]/`9b39da87`/`c7868c30` [AIO
+completion-dispatcher deadlock fix]) -- none touch JIT codegen, GC,
+`conservative_roots.rs`, or `BigInteger`/`generics.rs`, so this binary and
+the immediately-preceding entry's "fresh" binary should be code-equivalent
+for this bug's purposes. The shared Hibernate fixture
+(`/data/data/apps/hibernate-orm-harness/hib-libs/test-classes`) was also
+confirmed unchanged since the `HARNESS-REBUILD-20260717.md` rebuild (no
+files newer than that doc, `common.args` md5 unchanged) -- ruling out a
+different-fixture-build explanation for what follows.
+
+**Isolated micro-repro: 840,000 trials, 0 failures, 0 `AIOOBE3-DIAG` hits.**
+`SmallDividendRepro`/`BigDividendRepro` (5000 trials/launch x 100 process
+launches, `CRATONVM_DBG_GC_STRESS` in {65536, 4096, 16384, 262144, 2097152})
+plus `HashedNameProbe` (real `NamingHelper.hashedName` call, 2000 trials x 20
+launches, `CRATONVM_DBG_GC_STRESS=65536`) against this binary: uniformly
+clean. This part fully agrees with the immediately-preceding entry and every
+prior session back to the `wt-hib-mulsub-*` entries -- the isolated repro
+tooling has now gone 0-for-well-over-1,000,000 combined trials across at
+least four independent sessions and should probably be deprioritized in
+favor of the finding below.
+
+**Full end-to-end harness (`CratonRunner`/`DiscoverySelectors.selectClass`,
+default settings, no stress env vars): 7/7 runs FAILED, consistently, at
+50-55%.** This directly contradicts the immediately-preceding entry's "5
+clean end-to-end runs" on what should be equivalent code:
+
+```
+run 1 (plain default):                 found=132 started=132 ok=64 failed=68 ms=543996
+run 2 (plain default):                 found=132 started=132 ok=64 failed=68 ms=527804
+run 3 (plain default):                 found=132 started=132 ok=66 failed=66 ms=514271
+run 4 (plain default):                 found=132 started=132 ok=60 failed=72 ms=467151
+run 5 (plain default):                 found=132 started=132 ok=60 failed=72 ms=437629
+run 6 (CRATONVM_DBG_AIOOBE3=1 only):   found=132 started=132 ok=66 failed=66 ms=531132
+run 7 (CRATONVM_NO_PRECISE_JIT_MAPS=1
+       + CRATONVM_DBG_AIOOBE3=1):      found=132 started=132 ok=66 failed=66 ms=516149
+```
+
+Every single failure in a sampled run (`grep`, run 1, 68/68) is the
+identical, exact documented signature:
+`java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2`
+(no `InvalidMappingException` variety seen this session -- may be a rarer
+secondary symptom, or may correlate with something this session's runs
+didn't hit). This is **not flaky pass/fail noise** -- the failure count is
+tightly banded (66-72 of 132, i.e. every run independently lands within a
+~9% window of ~51% failure rate) across 7 independent process launches, some
+minutes apart, under materially different env-var configurations (plain,
+`AIOOBE3`-instrumented, precise-maps-disabled) -- indicating a deterministic
+per-test-method trigger condition under this session's environment, not a
+rare/lucky hit.
+
+**Fresh `CRATONVM_DBG_AIOOBE3` captures (run 6) reproduce the exact same
+diagnostic signature as the original decisive capture from two sessions
+ago**, at scale (dozens of hits across the run, all identical):
+
+```
+[AIOOBE3-DIAG] jit-reported index=2 length=2 array_ptr=0x20042648808
+header: class_id=0 kind=1 elem_ty=10 ident_hash=6547 array_length_field=2
+num_slots=2 gc_age=1 gc_flags=0 forwarding_ptr=0x0
+```
+
+`forwarding_ptr=0x0`, internally self-consistent `int[2]` header -- same as
+before. This reconfirms (does not newly establish) that this is genuine data
+corruption / wrong-reference-or-index, not object relocation. **New this
+session:** run 7 (`CRATONVM_NO_PRECISE_JIT_MAPS=1`, forcing every GC root
+lookup through the conservative scanner instead of precise oop maps)
+produced an **identical** failure count (66/132) to run 6's precise-maps-on
+baseline (66/132). If either the precise-map path or the conservative-scan
+path (the `f377eb69` subject) were the actual defect, forcing full-time
+reliance on the *other* one should have shifted the failure rate one way or
+the other. It didn't move at all. This is a second, independent piece of
+evidence (on top of the git-ancestry argument in the entry above) against
+*any* GC-root-tracking explanation, precise or conservative -- and further
+supports the `divideMagnitude`/`mulsub` arithmetic-or-argument-marshaling
+codegen hypothesis from the "fast, minimal, Hibernate-free repro" entry over
+any GC-root theory.
+
+**This session did not attempt a fix.** Per this doc's own standing
+guidance and given the exact faulty instruction still isn't pinned (only
+now ruled further away from GC-root theories), landing a speculative patch
+to shared JIT/GC infrastructure would be irresponsible.
+
+**Unresolved discrepancy, flagged honestly rather than silently
+overwritten:** this session's reproduction is about as strong as evidence
+gets for this doc's history (7/7 runs, tight failure-rate band, matching
+diagnostic signature, ruled out two GC-root theories) -- yet the
+*immediately preceding, same-day* session, working from code that appears
+equivalent and the same shared fixture, reported the opposite (6/6 clean,
+940k clean isolated trials). Both sessions' methodology looks sound on
+inspection; neither obviously made a setup mistake. Given this doc's own
+long-standing "heisenbug, extremely fragile, process/environment-sensitive"
+framing (previously observed as *rare, hard-to-trigger* crashes against a
+*normally-clean* baseline), this is the first time the *opposite* polarity
+has been observed -- a session where the bug looks like a **reliable,
+majority-of-runs** failure instead of a rare one. Whether this reflects
+genuine moment-to-moment host/environment sensitivity (extreme, but
+consistent with this doc's history), some subtle undetected divergence
+between the two sessions' otherwise-parallel setups, or something else
+entirely was not resolved this session.
+
+**Practical recommendation for the next session, superseding the isolated
+tools' priority:** the full end-to-end harness invocation is, *right now, in
+this session's environment*, a **reliable ~9-minute, ~50%-hit-rate repro** --
+categorically better than the isolated micro-repro tools, which have never
+once reproduced across 4 sessions and >1.5M combined trials. If this
+reliability holds for a follow-up session too, that session should pivot
+straight to `CRATONVM_DBG_JIT_DISASM=divideMagnitude,mulsub` against a live
+full-harness run (not the isolated repro) to finally attempt pinning the
+exact faulty instruction the "fast, minimal, Hibernate-free repro" and
+`CRATONVM_DBG_AIOOBE3` entries above narrowed to but could never get a live
+capture to confirm against. If it does *not* reproduce reliably for that
+next session either, that itself is useful evidence for the
+environment-sensitivity explanation over a setup-divergence explanation.
+
+**This item remains OPEN.** The hypothesis under test this round (BigInteger
+AIOOBE fixed by/related to `f377eb69`) is REFUTED -- agreeing with the entry
+immediately above, now via three independent lines of evidence (git
+ancestry, this session's high-volume live reproduction on the "fixed" tip,
+and the precise-maps-on/off invariance). Not moving to
+`docs/internal/fixed-suite-bugs/` -- this is not a resolution, and per this
+update, if anything the bug is *more* clearly alive and reproducible right
+now than the entry immediately above suggested. The rest of this doc's items
+are independently closed (see their own sections) but this one blocks
+declaring the whole `hib-misc-residuals-20260716.md` doc closed.
+
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
