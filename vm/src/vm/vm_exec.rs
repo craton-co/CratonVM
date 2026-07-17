@@ -1830,6 +1830,46 @@ impl<'a> NativeContextImpl<'a> {
                 snapshot.push(m);
             }
         }
+        // cceres3 FIX (blocked-window exact slot tracking): record every
+        // Object frame slot with the address it currently holds. GC folds
+        // advance each entry's `cur` through their pointer maps; the wake
+        // write-back in `check_post_block_gc_refs` stores `cur` back into
+        // the exact slot. Unlike the `fixup` chain (keyed by first-move
+        // addresses seeded from the FILTERED snapshot), this cannot strand a
+        // slot on a missed seed, a filtered entry, or a multi-block chain.
+        // Only the flag-raising deposit fills it — the wake-path refresh
+        // (`deposit_root_snapshot_no_flag`) must not, since a runnable
+        // thread's frames change under it.
+        if raise_blocked_flag {
+            let mut origins = self.thread.gc_block_state.slot_origins.lock();
+            origins.clear();
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: li as u32,
+                            is_stack: false,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: si as u32,
+                            is_stack: true,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
+            }
+        }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
         snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
@@ -2155,6 +2195,57 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // cceres3 FIX: exact per-slot write-back for the blocked window.
+        // Runs after the chain application above — any slot the chain already
+        // healed reads back != orig and is skipped; any slot the chain MISSED
+        // (seed gap / filtered snapshot / multi-block chain break) still
+        // holds `orig` and gets the tracked current address. Kind-strict on
+        // the operand stack (collision longs untouched); locals only rewrite
+        // when the slot still decodes to exactly `orig` as an object.
+        {
+            let origins = {
+                let mut o = self.thread.gc_block_state.slot_origins.lock();
+                std::mem::take(&mut *o)
+            };
+            if !origins.is_empty() {
+                let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
+                for so in &origins {
+                    if so.cur == so.orig {
+                        continue;
+                    }
+                    let fi = so.frame as usize;
+                    let Some(fr) = self.thread.frames.get_mut(fi) else {
+                        continue;
+                    };
+                    if so.is_stack {
+                        if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) && dbg {
+                            eprintln!(
+                                "[blockgc] writeback healed tid={} frame#{fi} stack[{}] 0x{:x}->0x{:x}",
+                                self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                            );
+                        }
+                    } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+                        if o.as_ptr() as usize == so.orig {
+                            // SAFETY: `cur` is the object's current address,
+                            // advanced through the GC pointer maps by the
+                            // initiator folds.
+                            fr.set_local(
+                                so.idx as u16,
+                                Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(so.cur as *mut u8)
+                                })),
+                            );
+                            if dbg {
+                                eprintln!(
+                                    "[blockgc] writeback healed tid={} frame#{fi} local[{}] 0x{:x}->0x{:x}",
+                                    self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.

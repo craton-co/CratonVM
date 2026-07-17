@@ -1287,6 +1287,17 @@ impl ThreadRegistry {
                     *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
+            // cceres3 FIX: advance the exact per-slot tracker through THIS
+            // collection's pointer map (see `GcBlockState::slot_origins`).
+            // Exact lookups per map — no chain keys to strand.
+            {
+                let mut origins = entry.gc_block_state.slot_origins.lock();
+                for so in origins.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&so.cur) {
+                        so.cur = new;
+                    }
+                }
+            }
             if dbg && (composed > 0 || seeded > 0) {
                 eprintln!(
                     "[blockgc] fold tid={} composed={} seeded={} fixup_total={} snapshot_len={}",

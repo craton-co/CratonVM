@@ -2495,6 +2495,45 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
 }
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
+    // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
+    // thread, verify no frame slot holds an already-forwarded (quarantined)
+    // address at the safepoint publish. A hit here bounds the miss window to
+    // "since the previous safepoint" on a RUNNING thread, which none of the
+    // DEPOSIT/WAKE/ARRIVE verifiers can see.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        thread_local! {
+            static LAST_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.heap.collection_count();
+        let prev = LAST_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            for (fi, fr) in thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _rs_t0 = if rootsnap_dbg_enabled() {
         Some((std::time::Instant::now(), thread.frames.len()))
     } else {
