@@ -2188,6 +2188,10 @@ fn publish_jul_handlers(
         .get(&read_jul_logger_name(ctx, logger))
         .cloned()
         .unwrap_or_default();
+    // Resolve the producing thread's Java tid once, BEFORE any record
+    // allocation below can move freshly-created objects.
+    let producer_tid = crate::current_java_thread_tid(ctx);
+    let producer_short_tid = crate::short_thread_id(producer_tid);
     for addr in handlers {
         // SAFETY: handlers are strongly referenced by Java-side LogCapture for
         // the whole interval they are registered; this is the same stable-ref
@@ -2207,6 +2211,12 @@ fn publish_jul_handlers(
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
         ctx.set_field(record, 4, Value::Object(Some(message)));
+        // Records must carry the producing thread's id: JULI's OneLineFormatter
+        // resolves record.getLongThreadID() via ThreadMXBean.getThreadInfo(long),
+        // which throws IllegalArgumentException for the 0 an unpopulated record
+        // reports (seen as "ErrorManager: 5" on every AsyncFileHandler format).
+        ctx.set_field_by_name(record, "longThreadID", Value::Long(producer_tid));
+        ctx.set_field_by_name(record, "threadID", Value::Int(producer_short_tid));
         // Prefer the JDK setter too: it writes the resolved private slot even
         // when the compact allocator has not materialized field metadata yet.
         let _ = ctx.invoke_virtual(

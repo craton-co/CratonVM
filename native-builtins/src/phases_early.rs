@@ -17096,8 +17096,24 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 7, Value::Object(None));
             ctx.set_field(this, 8, Value::Object(None));
             ctx.set_field(this, 9, Value::Long(0));
-            ctx.set_field(this, 10, Value::Int(0));
             ctx.set_field(this, 11, Value::Object(None));
+            // Real JDK's ctor stamps the constructing thread's id
+            // (Thread.currentThread().threadId()) into threadID/longThreadID.
+            // Leaving them 0 fed 0 to ThreadMXBean.getThreadInfo(long) from
+            // Tomcat JULI's OneLineFormatter, which rejects non-positive ids
+            // ("Invalid thread ID parameter") on EVERY AsyncFileHandler
+            // format. The mirror lookup below may allocate, so keep `this`
+            // pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let tid = crate::current_java_thread_tid(ctx);
+            let this = ctx.read_native_pin(this_pin, this);
+            let short_tid = crate::short_thread_id(tid);
+            // Slot 10 is the synthetic layout's threadID; the by-name writes
+            // land on the real-JDK layout's threadID/longThreadID fields.
+            ctx.set_field(this, 10, Value::Int(short_tid));
+            ctx.set_field_by_name(this, "threadID", Value::Int(short_tid));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(None)))
         },
     );
