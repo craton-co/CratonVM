@@ -69,7 +69,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\elasticsearch-suite
 | `-Start` | integer >= 1 | `1` | 1-based start index within the selected category. |
 | `-Count` | integer >= 0 | `0` | Number of classes to run; `0` means through the end. |
 | `-Parallel` | integer >= 1 | `1` | Concurrent class processes per mode. |
-| `-TimeoutSec` | integer >= 1 | `120` | Per-class timeout. Timeout status is `HANG`. |
+| `-TimeoutSec` | integer >= 1 | `120` | Normal per-class timeout. Timeout status is `HANG`. |
+| `-KnownSlowClassTimeoutSec` | integer >= 1 | `300` | CratonVM timeout floor for the two known finite-but-slow HNSW-bit classes. |
 | `-RunName` | string | timestamp | Result directory name. |
 | `-ElasticsearchRoot` | path | `C:\craton\CratonVM\apps\elasticsearch` | Elasticsearch checkout to run. |
 | `-WorkDir` | path | `apps\elasticsearch-suite-runner\.suite` | Generated lists, results, logs, baselines. |
@@ -186,6 +187,14 @@ Status values:
 - `CRASH`: fatal signal, panic, access violation, or non-JUnit process exit.
 - `NOCP`: module classpath file was missing.
 - `NOSUMMARY`: no JUnit signal and no crash fingerprint.
+
+The runner gives only `ES815HnswBitVectorsFormatTests` and
+`ES93HnswBitVectorsFormatTests` a CratonVM-specific timeout floor (300 seconds
+by default). They build HNSW graphs and have been verified to make continuous
+forward progress, but can exceed 120 seconds when the host is contended. The
+normal timeout still applies to all other classes; set
+`-KnownSlowClassTimeoutSec` to tune this narrow allowance for a particular
+host.
 
 Runs are resumable. Existing rows in `results.tsv` are skipped when rerunning
 the same `-RunName` and mode.
