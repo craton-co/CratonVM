@@ -176,23 +176,54 @@ This document tracks the **genuine remaining failures**.
     Family (b) was NOT separately root-caused — fixing family (a) made it disappear too on this
     class, most likely because mockk's `JvmSignatureValueGenerator.instantiate()` (decompiled from
     `mockk-jvm-1.14.5.jar`, `io/mockk/impl/recording/JvmSignatureValueGenerator.class` — the exact
-    class flagged as the prime suspect in the `RestClientExtensionsTests` residual writeup below)
+    class flagged as the prime suspect in the `RestClientExtensionsTests` entry below)
     shares the identical `sealedSubclasses`/`getPermittedSubclasses0()` code path for dummy-value
     generation during argument-signature detection, and some earlier-executing method on the same
     mock's declared surface (e.g. `ResponseSpec#onStatus(Predicate<HttpStatusCode>, ...)`) was
     likely throwing/corrupting mockk's internal signature-detection state before the later PTR-arg
-    calls were ever reached. **Not independently reconfirmed against `RestClientExtensionsTests`**
-    itself — that class's Kotlin test sources aren't currently compiled/testcp'd on the Azure host,
-    and building a fresh spring-web test module was out of scope this session given host disk/load
-    pressure (load average briefly exceeded 120 mid-session; see
-    `azure-host-disk-full-flapping-20260715`). Given the identical symptom shape and shared
-    mechanism, re-verifying `RestClientExtensionsTests` against this fix is a strong, low-effort
-    next step for whoever picks it up next — likely fixed or substantially improved, but unverified
-    as of this writing.
+    calls were ever reached. **Independently reconfirmed against `RestClientExtensionsTests` on
+    2026-07-17 — also FIXED**, same mechanism; see the dedicated entry immediately below for the
+    full re-verification writeup.
   *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
     hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
     (`java.io.tmpdir` honoring).
+*   **mockk `verify{}` matcher failures on `ParameterizedTypeReference`-typed args** (`web.client.RestClientExtensionsTests`) — **FIXED, independently reconfirmed 2026-07-17**
+  *   **Original status (through 2026-07-16, see [[restclientextensions-mockk-verify-ptr-residual]]
+    for the full original investigation)**: all 5 tests failed with
+    `io.mockk.MockKException: Can't instantiate proxy for class RestClient$RequestBodySpec`
+    (`AnnotatedTypeFactory$AnnotatedTypeBaseImpl.getAnnotatedOwnerType()` NPE, `location` null); this
+    was fixed by the unrelated AnnotatedType location seed (dev `3ee5ffaf`,
+    `annotated_type_fill_bookkeeping`), taking the class from 0/5 to 2/5. The residual 3/5
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) was
+    `java.lang.AssertionError: Verification failed ... body(eq(ParameterizedTypeReference<List<?
+    extends Foo>>)) ... arguments are not matching`, with the recorded arg and the verify matcher
+    rendering IDENTICALLY yet mockk's `eq` (`.equals`-based) reporting no match. Two hypotheses
+    (Type-equality bug, identity-hashCode magnitude) were both ruled out by standalone kotlinc
+    repros; remaining suspicion landed on mockk's `JvmSignatureValueGenerator`/`sealedSubclasses`
+    dummy-value-generation path (same class flagged in the `WebClientExtensionsTests` entry above),
+    but this was never pinned down to a CratonVM source line before this session.
+  *   **2026-07-17 reconfirmation**: built a fresh `dev`-tip worktree
+    (`/data/data/wt-restclientext-confirm-20260717`, branch `confirm/restclientext-20260717`, tip
+    `08808a57`, which contains `ce6bf419` — the `Class.getPermittedSubclasses0()` loader-aware-resolution
+    fix documented in the `WebClientExtensionsTests` entry above). `spring-web`'s Kotlin test sources
+    weren't previously compiled/testcp'd on this host, so they were built fresh via Gradle
+    (`/data/data/spring-framework-recheck` checkout, `:spring-web:testClasses`, JDK25
+    (`/home/victor/jdk25`, the system `/usr/bin/java` is a JRE-only OpenJDK21 install with no
+    `javac`), a private `GRADLE_USER_HOME` (`/data/tmp/gradle-home-restclientext-20260717`, seeded
+    from an existing cache then topped up online for a handful of newer Jackson/rsocket artifacts
+    not yet cached) to avoid colliding with other concurrent sessions' Gradle daemons/caches on this
+    host). Ran the real `org.springframework.web.client.RestClientExtensionsTests` class via the
+    standard `KRun` JUnit5-Launcher driver against the generated `spring-web` test runtime classpath
+    (205 entries) on the fresh binary. **Result: `found=5 succ=5 fail=0` — all 5 tests pass**,
+    reproduced identically across 4 consecutive runs (no flakiness). This is up from the previously
+    documented 2/5; the 3 previously-failing `verify{}`-matcher tests
+    (`RequestBodySpec#body`, `ResponseSpec#toEntity`, `ResponseSpec#requiredBody`) now all pass.
+  *   **Conclusion**: confirms the fixing agent's hypothesis for `WebClientExtensionsTests` — both
+    classes' `verify{}` matcher failures were the same root cause
+    (`JvmSignatureValueGenerator.instantiate()`'s `sealedSubclasses`/`getPermittedSubclasses0()`
+    dummy-value-generation path), and `ce6bf419` fixes both. **Status: FIXED, no further action
+    needed for this class.**
 *   **`@Import` attribute CCE across `@CompileWithForkedClassLoader`** (`web.service.registry.ImportHttpServiceRegistrarTests`)
   *   **Status**: **FIXED** (2026-07-16, `resolve_field_ref_loader_aware` — see the "2026-07-16 update #2" section below for full verification). The original `ClassCastException: java.lang.Class cannot be cast to [Ljava.lang.String;` at `ConfigurationClassParser$SourceClass.getAnnotationAttributes:1119` no longer reproduces. The class still does not reach 5/5 OK — the remaining 2/5 fail on an unrelated, pre-existing, documented host-environment gap (`java.lang.classfile.ClassFile` needs JDK24+; this host only has JDK17/21).
   *   **2026-07-16/17 addendum (independent parallel investigation, unresolved flag for follow-up)**: a separate session investigating this same bug (before discovering this fix had already landed) built and stress-tested an equivalent re-entrant fix and additionally ran a memory/RSS stress check that the verification above did not cover: a single larger, loader-heavy AOT-cluster class (`BeanDefinitionMethodGeneratorTests` alone, real in-process javac, 34 test methods) grew the VM process's RSS past 4GB and was OOM-killed by the kernel (`sudo dmesg`: "Out of memory: Killed process ... (cratonvm-fieldr) total-vm:8856216kB anon-rss:4063936kB"), and the flagship repro itself ran roughly 60-100x slower than baseline (2.2s to 135-280s across runs) with an equivalent fix applied. This happened on a host that was ALSO under severe, independent, confirmed disk-full/memory pressure at the time (dmesg shows an unrelated `rustc` process OOM-killed in the same general window; both `/dev/root` and `/data/data`'s backing volume were at or near 100% full) — so it is NOT conclusively proven this fix specifically causes unbounded memory growth outside that already-degraded environment. This session's own attempt to re-verify directly against this exact landed commit was itself blocked by the same disk-full condition recurring (`cargo build` failing with "No space left on device" mid-archive-write) before it could be settled either way. Recorded here, unresolved, as a flag for follow-up: re-run the same stress scenario (a single heavy, loader-forking AOT test class, watching peak RSS over the whole run, not just pass/fail) on a host with real headroom before treating this fix as fully hardened for broad, unattended CI use.
