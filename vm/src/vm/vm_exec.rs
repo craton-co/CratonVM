@@ -3180,6 +3180,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        // DIAGNOSTIC-ONLY (cceres3): a handle past the pin stack means some
+        // callee truncated below this caller's pins (pin-stack imbalance) —
+        // the silent `unwrap_or(fallback)` then hands back the RAW address,
+        // which is stale if a GC ran since the pin. Name the reader loudly
+        // under the flag; the culprit truncator is inside its call subtree.
+        if handle != usize::MAX && handle >= self.thread.native_pin_roots.len() {
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-DANGLING tid={} handle={} len={} reader:\n{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
         self.thread
             .native_pin_roots
             .get(handle)
