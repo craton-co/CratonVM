@@ -14427,6 +14427,41 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => Some(*r),
         _ => None,
     };
+    // cceres3 (SE_005 store-canary capture: native_stream_concat ->
+    // make_stream -> set_array_element stored an already-evacuated element):
+    // BOTH drains below run arbitrary Java (a real pipeline's spliterator),
+    // and `make_stream`/`alloc_ref_array` allocate — every raw local here
+    // spans GC-capable calls. Pin the two stream heads for the whole native,
+    // pin A's drained elements across B's drain and re-read them through the
+    // pins before combining, and redo the close-handler merge with the same
+    // discipline (its reads spanned B's drain and its stores spanned a fresh
+    // allocation).
+    let first_pin = match (a_ref, b_ref) {
+        (Some(a), _) => {
+            let p = ctx.pin_native_root(a);
+            if let Some(b) = b_ref {
+                ctx.pin_native_root(b);
+            }
+            Some((p, p, p + if b_ref.is_some() { 1 } else { 0 }))
+        }
+        (None, Some(b)) => {
+            let p = ctx.pin_native_root(b);
+            Some((p, usize::MAX, p))
+        }
+        (None, None) => None,
+    };
+    let (unpin_base, a_pin, b_pin) = match first_pin {
+        Some((base, ap, bp)) => (Some(base), ap, bp),
+        None => (None, usize::MAX, usize::MAX),
+    };
+    macro_rules! bail {
+        ($e:expr) => {{
+            if let Some(base) = unpin_base {
+                ctx.unpin_native_roots(base);
+            }
+            return Err($e);
+        }};
+    }
     // (Sequential `&mut` borrows — `stream_elements` is now `&mut`, so avoid the
     // closure form which would capture `ctx` mutably twice.)
     //
@@ -14434,22 +14469,57 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // `stream_elements_concat_bounded`) — `concat` is the one native that
     // must tolerate an unbounded/infinite real-pipeline operand.
     let a = match a_ref {
-        Some(r) => stream_elements_concat_bounded(ctx, r)?,
+        Some(r) => {
+            let r = ctx.read_native_pin(a_pin, r);
+            match stream_elements_concat_bounded(ctx, r) {
+                Ok(v) => v,
+                Err(e) => bail!(e),
+            }
+        }
         None => Vec::new(),
     };
+    // Pin A's elements across B's drain, then re-read them through the pins.
+    let (a_elem_base, a_handles) = pin_value_slice(ctx, &a);
     let b = match b_ref {
-        Some(r) => stream_elements_concat_bounded(ctx, r)?,
+        Some(r) => {
+            let r = ctx.read_native_pin(b_pin, r);
+            match stream_elements_concat_bounded(ctx, r) {
+                Ok(v) => v,
+                Err(e) => {
+                    if a_elem_base != usize::MAX {
+                        ctx.unpin_native_roots(a_elem_base);
+                    }
+                    bail!(e)
+                }
+            }
+        }
         None => Vec::new(),
     };
-    let mut combined = a;
+    let mut combined: Vec<Value> = a
+        .iter()
+        .enumerate()
+        .map(|(i, v)| read_pinned_elem(ctx, a_handles[i], *v))
+        .collect();
     combined.extend(b);
-    let r = make_stream(ctx, &combined)?;
-    if let Some(Value::Object(Some(dst))) = &r {
+    if a_elem_base != usize::MAX {
+        ctx.unpin_native_roots(a_elem_base);
+    }
+    // `make_stream` pins `combined` itself at entry; nothing GC-capable runs
+    // between the unpin above and that entry.
+    let r = match make_stream(ctx, &combined) {
+        Ok(r) => r,
+        Err(e) => bail!(e),
+    };
+    let r = if let Some(Value::Object(Some(dst))) = &r {
         // JDK contract: closing the concatenated stream closes BOTH inputs.
         // Only merge handlers from synthetic inputs (a foreign Stream impl keeps
         // unrelated data in field 1; its own close() owns its handlers).
+        let mut dst = *dst;
+        let dst_pin = ctx.pin_native_root(dst);
         let mut handlers: Vec<Value> = Vec::new();
-        for src in [a_ref, b_ref].into_iter().flatten() {
+        for (src, pin) in [(a_ref, a_pin), (b_ref, b_pin)] {
+            let Some(src) = src else { continue };
+            let src = ctx.read_native_pin(pin, src);
             let cn = ctx
                 .class_name_of_id(ctx.class_id_of_object(src))
                 .unwrap_or_default();
@@ -14468,12 +14538,26 @@ fn native_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
         if !handlers.is_empty() {
+            let (h_base, h_handles) = pin_value_slice(ctx, &handlers);
             let arr = alloc_ref_array(ctx, handlers.len());
+            let arr_pin = ctx.pin_native_root(arr);
             for (i, h) in handlers.iter().enumerate() {
-                ctx.set_array_element(arr, i, *h);
+                let arr = ctx.read_native_pin(arr_pin, arr);
+                let h = read_pinned_elem(ctx, h_handles[i], *h);
+                ctx.set_array_element(arr, i, h);
             }
-            ctx.set_field(*dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
+            dst = ctx.read_native_pin(dst_pin, dst);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(dst, STREAM_FIELD_CLOSE_HANDLERS, Value::Object(Some(arr)));
+            let _ = h_base;
         }
+        let dst = ctx.read_native_pin(dst_pin, dst);
+        Some(Value::Object(Some(dst)))
+    } else {
+        r
+    };
+    if let Some(base) = unpin_base {
+        ctx.unpin_native_roots(base);
     }
     Ok(r)
 }
