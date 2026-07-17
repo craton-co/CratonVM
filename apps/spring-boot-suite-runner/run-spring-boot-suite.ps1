@@ -584,7 +584,15 @@ function New-ProcessRecord {
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
+    # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
+    # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
+    # websocket -- reflective field reset in their web-server test fixtures). This
+    # runner launches SbRunner directly instead of through Gradle's test task, so
+    # none of those per-module jvmArgs apply; without it those classes fail with
+    # "IllegalStateException: Unable to reset field" on real HotSpot too, which is
+    # a harness gap, not a genuine VM behavior difference. Apply it universally --
+    # opens are additive and harmless for modules that don't need it.
+    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '--add-opens=java.base/java.net=ALL-UNNAMED')
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') { $args += @('-jar', $LaunchSpec.value, $class) }
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }
