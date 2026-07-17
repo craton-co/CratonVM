@@ -240,6 +240,36 @@ pub fn update_all_roots(
         }
     }
 
+    // DIAGNOSTIC-ONLY (cceres3): initiator-side counterpart of the
+    // ARRIVE-STALE / WAKE-STALE frame verifiers.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let crate::types::Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Stage 3 (precise oop maps) — relocate oop slots of active JIT frames on
     // this thread, the JIT analogue of the interpreter-frame remap above. Inert
     // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);

@@ -1572,13 +1572,95 @@ impl GenerationalHeap {
             } else {
                 (u32::MAX, "<null-forward>".to_string())
             };
+            // DIAGNOSTIC-ONLY (cceres2, 2026-07-16): before dying, name every
+            // heap slot that STILL holds the stale (old) address. A holder in
+            // OLD gen indicts the old->young scan/remap (card path) for that
+            // slot's store site; NO heap holder means the stale copy lived
+            // only in a frame/register/native local (root-remap gap). Card
+            // state is printed as-of-panic (the GC consumes dirty bits, so
+            // false here does NOT prove the card was clean at GC time).
+            let stale_usize = obj_ref.as_ptr() as usize;
+            let mut holders = String::new();
+            let mut holder_n = 0usize;
+            {
+                use std::fmt::Write as _;
+                if let Some(old) = self.old_gen.try_lock() {
+                    let card_base = self.card_table.base_addr();
+                    'oldscan: for (optr, _sz) in old.walk_objects() {
+                        // SAFETY: walk_objects yields valid object starts.
+                        let oh = unsafe { &*(optr as *const ObjectHeader) };
+                        let mut hits: Vec<usize> = Vec::new();
+                        // SAFETY: header/object pair valid for the walk.
+                        unsafe {
+                            for_each_ref_slot(optr, oh, |raw, idx| {
+                                if raw as usize == stale_usize {
+                                    hits.push(idx);
+                                }
+                            });
+                        }
+                        for idx in hits {
+                            let cidx = (optr as usize).saturating_sub(card_base)
+                                / crate::card_table::CARD_SIZE;
+                            let _ = write!(
+                                holders,
+                                "\n  OLD holder {:p} class_id={} kind={:?} slot={} card_dirty_now={}",
+                                optr,
+                                oh.class_id.as_u32(),
+                                oh.kind,
+                                idx,
+                                self.card_table.is_dirty(cidx),
+                            );
+                            holder_n += 1;
+                            if holder_n >= 16 {
+                                break 'oldscan;
+                            }
+                        }
+                    }
+                } else {
+                    let _ = write!(holders, "\n  (old_gen lock busy — old holders not scanned)");
+                }
+                // Young from-space: lock-free raw word scan over the published
+                // region bounds (object-walk under mutation is not crash-safe).
+                let yf_base = self.region_bounds[0].0.load(Ordering::Acquire);
+                let yf_end = self.region_bounds[0].1.load(Ordering::Acquire);
+                if yf_base != 0 && yf_end > yf_base && holder_n < 16 {
+                    let mut addr = yf_base;
+                    while addr + 8 <= yf_end {
+                        // SAFETY: [yf_base, yf_end) is a mapped arena range.
+                        let w: u64 = unsafe { std::ptr::read_volatile(addr as *const u64) };
+                        if w as usize == stale_usize {
+                            let _ = write!(
+                                holders,
+                                "\n  YOUNG word 0x{addr:x} (from-space offset 0x{:x}) still holds the stale address",
+                                addr - yf_base,
+                            );
+                            holder_n += 1;
+                            if holder_n >= 16 {
+                                break;
+                            }
+                        }
+                        addr += 8;
+                    }
+                }
+                if holder_n == 0 {
+                    let _ = write!(
+                        holders,
+                        "\n  NO heap holder found — the stale copy lived only in a \
+                         frame/register/native local (root-remap gap), or its holder \
+                         was itself already collected",
+                    );
+                }
+            }
+            crate::stale_objref_debug::LAST_STALE_ADDR
+                .store(obj_ref.as_ptr() as usize, Ordering::Release);
             panic!(
                 "CRATONVM_DBG_STALE_OBJREF: stale ObjectRef detected at {:p} — this \
                  object was evacuated by a moving GC to {:p} (class_id={fwd_class_id} \
                  kind={fwd_kind}), but native/interpreter code \
                  dereferenced the OLD address. This means a raw ObjectRef local was held \
                  across a GC-triggering call without pin_native_root/read_native_pin. See \
-                 docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.",
+                 docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.\
+                 \nHolder scan:{holders}",
                 obj_ref.as_ptr(),
                 fwd_ptr,
             );
@@ -1830,6 +1912,25 @@ impl GenerationalHeap {
     /// "suspected false roots" whose computed extent runs off the end of the
     /// from-space arena, so the worst case is over-retention rather than a
     /// deref of garbage.
+    /// DIAGNOSTIC-ONLY (cceres3): see `VmHeap::debug_forwarded_target`.
+    pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
+        if !crate::stale_objref_debug::enabled() || addr % 8 != 0 {
+            return None;
+        }
+        self.is_heap_addr(addr)?;
+        // SAFETY: `is_heap_addr` confirmed containment in a mapped arena; the
+        // quarantine ring keeps evacuated from-space readable while the
+        // canary flag is on.
+        let header = unsafe { &*(addr as *const ObjectHeader) };
+        if header.is_forwarded() {
+            let fwd = header.forwarding_address() as usize;
+            if fwd != 0 {
+                return Some(fwd);
+            }
+        }
+        None
+    }
+
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         if addr == 0 || addr & 0x7 != 0 {
             return None;

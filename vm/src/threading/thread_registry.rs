@@ -1002,7 +1002,18 @@ impl ThreadRegistry {
     pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
         let threads = self.threads.lock();
         if let Some(entry) = threads.get(&thread_id) {
-            entry.gc_block_state.fixup.lock().clear();
+            {
+                let mut f = entry.gc_block_state.fixup.lock();
+                if !f.is_empty() && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                    eprintln!(
+                        "[blockgc] native-unblock DISCARDS {} fixups tid={}",
+                        f.len(),
+                        thread_id.0,
+                    );
+                }
+                f.clear();
+            }
+            entry.gc_block_state.slot_origins.lock().clear();
             entry.root_snapshot.lock().clear();
             entry
                 .gc_block_state
@@ -1285,6 +1296,17 @@ impl ThreadRegistry {
                     // SAFETY: `new` comes from the GC pointer map and points
                     // at the relocated object's header.
                     *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+            // cceres3 FIX: advance the exact per-slot tracker through THIS
+            // collection's pointer map (see `GcBlockState::slot_origins`).
+            // Exact lookups per map — no chain keys to strand.
+            {
+                let mut origins = entry.gc_block_state.slot_origins.lock();
+                for so in origins.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&so.cur) {
+                        so.cur = new;
+                    }
                 }
             }
             if dbg && (composed > 0 || seeded > 0) {

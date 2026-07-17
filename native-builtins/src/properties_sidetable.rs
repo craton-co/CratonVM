@@ -896,7 +896,13 @@ fn chm_extra_entries(
         };
         let key_cur = ctx.read_native_pin(key_pin, key_obj);
         let kstr = ctx.read_string(key_cur);
-        ctx.unpin_native_roots(entry_pin);
+        // cceres3 (unpin-ring provenance, base=6 prev_len=9): do NOT release
+        // entry_pin here — key_pin/value_pin were pushed ABOVE it, so this
+        // truncate dropped them both and every handle stored in `pinned`
+        // dangled from this iteration on (read_native_pin then silently
+        // returned the raw, possibly-stale snapshot refs — the stale
+        // Properties pairs behind the domain sb_append/putAll captures).
+        // The end-of-function unpin(it_pin) releases the whole range.
         if let Some(ref s) = kstr {
             if skip.contains(s) {
                 if let Some((pin, _)) = value_pin {
@@ -917,7 +923,12 @@ fn chm_extra_entries(
             break;
         }
     }
-    ctx.unpin_native_roots(it_pin);
+    // cceres3 (PIN-DANGLING live capture): do NOT unpin it_pin here.
+    // `unpin_native_roots` TRUNCATES the pin stack, and every accumulated
+    // entry/key/value pin sits ABOVE it_pin — the read-back below was
+    // silently degrading to the raw, possibly-stale snapshot refs (the
+    // stale Properties pairs behind the entrySet-view / putAll captures).
+    // The single truncate after the read-back releases everything at once.
 
     let mut out = Vec::with_capacity(pinned.len());
     for entry in &pinned {
@@ -930,12 +941,8 @@ fn chm_extra_entries(
         };
         out.push((key_obj, value, entry.key_string.clone()));
     }
-    for entry in pinned {
-        if let Some((pin, _)) = entry.value_pin {
-            ctx.unpin_native_roots(pin);
-        }
-        ctx.unpin_native_roots(entry.key_pin);
-    }
+    let _ = pinned;
+    ctx.unpin_native_roots(it_pin);
     out
 }
 

@@ -43,6 +43,15 @@
 
 use std::sync::OnceLock;
 
+/// Address of the most recent stale `ObjectRef` the canary panicked on, for
+/// the interpreter's `PANIC_IN` handler to attribute against the panicking
+/// thread's own frame slots / pins / root snapshot (the holder scan in
+/// `get_header` covers the heap; this covers thread-local state, which is
+/// where a root-remap gap lives). Set immediately before the panic in
+/// `GenerationalHeap::get_header`; consumed (swapped to 0) by the handler.
+pub static LAST_STALE_ADDR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Cached `CRATONVM_DBG_STALE_OBJREF` gate. Read once per process; setting
 /// the variable after the first read has no effect (same convention as
 /// every other `CRATONVM_DBG_*` flag — see `vm/src/runtime/env_cache.rs`).
