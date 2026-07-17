@@ -1538,6 +1538,180 @@ the WRONG same-named copy. Eight fixes landed on
        requirement that a class be initialized before instantiation). Spun
        off as a follow-up task.
 
+       **2026-07-17 addendum #3 -- follow-up task closed: putstatic/new/
+       invokestatic siblings FIXED (7 sites across 4 files), one narrower
+       residual documented.** Picked up the follow-up flagged in addendum
+       #2 directly above, on the same worktree
+       (`/data/data/wt-javapoet-linewrapper-20260717`, branch
+       `fix/javapoet-linewrapper-20260717`).
+
+       **`jit_putstatic_int`/`_long`/`_float`/`_double`/`_object` -- FIXED.**
+       Confirmed real via a targeted repro (`PutstaticRepro`/`PSInit`:
+       `static void touch(boolean w, int v) { if (w) { PSInit.VALUE = v; }
+       else { dummy++; } }`, `PSInit` force-loaded-but-not-initialized via
+       `Class.forName(name, false, loader)`, `touch` tiered up to JIT via
+       ~20,000 calls on the `dummy++` arm before the one real write).
+       Fix: all five helpers now call `ensure_class_initialized_shared`
+       (via a shared `jit_putstatic_class_init_guard`) before writing.
+       Because `putstatic` is `void`-returning, the helpers were changed to
+       return `i64` (`0` normally, `i64::MIN` on a stashed `<clinit>`
+       exception) and the two `0xb3` codegen arms in `jit/src/x64.rs` gained
+       `emit_post_invoke_exception_check(b'V')` after the call --
+       structurally identical to the `getstatic`/`0xb2` fix above.
+       `set_static_shared`'s own hazard (lazily creates the class's static
+       `Vec` on first write, independent of `<clinit>` having run -- a
+       *later* `<clinit>` run would otherwise silently clobber an
+       early JIT write) makes running `<clinit>` first, not just
+       eventually, load-bearing here, not merely a JVMS technicality.
+
+       **`jit_new_object` -- FIXED.** Confirmed real via a targeted repro
+       (`NewObjectRepro`/`NCtor`: `static void touch(boolean w) { if (w) {
+       lastObj = new NCtor(); } else { dummy++; } }`, `NCtor`'s `<clinit>`
+       sets a static `TAG` its constructor reads). Buggy build: `tag=0`
+       (the constructor ran before `<clinit>`, and nothing ever re-triggers
+       it since the object already escaped into a static field). Fixed
+       build: `tag=777`. Fix: `jit_new_object` now calls
+       `ensure_class_initialized_shared` before any allocation-capacity
+       probing, returning the existing `0`/null OOM sentinel on failure --
+       the codegen's pre-existing `emit_post_alloc_oom_check()` guard
+       (already emitted after every call site of this helper) already
+       recognized that sentinel, so **no `jit/src/x64.rs` codegen change was
+       needed** for this one, unlike `getstatic`/`putstatic`. Scope note: a
+       `new` site the JIT's scalar-replacement optimizer proves
+       non-escaping elides the call to `jit_new_object` entirely (fields
+       kept in frame slots, no heap object, no helper call) and is **not**
+       covered by this fix -- flagged as a narrower residual below.
+
+       **`invokestatic` -- had the gap, FOUR separate fix sites needed.**
+       This was the one genuinely surprising part of this session: getting
+       an end-to-end repro (`InvokeStaticRepro`/`ISInit`: `ISInit.<clinit>`
+       unconditionally throws; `ISInit.compute(int)` touches none of its
+       own class's statics so it cannot "self-heal" the way an inlined
+       getstatic/putstatic would; `touch`'s rare branch calls
+       `ISInit.compute` inside a try/catch, tiered up via the always-taken
+       `dummy++` arm) to actually turn green required finding and fixing
+       **four** distinct code paths that all independently route a
+       JIT-reached `invokestatic` around class initialization -- three in
+       `vm/src/runtime/interpreter.rs`, one in `vm/src/vm/vm_exec.rs`:
+
+       1. `callee_compiler` (the closure `try_jit_upgrade_with_gate` hands
+          to `jit::try_compile` for cross-method direct calls) -- builds a
+          raw machine-code `CALL` straight into a callee's compiled entry
+          (`direct_calls` in `jit/src/lib.rs`), bypassing both the
+          interpreter's `execute_invokestatic` and the JIT dispatch
+          helper's own checked fallback. Fix: only take the direct-call
+          fast path for a `static` callee when its declaring class is
+          *already* initialized (`is_class_initialized_fast`, a lock-free
+          read of the embedded per-`Class` atomic); otherwise return `None`
+          and drop the site to the checked generic dispatch. Class-init
+          state is monotonic, so a check made once, here, at the caller's
+          compile time, is sound for the entire lifetime of the resulting
+          direct-call site.
+       2. `resolve_inline_site` -- when the JIT inlines a callee's bytecode
+          directly into the caller (`CRATONVM_JIT_MAIN_INLINE=1` for the
+          synchronous compiler, and *unconditionally* for the background
+          tiered compiler, which passes `callee_compiler = None` but always
+          wires an `inline_resolver`), there is no call boundary
+          whatsoever -- not even a raw `CALL` -- so a callee whose own body
+          never touches its class's statics (the existing "conservative
+          default: do NOT inline getstatic/putstatic-bearing callees" gate
+          only excludes the *opposite* shape) gave the JIT no code-level
+          opportunity at all to run `<clinit>`. Same fix shape: refuse to
+          admit a `static` callee for inlining unless its declaring class
+          is already initialized.
+       3. `try_jit_compile_callee_slow` -- the runtime-side counterpart of
+          (1), invoked from `jit_invoke_dispatch` (`vm/src/jit/helpers.rs`)
+          the first time a generic-dispatch `invokestatic` call site
+          actually executes and decides to eagerly compile+cache its
+          callee. Same fix shape again; on refusal, `*cache_negative` is
+          left `false` so a not-yet-initialized class doesn't get
+          permanently negative-cached (it may initialize very soon, at
+          which point this path should start succeeding).
+       4. `invoke_or_native` (`vm/src/vm/vm_exec.rs`) -- the actual root
+          cause of why the repro kept failing even after (1)-(3) were all
+          in place and correctly refusing their own fast paths: every one
+          of them falls back, one way or another, to `invoke_or_native`,
+          and its "real (non-synthetic) class" shortcut calls straight into
+          `invoke_on_class_shared` with **no** `ensure_class_initialized_shared`
+          anywhere in between -- for any class that merely happens to
+          already be *loaded* (as opposed to not-yet-loaded, which the
+          `invoke_shared` tail a few lines down handles correctly).
+          `Class.forName(name, false, loader)` (JLS-sanctioned
+          load-without-initialize -- exactly how the repro force-loads
+          `ISInit`) is the sharpest way to hit this, but any code path
+          that reaches `invoke_or_native` without its own prior check can.
+          `execute_invokestatic`/`execute_invoke_kind` (the interpreter's
+          own bytecode dispatch) both already check before ever reaching
+          `invoke_or_native`, which is exactly why the plain-interpreted
+          (`CRATONVM_DISABLE_JIT=1`) form of the repro was unaffected by
+          any of this -- masking the gap for every caller that happens to
+          check first. Fix: call `ensure_class_initialized_shared` right
+          before the `invoke_on_class_shared` shortcut. This is the
+          broadest-reaching fix of the four -- `invoke_or_native` is used
+          far beyond JIT dispatch -- but is unconditionally correct per
+          JVMS and cheap (one atomic load) once a class is initialized.
+
+       A second, related but architecturally separate gap was found and
+       fixed along the way: `has_dispatch` (`jit/src/x64.rs`,
+       `compile_with_param_slots`) did not account for
+       `static_field_info`/`new_info` at all. A compiled method whose ONLY
+       JIT-relevant content was a getstatic/putstatic/`new` site -- no
+       invoke, no direct call, no bounds check, nothing else already on
+       that trigger list -- compiled with `has_dispatch=false` and was
+       entered through `execute_jit_call`'s fast arm
+       (`vm/src/runtime/interpreter.rs`), which skips `set_jit_thread`
+       entirely. Every one of `jit_getstatic`/`jit_putstatic_*`/
+       `jit_new_object`'s new `ensure_class_initialized_shared` calls
+       depends on `jit_thread_mut()` resolving a live thread -- exactly
+       the `JIT_THREAD` TLS this flag exists to guarantee (its own doc
+       comment already names this exact failure shape: "otherwise the
+       callee's dispatch helper sees a null thread and silently returns
+       0", from the pre-existing `Character.getType` fix for
+       `direct_calls`). Without this, the putstatic/new_object repros
+       above initially reproduced the ORIGINAL bug even against the fixed
+       helpers, because the class-init check silently no-op'd on a null
+       thread. Fix: added `!compiler.static_field_info.is_empty() ||
+       !compiler.new_info.is_empty()` to the `has_dispatch` computation.
+       This is a real, previously-latent bug independent of this session's
+       other fixes -- it would equally have affected the already-landed
+       `jit_getstatic` fix for any method whose only JIT-relevant content
+       was getstatic sites, which the original verification's real-world
+       repro (`LineWrapper.append`, which also calls `flush()` via
+       `invokevirtual`) never happened to isolate.
+
+       **Verified:** all four repros above (`PutstaticRepro`, `NewObjectRepro`,
+       `InvokeStaticRepro`, plus a `GetstaticInvokestaticRepro` sanity check
+       confirming the already-landed `getstatic` fix is unaffected) pass
+       consistently across 3 reruns each against a from-scratch rebuild.
+       The original `LineWrapper$FlushType` repro (`MRun` against
+       `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithBasicTests`)
+       was re-run against the final binary and still reaches the same
+       distinct, unrelated, pre-existing QDox parser NPE noted in addendum
+       #2 -- confirming no regression. Regression-checked against a
+       from-scratch build: `cargo test -p cratonvm-jit --lib --release`
+       906/0 (0 failed) -- unchanged; `cargo test -p cratonvm-vm --lib
+       --release` 2201 passed/16 failed -- the same 16 pre-existing
+       `lock_order`/`jit::skip_list` release-mode names as addendum #2's
+       baseline, unchanged; `cargo test -p cratonvm-native-builtins --lib
+       --release` 3000 passed/0 failed, 6 ignored -- unchanged. Perf
+       spot-check: a tight 20M-iteration `new` + `putstatic` hot loop
+       (steady-state, both classes already initialized, so every added
+       `ensure_class_initialized_shared` call is on its already-initialized
+       fast path) measured ~32.4s on both a pre-session baseline binary and
+       the fully-fixed binary (two runs each; the fixed binary's two runs
+       bracketed the baseline's, 30.4s-34.4s vs 32.4s-32.5s) -- no
+       measurable per-call overhead added to either hot bytecode.
+
+       **Residual (not fixed this session, narrower than the above):**
+       scalar-replacement-elided `new` sites (JIT-proven non-escaping
+       objects, `jit/src/x64.rs`'s `self.scalar_replaced` map in the `0xbb`
+       codegen) never call `jit_new_object` at all -- no helper call, no
+       code-level opportunity to run `<clinit>`. Lower real-world severity
+       than the four fixed sites (scalar replacement requires the object to
+       provably never escape the compiling method, a narrow subset of all
+       `new` sites), but the same class of bug in principle. Flagged for a
+       future follow-up.
+
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~

@@ -30028,6 +30028,54 @@ fn try_jit_upgrade_with_gate(
                 store,
             )?;
             let code_attr = method.code()?;
+
+            // jit-invokestatic-clinit-gap fix (2026-07-17): JVMS §5.5
+            // requires a class be initialized before the first invocation
+            // of any of its own (not inherited) static methods -- the same
+            // trigger family as the `jit_getstatic`/`jit_putstatic_*`/
+            // `jit_new_object` fixes above, but for `invokestatic`. This
+            // closure builds a raw machine-code CALL straight to the
+            // callee's compiled entry point (`direct_calls` in
+            // `jit/src/lib.rs`), bypassing BOTH the interpreter's own
+            // `execute_invokestatic` (which calls
+            // `ensure_class_initialized_shared` unconditionally before
+            // every dispatch) and the JIT's generic fallback dispatch
+            // helper (`jit_invoke_dispatch` -> `invoke_or_native` ->
+            // `invoke_shared`, which also checks). Once a JIT-compiled
+            // caller takes this direct-call fast path for an invokestatic
+            // site, that site never routes through either checked path
+            // again -- if the callee's declaring class hadn't been
+            // initialized yet the moment this closure ran, it may never
+            // get initialized before the direct CALL first executes.
+            //
+            // A class's initialized state is monotonic per JVMS (once
+            // Initialized, it never reverts), so checking ONCE here, at
+            // compile time, is sound forever for this call site. Only take
+            // the direct-call fast path when the callee is a `static`
+            // method (the actual JVMS trigger -- `invokespecial`'s
+            // `<init>`/private/super calls reach this same closure but
+            // don't independently require class init, since their
+            // receiver's class was already initialized via `new`) AND its
+            // declaring class is ALREADY initialized. Otherwise return
+            // `None`, which drops the call site to the generic dispatch
+            // fallback (`jit_invoke_dispatch`) -- correctness-safe (that
+            // path checks), just not the fast path for this one call site
+            // until a future recompile (e.g. after the class initializes
+            // and the caller tiers up again). `is_class_initialized_fast`
+            // reads the embedded per-`Class` atomic directly with no extra
+            // lock -- `cm`'s read guard above (borrowed by `store`) is
+            // still live here -- mirroring
+            // `ensure_class_initialized_shared`'s own fast path.
+            if method.is_static() {
+                let declaring_class_initialized = store
+                    .get(declaring_id)
+                    .map(crate::vm::is_class_initialized_fast)
+                    .unwrap_or(false);
+                if !declaring_class_initialized {
+                    return None;
+                }
+            }
+
             let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
             let source_file = store
                 .get(declaring_id)
@@ -30796,6 +30844,37 @@ fn try_jit_compile_callee_slow(
         store,
     )?;
     let code_attr = method.code()?;
+    // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
+    // same gap as the `callee_compiler` (compile-time direct_calls) and
+    // `resolve_inline_site` (inlining) closures above -- this is the
+    // RUNTIME-side counterpart, invoked from `jit_invoke_dispatch`
+    // (`vm/src/jit/helpers.rs`) via `try_compile_callee` the first time a
+    // generic-dispatch invokestatic call site actually executes. On success
+    // this function's `(entry_ptr, needs_context)` gets cached into
+    // `jit_cache` and, per `jit_invoke_dispatch`'s own comment two call
+    // sites down, invoked via `invoke_or_native`/a direct call -- NOT
+    // through `invoke_shared`'s `ensure_class_initialized_shared` call.
+    // Same JVMS SS5.5 requirement, same fix: refuse to hand back a compiled
+    // entry for a `static` method whose declaring class isn't initialized
+    // yet, forcing this call (this one time) through the always-safe
+    // `invoke_or_native` fallback that jit_invoke_dispatch uses when this
+    // function returns `None`. Monotonic init state makes a compile-time
+    // (well, first-dispatch-time) check here sound for the cached entry's
+    // entire remaining lifetime, exactly like the other two sites.
+    if method.is_static() {
+        let declaring_class_initialized = store
+            .get(declaring_id)
+            .map(crate::vm::is_class_initialized_fast)
+            .unwrap_or(false);
+        if !declaring_class_initialized {
+            // Not yet initialized: don't cache a negative result either --
+            // the class may initialize very soon (e.g. the very next
+            // dispatch through the safe fallback), at which point this
+            // function should succeed and start caching the fast entry.
+            *cache_negative = false;
+            return None;
+        }
+    }
     let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
     // FJP fix (CORRECTED) case (2): the resolved method is INHERITED from a
     // class that has a Rust native override (e.g. `ForkJoinTask.fork()` reached
@@ -31689,6 +31768,35 @@ fn resolve_inline_site(
         return None;
     }
     let is_static = method.is_static();
+    // jit-inline-clinit-gap fix (2026-07-17): inlining a static method's
+    // bytecode splices it directly into the caller with NO call boundary at
+    // all -- not even the `direct_calls` raw CALL that `callee_compiler`
+    // (this file, the sibling closure guarding `direct_calls`) gates on
+    // class-init state. A callee whose OWN body never touches its class's
+    // statics (no getstatic/putstatic/new of its own -- the existing
+    // "conservative default: do NOT inline getstatic/putstatic-bearing
+    // callees" gate a few lines below only excludes the OPPOSITE shape)
+    // gives the JIT no code-level opportunity whatsoever to run `<clinit>`
+    // before the inlined body executes, silently violating the same JVMS
+    // §5.5 "class must be initialized before first invocation of any of its
+    // static methods" requirement `callee_compiler`'s gate enforces for the
+    // direct-call path. A class's initialized state is monotonic (JVMS:
+    // once Initialized, always Initialized), so -- exactly like
+    // `callee_compiler`'s check -- checking ONCE, here, at inline-planning
+    // time is sound forever for this call site: only admit a static
+    // callee for inlining when its declaring class is ALREADY initialized;
+    // otherwise return `None`, which drops the site to the ordinary
+    // dispatch/direct-call resolution below (both of which independently
+    // enforce initialization). `cm`'s read guard is still live here.
+    if is_static {
+        let declaring_class_initialized = store
+            .get(declaring_id)
+            .map(crate::vm::is_class_initialized_fast)
+            .unwrap_or(false);
+        if !declaring_class_initialized {
+            return None;
+        }
+    }
     let callee_max_locals = code_attr.max_locals as usize; // Widening: u16 to usize
     let code_bytes = code_attr.code.clone();
 
