@@ -346,16 +346,21 @@ function Get-RowStatus($Row) {
 # gradlew invocation helper
 # ---------------------------------------------------------------------------
 function Invoke-Gradlew {
-  param([string]$Gradlew, [string[]]$Args)
+  param([string]$Gradlew, [string[]]$GradleArgs)
   # Windows PowerShell 5.1 wraps ANY stderr line from a native process as a
   # terminating NativeCommandError while $ErrorActionPreference = 'Stop' is in
   # effect, even on exit code 0 (Gradle routinely logs benign warnings to
   # stderr). Temporarily relax to 'Continue' and check $LASTEXITCODE instead
   # (same pattern as the tomcat-suite-runner's Invoke-Setup).
+  # NOTE: parameter deliberately NOT named $Args -- that collides with
+  # PowerShell's automatic $args variable and silently corrupts the splat
+  # (gradlew received zero args, defaulted to the `help` task against the
+  # wrong project dir, every "Setup" run up to 2026-07-17 was silently
+  # discovering 0 classes / regenerating no classpaths despite exit 0).
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    & $Gradlew @Args 2>&1 | ForEach-Object { Write-Host $_ }
+    & $Gradlew @GradleArgs 2>&1 | ForEach-Object { Write-Host $_ }
     return $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prevEAP
@@ -377,10 +382,10 @@ function Invoke-GradleSetup {
     $dir = Join-Path $script:SpringBootDir $subtree
     if (-not (Test-Path $dir)) { Write-Info "skip missing subtree: $subtree"; continue }
     Write-Info "gradlew -p $subtree testClasses"
-    $rc = Invoke-Gradlew -Gradlew $gradlew -Args @('-p', $subtree, 'testClasses', '--no-daemon', '--continue')
+    $rc = Invoke-Gradlew -Gradlew $gradlew -GradleArgs @('-p', $dir, 'testClasses', '--no-daemon', '--continue')
     if ($rc -ne 0) { Write-Info "WARNING: testClasses had failures in $subtree (continuing; some modules may be env-gated)" }
     Write-Info "gradlew -p $subtree cratonvmTestCp"
-    $rc = Invoke-Gradlew -Gradlew $gradlew -Args @('-p', $subtree, 'cratonvmTestCp', '--init-script', $initScript, '--no-daemon', '--continue')
+    $rc = Invoke-Gradlew -Gradlew $gradlew -GradleArgs @('-p', $dir, 'cratonvmTestCp', '--init-script', $initScript, '--no-daemon', '--continue')
     if ($rc -ne 0) { Write-Info "WARNING: cratonvmTestCp had failures in $subtree" }
   }
   Build-ClassLists
@@ -489,7 +494,7 @@ function Get-ModuleClasspathEntries {
     $initScript = Join-Path $script:SpringBootDir 'cratonvm-test-cp.init.gradle'
     $projPath = ':' + ($Module -replace '/', ':')
     Write-Info "refreshing classpath for $Module"
-    Invoke-Gradlew -Gradlew $gradlew -Args @("${projPath}:cratonvmTestCp", '--init-script', $initScript, '--no-daemon', '--continue') | Out-Null
+    Invoke-Gradlew -Gradlew $gradlew -GradleArgs @("${projPath}:cratonvmTestCp", '--init-script', $initScript, '--no-daemon', '--continue') | Out-Null
   }
   if (-not (Test-Path $cpFile)) { Die "missing classpath file: $cpFile (run -Setup or -RefreshClasspaths first)" }
 
@@ -579,7 +584,15 @@ function New-ProcessRecord {
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true')
+    # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
+    # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
+    # websocket -- reflective field reset in their web-server test fixtures). This
+    # runner launches SbRunner directly instead of through Gradle's test task, so
+    # none of those per-module jvmArgs apply; without it those classes fail with
+    # "IllegalStateException: Unable to reset field" on real HotSpot too, which is
+    # a harness gap, not a genuine VM behavior difference. Apply it universally --
+    # opens are additive and harmless for modules that don't need it.
+    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '--add-opens=java.base/java.net=ALL-UNNAMED')
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') { $args += @('-jar', $LaunchSpec.value, $class) }
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }

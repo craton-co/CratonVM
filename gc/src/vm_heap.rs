@@ -506,6 +506,20 @@ impl VmHeap {
         }
     }
 
+    /// DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_BLOCKGC frame-desync hunt): if
+    /// `addr` is a heap address whose header is a forwarding marker (an
+    /// already-evacuated old address kept readable by the stale-objref
+    /// quarantine ring), return the forwarded (new) address. `None` when the
+    /// stale-objref canary is off, the address is outside the heap, or the
+    /// header is a live header. Generational backend only — the others never
+    /// quarantine old addresses.
+    pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
+        match self {
+            VmHeap::Generational(h) => h.debug_forwarded_target(addr),
+            _ => None,
+        }
+    }
+
     /// Loose validity check: alignment + heap-region containment.
     ///
     /// Unlike [`Self::is_object_address`] this does NOT read the object

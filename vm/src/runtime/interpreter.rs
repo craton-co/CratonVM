@@ -2529,6 +2529,92 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
 }
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
+    // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
+    // native returned without `check_post_block_gc` (unpaired exit), this
+    // thread is running with an unconsumed fixup chain / slot-origin set —
+    // its frames still hold from-space addresses from every GC it slept
+    // through. Apply them here, at the first safepoint publish, before this
+    // thread's stale refs can leak into reachable object graphs.
+    {
+        let pending = !thread.gc_block_state.fixup.lock().is_empty()
+            || thread
+                .gc_block_state
+                .slot_origins
+                .lock()
+                .iter()
+                .any(|so| so.cur != so.orig);
+        if pending {
+            let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
+            if n > 0 && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-HEAL tid={} applied {} pending fixups (leaked blocked-region exit upstream)",
+                    thread.thread_id.0, n,
+                );
+            }
+        }
+        // A raised flag at an interpreter safepoint means some raise site's
+        // exit skipped `check_post_block_gc` (the monitor_wait early-return
+        // bug class): this thread is RUNNING, yet every census still excludes
+        // it, so moving collections keep completing under its feet. Restore
+        // the invariant: wait out any in-flight pause and clear the flag
+        // (idempotent with the eventual legitimate wake, whose fixup-take
+        // then finds an empty map).
+        if thread
+            .gc_block_state
+            .in_blocked_region
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            shared.gc_barrier.leave_blocked_region_flagged(
+                thread.thread_id,
+                &thread.gc_block_state.in_blocked_region,
+            );
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-FLAG-CLEAR tid={} - in_blocked_region was raised on a running thread",
+                    thread.thread_id.0,
+                );
+            }
+        }
+    }
+    // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
+    // thread, verify no frame slot holds an already-forwarded (quarantined)
+    // address at the safepoint publish. A hit here bounds the miss window to
+    // "since the previous safepoint" on a RUNNING thread, which none of the
+    // DEPOSIT/WAKE/ARRIVE verifiers can see.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        thread_local! {
+            static LAST_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.heap.collection_count();
+        let prev = LAST_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            for (fi, fr) in thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _rs_t0 = if rootsnap_dbg_enabled() {
         Some((std::time::Instant::now(), thread.frames.len()))
     } else {
@@ -3062,6 +3148,36 @@ pub(crate) fn apply_pointer_map_to_thread(
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
+    // catches a frame slot left stale right after a safepoint-arrival remap.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
             }
         }
     }
@@ -6319,6 +6435,66 @@ pub fn execute(
                     f.max_stack,
                     msg
                 );
+            }
+            // cceres2: if this panic is the CRATONVM_DBG_STALE_OBJREF canary,
+            // attribute the stale address against THIS thread's own state —
+            // the heap-side holder scan runs in get_header; this covers the
+            // thread-local half (frame locals/stack, pins, snapshot), which
+            // is where a root-remap gap lives.
+            {
+                let stale = cratonvm_gc::stale_objref_debug::LAST_STALE_ADDR
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                if stale != 0 {
+                    let mut found = 0usize;
+                    for (fi, fr) in thread.frames.iter().enumerate() {
+                        for li in 0..fr.locals_len() {
+                            if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                                if o.as_ptr() as usize == stale {
+                                    eprintln!(
+                                        "[STALE-FRAME] frame#{fi} {}.{} pc={} local[{li}] holds stale 0x{stale:x}",
+                                        fr.class_name(), fr.method_name(), fr.pc,
+                                    );
+                                    found += 1;
+                                }
+                            }
+                        }
+                        for si in 0..fr.stack.len() {
+                            if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                                if o.as_ptr() as usize == stale {
+                                    eprintln!(
+                                        "[STALE-FRAME] frame#{fi} {}.{} pc={} stack[top-{si}] holds stale 0x{stale:x}",
+                                        fr.class_name(), fr.method_name(), fr.pc,
+                                    );
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                    for (pi, p) in thread.native_pin_roots.iter().enumerate() {
+                        if p.as_ptr() as usize == stale {
+                            eprintln!("[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}");
+                            found += 1;
+                        }
+                    }
+                    {
+                        let snap = thread.root_snapshot.lock();
+                        for (si, r) in snap.iter().enumerate() {
+                            if r.as_ptr() as usize == stale {
+                                eprintln!("[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}");
+                                found += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[STALE-FRAME] summary: {} thread-state slot(s) hold stale 0x{stale:x} (tid={}, blocked={})",
+                        found,
+                        thread.thread_id.0,
+                        thread
+                            .gc_block_state
+                            .in_blocked_region
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    );
+                }
             }
             Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::NotImplemented { feature: msg },
@@ -32466,6 +32642,24 @@ fn execute_jit_call(
     // "index out of bounds: the len is 4 but the index is 4" at the
     // pop-into-`jit_args` loop below.
     const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
+    // cceres2: never trust a separately-cached ABI flag over the compiled
+    // method's own record — a (compiled, needs_heap) pair captured at two
+    // different times can disagree after a recompile, and marshalling with
+    // the wrong flag shifts every argument by one inside the callee. See
+    // try_call_compiled_entry_reentrant for the matching guard + rationale.
+    let needs_heap = {
+        let own = compiled.needs_heap();
+        if own != needs_heap {
+            tracing::warn!(
+                "JIT ABI flag mismatch in execute_jit_call: cached needs_heap={needs_heap} \
+                 but compiled {}.{}{} says {own} — using the compiled method's own flag",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+            );
+        }
+        own
+    };
     let np = num_params as usize; // Widening: parameter count conversion
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     if np > max_java_params {
@@ -32981,6 +33175,22 @@ fn execute_jit_call_decoded(
     args_slice: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
     const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
+    // cceres2: same ABI-flag guard as execute_jit_call — the compiled
+    // method's own record wins over any separately-cached flag.
+    let needs_heap = {
+        let own = compiled.needs_heap();
+        if own != needs_heap {
+            tracing::warn!(
+                "JIT ABI flag mismatch in execute_jit_call_decoded: cached \
+                 needs_heap={needs_heap} but compiled {}.{}{} says {own} — using \
+                 the compiled method's own flag",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+            );
+        }
+        own
+    };
     let np = num_params as usize; // Widening: parameter count conversion
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
@@ -36452,11 +36662,21 @@ mod tests {
     #[test]
     fn buffered_input_stream_real_jdk_uses_its_own_bytecode() {
         let buffered = "java/io/BufferedInputStream";
+        // 995ff48c (Tomcat silent-hang scanner fix, see
+        // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md):
+        // the two read overloads are now DELIBERATELY forced to the registered
+        // native — interpreted per-byte read dispatch dominated the scanner's
+        // hot path. Everything else (ctor/mark/reset/skip/...) still runs its
+        // real-JDK bytecode so buffer/mark state stays bytecode-owned.
+        for (name, descriptor) in [("read", "()I"), ("read", "([BII)I")] {
+            assert!(
+                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} is forced native per 995ff48c"
+            );
+        }
         for (name, descriptor) in [
             ("<init>", "(Ljava/io/InputStream;)V"),
             ("<init>", "(Ljava/io/InputStream;I)V"),
-            ("read", "()I"),
-            ("read", "([BII)I"),
             ("skip", "(J)J"),
             ("available", "()I"),
             ("mark", "(I)V"),
