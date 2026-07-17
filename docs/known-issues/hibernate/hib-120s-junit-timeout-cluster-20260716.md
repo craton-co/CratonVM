@@ -378,3 +378,44 @@ class's own previously-recorded elapsed time, using the new
 `CRATONVM_DBG_TIER_ENQUEUE` diagnostic (added by the fix, in
 `jit/src/tiered.rs`) to confirm compile activity directly rather than
 inferring it from pass/fail alone.
+
+## Update 2026-07-17: `LockTest`'s "JIT compile-time tax" was actually a GC conservative-scan cost — real fix landed, worth re-checking this cluster's remaining classes against it
+
+The `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` "JIT compile-time
+tax" mechanism referenced throughout this doc has been root-caused precisely
+and **fixed** — see the `LockTest` entry in
+[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) for the
+full writeup. Short version: the actual cost was never compilation itself
+(the background compiler thread measured ~0 CPU); it was
+`vm/src/jit/conservative_roots.rs`'s `scan_active_jit_frames` conservative
+native-stack scan, which — once *any* method anywhere in the process had
+successfully published a JIT-compiled body — re-scanned the ENTIRE live
+native call stack on every single per-native-call GC root snapshot for a
+process whose interpreter recursion depth kept growing (exactly the shape
+of Hibernate/JUnit5/H2's deeply nested call chains). Fixed on `dev` at
+`f377eb69`: the scan's existing "verified clean" memo now also covers the
+case of recursing *deeper* than the last check (previously only recursing
+shallower was cheap), turning an O(current total stack depth) rescan into
+an O(incremental depth since last check) one. `LockTest`: 0/5 → 5/5 clean
+(dev tip `f377eb69`, ~7-9s each, was failing its 5s internal timeout by
+12-19s every run). Validated against `vm/benches/vm_benchmarks.rs` with no
+regression on any benchmark that exercises real interpreter/JIT/GC code.
+
+This is directly relevant to this cluster's own working hypothesis (a
+single systemic JIT/GC/native-call throughput gap): `scan_active_jit_frames`
+runs on *every* object-returning native call, not just in short one-shot
+test processes, so any of this cluster's still-open classes
+(`InsertOrderingRCATest`, `BatchTest`, and re-checks of the "resolved"
+`LiteralRenderingTest`) that publish at least one JIT compile and also have
+growing/varying interpreter recursion depth could be paying the same
+pre-fix cost. `InsertOrderingRCATest` was previously profiled (this doc's
+2026-07-17 entry above) with `CRATONVM_DBG_TIER_ENQUEUE` showing 2260
+compile enqueues at C1 — worth re-profiling with `CRATONVM_DBG_ROOTSNAP`
+against the post-`f377eb69` binary to see whether any of its remaining
+~9.7x-vs-HotSpot gap was this same mechanism rather than the "method-
+diversity-bound, can't amortize JIT compilation" architectural-gap verdict
+that session reached (that verdict was reached via a `--nojit`-is-slower
+bisection, which rules out *net* JIT-tax dominance but not a smaller
+`scan_active_jit_frames` contribution underneath it). Not re-checked this
+session (out of scope/time for the session that landed the fix) — flagged
+here for whichever session next touches this cluster.

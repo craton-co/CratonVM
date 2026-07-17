@@ -620,7 +620,7 @@ class-init-failure-mishandling explanation for the separate `ScannerTest`
 open with its own cause). Full writeup + evidence:
 [hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md](../../internal/hib-jarvisitortest-packagingtestcase-classpath-layout-NOT-A-BUG.md).
 
-## `LockTest` — real timing-sensitive assertion failure (root mechanism isolated 2026-07-16, still OPEN)
+## `LockTest` — FIXED 2026-07-17 (root cause was a GC conservative-scan cost, not JIT compilation itself)
 
 `org.hibernate.orm.test.jpa.lock.LockTest`
 
@@ -830,7 +830,145 @@ time budget allows. Filed here purely as evidence that the mechanism is
 stable across a large `dev` delta, so a future session picking this up can
 trust the existing root-cause writeup below without re-deriving it.
 
-## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
+## Update 2026-07-17 (session tasked with fixing the JIT compile-time-tax problem): FIXED — the real mechanism was never compilation cost, it was a GC conservative-scan cost gated on "any method has compiled"
+
+**Landed on `dev` at `f377eb69`** (branch `fix/hib-jit-tiering-heuristic-20260717`),
+built and validated from `dev@3dcf81e5` then rebased twice to keep up with a
+very active `dev` (final tip includes ~30 unrelated commits from concurrent
+sessions; none touched the changed file). **This entry supersedes the
+"JIT compile-time tax" framing** both this section and
+[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md)
+used for `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` since
+2026-07-16 — that framing was a reasonable inference from wall-clock
+bisection (`--nojit` / raised-threshold both "fixed" it) but the *mechanism*
+it implied (compilation itself burns CPU/wall-clock) turns out to be wrong.
+The real mechanism, found this session via direct profiling instead of
+inference:
+
+**Root cause.** `jit/src/tiered.rs`'s background compiler is genuinely
+async and lock-free on the mutator's hot path (confirmed: `/proc/<pid>/task/*/stat`
+CPU-tick sampling during a full JIT-on `LockTest` run showed the
+`cratonvm-jit-compiler` thread accumulating **~0 measured CPU ticks** despite
+340 compile-task enqueues, while `main-vm` alone accounted for essentially
+100% of wall-clock CPU — ruling out "compiling is slow" and "compiler thread
+steals cores from the mutator" as the mechanism). A `perf record`/`perf
+report` capture of the same run instead found **`cratonvm_gc::gen_heap::
+GenerationalHeap::is_object_address` (30.6%) + `cratonvm_vm::runtime::
+interpreter::update_root_snapshot` (26.0%) + `VmHeap::is_object_address`
+(9.2%) — ~66% of all CPU** — dominating, versus a combined <10% for the same
+symbols on a `--nojit` run of the identical workload.
+
+`CRATONVM_DBG_ROOTSNAP=1` pinned this precisely: `update_root_snapshot`'s
+per-call cost climbed from **~13.4us at 200k calls to ~63.8us at 400k calls**
+(same call count, `avg_frames` growing 49.9→79.3 in lockstep with the
+workload's naturally deepening interpreter recursion) on a default JIT-on
+run, while the *identical* workload under `--nojit` — or under JIT nominally
+on but with `CRATONVM_TIER_C1_THRESHOLD`/`_C2_THRESHOLD` raised so high no
+compile ever completes — stayed flat at **~1.8-2.0us for the entire run**,
+byte-for-byte matching each other. That last comparison is the key: it
+proves the cost is gated on **at least one method having successfully
+*published* a compiled body** (`cratonvm_jit::jit_code_range_count() > 0`),
+not on compilation *activity* — a class whose enqueued compiles all bail
+(skip-list, transient failure, etc.) never pays this cost at all no matter
+how many tasks get enqueued and retried (this is exactly why
+`CriteriaBuilderNonStandardFunctionsTest` no longer reproduced the failure
+even before this fix — see that entry below).
+
+Tracing into `vm/src/jit/conservative_roots.rs`'s `scan_active_jit_frames`
+(called from `update_root_snapshot` on every object-returning native call —
+see that function's own doc comments) found the exact mechanism: once
+`jit_code_range_count() > 0`, an "A5 fix" safety-net block conservatively
+scans the thread's native (Rust) call stack word-by-word for a stray return
+address into JIT-compiled code that the precise `JitEntryGuard` chain might
+have missed. A `UNREG_JIT_VERIFIED_LO` thread-local memoizes how much of
+`[search_lo, stack_high)` was already scanned clean, but **only helped when
+the current stack pointer was at or above (shallower than) the last verified
+point** — for a workload whose interpreter recursion depth keeps *growing*
+over the run's lifetime (deeply nested Hibernate/JUnit5/H2 call chains are
+exactly this shape), the memoized boundary was invalidated on almost every
+call, forcing a full linear rescan of the **entire currently-live native
+stack** (up to the 8 MiB cap in `native_stack_has_jit_frame`) on nearly
+every single root snapshot for the rest of the process's life, once any one
+method had compiled.
+
+**The fix** (`vm/src/jit/conservative_roots.rs`, in the `scan_active_jit_frames`
+block guarded by `!moving_young_enabled() && code_ranges > 0`): when
+`code_ranges` is unchanged since the last verification and the new
+`search_lo` is strictly *deeper* than the memoized `verified_lo`, only the
+new incremental band `[search_lo, verified_lo)` needs scanning — the
+once-verified `[verified_lo, stack_high)` band is provably still clean by
+the *same* invariant the existing memo already relies on ("nothing above our
+current stack pointer can change while we are nested below it"), which is
+symmetric with respect to which direction `search_lo` moved. On a clean
+incremental scan the verified boundary extends down to the new `search_lo`,
+exactly as the pre-existing shallower-or-equal case already did. Falls back
+to the original full-range scan whenever this can't be proven safe (first
+check, a shallower `search_lo`, or a new compile since the last check). The
+"found something" branch's marking scope (`scan_one_frame(search_lo, high,
+...)`) and GC-quiescence flag are byte-for-byte unchanged — only the
+*detection* scan is narrowed, never what gets conservatively marked once a
+frame is actually found.
+
+**Validation.**
+- `LockTest`: **5/5 clean passes** post-fix (dev tip `f377eb69`), consistently
+  7.0-9.3s total (vs. 0/5 pre-fix on the same tip — 4/5 failed the internal
+  5000ms timeout by 12.8-18.7s, the 5th didn't even finish inside a 90s
+  wrapper). `CRATONVM_DBG_ROOTSNAP` on the fixed binary stays flat at
+  ~1.06-1.94us/call for the entire run — as cheap as (or cheaper than)
+  `--nojit`, not just "less bad."
+- `CriteriaBuilderNonStandardFunctionsTest`: 5/5 clean both before and after
+  this fix on this dev tip (see its own entry below for why) — unaffected
+  either way by this specific class's workload, confirmed not regressed by
+  the fix.
+- `vm/src/jit/conservative_roots.rs`'s own 21 unit tests: 21/21 pass, both
+  pre- and post-rebase.
+- `jit::` module test sweep (125 tests): 118 passed either way; the same 7
+  failures (`jit::skip_list::tests::*`) reproduce byte-for-byte identically
+  on the unfixed binary too (confirmed via an explicit `git stash` A/B) —
+  pre-existing, unrelated to this fix (different file, JIT-eligibility
+  policy, not GC root scanning).
+- `vm/benches/vm_benchmarks.rs`: no regression on any benchmark that
+  actually exercises the interpreter/JIT/GC paths my fix touches
+  (`jit_hot_loop_dispatch` -14.1%, `specjvm_compiler_throughput` -6.2%,
+  `dacapo_avrora_100k_loop` -7.0%, `interpreter_fibonacci/{10,30,40}`
+  -22.5%/-13.3%/-10.7%, `shootout_binary_trees/{8,12}` -7.7%/-20.2% — all
+  "improved" per Criterion, though most of that delta is plausibly this
+  heavily-shared host settling down between runs rather than a genuine
+  effect of the fix on these particular short/tight-loop benchmarks, which
+  mostly don't run long enough to publish a JIT body inside the timed
+  window). Two benchmarks (`gc_write_barrier_lower_bound_touch_loop`,
+  `monitor_enter_exit_lower_bound_touch_loop`) showed a noisy, inconsistent
+  "regression" (+8-42% across two separate reruns) — traced to source and
+  confirmed these are explicitly-documented **placeholder** benchmarks
+  (`// Placeholder lower-bound benchmark` in `vm/benches/vm_benchmarks.rs`)
+  that call `black_box` on two pointers in a bare loop and touch *no*
+  interpreter, GC, or JIT code at all (verified by reading
+  `bench_gc_write_barrier`/`bench_monitor_enter_exit`'s source directly) —
+  structurally impossible for this fix to affect; a same-code-vs-itself
+  control rerun of the identical unfixed binary against its own saved
+  baseline showed comparable-magnitude noise (-2.5%/-7.4%) in the *opposite*
+  direction, confirming this host's nanosecond-scale measurement noise on a
+  ~250-300ns loop, not a real regression.
+- The full 4548-class Hibernate suite was **not** rerun this session (out of
+  time budget for a single-fix session) — a future session should fold this
+  fix into the next full-suite pass this repo's other sessions periodically
+  run.
+
+**Why this was missed by the earlier "JIT compile-time tax" sessions:**
+both prior sessions' bisections (`--nojit` fixes it; raising the threshold
+so nothing compiles fixes it) are *consistent* with either "compilation
+itself is the cost" or "the mere existence of one published compile flips on
+an expensive per-call GC scan" — both hypotheses predict the exact same
+bisection outcomes, since both require at least one method to actually
+compile. Distinguishing them needed the direct per-thread CPU-tick sampling
+and `perf record` profile this session ran, which neither prior session had
+time/tooling to do. The `CRATONVM_DBG_TIER_ENQUEUE` diagnostic those
+sessions added was necessary but not sufficient — it shows *enqueues*, not
+*publishes*, and (as this session's `CriteriaBuilderNonStandardFunctionsTest`
+finding below shows) a class can enqueue hundreds of compiles that all fail
+to publish and never pay this cost at all.
+
+## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, JIT-tax residual now FIXED too (2026-07-17)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
 
@@ -967,6 +1105,41 @@ should be read the same way as `LockTest`'s: the threshold raise is a real,
 validated, safe mitigation with no steady-state throughput regression, but
 it does **not** reliably fix this class's timeout either. Remains OPEN,
 tracked jointly with `LockTest` at the JIT-policy level.
+
+**Update 2026-07-17 (session that fixed `LockTest`'s JIT-tax mechanism,
+see that entry above for the full root-cause writeup): this class is now
+also RESOLVED, and the "OPEN" status above should no longer be trusted.**
+
+First, an important correction: **this class already passed reliably
+(5/5 clean, ~20-26s each) on `dev@3dcf81e5` — the base this session started
+from, *before* any code change.** `CRATONVM_DBG_TIER_ENQUEUE` showed 1695
+compile-task enqueues in a representative run, yet `CRATONVM_DBG_ROOTSNAP`
+stayed flat/cheap (~1.85-2.5us/call) for the entire run — meaning none of
+those 1695 enqueued tasks ever actually *published* a compiled body for this
+specific workload (all bailed via the skip-list or a transient failure), so
+`jit_code_range_count()` stayed 0 the whole run and the expensive
+`scan_active_jit_frames` path (see the `LockTest` entry above) never
+activated at all. This is presumably an incidental improvement from the
+cumulative reflection/GC-safety and JIT-policy fixes other sessions landed
+on `dev` between the 2026-07-16 baseline this doc's history was written
+against and `3dcf81e5` — not something traced to a single commit this
+session, and not something this session's own fix should get credit for.
+
+With this session's `scan_active_jit_frames` incremental-scan fix
+(`dev@f377eb69`) also applied: still **5/5 clean**, and modestly faster
+(12.4-16.9s vs. 13.0-26.0s pre-fix across the two sets of 5 reruns) —
+consistent with the fix being a pure win whenever it *does* activate (a
+different run of this same class, on a different day/host-load window,
+could plausibly publish at least one compile and hit the pre-fix pathology;
+this fix removes that risk going forward regardless of which specific
+methods happen to compile).
+
+**Reclassifying: no longer tracked as OPEN.** Both the original "real
+constraint violation" hypothesis (ruled out in the 2026-07-16 entry above)
+and the "JIT compile-time tax" residual (this update) are closed. If this
+class regresses again in a future full-suite run, re-open referencing this
+entry and the `LockTest` entry's root-cause writeup rather than re-deriving
+the JIT-tax bisection from scratch.
 
 ## Already-expected ABORTED entries (matches HotSpot, not a defect)
 
