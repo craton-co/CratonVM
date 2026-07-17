@@ -2157,6 +2157,155 @@ confirmation task, not an open-ended search:**
 No code change made this session (the relevant fix was found already-landed
 on `dev`, not authored here) — this is a docs-only update.
 
+## Update 2026-07-17 (A/B confirmation session): the `dbba7c93`/`b34e09cd` oop-map-safepoint fix is **REFUTED** as the fix for this bug — direct before/after comparison on two frozen, md5-verified binaries shows statistically indistinguishable ~50% failure rates on both sides. Still OPEN; root cause remains genuinely unresolved.
+
+Picked up the immediately-prior entry's own recommendation: do a direct,
+mechanical A/B using the two frozen binaries it left on the shared host —
+no rebuild needed. Verified both binaries' provenance first (worktree
+reflog + commit-date cross-check, since these are shared worktrees that can
+move under a session): `frozen-hib-biginteger-lead3-20260717/
+cratonvm-biginteger-lead3-20260717` (md5 `c4362967433ce9a308c9695cdcaa6390`)
+was built from `dev@fcefa8ca` (checked out 10:56 UTC), confirmed **not** an
+ancestor of `dbba7c93` (committed 11:19 UTC, i.e. genuinely pre-fix).
+`frozen-hib-biginteger-oopmapfix-20260717/cratonvm-oopmapfix-20260717` (md5
+`e6416207046352100f95fbfafd9b34ae`) was built from `dev@0bd8f8be` (checked
+out 12:09 UTC), confirmed to include both `dbba7c93` and `b34e09cd`
+(post-fix). Both md5s matched the prior session's own recorded values
+exactly — binaries unmodified.
+
+**Pre-fix binary: got a live crash on the very first attempt.** Ran the
+real harness driver (`CratonRunner`/`DiscoverySelectors.selectClass`,
+exactly what the suite uses) against `DefaultCatalogAndSchemaTest`,
+`CRATONVM_DBG_AIOOBE3=1 -Dcraton.trace=true`, no other stress flags:
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=66 failed=66 aborted=0 skipped=0 ms=543442
+```
+All 66 failures were the exact production signature
+(`java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for
+length 2` at `BigInteger.smallToString`/`NamingHelper.hashedName`), each
+preceded by an `[AIOOBE3-DIAG]` capture matching this saga's established
+signature exactly (`array_length_field=2 num_slots=2 forwarding_ptr=0x0`).
+A second, independent clean run gave the identical shape:
+`found=132 ok=66 failed=66`. (A third parallel attempt hit a genuine,
+severe host-memory crunch this session ran into — see the "host contention"
+note below — and was OOM-killed mid-run, logged 62 more real
+`[AIOOBE3-DIAG]` firings before termination but never reached `@@RESULT`;
+not counted as one of the two clean data points above, but consistent with
+them.)
+
+**Post-fix binary: immediately re-ran the identical recipe. It crashes at
+the same rate.**
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=64 failed=68 aborted=0 skipped=0 ms=554731
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=64 failed=68 aborted=0 skipped=0 ms=514891
+```
+Two independent, clean, uncontended, complete `selectClass` runs, both
+`found=132 ok=64 failed=68` — same count both times. Every one of the 68
+failures per run carries the byte-for-byte identical stack trace as the
+pre-fix binary and the original production bug:
+```
+java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+	at org.hibernate.boot.model.naming.NamingHelper.generateHashedConstraintName(NamingHelper.java:104)
+	...
+```
+preceded by the identical `[AIOOBE3-DIAG]` header capture shape
+(`array_length_field=2 num_slots=2 gc_age=1 gc_flags=0
+forwarding_ptr=0x0`) as every pre-fix capture. (Two further post-fix
+attempts run in parallel earlier in the session, under the same host-memory
+crunch noted below, also independently fired 20+ and 45+ real
+`[AIOOBE3-DIAG]` occurrences respectively before being OOM-killed short of
+`@@RESULT` — additional, independent confirmation beyond the two clean
+runs.)
+
+**Conclusion: pre-fix 66/132 (50.0%) and 66/132 (50.0%) vs. post-fix
+68/132 (51.5%) and 68/132 (51.5%, identical rerun) is not a meaningful
+difference — well within this bug's own long-documented run-to-run
+variance, and on the same side of "still crashes" both times.** The
+`dbba7c93`/`b34e09cd` "select exact oop map at active safepoint" fix,
+despite the previous session's mechanistically well-reasoned case for it
+(missed-root-at-nested-JIT-callee-safepoint explaining every piece of this
+saga's evidence), **does not measurably change this bug's reproduction
+rate at all.** This is a clean refutation, not another inconclusive
+non-reproduction data point — both binaries were driven with the exact
+same recipe, back-to-back, on the same host, and both crashed reliably.
+
+**What this means for the mechanism:** either (a) the previous session's
+match between the oop-map bug's mechanism and this bug's evidence trail is
+a coincidence — both bugs can independently produce a "validly-allocated,
+non-forwarded, wrong-shape array" signature, since that is simply what any
+missed-root-adjacent *or* pure-arithmetic/codegen corruption of this
+specific `int[2]` looks like from the object-header level — or (b) the
+`dbba7c93`/`b34e09cd` fix is real and necessary in general (906/906
+`cratonvm-jit` tests still pass, per the prior session) but does not cover
+the specific nested-call shape `divideMagnitude`'s calls into
+`primitiveLeftShift`/`mulsub` actually hit, for a reason not yet
+identified. This session did not have time to distinguish between these
+after the A/B result came back negative; either way, **the search for this
+bug's true root cause must continue** — the oop-map-safepoint angle should
+be considered exhausted as a candidate unless new evidence specifically
+reopens it.
+
+**Host-contention note (methodological, not a finding about the bug):**
+this session's host was, for roughly a 20-minute window while running 4
+harness processes plus another concurrent session's `rustc -C lto=fat`
+build in parallel, driven into genuine OOM-kill territory —
+`journalctl -k` confirms the kernel OOM-killer fired repeatedly (killing,
+among others, one of this session's own harness processes, another
+session's `dbus-daemon`, and another session's `java` process) during a
+window where `free -m` showed as little as 270 MB free / 809 MB available
+out of 32 GB total. This did **not** invalidate any of the four `@@RESULT`
+captures above (all four completed after the session backed off to
+strictly one process at a time), but it did truncate three additional
+attempts (one pre-fix, two post-fix) before they reached `@@RESULT` — those
+are reported above only as supporting `[AIOOBE3-DIAG]` evidence, not as
+clean pass/fail data points, consistent with this doc's own established
+practice of not counting host-contention casualties as findings about the
+code.
+
+**Recommendation for the next session:** do not re-attempt the
+`dbba7c93`/`b34e09cd` angle — it is now empirically closed, negatively.
+Every other angle this 9-session investigation has tried (`iastore` index
+arithmetic, operand-stack/frame sizing, `mulsub`/`primitiveLeftShift`
+codegen down to the instruction level, register allocation, getfield
+caching, safepoint spill, GC conservative-root scanning, the precise
+oop-map scanner) has also been ruled out with comparable rigor (see this
+section's full history above). The one thread not yet fully chased to a
+concrete faulty line: this session's own re-confirmation that
+`[AIOOBE3-DIAG]`'s header dump is always self-consistent
+(`array_length_field=2` matching the reported `length=2`,
+`forwarding_ptr=0x0`) across every capture in this investigation's history,
+on both pre- and post-oop-map-fix binaries — meaning the array header
+itself is never corrupted or stale; only the *index* (always reported as
+`2`, i.e. one past the valid end) is ever wrong. A follow-up session should
+pivot from "what corrupts the array" (repeatedly ruled out) to "why is the
+index specifically always `length`, never some other out-of-range value" —
+that specific, narrow pattern (off-by-one at the array's own boundary,
+every single time, across dozens of independent captures) has not been
+explicitly interrogated by any prior session and may be the more tractable
+next thread to pull.
+
+**Not moving this item to `docs/internal/fixed-suite-bugs/` and not
+closing this doc.** This is the opposite of this doc's hoped-for outcome
+this session: a strong, mechanistically-plausible lead was tested directly
+and empirically refuted, not confirmed. `DefaultCatalogAndSchemaTest`'s
+BigInteger AIOOBE remains the last open item in this document, still
+unresolved after 10 sessions.
+
+No code change made this session (the fix under test was already landed on
+`dev` by a different session; this session's own findings are refutational,
+not a new fix candidate) — this is a docs-only update. `git fetch origin
+dev` immediately before this edit confirmed no other session has touched
+`divideMagnitude`, `scan_one_frame_precise`, or this doc's
+`DefaultCatalogAndSchemaTest` section since the entry above was written
+(two unrelated commits landed in the interim: `2c20a877`, JIT
+putstatic/new/invokestatic class-init fix, and `a4d8d2f0`, an unrelated
+doc-link-path retarget after the 120s-timeout-cluster doc's archival — both
+confirmed not to touch this bug's code paths or this section's content).
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
