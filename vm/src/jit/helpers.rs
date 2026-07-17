@@ -3994,16 +3994,61 @@ pub unsafe extern "C" fn jit_instanceof(
 /// interpreter.  Using a thread-local flag sidesteps this platform limitation.
 // SAFETY: Called from JIT-compiled code when an array bounds check fails.
 // Only stores two i64 values in a thread-local; no pointer dereferences.
-pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
+pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
+    // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
+    // 2026-07-17, `CRATONVM_DBG_AIOOBE3`): dump the raw ObjectHeader at the
+    // pointer the JIT's bounds check actually compared against, to
+    // distinguish "array genuinely under-allocated" (header's own
+    // `array_length` field matches the reported `length`, and `forwarding_ptr`
+    // is null) from "stale/forwarded pointer" (non-null `forwarding_ptr`, or
+    // a header that doesn't look like a live long[] at all — the classic
+    // unrooted-local-across-allocating-call signature this codebase has hit
+    // repeatedly elsewhere). Best-effort raw read: the pointer came from a
+    // live JIT register moments ago, so even if stale it should still point
+    // at mapped (recycled, not unmapped) heap memory.
+    if aioobe3_dbg() {
+        if array_ptr != 0 {
+            let base = array_ptr as usize as *const u8;
+            let class_id = std::ptr::read_unaligned(base as *const u32);
+            let kind = std::ptr::read_unaligned(base.add(4) as *const u8);
+            let elem_ty = std::ptr::read_unaligned(base.add(5) as *const u8);
+            let ident_hash = std::ptr::read_unaligned(base.add(8) as *const i32);
+            let arr_len_hdr = std::ptr::read_unaligned(base.add(12) as *const u32);
+            let num_slots = std::ptr::read_unaligned(base.add(16) as *const u32);
+            let gc_age = std::ptr::read_unaligned(base.add(21) as *const u8);
+            let gc_flags = std::ptr::read_unaligned(base.add(22) as *const u8);
+            let fwd_ptr = std::ptr::read_unaligned(base.add(24) as *const usize);
+            eprintln!(
+                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
+header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
+array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags={gc_flags} \
+forwarding_ptr={fwd_ptr:#x}"
+            );
+        } else {
+            eprintln!(
+                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL"
+            );
+        }
+    }
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
     // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
     // method return value, so flag it as a genuine deopt so the interpreter
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
+}
+
+/// Cached `CRATONVM_DBG_AIOOBE3` gate: temp diagnostic companion to
+/// [`jit_throw_aioobe`] for the BigInteger.smallToString AIOOBE
+/// investigation (2026-07-17) — see that function's doc comment.
+#[inline]
+fn aioobe3_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE3").is_some())
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -7132,7 +7177,7 @@ mod tests {
         let _ = take_jit_deopt_pending();
         let _ = take_jit_pending_aioobe();
         // SAFETY: only stores into thread-locals; no pointer dereference.
-        let r = unsafe { jit_throw_aioobe(5, 3) };
+        let r = unsafe { jit_throw_aioobe(5, 3, 0) };
         assert_eq!(r, i64::MIN);
         assert!(
             take_jit_deopt_pending(),
