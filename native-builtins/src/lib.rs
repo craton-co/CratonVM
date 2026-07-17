@@ -36476,6 +36476,96 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // HIB-DST-STARTYEAR (2026-07-17): historical DST-adoption year for
+    // zones in the `tz_dst_rule` "EU rule" branch above.
+    //
+    // `tz_dst_rule` only knows the zone's CURRENT/modern recurring DST
+    // rule and applies it to every date unconditionally — including dates
+    // long before the zone had daylight saving at all. Confirmed live
+    // (standalone repro against real HotSpot JDK 25, cross-checked with
+    // `sun.util.calendar.ZoneInfo`'s own legacy `TimeZone.getOffset(long)`
+    // path, not just `java.time`):
+    // `TimeZone.getTimeZone("Europe/Amsterdam").getOffset(epochMillisFor(
+    // "1892-04-01T00:00:00Z"))` returned 7200000ms (+2h, modern DST rule
+    // wrongly applied) on CratonVM vs 3600000ms (+1h, no DST — HotSpot's
+    // own zone data correctly has no DST that far back) on real HotSpot.
+    // This is a distinct bug from HIB-PARIS-LMT above: that one is a
+    // one-time historical rawOffset cutover (LMT precision); this one is
+    // the recurring DST *rule itself* being retroactively misapplied to
+    // an era before the zone had DST in any form.
+    //
+    // Each value below is the first year real HotSpot JDK 25's own legacy
+    // `TimeZone.getOffset(long)` path reports ANY winter/summer offset
+    // split for that zone at all — i.e. the smallest year where
+    // `getOffset()` at a fixed mid-January instant differs from
+    // `getOffset()` at a fixed mid-July instant of the same year — found
+    // by scanning year-by-year from 1850 against real HotSpot JDK 25
+    // directly (not derived from a general historical claim: per this
+    // project's own hard-won lesson from HIB-PARIS-LMT, HotSpot's compiled
+    // legacy tzdata does not always carry the textbook-historical answer;
+    // what this project targets is matching HotSpot, not the real world).
+    //
+    // `alloc_synth_timezone` gates the constructed `SimpleTimeZone` with
+    // real `setStartYear(int)` bytecode using this value — the exact
+    // real-JDK mechanism for exactly this purpose (`SimpleTimeZone`'s own
+    // `getOffset`/`getOffsets` bytecode checks `year < startYear` and
+    // returns `rawOffset` with no DST applied when it's before the start
+    // year — see `javap -c java.util.SimpleTimeZone`), so no calendar-math
+    // reimplementation is needed on the Rust side; the real class does the
+    // gating itself, exactly as it would for a real HotSpot-constructed
+    // `SimpleTimeZone`.
+    //
+    // SCOPE LIMIT: this is a single flip year per zone, not full
+    // historical tzdata. Real HotSpot's own zone data for every zone below
+    // has a much messier history AFTER this adoption year — WWI-era DST
+    // suspended again in some zones during the interwar years, WWII
+    // occupation-driven changes to the *winter* (raw) offset itself
+    // (independent of any DST rule), and a widespread POST-WWII
+    // suspension of DST across Europe not reintroduced until the 1970s
+    // oil-crisis era / the 1996 EU-wide harmonization that `tz_dst_rule`'s
+    // modern rule actually models. Gating on just the first-ever-adoption
+    // year does NOT make CratonVM match HotSpot for that entire messy
+    // 1916(ish)-1980(ish) middle era — it only removes the strictly-wrong
+    // "DST applied to a date before the zone had DST at all" case, which
+    // is this fix's actual target (pre-20th-century dates, and more
+    // generally any date before each zone's real first-ever DST year).
+    // That intermediate-era imperfection is pre-existing — CratonVM's flat
+    // modern-rule model could never have matched that era, gated or not —
+    // and is unchanged by this fix, not a new regression.
+    fn dst_start_year(zone_id: &str) -> Option<i32> {
+        match zone_id {
+            // Europe/Paris: real HotSpot's legacy path first shows a
+            // winter/summer offset split in 1911 — the same year as the
+            // HIB-PARIS-LMT LMT->WET rawOffset cutover above (France
+            // adopted WET, then DST, in short order).
+            "Europe/Paris" => Some(1911),
+            // WWI-era DST adoption block: CET, Germany, Italy, Norway,
+            // Netherlands, Belgium, Austria, Denmark, Sweden, Poland,
+            // Czechia, Hungary, UK all first show a winter/summer split
+            // in 1916 against real HotSpot.
+            "CET" | "Europe/Berlin" | "Europe/Rome" | "Europe/Oslo" | "Europe/Amsterdam"
+            | "Europe/Brussels" | "Europe/Vienna" | "Europe/Copenhagen" | "Europe/Stockholm"
+            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London"
+            | "GB" => Some(1916),
+            // Spain: real HotSpot's legacy path shows an earlier (1901)
+            // Madrid-Mean-Time -> WET rawOffset switch that is NOT a DST
+            // split (winter == summer that year); the first genuine
+            // winter/summer split is 1918.
+            "Europe/Madrid" => Some(1918),
+            "Europe/Helsinki" => Some(1921),
+            "Europe/Bucharest" => Some(1932),
+            // Switzerland: real HotSpot shows no DST split at all until
+            // the short-lived 1941 wartime DST.
+            "Europe/Zurich" => Some(1941),
+            // Greece: real HotSpot's legacy path shows an earlier (1917)
+            // LMT -> EET rawOffset switch that is NOT a DST split (winter
+            // == summer that year); the first genuine winter/summer split
+            // is 1943 (wartime).
+            "Europe/Athens" => Some(1943),
+            _ => None,
+        }
+    }
+
     // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
     // offsets for zones whose real IANA tzdata models a historical LMT-style
     // offset before their first modern standardization transition.
@@ -36568,6 +36658,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "(ILjava/lang/String;IIIIIIIIIII)V",
                 &args,
             ) {
+                // HIB-DST-STARTYEAR (2026-07-17): gate the just-constructed
+                // SimpleTimeZone's DST rule to real HotSpot's own historical
+                // adoption year for this zone via the real
+                // `SimpleTimeZone.setStartYear(int)` bytecode — see
+                // `dst_start_year` above for how these years were found and
+                // what this fix does/doesn't cover. Best-effort: any
+                // dispatch failure just leaves the SimpleTimeZone ungated
+                // (this project's pre-fix, DST-applied-year-round
+                // behavior) — never worse than before this fix.
+                if let Some(start_year) = dst_start_year(id_str) {
+                    let _ = ctx.invoke_virtual_bytecode_only(
+                        obj,
+                        "setStartYear",
+                        "(I)V",
+                        &[Value::Int(start_year)],
+                    );
+                }
                 return cratonvm_types::Value::Object(Some(obj));
             }
         }
