@@ -1363,6 +1363,31 @@ impl ValueStack {
         None
     }
 
+    /// cceres3 blocked-window slot write-back: rewrite the object pointer at
+    /// `offset_from_top` (same index space as `peek_at`) from `old` to `new`.
+    /// Kind-strict: collision Long/Double slots are never touched (mirrors
+    /// `update_object_refs`). Returns true when the slot was rewritten.
+    pub fn rewrite_object_at(&mut self, offset_from_top: usize, old: usize, new: usize) -> bool {
+        if offset_from_top >= self.len {
+            return false;
+        }
+        let i = self.len - 1 - offset_from_top;
+        let cv = self.slots[i];
+        if !cv.is_object() || self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE {
+            return false;
+        }
+        match cv.as_object_ptr() {
+            Some(p) if p as usize == old => {
+                // SAFETY: `new` is a live moved object's address from the GC
+                // pointer maps (same invariant as `update_object_refs`).
+                let _ = unsafe { crate::types::ObjectRef::from_raw(new as *mut u8) };
+                self.slots[i].update_object_ptr_unchecked(new as u64);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];

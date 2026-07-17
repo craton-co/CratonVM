@@ -7518,14 +7518,14 @@ fn re5_collect_publisher_body(
     // waits on the OTHER thread's own cooperation with that same pause.
     let deadline = Instant::now() + RE5_PUBLISHER_WAIT;
     ctx.begin_blocking_region();
-    let mut state = collector.state.lock().unwrap();
+    let mut state = collector.state.lock().unwrap_or_else(|e| e.into_inner());
     while !state.completed && state.error.is_none() {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         let wait_for = deadline.saturating_duration_since(now);
-        let (next_state, wait) = collector.done.wait_timeout(state, wait_for).unwrap();
+        let (next_state, wait) = collector.done.wait_timeout(state, wait_for).unwrap_or_else(|e| e.into_inner());
         state = next_state;
         if wait.timed_out() {
             break;

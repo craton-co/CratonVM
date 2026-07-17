@@ -3442,8 +3442,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     let sn_for_mirror = sn_pin
         .map(|(pin, original)| ctx.read_native_pin(pin, original))
         .unwrap_or_else(|| alloc_java_service_name(ctx, &name));
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // controller-mirror allocation below can move `sn_for_mirror` (read from
+    // its pin just above, or freshly allocated in the anonymous branch) before
+    // the NAME-slot store; re-read it after the alloc.
+    let sn_mirror_pin = ctx.pin_native_root(sn_for_mirror);
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
+    let sn_for_mirror = ctx.read_native_pin(sn_mirror_pin, sn_for_mirror);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
     ctx.set_field(
@@ -3474,9 +3480,20 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // P3 value plumbing: connect this builder's provides-consumers and the
     // per-name registrations real requires()-suppliers read from, and index
     // provided/alias names for dependency resolution.
-    wire_provides_injectors(ctx, builder, id, &name);
+    //
+    // cceres3 (DS2/DM_002 live captures): `builder` is a raw copy captured at
+    // native entry; the service-name/controller-mirror/list allocations above
+    // can move it, so handing the raw copy to these two helpers made their
+    // very first `get_field_by_name(builder, ..)` read recycled memory. Pin
+    // and re-read at the point of use.
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    wire_provides_injectors(ctx, builder_cur, id, &name);
     // Legacy addDependency(…, Injector) wiring — injected before start().
-    capture_dependency_injections(ctx, builder, id);
+    // (wire_provides_injectors is itself GC-capable — re-read again.)
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    capture_dependency_injections(ctx, builder_cur, id);
+    ctx.unpin_native_roots(builder_pin);
 
     if msc_dbg() {
         eprintln!(

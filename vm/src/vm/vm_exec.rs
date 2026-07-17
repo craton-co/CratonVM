@@ -698,6 +698,44 @@ fn safe_native_call_impl(
     args: &[Value],
     prevalidated_objects: bool,
 ) -> MethodCallResult {
+    // DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector. A native that
+    // returns with FEWER pins than it entered with truncated its CALLER's
+    // pins (`unpin_native_roots` is a truncate) — every handle the caller
+    // still holds now dangles and `read_native_pin` silently degrades to the
+    // raw, possibly-stale fallback. The guard fires on every exit path
+    // (including unwind) via Drop and names the culprit at the funnel.
+    struct PinFloorGuard {
+        floor: usize,
+        thread: *const JvmThread,
+        callee_addr: usize,
+    }
+    impl Drop for PinFloorGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard lives strictly within this call frame; the
+            // thread outlives it (debug-only read of a Vec length).
+            let len = unsafe { (*self.thread).native_pin_roots.len() };
+            if len < self.floor {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
+                    eprintln!(
+                        "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
+                        self.floor,
+                    );
+                }
+            }
+        }
+    }
+    let _pin_floor_guard = if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        Some(PinFloorGuard {
+            floor: thread.native_pin_roots.len(),
+            thread: thread as *const JvmThread,
+            callee_addr: callback as usize,
+        })
+    } else {
+        None
+    };
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
@@ -1137,6 +1175,21 @@ fn safe_native_call_impl(
     // an exception ref has already gone stale, a native may leave the live
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
+    if unpin_ring_enabled() && pin_base < thread.native_pin_roots.len() {
+        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        UNPIN_RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() >= 6 {
+                r.remove(0);
+            }
+            r.push((
+                pin_base,
+                thread.native_pin_roots.len(),
+                format!("funnel-return callee={callee}\n"),
+            ));
+        });
+    }
     thread.native_pin_roots.truncate(pin_base);
     // A running JIT thread cannot be collected from this ordinary (non-blocking)
     // return boundary: a peer-requested STW waits for the thread to reach its
@@ -1202,6 +1255,103 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
 /// the caller still needs is rooted AND remapped across the block (frame
 /// slots are; immutable `&[Value]` arg slices are NOT — see the
 /// synchronized-method prologue, which deliberately does not use this).
+/// cceres3 FIX (leaked blocked-region exit self-heal): apply any pending
+/// blocked-window fixup chain + exact slot-origin write-backs to this
+/// thread's frames and thread-level refs, WITHOUT touching the blocked flag
+/// or barrier accounting. Normally `check_post_block_gc` consumes these on
+/// wake; a blocked-region exit path that skips it (observed live: an EQE
+/// worker ran 43 frames -> 1 frame with fixup_pending=44 across four
+/// deposits) leaves the thread executing on stale frames and poisons every
+/// object graph it touches. Calling this from the safepoint publish bounds
+/// that damage to one safepoint interval. Returns the number of chain
+/// entries + write-backs applied.
+pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
+    use crate::memory::gc::update_value_ref;
+    let fixup = {
+        let mut f = thread.gc_block_state.fixup.lock();
+        std::mem::take(&mut *f)
+    };
+    let origins = {
+        let mut o = thread.gc_block_state.slot_origins.lock();
+        std::mem::take(&mut *o)
+    };
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+        return 0;
+    }
+    let mut applied = 0usize;
+    if !fixup.is_empty() {
+        applied += fixup.len();
+        for frame in &mut thread.frames {
+            frame.update_local_refs(&fixup, &shared.heap);
+            frame.stack.update_object_refs(&fixup, &shared.heap);
+            if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for val in &mut thread.printed {
+            update_value_ref(val, &fixup);
+        }
+        for slot in [
+            &mut thread.java_thread_obj,
+            &mut thread.native_pending_return,
+            &mut thread.pending_async_exception,
+        ] {
+            if let Some(obj_ref) = slot.as_mut() {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for obj_ref in thread
+            .native_pin_roots
+            .iter_mut()
+            .chain(thread.native_alloc_pool.iter_mut())
+        {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = fixup.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        for (_key_id, key_ref, val) in &mut thread.scoped_values {
+            if let Some(obj_ref) = key_ref {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            update_value_ref(val, &fixup);
+        }
+        crate::native::jni::update_local_refs_after_gc(&fixup);
+    }
+    for so in &origins {
+        if so.cur == so.orig {
+            continue;
+        }
+        let fi = so.frame as usize;
+        let Some(fr) = thread.frames.get_mut(fi) else {
+            continue;
+        };
+        if so.is_stack {
+            if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) {
+                applied += 1;
+            }
+        } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+            if o.as_ptr() as usize == so.orig {
+                fr.set_local(
+                    so.idx as u16,
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(so.cur as *mut u8) })),
+                );
+                applied += 1;
+            }
+        }
+    }
+    applied
+}
+
 pub(crate) fn monitor_enter_blocking(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -1834,6 +1984,46 @@ impl<'a> NativeContextImpl<'a> {
                 snapshot.push(m);
             }
         }
+        // cceres3 FIX (blocked-window exact slot tracking): record every
+        // Object frame slot with the address it currently holds. GC folds
+        // advance each entry's `cur` through their pointer maps; the wake
+        // write-back in `check_post_block_gc_refs` stores `cur` back into
+        // the exact slot. Unlike the `fixup` chain (keyed by first-move
+        // addresses seeded from the FILTERED snapshot), this cannot strand a
+        // slot on a missed seed, a filtered entry, or a multi-block chain.
+        // Only the flag-raising deposit fills it — the wake-path refresh
+        // (`deposit_root_snapshot_no_flag`) must not, since a runnable
+        // thread's frames change under it.
+        if raise_blocked_flag {
+            let mut origins = self.thread.gc_block_state.slot_origins.lock();
+            origins.clear();
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: li as u32,
+                            is_stack: false,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: si as u32,
+                            is_stack: true,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
+            }
+        }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
         snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
@@ -1948,6 +2138,61 @@ impl<'a> NativeContextImpl<'a> {
         {
             let trace = crate::runtime::stackwalker::capture_frames_no_lines(&self.thread.frames);
             *self.thread.frame_trace.lock() = trace;
+        }
+        // DIAGNOSTIC-ONLY (cceres3): catch a frame slot that is ALREADY stale
+        // at block entry — the deposited snapshot then can never chain it
+        // (`fold_pointer_map_into_blocked` seeds only from snapshot
+        // addresses), so the wake-time fixup misses it forever. Needs both
+        // CRATONVM_DBG_BLOCKGC and the CRATONVM_DBG_STALE_OBJREF ring.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            let mut stale_n = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+            }
+            let pending = self.thread.gc_block_state.fixup.lock().len();
+            if stale_n > 0 || pending > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} raise={} frames={} fixup_pending={} stale={}",
+                    self.thread.thread_id.0,
+                    raise_blocked_flag,
+                    self.thread.frames.len(),
+                    pending,
+                    stale_n,
+                );
+                if pending > 0 {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        eprintln!(
+                            "[blockgc] deposit-with-pending tid={} caller:\n{}",
+                            self.thread.thread_id.0,
+                            std::backtrace::Backtrace::force_capture(),
+                        );
+                    }
+                }
+            }
         }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
@@ -2114,6 +2359,57 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // cceres3 FIX: exact per-slot write-back for the blocked window.
+        // Runs after the chain application above — any slot the chain already
+        // healed reads back != orig and is skipped; any slot the chain MISSED
+        // (seed gap / filtered snapshot / multi-block chain break) still
+        // holds `orig` and gets the tracked current address. Kind-strict on
+        // the operand stack (collision longs untouched); locals only rewrite
+        // when the slot still decodes to exactly `orig` as an object.
+        {
+            let origins = {
+                let mut o = self.thread.gc_block_state.slot_origins.lock();
+                std::mem::take(&mut *o)
+            };
+            if !origins.is_empty() {
+                let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
+                for so in &origins {
+                    if so.cur == so.orig {
+                        continue;
+                    }
+                    let fi = so.frame as usize;
+                    let Some(fr) = self.thread.frames.get_mut(fi) else {
+                        continue;
+                    };
+                    if so.is_stack {
+                        if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) && dbg {
+                            eprintln!(
+                                "[blockgc] writeback healed tid={} frame#{fi} stack[{}] 0x{:x}->0x{:x}",
+                                self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                            );
+                        }
+                    } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+                        if o.as_ptr() as usize == so.orig {
+                            // SAFETY: `cur` is the object's current address,
+                            // advanced through the GC pointer maps by the
+                            // initiator folds.
+                            fr.set_local(
+                                so.idx as u16,
+                                Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(so.cur as *mut u8)
+                                })),
+                            );
+                            if dbg {
+                                eprintln!(
+                                    "[blockgc] writeback healed tid={} frame#{fi} local[{}] 0x{:x}->0x{:x}",
+                                    self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
@@ -2121,6 +2417,42 @@ impl<'a> NativeContextImpl<'a> {
         // cleared atomically above; transiently re-raising it here would
         // re-open the excluded-while-running census window.
         self.deposit_root_snapshot_no_flag();
+        // DIAGNOSTIC-ONLY (cceres3): verify no frame slot is left stale after
+        // the wake-time fixup application — catches both "chain key missing"
+        // (was_key=false) and "frame held an intermediate address" desyncs at
+        // the exact wake where they surface.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
@@ -2269,6 +2601,24 @@ impl<'a> NativeContextImpl<'a> {
         let group = self.get_or_create_main_thread_group();
         // Re-read the (GC-remapped) holder after the group allocation.
         let holder = self.thread.native_pin_roots[pin_base];
+        // `group` (whether freshly built by this call or served from the
+        // `main_thread_group` cache — including the claim/wait/notify path's
+        // "another thread is building, wait then re-read" branch) is a bare
+        // Rust local from here on. `SharedVm::main_thread_group` is itself a
+        // GC root now (memory/roots.rs step 8d / memory/gc.rs step 6d), so
+        // the CACHE stays live and gets remapped by any later GC — but this
+        // local `Copy` of the `ObjectRef` does not track that remap. Pin it
+        // alongside `holder` so the invoke below (which runs `<init>`
+        // bytecode and can itself trigger further moving GCs) can't leave it
+        // stale; confirmed live via a `cratonvm-aio-dispatch-N` SIGSEGV
+        // (`is_forwarded`/`get_header:1558`) inside the `FieldHolder.<init>`
+        // field-setter that stores this exact value into `holder.group`.
+        let group_idx = group.map(|g| {
+            let idx = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(g);
+            idx
+        });
+        let group = group_idx.map(|idx| self.thread.native_pin_roots[idx]);
         let args = [
             Value::Object(Some(holder)),
             Value::Object(group), // ThreadGroup (may be None if group alloc failed)
@@ -2307,10 +2657,140 @@ impl<'a> NativeContextImpl<'a> {
     /// `(String)` ctor would recurse through
     /// `Thread.currentThread().getThreadGroup()` вЂ” our caller is the
     /// thread construction path itself, so that would loop.
+    ///
+    /// CONCURRENCY (fixes a confirmed TOCTOU race — see
+    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// follow-up #4"): the body below allocates two `ThreadGroup` objects
+    /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
+    /// cannot simply hold `main_thread_group`'s write lock across the
+    /// whole build — `RwLock` is not reentrant, and this same function is
+    /// reachable indirectly from inside a `<clinit>`/`<init>` it runs, and
+    /// concurrent GC-blocked-region waits must not stall holding a plain
+    /// lock across a safepoint. Instead this mirrors the codebase's own
+    /// JVMS §5.5 class-init claim/wait/notify idiom
+    /// (`vm_util::ensure_class_initialized_shared`,
+    /// `SharedVm::class_init_waiters`): exactly one thread transitions
+    /// `main_thread_group_init` `Idle -> InProgress` and performs the
+    /// build; every other concurrent caller blocks on the `InProgress`
+    /// claim's condvar — via the same deposit/enter_blocked/
+    /// arrive_and_wait/check_post_block_gc protocol class-init waiters use
+    /// — until the builder finishes and notifies, then re-checks the
+    /// (now-published) result instead of racing its own independent build.
     pub(crate) fn get_or_create_main_thread_group(&mut self) -> Option<ObjectRef> {
+        use std::sync::Arc;
         if let Some(obj) = *self.shared.main_thread_group.read() {
             return Some(obj);
         }
+        let current_thread_id = self.thread.thread_id.0;
+        loop {
+            // Try to claim the build under the (cheap, never held across an
+            // allocation) init-state lock; discover an in-progress build by
+            // someone else; or discover the result already landed while we
+            // were retrying.
+            let waiter = {
+                let mut init = self.shared.main_thread_group_init.lock();
+                match &*init {
+                    super::MainThreadGroupInit::InProgress {
+                        owner_thread,
+                        waiter,
+                    } => {
+                        if *owner_thread == current_thread_id {
+                            // Re-entrant call on the SAME thread that is
+                            // already building the group (e.g. a nested
+                            // currentThread() triggered from within
+                            // ThreadGroup's own <clinit>/<init>). Mirrors
+                            // JVMS §5.5 step 2's re-entrant rule for class
+                            // init ("release LC and complete normally"):
+                            // return None (no group yet) rather than
+                            // deadlocking on our own claim.
+                            return None;
+                        }
+                        Some(Arc::clone(waiter))
+                    }
+                    super::MainThreadGroupInit::Idle => {
+                        // Re-check under the lock: another thread may have
+                        // finished (or failed) a build between our
+                        // lock-free fast-path read above and acquiring
+                        // this lock.
+                        if let Some(obj) = *self.shared.main_thread_group.read() {
+                            return Some(obj);
+                        }
+                        *init = super::MainThreadGroupInit::InProgress {
+                            owner_thread: current_thread_id,
+                            waiter: Arc::new((
+                                parking_lot::Mutex::new(false),
+                                parking_lot::Condvar::new(),
+                            )),
+                        };
+                        None
+                    }
+                }
+            };
+
+            let Some(waiter) = waiter else {
+                // We claimed the build — proceed to the code below.
+                break;
+            };
+
+            // Someone else is building; block until they finish. Same
+            // GC-safe blocked-region protocol as class-init waiters: retire
+            // the TLAB, deposit a root snapshot, arrive-and-wait if a STW
+            // is already in flight so we don't strand a GC initiator, wait
+            // on the condvar (bounded, so a builder that somehow never
+            // notifies can't wedge us forever), then re-sync any
+            // cross-GC fixups before touching heap state again.
+            self.thread.tlab.retire();
+            self.deposit_root_snapshot();
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait_auto(ThreadId(current_thread_id));
+            }
+            {
+                let (lock, cvar) = &*waiter;
+                let mut guard = lock.lock();
+                if !*guard {
+                    let _ = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                }
+            }
+            drop(blk);
+            self.check_post_block_gc();
+            // Loop back to re-check: `Some` once the builder published a
+            // result; `Idle` (no result) if the builder failed, in which
+            // case we retry and may become the new builder ourselves.
+            if let Some(obj) = *self.shared.main_thread_group.read() {
+                return Some(obj);
+            }
+        }
+
+        // We are now the sole builder. This guard runs on EVERY exit path
+        // below (success, an early `None` return via `?`/`return`, or a
+        // panic unwind) so a builder that bails out never leaves waiters
+        // blocked for the full 30s timeout — or, worse, permanently wedges
+        // `main_thread_group_init` in `InProgress` for a thread that has
+        // already moved on.
+        struct FinishGuard<'s> {
+            shared: &'s SharedVm,
+        }
+        impl Drop for FinishGuard<'_> {
+            fn drop(&mut self) {
+                let prev = std::mem::replace(
+                    &mut *self.shared.main_thread_group_init.lock(),
+                    super::MainThreadGroupInit::Idle,
+                );
+                if let super::MainThreadGroupInit::InProgress { waiter, .. } = prev {
+                    let (lock, cvar) = &*waiter;
+                    *lock.lock() = true;
+                    cvar.notify_all();
+                }
+            }
+        }
+        let _finish_guard = FinishGuard {
+            shared: self.shared,
+        };
+
         let tg_class =
             <Self as NativeContext>::ensure_class_initialized(self, "java/lang/ThreadGroup")
                 .ok()?;
@@ -2586,6 +3066,18 @@ fn reread_native_object_values(
         .collect()
 }
 
+thread_local! {
+    /// DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_UNPIN_RING): last few pin-stack
+    /// truncations with backtraces; dumped by the PIN-DANGLING canary.
+    static UNPIN_RING: std::cell::RefCell<Vec<(usize, usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn unpin_ring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_UNPIN_RING").is_some())
+}
+
 struct VmNativeThreadBlocker {
     shared: std::sync::Arc<SharedVm>,
     thread_id: ThreadId,
@@ -2678,7 +3170,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // the existing blocking-path deposit mechanism without actually
     // blocking.
     fn refresh_root_snapshot(&mut self) {
-        self.deposit_root_snapshot();
+        // cceres3 ROOT FIX (WildFly boot CCE long tail): this is a
+        // NON-blocking republish — the caller (the native-collections stream
+        // drain loops) keeps executing Java right after it. The old
+        // `deposit_root_snapshot()` call was the raise=true variant: it set
+        // `in_blocked_region` and nothing ever consumed it, so the identity
+        // census EXCLUDED the running thread from every subsequent STW pause
+        // (moving collections completed under its feet), its
+        // `gc_block_state.fixup` accumulated unconsumed (observed live:
+        // fixup_pending=44 across four raise=true deposits while running 43
+        // frames deep in infinispan/management-model stream work), and every
+        // frame ref it held or stored went stale — the poisoned-island
+        // producer behind the WFLYCTL0079 / "Object cannot be cast to X"
+        // family. The no-flag variant republishes pins/snapshot without
+        // touching the flag — exactly what a still-running thread needs.
+        self.deposit_root_snapshot_no_flag();
     }
 
     fn load_class(&mut self, name: &str) -> MethodCallResult {
@@ -2849,6 +3355,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_BLOCKGC): pin-time canary —
+        // pinning an ALREADY-forwarded address preserves the staleness (the
+        // GC only remaps pins through per-cycle pointer maps, which never
+        // contain long-dead addresses). A hit here means the CALLER received
+        // a stale value from upstream; the backtrace names it.
+        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} caller:\n{}",
+                        self.thread.thread_id.0,
+                        obj.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
         // CRATONVM_DBG_BLOCKED_ACCESS: a pin pushed while this thread's
         // `in_blocked_region` flag is raised is invisible to BOTH the STW root
         // scan (which reads the deposit-time snapshot) and the blocked-thread
@@ -2873,6 +3397,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        // DIAGNOSTIC-ONLY (cceres3): a handle past the pin stack means some
+        // callee truncated below this caller's pins (pin-stack imbalance) —
+        // the silent `unwrap_or(fallback)` then hands back the RAW address,
+        // which is stale if a GC ran since the pin. Name the reader loudly
+        // under the flag; the culprit truncator is inside its call subtree.
+        if handle != usize::MAX && handle >= self.thread.native_pin_roots.len() {
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    let ring = if unpin_ring_enabled() {
+                        UNPIN_RING.with(|r| {
+                            r.borrow()
+                                .iter()
+                                .map(|(b, l, bt)| {
+                                    format!("\n  truncate base={b} prev_len={l} at:\n{bt}")
+                                })
+                                .collect::<String>()
+                        })
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[blockgc] PIN-DANGLING tid={} handle={} len={} reader:\n{}\nrecent truncations:{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        std::backtrace::Backtrace::force_capture(),
+                        ring,
+                    );
+                }
+            }
+        }
         self.thread
             .native_pin_roots
             .get(handle)
@@ -2882,6 +3438,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn unpin_native_roots(&mut self, base: usize) {
         if base < self.thread.native_pin_roots.len() {
+            if unpin_ring_enabled() {
+                let bt = format!("{}", std::backtrace::Backtrace::force_capture());
+                let short: String = bt.lines().skip(8).take(12).map(|l| format!("{l}\n")).collect();
+                UNPIN_RING.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if r.len() >= 6 {
+                        r.remove(0);
+                    }
+                    r.push((base, self.thread.native_pin_roots.len(), short));
+                });
+            }
             self.thread.native_pin_roots.truncate(base);
         }
     }
@@ -9416,6 +9983,29 @@ pub fn invoke_or_native(
         return Ok(None);
     }
 
+    // A JIT helper resolves virtual calls against the runtime custom-loader
+    // class, while these callbacks are deliberately registered on ClassLoader.
+    // Preserve the JDK null-name contract before inherited cached bytecode can
+    // turn a null resource lookup into a null return.
+    if args.len() == 2
+        && args.get(1).is_some_and(Value::is_null)
+        && matches!(
+            (method_name, descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // In real-JDK mode ClassLoader's registered bridge can be tagged as a
     // synthetic stub and therefore lose to the JDK bytecode selector. That
     // bytecode uses the flat global class store and breaks child/fork-loader
@@ -13177,13 +13767,21 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/logging/Logger"
                             && (method_name == "getResourceBundleName"
                                 || method_name == "getResourceBundle"))
-                        // B3: ClassLoader.getResources / getSystemResources
-                        // have real-JDK bytecode but that bytecode walks
-                        // URLClassPath (which NPEs during <clinit>). Force
-                        // the native override ahead of the bytecode.
+                        // B3: ClassLoader resource methods have real-JDK
+                        // bytecode but that bytecode walks URLClassPath (which
+                        // is deliberately shimmed in CratonVM).  Force the
+                        // native overrides ahead of it.  The singular and
+                        // stream forms must be in the same group as the bulk
+                        // forms: EmbeddedImplClassLoader relies on them while
+                        // resolving its per-loader IMPL-JARS and otherwise a
+                        // null name silently returns null instead of NPE.
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
-                                || method_name == "getSystemResources"))
+                                || method_name == "getSystemResources"
+                                || method_name == "getResource"
+                                || method_name == "getSystemResource"
+                                || method_name == "getResourceAsStream"
+                                || method_name == "getSystemResourceAsStream"))
                         // WildFly process-controller bootstrap: real
                         // ServerSocket.getLocalSocketAddress() is Java bytecode
                         // that builds from ServerSocket's internal impl fields.
@@ -15201,17 +15799,24 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // `ClassLoader.loadClass` is backed by concrete JDK bytecode,
-                        // but CratonVM supplies the actual loader-aware implementation
-                        // as a native.  Let that native win when an inherited base
-                        // method is selected; direct subclass overrides still resolve
-                        // on their own declaring class and continue to run normally.
+                        // ClassLoader's concrete JDK bytecode reads URLClassPath state
+                        // that CratonVM replaces with loader-aware natives.  Let the
+                        // native win for the inherited base methods; direct subclass
+                        // overrides still resolve on their own declaring class and run
+                        // normally.  Besides preserving per-loader resource isolation,
+                        // this preserves ClassLoader's specified NPE contract for a
+                        // null resource name.
                         || (class_name == "java/lang/ClassLoader"
-                            && method_name == "loadClass"
                             && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;)Ljava/lang/Class;"
-                                    | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                                (method_name, descriptor),
+                                ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                                    | ("loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;")
+                                    | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getSystemResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getSystemResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                                    | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                             ));
                     if check_override
                         && shared

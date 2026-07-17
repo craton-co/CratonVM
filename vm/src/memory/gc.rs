@@ -240,6 +240,36 @@ pub fn update_all_roots(
         }
     }
 
+    // DIAGNOSTIC-ONLY (cceres3): initiator-side counterpart of the
+    // ARRIVE-STALE / WAKE-STALE frame verifiers.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let crate::types::Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+        }
+    }
     // Stage 3 (precise oop maps) — relocate oop slots of active JIT frames on
     // this thread, the JIT analogue of the interpreter-frame remap above. Inert
     // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
@@ -371,6 +401,36 @@ pub fn update_all_roots(
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
+    // 6d. Cached "main" java.lang.ThreadGroup singleton
+    //     (`SharedVm::main_thread_group`). The root scan keeps it ALIVE
+    //     (memory/roots.rs step 8d), but — exactly like `singleton_oom`
+    //     just above — the cache is a bare `SharedVm` field that no other
+    //     remap step covers, so without this a moving GC that relocates the
+    //     group after it is published leaves the cache pointing at
+    //     from-space. Every later reader of the cache (including
+    //     `get_or_create_main_thread_group`'s own fast path, and
+    //     `build_thread_field_holder`'s use of its return value) then hands
+    //     out a dangling `ObjectRef`, which crashes the next
+    //     `FieldHolder.<init>` field-setter that stores it into
+    //     `holder.group` (`is_forwarded`/`get_header:1558`, confirmed live
+    //     on a `cratonvm-aio-dispatch-N` thread). try_write mirrors the
+    //     system-streams convention below: `get_or_create_main_thread_group`
+    //     only ever holds the write lock for the single final-store
+    //     assignment (never across an allocation), so a locked slot here
+    //     means that store is mid-flight and its value is about to be
+    //     overwritten anyway.
+    {
+        if let Some(mut tg) = shared.main_thread_group.try_write() {
+            if let Some(ref mut obj_ref) = *tg {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
             }
         }
     }

@@ -26749,6 +26749,28 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // Real-JDK `Module.getDescriptor()` is a field read, but Module mirrors
+    // produced by CratonVM do not carry the JDK's private descriptor field.
+    // The synthetic-JDK registration has a bridge for this already; install it
+    // here as well because this is the registration path used by the CLI.
+    registry.register(
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let module = match args.first() {
+                Some(Value::Object(Some(module))) => *module,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = match ctx.get_field_by_name(module, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let descriptor = build_synthetic_module_descriptor(ctx, &name);
+            Ok(Some(Value::Object(Some(descriptor))))
+        },
+    );
+
     // `java/lang/Module.addUses(Class)` — companion to `canUse` above, same
     // null-descriptor gap (real bytecode reads `this.descriptor` to decide
     // whether the module already implicitly "uses" everything as an
@@ -31288,6 +31310,35 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // A real ThreadGroup is required: the FieldHolder ctor stores it,
         // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
         // to the current thread's group when the caller passed null.
+        //
+        // GCBARRIER-CDLWAIT-FIX (2026-07-17): this block's `get_field_by_name`
+        // calls (and, under `CRATONVM_DBG_GC_STRESS` / real allocation
+        // pressure, any heap touch at all) can trigger a moving collection.
+        // `holder` was pinned right above via `holder_handle`, but nothing
+        // re-read it through that pin before this point -- so a GC landing
+        // in this exact window silently relocates the just-allocated
+        // FieldHolder while the bare `holder` local still names its dead
+        // from-space address. That address remains a *structurally valid*
+        // read (headers of already-evacuated copies stay intact until the
+        // space is reused), so nothing downstream ever threw; it just meant
+        // `args[0]` below handed the FieldHolder ctor invoke a receiver that
+        // pointed at reclaimed memory. Root-caused live: under
+        // `CRATONVM_DBG_GC_STRESS`, the FIRST-ever `new Thread(Runnable,
+        // String)` in a process reliably hit this window (this call's own
+        // `ensure_class_initialized("java/lang/Thread$FieldHolder")` above
+        // loads+links that class for the first time, doing enough
+        // allocating work to make a GC land here on cold runs; every
+        // subsequent construction is warm and never triggers a GC in this
+        // narrow span) -- the constructed `Thread.holder.task` field then
+        // read back as a zero/default slot (decoded as `Int(0)`, not even a
+        // stale `Object` ref) because the ctor's `putfield` landed on the
+        // abandoned copy, and that worker's `Runnable.run()` (and therefore
+        // its `CountDownLatch.countDown()`) was silently never invoked.
+        // Re-read `holder` through its pin now, immediately before it is
+        // used to build `args`, exactly like `target`/`this` already are
+        // re-read (via `target_handle`/`pin_base`) after the invoke below --
+        // this closes the identical gap on the WAY IN.
+        let holder = ctx.read_native_pin(holder_handle, holder);
         let group = match group {
             Value::Object(Some(_)) => group,
             _ => {
@@ -31298,6 +31349,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     _ => Value::Object(None),
                 }
             }
+        };
+        // Same fix, applied again: the group-resolution block just above is
+        // itself a further opportunity for a GC to land before `args` is
+        // built, so re-read `holder` (and the `target` object, if any, via
+        // `target_handle`) one more time right at the point of use.
+        let holder = ctx.read_native_pin(holder_handle, holder);
+        let target = match target_handle {
+            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+            None => target,
         };
         let args = [
             Value::Object(Some(holder)),

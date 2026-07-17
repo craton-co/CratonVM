@@ -6031,6 +6031,15 @@ fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Mirror the real constructor's semantics by field name instead.
     if !ctx.is_class_synthetic_stub("java/util/EnumMap") {
         let key_type = args.get(1).copied().unwrap_or(Value::Object(None));
+        // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+        // `getEnumConstants` re-enters Java and the two array allocations can
+        // move `this`/`key_type`/`universe` before the by-name field stores
+        // below (live store-canary capture during a domain boot).
+        let this_pin = ctx.pin_native_root(this);
+        let kt_pin = match key_type {
+            Value::Object(Some(k)) => Some(ctx.pin_native_root(k)),
+            _ => None,
+        };
         let universe = match key_type {
             Value::Object(Some(enum_class)) => {
                 match ctx.invoke_virtual(
@@ -6040,29 +6049,47 @@ fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     &[],
                 ) {
                     Ok(Some(Value::Object(Some(universe)))) => universe,
-                    _ => enum_constants_array_for_class(ctx, enum_class).unwrap_or_else(|| {
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
-                    }),
+                    _ => {
+                        let enum_class =
+                            kt_pin.map_or(enum_class, |p| ctx.read_native_pin(p, enum_class));
+                        enum_constants_array_for_class(ctx, enum_class).unwrap_or_else(|| {
+                            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
+                        })
+                    }
                 }
             }
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         };
+        let uni_pin = ctx.pin_native_root(universe);
         let vals = ctx.new_array(
             cratonvm_types::ArrayElementType::Reference,
             ctx.array_length(universe),
         );
+        let this = ctx.read_native_pin(this_pin, this);
+        let universe = ctx.read_native_pin(uni_pin, universe);
+        let key_type = match key_type {
+            Value::Object(Some(k)) => {
+                Value::Object(Some(kt_pin.map_or(k, |p| ctx.read_native_pin(p, k))))
+            }
+            other => other,
+        };
         ctx.set_field_by_name(this, "keyType", key_type);
         ctx.set_field_by_name(this, "keyUniverse", Value::Object(Some(universe)));
         ctx.set_field_by_name(this, "vals", Value::Object(Some(vals)));
         ctx.set_field_by_name(this, "size", Value::Int(0));
         ctx.set_field_by_name(this, "entrySet", Value::Object(None));
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
     let cap = 16;
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let this_pin = ctx.pin_native_root(this);
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(buckets)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 

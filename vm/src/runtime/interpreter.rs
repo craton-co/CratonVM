@@ -2529,6 +2529,92 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
 }
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
+    // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
+    // native returned without `check_post_block_gc` (unpaired exit), this
+    // thread is running with an unconsumed fixup chain / slot-origin set —
+    // its frames still hold from-space addresses from every GC it slept
+    // through. Apply them here, at the first safepoint publish, before this
+    // thread's stale refs can leak into reachable object graphs.
+    {
+        let pending = !thread.gc_block_state.fixup.lock().is_empty()
+            || thread
+                .gc_block_state
+                .slot_origins
+                .lock()
+                .iter()
+                .any(|so| so.cur != so.orig);
+        if pending {
+            let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
+            if n > 0 && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-HEAL tid={} applied {} pending fixups (leaked blocked-region exit upstream)",
+                    thread.thread_id.0, n,
+                );
+            }
+        }
+        // A raised flag at an interpreter safepoint means some raise site's
+        // exit skipped `check_post_block_gc` (the monitor_wait early-return
+        // bug class): this thread is RUNNING, yet every census still excludes
+        // it, so moving collections keep completing under its feet. Restore
+        // the invariant: wait out any in-flight pause and clear the flag
+        // (idempotent with the eventual legitimate wake, whose fixup-take
+        // then finds an empty map).
+        if thread
+            .gc_block_state
+            .in_blocked_region
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            shared.gc_barrier.leave_blocked_region_flagged(
+                thread.thread_id,
+                &thread.gc_block_state.in_blocked_region,
+            );
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-FLAG-CLEAR tid={} - in_blocked_region was raised on a running thread",
+                    thread.thread_id.0,
+                );
+            }
+        }
+    }
+    // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
+    // thread, verify no frame slot holds an already-forwarded (quarantined)
+    // address at the safepoint publish. A hit here bounds the miss window to
+    // "since the previous safepoint" on a RUNNING thread, which none of the
+    // DEPOSIT/WAKE/ARRIVE verifiers can see.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        thread_local! {
+            static LAST_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+        }
+        let cc = shared.heap.collection_count();
+        let prev = LAST_CC.with(|c| c.replace(cc));
+        if cc != prev && prev != u64::MAX {
+            for (fi, fr) in thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let _rs_t0 = if rootsnap_dbg_enabled() {
         Some((std::time::Instant::now(), thread.frames.len()))
     } else {
@@ -3062,6 +3148,36 @@ pub(crate) fn apply_pointer_map_to_thread(
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
+    // catches a frame slot left stale right after a safepoint-arrival remap.
+    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if let Some(new) = heap.debug_forwarded_target(a) {
+                        eprintln!(
+                            "[blockgc] ARRIVE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
+                            thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            pointer_map.contains_key(&a),
+                        );
+                    }
+                }
             }
         }
     }
@@ -6319,6 +6435,66 @@ pub fn execute(
                     f.max_stack,
                     msg
                 );
+            }
+            // cceres2: if this panic is the CRATONVM_DBG_STALE_OBJREF canary,
+            // attribute the stale address against THIS thread's own state —
+            // the heap-side holder scan runs in get_header; this covers the
+            // thread-local half (frame locals/stack, pins, snapshot), which
+            // is where a root-remap gap lives.
+            {
+                let stale = cratonvm_gc::stale_objref_debug::LAST_STALE_ADDR
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                if stale != 0 {
+                    let mut found = 0usize;
+                    for (fi, fr) in thread.frames.iter().enumerate() {
+                        for li in 0..fr.locals_len() {
+                            if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                                if o.as_ptr() as usize == stale {
+                                    eprintln!(
+                                        "[STALE-FRAME] frame#{fi} {}.{} pc={} local[{li}] holds stale 0x{stale:x}",
+                                        fr.class_name(), fr.method_name(), fr.pc,
+                                    );
+                                    found += 1;
+                                }
+                            }
+                        }
+                        for si in 0..fr.stack.len() {
+                            if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                                if o.as_ptr() as usize == stale {
+                                    eprintln!(
+                                        "[STALE-FRAME] frame#{fi} {}.{} pc={} stack[top-{si}] holds stale 0x{stale:x}",
+                                        fr.class_name(), fr.method_name(), fr.pc,
+                                    );
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                    for (pi, p) in thread.native_pin_roots.iter().enumerate() {
+                        if p.as_ptr() as usize == stale {
+                            eprintln!("[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}");
+                            found += 1;
+                        }
+                    }
+                    {
+                        let snap = thread.root_snapshot.lock();
+                        for (si, r) in snap.iter().enumerate() {
+                            if r.as_ptr() as usize == stale {
+                                eprintln!("[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}");
+                                found += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[STALE-FRAME] summary: {} thread-state slot(s) hold stale 0x{stale:x} (tid={}, blocked={})",
+                        found,
+                        thread.thread_id.0,
+                        thread
+                            .gc_block_state
+                            .in_blocked_region
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    );
+                }
             }
             Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::NotImplemented { feature: msg },
@@ -13555,6 +13731,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale (relocated by a moving GC) while it sat mid-flight
+            // between the operand-stack pop above and here. resolve_field_ref
+            // below is a cache-miss-cold path on a field's FIRST-ever
+            // resolution: it can call load_class_concurrent, which loads
+            // and links (and may run clinit for) the field's declaring
+            // class -- real work that allocates, and under GC-stress
+            // (or ordinary allocation pressure) can trigger a moving
+            // collection. obj_ref was popped into this bare Rust local
+            // BEFORE that call and is therefore invisible to the collector's
+            // root scan for its duration; a relocated receiver leaves this
+            // local pointing at an intact (structurally valid, so it evades
+            // the CRATONVM_DBG_STRAYSTACK num_slots/class_id sanity check)
+            // but dead from-space copy -- same shape as the native-call-arg
+            // and getfield-loaded-value barriers elsewhere in this file, just
+            // never applied to the getfield/putfield RECEIVER itself.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
@@ -13994,6 +14187,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale while resolving the field above. resolve_field_ref at
+            // the top of this opcode handler runs BEFORE this pop (the
+            // receiver was still nominally live on the Java operand stack
+            // during that call), but a cache-miss-cold resolution can load
+            // and link the field's declaring class for the first time --
+            // real allocating work -- and a moving collection triggered
+            // during it (confirmed live: java.lang.Thread$FieldHolder's
+            // very first "putfield task" under CRATONVM_DBG_GC_STRESS,
+            // which silently dropped the write, leaving Thread.holder.task
+            // permanently null and that worker's Runnable never invoked)
+            // can leave this local pointing at a forwarded-but-structurally-
+            // intact from-space copy that CRATONVM_DBG_STRAYSTACK's
+            // num_slots/class_id sanity check does not catch. Heal it the
+            // same way native-call arguments and the getfield RECEIVER
+            // (see the identical fix just above) already are.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
@@ -16909,12 +17119,28 @@ fn drive_defining_loader_load(
         use cratonvm_native_api::NativeContext as _;
         let mut ctx = crate::vm::NativeContextImpl { shared, thread };
         let name_obj = ctx.create_string(&dotted);
-        ctx.invoke_virtual(
+        let result = ctx.invoke_virtual(
             loader_obj,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
-        )
+        );
+        // Elasticsearch's EmbeddedImplClassLoader can report a failed Java
+        // `loadClass` while its provider archive still contains the requested
+        // implementation class. This fallback belongs at the VM's
+        // initiating-loader boundary, where bytecode references have no
+        // ServiceLoader context. The archive helper preserves this loader's
+        // namespace and defining-loader association.
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => result,
+            _ => cratonvm_native_builtins::service_loader::impl_jars_load_class(
+                &mut ctx,
+                Some(loader_obj),
+                name,
+            )
+            .map(|mirror| Ok(Some(Value::Object(Some(mirror)))))
+            .unwrap_or(result),
+        }
     };
     // Defensive: a re-entrant call that unwound abnormally must not leave stray
     // frames on this thread's stack.
@@ -19144,6 +19370,19 @@ fn execute_invoke_kind(
     // resolved base methods so real-JDK URLClassPath shims never discard local
     // resources or custom URLStreamHandler-backed URLs.
     if let Some(res) = intercept_urlclassloader_subclass_native_method(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        is_special,
+        &args,
+    ) {
+        return res;
+    }
+
+    if let Some(res) = intercept_classloader_subclass_resource_native(
         shared,
         thread,
         frame_idx,
@@ -24081,7 +24320,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+        // ClassLoader resource methods have the same issue: real JDK bytecode
+        // walks URLClassPath state which CratonVM intentionally replaces with
+        // native per-loader lookups.  Keep the singular, stream, and bulk
+        // methods together so URLClassLoader instances do not fall back to the
+        // process-wide dynamic classpath (which leaks resources between test
+        // loaders) and null arguments retain their specified NPE contract.
+        if class_name == "java/lang/ClassLoader"
+            && matches!(
+                method_name,
+                "getResource"
+                    | "getSystemResource"
+                    | "getResources"
+                    | "getSystemResources"
+                    | "getResourceAsStream"
+                    | "getSystemResourceAsStream"
+            )
+        {
+            return true;
+        }
+
+        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25381,6 +25640,38 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // The resource-name argument is specified to be non-null for every
+    // ClassLoader resource accessor.  A virtual call whose constant-pool
+    // owner is ClassLoader can resolve to an inherited cached method on a
+    // custom loader, so the generic force-native lookup below sees the custom
+    // class name and misses the callback registered on ClassLoader.  Route
+    // only the null-argument contract through that base callback before
+    // method-cache dispatch; normal non-null calls retain the custom loader's
+    // virtual implementation.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     // `Class.getClassLoader()` is a concrete JDK method, but Class mirrors in
     // this VM use an internal layout and their real `classLoader` field can be
     // a stale non-loader object.  Dispatch by the receiver's *runtime* class
@@ -25497,6 +25788,34 @@ fn intercept_force_registered_native_cached(
     let class_name = cached.class_name.as_ref();
     let method_name = cached.method_name.as_ref();
     let method_descriptor = cached.method_descriptor.as_ref();
+    // Keep the cached path aligned with the uncached null-resource contract
+    // above.  The cache is keyed by the resolved custom-loader method, while
+    // the implementation callback is deliberately registered on ClassLoader.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let ret_type = crate::jit::return_type(method_descriptor);
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     let force_native = *cached.force_native_cache.get_or_init(|| {
         force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
     });
@@ -25704,6 +26023,66 @@ fn intercept_urlclassloader_subclass_native_method(
         shared
             .native_methods
             .find("java/net/URLClassLoader", method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// A class may invoke an inherited ClassLoader resource method through a
+/// constant-pool reference to its concrete subclass.  The regular force-native
+/// gate is keyed by that symbolic class, so it misses the native registered on
+/// ClassLoader and the real JDK body silently accepts null names. Resolve the
+/// actual declaration and dispatch the shared ClassLoader native instead.
+#[inline]
+fn intercept_classloader_subclass_resource_native(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    is_special: bool,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if is_special
+        || !matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let declaring_name = {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        let (_m, declaring_id) = crate::classloading::find_method_recursive(
+            recv_cid,
+            method_name,
+            method_descriptor,
+            store,
+        )?;
+        store.get(declaring_id).map(|c| c.name.to_string())?
+    };
+    if declaring_name != "java/lang/ClassLoader"
+        || native_shadow_suppressed_by_redefine(shared, "java/lang/ClassLoader")
+    {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("java/lang/ClassLoader", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -32263,6 +32642,24 @@ fn execute_jit_call(
     // "index out of bounds: the len is 4 but the index is 4" at the
     // pop-into-`jit_args` loop below.
     const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
+    // cceres2: never trust a separately-cached ABI flag over the compiled
+    // method's own record — a (compiled, needs_heap) pair captured at two
+    // different times can disagree after a recompile, and marshalling with
+    // the wrong flag shifts every argument by one inside the callee. See
+    // try_call_compiled_entry_reentrant for the matching guard + rationale.
+    let needs_heap = {
+        let own = compiled.needs_heap();
+        if own != needs_heap {
+            tracing::warn!(
+                "JIT ABI flag mismatch in execute_jit_call: cached needs_heap={needs_heap} \
+                 but compiled {}.{}{} says {own} — using the compiled method's own flag",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+            );
+        }
+        own
+    };
     let np = num_params as usize; // Widening: parameter count conversion
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     if np > max_java_params {
@@ -32778,6 +33175,22 @@ fn execute_jit_call_decoded(
     args_slice: &[Value],
 ) -> Result<Option<CachedCallResult>, MethodCallFailed> {
     const JIT_ABI_MAX_JAVA_ARGS: usize = 8;
+    // cceres2: same ABI-flag guard as execute_jit_call — the compiled
+    // method's own record wins over any separately-cached flag.
+    let needs_heap = {
+        let own = compiled.needs_heap();
+        if own != needs_heap {
+            tracing::warn!(
+                "JIT ABI flag mismatch in execute_jit_call_decoded: cached \
+                 needs_heap={needs_heap} but compiled {}.{}{} says {own} — using \
+                 the compiled method's own flag",
+                cached.class_name,
+                cached.method_name,
+                cached.method_descriptor,
+            );
+        }
+        own
+    };
     let np = num_params as usize; // Widening: parameter count conversion
     let max_java_params = JIT_ABI_MAX_JAVA_ARGS - if needs_heap { 1 } else { 0 };
     // Too many args for the register-only JIT ABI, or a mismatch between the
@@ -36249,11 +36662,21 @@ mod tests {
     #[test]
     fn buffered_input_stream_real_jdk_uses_its_own_bytecode() {
         let buffered = "java/io/BufferedInputStream";
+        // 995ff48c (Tomcat silent-hang scanner fix, see
+        // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md):
+        // the two read overloads are now DELIBERATELY forced to the registered
+        // native — interpreted per-byte read dispatch dominated the scanner's
+        // hot path. Everything else (ctor/mark/reset/skip/...) still runs its
+        // real-JDK bytecode so buffer/mark state stays bytecode-owned.
+        for (name, descriptor) in [("read", "()I"), ("read", "([BII)I")] {
+            assert!(
+                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} is forced native per 995ff48c"
+            );
+        }
         for (name, descriptor) in [
             ("<init>", "(Ljava/io/InputStream;)V"),
             ("<init>", "(Ljava/io/InputStream;I)V"),
-            ("read", "()I"),
-            ("read", "([BII)I"),
             ("skip", "(J)J"),
             ("available", "()I"),
             ("mark", "(I)V"),
