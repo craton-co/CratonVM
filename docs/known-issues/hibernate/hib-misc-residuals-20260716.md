@@ -499,6 +499,96 @@ pinned to a specific faulty line — declined to guess). Probe sources left at
 `/data/data/tmp/MultiMethodProbeRunner.java`, `/data/data/tmp/DiscoveryOnlyProbe.java`,
 and `/data/data/tmp/BigIntRepro.java` on the shared host for reuse.
 
+## Update 2026-07-17 (follow-up session): `longRadix`/`digitsPerLong` clinit gap FOUND and FIXED (real, distinct bug) — but does NOT resolve this AIOOBE; JIT-tier-enqueue evidence narrows the suspect list to `MutableBigInteger.divide`/`divideKnuth`/`normalize`/`compare`, still OPEN
+
+Picked up this doc's own "next step" (get `CRATONVM_DBG_TIER_ENQUEUE` correlated
+against failures) plus independently investigated the `longRadix`/`digitsPerLong`
+static-init angle the previous entry flagged but didn't confirm either way.
+
+**A real, distinct, now-FIXED bug was found first, before the JIT angle.**
+`vm/src/vm/vm_util.rs`'s `post_clinit_fixup` for `java/math/BigInteger` already
+force-populates `ZERO`/`ONE`/`TWO`/`NEGATIVE_ONE`/`TEN` because real-JDK
+`BigInteger.<clinit>` is documented (in that same function, comment predates this
+session) to not reliably complete under CratonVM. That fixup never touched
+`digitsPerLong`/`longRadix` — the 37-element radix-conversion tables
+`smallToString` indexes (`java.base/java/math/BigInteger.java`, extracted from
+this build's own `jdk25/lib/src.zip`: both are plain array-literal statics
+populated via `valueOf(0x...)` calls inside the same `<clinit>`, **not** lazily
+computed via `pow()`/`square()` as the previous entry speculated — direct source
+inspection settles that open question). Extended the existing fixup to also
+force-populate both tables with the real JDK's own constants, using the same
+`make_or_patch_bi`/`set_static_by_name` idiom already established for the five
+named constants. Landed as `f725589c` on `dev` (commit message has the full
+before/after detail).
+
+**This fix is real and necessary in general, but it is NOT what's causing
+`DefaultCatalogAndSchemaTest`'s residual AIOOBE — confirmed, not assumed:**
+- A reflection dump taken *immediately after* the AIOOBE fires (patched into a
+  `MultiMethodRunner` harness added this session) shows `longRadix.length=37` and
+  `longRadix[35]=3379220508056640625` (the correct JDK value) at the moment of
+  failure, on the *same run* that just threw. The table is not corrupted, wrong,
+  or truncated when the crash happens — directly answering the previous entry's
+  open question ("could `longRadix`'s static-init be a shared suspect?") with a
+  concrete no.
+- Three separate isolated probes — a raw `BigInteger.valueOf(...).toString(35)`
+  loop (up to 129-bit magnitudes), a `new BigInteger(1, digest).toString(35)` loop
+  matching Hibernate's exact construction (50 random 128-bit digests, then 3000
+  more in a single long-running process to force JIT tier-up), and 2000 calls
+  through the *real* `org.hibernate.boot.model.naming.NamingHelper.hashedName()`
+  — all pass 100% clean against the fixed binary. The fix is correct and
+  sufficient for every reproduction narrower than the full multi-method Hibernate
+  scenario.
+- The minimal 2-method repro this doc's previous entry established
+  (`entityPersister` + `createSchema_fromSessionFactory` interleaved across the
+  12 `@ParameterizedClass` options, via a `MultiMethodRunner` harness added this
+  session, similar in spirit to the previous entry's `MultiMethodProbeRunner`)
+  **still reproduces on the fixed binary**, byte-for-byte identical symptom
+  (`ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2` at
+  `BigInteger.smallToString`). This is the same conclusion the previous entry
+  already reached from a different angle (its 200,000-iteration standalone loop
+  also found zero failures) — two independent investigations, two different
+  probe styles, same result: the static radix tables are not the mechanism.
+
+**New, more specific lead for the actual (still open) bug.** Re-ran the minimal
+2-method repro under `CRATONVM_DBG_TIER_ENQUEUE=1`: `java/math/MutableBigInteger`'s
+`divide(...)`/`divide(...,Z)`/`divideKnuth(...)`/`normalize()`/`compare(...)`/
+`toBigInteger(I)` **all get enqueued for C1 compilation together, at the same
+invocation count (1524) and same instant (~72-94s into the run)**, shortly before
+the failure fires later in the run. This is the exact call chain `smallToString`'s
+digit-group loop drives (`MutableBigInteger.divide` → `divideKnuth` for the
+Knuth Algorithm-D long division that peels off each base-35 digit group). A
+`--nojit` rerun of the identical 2-method repro (same fixed binary) passes 24/24
+clean, confirming — as the previous entry's own `--nojit` bisection already
+showed on the unfixed binary — that JIT involvement is necessary for the failure
+to manifest, and now additionally pointing at `MutableBigInteger`'s Knuth-division
+family specifically as the tier-up event that immediately precedes it, rather than
+`smallToString`/`BigInteger.toString` themselves (which are comparatively trivial
+wrappers around the division loop).
+
+**Still not pinned to a specific line or confirmed as a genuine JIT codegen bug
+vs. a GC/compile-timing interaction** — consistent with the previous entry's own
+assessment that this needs either a JIT-compiler-thread trace during the exact
+failing compile/install event, or line-level disassembly of the compiled
+`divideKnuth`/`divide` to compare against the interpreter's semantics. Not
+pursued further this session given the time already spent reconciling the
+`longRadix` angle and this task's primary scope (BatchTest/SmokeTests
+re-verification, budgeted as this session's other two items). **Next step for a
+follow-up session:** disassemble the JIT-compiled `MutableBigInteger.divideKnuth`
+(this codebase's JIT disassembly diagnostic, e.g. `CRATONVM_DBG_JIT_DISASM`) for
+the specific method/tier combination logged above, and compare against the
+interpreter's array-bounds/loop-trip-count computation for the same inputs —
+`divideKnuth`'s array-index/loop-bound arithmetic (a complex multi-word Knuth
+Algorithm D implementation, `MutableBigInteger.java`) is the most promising
+concrete place to look for a register-allocation or loop-bound miscompilation,
+per this session's tier-enqueue correlation.
+
+**Verification of this session's own fix:** `cargo test --release -p cratonvm-vm
+--lib vm_util` — 39/39 pass, no regressions. Build clean, no new warnings beyond
+pre-existing ones. Reproduction harnesses (`MethodRunner.java`,
+`MultiMethodRunner.java`, `ResourceLoopProbe.java`, `BigIntRadixProbe.java`,
+`BigIntCtorProbe.java`/`BigIntCtorProbe2.java`, `HashedNameProbe.java`) left in
+`/data/hib-baseline-runner-20260716/` on the shared host for reuse.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
