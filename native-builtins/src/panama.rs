@@ -685,25 +685,17 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     // byteSize() → long
     r.register(ms, "byteSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Long(size)))
+        Ok(Some(Value::Long(crate::panama_libffi::segment_byte_size(
+            ctx, this,
+        ))))
     });
 
     // address() → long (raw pointer as long)
     r.register(ms, "address", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let ptr = match ctx.get_field(this, 0) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        let off = match ctx.get_field(this, 5) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        Ok(Some(Value::Long(ptr + off)))
+        Ok(Some(Value::Long(crate::panama_libffi::segment_address(
+            ctx, this,
+        ))))
     });
 
     // isNative() → boolean (always true for our segments)
@@ -830,23 +822,39 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
             };
-            let base_ptr = match ctx.get_field(this, 0) {
-                Value::Long(n) => n,
-                _ => 0,
+            let size = crate::panama_libffi::segment_byte_size(ctx, this);
+            let end = offset.checked_add(new_size);
+            if offset < 0 || new_size < 0 || end.map_or(true, |n| n > size) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: format!(
+                        "slice offset {} + size {} exceeds segment size {}",
+                        offset, new_size, size
+                    ),
+                }
+                .into());
+            }
+            let base_ptr = crate::panama_libffi::segment_address(ctx, this);
+            let slice_ptr = base_ptr.checked_add(offset).ok_or_else(|| {
+                MethodCallFailed::from(RuntimeError::IllegalStateException {
+                    message: "address arithmetic overflow in MemorySegment.asSlice".into(),
+                })
+            })?;
+            // A synthetic slice cannot retain the real implementation's
+            // private scope object.  It stores an already-adjusted absolute
+            // address instead, which is valid for both real and synthetic
+            // source segments and avoids treating real field 0/5 as ptr/off.
+            let read_only = match ctx.get_field_by_name(this, "readOnly") {
+                Value::Int(n) => Value::Int(n),
+                _ => ctx.get_field(this, 3),
             };
-            let base_off = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let arena_val = ctx.get_field(this, 2);
 
             let slice = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
-            ctx.set_field(slice, 0, Value::Long(base_ptr));
+            ctx.set_field(slice, 0, Value::Long(slice_ptr));
             ctx.set_field(slice, 1, Value::Long(new_size));
-            ctx.set_field(slice, 2, arena_val);
-            ctx.set_field(slice, 3, ctx.get_field(this, 3)); // inherit read-only
-            ctx.set_field(slice, 4, ctx.get_field(this, 4)); // retain alive/kind marker
-            ctx.set_field(slice, 5, Value::Long(base_off + offset));
+            ctx.set_field(slice, 2, Value::Object(None));
+            ctx.set_field(slice, 3, read_only);
+            ctx.set_field(slice, 4, Value::Int(1));
+            ctx.set_field(slice, 5, Value::Long(0));
             Ok(Some(Value::Object(Some(slice))))
         },
     );
@@ -1196,32 +1204,12 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
 
-            let src_ptr = match ctx.get_field(src, 0) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let src_off = match ctx.get_field(src, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let dst_ptr = match ctx.get_field(dst, 0) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let dst_off = match ctx.get_field(dst, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
+            let src_ptr = crate::panama_libffi::segment_address(ctx, src);
+            let dst_ptr = crate::panama_libffi::segment_address(ctx, dst);
 
             // Validate offsets against segment sizes to prevent out-of-bounds access
-            let src_size = match ctx.get_field(src, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let dst_size = match ctx.get_field(dst, 1) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
+            let src_size = crate::panama_libffi::segment_byte_size(ctx, src);
+            let dst_size = crate::panama_libffi::segment_byte_size(ctx, dst);
 
             if bytes > 0 {
                 if bytes > MAX_COPY_SIZE {
@@ -1263,12 +1251,8 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 }
 
                 // Validate address arithmetic doesn't overflow
-                let src_total = (src_ptr as u64)
-                    .checked_add(src_off as u64)
-                    .and_then(|v| v.checked_add(src_offset as u64));
-                let dst_total = (dst_ptr as u64)
-                    .checked_add(dst_off as u64)
-                    .and_then(|v| v.checked_add(dst_offset as u64));
+                let src_total = (src_ptr as u64).checked_add(src_offset as u64);
+                let dst_total = (dst_ptr as u64).checked_add(dst_offset as u64);
 
                 if let (Some(s), Some(d)) = (src_total, dst_total) {
                     let src_addr = s as *const u8;
@@ -1324,19 +1308,8 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n as u8,
                 _ => 0,
             };
-            let ptr = match ctx.get_field(this, 0) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let off = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let size = match ctx.get_field(this, 1) {
-                Value::Long(n) => n as usize,
-                _ => 0,
-            };
-            let addr = (ptr + off) as *mut u8;
+            let size = crate::panama_libffi::segment_byte_size(ctx, this).max(0) as usize;
+            let addr = crate::panama_libffi::segment_address(ctx, this) as *mut u8;
             if size > 0 && !addr.is_null() {
                 if size > MAX_COPY_SIZE {
                     return Err(RuntimeError::IllegalStateException {
@@ -1378,18 +1351,8 @@ fn pe_segment_access_addr(
     offset: i64,
     width: i64,
 ) -> Result<usize, MethodCallFailed> {
-    let ptr = match ctx.get_field(seg, 0) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let base_off = match ctx.get_field(seg, 5) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let size = match ctx.get_field(seg, 1) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
+    let ptr = crate::panama_libffi::segment_address(ctx, seg);
+    let size = crate::panama_libffi::segment_byte_size(ctx, seg);
 
     // A 0-size segment (e.g. ofAddress before reinterpret) is not accessible.
     if size <= 0 {
@@ -1415,9 +1378,7 @@ fn pe_segment_access_addr(
     }
 
     // Validate address arithmetic doesn't overflow.
-    let total = (ptr as u64)
-        .checked_add(base_off as u64)
-        .and_then(|v| v.checked_add(offset as u64));
+    let total = (ptr as u64).checked_add(offset as u64);
     match total {
         Some(addr) if addr != 0 => Ok(addr as usize),
         Some(_) => Err(RuntimeError::IllegalStateException {
@@ -1861,7 +1822,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
     r.register(linker, "downcallHandle", "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/FunctionDescriptor;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
         let addr_seg = obj_arg(args, 1)?;
         let descriptor = obj_arg(args, 2)?;
-        let fn_addr = match ctx.get_field(addr_seg, 0) { Value::Long(n) => n, _ => 0 };
+        let fn_addr = crate::panama_libffi::segment_address(ctx, addr_seg);
 
         let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
         ctx.set_field(handle, 0, Value::Long(fn_addr));
@@ -1878,7 +1839,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let addr_seg = obj_arg(args, 1)?;
             let descriptor = obj_arg(args, 2)?;
-            let fn_addr = match ctx.get_field(addr_seg, 0) { Value::Long(n) => n, _ => 0 };
+            let fn_addr = crate::panama_libffi::segment_address(ctx, addr_seg);
 
             // Scan the option array for a firstVariadicArg option (kind=0).
             // Linker.Option synthetic layout: field 0 = kind (Int), field 1 = payload (Long).
@@ -3606,18 +3567,9 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
             Some(Value::Long(n)) => *n,
             _ => 0,
         };
-        let ptr = match ctx.get_field(this, 0) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
-        let base_off = match ctx.get_field(this, 5) {
-            Value::Long(n) => n,
-            _ => 0,
-        };
+        let ptr = crate::panama_libffi::segment_address(ctx, this);
         // Validate address arithmetic doesn't overflow (matches setUtf8String/copy)
-        let total = (ptr as u64)
-            .checked_add(base_off as u64)
-            .and_then(|v| v.checked_add(offset as u64));
+        let total = (ptr as u64).checked_add(offset as u64);
         let addr_val = match total {
             Some(v) => v,
             None => {
@@ -3641,8 +3593,8 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
         // wrapping a raw function pointer); the JDK rejects reading a
         // C string from such a segment, so we do too rather than blindly
         // scanning MAX_CSTR_LEN bytes from an unbounded address.
-        let seg_size = match ctx.get_field(this, 1) {
-            Value::Long(n) if n > 0 => {
+        let seg_size = match crate::panama_libffi::segment_byte_size(ctx, this) {
+            n if n > 0 => {
                 // Account for offset within the segment
                 let remaining = n - offset;
                 if remaining <= 0 {
@@ -3700,14 +3652,7 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
             let str_obj = obj_arg(args, 2)?;
             let s = ctx.read_string(str_obj).unwrap_or_default();
 
-            let ptr = match ctx.get_field(this, 0) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let base_off = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
+            let ptr = crate::panama_libffi::segment_address(ctx, this);
             // Bounds check: string + null terminator must fit within segment.
             // A segment with size 0 has unknown bounds (e.g. created via
             // ofAddress or wrapping a raw function pointer); writing to such a
@@ -3715,8 +3660,8 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
             // (getUtf8String) rejects zero-size segments, so the WRITE path must
             // be symmetric and reject them too rather than skipping the bounds
             // check and writing blindly to the raw address.
-            let seg_size = match ctx.get_field(this, 1) {
-                Value::Long(n) if n > 0 => n,
+            let seg_size = match crate::panama_libffi::segment_byte_size(ctx, this) {
+                n if n > 0 => n,
                 _ => {
                     return Err(RuntimeError::IllegalStateException {
                         message: "setUtf8String on a segment with unknown bounds \
@@ -3740,9 +3685,7 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
             }
 
             // Validate address arithmetic doesn't overflow
-            let total = (ptr as u64)
-                .checked_add(base_off as u64)
-                .and_then(|v| v.checked_add(offset as u64));
+            let total = (ptr as u64).checked_add(offset as u64);
             if let Some(addr_val) = total {
                 let addr = addr_val as *mut u8;
                 if !addr.is_null() {
@@ -3786,23 +3729,19 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
             };
-            let ptr = match ctx.get_field(this, 0) {
-                Value::Long(n) => n,
-                _ => 0,
+            let ptr = crate::panama_libffi::segment_address(ctx, this);
+            let read_only = match ctx.get_field_by_name(this, "readOnly") {
+                Value::Int(n) => Value::Int(n),
+                _ => ctx.get_field(this, 3),
             };
-            let off = match ctx.get_field(this, 5) {
-                Value::Long(n) => n,
-                _ => 0,
-            };
-            let arena_val = ctx.get_field(this, 2);
 
             let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
             ctx.set_field(seg, 0, Value::Long(ptr));
             ctx.set_field(seg, 1, Value::Long(new_size));
-            ctx.set_field(seg, 2, arena_val);
-            ctx.set_field(seg, 3, ctx.get_field(this, 3));
+            ctx.set_field(seg, 2, Value::Object(None));
+            ctx.set_field(seg, 3, read_only);
             ctx.set_field(seg, 4, Value::Int(1));
-            ctx.set_field(seg, 5, Value::Long(off));
+            ctx.set_field(seg, 5, Value::Long(0));
             Ok(Some(Value::Object(Some(seg))))
         },
     );

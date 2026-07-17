@@ -3013,6 +3013,16 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
+        if std::env::var("CRATONVM_DBG_DEFINE").is_ok()
+            && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
+        {
+            eprintln!(
+                "[DEFINE-DBG] define_class name={} loader_id={:?} bytes_len={}",
+                name,
+                loader_id,
+                bytes.len()
+            );
+        }
         // WP2.3: Reject too-short / non-CAFEBABE bytes up-front with a
         // typed ClassFormatError. The reader will catch malformed
         // bytes too, but a stronger pre-check produces clearer error
@@ -5493,6 +5503,16 @@ impl ClassManager {
         self.class_store
             .get(child_id)
             .is_some_and(|child| child.is_subclass_of(parent_id, &self.class_store))
+    }
+
+    /// Loader-identity-blind fallback for [`is_subclass_of`] -- see
+    /// `Class::is_subclass_of_by_name`'s doc comment for the full rationale
+    /// (exception-handler `catch_type` resolution needing to match a
+    /// same-named-but-different-`ClassId` exception class across loaders).
+    pub fn is_subclass_of_by_name(&self, child_id: ClassId, target_name: &str) -> bool {
+        self.class_store
+            .get(child_id)
+            .is_some_and(|child| child.is_subclass_of_by_name(target_name, &self.class_store))
     }
 
     /// Get a reference to the underlying class store.

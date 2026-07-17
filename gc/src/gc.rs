@@ -542,7 +542,22 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
             }
         }
     } else {
-        HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+        // object_body_size() honours the per-object GC_FLAG_COMPACT bit: a
+        // compact-layout instance stores its true body size (ref fields = 8B,
+        // primitive fields = 16B, packed by declared field, NOT a uniform
+        // num_slots*SLOT_SIZE) in the header's array_length. Using the plain
+        // num_slots*SLOT_SIZE legacy formula unconditionally here OVER-sizes
+        // every compact object (up to 8 bytes wasted per reference field),
+        // which corrupted evacuation: evacuate_object()/its equivalent below
+        // used this inflated size both to reserve destination space AND as
+        // the copy_nonoverlapping() length, desyncing every subsequent
+        // object's stride through the region from its actual body size.
+        // Root-caused via the JavaPoet LineWrapper NPE
+        // (docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md): LineWrapper
+        // mixes ref/primitive fields with its LAST field (nextFlush, a ref)
+        // landing at a compact byte offset the legacy formula never accounted
+        // for. Mirrors the already-correct gen_heap.rs::gen_object_total_size.
+        HEADER_SIZE + crate::object_body_size(header)
     }
 }
 

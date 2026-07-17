@@ -2179,15 +2179,37 @@ fn publish_jul_handlers(
     level: Option<ObjectRef>,
     message: Option<ObjectRef>,
 ) {
+    publish_jul_handlers_src(ctx, logger, level, message, None, None)
+}
+
+/// `publish_jul_handlers` with the caller-provided source class/method pair
+/// (`Logger.logp` args) stamped into each record so JULI's OneLineFormatter
+/// prints the real source instead of "null.null".
+fn publish_jul_handlers_src(
+    ctx: &mut dyn NativeContext,
+    logger: Option<ObjectRef>,
+    level: Option<ObjectRef>,
+    message: Option<ObjectRef>,
+    src_cls: Option<ObjectRef>,
+    src_mth: Option<ObjectRef>,
+) {
     let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
         return;
     };
+    // The record allocations below can move these; pin so each iteration
+    // re-reads the current addresses (native stale-local family).
+    let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
     let handlers = logger_handlers()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&read_jul_logger_name(ctx, logger))
         .cloned()
         .unwrap_or_default();
+    // Resolve the producing thread's Java tid once, BEFORE any record
+    // allocation below can move freshly-created objects.
+    let producer_tid = crate::current_java_thread_tid(ctx);
+    let producer_short_tid = crate::short_thread_id(producer_tid);
     for addr in handlers {
         // SAFETY: handlers are strongly referenced by Java-side LogCapture for
         // the whole interval they are registered; this is the same stable-ref
@@ -2207,6 +2229,20 @@ fn publish_jul_handlers(
         // sourceClassName, sourceMethodName, message. Keep a slot fallback for
         // the private-field resolver path used by compact allocations.
         ctx.set_field(record, 4, Value::Object(Some(message)));
+        // Records must carry the producing thread's id: JULI's OneLineFormatter
+        // resolves record.getLongThreadID() via ThreadMXBean.getThreadInfo(long),
+        // which throws IllegalArgumentException for the 0 an unpopulated record
+        // reports (seen as "ErrorManager: 5" on every AsyncFileHandler format).
+        ctx.set_field_by_name(record, "longThreadID", Value::Long(producer_tid));
+        ctx.set_field_by_name(record, "threadID", Value::Int(producer_short_tid));
+        if let Some((pin, obj)) = src_cls_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(src)));
+        }
+        if let Some((pin, obj)) = src_mth_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
+        }
         // Prefer the JDK setter too: it writes the resolved private slot even
         // when the compact allocator has not materialized field metadata yet.
         let _ = ctx.invoke_virtual(
@@ -2241,6 +2277,11 @@ fn publish_jul_handlers(
             &[Value::Object(Some(record))],
         );
     }
+    if let Some((pin, _)) = src_cls_pin {
+        ctx.unpin_native_roots(pin);
+    } else if let Some((pin, _)) = src_mth_pin {
+        ctx.unpin_native_roots(pin);
+    }
 }
 
 /// `java/util/logging/Logger.logp(Level, sourceClass, sourceMethod, msg)`
@@ -2272,6 +2313,17 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // The explicit source class/method pair JULI's DirectJDKLog resolves
+    // from the caller stack. Stamped into bridged records so
+    // OneLineFormatter prints the real source instead of "null.null".
+    let src_cls_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let src_mth_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -2295,9 +2347,16 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // explicitly installed handlers. Tomcat's LogCapture sets a logger to
         // FINE specifically to assert a recoverable handshake underflow.
         "FINE" | "FINER" | "FINEST" => {
-            publish_jul_handlers(ctx, this, level_obj, message_obj);
+            publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
             if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-                publish_to_jul_handlers(ctx, logger, level, message)?;
+                publish_to_jul_handlers_src(
+                    ctx,
+                    logger,
+                    level,
+                    message,
+                    src_cls_obj,
+                    src_mth_obj,
+                )?;
             }
             return Ok(None);
         }
@@ -2306,7 +2365,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
-    publish_jul_handlers(ctx, this, level_obj, message_obj);
+    publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
     if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
@@ -2331,7 +2390,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         eprintln!("{tag} [{logger_name}] {message}");
     }
     if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-        publish_to_jul_handlers(ctx, logger, level, message)?;
+        publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
     }
     Ok(None)
 }
@@ -2345,9 +2404,25 @@ fn publish_to_jul_handlers(
     level: ObjectRef,
     message: ObjectRef,
 ) -> MethodCallResult {
+    publish_to_jul_handlers_src(ctx, logger, level, message, None, None)
+}
+
+/// `publish_to_jul_handlers` with the caller-provided source class/method
+/// pair (`Logger.logp` args) stamped into the bridged record.
+fn publish_to_jul_handlers_src(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    level: ObjectRef,
+    message: ObjectRef,
+    src_cls: Option<ObjectRef>,
+    src_mth: Option<ObjectRef>,
+) -> MethodCallResult {
     let base_pin = ctx.pin_native_root(logger);
     let level_pin = ctx.pin_native_root(level);
     let message_pin = ctx.pin_native_root(message);
+    // Released with base_pin below (stack discipline).
+    let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
     let result = (|| {
         let logger = ctx.read_native_pin(base_pin, logger);
         let level = ctx.read_native_pin(level_pin, level);
@@ -2390,6 +2465,14 @@ fn publish_to_jul_handlers(
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
         ctx.set_field(record, 4, Value::Object(Some(message)));
+        if let Some((pin, obj)) = src_cls_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(src)));
+        }
+        if let Some((pin, obj)) = src_mth_pin {
+            let src = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
+        }
         let _ = ctx.invoke_virtual(
             record,
             "setMessage",
@@ -2439,14 +2522,28 @@ fn publish_to_jul_handlers(
     result
 }
 
-/// Resolve a JUL log message argument that is EITHER a `String` OR a
-/// `java.util.function.Supplier<String>` (invoke `get()` and read it).
+/// Render a JUL message value: read `String`s directly, invoke `get()` only
+/// on actual `java.util.function.Supplier` instances, and use `toString()`
+/// for ordinary parameter objects.
 fn jul_resolve_msg(ctx: &mut dyn NativeContext, o: ObjectRef) -> String {
     if let Some(s) = ctx.read_string(o) {
         return s;
     }
+    let supplier_class = ctx.class_id_by_name("java/util/function/Supplier");
+    let object_class = ctx.class_id_of_object(o);
+    if supplier_class.is_some_and(|supplier| {
+        object_class == supplier || ctx.is_subclass(object_class, supplier)
+    }) {
+        if let Ok(Some(Value::Object(Some(r)))) =
+            ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[])
+        {
+            if let Some(s) = ctx.read_string(r) {
+                return s;
+            }
+        }
+    }
     if let Ok(Some(Value::Object(Some(r)))) =
-        ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[Value::Object(Some(o))])
+        ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[])
     {
         if let Some(s) = ctx.read_string(r) {
             return s;

@@ -1,4 +1,35 @@
-# DoHead family — post-fix sporadic residual singletons (catalogue)
+# DoHead family — post-fix sporadic residuals (FIXED)
+
+**Status: CLOSED 2026-07-17.** This record is retained as an internal history
+because the former singleton failures were traced to aliasing of live NIO
+objects in native tables keyed only by Java identity hash code. Java identity
+hashes are stable across moving GC but are not unique; collisions made channel,
+SelectionKey, and Selector state cross-wire under the repeated Tomcat
+start/stop pressure used by this family.
+
+The fix buckets each table by stable identity hash and disambiguates the row by
+its ObjectRef. Those references are explicitly rooted and remapped after a
+moving collection. This covers SocketChannel/ServerSocketChannel synthetic
+state, SelectionKey state, and Selector-to-native-id state.
+
+## 2026-07-17 closure evidence
+
+- Commit: `fbd790c7 fix(nio): disambiguate identity hash side tables`.
+- Remote probe binary: `/data/data/cvm-dohead-postfix-eintr9-20260717`.
+- Exact closure matrix: `/data/data/dohead-postfix-eintr9-full-20260717`.
+  Configuration: 64 classes, one pass, two processes, `-Xmx1g`, 900-second
+  class timeout. `summary.txt` contains 64 `PASS` records, zero `FAIL`,
+  `TIMEOUT`, or `CRASH` records, and ends with `ALL_DONE` at 16:58:17 UTC.
+- The prior focused pressure reproducer
+  `TestHttpServletDoHeadInvalidWrite511ValidWrite511` passed eight concurrent
+  c9 runs (two independent lanes, four passes each), including the c7/c8
+  header, HTTP/2 EOF, and selector-stall trigger.
+- `cargo test -p cratonvm-native-io --lib -- --test-threads=1`: 349 passed,
+  zero failed.
+
+The sections below are the historical open checkpoint and observations that
+led to this resolution.
+
 
 ## 2026-07-16 closure attempt checkpoint
 

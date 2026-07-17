@@ -334,6 +334,37 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
+    // 8d. Cached "main" java.lang.ThreadGroup singleton
+    //     (`NativeContextImpl::get_or_create_main_thread_group`,
+    //     vm/src/vm/vm_exec.rs). This mirrors the `singleton_oom`/
+    //     `system_out`/`system_err`/`system_in` entries just above: the
+    //     cache is a bare `SharedVm` field, not itself reachable through any
+    //     other root chain at the moment it is first published (a fresh
+    //     `Thread$FieldHolder.<init>` that is about to store it into
+    //     `holder.group` hasn't run yet), so without scanning it here a
+    //     moving GC that fires between the cache's publish and that store
+    //     can reclaim/relocate the object out from under the cache. Found
+    //     live via a `cratonvm-aio-dispatch-N` SIGSEGV
+    //     (`is_forwarded`/`get_header:1558` inside the `FieldHolder.<init>`
+    //     field-setter that consumes this very cache's value) that survived
+    //     the TOCTOU claim/wait/notify fix for the same function — the
+    //     claim/wait/notify fix closes the *concurrent-double-build* race,
+    //     but does nothing for a *single*, correctly-built group going
+    //     stale on a *later* GC once every builder/waiter has already
+    //     returned. try_read (not read): `get_or_create_main_thread_group`
+    //     briefly holds the write lock only for the final store (never
+    //     across an allocation), so contention here is transient, but
+    //     mirror the try_read convention used by the adjacent
+    //     system-streams scan rather than assume that can never coincide
+    //     with a GC-safepoint poll.
+    {
+        if let Some(g) = shared.main_thread_group.try_read() {
+            if let Some(tg_ref) = *g {
+                roots.push(tg_ref);
+            }
+        }
+    }
+
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
         shared.jni_global_refs.lock().collect_roots(&mut roots);
@@ -674,6 +705,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key
     //     reachable only through sk_table could be swept before the remap ran.
     cratonvm_native_io::nio_selector::gc_scan_selector_roots(&mut roots);
+    cratonvm_native_io::socket_channel::gc_scan_channel_roots(&mut roots);
     //     ScheduledThreadPoolExecutor pending runnables (stored as relocatable
     //     addresses; remap companion `scheduled_pump::gc_update_scheduled_refs`).
     cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(&mut roots);

@@ -67,10 +67,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// unconditionally: bounded by `class_mirrors.len()`, each entry a single
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
-pub fn rebuild_mirror_pins(
-    shared: &crate::vm::SharedVm,
-    pointer_map: &HashMap<usize, usize>,
-) {
+pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
     let class_mirrors = shared.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
@@ -408,6 +405,36 @@ pub fn update_all_roots(
         }
     }
 
+    // 6d. Cached "main" java.lang.ThreadGroup singleton
+    //     (`SharedVm::main_thread_group`). The root scan keeps it ALIVE
+    //     (memory/roots.rs step 8d), but — exactly like `singleton_oom`
+    //     just above — the cache is a bare `SharedVm` field that no other
+    //     remap step covers, so without this a moving GC that relocates the
+    //     group after it is published leaves the cache pointing at
+    //     from-space. Every later reader of the cache (including
+    //     `get_or_create_main_thread_group`'s own fast path, and
+    //     `build_thread_field_holder`'s use of its return value) then hands
+    //     out a dangling `ObjectRef`, which crashes the next
+    //     `FieldHolder.<init>` field-setter that stores it into
+    //     `holder.group` (`is_forwarded`/`get_header:1558`, confirmed live
+    //     on a `cratonvm-aio-dispatch-N` thread). try_write mirrors the
+    //     system-streams convention below: `get_or_create_main_thread_group`
+    //     only ever holds the write lock for the single final-store
+    //     assignment (never across an allocation), so a locked slot here
+    //     means that store is mid-flight and its value is about to be
+    //     overwritten anyway.
+    {
+        if let Some(mut tg) = shared.main_thread_group.try_write() {
+            if let Some(ref mut obj_ref) = *tg {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+
     // 7. System streams (System.out, System.err)
     // 7. System streams (System.out, System.err, System.in)
     //
@@ -508,6 +535,7 @@ pub fn update_all_roots(
     // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
     // early-returns when nothing moved (non-moving GC).
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
+    cratonvm_native_io::socket_channel::channel_fields_update_after_gc(pointer_map);
 
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {

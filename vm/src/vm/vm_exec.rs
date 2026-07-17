@@ -1121,7 +1121,10 @@ fn safe_native_call_impl(
                 {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-                    let top = thread
+                    // The cached-dispatch callback pointer often has no ring
+                    // name; the top Java frame names the method this native
+                    // implements, which is the actionable identity.
+                    let java_site = thread
                         .frames
                         .last()
                         .map(|f| {
@@ -1134,11 +1137,12 @@ fn safe_native_call_impl(
                         })
                         .unwrap_or_default();
                     tracing::warn!(
-                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale                          (already-evacuated) ref 0x{:x} - healed to 0x{:x}                          (invoked from {})",
+                        "CRATONVM_DBG_STALE_OBJREF: native {} (invoked from {}) returned a \
+                         stale (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
                         callee,
+                        java_site,
                         o.as_ptr() as usize,
                         healed.as_ptr() as usize,
-                        top,
                     );
                 }
                 *o = healed;
@@ -2597,6 +2601,24 @@ impl<'a> NativeContextImpl<'a> {
         let group = self.get_or_create_main_thread_group();
         // Re-read the (GC-remapped) holder after the group allocation.
         let holder = self.thread.native_pin_roots[pin_base];
+        // `group` (whether freshly built by this call or served from the
+        // `main_thread_group` cache — including the claim/wait/notify path's
+        // "another thread is building, wait then re-read" branch) is a bare
+        // Rust local from here on. `SharedVm::main_thread_group` is itself a
+        // GC root now (memory/roots.rs step 8d / memory/gc.rs step 6d), so
+        // the CACHE stays live and gets remapped by any later GC — but this
+        // local `Copy` of the `ObjectRef` does not track that remap. Pin it
+        // alongside `holder` so the invoke below (which runs `<init>`
+        // bytecode and can itself trigger further moving GCs) can't leave it
+        // stale; confirmed live via a `cratonvm-aio-dispatch-N` SIGSEGV
+        // (`is_forwarded`/`get_header:1558`) inside the `FieldHolder.<init>`
+        // field-setter that stores this exact value into `holder.group`.
+        let group_idx = group.map(|g| {
+            let idx = self.thread.native_pin_roots.len();
+            self.thread.native_pin_roots.push(g);
+            idx
+        });
+        let group = group_idx.map(|idx| self.thread.native_pin_roots[idx]);
         let args = [
             Value::Object(Some(holder)),
             Value::Object(group), // ThreadGroup (may be None if group alloc failed)
@@ -2635,10 +2657,140 @@ impl<'a> NativeContextImpl<'a> {
     /// `(String)` ctor would recurse through
     /// `Thread.currentThread().getThreadGroup()` вЂ” our caller is the
     /// thread construction path itself, so that would loop.
+    ///
+    /// CONCURRENCY (fixes a confirmed TOCTOU race — see
+    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// follow-up #4"): the body below allocates two `ThreadGroup` objects
+    /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
+    /// cannot simply hold `main_thread_group`'s write lock across the
+    /// whole build — `RwLock` is not reentrant, and this same function is
+    /// reachable indirectly from inside a `<clinit>`/`<init>` it runs, and
+    /// concurrent GC-blocked-region waits must not stall holding a plain
+    /// lock across a safepoint. Instead this mirrors the codebase's own
+    /// JVMS §5.5 class-init claim/wait/notify idiom
+    /// (`vm_util::ensure_class_initialized_shared`,
+    /// `SharedVm::class_init_waiters`): exactly one thread transitions
+    /// `main_thread_group_init` `Idle -> InProgress` and performs the
+    /// build; every other concurrent caller blocks on the `InProgress`
+    /// claim's condvar — via the same deposit/enter_blocked/
+    /// arrive_and_wait/check_post_block_gc protocol class-init waiters use
+    /// — until the builder finishes and notifies, then re-checks the
+    /// (now-published) result instead of racing its own independent build.
     pub(crate) fn get_or_create_main_thread_group(&mut self) -> Option<ObjectRef> {
+        use std::sync::Arc;
         if let Some(obj) = *self.shared.main_thread_group.read() {
             return Some(obj);
         }
+        let current_thread_id = self.thread.thread_id.0;
+        loop {
+            // Try to claim the build under the (cheap, never held across an
+            // allocation) init-state lock; discover an in-progress build by
+            // someone else; or discover the result already landed while we
+            // were retrying.
+            let waiter = {
+                let mut init = self.shared.main_thread_group_init.lock();
+                match &*init {
+                    super::MainThreadGroupInit::InProgress {
+                        owner_thread,
+                        waiter,
+                    } => {
+                        if *owner_thread == current_thread_id {
+                            // Re-entrant call on the SAME thread that is
+                            // already building the group (e.g. a nested
+                            // currentThread() triggered from within
+                            // ThreadGroup's own <clinit>/<init>). Mirrors
+                            // JVMS §5.5 step 2's re-entrant rule for class
+                            // init ("release LC and complete normally"):
+                            // return None (no group yet) rather than
+                            // deadlocking on our own claim.
+                            return None;
+                        }
+                        Some(Arc::clone(waiter))
+                    }
+                    super::MainThreadGroupInit::Idle => {
+                        // Re-check under the lock: another thread may have
+                        // finished (or failed) a build between our
+                        // lock-free fast-path read above and acquiring
+                        // this lock.
+                        if let Some(obj) = *self.shared.main_thread_group.read() {
+                            return Some(obj);
+                        }
+                        *init = super::MainThreadGroupInit::InProgress {
+                            owner_thread: current_thread_id,
+                            waiter: Arc::new((
+                                parking_lot::Mutex::new(false),
+                                parking_lot::Condvar::new(),
+                            )),
+                        };
+                        None
+                    }
+                }
+            };
+
+            let Some(waiter) = waiter else {
+                // We claimed the build — proceed to the code below.
+                break;
+            };
+
+            // Someone else is building; block until they finish. Same
+            // GC-safe blocked-region protocol as class-init waiters: retire
+            // the TLAB, deposit a root snapshot, arrive-and-wait if a STW
+            // is already in flight so we don't strand a GC initiator, wait
+            // on the condvar (bounded, so a builder that somehow never
+            // notifies can't wedge us forever), then re-sync any
+            // cross-GC fixups before touching heap state again.
+            self.thread.tlab.retire();
+            self.deposit_root_snapshot();
+            let blk = self.shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = self
+                    .shared
+                    .gc_barrier
+                    .arrive_and_wait_auto(ThreadId(current_thread_id));
+            }
+            {
+                let (lock, cvar) = &*waiter;
+                let mut guard = lock.lock();
+                if !*guard {
+                    let _ = cvar.wait_for(&mut guard, std::time::Duration::from_secs(30));
+                }
+            }
+            drop(blk);
+            self.check_post_block_gc();
+            // Loop back to re-check: `Some` once the builder published a
+            // result; `Idle` (no result) if the builder failed, in which
+            // case we retry and may become the new builder ourselves.
+            if let Some(obj) = *self.shared.main_thread_group.read() {
+                return Some(obj);
+            }
+        }
+
+        // We are now the sole builder. This guard runs on EVERY exit path
+        // below (success, an early `None` return via `?`/`return`, or a
+        // panic unwind) so a builder that bails out never leaves waiters
+        // blocked for the full 30s timeout — or, worse, permanently wedges
+        // `main_thread_group_init` in `InProgress` for a thread that has
+        // already moved on.
+        struct FinishGuard<'s> {
+            shared: &'s SharedVm,
+        }
+        impl Drop for FinishGuard<'_> {
+            fn drop(&mut self) {
+                let prev = std::mem::replace(
+                    &mut *self.shared.main_thread_group_init.lock(),
+                    super::MainThreadGroupInit::Idle,
+                );
+                if let super::MainThreadGroupInit::InProgress { waiter, .. } = prev {
+                    let (lock, cvar) = &*waiter;
+                    *lock.lock() = true;
+                    cvar.notify_all();
+                }
+            }
+        }
+        let _finish_guard = FinishGuard {
+            shared: self.shared,
+        };
+
         let tg_class =
             <Self as NativeContext>::ensure_class_initialized(self, "java/lang/ThreadGroup")
                 .ok()?;
@@ -6104,13 +6256,57 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let term_monitor = match shared_arc.monitors.enter_inflated_or_contend(wake_obj, tid) {
                 Ok((monitor, contended)) => {
                     if contended {
+                        // GCBARRIER-LIVELOCK-FIX (2026-07-18): every other
+                        // `block_enter` call site in this codebase (see
+                        // `monitor_enter_blocking`, `monitor_enter_synchronized_method`)
+                        // deposits a root snapshot — which raises
+                        // `gc_block_state.in_blocked_region` — BEFORE calling
+                        // `GcBarrier::enter_blocked()`, exactly as
+                        // `Monitor::block_enter`'s own doc comment requires
+                        // ("The caller MUST have marked itself GC-blocked
+                        // first (deposit roots + `GcBarrier::enter_blocked`)").
+                        // This call site skipped the deposit: `enter_blocked()`
+                        // alone only bumps the barrier's legacy `threads_blocked`
+                        // atomic, but the production census
+                        // (`request_stw_counted_with_live_blocked` /
+                        // `alive_count_blocked_and_os_tids`) excludes a thread
+                        // from `expected` by reading `in_blocked_region`, NOT
+                        // that atomic. A STW requested AFTER `enter_blocked()`'s
+                        // `pre_stw` snapshot but WHILE this thread is still
+                        // parked in `monitor.block_enter()` below therefore
+                        // counted this (terminating) thread in `expected` —
+                        // and `block_enter()` never checks safepoints, so it
+                        // could never arrive. If the monitor's current owner
+                        // (e.g. a `Thread.join()` caller) was itself waiting
+                        // out that same pause before its next native call
+                        // could release the monitor (`Object.wait()`'s
+                        // release happens only once the native actually
+                        // runs), the result was the exact three-way deadlock
+                        // `block_enter`'s doc warns about — "owner waits GC,
+                        // contender waits owner, GC waits contender" — except
+                        // here the GC-blocked prerequisite was never met, so
+                        // the barrier's `expected` count permanently included
+                        // a slot no thread could ever satisfy: a real,
+                        // reproducible livelock under rapid thread churn
+                        // (root-caused live via gdb + `CRATONVM_DBG_STW_CENSUS`,
+                        // caught as a `blocked=false` alive thread wedged
+                        // between `thread-start:run-returned` and the
+                        // termination sequence's own later, correct
+                        // `deposit_root_snapshot()`).
+                        NativeContextImpl {
+                            shared: &shared_arc,
+                            thread: &mut jvm_thread,
+                        }
+                        .deposit_root_snapshot();
                         let blk = shared_arc.gc_barrier.enter_blocked();
                         if blk.pre_stw {
                             // GCAUDIT-0711-FIX (finding 1a): `_auto` for
                             // uniformity with every other barrier arrival —
-                            // this thread never raises `in_blocked_region`
-                            // before this point, so it resolves identically
-                            // to the old `arrive_and_wait`.
+                            // the deposit above just raised `in_blocked_region`,
+                            // so this pause's own census may have already
+                            // excluded us; only the exclusion snapshot the
+                            // census recorded (not this thread's guess) can
+                            // say which.
                             let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
                         }
                         monitor.block_enter(tid);
@@ -9787,6 +9983,29 @@ pub fn invoke_or_native(
         return Ok(None);
     }
 
+    // A JIT helper resolves virtual calls against the runtime custom-loader
+    // class, while these callbacks are deliberately registered on ClassLoader.
+    // Preserve the JDK null-name contract before inherited cached bytecode can
+    // turn a null resource lookup into a null return.
+    if args.len() == 2
+        && args.get(1).is_some_and(Value::is_null)
+        && matches!(
+            (method_name, descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // In real-JDK mode ClassLoader's registered bridge can be tagged as a
     // synthetic stub and therefore lose to the JDK bytecode selector. That
     // bytecode uses the flat global class store and breaks child/fork-loader
@@ -10096,12 +10315,46 @@ pub fn invoke_or_native(
 
     // For real (non-synthetic) classes, dispatch via invoke_on_class_shared
     // which handles ACC_NATIVE methods and bytecode execution.
+    //
+    // jit-invokestatic-clinit-gap fix (2026-07-17): fourth and final
+    // occurrence of the JVMS 5.5 class-init gap this session's sibling
+    // fixes have been closing (see jit_getstatic/jit_putstatic_*
+    // /jit_new_object in vm/src/jit/helpers.rs, and the
+    // callee_compiler/resolve_inline_site/try_jit_compile_callee_slow
+    // gates in vm/src/runtime/interpreter.rs) -- and the one that
+    // actually explained a synthetic repro (a JIT-compiled static method
+    // whose first-ever call reached, via a rare branch, an invokestatic
+    // to a static method of a class loaded-but-not-yet-initialized) that
+    // kept observing the bug even after all three JIT-side gates above
+    // were in place and correctly refusing their own fast paths: every
+    // one of them falls back, one way or another, to invoke_or_native --
+    // and THIS shortcut, taken whenever the target class is already
+    // LOADED (as opposed to not-yet-loaded, which the invoke_shared tail
+    // below handles correctly), calls straight into
+    // invoke_on_class_shared with no ensure_class_initialized_shared
+    // anywhere in between.
+    //
+    // Class.forName(name, false, loader) (JLS-sanctioned load-without-
+    // initialize) is the sharpest way to hit this -- LOADED but not yet
+    // INITIALIZED -- but it is not the only one. execute_invokestatic
+    // and execute_invoke_kind (this crate's own interpreter dispatch)
+    // both already call ensure_class_initialized_shared BEFORE reaching
+    // invoke_or_native, which is exactly why the plain-interpreted
+    // (CRATONVM_DISABLE_JIT=1) form of the repro was unaffected --
+    // masking this gap for every caller that happens to check first.
+    // Any caller that does NOT -- jit_invoke_dispatch's slow-path
+    // fallback being the concrete one found this session -- silently
+    // skips <clinit> for a call whose target class merely happens to
+    // already be loaded. Class-init state is monotonic, so this call is
+    // cheap (a single atomic load) once initialized and can never
+    // regress an already-initialized class back to needing the check.
     {
         let cm = shared.class_manager.read();
         if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
                     drop(cm);
+                    super::ensure_class_initialized_shared(shared, thread, class_id)?;
                     return invoke_on_class_shared(
                         shared,
                         thread,
@@ -10809,6 +11062,18 @@ pub(super) fn proxy_invoke_handler(
         "parameterTypes",
         Value::Object(Some(param_arr)),
     );
+    // `Method.getExceptionTypes()` is specified to return a non-null Class[]
+    // and proxy InvocationHandlers receive this synthesized Method directly.
+    // Keep the real declared throws clause instead of inheriting alloc_object's
+    // null default (Spring's ReflectionUtils iterates this array unconditionally).
+    let exception_arr =
+        proxy_method_exception_types(ctx.shared, declaring_mirror, method_name, descriptor);
+    proxy_method_set_field_by_name(
+        ctx.shared,
+        method_obj,
+        "exceptionTypes",
+        Value::Object(Some(exception_arr)),
+    );
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(
         ctx.shared,
@@ -10851,6 +11116,9 @@ pub(super) fn proxy_invoke_handler(
         ctx.shared
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
+        ctx.shared
+            .heap
+            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
         // Silence "zero_mirror unused" — kept above to preserve the
         // original allocation flow.
         let _ = zero_mirror;
@@ -11176,6 +11444,16 @@ pub(crate) fn proxy_invoke_handler_shared(
         "parameterTypes",
         Value::Object(Some(param_arr)),
     );
+    // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
+    // observe a non-null, accurately populated Method.exceptionTypes array.
+    let exception_arr =
+        proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
+    proxy_method_set_field_by_name(
+        shared,
+        method_obj,
+        "exceptionTypes",
+        Value::Object(Some(exception_arr)),
+    );
     proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(
         shared,
@@ -11209,6 +11487,9 @@ pub(crate) fn proxy_invoke_handler_shared(
         shared
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
+        shared
+            .heap
+            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
     }
     // Silence "zero_mirror unused" — kept above to preserve the original
     // allocation flow.
@@ -11460,6 +11741,49 @@ fn proxy_method_declared_exceptions(
         }
     }
     Vec::new()
+}
+
+/// Build the `Class[]` stored in the synthetic `Method.exceptionTypes` field
+/// supplied to an `InvocationHandler`. Unlike the backing object's default
+/// null, this is always an array, including when the proxied method has no
+/// `Exceptions` attribute. The declaring interface is already resolved by the
+/// proxy dispatch path, so its classfile attribute is authoritative.
+fn proxy_method_exception_types(
+    shared: &SharedVm,
+    declaring_mirror: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+) -> ObjectRef {
+    let class_component = shared
+        .class_manager
+        .write()
+        .load_class("java/lang/Class")
+        .unwrap_or(ClassId::new(0));
+    let declaring_class = shared
+        .class_mirrors_reverse
+        .read()
+        .get(&declaring_mirror)
+        .copied();
+    let declared = declaring_class
+        .map(|class_id| {
+            proxy_method_declared_exceptions(shared, class_id, method_name, descriptor)
+        })
+        .unwrap_or_default();
+    let exception_arr = shared.heap.alloc_array(
+        class_component,
+        crate::memory::heap::ArrayElementType::Reference,
+        declared.len(),
+    );
+    for (index, exception_name) in declared.iter().enumerate() {
+        let exception_mirror =
+            proxy_descriptor_to_class_mirror(shared, &format!("L{exception_name};"));
+        let _ = shared.heap.set_array_element(
+            exception_arr,
+            index,
+            Value::Object(Some(exception_mirror)),
+        );
+    }
+    exception_arr
 }
 
 /// Shared-interpreter version of `annotation_proxy_invoke`.
@@ -13443,13 +13767,21 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/logging/Logger"
                             && (method_name == "getResourceBundleName"
                                 || method_name == "getResourceBundle"))
-                        // B3: ClassLoader.getResources / getSystemResources
-                        // have real-JDK bytecode but that bytecode walks
-                        // URLClassPath (which NPEs during <clinit>). Force
-                        // the native override ahead of the bytecode.
+                        // B3: ClassLoader resource methods have real-JDK
+                        // bytecode but that bytecode walks URLClassPath (which
+                        // is deliberately shimmed in CratonVM).  Force the
+                        // native overrides ahead of it.  The singular and
+                        // stream forms must be in the same group as the bulk
+                        // forms: EmbeddedImplClassLoader relies on them while
+                        // resolving its per-loader IMPL-JARS and otherwise a
+                        // null name silently returns null instead of NPE.
                         || (class_name == "java/lang/ClassLoader"
                             && (method_name == "getResources"
-                                || method_name == "getSystemResources"))
+                                || method_name == "getSystemResources"
+                                || method_name == "getResource"
+                                || method_name == "getSystemResource"
+                                || method_name == "getResourceAsStream"
+                                || method_name == "getSystemResourceAsStream"))
                         // WildFly process-controller bootstrap: real
                         // ServerSocket.getLocalSocketAddress() is Java bytecode
                         // that builds from ServerSocket's internal impl fields.
@@ -15467,17 +15799,24 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // `ClassLoader.loadClass` is backed by concrete JDK bytecode,
-                        // but CratonVM supplies the actual loader-aware implementation
-                        // as a native.  Let that native win when an inherited base
-                        // method is selected; direct subclass overrides still resolve
-                        // on their own declaring class and continue to run normally.
+                        // ClassLoader's concrete JDK bytecode reads URLClassPath state
+                        // that CratonVM replaces with loader-aware natives.  Let the
+                        // native win for the inherited base methods; direct subclass
+                        // overrides still resolve on their own declaring class and run
+                        // normally.  Besides preserving per-loader resource isolation,
+                        // this preserves ClassLoader's specified NPE contract for a
+                        // null resource name.
                         || (class_name == "java/lang/ClassLoader"
-                            && method_name == "loadClass"
                             && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;)Ljava/lang/Class;"
-                                    | "(Ljava/lang/String;Z)Ljava/lang/Class;"
+                                (method_name, descriptor),
+                                ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                                    | ("loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;")
+                                    | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getSystemResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                                    | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getSystemResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                                    | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                                    | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                             ));
                     if check_override
                         && shared

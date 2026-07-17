@@ -1155,6 +1155,30 @@ impl ClassPath {
         Self::find_in_archive(archive, name)
     }
 
+    /// Return the physical entry selected for a multi-release lookup.
+    ///
+    /// Resource URLs must name this physical entry, not the logical base name:
+    /// callers such as `URL.openStream()` re-open the URL and therefore cannot
+    /// recover a version choice made only while probing the archive.  Returning
+    /// `p/res.txt` for an effective `META-INF/versions/17/p/res.txt` made a
+    /// multi-release class load use the right bytes while its corresponding
+    /// resource URL exposed the base bytes.
+    fn multi_release_entry_name(
+        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
+        entry_index: &FxHashSet<String>,
+        name: &str,
+    ) -> Option<String> {
+        let present = Self::ensure_versions_cache(archive, versions_cache);
+        for &ver in present.range(9..=JVM_FEATURE_VERSION).rev() {
+            let versioned = format!("META-INF/versions/{ver}/{name}");
+            if entry_index.contains(&versioned) {
+                return Some(versioned);
+            }
+        }
+        entry_index.contains(name).then(|| name.to_string())
+    }
+
     fn build_archive_entry_index(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> FxHashSet<String> {
         let mut index = FxHashSet::default();
         for i in 0..archive.len() {
@@ -3273,16 +3297,10 @@ impl ClassPath {
                         }
                         continue;
                     }
-                    let direct = if *multi_release {
-                        Self::find_in_multi_release_archive(
-                            archive,
-                            versions_cache,
-                            Some(entry_index),
-                            name,
-                        )
-                        .is_some()
+                    let direct_entry = if *multi_release {
+                        Self::multi_release_entry_name(archive, versions_cache, entry_index, name)
                     } else {
-                        Self::find_in_indexed_archive(archive, entry_index, name).is_some()
+                        entry_index.contains(name).then(|| name.to_string())
                     };
                     // HotSpot's URLClassLoader matches a request for `cnf` against
                     // a `cnf/` directory entry inside a JAR. Without the slash-
@@ -3290,23 +3308,23 @@ impl ClassPath {
                     // the JAR clearly contains the directory, breaking DaCapo's
                     // `extractBenchmarkSet` (which dereferences the URL's
                     // protocol without a null check).
-                    let with_slash = if !direct && !name.ends_with('/') {
+                    let slash_entry = if direct_entry.is_none() && !name.ends_with('/') {
                         let alt = format!("{name}/");
                         if *multi_release {
-                            Self::find_in_multi_release_archive(
+                            Self::multi_release_entry_name(
                                 archive,
                                 versions_cache,
-                                Some(entry_index),
+                                entry_index,
                                 &alt,
                             )
-                            .is_some()
                         } else {
-                            Self::find_in_indexed_archive(archive, entry_index, &alt).is_some()
+                            entry_index.contains(&alt).then_some(alt)
                         }
                     } else {
-                        false
+                        None
                     };
-                    let found = direct || with_slash;
+                    let selected_entry = direct_entry.or(slash_entry);
+                    let found = selected_entry.is_some();
                     if dbg {
                         eprintln!(
                             "[GRES-DBG]   jar {} mr={} -> {}",
@@ -3323,11 +3341,7 @@ impl ClassPath {
                         // Strip UNC prefix \\?\ that canonicalize produces on Windows.
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
-                        let suffix = if with_slash {
-                            format!("{name}/")
-                        } else {
-                            name.to_string()
-                        };
+                        let suffix = selected_entry.expect("resource hit has an entry name");
                         urls.push(format!("jar:file:/{p}!/{suffix}"));
                     }
                 }

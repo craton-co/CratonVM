@@ -2828,6 +2828,127 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 crate::dispatch_trace::record_note(
                     "Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated",
                 );
+
+                // KC16 RBIGDEC.1 follow-up (2026-07-17, hib-defaultcatalog
+                // investigation): `smallToString`'s radix-conversion tables
+                // (`digitsPerLong`/`longRadix`, populated by JDK's own static
+                // array initializers evaluated inside this same `<clinit>`)
+                // are casualties of the identical incomplete-clinit failure
+                // fixed above for ZERO/ONE/TWO/NEGATIVE_ONE/TEN — but went
+                // unnoticed until now because nothing in the suite
+                // previously called `BigInteger.toString(radix)` for a
+                // radix other than the JDK's own internal fast paths.
+                // Hibernate's `NamingHelper.hashedName()` calls
+                // `toString(35)` to derive constraint-name hashes, hits
+                // `smallToString`'s `longRadix[35]`, and finds a truncated
+                // (length-2 instead of 37) array —
+                // `ArrayIndexOutOfBoundsException: Index 2 out of bounds for
+                // length 2` on `DefaultCatalogAndSchemaTest`'s foreign-key
+                // binding path (`CollectionBinder.bindOwnedManyToManyForeignKeyMappedBy`
+                // -> `Table.createUniqueKey` -> `ImplicitNamingStrategyJpaCompliantImpl`
+                // -> `NamingHelper.generateHashedConstraintName`). Only
+                // reproduces when 2+ distinct `@Test` methods run against
+                // the same `@ParameterizedClass` instance in one process
+                // (confirmed via isolated single-method `MethodRunner`
+                // reruns, all 12/12 clean; the failure needs a prior
+                // `entityPersister`-style invocation ahead of
+                // `createSchema_fromSessionFactory` in the same JVM to
+                // surface — consistent with a once-per-process clinit gap
+                // rather than a per-call bug). Force-populate both tables
+                // with the real JDK's own constants (`java.math.BigInteger`
+                // source, radices 2..=36; indices 0/1 are legitimately
+                // unused/null per the JDK's own doc comment on these
+                // fields).
+                const DIGITS_PER_LONG: [i32; 37] = [
+                    0, 0, 62, 39, 31, 27, 24, 22, 20, 19, 18, 18, 17, 17, 16, 16, 15, 15, 15, 14,
+                    14, 14, 14, 13, 13, 13, 13, 13, 13, 12, 12, 12, 12, 12, 12, 12, 12,
+                ];
+                const LONG_RADIX_HEX: [u64; 37] = [
+                    0,
+                    0,
+                    0x4000000000000000,
+                    0x383d9170b85ff80b,
+                    0x4000000000000000,
+                    0x6765c793fa10079d,
+                    0x41c21cb8e1000000,
+                    0x3642798750226111,
+                    0x1000000000000000,
+                    0x12bf307ae81ffd59,
+                    0x0de0b6b3a7640000,
+                    0x4d28cb56c33fa539,
+                    0x1eca170c00000000,
+                    0x780c7372621bd74d,
+                    0x1e39a5057d810000,
+                    0x5b27ac993df97701,
+                    0x1000000000000000,
+                    0x27b95e997e21d9f1,
+                    0x5da0e1e53c5c8000,
+                    0x0b16a458ef403f19,
+                    0x16bcc41e90000000,
+                    0x2d04b7fdd9c0ef49,
+                    0x5658597bcaa24000,
+                    0x06feb266931a75b7,
+                    0x0c29e98000000000,
+                    0x14adf4b7320334b9,
+                    0x226ed36478bfa000,
+                    0x383d9170b85ff80b,
+                    0x5a3c23e39c000000,
+                    0x04e900abb53e6b71,
+                    0x07600ec618141000,
+                    0x0aee5720ee830681,
+                    0x1000000000000000,
+                    0x172588ad4f5f0981,
+                    0x211e44f7d02c1000,
+                    0x2ee56725f06e5c71,
+                    0x41c21cb8e1000000,
+                ];
+                let mut radix_fixed = false;
+                if let Some(dpl_arr) = shared.heap.try_alloc_array(
+                    ClassId::new(0),
+                    ArrayElementType::Int,
+                    DIGITS_PER_LONG.len(),
+                ) {
+                    for (i, &d) in DIGITS_PER_LONG.iter().enumerate() {
+                        let _ = shared.heap.set_array_element(dpl_arr, i, Value::Int(d));
+                    }
+                    if set_static_by_name("digitsPerLong", Value::Object(Some(dpl_arr))) {
+                        radix_fixed = true;
+                    }
+                }
+                if let Some(lr_arr) = shared.heap.try_alloc_array(
+                    class_id,
+                    ArrayElementType::Reference,
+                    LONG_RADIX_HEX.len(),
+                ) {
+                    for (i, &hex) in LONG_RADIX_HEX.iter().enumerate() {
+                        if i < 2 || hex == 0 {
+                            continue;
+                        }
+                        let mag_words: Vec<i32> = if hex <= 0xFFFF_FFFF {
+                            vec![hex as i32]
+                        } else {
+                            vec![(hex >> 32) as i32, (hex & 0xFFFF_FFFF) as i32]
+                        };
+                        if let Some(bi) = make_or_patch_bi(None, 1, &mag_words) {
+                            let _ = shared.heap.set_array_element(
+                                lr_arr,
+                                i,
+                                Value::Object(Some(bi)),
+                            );
+                        }
+                    }
+                    if set_static_by_name("longRadix", Value::Object(Some(lr_arr))) {
+                        radix_fixed = true;
+                    }
+                }
+                if radix_fixed {
+                    tracing::warn!(
+                        "Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated"
+                    );
+                    crate::dispatch_trace::record_note(
+                        "Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated",
+                    );
+                }
             } else {
                 tracing::warn!(
                     "Post-clinit fixup: BigInteger fixup skipped — signum/mag field indices not resolved"

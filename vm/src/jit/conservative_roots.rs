@@ -199,6 +199,19 @@ thread_local! {
     /// it be unchanged — any new compilation invalidates the memo and forces
     /// a fresh scan. Reset to `(usize::MAX, 0)` so the very first check
     /// always scans.
+    ///
+    /// 2026-07-17: the same "nothing above our current stack pointer can
+    /// change while nested below it" argument also covers the opposite
+    /// direction — recursing DEEPER (`search_lo < verified_lo`) with an
+    /// unchanged `code_range_count`. The once-verified `[verified_lo,
+    /// stack_high)` band is unaffected by descending further below it, so
+    /// `scan_active_jit_frames` only needs to scan the new incremental band
+    /// `[search_lo, verified_lo)` in that case, not the whole
+    /// `[search_lo, stack_high)` range again. See the caller for the
+    /// rationale and the throughput evidence that motivated it (a
+    /// perpetually-growing recursion depth, as in Hibernate/JUnit5's nested
+    /// call chains, previously paid a full stack rescan on every single
+    /// per-native-call root snapshot).
     static UNREG_JIT_VERIFIED_LO: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((usize::MAX, 0)) };
 }
@@ -1426,11 +1439,68 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
             let already_clean = code_ranges == verified_ranges && search_lo >= verified_lo;
             if !already_clean {
                 let high = current_thread_stack_high();
-                if high > search_lo && native_stack_has_jit_frame(search_lo, high) {
-                    scan_one_frame(search_lo, high, heap, out);
-                    cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
-                } else {
-                    UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                if high > search_lo {
+                    // Incremental fast path (2026-07-17 throughput fix): when the
+                    // code-range set is unchanged and we have recursed DEEPER
+                    // since the last verification (`search_lo < verified_lo`),
+                    // the once-verified `[verified_lo, high)` band is still
+                    // guaranteed clean by the exact same invariant documented on
+                    // `UNREG_JIT_VERIFIED_LO` above ("nothing above our current
+                    // stack pointer can change while we are nested below it") —
+                    // that argument is symmetric in shallower-vs-deeper: it only
+                    // depends on `[verified_lo, high)` lying entirely above
+                    // (numerically) the deepest point reached since it was
+                    // proven clean, which `search_lo < verified_lo` establishes
+                    // just as validly as the already-handled `search_lo >=
+                    // verified_lo` case above. Only the NEW incremental band
+                    // `[search_lo, verified_lo)` can possibly contain content
+                    // that has changed since the last check, so only it needs
+                    // scanning; if it comes back clean, extend the verified
+                    // boundary down to `search_lo` exactly as the shallow path
+                    // already does.
+                    //
+                    // Without this, a workload whose interpreter call depth
+                    // keeps growing (rather than staying flat or shrinking) —
+                    // e.g. Hibernate/JUnit5/H2's deeply nested reflective call
+                    // chains — re-scans the ENTIRE live native stack (up to the
+                    // 8 MiB cap in `native_stack_has_jit_frame`) on every single
+                    // per-native-call root snapshot once any method has
+                    // compiled, which profiling found to be the dominant cost
+                    // (`cratonvm_gc::gen_heap::GenerationalHeap::is_object_address`
+                    // + `update_root_snapshot` together ~66% of total CPU in a
+                    // `perf record` capture; `CRATONVM_DBG_ROOTSNAP` showed
+                    // per-call cost climbing from ~13us to ~64us over a
+                    // 400k-call `LockTest` run, vs. a flat ~2us with `--nojit`
+                    // or with compilation never completing). See
+                    // docs/known-issues/hibernate/hib-misc-residuals-20260716.md's
+                    // `LockTest` section for the full investigation.
+                    //
+                    // Falls back to the original full-range `[search_lo, high)`
+                    // scan whenever the incremental argument can't be proven
+                    // safe: the very first check (`verified_lo == usize::MAX`),
+                    // a `search_lo` that is not strictly deeper than
+                    // `verified_lo`, or a new compilation since the last check
+                    // (`code_ranges != verified_ranges`) — identical to
+                    // pre-fix behavior in all of those cases.
+                    let scan_hi = if code_ranges == verified_ranges
+                        && search_lo < verified_lo
+                        && verified_lo <= high
+                    {
+                        verified_lo
+                    } else {
+                        high
+                    };
+                    if native_stack_has_jit_frame(search_lo, scan_hi) {
+                        // A hit anywhere in the checked band still conservatively
+                        // marks (and flags) the FULL `[search_lo, high)` span —
+                        // unchanged from pre-fix behavior. Only the detection
+                        // scan itself is narrowed above, never the marking scope
+                        // once something is actually found.
+                        scan_one_frame(search_lo, high, heap, out);
+                        cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                    } else {
+                        UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
+                    }
                 }
             }
         }
@@ -1929,40 +1999,50 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         verify_precise_covers_conservative(info, cm, heap);
     }
 
-    // Map offsets are relative to the compiled frame's RBP.  The guard's
-    // `frame_base` is only the conservative scan bound; it is not an oop-map
-    // base for ordinary interpreter-to-JIT entries.
-    let slot_base = if info.exact_rbp != 0 {
-        info.exact_rbp
-    } else {
-        info.frame_base
-    };
+    // A GC runs inside a helper, so its instruction pointer cannot identify
+    // the suspended JIT caller. The emitter therefore writes the bytecode PC
+    // of the active safepoint into a dedicated `[rbp - sp_id_slot_off]` slot
+    // before every GC-capable call. Use that id to select ONE exact map for the
+    // innermost JIT frame, then follow the standard saved-RBP/return-address
+    // chain to select the exact map for each compiled caller as well. The old
+    // implementation scanned the union of every map in only the boundary
+    // method; besides retaining dead oops, it omitted maps belonging to nested
+    // JIT callers entirely.
+    let scanner_sp = current_stack_pointer();
+    if info.exact_rbp != 0
+        && info.exact_rbp & 0x7 == 0
+        && info.exact_rbp >= scanner_sp
+        && info.exact_rbp < info.frame_base
+    {
+        scan_active_oop_map_at_rbp(info.exact_rbp, cm, heap, out);
 
-    // Without call-frame introspection we can't directly recover the
-    // "current" native PC inside the active JIT frame. Two approaches
-    // are available; this implementation uses the simpler one:
-    //
-    //   1. (Used here) Enumerate EVERY oop map the method has and read
-    //      the corresponding slots. A slot that's live at one
-    //      safepoint but not another is read as junk at the second
-    //      safepoint — but validated via `heap.is_object_address` so
-    //      a non-oop reads as None and is dropped. This is
-    //      conservative-within-the-map: false positives filtered,
-    //      false negatives impossible given the union-of-all-maps.
-    //
-    //   2. (Future) Use frame-pointer walking to recover the exact
-    //      return PC, then binary-search the map table for the
-    //      matching safepoint. Requires the JIT to maintain RBP via
-    //      the standard prologue/epilogue, which current x64.rs
-    //      already does.
-    //
-    // Approach 1 is the correct choice for this session because it
-    // depends only on the oop-map data itself, not on a separate
-    // frame-walking routine that would need its own test battery.
-    // When approach 2 lands in a future session it can replace the
-    // loop below without touching any other code.
-    for map in &cm.oop_maps {
-        scan_oop_slots(slot_base, &map.frame_slot_offsets, heap, out);
+        let mut child_rbp = info.exact_rbp;
+        let mut guard = 0usize;
+        while guard < 4096 {
+            guard += 1;
+            // SAFETY: `child_rbp` is an aligned address in this thread's live
+            // JIT stack interval. The frame prologue establishes `[rbp]` as the
+            // caller RBP and `[rbp + 8]` as its return address.
+            let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+            let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+            let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                break;
+            };
+            if parent_rbp <= child_rbp
+                || parent_rbp & 0x7 != 0
+                || parent_rbp < scanner_sp
+                || parent_rbp >= info.frame_base
+            {
+                break;
+            }
+            // SAFETY: code ranges retain their CompiledMethod metadata for the
+            // lifetime of an active frame (the same contract as the relocation
+            // walker immediately above in this module).
+            let parent_cm: &cratonvm_jit::CompiledMethod =
+                unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+            scan_active_oop_map_at_rbp(parent_rbp, parent_cm, heap, out);
+            child_rbp = parent_rbp;
+        }
     }
     // T1.1.a — Conservative sweep between the scanner's current SP and
     // the captured frame base to cover any oop living in a spill slot
@@ -1973,25 +2053,51 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // spills between them; the sweep catches those. The
     // `heap.is_object_address` validation filters non-oop values so
     // false positives are harmless.
-    let scanner_sp = current_stack_pointer();
     scan_one_frame(scanner_sp, info.frame_base, heap, out);
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
 }
 
-/// Read each oop slot listed in `slot_offsets` (byte offsets relative
-/// to `frame_base`), validate via `heap.is_object_address`, and push
-/// any hit into `out`. Used by [`scan_one_frame_precise`].
-fn scan_oop_slots(
-    frame_base: usize,
-    slot_offsets: &[i16],
+/// Scan the one oop map selected by a live frame's safepoint-id slot.
+/// `rbp` must be the exact frame base established by the compiled prologue.
+/// A missing id or map deliberately scans nothing here: the caller's
+/// conservative compatibility backstop remains responsible for legacy and
+/// uncovered frames.
+fn scan_active_oop_map_at_rbp(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
     heap: &VmHeap,
     out: &mut Vec<ObjectRef>,
 ) {
+    let sp_id_slot_off = cm.sp_id_slot_off;
+    if sp_id_slot_off <= 0 || rbp < sp_id_slot_off as usize {
+        return;
+    }
+    let id_addr = rbp - sp_id_slot_off as usize;
+    if id_addr & 0x7 != 0 {
+        return;
+    }
+    // SAFETY: the safepoint id lives in the validated frame's reserved local
+    // slot. It is written before the helper call that can trigger this scan.
+    let safepoint_id = unsafe { (id_addr as *const usize).read() } as u32;
+    let Some(map) = cm.find_oop_map_for_safepoint_id(safepoint_id) else {
+        return;
+    };
+    scan_oop_slots(rbp, &map.frame_slot_offsets, heap, out);
+}
+
+/// Read each oop slot listed in `slot_offsets` (positive byte distances below
+/// `rbp`), validate via `heap.is_object_address`, and push any hit into `out`.
+/// Used by [`scan_one_frame_precise`].
+fn scan_oop_slots(rbp: usize, slot_offsets: &[i16], heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     for &offset in slot_offsets {
-        // Negative offsets index below RBP (locals / spills); positive
-        // offsets index above RBP (arguments / return area). Both
-        // are valid for the walker.
-        let addr = (frame_base as isize + offset as isize) as usize;
+        // x64 map entries are positive distances from RBP to slots in the
+        // downward-growing local/spill area: `off` means `[rbp - off]`.
+        // Reject malformed zero/negative entries rather than ever reading a
+        // saved RBP or return address as an oop slot.
+        if offset <= 0 || rbp < offset as usize {
+            continue;
+        }
+        let addr = rbp - offset as usize;
         // Alignment check defensively matches the conservative scan.
         if addr & 0x7 != 0 {
             continue;
@@ -2479,9 +2585,9 @@ mod tests {
         // uses a stable `Box<[usize; 3]>` so the compiler cannot elide
         // the stores and the offsets are deterministic.
         let slots: Box<[usize; 3]> = Box::new([obj_addr, 0xdead_beef_dead_beefusize, obj_addr]);
-        let frame_base = slots.as_ptr() as usize;
-        // Offsets are in bytes relative to frame_base.
-        let offsets: Vec<i16> = vec![0, 8, 16];
+        let frame_base = unsafe { slots.as_ptr().add(slots.len()) as usize };
+        // Map offsets are positive distances below RBP; use one-past-end as RBP.
+        let offsets: Vec<i16> = vec![24, 16, 8];
 
         let mut out = Vec::new();
         scan_oop_slots(frame_base, &offsets, &heap, &mut out);

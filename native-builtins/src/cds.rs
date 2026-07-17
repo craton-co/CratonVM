@@ -1441,6 +1441,13 @@ mod cds_tests {
         ) -> Result<(), String> {
             panic!("MockNativeContext: check_deep_reflection_access not implemented for testing")
         }
+        fn resolve_field_index_by_class_id(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+        ) -> Option<usize> {
+            panic!("MockNativeContext: resolve_field_index_by_class_id not implemented for testing")
+        }
         fn load_class(&mut self, _: &str) -> cratonvm_types::error::MethodCallResult {
             panic!("MockNativeContext: load_class not implemented for testing")
         }

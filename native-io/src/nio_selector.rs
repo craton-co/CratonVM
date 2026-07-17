@@ -894,7 +894,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
-        if err.kind() == ErrorKind::Interrupted {
+        if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
             return Ok(0);
         }
         // Closing from another thread may invalidate the epoll fd while this
@@ -1386,7 +1386,7 @@ fn kernel_select_poll(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed>
     };
     if n < 0 {
         let err = std::io::Error::last_os_error();
-        if err.kind() == ErrorKind::Interrupted {
+        if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
             return Ok(0);
         }
         return Err(ioex(format!("poll: {err}")));
@@ -1731,14 +1731,24 @@ pub fn take_any_pending_accepted(listener_fd: i32) -> Option<TcpStream> {
 /// every `select` threw `ClosedSelectorException`. We key the selector
 /// object to its native id by identity hash instead (the same pattern as the
 /// SelectionKey `sk_table`); openness lives in the native `SelectorState`.
-fn sel_obj_ids() -> &'static RwLock<HashMap<i32, i32>> {
-    static T: OnceLock<RwLock<HashMap<i32, i32>>> = OnceLock::new();
+struct SelectorObjId {
+    object: ObjectRef,
+    id: i32,
+}
+
+fn sel_obj_ids() -> &'static RwLock<HashMap<i32, Vec<SelectorObjId>>> {
+    static T: OnceLock<RwLock<HashMap<i32, Vec<SelectorObjId>>>> = OnceLock::new();
     T.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn selector_id_from_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
     let hash = ctx.identity_hash_code(obj);
-    if let Some(id) = sel_obj_ids().read().get(&hash).copied() {
+    if let Some(id) = sel_obj_ids()
+        .read()
+        .get(&hash)
+        .and_then(|bucket| bucket.iter().find(|entry| entry.object == obj))
+        .map(|entry| entry.id)
+    {
         return id;
     }
     // Legacy fallback for any synthetic-layout selector object.
@@ -1765,8 +1775,9 @@ fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
 fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // C27: side-table is now keyed by GC-stable identity hash code; the
     // stored `channel` is an `ObjectRef`, not a raw pointer.
-    let key = ctx.identity_hash_code(key_obj);
-    let channel = sk_table().read().get(&key).map(|s| s.channel)?;
+    let hash = ctx.identity_hash_code(key_obj);
+    let table = sk_table().read();
+    let channel = sk_find(&table, key_obj, hash)?.channel;
     // The channel's registry id lives in the socket_channel side-table now
     // (its F_REG_ID object slot collides with a real-JDK reference field).
     crate::socket_channel::channel_net_fd(ctx, channel)
@@ -1775,8 +1786,9 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // C27: identity-hash-code key + stored `ObjectRef` value (no
     // from_raw resurrection).
-    let key = ctx.identity_hash_code(key_obj);
-    let s = sk_table().read().get(&key).map(|s| s.selector)?;
+    let hash = ctx.identity_hash_code(key_obj);
+    let table = sk_table().read();
+    let s = sk_find(&table, key_obj, hash)?.selector;
     Some(selector_id_from_obj(ctx, s))
 }
 
@@ -1800,7 +1812,9 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // best-effort legacy path but are not relied upon.
     sel_obj_ids()
         .write()
-        .insert(ctx.identity_hash_code(obj), id);
+        .entry(ctx.identity_hash_code(obj))
+        .or_default()
+        .push(SelectorObjId { object: obj, id });
     let n = ctx.object_num_fields(obj);
     if n > SI_ID {
         ctx.set_field(obj, SI_ID, Value::Int(id));
@@ -1820,7 +1834,17 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if id != 0 {
         selector_close(id);
     }
-    sel_obj_ids().write().remove(&ctx.identity_hash_code(obj));
+    let hash = ctx.identity_hash_code(obj);
+    let mut ids = sel_obj_ids().write();
+    let remove_bucket = if let Some(bucket) = ids.get_mut(&hash) {
+        bucket.retain(|entry| entry.object != obj);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        ids.remove(&hash);
+    }
     if ctx.object_num_fields(obj) > SI_OPEN_FLAG {
         ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(0));
     }
@@ -1855,7 +1879,7 @@ fn selector_wakeup_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 /// blocking/poll select entry (it has the `ctx` needed to read channel state).
 fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
     // Snapshot keys that currently have no pollable OS handle but want events.
-    let candidates: Vec<(i32, i32)> = {
+    let candidates: Vec<(i32, ObjectRef)> = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else {
             return;
@@ -1863,17 +1887,18 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
         let st = s.lock();
         st.keys
             .values()
-            .filter(|k| k.interest_ops != 0 && k.key_hash != 0 && k.handle.os_handle().is_none())
-            .map(|k| (k.net_fd, k.key_hash))
+            .filter(|k| k.interest_ops != 0 && k.handle.os_handle().is_none())
+            .filter_map(|k| k.key_obj.map(|key| (k.net_fd, key)))
             .collect()
     };
     if candidates.is_empty() {
         return;
     }
-    for (old_fd, key_hash) in candidates {
+    for (old_fd, key_obj) in candidates {
         let channel = {
+            let hash = ctx.identity_hash_code(key_obj);
             let t = sk_table().read();
-            match t.get(&key_hash) {
+            match sk_find(&t, key_obj, hash) {
                 Some(s) => s.channel,
                 None => continue,
             }
@@ -1988,21 +2013,19 @@ fn selector_select_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn apply_ready_ops(_ctx: &mut dyn NativeContext, id: i32) {
     // C27: side-table is keyed by the SelectionKey's identity hash
     // code; carry the hash through instead of a raw pointer.
-    let snap: Vec<(i32, i32)> = {
+    let snap: Vec<(ObjectRef, i32)> = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else { return };
         let st = s.lock();
         st.keys
             .values()
-            .map(|k| (k.key_hash, k.ready_ops))
+            .filter_map(|k| k.key_obj.map(|obj| (obj, k.ready_ops)))
             .collect()
     };
     let mut table = sk_table().write();
-    for (hash, ready) in snap {
-        if hash == 0 {
-            continue;
-        }
-        if let Some(state) = table.get_mut(&hash) {
+    for (key, ready) in snap {
+        let hash = _ctx.identity_hash_code(key);
+        if let Some(state) = sk_find_mut(&mut table, key, hash) {
             state.ready_ops = ready;
         }
     }
@@ -2118,6 +2141,7 @@ fn selector_select_now_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // Mirrors `SEED_TABLE` (native-builtins/src/securerandom.rs) and the
 // `VH_META_TABLE` pattern (native-builtins/src/lang_invoke.rs).
 struct SkState {
+    key: ObjectRef,
     channel: ObjectRef,
     selector: ObjectRef,
     interest_ops: i32,
@@ -2126,10 +2150,25 @@ struct SkState {
     cancelled: bool,
 }
 
-fn sk_table() -> &'static parking_lot::RwLock<FxHashMap<i32, SkState>> {
-    static REG: std::sync::OnceLock<parking_lot::RwLock<FxHashMap<i32, SkState>>> =
+fn sk_table() -> &'static parking_lot::RwLock<FxHashMap<i32, Vec<SkState>>> {
+    static REG: std::sync::OnceLock<parking_lot::RwLock<FxHashMap<i32, Vec<SkState>>>> =
         std::sync::OnceLock::new();
     REG.get_or_init(|| parking_lot::RwLock::new(FxHashMap::default()))
+}
+
+fn sk_find(table: &FxHashMap<i32, Vec<SkState>>, key: ObjectRef, hash: i32) -> Option<&SkState> {
+    table.get(&hash)?.iter().find(|state| state.key == key)
+}
+
+fn sk_find_mut(
+    table: &mut FxHashMap<i32, Vec<SkState>>,
+    key: ObjectRef,
+    hash: i32,
+) -> Option<&mut SkState> {
+    table
+        .get_mut(&hash)?
+        .iter_mut()
+        .find(|state| state.key == key)
 }
 
 /// Post-GC hook — remap every ObjectRef stored in `sk_table` through the
@@ -2174,12 +2213,23 @@ pub fn sk_table_update_after_gc<S: std::hash::BuildHasher>(
             }
         }
     }
+    {
+        let mut ids = sel_obj_ids().write();
+        for bucket in ids.values_mut() {
+            for entry in bucket {
+                entry.object = remap(entry.object);
+            }
+        }
+    }
     let mut table = sk_table().write();
-    for state in table.values_mut() {
-        state.channel = remap(state.channel);
-        state.selector = remap(state.selector);
-        if let Some(att) = state.attachment {
-            state.attachment = Some(remap(att));
+    for bucket in table.values_mut() {
+        for state in bucket {
+            state.key = remap(state.key);
+            state.channel = remap(state.channel);
+            state.selector = remap(state.selector);
+            if let Some(att) = state.attachment {
+                state.attachment = Some(remap(att));
+            }
         }
     }
 }
@@ -2227,12 +2277,23 @@ pub fn gc_scan_selector_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
             }
         }
     }
+    {
+        let ids = sel_obj_ids().read();
+        for bucket in ids.values() {
+            for entry in bucket {
+                push(entry.object);
+            }
+        }
+    }
     let table = sk_table().read();
-    for state in table.values() {
-        push(state.channel);
-        push(state.selector);
-        if let Some(att) = state.attachment {
-            push(att);
+    for bucket in table.values() {
+        for state in bucket {
+            push(state.key);
+            push(state.channel);
+            push(state.selector);
+            if let Some(att) = state.attachment {
+                push(att);
+            }
         }
     }
 }
@@ -2242,9 +2303,9 @@ fn sk_state_get_field<F: FnOnce(&SkState) -> Value>(
     key: ObjectRef,
     f: F,
 ) -> Option<Value> {
-    let k = ctx.identity_hash_code(key);
+    let hash = ctx.identity_hash_code(key);
     let table = sk_table().read();
-    table.get(&k).map(f)
+    sk_find(&table, key, hash).map(f)
 }
 
 fn sk_state_with_mut<F: FnOnce(&mut SkState) -> R, R>(
@@ -2252,9 +2313,9 @@ fn sk_state_with_mut<F: FnOnce(&mut SkState) -> R, R>(
     key: ObjectRef,
     f: F,
 ) -> Option<R> {
-    let k = ctx.identity_hash_code(key);
+    let hash = ctx.identity_hash_code(key);
     let mut table = sk_table().write();
-    table.get_mut(&k).map(f)
+    sk_find_mut(&mut table, key, hash).map(f)
 }
 
 fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2328,17 +2389,19 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Value::Object(Some(o)) => Some(o),
         _ => None,
     };
-    sk_table().write().insert(
-        key_hash,
-        SkState {
+    sk_table()
+        .write()
+        .entry(key_hash)
+        .or_default()
+        .push(SkState {
+            key: key_obj,
             channel,
             selector: selector_obj,
             interest_ops: ops,
             ready_ops: 0,
             attachment: attachment_obj,
             cancelled: false,
-        },
-    );
+        });
 
     selector_register(sel_id, net_fd, ops, Some(key_obj), key_hash, kind)?;
 
@@ -2481,7 +2544,7 @@ fn sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // it before grabbing `selectors()` to keep the canonical
     // lock-order (selectors() before sk_table()) that `apply_ready_ops`
     // and `sk_table_update_after_gc` use.
-    let known = sk_table().read().contains_key(&key_hash);
+    let known = sk_state_get_field(ctx, this, |_| Value::Int(1)).is_some();
     sk_state_with_mut(ctx, this, |s| {
         s.interest_ops = ops;
     });
@@ -2504,7 +2567,7 @@ fn sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 let net_fd = st
                     .keys
                     .values_mut()
-                    .find(|k| k.key_hash == key_hash)
+                    .find(|k| k.key_obj == Some(this))
                     .map(|k| {
                         k.interest_ops = ops;
                         k.net_fd
@@ -2597,7 +2660,7 @@ fn sk_cancel_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let Some(target) = st
             .keys
             .iter()
-            .find(|(_, k)| k.key_hash == key_hash)
+            .find(|(_, k)| k.key_obj == Some(this))
             .map(|(fd, _)| *fd)
         else {
             continue;
@@ -3997,17 +4060,15 @@ mod tests {
         let sk_key = 0x7E57_0001_u32 as i32;
         {
             let mut table = sk_table().write();
-            table.insert(
-                sk_key,
-                SkState {
-                    channel,
-                    selector,
-                    interest_ops: OP_READ,
-                    ready_ops: 0,
-                    attachment: Some(attachment),
-                    cancelled: false,
-                },
-            );
+            table.entry(sk_key).or_default().push(SkState {
+                key: fake_ref(0x5500),
+                channel,
+                selector,
+                interest_ops: OP_READ,
+                ready_ops: 0,
+                attachment: Some(attachment),
+                cancelled: false,
+            });
         }
 
         // A selector whose key carries a non-null `key_obj`.
@@ -4043,17 +4104,15 @@ mod tests {
         let sk_key = 0x7E57_0003_u32 as i32;
         {
             let mut table = sk_table().write();
-            table.insert(
-                sk_key,
-                SkState {
-                    channel,
-                    selector,
-                    interest_ops: 0,
-                    ready_ops: 0,
-                    attachment: None,
-                    cancelled: false,
-                },
-            );
+            table.entry(sk_key).or_default().push(SkState {
+                key: fake_ref(0x6500),
+                channel,
+                selector,
+                interest_ops: 0,
+                ready_ops: 0,
+                attachment: None,
+                cancelled: false,
+            });
         }
 
         let mut roots: Vec<ObjectRef> = Vec::new();

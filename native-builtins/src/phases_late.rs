@@ -26315,67 +26315,83 @@ fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let bfa = "java/nio/file/attribute/BasicFileAttributes";
-    r.register(
-        bfa,
-        "creationTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+    // FileTreeWalker hands `Files.find` the concrete platform attributes
+    // implementation, and its predicate invokes `isRegularFile` virtually on
+    // that class.  Registering only on the BasicFileAttributes interface is
+    // insufficient when the interpreter resolves the concrete override first:
+    // every file then appeared non-regular and Files.find produced an empty
+    // stream for a mounted embedded JAR.
+    for attrs_class in [
+        "java/nio/file/attribute/BasicFileAttributes",
+        "sun/nio/fs/WindowsFileAttributes",
+        "sun/nio/fs/UnixFileAttributes",
+    ] {
+        r.register(
+            attrs_class,
+            "creationTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "creation");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(
+            attrs_class,
+            "lastAccessTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "access");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(
+            attrs_class,
+            "lastModifiedTime",
+            "()Ljava/nio/file/attribute/FileTime;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let millis = basic_file_attributes_time_millis(ctx, this, "modified");
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+            },
+        );
+        r.register(attrs_class, "isDirectory", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "creation");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(
-        bfa,
-        "lastAccessTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+            Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
+                ctx, this,
+            )))))
+        });
+        r.register(attrs_class, "isRegularFile", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "access");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(
-        bfa,
-        "lastModifiedTime",
-        "()Ljava/nio/file/attribute/FileTime;",
-        |ctx, args| {
+            Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
+                ctx, this,
+            )))))
+        });
+        r.register(attrs_class, "isSymbolicLink", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(attrs_class, "isOther", "()Z", |_ctx, _args| {
+            Ok(Some(Value::Int(0)))
+        });
+        r.register(attrs_class, "size", "()J", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let millis = basic_file_attributes_time_millis(ctx, this, "modified");
-            Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
-        },
-    );
-    r.register(bfa, "isDirectory", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(basic_file_attributes_is_dir(
-            ctx, this,
-        )))))
-    });
-    r.register(bfa, "isRegularFile", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
-            ctx, this,
-        )))))
-    });
-    r.register(bfa, "isSymbolicLink", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(bfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(bfa, "size", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
-    });
-    // `fileKey()` returns an object that uniquely identifies the file, or
-    // `null` if a file key is not available. The JDK Windows file system
-    // returns null when running on FAT-class volumes / network shares; we
-    // return null unconditionally — this is the documented JDK contract,
-    // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
-    // (the only `fileKey` consumer in the JDK walker) skip its identity
-    // comparison instead of throwing `AbstractMethodError`.
-    r.register(bfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+            Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
+        });
+        // `fileKey()` returns an object that uniquely identifies the file, or
+        // `null` if a file key is not available. The JDK Windows file system
+        // returns null when running on FAT-class volumes / network shares; we
+        // return null unconditionally — this is the documented JDK contract,
+        // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
+        // (the only `fileKey` consumer in the JDK walker) skip its identity
+        // comparison instead of throwing `AbstractMethodError`.
+        r.register(
+            attrs_class,
+            "fileKey",
+            "()Ljava/lang/Object;",
+            |_ctx, _args| Ok(Some(Value::Object(None))),
+        );
+    }
 
     // FileTime — see `filetime_alloc` / `filetime_read_millis`. The millis is
     // stored in the real `long value` field (by name) so descriptor coercion
@@ -36243,10 +36259,45 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => return Ok(Some(path_val)),
     };
-    let skip_file_callbacks = ctx
-        .class_name_of_id(ctx.class_id_of_object(visitor))
+    let visitor_class_id = ctx.class_id_of_object(visitor);
+    let visitor_class_name = ctx.class_name_of_id(visitor_class_id);
+    let skip_file_callbacks = visitor_class_name
+        .as_deref()
         .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
-    p98_walk_dir(ctx, &root_str, visitor, path_obj, skip_file_callbacks)?;
+    if std::env::var_os("CRATONVM_DBG_VISITFILE").is_some() {
+        eprintln!(
+            "[p98-walkfiletree] visitor_class_id={:?} visitor_class_name={:?} skip_file_callbacks={}",
+            visitor_class_id, visitor_class_name, skip_file_callbacks
+        );
+    }
+
+    // GC-safety: the walk below drives a re-entrant, potentially deep and
+    // long-running sequence of Java callbacks (preVisitDirectory/visitFile/
+    // postVisitDirectory) for every directory and file under `root`. Any of
+    // those calls can allocate and trigger GC (directly, or transitively --
+    // e.g. `PathFileObject.forJarPath` inside a compiler's own visitor).
+    // `visitor` is a single Rust-local `ObjectRef` that stays alive across
+    // the ENTIRE recursive walk; under a moving collector a mid-walk
+    // relocation leaves a bare local like this stale, and `invoke_virtual`'s
+    // own `load_and_forward` cannot repair it once the old slot has been
+    // reused for an unrelated (often array) allocation -- silently
+    // redirecting dispatch to `java.lang.Object` and raising a spurious
+    // `NoSuchMethodError` on the visitor's real method. Confirmed live: a
+    // very large in-memory javac classpath walk (`BeanRegistrationsAot-
+    // ContributionTests`, `JavacFileManager$ArchiveContainer.list`'s own
+    // `SimpleFileVisitor`) reproduced exactly this signature --
+    // `NoSuchMethodError: java/lang/Object.visitFile(...)`.
+    //
+    // Pin `visitor` and the root `path_obj` (used at both ends of the walk)
+    // for the whole traversal via `p98_pin`/`p98_read_pin` (see their doc
+    // comment below) and unpin the complete batch -- every pin taken
+    // anywhere during the walk, since `visitor_pin` is the first one pushed
+    // -- once it returns.
+    let visitor_pin = p98_pin(ctx, visitor);
+    let path_pin = p98_pin(ctx, path_obj);
+    let result = p98_walk_dir(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks);
+    ctx.unpin_native_roots(visitor_pin.0);
+    result?;
     Ok(Some(path_val))
 }
 
@@ -36289,6 +36340,24 @@ fn p98_invoke_file_visitor(
     })
 }
 
+/// A native-pinned GC root plus its original (possibly later stale) value,
+/// kept as the fallback `read_native_pin` returns for `NativeContext`
+/// implementations that don't support pinning (e.g. test mocks -- see
+/// [`NativeContext::pin_native_root`]'s doc comment). Create one with
+/// `p98_pin` right after allocating/receiving the object and resolve the
+/// current, GC-forwarded reference with `p98_read_pin` immediately before
+/// each re-entrant use -- never hold the raw `ObjectRef` itself across a
+/// call that can allocate.
+type P98Pin = (usize, ObjectRef);
+
+fn p98_pin(ctx: &mut dyn NativeContext, obj: ObjectRef) -> P98Pin {
+    (ctx.pin_native_root(obj), obj)
+}
+
+fn p98_read_pin(ctx: &dyn NativeContext, pin: P98Pin) -> ObjectRef {
+    ctx.read_native_pin(pin.0, pin.1)
+}
+
 /// Build a concrete platform `BasicFileAttributes` implementation for a
 /// `Files.walkFileTree` visitor callback. The named-field bridge makes the
 /// representation independent from the platform class's physical field order.
@@ -36305,19 +36374,21 @@ fn p98_alloc_basic_file_attributes(
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
-    visitor: ObjectRef,
-    dir_path_obj: ObjectRef,
+    visitor_pin: P98Pin,
+    dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let pre = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "preVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(Some(attrs)),
     )?;
     if let Some(r) = pre {
@@ -36337,10 +36408,12 @@ fn p98_walk_dir(
         for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
             let es = jarfs_encode(&jar, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36349,13 +36422,15 @@ fn p98_walk_dir(
                     false,
                     jarfs_entry_size(&jar, &child).unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36370,10 +36445,12 @@ fn p98_walk_dir(
         for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
             let es = jrtfs_encode(&java_home, &child);
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36382,13 +36459,15 @@ fn p98_walk_dir(
                     false,
                     jrtfs_entry_size(&java_home, &child).unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36403,10 +36482,12 @@ fn p98_walk_dir(
             let ep = entry.path();
             let es = ep.to_string_lossy().to_string();
             let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let epo_pin = p98_pin(ctx, epo);
             let s = ctx.create_string(&es);
-            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            let epo_now = p98_read_pin(ctx, epo_pin);
+            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
             if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor, epo, skip_file_callbacks)? {
+                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
                     return Ok(false);
                 }
             } else if !skip_file_callbacks {
@@ -36418,13 +36499,15 @@ fn p98_walk_dir(
                         .map(|metadata| metadata.len() as i64)
                         .unwrap_or(0),
                 );
+                let visitor_now = p98_read_pin(ctx, visitor_pin);
+                let epo_now = p98_read_pin(ctx, epo_pin);
                 let vr = p98_invoke_file_visitor(
                     ctx,
-                    visitor,
+                    visitor_now,
                     "visitFile",
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
-                    epo,
+                    epo_now,
                     Value::Object(Some(fa)),
                 )?;
                 if let Some(r) = vr {
@@ -36435,13 +36518,15 @@ fn p98_walk_dir(
             }
         }
     }
+    let visitor_now = p98_read_pin(ctx, visitor_pin);
+    let dir_path_now = p98_read_pin(ctx, dir_path_pin);
     let post = p98_invoke_file_visitor(
         ctx,
-        visitor,
+        visitor_now,
         "postVisitDirectory",
         "(Ljava/nio/file/Path;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/io/IOException;)Ljava/nio/file/FileVisitResult;",
-        dir_path_obj,
+        dir_path_now,
         Value::Object(None),
     )?;
     if let Some(r) = post {
@@ -63661,42 +63746,93 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
 // Legacy synthetic ThreadGroup = name=0, parent=1, daemon=2, maxPriority=3.
 // =============================================================================
 
+// Stale-ObjectRef hazard (2026-07-17, see
+// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8 follow-up
+// #2): `tg_enumerate_threads` walks `ThreadRegistry::alive_thread_objects()`
+// (every live Thread mirror) and, for each one, `tg_matches_thread` walks its
+// full ThreadGroup ancestry chain via repeated `tg_get_field(.., "parent",
+// ..)` calls. With many live threads (this native is reached by
+// `ThreadGroup.enumerate()`, which Tomcat/Reactor Netty's WebSocket client
+// connector churn calls heavily) the whole walk can run long enough in wall
+//-clock terms to overlap a concurrent moving-GC relocation pass on another
+// thread. Every `ObjectRef` these helpers juggle (`this`, `thread`, `group`,
+// `requested`, `arr`) was, before this fix, a bare native-local Rust variable
+// with no root registration of its own — invisible to the GC's move-fixup
+// pass, unlike `ThreadRegistry`'s own copy (which IS remapped, see
+// `ThreadRegistry::update_thread_objs_after_gc`). A relocation mid-walk left
+// the *local* copy dangling, and the next heap touch (observed at
+// `class_id_of_object` -> `gen_heap::class_id_of`'s header read) segfaulted —
+// exactly the "native stale-local" hazard class documented for other natives
+// in this file (see `Thread$State.values()` below for the same
+// pin_native_root/read_native_pin/unpin_native_roots pattern applied here).
+// Fix: pin every ObjectRef the instant it is obtained (loop element, field
+// read) and re-read through the pin before each subsequent heap touch, so a
+// relocation anywhere in the walk is transparently followed instead of left
+// dangling.
+
 fn tg_slot(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     this: ObjectRef,
     field: &str,
     legacy_fallback: usize,
 ) -> Option<usize> {
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    ctx.resolve_field_index(&class_name, field)
+    let this = ctx.read_native_pin(pin, this);
+    let result = ctx
+        .resolve_field_index(&class_name, field)
         .filter(|idx| *idx < ctx.object_num_fields(this))
-        .or_else(|| (legacy_fallback < ctx.object_num_fields(this)).then_some(legacy_fallback))
+        .or_else(|| (legacy_fallback < ctx.object_num_fields(this)).then_some(legacy_fallback));
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_get_field(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     this: ObjectRef,
     field: &str,
     legacy_fallback: usize,
 ) -> Value {
-    tg_slot(ctx, this, field, legacy_fallback)
-        .map(|idx| ctx.get_field(this, idx))
-        .unwrap_or(Value::Object(None))
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
+    let result = match tg_slot(ctx, this, field, legacy_fallback) {
+        Some(idx) => {
+            let this = ctx.read_native_pin(pin, this);
+            ctx.get_field(this, idx)
+        }
+        None => Value::Object(None),
+    };
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_of_thread(ctx: &mut dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(thread, "holder") {
-        Value::Object(Some(holder)) => match ctx.get_field_by_name(holder, "group") {
-            Value::Object(group) => group,
-            _ => None,
-        },
-        _ => match ctx.get_field_by_name(thread, "group") {
-            Value::Object(group) => group,
-            _ => None,
-        },
-    }
+    let pin = ctx.pin_native_root(thread);
+    let thread = ctx.read_native_pin(pin, thread);
+    let result = match ctx.get_field_by_name(thread, "holder") {
+        Value::Object(Some(holder)) => {
+            let holder_pin = ctx.pin_native_root(holder);
+            let holder = ctx.read_native_pin(holder_pin, holder);
+            let r = match ctx.get_field_by_name(holder, "group") {
+                Value::Object(group) => group,
+                _ => None,
+            };
+            ctx.unpin_native_roots(holder_pin);
+            r
+        }
+        _ => {
+            let thread = ctx.read_native_pin(pin, thread);
+            match ctx.get_field_by_name(thread, "group") {
+                Value::Object(group) => group,
+                _ => None,
+            }
+        }
+    };
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 fn tg_matches_thread(
@@ -63705,20 +63841,38 @@ fn tg_matches_thread(
     thread: ObjectRef,
     recurse: bool,
 ) -> bool {
+    let requested_pin = ctx.pin_native_root(requested);
+    let thread_pin = ctx.pin_native_root(thread);
+    let thread = ctx.read_native_pin(thread_pin, thread);
     let mut current = tg_of_thread(ctx, thread);
-    while let Some(group) = current {
+    ctx.unpin_native_roots(thread_pin);
+
+    // Pin the ancestry-walk cursor across the loop -- each iteration below
+    // makes at least one more native call (`tg_get_field(.., "parent", ..)`)
+    // that can span an intervening concurrent GC relocation pass.
+    let found = loop {
+        let Some(group) = current else {
+            break false;
+        };
+        let group_pin = ctx.pin_native_root(group);
+        let group = ctx.read_native_pin(group_pin, group);
+        let requested = ctx.read_native_pin(requested_pin, requested);
         if group == requested {
-            return true;
+            ctx.unpin_native_roots(group_pin);
+            break true;
         }
         if !recurse {
-            break;
+            ctx.unpin_native_roots(group_pin);
+            break false;
         }
         current = match tg_get_field(ctx, group, "parent", 1) {
             Value::Object(parent) => parent,
             _ => None,
         };
-    }
-    false
+        ctx.unpin_native_roots(group_pin);
+    };
+    ctx.unpin_native_roots(requested_pin);
+    found
 }
 
 fn tg_enumerate_threads(
@@ -63729,15 +63883,47 @@ fn tg_enumerate_threads(
 ) -> i32 {
     let arr_len = ctx.array_length(arr);
     let mut count = 0usize;
-    for obj in ctx.enumerate_threads(usize::MAX) {
+    // `group` and `arr` are held across the entire enumeration loop, which
+    // -- for every live thread mirror `ctx.enumerate_threads()` returns --
+    // makes one or more further native calls via `tg_matches_thread`. See
+    // the stale-ObjectRef doc comment above `tg_slot` for why this whole
+    // walk must stay pinned rather than holding bare native-local copies.
+    let group_pin = ctx.pin_native_root(group);
+    let arr_pin = ctx.pin_native_root(arr);
+    // `enumerate_threads()` hands back a point-in-time Vec snapshot (a copy
+    // out of `ThreadRegistry`'s own, separately-GC-remapped map) -- every
+    // element is fresh at the INSTANT this call returns, but the loop below
+    // can take many more native calls' worth of wall-clock time to work
+    // through the whole Vec (one `tg_matches_thread` ancestry walk per
+    // thread). Pinning lazily -- i.e. only once the loop body reaches a
+    // given element -- leaves every later element in the Vec unprotected
+    // for however long it takes to process every earlier one, which is
+    // exactly the window that let this bug reproduce even after the first
+    // round of pinning below was added (see
+    // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md 5.8 follow-up
+    // #2). Pin the *entire* snapshot in one tight pass immediately after
+    // capturing it instead, so every element is under a live pin before any
+    // further GC-unsafe native call has a chance to run.
+    let threads = ctx.enumerate_threads(usize::MAX);
+    let thread_pins: Vec<usize> = threads.iter().map(|&t| ctx.pin_native_root(t)).collect();
+    for (obj, &obj_pin) in threads.iter().zip(thread_pins.iter()) {
         if count >= arr_len {
             break;
         }
+        let obj = ctx.read_native_pin(obj_pin, *obj);
+        let group = ctx.read_native_pin(group_pin, group);
         if tg_matches_thread(ctx, group, obj, recurse) {
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            let arr = ctx.read_native_pin(arr_pin, arr);
             let _ = ctx.set_array_element(arr, count, Value::Object(Some(obj)));
             count += 1;
         }
     }
+    // Unpinning the earliest handle (`group_pin`) also unwinds every pin
+    // pushed after it -- `arr_pin` and the whole `thread_pins` batch -- see
+    // the LIFO `native_pin_roots` discipline used throughout this file
+    // (e.g. `Thread$State.values()` below).
+    ctx.unpin_native_roots(group_pin);
     count as i32
 }
 
@@ -63748,9 +63934,13 @@ fn tg_set_field(
     legacy_fallback: usize,
     value: Value,
 ) {
+    let pin = ctx.pin_native_root(this);
+    let this = ctx.read_native_pin(pin, this);
     if let Some(idx) = tg_slot(ctx, this, field, legacy_fallback) {
+        let this = ctx.read_native_pin(pin, this);
         ctx.set_field(this, idx, value);
     }
+    ctx.unpin_native_roots(pin);
 }
 
 pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
@@ -64346,6 +64536,38 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "loggerName", Value::Object(None));
             ctx.set_field_by_name(this, "thrown", Value::Object(None));
             ctx.set_field_by_name(this, "parameters", Value::Object(None));
+            // Real JDK stamps the constructing thread's id into
+            // threadID/longThreadID. Without it, records report
+            // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
+            // that 0 to ThreadMXBean.getThreadInfo(long), which rejects
+            // non-positive ids ("Invalid thread ID parameter") on every
+            // AsyncFileHandler format. The mirror lookup may allocate, so
+            // keep this pinned across it.
+            let real = crate::log_record_real_layout(ctx, this);
+            let this_pin = ctx.pin_native_root(this);
+            let tid = crate::current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(crate::epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "threadID", Value::Int(crate::short_thread_id(tid)));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -64385,8 +64607,17 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         );
         Ok(None)
     });
+    // Real-layout records (crate::log_record_real_layout) resolve by NAME:
+    // their raw indexes (loggerName=8, thrown=12, parameters=11, instant=7,
+    // sequenceNumber=1) disagree with this block's legacy 7-field slots, and
+    // a real record passes the num_fields >= 7 guard, so slot access would
+    // read or clobber unrelated real fields (e.g. slot 2 is the real
+    // sourceClassName, slot 5 the real threadID).
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "loggerName")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 2)))
         } else {
@@ -64395,13 +64626,19 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setLoggerName", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "loggerName", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 2, value);
         }
         Ok(None)
     });
     r.register(lr, "getThrown", "()Ljava/lang/Throwable;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "thrown")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 3)))
         } else {
@@ -64410,18 +64647,25 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "thrown", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 3, value);
         }
         Ok(None)
     });
     r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            let field = ctx.get_field(this, 4);
-            if matches!(field, Value::Object(Some(_))) {
-                return Ok(Some(field));
-            }
+        let field = if crate::log_record_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "parameters")
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.get_field(this, 4)
+        } else {
+            Value::Object(None)
+        };
+        if matches!(field, Value::Object(Some(_))) {
+            return Ok(Some(field));
         }
         // Return empty Object[] if not set
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -64433,29 +64677,68 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) >= 7 {
-                ctx.set_field(this, 4, args.get(1).copied().unwrap_or(Value::Object(None)));
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            if crate::log_record_real_layout(ctx, this) {
+                ctx.set_field_by_name(this, "parameters", value);
+            } else if ctx.object_num_fields(this) >= 7 {
+                ctx.set_field(this, 4, value);
             }
             Ok(None)
         },
     );
     r.register(lr, "getMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            // Real bytecode derives millis from `instant`.
+            if let Value::Object(Some(instant)) = ctx.get_field_by_name(this, "instant") {
+                return ctx.invoke_virtual(instant, "toEpochMilli", "()J", &[]);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
         if ctx.object_num_fields(this) >= 7 {
-            Ok(Some(ctx.get_field(this, 5)))
+            match ctx.get_field(this, 5) {
+                millis @ Value::Long(_) => Ok(Some(millis)),
+                _ => Ok(Some(Value::Long(0))),
+            }
         } else {
             Ok(Some(Value::Long(0)))
         }
     });
     r.register(lr, "setMillis", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 5, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let millis = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        if crate::log_record_real_layout(ctx, this) {
+            // Mirror the real setter: replace `instant`. The Instant
+            // construction may allocate; keep `this` pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let instant = ctx
+                .invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(millis)],
+                )
+                .ok()
+                .flatten();
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 5, Value::Long(millis));
         }
         Ok(None)
     });
     r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "sequenceNumber")));
+        }
         if ctx.object_num_fields(this) >= 7 {
             Ok(Some(ctx.get_field(this, 6)))
         } else {
@@ -64464,8 +64747,11 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     });
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) >= 7 {
-            ctx.set_field(this, 6, args.get(1).copied().unwrap_or(Value::Long(0)));
+        let value = args.get(1).copied().unwrap_or(Value::Long(0));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, "sequenceNumber", value);
+        } else if ctx.object_num_fields(this) >= 7 {
+            ctx.set_field(this, 6, value);
         }
         Ok(None)
     });

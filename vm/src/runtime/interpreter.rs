@@ -639,6 +639,40 @@ fn stw_take_over_and_wait(
                 taken = taken.count(),
                 "STW cross-thread JIT takeover is still waiting for cooperative mutators"
             );
+            // GCBARRIER-LIVELOCK-FIX (2026-07-18) tripwire: cross-check the
+            // barrier's legacy `threads_blocked` atomic (bumped by any
+            // `GcBarrier::enter_blocked()` / `mark_blocked_region_enter()`
+            // call) against the registry's authoritative `in_blocked_region`
+            // census — the ONLY signal the production `expected` computation
+            // (`request_stw_counted_with_live_blocked` /
+            // `alive_count_blocked_and_os_tids`) actually excludes threads
+            // on. A caller that reaches `enter_blocked()` without first
+            // depositing a root snapshot (`in_blocked_region` stays false)
+            // bumps the legacy counter but stays invisible to the census —
+            // silently inflating `expected` by one uncounted mutator that can
+            // never arrive. This is the exact shape of a livelock fixed at
+            // this date in `vm/src/vm/vm_exec.rs`'s thread-termination
+            // "notify waiting joiners" block (a `block_enter()` call missing
+            // the `deposit_root_snapshot()` its own doc comment requires).
+            // Always-on (not gated behind CRATONVM_DBG_STW_CENSUS) because it
+            // only runs once takeover is already stuck for 64+ rounds — a
+            // rare, already-anomalous path — and a mismatch here is the
+            // single fastest signal to root-cause a recurrence of this bug
+            // class at any OTHER call site.
+            let (census_alive, census_blocked, _tids, _blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            let legacy_blocked = shared.gc_barrier.blocked_count() as usize;
+            if legacy_blocked > census_blocked {
+                eprintln!(
+                    "[gcbarrier-tripwire] legacy blocked_count()={legacy_blocked} > \
+                     census in_blocked_region count={census_blocked} (alive={census_alive}) \
+                     -- a thread called GcBarrier::enter_blocked()/mark_blocked_region_enter() \
+                     WITHOUT first depositing a root snapshot, so it is invisible to the \
+                     production STW census but still occupies an `expected` slot no arrival \
+                     can ever satisfy. Set CRATONVM_DBG_STW_CENSUS=1 for a full per-thread dump.\n{}",
+                    shared.thread_registry.debug_thread_census()
+                );
+            }
             if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some()
                 || std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
             {
@@ -10039,6 +10073,11 @@ fn find_exception_handler_pc_unknown(
         else {
             continue;
         };
+        // Owned copy, independent of `cm_guard`'s current borrow, so it
+        // survives the lock drop/reacquire below and stays usable in the
+        // loader-identity-blind fallback match (see
+        // `Class::is_subclass_of_by_name`).
+        let catch_class_name_owned = catch_class_name.to_string();
         let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
             None => {
@@ -10052,7 +10091,9 @@ fn find_exception_handler_pc_unknown(
                 }
             }
         };
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
@@ -10107,6 +10148,11 @@ fn find_exception_handler_impl(
         else {
             continue;
         };
+        // Owned copy for the loader-identity-blind fallback below (see
+        // `Class::is_subclass_of_by_name`) — independent of `cm_guard`'s
+        // current borrow so it stays valid across the lock drop/reacquire
+        // in the lazy-load branch just below.
+        let catch_class_name_owned = catch_class_name.to_string();
 
         // Try to find the catch type class on the held lock — `&str`,
         // no allocation.
@@ -10128,7 +10174,9 @@ fn find_exception_handler_impl(
             }
         };
 
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             return Some((entry.handler_pc as usize, exc));
         }
@@ -10226,6 +10274,11 @@ fn route_jit_exception_through_method(
         let Some(catch_class_name) = class.constant_pool.get_class_name(entry.catch_type) else {
             continue;
         };
+        // Owned copy for the loader-identity-blind fallback below (see
+        // `Class::is_subclass_of_by_name`) — independent of `cm_guard`'s
+        // current borrow so it stays valid across the lock drop/reacquire
+        // in the lazy-load branch just below.
+        let catch_class_name_owned = catch_class_name.to_string();
         let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
             Some(id) => id,
             None => {
@@ -10239,7 +10292,9 @@ fn route_jit_exception_through_method(
                 }
             }
         };
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id) {
+        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+            || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
+        {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             handler_pc = Some(entry.handler_pc as usize);
             break;
@@ -13676,6 +13731,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale (relocated by a moving GC) while it sat mid-flight
+            // between the operand-stack pop above and here. resolve_field_ref
+            // below is a cache-miss-cold path on a field's FIRST-ever
+            // resolution: it can call load_class_concurrent, which loads
+            // and links (and may run clinit for) the field's declaring
+            // class -- real work that allocates, and under GC-stress
+            // (or ordinary allocation pressure) can trigger a moving
+            // collection. obj_ref was popped into this bare Rust local
+            // BEFORE that call and is therefore invisible to the collector's
+            // root scan for its duration; a relocated receiver leaves this
+            // local pointing at an intact (structurally valid, so it evades
+            // the CRATONVM_DBG_STRAYSTACK num_slots/class_id sanity check)
+            // but dead from-space copy -- same shape as the native-call-arg
+            // and getfield-loaded-value barriers elsewhere in this file, just
+            // never applied to the getfield/putfield RECEIVER itself.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             let mut field = resolve_field_ref(shared, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
@@ -14115,6 +14187,23 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
+            // GCBARRIER-CDLWAIT-FIX (2026-07-17): heal a receiver that went
+            // stale while resolving the field above. resolve_field_ref at
+            // the top of this opcode handler runs BEFORE this pop (the
+            // receiver was still nominally live on the Java operand stack
+            // during that call), but a cache-miss-cold resolution can load
+            // and link the field's declaring class for the first time --
+            // real allocating work -- and a moving collection triggered
+            // during it (confirmed live: java.lang.Thread$FieldHolder's
+            // very first "putfield task" under CRATONVM_DBG_GC_STRESS,
+            // which silently dropped the write, leaving Thread.holder.task
+            // permanently null and that worker's Runnable never invoked)
+            // can leave this local pointing at a forwarded-but-structurally-
+            // intact from-space copy that CRATONVM_DBG_STRAYSTACK's
+            // num_slots/class_id sanity check does not catch. Heal it the
+            // same way native-call arguments and the getfield RECEIVER
+            // (see the identical fix just above) already are.
+            let obj_ref = shared.heap.load_and_forward(obj_ref);
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
@@ -17030,12 +17119,28 @@ fn drive_defining_loader_load(
         use cratonvm_native_api::NativeContext as _;
         let mut ctx = crate::vm::NativeContextImpl { shared, thread };
         let name_obj = ctx.create_string(&dotted);
-        ctx.invoke_virtual(
+        let result = ctx.invoke_virtual(
             loader_obj,
             "loadClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
-        )
+        );
+        // Elasticsearch's EmbeddedImplClassLoader can report a failed Java
+        // `loadClass` while its provider archive still contains the requested
+        // implementation class. This fallback belongs at the VM's
+        // initiating-loader boundary, where bytecode references have no
+        // ServiceLoader context. The archive helper preserves this loader's
+        // namespace and defining-loader association.
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => result,
+            _ => cratonvm_native_builtins::service_loader::impl_jars_load_class(
+                &mut ctx,
+                Some(loader_obj),
+                name,
+            )
+            .map(|mirror| Ok(Some(Value::Object(Some(mirror)))))
+            .unwrap_or(result),
+        }
     };
     // Defensive: a re-entrant call that unwound abnormally must not leave stray
     // frames on this thread's stack.
@@ -19265,6 +19370,19 @@ fn execute_invoke_kind(
     // resolved base methods so real-JDK URLClassPath shims never discard local
     // resources or custom URLStreamHandler-backed URLs.
     if let Some(res) = intercept_urlclassloader_subclass_native_method(
+        shared,
+        thread,
+        frame_idx,
+        method_name.as_ref(),
+        method_descriptor.as_ref(),
+        receiver_class_id,
+        is_special,
+        &args,
+    ) {
+        return res;
+    }
+
+    if let Some(res) = intercept_classloader_subclass_resource_native(
         shared,
         thread,
         frame_idx,
@@ -23673,12 +23791,6 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    if class_name == "java/io/BufferedInputStream"
-        && method_name == "read"
-        && matches!(method_descriptor, "([BII)I" | "()I")
-    {
-        return true;
-    }
     if class_name == "java/io/DataInputStream"
         && matches!(
             (method_name, method_descriptor),
@@ -24208,7 +24320,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+        // ClassLoader resource methods have the same issue: real JDK bytecode
+        // walks URLClassPath state which CratonVM intentionally replaces with
+        // native per-loader lookups.  Keep the singular, stream, and bulk
+        // methods together so URLClassLoader instances do not fall back to the
+        // process-wide dynamic classpath (which leaks resources between test
+        // loaders) and null arguments retain their specified NPE contract.
+        if class_name == "java/lang/ClassLoader"
+            && matches!(
+                method_name,
+                "getResource"
+                    | "getSystemResource"
+                    | "getResources"
+                    | "getSystemResources"
+                    | "getResourceAsStream"
+                    | "getSystemResourceAsStream"
+            )
+        {
+            return true;
+        }
+
+        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25508,6 +25640,38 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // The resource-name argument is specified to be non-null for every
+    // ClassLoader resource accessor.  A virtual call whose constant-pool
+    // owner is ClassLoader can resolve to an inherited cached method on a
+    // custom loader, so the generic force-native lookup below sees the custom
+    // class name and misses the callback registered on ClassLoader.  Route
+    // only the null-argument contract through that base callback before
+    // method-cache dispatch; normal non-null calls retain the custom loader's
+    // virtual implementation.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     // `Class.getClassLoader()` is a concrete JDK method, but Class mirrors in
     // this VM use an internal layout and their real `classLoader` field can be
     // a stale non-loader object.  Dispatch by the receiver's *runtime* class
@@ -25624,6 +25788,34 @@ fn intercept_force_registered_native_cached(
     let class_name = cached.class_name.as_ref();
     let method_name = cached.method_name.as_ref();
     let method_descriptor = cached.method_descriptor.as_ref();
+    // Keep the cached path aligned with the uncached null-resource contract
+    // above.  The cache is keyed by the resolved custom-loader method, while
+    // the implementation callback is deliberately registered on ClassLoader.
+    if args.len() == 2
+        && matches!(args.get(1), Some(Value::Object(None)))
+        && matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        let cb = shared
+            .native_methods
+            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let ret_type = crate::jit::return_type(method_descriptor);
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result.filter(|_| ret_type != b'V') {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     let force_native = *cached.force_native_cache.get_or_init(|| {
         force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
     });
@@ -25831,6 +26023,66 @@ fn intercept_urlclassloader_subclass_native_method(
         shared
             .native_methods
             .find("java/net/URLClassLoader", method_name, method_descriptor)?;
+    let ret_type = crate::jit::return_type(method_descriptor);
+    Some((|| {
+        let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+        if let Some(value) = result.filter(|_| ret_type != b'V') {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, ret_type),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        Ok(CachedCallResult::Handled)
+    })())
+}
+
+/// A class may invoke an inherited ClassLoader resource method through a
+/// constant-pool reference to its concrete subclass.  The regular force-native
+/// gate is keyed by that symbolic class, so it misses the native registered on
+/// ClassLoader and the real JDK body silently accepts null names. Resolve the
+/// actual declaration and dispatch the shared ClassLoader native instead.
+#[inline]
+fn intercept_classloader_subclass_resource_native(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    method_name: &str,
+    method_descriptor: &str,
+    receiver_class_id: Option<ClassId>,
+    is_special: bool,
+    args: &[Value],
+) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    if is_special
+        || !matches!(
+            (method_name, method_descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        return None;
+    }
+    let recv_cid = receiver_class_id?;
+    let declaring_name = {
+        let cm = shared.class_manager.read();
+        let store = &cm.class_store;
+        let (_m, declaring_id) = crate::classloading::find_method_recursive(
+            recv_cid,
+            method_name,
+            method_descriptor,
+            store,
+        )?;
+        store.get(declaring_id).map(|c| c.name.to_string())?
+    };
+    if declaring_name != "java/lang/ClassLoader"
+        || native_shadow_suppressed_by_redefine(shared, "java/lang/ClassLoader")
+    {
+        return None;
+    }
+    let cb = shared
+        .native_methods
+        .find("java/lang/ClassLoader", method_name, method_descriptor)?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -30189,6 +30441,54 @@ fn try_jit_upgrade_with_gate(
                 store,
             )?;
             let code_attr = method.code()?;
+
+            // jit-invokestatic-clinit-gap fix (2026-07-17): JVMS §5.5
+            // requires a class be initialized before the first invocation
+            // of any of its own (not inherited) static methods -- the same
+            // trigger family as the `jit_getstatic`/`jit_putstatic_*`/
+            // `jit_new_object` fixes above, but for `invokestatic`. This
+            // closure builds a raw machine-code CALL straight to the
+            // callee's compiled entry point (`direct_calls` in
+            // `jit/src/lib.rs`), bypassing BOTH the interpreter's own
+            // `execute_invokestatic` (which calls
+            // `ensure_class_initialized_shared` unconditionally before
+            // every dispatch) and the JIT's generic fallback dispatch
+            // helper (`jit_invoke_dispatch` -> `invoke_or_native` ->
+            // `invoke_shared`, which also checks). Once a JIT-compiled
+            // caller takes this direct-call fast path for an invokestatic
+            // site, that site never routes through either checked path
+            // again -- if the callee's declaring class hadn't been
+            // initialized yet the moment this closure ran, it may never
+            // get initialized before the direct CALL first executes.
+            //
+            // A class's initialized state is monotonic per JVMS (once
+            // Initialized, it never reverts), so checking ONCE here, at
+            // compile time, is sound forever for this call site. Only take
+            // the direct-call fast path when the callee is a `static`
+            // method (the actual JVMS trigger -- `invokespecial`'s
+            // `<init>`/private/super calls reach this same closure but
+            // don't independently require class init, since their
+            // receiver's class was already initialized via `new`) AND its
+            // declaring class is ALREADY initialized. Otherwise return
+            // `None`, which drops the call site to the generic dispatch
+            // fallback (`jit_invoke_dispatch`) -- correctness-safe (that
+            // path checks), just not the fast path for this one call site
+            // until a future recompile (e.g. after the class initializes
+            // and the caller tiers up again). `is_class_initialized_fast`
+            // reads the embedded per-`Class` atomic directly with no extra
+            // lock -- `cm`'s read guard above (borrowed by `store`) is
+            // still live here -- mirroring
+            // `ensure_class_initialized_shared`'s own fast path.
+            if method.is_static() {
+                let declaring_class_initialized = store
+                    .get(declaring_id)
+                    .map(crate::vm::is_class_initialized_fast)
+                    .unwrap_or(false);
+                if !declaring_class_initialized {
+                    return None;
+                }
+            }
+
             let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
             let source_file = store
                 .get(declaring_id)
@@ -30957,6 +31257,37 @@ fn try_jit_compile_callee_slow(
         store,
     )?;
     let code_attr = method.code()?;
+    // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
+    // same gap as the `callee_compiler` (compile-time direct_calls) and
+    // `resolve_inline_site` (inlining) closures above -- this is the
+    // RUNTIME-side counterpart, invoked from `jit_invoke_dispatch`
+    // (`vm/src/jit/helpers.rs`) via `try_compile_callee` the first time a
+    // generic-dispatch invokestatic call site actually executes. On success
+    // this function's `(entry_ptr, needs_context)` gets cached into
+    // `jit_cache` and, per `jit_invoke_dispatch`'s own comment two call
+    // sites down, invoked via `invoke_or_native`/a direct call -- NOT
+    // through `invoke_shared`'s `ensure_class_initialized_shared` call.
+    // Same JVMS SS5.5 requirement, same fix: refuse to hand back a compiled
+    // entry for a `static` method whose declaring class isn't initialized
+    // yet, forcing this call (this one time) through the always-safe
+    // `invoke_or_native` fallback that jit_invoke_dispatch uses when this
+    // function returns `None`. Monotonic init state makes a compile-time
+    // (well, first-dispatch-time) check here sound for the cached entry's
+    // entire remaining lifetime, exactly like the other two sites.
+    if method.is_static() {
+        let declaring_class_initialized = store
+            .get(declaring_id)
+            .map(crate::vm::is_class_initialized_fast)
+            .unwrap_or(false);
+        if !declaring_class_initialized {
+            // Not yet initialized: don't cache a negative result either --
+            // the class may initialize very soon (e.g. the very next
+            // dispatch through the safe fallback), at which point this
+            // function should succeed and start caching the fast entry.
+            *cache_negative = false;
+            return None;
+        }
+    }
     let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
     // FJP fix (CORRECTED) case (2): the resolved method is INHERITED from a
     // class that has a Rust native override (e.g. `ForkJoinTask.fork()` reached
@@ -31850,6 +32181,35 @@ fn resolve_inline_site(
         return None;
     }
     let is_static = method.is_static();
+    // jit-inline-clinit-gap fix (2026-07-17): inlining a static method's
+    // bytecode splices it directly into the caller with NO call boundary at
+    // all -- not even the `direct_calls` raw CALL that `callee_compiler`
+    // (this file, the sibling closure guarding `direct_calls`) gates on
+    // class-init state. A callee whose OWN body never touches its class's
+    // statics (no getstatic/putstatic/new of its own -- the existing
+    // "conservative default: do NOT inline getstatic/putstatic-bearing
+    // callees" gate a few lines below only excludes the OPPOSITE shape)
+    // gives the JIT no code-level opportunity whatsoever to run `<clinit>`
+    // before the inlined body executes, silently violating the same JVMS
+    // §5.5 "class must be initialized before first invocation of any of its
+    // static methods" requirement `callee_compiler`'s gate enforces for the
+    // direct-call path. A class's initialized state is monotonic (JVMS:
+    // once Initialized, always Initialized), so -- exactly like
+    // `callee_compiler`'s check -- checking ONCE, here, at inline-planning
+    // time is sound forever for this call site: only admit a static
+    // callee for inlining when its declaring class is ALREADY initialized;
+    // otherwise return `None`, which drops the site to the ordinary
+    // dispatch/direct-call resolution below (both of which independently
+    // enforce initialization). `cm`'s read guard is still live here.
+    if is_static {
+        let declaring_class_initialized = store
+            .get(declaring_id)
+            .map(crate::vm::is_class_initialized_fast)
+            .unwrap_or(false);
+        if !declaring_class_initialized {
+            return None;
+        }
+    }
     let callee_max_locals = code_attr.max_locals as usize; // Widening: u16 to usize
     let code_bytes = code_attr.code.clone();
 
@@ -33710,7 +34070,6 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
-        let declaring_class_id = entry.declaring_class_id;
         let is_native = entry.is_native;
         // Lock-order fix: drop the `vtable_manager` read guard BEFORE
         // taking `class_manager` below. `vtable_install_adapter` (called
@@ -33728,16 +34087,27 @@ fn execute_invokevirtual_vtable_fast(
         // invariant that the vtable must be queryable WITHOUT holding
         // class_manager - this restores it.
         drop(guard);
-        let declaring_name = shared
-            .class_manager
-            .read()
-            .get_class(cratonvm_types::ClassId::new(declaring_class_id as u32))
-            .map(|c| c.name.to_string())
-            .unwrap_or_else(|| cached.class_name.to_string());
-        if force_native_over_real_jdk_bytecode(&declaring_name, &method_name, &method_descriptor)
+        // `CachedBytecodeMethod` retains the resolved declaring method, so
+        // memoize this pure, 55-branch decision on that shared entry instead
+        // of reopening `class_manager` and re-evaluating it for every vtable
+        // hit. The native-registry probe remains live: registrations can
+        // differ between VM configurations, while the cache only avoids the
+        // deterministic name/descriptor classification work.
+        let force_native = *cached.force_native_cache.get_or_init(|| {
+            force_native_over_real_jdk_bytecode(
+                cached.class_name.as_ref(),
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+            )
+        });
+        if force_native
             && shared
                 .native_methods
-                .find(&declaring_name, &method_name, &method_descriptor)
+                .find(
+                    cached.class_name.as_ref(),
+                    cached.method_name.as_ref(),
+                    cached.method_descriptor.as_ref(),
+                )
                 .is_some()
         {
             return Ok(CachedCallResult::CacheMiss);

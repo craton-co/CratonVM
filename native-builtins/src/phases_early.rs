@@ -7,6 +7,23 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
+/// POSIX permits a blocking socket read to be interrupted before it consumes
+/// bytes. Retry that transient condition instead of exposing it as a Java EOF
+/// or a zero-length read. Some socket wrappers preserve Linux EINTR only as
+/// raw OS error 4, so accept both representations.
+fn read_retry_eintr<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
@@ -15292,7 +15309,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         };
         if let Some(stream) = stream {
             let mut stream_ref = &*stream;
-            match stream_ref.read(&mut buf) {
+            match read_retry_eintr(&mut stream_ref, &mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
@@ -15323,7 +15340,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             };
             if let Some(stream) = stream {
                 let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
+                match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -15360,7 +15377,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             };
             if let Some(stream) = stream {
                 let mut stream_ref = &*stream;
-                match stream_ref.read(&mut tmp) {
+                match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -17104,6 +17121,40 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     // --- LogRecord ---
     // Slots mirror the small accessor surface WildFly/JBoss copies during logging
     // bootstrap: level, message, source, logger, resource bundle, sequence, etc.
+    // Real-JDK-layout records (crate::log_record_real_layout) resolve every
+    // field by NAME instead: the synthetic slots disagree with the real JDK
+    // declaration order almost everywhere (synthetic slot 4 "loggerName" is
+    // the real layout's `message`, slot 5 "millis" is the real `threadID`,
+    // ...), so raw-slot access on a real record reads or clobbers unrelated
+    // fields -- the source of Tomcat JULI's garbled file-log lines.
+    fn lr_get(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        name: &'static str,
+        slot: usize,
+    ) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        if crate::log_record_real_layout(ctx, this) {
+            Ok(Some(ctx.get_field_by_name(this, name)))
+        } else {
+            Ok(Some(ctx.get_field(this, slot)))
+        }
+    }
+    fn lr_set(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        name: &'static str,
+        slot: usize,
+    ) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        let value = args.get(1).copied().unwrap_or(Value::Object(None));
+        if crate::log_record_real_layout(ctx, this) {
+            ctx.set_field_by_name(this, name, value);
+        } else {
+            ctx.set_field(this, slot, value);
+        }
+        Ok(Some(Value::Object(None)))
+    }
     let lr = "java/util/logging/LogRecord";
     r.register(
         lr,
@@ -17113,18 +17164,57 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let level = args.get(1).copied().unwrap_or(Value::Object(None));
             let msg = args.get(2).copied().unwrap_or(Value::Object(None));
-            ctx.set_field(this, 0, level);
-            ctx.set_field(this, 1, msg);
-            ctx.set_field(this, 2, Value::Object(None));
-            ctx.set_field(this, 3, Value::Object(None));
-            ctx.set_field(this, 4, Value::Object(None));
-            ctx.set_field(this, 5, Value::Long(0));
-            ctx.set_field(this, 6, Value::Object(None));
-            ctx.set_field(this, 7, Value::Object(None));
-            ctx.set_field(this, 8, Value::Object(None));
-            ctx.set_field(this, 9, Value::Long(0));
-            ctx.set_field(this, 10, Value::Int(0));
-            ctx.set_field(this, 11, Value::Object(None));
+            let real = crate::log_record_real_layout(ctx, this);
+            if real {
+                ctx.set_field_by_name(this, "level", level);
+                ctx.set_field_by_name(this, "message", msg);
+            } else {
+                ctx.set_field(this, 0, level);
+                ctx.set_field(this, 1, msg);
+                ctx.set_field(this, 2, Value::Object(None));
+                ctx.set_field(this, 3, Value::Object(None));
+                ctx.set_field(this, 4, Value::Object(None));
+                ctx.set_field(this, 6, Value::Object(None));
+                ctx.set_field(this, 7, Value::Object(None));
+                ctx.set_field(this, 8, Value::Object(None));
+                ctx.set_field(this, 9, Value::Long(0));
+                ctx.set_field(this, 11, Value::Object(None));
+            }
+            // Real JDK's ctor stamps the constructing thread's id into
+            // threadID/longThreadID (without it Tomcat JULI's
+            // OneLineFormatter feeds 0 to ThreadMXBean.getThreadInfo(long):
+            // "Invalid thread ID parameter" on every AsyncFileHandler
+            // format) and the creation Instant, which getMillis()/the JULI
+            // timestamp column read back. The lookups below may allocate, so
+            // keep `this` pinned across them.
+            let this_pin = ctx.pin_native_root(this);
+            let tid = crate::current_java_thread_tid(ctx);
+            let now_ms = crate::epoch_millis_now();
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(now_ms)],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            let short_tid = crate::short_thread_id(tid);
+            if real {
+                ctx.set_field_by_name(this, "threadID", Value::Int(short_tid));
+                ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+                if let Some(instant @ Value::Object(Some(_))) = instant {
+                    ctx.set_field_by_name(this, "instant", instant);
+                }
+            } else {
+                ctx.set_field(this, 5, Value::Long(now_ms));
+                ctx.set_field(this, 10, Value::Int(short_tid));
+            }
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(None)))
         },
     );
@@ -17132,155 +17222,139 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         lr,
         "getLevel",
         "()Ljava/util/logging/Level;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
+        |ctx, args| lr_get(ctx, args, "level", 0),
     );
     r.register(lr, "getMessage", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        lr_get(ctx, args, "message", 1)
     });
     r.register(lr, "setMessage", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, args[1]);
-        Ok(Some(Value::Object(None)))
+        lr_set(ctx, args, "message", 1)
     });
     r.register(
         lr,
         "getSourceClassName",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
+        |ctx, args| lr_get(ctx, args, "sourceClassName", 2),
     );
     r.register(
         lr,
         "setSourceClassName",
         "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 2, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
+        |ctx, args| lr_set(ctx, args, "sourceClassName", 2),
     );
     r.register(
         lr,
         "getSourceMethodName",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        },
+        |ctx, args| lr_get(ctx, args, "sourceMethodName", 3),
     );
     r.register(
         lr,
         "setSourceMethodName",
         "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 3, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
+        |ctx, args| lr_set(ctx, args, "sourceMethodName", 3),
     );
 
     r.register(lr, "getLoggerName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
+        lr_get(ctx, args, "loggerName", 4)
     });
     r.register(lr, "setLoggerName", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 4, args[1]);
-        Ok(Some(Value::Object(None)))
+        lr_set(ctx, args, "loggerName", 4)
     });
     r.register(lr, "getMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 5)))
+        if crate::log_record_real_layout(ctx, this) {
+            // Real bytecode derives millis from `instant`.
+            if let Value::Object(Some(instant)) = ctx.get_field_by_name(this, "instant") {
+                return ctx.invoke_virtual(instant, "toEpochMilli", "()J", &[]);
+            }
+            return Ok(Some(Value::Long(0)));
+        }
+        match ctx.get_field(this, 5) {
+            millis @ Value::Long(_) => Ok(Some(millis)),
+            _ => Ok(Some(Value::Long(0))),
+        }
     });
     r.register(lr, "setMillis", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 5, args[1]);
+        let millis = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        if crate::log_record_real_layout(ctx, this) {
+            // Mirror the real setter: replace `instant`. The Instant
+            // construction may allocate; keep `this` pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let instant = ctx
+                .invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(millis)],
+                )
+                .ok()
+                .flatten();
+            let this = ctx.read_native_pin(this_pin, this);
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
+        } else {
+            ctx.set_field(this, 5, Value::Long(millis));
+        }
         Ok(Some(Value::Object(None)))
     });
     r.register(lr, "getParameters", "()[Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 6)))
+        lr_get(ctx, args, "parameters", 6)
     });
     r.register(
         lr,
         "setParameters",
         "([Ljava/lang/Object;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 6, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
+        |ctx, args| lr_set(ctx, args, "parameters", 6),
     );
     r.register(
         lr,
         "getResourceBundle",
         "()Ljava/util/ResourceBundle;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 7)))
-        },
+        |ctx, args| lr_get(ctx, args, "resourceBundle", 7),
     );
     r.register(
         lr,
         "setResourceBundle",
         "(Ljava/util/ResourceBundle;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 7, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
+        |ctx, args| lr_set(ctx, args, "resourceBundle", 7),
     );
     r.register(
         lr,
         "getResourceBundleName",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 8)))
-        },
+        |ctx, args| lr_get(ctx, args, "resourceBundleName", 8),
     );
     r.register(
         lr,
         "setResourceBundleName",
         "(Ljava/lang/String;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 8, args[1]);
-            Ok(Some(Value::Object(None)))
-        },
+        |ctx, args| lr_set(ctx, args, "resourceBundleName", 8),
     );
     r.register(lr, "getSequenceNumber", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 9)))
+        lr_get(ctx, args, "sequenceNumber", 9)
     });
     r.register(lr, "setSequenceNumber", "(J)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 9, args[1]);
-        Ok(Some(Value::Object(None)))
+        lr_set(ctx, args, "sequenceNumber", 9)
     });
     r.register(lr, "getThreadID", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 10)))
+        lr_get(ctx, args, "threadID", 10)
     });
     r.register(lr, "setThreadID", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 10, args[1]);
-        Ok(Some(Value::Object(None)))
+        lr_set(ctx, args, "threadID", 10)
     });
     r.register(lr, "getThrown", "()Ljava/lang/Throwable;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 11)))
+        lr_get(ctx, args, "thrown", 11)
     });
     r.register(lr, "setThrown", "(Ljava/lang/Throwable;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 11, args[1]);
-        Ok(Some(Value::Object(None)))
+        lr_set(ctx, args, "thrown", 11)
     });
 
     // --- Handler (abstract base, 1-field: level=0) ---

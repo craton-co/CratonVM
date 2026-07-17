@@ -2131,6 +2131,63 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     let heap = &vm.heap;
     let class_id = ClassId::new(class_id_raw as u32);
 
+    // JVMS §5.5 / §new: `new` must initialize its class before the object
+    // is allocated -- same missing check, same shape of bug as the
+    // `jit_getstatic`/`jit_putstatic_*` fixes above (see `jit_getstatic`'s
+    // comment for the full hazard writeup). The interpreter's own `new`
+    // handler (`runtime/interpreter.rs`, opcode `0xbb`) already calls
+    // `ensure_class_initialized_shared` before it ever looks at
+    // `num_total_fields`; this JIT slow-path helper never did, so a
+    // JIT-compiled `new` that happens to be the first-ever touch of its
+    // class (e.g. a rarely-taken `new`, reached only after the surrounding
+    // method already tiered up to JIT via other branches) could allocate
+    // and construct an instance of a class whose `<clinit>` — including any
+    // static state the constructor itself reads — had not yet run.
+    //
+    // Run the check BEFORE any allocation-capacity probing below: a
+    // `<clinit>` failure must be surfaced as the ordinary
+    // `ExceptionInInitializerError` through the caller's exception table,
+    // not after this helper has already committed heap state for an object
+    // that will never be returned. Mirrors the existing OOM/negative-length
+    // convention on this same helper family (`jit_alloc_oom`,
+    // `jit_negative_array_size`): stash the exception via
+    // `set_jit_pending_exception` and return the `0`/null sentinel, which
+    // the codegen's EXISTING `emit_post_alloc_oom_check()` guard (already
+    // emitted after every call site of this helper in `jit/src/x64.rs`,
+    // 0xbb arm) already recognizes and routes through the exception table —
+    // no codegen change needed for this fix, unlike `getstatic`/`putstatic`,
+    // whose fallible-call convention had no existing post-call check at all.
+    //
+    // NOTE (scope): this only covers the ordinary allocation path. A `new`
+    // site proven non-escaping by the JIT's scalar-replacement optimizer
+    // (`self.scalar_replaced` in `jit/src/x64.rs`'s 0xbb codegen) elides the
+    // call to this helper entirely and is NOT covered by this fix -- flagged
+    // as a residual in docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+            use crate::error::MethodCallFailed;
+            match err {
+                MethodCallFailed::ExceptionThrown(exc) => {
+                    set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err) => {
+                    let msg = format!(
+                        "JIT new class_id {class_id_raw} failed to initialize: {vm_err}"
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/InternalError",
+                        Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
+                }
+            }
+            return 0;
+        }
+    }
+
     // CRIT (jit/gc audit, 2026-05): probe young-gen capacity BEFORE
     // allocating. If young gen would overflow, retire the calling
     // thread's TLAB and trigger an orchestrated STW GC so the next
@@ -3423,6 +3480,55 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
 
+    // JVMS §5.5 / §getstatic: the declaring class must be initialized
+    // before its static storage is read. The interpreter's `getstatic`
+    // handler (`runtime/interpreter.rs`) already calls
+    // `ensure_class_initialized_shared` first; this JIT helper never did.
+    // A JIT-compiled `getstatic` that happens to be the FIRST-EVER access
+    // to that class's statics (e.g. a rarely-taken branch, such as
+    // `LineWrapper.append`'s `shouldWrap ? FlushType.WRAP : nextFlush`
+    // ternary, whose WRAP arm is only exercised once a line actually needs
+    // wrapping -- well after the surrounding method has already tiered up
+    // to JIT) silently read the zero-initialized placeholder
+    // (`get_static_shared` returns `Value::Int(0)` for a class with no
+    // `statics` entry yet) instead of running `<clinit>` first. Decoded as
+    // a reference by the caller, that `Int(0)` becomes a null pointer --
+    // `LineWrapper$FlushType.ordinal()` NPE, JIT-only (the interpreter
+    // path always initializes the class on its own earlier `getstatic`,
+    // masking this gap; see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // "JavaPoet LineWrapper$FlushType NPE" JIT-only residual).
+    //
+    // Mirror the interpreter: ensure init before reading. On failure
+    // (`<clinit>` threw -- JVMS wraps this as ExceptionInInitializerError),
+    // stash the exception and return the `i64::MIN` deopt sentinel so the
+    // caller's `emit_post_invoke_exception_check` (added alongside this
+    // fix in `jit/src/x64.rs`'s `0xb2` getstatic codegen) routes it through
+    // the method's exception table instead of pushing a bogus value.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+            use crate::error::MethodCallFailed;
+            match err {
+                MethodCallFailed::ExceptionThrown(exc) => {
+                    set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err) => {
+                    let msg = format!(
+                        "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/InternalError",
+                        Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
+                }
+            }
+            return i64::MIN;
+        }
+    }
+
     // Bootstrap intercept: mirror the interpreter's System.out/err/in intercept.
     // The real JDK System.<clinit> isn't fully bootable; the interpreter returns
     // pre-built synthetic streams for these three fields. The JIT must do the same,
@@ -3497,6 +3603,72 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     }
 }
 
+// JVMS §5.5 / §putstatic: the declaring class must be initialized before
+// its static storage is written, exactly like §getstatic (see the long
+// comment on `jit_getstatic`'s fix for the full hazard writeup — this is
+// the sibling bytecode, same missing check, same shape of bug). Beyond the
+// generic "read/write before <clinit> ran" hazard, `putstatic` has its own
+// sharper failure mode: `set_static_shared` (`vm/src/vm/vm_object.rs`)
+// lazily creates the class's static-field `Vec` on FIRST write, sized from
+// `class.fields.len()`, with no awareness of whether `<clinit>` has run.
+// If a JIT `putstatic` writes first, a *later* `<clinit>` run (triggered by
+// some other, unrelated access to the class) reaches the very same
+// `set_static_shared` and unconditionally overwrites that slot with its own
+// initializer value — silently discarding the JIT's write. Ordering
+// `<clinit>` before the write (mirroring the interpreter's own `putstatic`
+// handler, `runtime/interpreter.rs`, which calls
+// `ensure_class_initialized_shared` before ever touching the operand
+// stack/value) is the only sound fix.
+//
+// `putstatic` is `void`-returning, so unlike `jit_getstatic` there is no
+// legitimate return value that could collide with the `i64::MIN` deopt
+// sentinel — but the JIT call site still needs *some* signal to route a
+// `<clinit>` failure through the method's exception table instead of
+// silently proceeding to the (now-skipped) write. Mirrors the existing
+// void-helper convention used by the `invokestatic` arraycopy dispatch call
+// (`jit/src/x64.rs`, `emit_post_invoke_exception_check(b'V')` after
+// `self.helpers.invoke_dispatch`): the helper always returns `i64`, `0` on
+// the ordinary/no-exception path and `i64::MIN` when it stashed a pending
+// exception via `set_jit_pending_exception`. The matching codegen change
+// (`emit_post_invoke_exception_check(b'V')` after each `putstatic_*` call)
+// lives in `jit/src/x64.rs`'s two `0xb3` arms.
+//
+// Shared by all five `jit_putstatic_*` helpers. Returns `Some(i64::MIN)`
+// (the deopt sentinel, after stashing a Java exception) if `<clinit>`
+// failed; the caller must return that value immediately without writing
+// the field. Returns `None` when initialization already succeeded (or the
+// per-thread JIT context isn't available — mirrors `jit_getstatic`'s same
+// defensive fallback), meaning the caller should proceed with the write.
+#[inline]
+unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Option<i64> {
+    let class_id = ClassId::new(class_id_raw as u32);
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+            use crate::error::MethodCallFailed;
+            match err {
+                MethodCallFailed::ExceptionThrown(exc) => {
+                    set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err) => {
+                    let msg = format!(
+                        "JIT putstatic class_id {class_id_raw} failed to initialize: {vm_err}"
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/InternalError",
+                        Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
+                }
+            }
+            return Some(i64::MIN);
+        }
+    }
+    None
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -3505,17 +3677,21 @@ pub unsafe extern "C" fn jit_putstatic_int(
     class_id_raw: i64,
     field_index: i64,
     val: i64,
-) {
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 {
-        return;
+        return 0;
     }
     // SAFETY: vm_ptr is non-null and points to a valid SharedVm.
     let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+        return sentinel;
+    }
     let class_id = ClassId::new(class_id_raw as u32);
     crate::vm::set_static_shared(vm, class_id, field_index as usize, Value::Int(val as i32));
+    0
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3526,14 +3702,18 @@ pub unsafe extern "C" fn jit_putstatic_long(
     class_id_raw: i64,
     field_index: i64,
     val: i64,
-) {
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+        return sentinel;
+    }
     let class_id = ClassId::new(class_id_raw as u32);
     crate::vm::set_static_shared(vm, class_id, field_index as usize, Value::Long(val));
+    0
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3544,12 +3724,15 @@ pub unsafe extern "C" fn jit_putstatic_float(
     class_id_raw: i64,
     field_index: i64,
     val: i64,
-) {
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+        return sentinel;
+    }
     let class_id = ClassId::new(class_id_raw as u32);
     crate::vm::set_static_shared(
         vm,
@@ -3557,6 +3740,7 @@ pub unsafe extern "C" fn jit_putstatic_float(
         field_index as usize,
         Value::Float(f32::from_bits(val as u32)),
     );
+    0
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3567,12 +3751,15 @@ pub unsafe extern "C" fn jit_putstatic_double(
     class_id_raw: i64,
     field_index: i64,
     val: i64,
-) {
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+        return sentinel;
+    }
     let class_id = ClassId::new(class_id_raw as u32);
     crate::vm::set_static_shared(
         vm,
@@ -3580,6 +3767,7 @@ pub unsafe extern "C" fn jit_putstatic_double(
         field_index as usize,
         Value::Double(f64::from_bits(val as u64)),
     );
+    0
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3591,12 +3779,15 @@ pub unsafe extern "C" fn jit_putstatic_object(
     class_id_raw: i64,
     field_index: i64,
     val: i64,
-) {
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
+    if let Some(sentinel) = jit_putstatic_class_init_guard(vm, class_id_raw) {
+        return sentinel;
+    }
     let class_id = ClassId::new(class_id_raw as u32);
     // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier — log the
     // OLD static value before overwriting. Mirrors interpreter putstatic
@@ -3611,6 +3802,7 @@ pub unsafe extern "C" fn jit_putstatic_object(
         Value::Object(Some(ObjectRef::from_raw(val as usize as *mut u8)))
     };
     crate::vm::set_static_shared(vm, class_id, field_index as usize, value);
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -4020,16 +4212,61 @@ pub unsafe extern "C" fn jit_instanceof(
 /// interpreter.  Using a thread-local flag sidesteps this platform limitation.
 // SAFETY: Called from JIT-compiled code when an array bounds check fails.
 // Only stores two i64 values in a thread-local; no pointer dereferences.
-pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
+pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
+    // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
+    // 2026-07-17, `CRATONVM_DBG_AIOOBE3`): dump the raw ObjectHeader at the
+    // pointer the JIT's bounds check actually compared against, to
+    // distinguish "array genuinely under-allocated" (header's own
+    // `array_length` field matches the reported `length`, and `forwarding_ptr`
+    // is null) from "stale/forwarded pointer" (non-null `forwarding_ptr`, or
+    // a header that doesn't look like a live long[] at all — the classic
+    // unrooted-local-across-allocating-call signature this codebase has hit
+    // repeatedly elsewhere). Best-effort raw read: the pointer came from a
+    // live JIT register moments ago, so even if stale it should still point
+    // at mapped (recycled, not unmapped) heap memory.
+    if aioobe3_dbg() {
+        if array_ptr != 0 {
+            let base = array_ptr as usize as *const u8;
+            let class_id = std::ptr::read_unaligned(base as *const u32);
+            let kind = std::ptr::read_unaligned(base.add(4) as *const u8);
+            let elem_ty = std::ptr::read_unaligned(base.add(5) as *const u8);
+            let ident_hash = std::ptr::read_unaligned(base.add(8) as *const i32);
+            let arr_len_hdr = std::ptr::read_unaligned(base.add(12) as *const u32);
+            let num_slots = std::ptr::read_unaligned(base.add(16) as *const u32);
+            let gc_age = std::ptr::read_unaligned(base.add(21) as *const u8);
+            let gc_flags = std::ptr::read_unaligned(base.add(22) as *const u8);
+            let fwd_ptr = std::ptr::read_unaligned(base.add(24) as *const usize);
+            eprintln!(
+                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
+header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
+array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags={gc_flags} \
+forwarding_ptr={fwd_ptr:#x}"
+            );
+        } else {
+            eprintln!(
+                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL"
+            );
+        }
+    }
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
     // Out-of-band deopt signal: this `i64::MIN` IS the bounds-check stub's
     // method return value, so flag it as a genuine deopt so the interpreter
     // doesn't mistake a method legitimately returning `Long.MIN_VALUE` for one.
     set_jit_deopt_pending();
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
+}
+
+/// Cached `CRATONVM_DBG_AIOOBE3` gate: temp diagnostic companion to
+/// [`jit_throw_aioobe`] for the BigInteger.smallToString AIOOBE
+/// investigation (2026-07-17) — see that function's doc comment.
+#[inline]
+fn aioobe3_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE3").is_some())
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -4597,6 +4834,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     } else {
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
+
+    // JIT dispatch normally calls a custom loader's inherited bytecode
+    // directly. ClassLoader's resource methods must throw NPE for a null name
+    // before that bytecode runs; the sentinel routes it through Java handlers.
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
 
     let info_key = info_ptr as usize;
     // Cached exact-receiver native fast path — the FIRST per-callsite probe. The
@@ -5947,6 +6200,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     if args_slice.is_empty() {
         return 0;
     }
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
     let receiver_raw = args_slice[0];
     if receiver_raw == 0 {
         // Null receiver: throw NullPointerException (JVM semantics), mirroring
@@ -6029,6 +6294,39 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
         values
     };
+
+    // ClassLoader's resource accessors require a non-null resource name. The
+    // MIC fast path dispatches on a custom loader's runtime class and can call
+    // inherited JDK bytecode without consulting the ClassLoader callback that
+    // owns this contract. Handle the null-only case before cache lookup; normal
+    // resource calls still use the loader's virtual implementation unchanged.
+    if args_slice.len() == 2
+        && args_slice[1] == 0
+        && matches!(
+            (info.method_name, info.descriptor),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+        )
+    {
+        if let Some(callback) = vm.native_methods.find(
+            "java/lang/ClassLoader",
+            info.method_name,
+            info.descriptor,
+        ) {
+            let values = decode_values();
+            return match crate::vm::safe_native_call(vm, thread, callback, &values) {
+                Ok(Some(Value::Int(v))) => v as i64,
+                Ok(Some(Value::Long(v))) => v,
+                Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+                Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+                Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+                Ok(Some(Value::Object(None)) | None) => 0,
+                Ok(_) => 0,
+                Err(error) => handle_jit_dispatch_error(vm, thread, error, info),
+            };
+        }
+    }
 
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
@@ -7158,7 +7456,7 @@ mod tests {
         let _ = take_jit_deopt_pending();
         let _ = take_jit_pending_aioobe();
         // SAFETY: only stores into thread-locals; no pointer dereference.
-        let r = unsafe { jit_throw_aioobe(5, 3) };
+        let r = unsafe { jit_throw_aioobe(5, 3, 0) };
         assert_eq!(r, i64::MIN);
         assert!(
             take_jit_deopt_pending(),

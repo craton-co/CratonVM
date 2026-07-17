@@ -13856,13 +13856,30 @@ impl Compiler {
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
         // — no helper call, no per-alloc layout lookup. `class_layout` here runs
         // once at JIT-compile time, not per allocation.
-        let compact_body: Option<usize> = if cratonvm_types::compact_ref_fields_enabled() {
-            cratonvm_types::class_layout(class_id_raw)
-                .filter(|l| l.field_count() == num_fields)
-                .map(|l| l.body_size as usize)
-        } else {
-            None
-        };
+        // GROOVY-CLUSTER-20260717: class_layout(class_id_raw) is snapshotted
+        // ONCE here at JIT-compile time and its body_size/offsets get baked
+        // as immediate constants into the machine code below (bump-allocation
+        // size, array_length header write). Unlike the interpreter
+        // (vm/src/vm/vm_exec.rs) and the GC scan (gc/src/gen_heap.rs,
+        // gc/src/heap.rs), which both validate their own cached layout
+        // against layout_generation() before trusting it, this compile-time
+        // snapshot has no such check. When a class's registered compact
+        // layout is later replaced -- class_manager.rs's
+        // recompute_subclass_layouts / register_compact_layout_if_enabled,
+        // exercised whenever a synthetic-stub class gets upgraded to real
+        // bytecode with a different field count (the exact shape of ANTLR/
+        // Groovy-generated parser classes) -- any already-JIT-compiled new
+        // site keeps allocating objects at the OLD, now-wrong size while
+        // field-access code (correctly, dynamically, per-object) uses the
+        // CURRENT layout, corrupting the heap (confirmed via bisect +
+        // core-dump: SIGSEGV in JIT-generated code, RAX holding a garbage
+        // sign-extended int value used as a pointer). Disabling the fast
+        // inline-compact path here (falling back to the always-correct
+        // legacy-sized bump allocation, still avoiding the helper call) is
+        // the minimal safe fix; a full fix would thread layout_generation()
+        // through the JIT's compact-object fast paths the same way the
+        // interpreter/GC already do. See known-issues doc for detail.
+        let compact_body: Option<usize> = None;
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)
@@ -15319,6 +15336,12 @@ impl Compiler {
                         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.emit_call_absolute(self.helpers.getstatic);
+                        // jit-linewrapper-flushtype-npe fix (2026-07-17):
+                        // see the matching fix + comment at the top-level
+                        // 0xb2 arm -- same helper, same missing
+                        // post-invoke exception check for a `<clinit>`
+                        // failure surfaced via the deopt sentinel.
+                        self.emit_post_invoke_exception_check(type_tag);
                         // Volatile static: emit MFENCE after read (SeqCst acquire)
                         if is_volatile {
                             self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
@@ -15375,6 +15398,18 @@ impl Compiler {
                         self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                         self.load_slot_to_reg(ARG_REGS[3], val_slot);
                         self.emit_call_absolute(helper_fn);
+                        // jit-putstatic-clinit-gap fix (2026-07-17): the
+                        // helper now runs `<clinit>` on first touch before
+                        // writing and, on failure, returns the `i64::MIN`
+                        // deopt sentinel instead of `0` (mirrors
+                        // `jit_getstatic`'s sentinel; see the fix comment on
+                        // `jit_putstatic_class_init_guard` in
+                        // `vm/src/jit/helpers.rs`). `putstatic` is
+                        // void-returning, so route it through the shared
+                        // void-helper exception-check convention (same one
+                        // the `invokestatic` arraycopy dispatch call uses)
+                        // rather than pushing a value.
+                        self.emit_post_invoke_exception_check(b'V');
                         // Volatile static: emit MFENCE after write (SeqCst store-load barrier)
                         if is_volatile {
                             self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
@@ -16328,17 +16363,29 @@ impl Compiler {
         // R10D = array_length (loaded in the bounds check)
         // We need to pass (index, length) to jit_throw_aioobe
 
-        // Set up args for jit_throw_aioobe(index: i64, length: i64)
+        // Set up args for jit_throw_aioobe(index: i64, length: i64, array_ptr: i64)
+        //
+        // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
+        // 2026-07-17): RAX still holds the array pointer at this point (the
+        // bounds check only reads through it into R10D; nothing in this
+        // stub clobbers RAX before the CALL), so pass it as a 3rd arg for
+        // `CRATONVM_DBG_AIOOBE3` diagnostics. Behavior-neutral when unset.
         #[cfg(target_os = "windows")]
         {
-            // Windows: arg1=RCX, arg2=RDX
+            // Windows: arg1=RCX, arg2=RDX, arg3=R8
             // RCX already contains the index
+            // MOV R8, RAX (move array pointer to arg3)
+            self.buf.emit(&[0x49, 0x89, 0xC0]); // REX.WB + MOV r/m64, r64 (R8 <- RAX)
             // MOV RDX, R10 (move length to arg2)
             self.buf.emit(&[0x4C, 0x89, 0xD2]); // REX.WR + MOV r/m64, r64
         }
         #[cfg(not(target_os = "windows"))]
         {
-            // SysV: arg1=RDI, arg2=RSI
+            // SysV: arg1=RDI, arg2=RSI, arg3=RDX
+            // MOV RDX, RAX (move array pointer to arg3)
+            self.rex_w();
+            self.buf.emit_byte(0x8B);
+            self.modrm_reg(RDX, RAX);
             // MOV RDI, RCX (move index to arg1)
             self.rex_w();
             self.buf.emit_byte(0x8B);
@@ -20421,6 +20468,15 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
                     self.emit_call_absolute(self.helpers.getstatic);
+                    // jit-linewrapper-flushtype-npe fix (2026-07-17): the
+                    // helper now runs `<clinit>` on first touch and, on
+                    // failure, stashes the Java exception and returns the
+                    // `i64::MIN` deopt sentinel instead of a field value.
+                    // Route that through the shared exception-check stub
+                    // (mirrors every other fallible JIT helper call) rather
+                    // than pushing the sentinel bits as if they were a
+                    // legitimate result.
+                    self.emit_post_invoke_exception_check(type_tag);
                     // Volatile static: emit MFENCE after read (SeqCst acquire)
                     if is_volatile {
                         self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
@@ -20490,6 +20546,10 @@ impl Compiler {
                     self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // field_index // Cast: x86-64 immediate encoding
                     self.load_slot_to_reg(ARG_REGS[3], val_slot); // value
                     self.emit_call_absolute(helper_fn);
+                    // jit-putstatic-clinit-gap fix (2026-07-17): see the
+                    // matching comment at the inlined-callee 0xb3 arm above —
+                    // same helper, same new fallible-`<clinit>` sentinel.
+                    self.emit_post_invoke_exception_check(b'V');
                     // Volatile static: emit MFENCE after write (SeqCst store-load barrier)
                     if is_volatile {
                         self.buf.emit(&[0x0F, 0xAE, 0xF0]); // MFENCE
@@ -27074,7 +27134,34 @@ pub fn compile_with_param_slots(
         // fast entry mis-read the sentinel as a return value (int-truncated
         // to 0) and leaked the pending SOE (observed: DeepRec printed
         // "no-overflow r=0" instead of catching the error).
-        || !compiler.self_call_patches.is_empty();
+        || !compiler.self_call_patches.is_empty()
+        // jit-clinit-gap-has-dispatch fix (2026-07-17): `jit_getstatic`,
+        // `jit_putstatic_*`, and `jit_new_object` all now run
+        // `ensure_class_initialized_shared` (see the matching fix comments
+        // on each in `vm/src/jit/helpers.rs`), which needs `jit_thread_mut()`
+        // to resolve a live `&mut JvmThread` -- exactly the same
+        // `JIT_THREAD` TLS this whole `has_dispatch` flag exists to
+        // guarantee (see the doc comment above: "otherwise the callee's
+        // dispatch helper sees a null thread and silently returns 0").
+        // Before this line, a method whose ONLY JIT-relevant content was
+        // getstatic/putstatic/new sites -- no invoke, no direct call, no
+        // bounds check, nothing else on this list -- compiled with
+        // `has_dispatch=false` and was entered through `execute_jit_call`'s
+        // fast arm (`vm/src/runtime/interpreter.rs`, `if !compiled.
+        // has_dispatch`), which skips `set_jit_thread` entirely. Any of
+        // those three helpers then saw `jit_thread_mut() == None` and
+        // silently skipped the class-init check altogether (the same
+        // "silently returns 0"-shaped failure the `Character.getType`
+        // fix above this comment already fixed for `direct_calls`) --
+        // confirmed via a minimal repro (`static void touch(boolean w) {
+        // if (w) { Init.VALUE = v; } else { dummy++; } }`, no other
+        // dispatch-needing construct) whose compiled artifact had
+        // `has_dispatch=false`, `static_field_info.len()=3`, and observably
+        // wrote the static WITHOUT running `<clinit>` first. `new_info` gets
+        // the same treatment for the identical reason on the `jit_new_object`
+        // side.
+        || !compiler.static_field_info.is_empty()
+        || !compiler.new_info.is_empty();
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {

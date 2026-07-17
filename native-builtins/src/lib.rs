@@ -26749,6 +26749,28 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // Real-JDK `Module.getDescriptor()` is a field read, but Module mirrors
+    // produced by CratonVM do not carry the JDK's private descriptor field.
+    // The synthetic-JDK registration has a bridge for this already; install it
+    // here as well because this is the registration path used by the CLI.
+    registry.register(
+        "java/lang/Module",
+        "getDescriptor",
+        "()Ljava/lang/module/ModuleDescriptor;",
+        |ctx, args| {
+            let module = match args.first() {
+                Some(Value::Object(Some(module))) => *module,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let name = match ctx.get_field_by_name(module, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let descriptor = build_synthetic_module_descriptor(ctx, &name);
+            Ok(Some(Value::Object(Some(descriptor))))
+        },
+    );
+
     // `java/lang/Module.addUses(Class)` — companion to `canUse` above, same
     // null-descriptor gap (real bytecode reads `this.descriptor` to decide
     // whether the module already implicitly "uses" everything as an
@@ -31288,6 +31310,35 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         // A real ThreadGroup is required: the FieldHolder ctor stores it,
         // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
         // to the current thread's group when the caller passed null.
+        //
+        // GCBARRIER-CDLWAIT-FIX (2026-07-17): this block's `get_field_by_name`
+        // calls (and, under `CRATONVM_DBG_GC_STRESS` / real allocation
+        // pressure, any heap touch at all) can trigger a moving collection.
+        // `holder` was pinned right above via `holder_handle`, but nothing
+        // re-read it through that pin before this point -- so a GC landing
+        // in this exact window silently relocates the just-allocated
+        // FieldHolder while the bare `holder` local still names its dead
+        // from-space address. That address remains a *structurally valid*
+        // read (headers of already-evacuated copies stay intact until the
+        // space is reused), so nothing downstream ever threw; it just meant
+        // `args[0]` below handed the FieldHolder ctor invoke a receiver that
+        // pointed at reclaimed memory. Root-caused live: under
+        // `CRATONVM_DBG_GC_STRESS`, the FIRST-ever `new Thread(Runnable,
+        // String)` in a process reliably hit this window (this call's own
+        // `ensure_class_initialized("java/lang/Thread$FieldHolder")` above
+        // loads+links that class for the first time, doing enough
+        // allocating work to make a GC land here on cold runs; every
+        // subsequent construction is warm and never triggers a GC in this
+        // narrow span) -- the constructed `Thread.holder.task` field then
+        // read back as a zero/default slot (decoded as `Int(0)`, not even a
+        // stale `Object` ref) because the ctor's `putfield` landed on the
+        // abandoned copy, and that worker's `Runnable.run()` (and therefore
+        // its `CountDownLatch.countDown()`) was silently never invoked.
+        // Re-read `holder` through its pin now, immediately before it is
+        // used to build `args`, exactly like `target`/`this` already are
+        // re-read (via `target_handle`/`pin_base`) after the invoke below --
+        // this closes the identical gap on the WAY IN.
+        let holder = ctx.read_native_pin(holder_handle, holder);
         let group = match group {
             Value::Object(Some(_)) => group,
             _ => {
@@ -31298,6 +31349,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     _ => Value::Object(None),
                 }
             }
+        };
+        // Same fix, applied again: the group-resolution block just above is
+        // itself a further opportunity for a GC to land before `args` is
+        // built, so re-read `holder` (and the `target` object, if any, via
+        // `target_handle`) one more time right at the point of use.
+        let holder = ctx.read_native_pin(holder_handle, holder);
+        let target = match target_handle {
+            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+            None => target,
         };
         let args = [
             Value::Object(Some(holder)),
@@ -33784,18 +33844,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_snapshot_list_itr_previous_index,
     );
-    registry.register(array_list_itr, "remove", "()V", |_ctx, _args| Ok(None));
+    registry.register(
+        array_list_itr,
+        "remove",
+        "()V",
+        native_arraylist_list_itr_remove,
+    );
     registry.register(
         array_list_itr,
         "set",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_set,
     );
     registry.register(
         array_list_itr,
         "add",
         "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_arraylist_list_itr_add,
     );
     for empty_iterator in [
         "java/util/Collections$EmptyIterator",
@@ -34523,6 +34588,38 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 args.get(2).copied().unwrap_or(Value::Object(None)),
             );
             ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            // Real JDK stamps the constructing thread's id into
+            // threadID/longThreadID. Without it, records report
+            // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
+            // that 0 to ThreadMXBean.getThreadInfo(long), which rejects
+            // non-positive ids ("Invalid thread ID parameter") on every
+            // AsyncFileHandler format. The mirror lookup may allocate, so
+            // keep this pinned across it.
+            let real = log_record_real_layout(ctx, this);
+            let this_pin = ctx.pin_native_root(this);
+            let tid = current_java_thread_tid(ctx);
+            // Creation time: the real ctor stores Instant.now(), which
+            // getMillis()/JULI's OneLineFormatter timestamp column read
+            // back. Only materialize it for the real layout.
+            let instant = if real {
+                ctx.invoke(
+                    "java/time/Instant",
+                    "ofEpochMilli",
+                    "(J)Ljava/time/Instant;",
+                    &[Value::Long(epoch_millis_now())],
+                )
+                .ok()
+                .flatten()
+            } else {
+                None
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "threadID", Value::Int(short_thread_id(tid)));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            if let Some(instant @ Value::Object(Some(_))) = instant {
+                ctx.set_field_by_name(this, "instant", instant);
+            }
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -36123,19 +36220,67 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and `withZone(null)` immediately NPEs, blowing up the entire
     // log4j logging stack and stalling WildFly bootstrap.
     //
-    // Until the underlying tzdb.dat read is fixed, intercept the call
-    // and return a synthetic UTC ZoneId object.  The returned value
-    // satisfies `withZone(non-null)` so log4j initialises cleanly.
-    // DST semantics are wrong, but log timestamps default to UTC,
-    // which is acceptable for boot diagnostics.
+    // HHH-10372 correctness fix (2026-07-17): the original version of this
+    // bypass (still present as the fallback below) *always* returned a
+    // hardcoded UTC ZoneOffset, ignoring any `TimeZone.setDefault(...)`
+    // call the running program had made — a host-timezone-leak that
+    // silently broke every caller relying on a *settable* JVM default,
+    // not just log4j's boot-time NPE guard. Concretely: Hibernate's
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` (`Timezones.withDefaultTimeZone()`
+    // test helper) call `TimeZone.setDefault(...)` then read it back via
+    // `ZoneId.systemDefault()` — with the old hardcoded-UTC bypass, that
+    // always resolved to UTC regardless of what was set, producing
+    // timezone-offset-sized value corruption (63/608 parameterized
+    // failures, e.g. `expected: <2017-11-06 09:19:01.0> but was:
+    // <2017-11-06 01:19:01.0>`, matching whatever offset `TimeZone.setDefault`
+    // was called with).
+    //
+    // Fix: first try to resolve the *actual current* default zone via
+    // `TimeZone.getDefault()` (also natively overridden below in the
+    // "Round 54" fix, and confirmed to correctly track `setDefault(...)`
+    // — it does not touch the broken ZoneInfoFile/tzdb.dat path) and hand
+    // its id to the real bytecode `ZoneId.of(String)` (unregistered/native-free
+    // in real-JDK mode, so it runs the actual JDK parsing+tzdb-rules logic,
+    // which already works correctly for explicit `ZoneId.of(...)` calls
+    // elsewhere in this same test suite — DST rules included). Only fall
+    // back to the original hardcoded synthetic UTC ZoneOffset (preserving
+    // the exact previous behavior) if that chain fails for any reason
+    // (e.g. too early in boot for TimeZone/ZoneId to be ready yet) — the
+    // log4j NPE guard this bypass exists for must never regress.
     registry.register(
         "java/time/ZoneId",
         "systemDefault",
         "()Ljava/time/ZoneId;",
         |ctx, _args| {
-            // Allocate a synthetic instance of ZoneOffset (a concrete
-            // ZoneId subclass with a single int totalSeconds field).
-            // Using the abstract ZoneId class directly may break
+            if let Ok(Some(Value::Object(Some(tz)))) = ctx.invoke(
+                "java/util/TimeZone",
+                "getDefault",
+                "()Ljava/util/TimeZone;",
+                &[],
+            ) {
+                if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
+                    "java/util/TimeZone",
+                    "getID",
+                    "()Ljava/lang/String;",
+                    &[Value::Object(Some(tz))],
+                ) {
+                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
+                    if has_id {
+                        if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                            "java/time/ZoneId",
+                            "of",
+                            "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                            &[Value::Object(Some(id_str))],
+                        ) {
+                            return Ok(Some(zone));
+                        }
+                    }
+                }
+            }
+            // Fallback: original hardcoded-UTC synthetic bypass (see doc
+            // comment above) — allocate a synthetic instance of ZoneOffset
+            // (a concrete ZoneId subclass with a single int totalSeconds
+            // field). Using the abstract ZoneId class directly may break
             // instanceof checks downstream; ZoneOffset.UTC is the
             // canonical way to get a non-null ZoneId without touching
             // ZoneInfoFile.
@@ -36391,6 +36536,164 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // HIB-DST-STARTYEAR (2026-07-17): historical DST-adoption year for
+    // zones in the `tz_dst_rule` "EU rule" branch above.
+    //
+    // `tz_dst_rule` only knows the zone's CURRENT/modern recurring DST
+    // rule and applies it to every date unconditionally — including dates
+    // long before the zone had daylight saving at all. Confirmed live
+    // (standalone repro against real HotSpot JDK 25, cross-checked with
+    // `sun.util.calendar.ZoneInfo`'s own legacy `TimeZone.getOffset(long)`
+    // path, not just `java.time`):
+    // `TimeZone.getTimeZone("Europe/Amsterdam").getOffset(epochMillisFor(
+    // "1892-04-01T00:00:00Z"))` returned 7200000ms (+2h, modern DST rule
+    // wrongly applied) on CratonVM vs 3600000ms (+1h, no DST — HotSpot's
+    // own zone data correctly has no DST that far back) on real HotSpot.
+    // This is a distinct bug from HIB-PARIS-LMT above: that one is a
+    // one-time historical rawOffset cutover (LMT precision); this one is
+    // the recurring DST *rule itself* being retroactively misapplied to
+    // an era before the zone had DST in any form.
+    //
+    // Each value below is the first year real HotSpot JDK 25's own legacy
+    // `TimeZone.getOffset(long)` path reports ANY winter/summer offset
+    // split for that zone at all — i.e. the smallest year where
+    // `getOffset()` at a fixed mid-January instant differs from
+    // `getOffset()` at a fixed mid-July instant of the same year — found
+    // by scanning year-by-year from 1850 against real HotSpot JDK 25
+    // directly (not derived from a general historical claim: per this
+    // project's own hard-won lesson from HIB-PARIS-LMT, HotSpot's compiled
+    // legacy tzdata does not always carry the textbook-historical answer;
+    // what this project targets is matching HotSpot, not the real world).
+    //
+    // `alloc_synth_timezone` gates the constructed `SimpleTimeZone` with
+    // real `setStartYear(int)` bytecode using this value — the exact
+    // real-JDK mechanism for exactly this purpose (`SimpleTimeZone`'s own
+    // `getOffset`/`getOffsets` bytecode checks `year < startYear` and
+    // returns `rawOffset` with no DST applied when it's before the start
+    // year — see `javap -c java.util.SimpleTimeZone`), so no calendar-math
+    // reimplementation is needed on the Rust side; the real class does the
+    // gating itself, exactly as it would for a real HotSpot-constructed
+    // `SimpleTimeZone`.
+    //
+    // SCOPE LIMIT: this is a single flip year per zone, not full
+    // historical tzdata. Real HotSpot's own zone data for every zone below
+    // has a much messier history AFTER this adoption year — WWI-era DST
+    // suspended again in some zones during the interwar years, WWII
+    // occupation-driven changes to the *winter* (raw) offset itself
+    // (independent of any DST rule), and a widespread POST-WWII
+    // suspension of DST across Europe not reintroduced until the 1970s
+    // oil-crisis era / the 1996 EU-wide harmonization that `tz_dst_rule`'s
+    // modern rule actually models. Gating on just the first-ever-adoption
+    // year does NOT make CratonVM match HotSpot for that entire messy
+    // 1916(ish)-1980(ish) middle era — it only removes the strictly-wrong
+    // "DST applied to a date before the zone had DST at all" case, which
+    // is this fix's actual target (pre-20th-century dates, and more
+    // generally any date before each zone's real first-ever DST year).
+    // That intermediate-era imperfection is pre-existing — CratonVM's flat
+    // modern-rule model could never have matched that era, gated or not —
+    // and is unchanged by this fix, not a new regression.
+    fn dst_start_year(zone_id: &str) -> Option<i32> {
+        match zone_id {
+            // Europe/Paris: real HotSpot's legacy path first shows a
+            // winter/summer offset split in 1911 — the same year as the
+            // HIB-PARIS-LMT LMT->WET rawOffset cutover above (France
+            // adopted WET, then DST, in short order).
+            "Europe/Paris" => Some(1911),
+            // WWI-era DST adoption block: CET, Germany, Italy, Norway,
+            // Netherlands, Belgium, Austria, Denmark, Sweden, Poland,
+            // Czechia, Hungary, UK all first show a winter/summer split
+            // in 1916 against real HotSpot.
+            "CET" | "Europe/Berlin" | "Europe/Rome" | "Europe/Oslo" | "Europe/Amsterdam"
+            | "Europe/Brussels" | "Europe/Vienna" | "Europe/Copenhagen" | "Europe/Stockholm"
+            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London"
+            | "GB" => Some(1916),
+            // Spain: real HotSpot's legacy path shows an earlier (1901)
+            // Madrid-Mean-Time -> WET rawOffset switch that is NOT a DST
+            // split (winter == summer that year); the first genuine
+            // winter/summer split is 1918.
+            "Europe/Madrid" => Some(1918),
+            "Europe/Helsinki" => Some(1921),
+            "Europe/Bucharest" => Some(1932),
+            // Switzerland: real HotSpot shows no DST split at all until
+            // the short-lived 1941 wartime DST.
+            "Europe/Zurich" => Some(1941),
+            // Greece: real HotSpot's legacy path shows an earlier (1917)
+            // LMT -> EET rawOffset switch that is NOT a DST split (winter
+            // == summer that year); the first genuine winter/summer split
+            // is 1943 (wartime).
+            "Europe/Athens" => Some(1943),
+            _ => None,
+        }
+    }
+
+    // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
+    // offsets for zones whose real IANA tzdata models a historical LMT-style
+    // offset before their first modern standardization transition.
+    // `tz_standard_offset_seconds`/`tz_dst_rule` above only know the
+    // CURRENT/modern standard offset and (for zones with a recurring annual
+    // DST rule) a `java.util.SimpleTimeZone`-representable rule — neither
+    // can express a ONE-TIME historical cutover, because SimpleTimeZone's
+    // `getOffsets(long, int[])` (what `GregorianCalendar.computeTime()`/
+    // `.computeFields()` actually call for a non-`ZoneInfo` zone — see
+    // `TimeZone.getOffsets`) only ever consults `rawOffset` (fixed at
+    // construction, no date parameter) plus the DST rule; there is no
+    // structural way to make `rawOffset` itself date-dependent. This table
+    // plus the `SimpleTimeZone.getOffsets` override below patches in the
+    // exact historical cutover(s) real HotSpot's tzdb encodes for the
+    // zones this project's Hibernate ORM suite exercises pre-standardization
+    // dates for (`ZonedDateTimeTest`'s 1904/1905 Europe/Paris boundary
+    // cases — see docs/known-issues/hibernate/hib-misc-residuals-20260716.md
+    // and docs/internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+    //
+    // Values cross-checked against real HotSpot JDK 25's
+    // `ZoneId.of(id).getRules().getTransitions()` — the earliest transition
+    // each zone's tzdb rule-set models, i.e. the exact instant HotSpot
+    // itself switches away from the zone's Local Mean Time. Returns
+    // `(cutover_epoch_millis, pre_cutover_offset_seconds)`: for any queried
+    // instant strictly before `cutover_epoch_millis`, the real/correct
+    // offset is `pre_cutover_offset_seconds`, not the zone's modern
+    // rawOffset/DST rule. This is intentionally a small, explicit table
+    // (not full historical tzdata) — it only covers zones actually
+    // exercised pre-cutover by this codebase's test suites; a zone not
+    // listed here simply keeps the existing (correct, post-standardization)
+    // rawOffset/DST-rule behavior for every date, unchanged from before this
+    // fix.
+    fn historical_lmt_offset(zone_id: &str) -> Option<(i64, i32)> {
+        match zone_id {
+            // Europe/Paris: Paris Mean Time (+00:09:21) until the
+            // 1911-03-11 00:00 local switch to WET (UTC+0). Confirmed via
+            // `GeneralityRepro.java` that real HotSpot JDK 25's OWN legacy
+            // `TimeZone.getOffset(long)`/`GregorianCalendar` path (not just
+            // `java.time`) correctly resolves this to 561s pre-cutover —
+            // i.e. adding this entry makes CratonVM MATCH real HotSpot.
+            //
+            // Deliberately NOT extended to Europe/Amsterdam (+00:17:30
+            // until 1892-05-01) or Europe/Oslo (+00:53:28 until
+            // 1893-03-31), even though those zones have an analogous
+            // historical LMT cutover in real IANA tzdata and in
+            // `java.time`'s `ZoneRules`: probed with the same
+            // `GeneralityRepro.java` against real HotSpot JDK 25, and
+            // unlike Paris, HotSpot's own *legacy* `TimeZone`/
+            // `GregorianCalendar` path returns the flat MODERN offset
+            // (3600s) for both zones even strictly before their cutover
+            // instant — real HotSpot's compiled legacy `ZoneInfo` binary
+            // tzdata apparently doesn't carry these zones' pre-1892/1893
+            // LMT rule at all, even though `java.time`'s separate,
+            // text-tzdata-backed `ZoneRules` does. Adding a table entry
+            // for these two would make CratonVM's legacy path *more
+            // textbook-correct than real HotSpot* — i.e. diverge from the
+            // reference JVM this project targets bug-for-bug compatibility
+            // with, not converge on it. If a future test genuinely needs
+            // one of these (or another zone's) legacy-path LMT precision
+            // matched, re-verify against real HotSpot with
+            // `GeneralityRepro.java`-style probing FIRST — do not assume
+            // "real IANA tzdata has a cutover" implies "HotSpot's legacy
+            // Calendar path resolves it".
+            "Europe/Paris" => Some((-1855958961_000, 9 * 60 + 21)),
+            _ => None,
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
         // current recurring DST rule is known (`tz_dst_rule`), construct a
@@ -36415,6 +36718,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "(ILjava/lang/String;IIIIIIIIIII)V",
                 &args,
             ) {
+                // HIB-DST-STARTYEAR (2026-07-17): gate the just-constructed
+                // SimpleTimeZone's DST rule to real HotSpot's own historical
+                // adoption year for this zone via the real
+                // `SimpleTimeZone.setStartYear(int)` bytecode — see
+                // `dst_start_year` above for how these years were found and
+                // what this fix does/doesn't cover. Best-effort: any
+                // dispatch failure just leaves the SimpleTimeZone ungated
+                // (this project's pre-fix, DST-applied-year-round
+                // behavior) — never worse than before this fix.
+                if let Some(start_year) = dst_start_year(id_str) {
+                    let _ = ctx.invoke_virtual_bytecode_only(
+                        obj,
+                        "setStartYear",
+                        "(I)V",
+                        &[Value::Int(start_year)],
+                    );
+                }
                 return cratonvm_types::Value::Object(Some(obj));
             }
         }
@@ -36626,6 +36946,59 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    // HIB-PARIS-LMT (2026-07-17): SimpleTimeZone.getOffsets(long, int[]) —
+    // the package-private method GregorianCalendar.computeTime()/
+    // computeFields() actually call (via TimeZone.getOffsets / directly) for
+    // any zone that isn't a `sun.util.calendar.ZoneInfo` — which, per
+    // `alloc_synth_timezone` above, is every zone with a known
+    // `tz_dst_rule` (all the `Europe/*` zones the Hibernate ORM
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` suites exercise). For dates
+    // strictly before a zone's `historical_lmt_offset` cutover, return the
+    // historical LMT offset directly; otherwise defer to the real
+    // SimpleTimeZone bytecode (its existing, already-correct
+    // rawOffset/DST-rule computation) via `invoke_virtual_bytecode_only` —
+    // skipping the native-override check so this doesn't re-enter itself.
+    // See `historical_lmt_offset` for why this can't be expressed by
+    // overriding `getRawOffset()` instead (no date parameter to key off).
+    registry.register(
+        "java/util/SimpleTimeZone",
+        "getOffsets",
+        "(J[I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
+
+            let id = match ctx.get_field_by_name(this, "ID") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+
+            if let Some((cutover_millis, pre_offset_secs)) = historical_lmt_offset(&id) {
+                if date < cutover_millis {
+                    let offset_ms = pre_offset_secs.saturating_mul(1000);
+                    if let Value::Object(Some(arr)) = offsets_arr {
+                        ctx.set_array_element(arr, 0, Value::Int(offset_ms));
+                        ctx.set_array_element(arr, 1, Value::Int(0));
+                    }
+                    return Ok(Some(Value::Int(offset_ms)));
+                }
+            }
+
+            ctx.invoke_virtual_bytecode_only(
+                this,
+                "getOffsets",
+                "(J[I)I",
+                &[Value::Long(date), offsets_arr],
+            )
+        },
     );
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
@@ -46215,6 +46588,57 @@ fn next_java_thread_tid() -> i64 {
     let tid = (*entry).max(1);
     *entry = tid.saturating_add(1);
     tid
+}
+
+/// Current thread's Java `Thread.tid` (what `Thread.currentThread().threadId()`
+/// returns): read it off the current thread's mirror so native-built
+/// `LogRecord`s carry the same id that thread-keyed consumers (JULI's
+/// `OneLineFormatter` -> `ThreadMXBean.getThreadInfo(long)`) resolve against.
+/// Falls back to the VM thread id when the mirror exposes no positive `tid`
+/// (e.g. synthetic Thread layouts) -- `threadId()` must stay positive.
+pub(crate) fn current_java_thread_tid(ctx: &mut dyn NativeContext) -> i64 {
+    let thread_obj = ctx.current_thread_object();
+    match ctx.get_field_by_name(thread_obj, "tid") {
+        Value::Long(id) if id > 0 => id,
+        Value::Int(id) if id > 0 => id as i64,
+        _ => ctx.thread_id().max(1) as i64,
+    }
+}
+
+/// The JDK's legacy int thread id for a long tid: ids that fit keep their
+/// value, larger (e.g. VM-fabricated high-range) tids collapse onto the
+/// same "above Integer.MAX_VALUE/2" convention `LogRecord.shortThreadID`
+/// uses. The exact high-range value is only ever a display label.
+pub(crate) fn short_thread_id(tid: i64) -> i32 {
+    if tid <= (i32::MAX / 2) as i64 {
+        tid as i32
+    } else {
+        i32::MAX / 2 + 1
+    }
+}
+
+/// Wall-clock now in epoch millis, for stamping `LogRecord` creation time.
+pub(crate) fn epoch_millis_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether `rec` is a real-JDK-layout `java.util.logging.LogRecord`. The real
+/// class resolves its private `longThreadID` long by NAME (typed zero even
+/// before any write); synthetic WildFly/JBoss mirrors have no such field, so
+/// the lookup yields `Object(None)`. Slot-based accessor fallbacks are only
+/// valid on the synthetic layouts: the real JDK 25 declaration order
+/// (level=0, sequenceNumber=1, sourceClassName=2, sourceMethodName=3,
+/// message=4, threadID=5, longThreadID=6, instant=7, loggerName=8,
+/// resourceBundle=9, resourceBundleName=10, parameters=11, thrown=12)
+/// disagrees with the synthetic slots almost everywhere.
+pub(crate) fn log_record_real_layout(
+    ctx: &dyn NativeContext,
+    rec: cratonvm_types::ObjectRef,
+) -> bool {
+    matches!(ctx.get_field_by_name(rec, "longThreadID"), Value::Long(_))
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.
@@ -76719,6 +77143,104 @@ fn native_arraylist_list_itr_list(
         Value::Object(Some(list)) => Some(list),
         _ => None,
     }
+}
+
+/// `ArrayList$ListItr.set(Object)` -- real live mutation against the
+/// backing `ArrayList` (found via `native_arraylist_list_itr_list`), NOT a
+/// no-op. Root-caused 2026-07-17: this class's `set`/`add`/`remove` were
+/// previously registered as hardcoded `|_ctx, _args| Ok(None)` stubs (a
+/// leftover from an earlier, genuinely-immutable "snapshot" design), but
+/// `native_arraylist_list_iterator` and the sibling `next`/`previous`
+/// natives above already carry a LIVE backing-list reference in the
+/// `this$0`-equivalent slot -- so the iterator is not actually a frozen
+/// snapshot, and silently dropping `set`/`add`/`remove` produced silent
+/// data loss for any real-JDK code using `List.listIterator()` mutators
+/// (e.g. ANTLR4's `IntervalSet.add(int)`, which merges adjacent intervals
+/// via `ListIterator.set`/`.previous`/`.remove` -- this exact bug corrupted
+/// Groovy's ANTLR4-generated parser ATN after `ATNDeserializer.optimizeSets`,
+/// producing spurious `Unexpected input` parse failures for basic numeric/
+/// string literals). Mirrors real-JDK `ArrayList$ListItr.set`'s
+/// `IllegalStateException` guard (`lastRet < 0`) and delegates the actual
+/// write to the already-correct `native_al_set`.
+fn native_arraylist_list_itr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (_, last_ret_slot, _, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "set".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_set(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret), e],
+    )?;
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.add(Object)` -- real live insertion at the cursor
+/// position. See `native_arraylist_list_itr_set` for the root-cause
+/// narrative; mirrors real-JDK `ArrayList$ListItr.add`'s cursor/lastRet
+/// bookkeeping (advance cursor past the inserted element, reset lastRet to
+/// -1 so a following `remove()`/`set()` correctly throws
+/// `IllegalStateException`).
+fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let cursor = ctx.get_field(this, cursor_slot).as_int().unwrap_or(0);
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    let e = args.get(1).copied().unwrap_or(Value::Object(None));
+    cratonvm_native_collections::native_al_add_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(cursor), e],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
+}
+
+/// `ArrayList$ListItr.remove()` -- real live removal of the last element
+/// returned by `next()`/`previous()`. See `native_arraylist_list_itr_set`
+/// for the root-cause narrative; mirrors real-JDK `ArrayList$Itr.remove`'s
+/// cursor rewind (`cursor = lastRet`) and `lastRet` reset.
+fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
+    let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
+    if last_ret < 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let list = match native_arraylist_list_itr_list(ctx, this) {
+        Some(list) => list,
+        None => return Ok(None),
+    };
+    cratonvm_native_collections::native_al_remove_at(
+        ctx,
+        &[Value::Object(Some(list)), Value::Int(last_ret)],
+    )?;
+    ctx.set_field(this, cursor_slot, Value::Int(last_ret));
+    ctx.set_field(this, last_ret_slot, Value::Int(-1));
+    if let Some(slot) = expected_slot {
+        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        set_field_if_present(ctx, this, slot, Value::Int(mod_count));
+    }
+    Ok(None)
 }
 
 fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

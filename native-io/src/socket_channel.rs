@@ -249,9 +249,9 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
         }
         .into(),
         ErrorKind::AddrInUse => ioex(format!("BindException: Address already in use: {ctx}: {e}")),
-        ErrorKind::AddrNotAvailable => {
-            ioex(format!("BindException: Cannot assign requested address: {ctx}: {e}"))
-        }
+        ErrorKind::AddrNotAvailable => ioex(format!(
+            "BindException: Cannot assign requested address: {ctx}: {e}"
+        )),
         ErrorKind::PermissionDenied => {
             ioex(format!("BindException: Permission denied: {ctx}: {e}"))
         }
@@ -379,8 +379,13 @@ enum Syn {
     Null,
 }
 
-fn chan_fields() -> &'static RwLock<HashMap<i32, [Syn; N_FIELDS]>> {
-    static T: OnceLock<RwLock<HashMap<i32, [Syn; N_FIELDS]>>> = OnceLock::new();
+struct ChanState {
+    object: ObjectRef,
+    fields: [Syn; N_FIELDS],
+}
+
+fn chan_fields() -> &'static RwLock<HashMap<i32, Vec<ChanState>>> {
+    static T: OnceLock<RwLock<HashMap<i32, Vec<ChanState>>>> = OnceLock::new();
     T.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -400,8 +405,17 @@ fn cf_set(ctx: &mut dyn NativeContext, obj: ObjectRef, idx: usize, v: Value) {
     };
     let key = ctx.identity_hash_code(obj);
     let mut t = chan_fields().write();
-    let arr = t.entry(key).or_insert_with(default_syn);
-    arr[idx] = slot;
+    let bucket = t.entry(key).or_default();
+    if let Some(state) = bucket.iter_mut().find(|state| state.object == obj) {
+        state.fields[idx] = slot;
+    } else {
+        let mut fields = default_syn();
+        fields[idx] = slot;
+        bucket.push(ChanState {
+            object: obj,
+            fields,
+        });
+    }
 }
 
 /// Default synthetic state for a channel object before its `open()`/`accept()`
@@ -419,7 +433,12 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
         return Value::Int(0);
     }
     let key = ctx.identity_hash_code(obj);
-    match chan_fields().read().get(&key).map(|a| &a[idx]) {
+    match chan_fields()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|state| state.object == obj))
+        .map(|state| &state.fields[idx])
+    {
         Some(Syn::I(i)) => Value::Int(*i),
         _ => Value::Int(0),
     }
@@ -429,7 +448,16 @@ fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
 /// does not grow without bound across short-lived connections.
 fn cf_clear(ctx: &dyn NativeContext, obj: ObjectRef) {
     let key = ctx.identity_hash_code(obj);
-    chan_fields().write().remove(&key);
+    let mut table = chan_fields().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|state| state.object != obj);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
 }
 
 /// Cross-module accessor: the `tcp_registry` id backing a synthetic
@@ -447,16 +475,41 @@ pub fn channel_net_fd(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<i32> {
 fn cf_remote(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, i32)> {
     let key = ctx.identity_hash_code(obj);
     let t = chan_fields().read();
-    let arr = t.get(&key)?;
-    let host = match &arr[F_REMOTE] {
+    let state = t.get(&key)?.iter().find(|state| state.object == obj)?;
+    let host = match &state.fields[F_REMOTE] {
         Syn::S(s) => s.clone(),
         _ => return None,
     };
-    let port = match arr[F_REMOTE_PORT] {
+    let port = match state.fields[F_REMOTE_PORT] {
         Syn::I(p) => p,
         _ => 0,
     };
     Some((host, port))
+}
+
+pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
+    let table = chan_fields().read();
+    for bucket in table.values() {
+        roots.extend(bucket.iter().map(|state| state.object));
+    }
+}
+
+pub fn channel_fields_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut table = chan_fields().write();
+    for bucket in table.values_mut() {
+        for state in bucket {
+            let old = state.object.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                state.object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
 }
 
 fn read_reg_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
@@ -901,9 +954,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis())
                     .unwrap_or(0);
-                eprintln!(
-                    "[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}"
-                );
+                eprintln!("[SC_CLOSE] t={ms} id={id:#x} local={local} peer={peer}");
                 // 2026-07-16 follow-up: pin the exact Java call site issuing
                 // this close(). `NativeContext::capture_stack_trace` needs no
                 // `Thread` object handle -- it walks the CURRENT thread's live
@@ -914,7 +965,10 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 // conventional stack-trace reading order -- `capture_stack_trace`
                 // itself returns outer->inner, so reverse it here.
                 let raw_trace = ctx.capture_stack_trace(0);
-                eprintln!("[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)", raw_trace.len());
+                eprintln!(
+                    "[SC_CLOSE_STACK] t={ms} id={id:#x} ({} frames)",
+                    raw_trace.len()
+                );
                 for entry in raw_trace.iter().rev() {
                     let file = entry.source_file.as_deref().unwrap_or("?");
                     eprintln!(
@@ -1393,24 +1447,48 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 ///   * Ok(None) when EAGAIN/WouldBlock
 ///   * Ok(Some(-1)) on EOF
 ///   * Err(...) on hard error
+/// FNV-1a 64-bit hash, used only by the `CRATONVM_DBG_SC_READ` diagnostic
+/// below to cheaply fingerprint the bytes a given `sc_read` call actually
+/// delivered, so two calls can be compared for byte-identical content
+/// without dumping full hex payloads into the log.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.read(buf) {
-        Ok(0) => Ok(Some(-1)),
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.read(buf) {
+            Ok(0) => return Ok(Some(-1)),
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return Ok(None)
+            }
+            // EINTR consumes no bytes. Retrying is required instead of
+            // reporting a short/zero channel operation or aborting a Tomcat
+            // response. Some Linux wrappers preserve it only as raw errno 4.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
 fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
-    match s.write(data) {
-        Ok(n) => Ok(Some(n as i32)),
-        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
-        Err(e) if e.kind() == ErrorKind::Interrupted => Ok(Some(0)),
-        Err(e) => Err(e),
+    loop {
+        match s.write(data) {
+            Ok(n) => return Ok(Some(n as i32)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(None),
+            // Like read(), a signal interruption has not written any bytes;
+            // retry so a header/body gathering write cannot be abandoned.
+            Err(e) if e.kind() == ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -1490,7 +1568,90 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     if n > 0 {
         crate::net::socket_capture('r', id, &buf[..n as usize]);
+        // Reload `bb` through the pin BEFORE touching it again: the blocking
+        // read above may have crossed a GC pause that relocated the object,
+        // so the original `bb` reference could be stale here (see
+        // `pin_native_root`'s doc comment on this exact hazard). Both the
+        // diagnostic below and the real write path use this reloaded ref.
         let bb = ctx.read_native_pin(bb_pin, bb);
+        // Diagnostic (CRATONVM_DBG_SC_READ=1, added 2026-07-17 continuing the
+        // StompWebSocketIntegrationTests premature-close investigation): the
+        // prior session pinned the failure to the server dispatching one
+        // client-written STOMP CONNECT frame to Spring's
+        // handleMessageFromClient TWICE, with live gdb confirming exactly 2
+        // physical `sc_read` calls occur before either dispatch (Jetty
+        // backend) — i.e. this native genuinely gets invoked twice, each
+        // apparently returning a real, non-empty payload. Fingerprint every
+        // real (n>0) read with an FNV-1a hash + byte count + the buffer's
+        // `position` field before/after, so a rerun can show directly
+        // whether the two reads return byte-identical content (a
+        // duplicate-delivery bug below `try_read_nb`/the OS socket) or two
+        // genuinely different byte ranges (pointing the remaining
+        // investigation at Jetty's/Tomcat's own frame-parser instead). Kept
+        // as a permanent opt-in hook, zero cost when unset, matching
+        // CRATONVM_DBG_SC_CLOSE's precedent in this same file.
+        if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+            let pos_before = match ctx.get_field_by_name(bb, "position") {
+                Value::Int(v) => v,
+                _ => -1,
+            };
+            let (local, peer) = match tcp_registry().read().get(&id) {
+                Some(TcpHandle::Stream(s)) => (
+                    s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    s.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let hash = fnv1a64(&buf[..n as usize]);
+            let dump_len = (n as usize).min(64);
+            let hex: String = buf[..dump_len].iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!(
+                "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
+            );
+            // 2026-07-17 continuation: a live rerun of StompWebSocketIntegrationTests
+            // against this diagnostic found the Tomcat parameterization's `sc_read`
+            // returning the SAME (id, byte-content) pair dozens of times in a row
+            // (identical FNV-1a hash) at a steady ~20-60ms cadence -- i.e. the
+            // native read layer itself, not just Spring's message dispatch, sees
+            // byte-identical "new" reads. Capture ONE Java stack trace the first
+            // time a read's hash repeats the immediately preceding read on the
+            // same channel id, to pin the exact Tomcat call site re-issuing the
+            // read (only once per repeat streak, to avoid flooding the log across
+            // a long redelivery spin).
+            fn last_read_hash() -> &'static parking_lot::Mutex<HashMap<i32, (u64, bool)>> {
+                static T: OnceLock<parking_lot::Mutex<HashMap<i32, (u64, bool)>>> = OnceLock::new();
+                T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            }
+            let mut streak_started = false;
+            {
+                let mut m = last_read_hash().lock();
+                let entry = m.entry(id).or_insert((0, false));
+                if entry.0 == hash && !entry.1 {
+                    entry.1 = true;
+                    streak_started = true;
+                } else if entry.0 != hash {
+                    *entry = (hash, false);
+                }
+            }
+            if streak_started {
+                let raw_trace = ctx.capture_stack_trace(0);
+                eprintln!(
+                    "[SC_READ_REPEAT_STACK] t={ms} id={id:#x} n={n} fnv1a={hash:#018x} ({} frames)",
+                    raw_trace.len()
+                );
+                for entry in raw_trace.iter().rev() {
+                    let file = entry.source_file.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  at {}.{}({}:{})",
+                        entry.class_name, entry.method_name, file, entry.line_number
+                    );
+                }
+            }
+        }
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
@@ -1640,19 +1801,30 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         data.extend_from_slice(bytes);
     }
 
+    // A gathering write can block for exactly the same reason as a scalar
+    // SocketChannel.write. The copied payload and every Java source buffer are
+    // rooted above, so make this a GC-cooperative blocking region as well.
+    // Without this bracket, a full send buffer can leave a mutator in native
+    // I/O while a concurrent moving collection waits for it to reach a
+    // safepoint; that is the remaining transport-pressure hole in this path.
+    ctx.begin_blocking_region();
     let write_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))
+                let r = try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e));
+                ctx.end_blocking_region();
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }
                 return Ok(Some(Value::Long(0)));
             }
             _ => {
+                ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
                     ctx.unpin_native_roots(*pin);
                 }
@@ -2036,6 +2208,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // from that side-channel first so we don't block on a queue that
     // has already been emptied.
     let preaccepted = crate::nio_selector::take_any_pending_accepted(id);
+    let preaccepted_used = preaccepted.is_some();
 
     // Clone listener out so the registry lock isn't held across blocking accept.
     let listener_clone = {
@@ -2083,6 +2256,29 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some((stream, peer)) = accepted else {
         return Ok(Some(Value::Object(None)));
     };
+    // Diagnostic (CRATONVM_DBG_SC_READ=1, shares the read diagnostic's env
+    // var — same investigation): log every successful accept() with the
+    // NEW child id and whether it came from the selector's pre-drained
+    // `pending_accepted` side-channel or a fresh OS `accept()` call. If the
+    // StompWebSocketIntegrationTests repro ever shows TWO child ids for
+    // what should be one client connection (same peer port), that is a
+    // double-accept bug upstream of `sc_read` entirely; if it shows only
+    // ONE id (as expected), the duplicate-CONNECT-dispatch investigation
+    // stays focused on `sc_read` / the buffer fill-and-parse path.
+    if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!(
+            "[SC_ACCEPT] t={ms} listener_id={id:#x} peer={peer} source={}",
+            if preaccepted_used {
+                "preaccepted"
+            } else {
+                "fresh"
+            }
+        );
+    }
 
     // Inherit non-blocking flag of the parent channel.
     let _ = stream.set_nonblocking(!blocking);
