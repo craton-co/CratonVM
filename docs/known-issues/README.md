@@ -4,6 +4,25 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-17 Spring suite: full 2912-class run, 177 genuine bugs fully HotSpot-triaged (complete replacement of prior partial docs)
+
+Ran the **complete** Spring Framework suite (all 2912 classes, no filtering)
+on dev `213d93ea` — 91% OK (2649/2912). Cross-referenced every one of the 263
+non-OK classes against HotSpot (134 via the existing `hs516_final.tsv`
+baseline, the remaining 129 via a fresh targeted HotSpot rerun) — nothing
+left unclassified. Result: 86 environmental (73 EMPTY + 13 FAIL, both match
+HotSpot exactly) + **177 genuine CratonVM bugs**. Notable: the entire `jmx.*`
+module (26 classes) fails — confirms it was never actually fixed, despite an
+earlier signature-mismatch fix; `test.context.jdbc.*` (30 classes) fails
+100% uniformly behind Spring's own failure-threshold circuit breaker,
+masking the real root cause; the AOT bean-registration TIMEOUT cluster from
+the prior doc is unchanged. See
+[`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md).
+This **replaces** the prior `-125`/`-159` lineage and the
+`CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md` doc, both of which only
+covered a 516-class subset ~986 commits behind this run — both retired to
+`docs/internal/spring/`.
+
 ## 2026-07-16 WildFly boot CCE family ROOT CAUSE FIXED — moving young GC's object-start walk truncated at the first TLAB gap, mass-dangling references (was misattributed for weeks as "register-invisible JIT roots" / per-site missed pins)
 
 FIXED (full writeup): [`wildfly-cce0079-young-start-set-truncation-FIXED.md`](../internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md)
