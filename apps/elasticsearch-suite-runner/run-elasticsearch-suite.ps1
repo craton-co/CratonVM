@@ -32,6 +32,7 @@ param(
   [string]$Seed = 'B17AC9D3E1F2A0C4',
   [string[]]$CratonArgs = @(),
 
+  [switch]$SkipNativeFixtureCheck,
   [switch]$RefreshLists,
   [switch]$ListOnly,
   [switch]$AllModes
@@ -46,6 +47,73 @@ function Write-Info([string]$Message) {
 function Die([string]$Message) {
   Write-Error "[elasticsearch-suite] $Message"
   exit 1
+}
+
+function Get-LinuxX64DynamicSymbols([string]$Library) {
+  $nm = Get-Command nm -ErrorAction SilentlyContinue
+  if ($nm) {
+    $exports = @(& $nm.Source '-D' '--defined-only' $Library 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $exports.Count -eq 0) {
+      Die "Unable to read dynamic symbols from native fixture: $Library"
+    }
+    return $exports
+  }
+
+  # The preparer supplies this image. Its nm fallback keeps the standard
+  # Windows PowerShell runner able to validate the Linux fixture it launches
+  # through a Linux target environment.
+  $docker = Get-Command docker -ErrorAction SilentlyContinue
+  if (-not $docker) {
+    Die "Cannot validate Linux libvec fixture because neither 'nm' nor Docker is available. Run this runner on the Linux target, or prepare the fixture with prepare-elasticsearch-libvec-fixture.ps1."
+  }
+
+  $libraryDir = Split-Path -Parent $Library
+  $libraryName = Split-Path -Leaf $Library
+  $image = 'cratonvm-es-libvec-toolchain-20260717'
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $exports = @(& $docker.Source 'run' '--rm' '-v' "$libraryDir`:/fixture:ro" $image 'nm' '-D' '--defined-only' "/fixture/$libraryName" 2>$null)
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($exitCode -ne 0 -or $exports.Count -eq 0) {
+    Die "Unable to read dynamic symbols from native fixture: $Library. Install GNU binutils or run prepare-elasticsearch-libvec-fixture.ps1 to create the local validation image."
+  }
+  return $exports
+}
+
+function Assert-LinuxX64VectorFixture([string]$Root) {
+  # JdkVectorLibrary eagerly links its complete native table during class
+  # initialization. A missing or old libvec therefore makes nearly every ES
+  # test fail before it reaches test code. Keep this check before class-list
+  # selection so a fixture error can never be recorded as suite failures.
+  $library = Join-Path $Root 'lib/platform/linux-x64/libvec.so'
+  if (-not (Test-Path -LiteralPath $library -PathType Leaf)) {
+    Die "Elasticsearch native fixture is missing: $library. Rebuild it from this checkout with apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 -ElasticsearchRoot '$Root'."
+  }
+
+  $exports = @(Get-LinuxX64DynamicSymbols $library)
+
+  $symbols = @($exports | ForEach-Object {
+    $parts = $_ -split '\s+'
+    if ($parts.Count -ge 3) { $parts[$parts.Count - 1] }
+  } | Where-Object { $_ })
+  $vectorSymbols = @($symbols | Where-Object { $_ -like 'vec_*' })
+
+  # The 2026-07 fixture ABI has 155 vec_* exports. The old 145-export
+  # artifact lacks the bulk8 family; these sentinels make the diagnostic
+  # explicit even if a future tooling change changes the count.
+  $required = @('vec_caps', 'vec_cosi8_bulk8', 'vec_doti8_bulk8', 'vec_sqri8_bulk8')
+  $missing = @($required | Where-Object { $symbols -notcontains $_ })
+  if ($vectorSymbols.Count -lt 155 -or $missing.Count -gt 0) {
+    $missingText = if ($missing.Count) { $missing -join ', ' } else { 'none' }
+    Die "Elasticsearch native fixture is stale or incompatible: $library exports $($vectorSymbols.Count) vec_* symbols (need at least 155); missing required symbols: $missingText. Rebuild it from this checkout with apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1 -ElasticsearchRoot '$Root'."
+  }
+
+  $hash = (Get-FileHash -LiteralPath $library -Algorithm SHA256).Hash.ToLowerInvariant()
+  Write-Info "validated libvec path=$library vec_symbols=$($vectorSymbols.Count) sha256=$hash"
 }
 
 function Get-RepoRoot {
@@ -884,6 +952,12 @@ if (-not $ElasticsearchRoot) {
 }
 $script:ElasticsearchDir = [System.IO.Path]::GetFullPath($ElasticsearchRoot)
 if (-not (Test-Path $script:ElasticsearchDir)) { Die "Elasticsearch root not found: $script:ElasticsearchDir" }
+
+if ($SkipNativeFixtureCheck) {
+  Write-Info 'SKIPPING native libvec fixture check by explicit request'
+} else {
+  Assert-LinuxX64VectorFixture $script:ElasticsearchDir
+}
 
 if (-not $WorkDir) { $WorkDir = Join-Path $PSScriptRoot '.suite' }
 $script:WorkRoot = [System.IO.Path]::GetFullPath($WorkDir)

@@ -5,7 +5,7 @@ Status: RESOLVED (fixture-only; not a CratonVM bug)
 ## Context
 
 While executing the tmp-exhaustion rerun documented in
-[ES-RUN-20260715-root-tmp-exhaustion-invalidates-rerun.md](ES-RUN-20260715-root-tmp-exhaustion-invalidates-rerun.md),
+[ES-RUN-20260715-root-tmp-exhaustion-invalidates-rerun.md](../../known-issues/elasticsearch-suite/ES-RUN-20260715-root-tmp-exhaustion-invalidates-rerun.md),
 the shared Elasticsearch checkout used as `-ElasticsearchRoot` for that rerun —
 `/data/data/cratonvm-worktrees/20260708-191002-es-nonpassed-rerun/apps/elasticsearch`
 — turned out to still be missing
@@ -71,11 +71,27 @@ Verified with a 20-class smoke run
 `UnsatisfiedLinkError` or `vec_cosi8_bulk8` `LinkageError` in any of the 20
 classes afterward; `[main] vec_caps=3` / `Using native vector library`
 logged cleanly. Remaining failures in that same smoke run are unrelated
-(see [ES-BUG-20260716-embeddedimplclassloader-noclassdeffounderror.md](ES-BUG-20260716-embeddedimplclassloader-noclassdeffounderror.md)).
+(see [ES-BUG-20260716-embeddedimplclassloader-noclassdeffounderror.md](../../known-issues/elasticsearch-suite/ES-BUG-20260716-embeddedimplclassloader-noclassdeffounderror.md)).
+
+## Durable closure (2026-07-17)
+
+The fixture is now rebuilt from the exact checked-out Elasticsearch native
+sources, not copied from another worktree or artifact cache. The host rebuild
+exports 155 `vec_*` symbols and includes the required `bulk8` ABI sentinels.
+A HotSpot FFM probe loaded the installed library, resolved `vec_caps`,
+`vec_cosi8_bulk8`, `vec_doti8_bulk8`, and `vec_sqri8_bulk8`, and successfully
+invoked `vec_caps`.
+
+`apps/elasticsearch-suite-runner/prepare-elasticsearch-libvec-fixture.ps1`
+now performs the reproducible build, export check, and atomic installation.
+`run-elasticsearch-suite.ps1` validates the same ABI before selecting any test
+classes, so an absent or stale fixture is never recorded as a suite-wide
+CratonVM failure.
 
 ## Takeaway for future runs against this checkout
 
-This shared ESROOT does not durably retain fixture fixes applied to other
+Run the fixture preparation script for each exact `-ElasticsearchRoot`; do not
+copy `libvec.so` between checkouts. This shared ESROOT does not durably retain fixture fixes applied to other
 worktrees/binaries — check `lib/platform/linux-x64/libvec.so` symbol count
 (`nm -D ... | grep -c 'T vec_'`; should be 155, not 145 or absent) before
 trusting any suite run against it. Do not assume a `Status: FIXED` doc
