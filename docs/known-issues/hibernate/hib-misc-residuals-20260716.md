@@ -1,7 +1,7 @@
 # Misc non-passed residuals — 2026-07-16 full-suite rerun
 
 The remaining 13 non-passed classes (of 20 total) not covered by the
-[120-second timeout cluster](hib-120s-junit-timeout-cluster-20260716.md).
+[120-second timeout cluster](../../internal/hib-120s-junit-timeout-cluster-20260716.md).
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
@@ -2364,7 +2364,7 @@ cause.
 Re-ran this class's known bisection (as part of a session tasked with
 `InsertOrderingRCATest`/`LiteralRenderingTest`/`LockTest` throughput
 profiling -- see the other two classes' writeup in
-[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md))
+[hib-120s-junit-timeout-cluster-20260716.md](../../internal/hib-120s-junit-timeout-cluster-20260716.md))
 against `dev@33df5d3c`, many commits ahead of this section's original
 `dcb24161`/later-session tips. Result: **identical mechanism, still
 reproduces.**
@@ -2405,7 +2405,7 @@ built and validated from `dev@3dcf81e5` then rebased twice to keep up with a
 very active `dev` (final tip includes ~30 unrelated commits from concurrent
 sessions; none touched the changed file). **This entry supersedes the
 "JIT compile-time tax" framing** both this section and
-[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md)
+[hib-120s-junit-timeout-cluster-20260716.md](../../internal/hib-120s-junit-timeout-cluster-20260716.md)
 used for `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` since
 2026-07-16 — that framing was a reasonable inference from wall-clock
 bisection (`--nojit` / raised-threshold both "fixed" it) but the *mechanism*
@@ -2643,7 +2643,7 @@ benchmark-suite validation, deliberately not changed blind this session).
 
 **Reclassifying:** this is not a distinct wrong-behavior/id-generation bug.
 Moving out of "genuine wrong-behavior symptom" — it belongs with
-[the 120s-timeout cluster](hib-120s-junit-timeout-cluster-20260716.md) (same
+[the 120s-timeout cluster](../../internal/hib-120s-junit-timeout-cluster-20260716.md) (same
 `TimeoutException(...)` shape, same "one test absorbs a one-time
 SessionFactory-bootstrap cost that occasionally exceeds 120s" shape) and
 with this file's own `LockTest` entry (same JIT-compile-tax root mechanism,

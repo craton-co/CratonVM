@@ -115,7 +115,7 @@ CratonVM correctly produces `NoClassDefFoundError` on the second class-load
 attempt and fails fast (369ms) — no hang, no misattribution. This rules out
 a "failed static init state mishandled as a hang" explanation for the
 *separate* `ScannerTest` 120s-timeout entry tracked in
-[hib-120s-junit-timeout-cluster-20260716.md](../../known-issues/hibernate/hib-120s-junit-timeout-cluster-20260716.md)
+[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md)
 — that timeout has a different, still-open cause (systemic throughput gap,
 per that doc), not this classpath issue.
 
