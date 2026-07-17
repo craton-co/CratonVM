@@ -32,8 +32,8 @@ rather than a synthetic key shape. `DSS` remains the accepted alias.
 
 - `cargo test -p cratonvm-native-builtins jca::key_factory::tests -- --nocapture`: 10 passed.
 - Exact Spring Boot fixture using the unique release executable:
-  - JIT on: `CertificateMatcherTests` PASS, 24 tests, 0 failed, 0 aborted, 0 containers failed (66.225 s).
-  - `--nojit`: PASS, 24 tests, 0 failed, 0 aborted, 0 containers failed (67.052 s).
+  - JIT on: `CertificateMatcherTests` PASS, 24 tests, 0 failed, 0 aborted, 0 containers failed (53.201 s).
+  - `--nojit`: PASS, 24 tests, 0 failed, 0 aborted, 0 containers failed (59.122 s).
 
 The fixture generates RSA, DSA, Ed25519, Ed448, P-256, and P-521 key pairs;
 therefore the validation also confirms this DSA route does not regress the
