@@ -7412,8 +7412,16 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
                 ctx.unpin_native_roots(entry_pin);
                 ctx.unpin_native_roots(buckets_pin);
             }
-            ctx.unpin_native_roots(value_pin);
-            ctx.unpin_native_roots(key_pin);
+            // cceres3 (PIN-DANGLING root cause, live-captured): DO NOT unpin
+            // key_pin/value_pin per iteration. `unpin_native_roots` TRUNCATES
+            // the pin stack — the pairs were all pinned up front, so
+            // unpinning iteration 0's pins wiped iteration 1..N's handles and
+            // every later `read_pinned_elem` silently degraded to the raw,
+            // possibly-stale snapshot value (the stored-stale set elements
+            // behind the hs_hash_code/hs_iterator canary hits). The single
+            // `unpin_native_roots(roots_base)` at function end releases the
+            // whole range correctly.
+            let _ = (key_pin, value_pin);
         }
     } else {
         let keys = collect_keys_any(ctx, source);
@@ -32943,12 +32951,16 @@ fn native_ts_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let (data_opt, size, _) = ts_state(ctx, this);
+    // cceres3: `data` spans the result-array allocation — pin + re-read.
+    let data_pin = data_opt.map(|d| ctx.pin_native_root(d));
     let arr = alloc_ref_array(ctx, size as usize);
-    if let Some(data) = data_opt {
+    if let (Some(data), Some(pin)) = (data_opt, data_pin) {
+        let data = ctx.read_native_pin(pin, data);
         for i in 0..(size as usize) {
             let v = ctx.get_array_element(data, i);
             ctx.set_array_element(arr, i, v);
         }
+        ctx.unpin_native_roots(pin);
     }
     Ok(Some(Value::Object(Some(arr))))
 }
