@@ -129,11 +129,66 @@ This document tracks the **genuine remaining failures**.
     RenderingResponse 1/1, RSocketRequester 13/13, WebClientObservation 9/9,
     CoExchangeFilterFunction 1/1, InvocableHandlerMethodKotlin 40/40 — all OK. A/B control: unfixed
     binary, identical flags -> 10/10 SOE.
-  *   Residual: `WebClientExtensionsTests` 20/32 (SOE gone). The 12 failures are two separate,
-    pre-existing families: (a) `IllegalStateException: Unable to create proxy for sealed class
-    interface org.springframework.http.HttpStatusCode, no subclasses available` — mockk resolves
-    `KClass.sealedSubclasses` (kotlin-reflect metadata family); (b) mockk `verify` matcher failures
-    (`... was not called`), same family as the tracked `RestClientExtensionsTests` residual.
+  *   **Residual — FIXED (2026-07-17)**: `WebClientExtensionsTests` was 20/32 (SOE gone, but 12
+    failures remained), split into two apparent families that turned out to share ONE root cause:
+    (a) `IllegalStateException: Unable to create proxy for sealed class interface
+    org.springframework.http.HttpStatusCode, no subclasses available`; (b) mockk `verify{}` matcher
+    failures (`... was not called`) on `ParameterizedTypeReference<List<? extends Foo>>`-typed
+    args, the same symptom family as the tracked `RestClientExtensionsTests` residual below.
+    **Root cause**: `Class.getPermittedSubclasses0()` (`native_class_get_permitted_subclasses`,
+    `native-builtins/src/lang_class.rs`) resolved each permitted-subclass NAME via
+    `ctx.class_id_by_name(name)`, a PASSIVE cache lookup that never triggers classloading. mockk's
+    `ProxyMaker.findActualClassToBeProxied` (decompiled from `mockk-agent-jvm-1.14.5.jar`) does
+    `clazz.kotlin.sealedSubclasses.firstOrNull() ?: error("Unable to create proxy for sealed class
+    $clazz, no subclasses available")`; since `HttpStatusCode` is a plain Java `sealed interface`
+    (no Kotlin `@Metadata`), kotlin-reflect resolves `sealedSubclasses` via
+    `Java16SealedRecordLoader`, i.e. by reflectively calling the standard
+    `Class.isSealed()`/`Class.getPermittedSubclasses()` pair. A live probe (calling
+    `getPermittedSubclasses0()` directly via reflection, bypassing the public wrapper) showed
+    `isSealed()` correctly `true` (the classfile's `PermittedSubclasses` attribute parses fine) but
+    `getPermittedSubclasses0()` returning `[null, null]` — a correctly-SIZED 2-element array with
+    BOTH entries unresolved, because `HttpStatus`/`DefaultHttpStatusCode` simply hadn't been loaded
+    yet at the time the reflective probe ran (the common case — nothing forces Spring to touch a
+    concrete `HttpStatus`/`DefaultHttpStatusCode` before mockk's `ProxyMaker` asks). Real JDK's own
+    `Class.getPermittedSubclasses()` Java wrapper then filters the raw native result down to entries
+    that verifiably extend/implement `this`; a `null` entry fails that check, so the 2-element
+    `[null, null]` silently collapsed to the empty `[]` mockk observed. Same root-cause family as
+    the `getEnclosingClass`/`getDeclaringClass` loader-identity fix (`aca7f635`) and the
+    getstatic/putstatic loader-aware fix (`19d7f417`/`b04eb903`): a flat, passive class-name lookup
+    standing in for what should be a real (re-entrant) `loadClass()` resolution.
+    **Fix**: `native_class_get_permitted_subclasses` now falls back to an ACTIVE, loader-correct
+    resolution on a cache miss — `ctx.invoke_virtual(loader, "loadClass", ...)` on `this` sealed
+    class's OWN classloader (reusing `native_class_get_class_loader`'s existing defining-loader /
+    app-loader-fallback logic), mirroring `declaring_class_loader_aware`'s re-entrant-call pattern.
+    Safe here (unlike the REVERTED getstatic/putstatic interpreter-opcode attempt documented in the
+    `ImportHttpServiceRegistrarTests` entry below): `getPermittedSubclasses0()` is an ordinary
+    native-method call boundary, the same shape `Class.forName`'s native already uses for
+    re-entrant `loadClass()` calls routinely and safely. The passive cache lookup still runs first
+    (cheap, handles the overwhelming common case where the subclass is already loaded).
+    **Verified**: fresh `dev`-tip worktree (`fix/mockk-webclientext-20260717`), full-class run via a
+    JUnit5-Launcher driver against the real spring-webflux test classpath: pre-fix `20/33` (13
+    failures — 9x family-(a) `IllegalStateException`, 4x family-(b) `AssertionError: Verification
+    failed ... was not called`, all on PTR-typed args — 33 not 32 methods found, one more than the
+    original report, likely a parameterized variant added since); post-fix `33/33`, reproduced
+    twice. A standalone live probe confirms `getPermittedSubclasses0()` now returns
+    `[DefaultHttpStatusCode, HttpStatus]` instead of `[null, null]`, and kotlin-reflect's
+    `KClass.isSealed`/`.sealedSubclasses` (called directly, not just through mockk) match.
+    Family (b) was NOT separately root-caused — fixing family (a) made it disappear too on this
+    class, most likely because mockk's `JvmSignatureValueGenerator.instantiate()` (decompiled from
+    `mockk-jvm-1.14.5.jar`, `io/mockk/impl/recording/JvmSignatureValueGenerator.class` — the exact
+    class flagged as the prime suspect in the `RestClientExtensionsTests` residual writeup below)
+    shares the identical `sealedSubclasses`/`getPermittedSubclasses0()` code path for dummy-value
+    generation during argument-signature detection, and some earlier-executing method on the same
+    mock's declared surface (e.g. `ResponseSpec#onStatus(Predicate<HttpStatusCode>, ...)`) was
+    likely throwing/corrupting mockk's internal signature-detection state before the later PTR-arg
+    calls were ever reached. **Not independently reconfirmed against `RestClientExtensionsTests`**
+    itself — that class's Kotlin test sources aren't currently compiled/testcp'd on the Azure host,
+    and building a fresh spring-web test module was out of scope this session given host disk/load
+    pressure (load average briefly exceeded 120 mid-session; see
+    `azure-host-disk-full-flapping-20260715`). Given the identical symptom shape and shared
+    mechanism, re-verifying `RestClientExtensionsTests` against this fix is a strong, low-effort
+    next step for whoever picks it up next — likely fixed or substantially improved, but unverified
+    as of this writing.
   *   Probe kit: `/data/data/wt-mockk-dispatch-20260715/probes/` — `MkProbe.java` (agent-init +
     hashCode chain with a printing `MockKAgentLogFactory`; the init TRACE lines name the exact
     failing step), `BootProbe.java` (boot-jar append + null-loader `forName`), `TmpProbe.java`
