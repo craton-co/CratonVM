@@ -896,7 +896,13 @@ fn chm_extra_entries(
         };
         let key_cur = ctx.read_native_pin(key_pin, key_obj);
         let kstr = ctx.read_string(key_cur);
-        ctx.unpin_native_roots(entry_pin);
+        // cceres3 (unpin-ring provenance, base=6 prev_len=9): do NOT release
+        // entry_pin here — key_pin/value_pin were pushed ABOVE it, so this
+        // truncate dropped them both and every handle stored in `pinned`
+        // dangled from this iteration on (read_native_pin then silently
+        // returned the raw, possibly-stale snapshot refs — the stale
+        // Properties pairs behind the domain sb_append/putAll captures).
+        // The end-of-function unpin(it_pin) releases the whole range.
         if let Some(ref s) = kstr {
             if skip.contains(s) {
                 if let Some((pin, _)) = value_pin {

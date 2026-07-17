@@ -1171,6 +1171,21 @@ fn safe_native_call_impl(
     // an exception ref has already gone stale, a native may leave the live
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
+    if unpin_ring_enabled() && pin_base < thread.native_pin_roots.len() {
+        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        UNPIN_RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() >= 6 {
+                r.remove(0);
+            }
+            r.push((
+                pin_base,
+                thread.native_pin_roots.len(),
+                format!("funnel-return callee={callee}\n"),
+            ));
+        });
+    }
     thread.native_pin_roots.truncate(pin_base);
     // A running JIT thread cannot be collected from this ordinary (non-blocking)
     // return boundary: a peer-requested STW waits for the thread to reach its
@@ -2899,6 +2914,18 @@ fn reread_native_object_values(
         .collect()
 }
 
+thread_local! {
+    /// DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_UNPIN_RING): last few pin-stack
+    /// truncations with backtraces; dumped by the PIN-DANGLING canary.
+    static UNPIN_RING: std::cell::RefCell<Vec<(usize, usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn unpin_ring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_UNPIN_RING").is_some())
+}
+
 struct VmNativeThreadBlocker {
     shared: std::sync::Arc<SharedVm>,
     thread_id: ThreadId,
@@ -3227,12 +3254,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    let ring = if unpin_ring_enabled() {
+                        UNPIN_RING.with(|r| {
+                            r.borrow()
+                                .iter()
+                                .map(|(b, l, bt)| {
+                                    format!("\n  truncate base={b} prev_len={l} at:\n{bt}")
+                                })
+                                .collect::<String>()
+                        })
+                    } else {
+                        String::new()
+                    };
                     eprintln!(
-                        "[blockgc] PIN-DANGLING tid={} handle={} len={} reader:\n{}",
+                        "[blockgc] PIN-DANGLING tid={} handle={} len={} reader:\n{}\nrecent truncations:{}",
                         self.thread.thread_id.0,
                         handle,
                         self.thread.native_pin_roots.len(),
                         std::backtrace::Backtrace::force_capture(),
+                        ring,
                     );
                 }
             }
@@ -3246,6 +3286,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn unpin_native_roots(&mut self, base: usize) {
         if base < self.thread.native_pin_roots.len() {
+            if unpin_ring_enabled() {
+                let bt = format!("{}", std::backtrace::Backtrace::force_capture());
+                let short: String = bt.lines().skip(8).take(12).map(|l| format!("{l}\n")).collect();
+                UNPIN_RING.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if r.len() >= 6 {
+                        r.remove(0);
+                    }
+                    r.push((base, self.thread.native_pin_roots.len(), short));
+                });
+            }
             self.thread.native_pin_roots.truncate(base);
         }
     }
