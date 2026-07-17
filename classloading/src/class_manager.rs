@@ -3013,6 +3013,16 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
+        if std::env::var("CRATONVM_DBG_DEFINE").is_ok()
+            && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
+        {
+            eprintln!(
+                "[DEFINE-DBG] define_class name={} loader_id={:?} bytes_len={}",
+                name,
+                loader_id,
+                bytes.len()
+            );
+        }
         // WP2.3: Reject too-short / non-CAFEBABE bytes up-front with a
         // typed ClassFormatError. The reader will catch malformed
         // bytes too, but a stronger pre-check produces clearer error

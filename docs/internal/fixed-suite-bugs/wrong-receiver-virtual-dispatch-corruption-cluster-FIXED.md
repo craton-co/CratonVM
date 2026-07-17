@@ -1,15 +1,26 @@
-# Wrong-receiver virtual dispatch: `String.setOption`/`File.get()` NoSuchMethodError cluster
+# Fixed: wrong-receiver virtual dispatch: `String.setOption`/`File.get()` NoSuchMethodError cluster
 
-**Status: OPEN**
+**Status: FIXED — 2026-07-17**
 
-**Severity: CRITICAL** (Case 1) / **HIGH, unconfirmed mechanism** (Case 2) —
-both are correctness bugs where a virtual/interface call site ends up
-invoking a method on the wrong runtime object. Case 1 is root-caused with
-file:line precision to a synthetic-object/real-bytecode layout split-brain
-(a known bug *family* in this codebase, previously fixed for two sibling
-producers but not for a third). Case 2 has the same *symptom shape* but its
-mechanism is **not** confirmed to be the same bug — treat as a separate,
-still-open investigation (see "Case 2" below for why).
+## Resolution
+
+- **Case 1:** real-network mode now excludes only legacy
+  `SSLSocketFactory` `SyntheticStub` registrations. The later P68
+  `Bridge` registrations remain live, perform the TLS work, and create
+  layout-correct `SSLSocket` objects. This prevents a two-slot synthetic
+  `Socket` from reaching real `Socket` bytecode while avoiding the
+  unsupported fallback to the full JDK JSSE implementation.
+- **Case 2:** JUL's native parameter renderer was invoking `get()` on every
+  non-String argument, treating ordinary objects such as `File` as
+  `Supplier`s. It now calls `get()` only for actual
+  `java.util.function.Supplier` instances and otherwise uses `toString()`.
+
+Regression coverage runs the real-network loopback probe and asserts that
+the `SSLSocketFactory` registry contains bridge methods and no synthetic
+stubs. A second fixture drives `Logger.log(Level, String, Object[])` with a
+`File` argument in both interpreter and JIT modes. Both pass on the remote
+build host. The remainder of this document is retained as the original
+investigation record.
 
 ## Symptom — Case 1: `java/lang/String.setOption(ILjava/lang/Object;)V`
 

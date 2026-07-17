@@ -3557,7 +3557,12 @@ impl NativeMethodRegistry {
                 // and are layout-correct. (Root-cause analysis shared with
                 // the concurrent dohead-third-cause session; landed here to
                 // complete the DoHead family fix.)
-                || class_name == "javax/net/SocketFactory")
+                || class_name == "javax/net/SocketFactory"
+                // A legacy SSLSocketFactory stub returns a two-slot Socket.
+                // Keep P68's later Bridge registrations: they perform TLS and
+                // produce a layout-correct SSLSocket.
+                || (class_name == "javax/net/ssl/SSLSocketFactory"
+                    && self.current_category == NativeKind::SyntheticStub))
         {
             return;
         }

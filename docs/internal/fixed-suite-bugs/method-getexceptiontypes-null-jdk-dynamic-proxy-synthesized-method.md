@@ -1,12 +1,28 @@
 # `Method.getExceptionTypes()` returns `null` (not an empty array) for the synthetic `Method` object CratonVM builds for JDK dynamic-proxy `InvocationHandler.invoke()` calls — 3 classes (4 test methods)
 
-**Status: OPEN. Severity: MEDIUM — not memory-unsafe, but breaks the JDK's
-documented never-null contract for `Method.getExceptionTypes()`/
-`Constructor.getExceptionTypes()` on any `Method` object that flows through a
-`java.lang.reflect.Proxy` `InvocationHandler.invoke()` callback, which is the
-plumbing under every Spring Data repository proxy, every JDK-proxy-based
-Spring AOP advice chain, and any other `Proxy.newProxyInstance`-based code
-that inspects the `Method` it's handed.**
+**Status: FIXED (2026-07-17).** Both live JDK-proxy dispatch paths now set
+`Method.exceptionTypes` to a non-null, correctly typed `Class[]`, populated
+from the declaring interface method's JVMS `Exceptions` attribute. This closes
+the Spring Data NPE and preserves declared checked exceptions for every
+`InvocationHandler.invoke()` callback.
+
+## Resolution and verification
+
+`proxy_invoke_handler` and its shared-interpreter counterpart
+`proxy_invoke_handler_shared` both synthesize the `Method` passed to an
+`InvocationHandler`. Both now use a common helper that allocates a `Class[]`
+even for no-throws methods and fills it from the exact declaring interface's
+`Exceptions` attribute. The legacy synthetic-layout fallback writes its
+`exceptionTypes` slot as well.
+
+Verified on the Linux build host with a uniquely named release binary
+`probes/cratonvm-proxy-getexceptiontypes-20260717` using the committed
+`vm/tests/resources/cratonvm/ProxyMethodExceptionTypes.java` probe:
+
+- normal execution: `OK proxy-method-exception-types`;
+- interpreter-only execution (`CRATONVM_DISABLE_JIT=1`): the same `OK` result;
+- the probe checks both a zero-length, non-null `Class[]` and an accurately
+  preserved `IOException` throws declaration.
 
 Found while re-running the Spring Boot 4.1.0-SNAPSHOT suite in worktree
 `CratonVM-spring-boot-crashfail-20260714` (`rerun-20260716`, shard3). All 3

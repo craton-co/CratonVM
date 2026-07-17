@@ -3397,6 +3397,55 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
 
+    // JVMS §5.5 / §getstatic: the declaring class must be initialized
+    // before its static storage is read. The interpreter's `getstatic`
+    // handler (`runtime/interpreter.rs`) already calls
+    // `ensure_class_initialized_shared` first; this JIT helper never did.
+    // A JIT-compiled `getstatic` that happens to be the FIRST-EVER access
+    // to that class's statics (e.g. a rarely-taken branch, such as
+    // `LineWrapper.append`'s `shouldWrap ? FlushType.WRAP : nextFlush`
+    // ternary, whose WRAP arm is only exercised once a line actually needs
+    // wrapping -- well after the surrounding method has already tiered up
+    // to JIT) silently read the zero-initialized placeholder
+    // (`get_static_shared` returns `Value::Int(0)` for a class with no
+    // `statics` entry yet) instead of running `<clinit>` first. Decoded as
+    // a reference by the caller, that `Int(0)` becomes a null pointer --
+    // `LineWrapper$FlushType.ordinal()` NPE, JIT-only (the interpreter
+    // path always initializes the class on its own earlier `getstatic`,
+    // masking this gap; see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // "JavaPoet LineWrapper$FlushType NPE" JIT-only residual).
+    //
+    // Mirror the interpreter: ensure init before reading. On failure
+    // (`<clinit>` threw -- JVMS wraps this as ExceptionInInitializerError),
+    // stash the exception and return the `i64::MIN` deopt sentinel so the
+    // caller's `emit_post_invoke_exception_check` (added alongside this
+    // fix in `jit/src/x64.rs`'s `0xb2` getstatic codegen) routes it through
+    // the method's exception table instead of pushing a bogus value.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
+            use crate::error::MethodCallFailed;
+            match err {
+                MethodCallFailed::ExceptionThrown(exc) => {
+                    set_jit_pending_exception(exc);
+                }
+                MethodCallFailed::InternalError(vm_err) => {
+                    let msg = format!(
+                        "JIT getstatic class_id {class_id_raw} field_index {field_index} failed to initialize: {vm_err}"
+                    );
+                    if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                        vm,
+                        thread,
+                        "java/lang/InternalError",
+                        Some(&msg),
+                    ) {
+                        set_jit_pending_exception(exc);
+                    }
+                }
+            }
+            return i64::MIN;
+        }
+    }
+
     // Bootstrap intercept: mirror the interpreter's System.out/err/in intercept.
     // The real JDK System.<clinit> isn't fully bootable; the interpreter returns
     // pre-built synthetic streams for these three fields. The JIT must do the same,
