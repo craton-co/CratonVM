@@ -3480,9 +3480,20 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // P3 value plumbing: connect this builder's provides-consumers and the
     // per-name registrations real requires()-suppliers read from, and index
     // provided/alias names for dependency resolution.
-    wire_provides_injectors(ctx, builder, id, &name);
+    //
+    // cceres3 (DS2/DM_002 live captures): `builder` is a raw copy captured at
+    // native entry; the service-name/controller-mirror/list allocations above
+    // can move it, so handing the raw copy to these two helpers made their
+    // very first `get_field_by_name(builder, ..)` read recycled memory. Pin
+    // and re-read at the point of use.
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    wire_provides_injectors(ctx, builder_cur, id, &name);
     // Legacy addDependency(…, Injector) wiring — injected before start().
-    capture_dependency_injections(ctx, builder, id);
+    // (wire_provides_injectors is itself GC-capable — re-read again.)
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    capture_dependency_injections(ctx, builder_cur, id);
+    ctx.unpin_native_roots(builder_pin);
 
     if msc_dbg() {
         eprintln!(
