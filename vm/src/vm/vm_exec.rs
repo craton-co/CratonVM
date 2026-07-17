@@ -10394,6 +10394,18 @@ pub(super) fn proxy_invoke_handler(
         "parameterTypes",
         Value::Object(Some(param_arr)),
     );
+    // `Method.getExceptionTypes()` is specified to return a non-null Class[]
+    // and proxy InvocationHandlers receive this synthesized Method directly.
+    // Keep the real declared throws clause instead of inheriting alloc_object's
+    // null default (Spring's ReflectionUtils iterates this array unconditionally).
+    let exception_arr =
+        proxy_method_exception_types(ctx.shared, declaring_mirror, method_name, descriptor);
+    proxy_method_set_field_by_name(
+        ctx.shared,
+        method_obj,
+        "exceptionTypes",
+        Value::Object(Some(exception_arr)),
+    );
     proxy_method_set_field_by_name(ctx.shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(
         ctx.shared,
@@ -10436,6 +10448,9 @@ pub(super) fn proxy_invoke_handler(
         ctx.shared
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
+        ctx.shared
+            .heap
+            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
         // Silence "zero_mirror unused" — kept above to preserve the
         // original allocation flow.
         let _ = zero_mirror;
@@ -10761,6 +10776,16 @@ pub(crate) fn proxy_invoke_handler_shared(
         "parameterTypes",
         Value::Object(Some(param_arr)),
     );
+    // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
+    // observe a non-null, accurately populated Method.exceptionTypes array.
+    let exception_arr =
+        proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
+    proxy_method_set_field_by_name(
+        shared,
+        method_obj,
+        "exceptionTypes",
+        Value::Object(Some(exception_arr)),
+    );
     proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
     proxy_method_set_field_by_name(
         shared,
@@ -10794,6 +10819,9 @@ pub(crate) fn proxy_invoke_handler_shared(
         shared
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
+        shared
+            .heap
+            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
     }
     // Silence "zero_mirror unused" — kept above to preserve the original
     // allocation flow.
@@ -11045,6 +11073,49 @@ fn proxy_method_declared_exceptions(
         }
     }
     Vec::new()
+}
+
+/// Build the `Class[]` stored in the synthetic `Method.exceptionTypes` field
+/// supplied to an `InvocationHandler`. Unlike the backing object's default
+/// null, this is always an array, including when the proxied method has no
+/// `Exceptions` attribute. The declaring interface is already resolved by the
+/// proxy dispatch path, so its classfile attribute is authoritative.
+fn proxy_method_exception_types(
+    shared: &SharedVm,
+    declaring_mirror: ObjectRef,
+    method_name: &str,
+    descriptor: &str,
+) -> ObjectRef {
+    let class_component = shared
+        .class_manager
+        .write()
+        .load_class("java/lang/Class")
+        .unwrap_or(ClassId::new(0));
+    let declaring_class = shared
+        .class_mirrors_reverse
+        .read()
+        .get(&declaring_mirror)
+        .copied();
+    let declared = declaring_class
+        .map(|class_id| {
+            proxy_method_declared_exceptions(shared, class_id, method_name, descriptor)
+        })
+        .unwrap_or_default();
+    let exception_arr = shared.heap.alloc_array(
+        class_component,
+        crate::memory::heap::ArrayElementType::Reference,
+        declared.len(),
+    );
+    for (index, exception_name) in declared.iter().enumerate() {
+        let exception_mirror =
+            proxy_descriptor_to_class_mirror(shared, &format!("L{exception_name};"));
+        let _ = shared.heap.set_array_element(
+            exception_arr,
+            index,
+            Value::Object(Some(exception_mirror)),
+        );
+    }
+    exception_arr
 }
 
 /// Shared-interpreter version of `annotation_proxy_invoke`.
