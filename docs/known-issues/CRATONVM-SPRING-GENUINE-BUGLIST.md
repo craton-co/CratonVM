@@ -21,6 +21,34 @@ This document tracks the **genuine remaining failures**.
     (`found=9 succ=9 fail=0`, all 9 methods including both previously-crashing ones now pass, zero
     corruption-signature log lines). Not this session's fix; attributing correctly rather than
     claiming credit. Full history of the original investigation kept below for context.
+  *   **2026-07-17 independent re-confirmation** (separate task, separate worktree, no code
+    changes): re-verified the FIXED status above from scratch rather than trusting the prior
+    session's self-report, per this codebase's own "verify merged state, not agent self-reports"
+    lesson. Deliberately used a **maximally independent setup** to rule out any shared-fixture
+    artifact: a brand-new `git clone` of upstream `spring-projects/spring-framework` (not a reused
+    worktree -- the host's disk-pressure cleanup had deleted every prior spring-framework checkout
+    on this host by the time this task started), built fresh via Gradle (`:spring-context:testClasses`,
+    version `7.1.0-SNAPSHOT`, single `byte-buddy-1.18.3`/`mockito-core-5.23.0` on the classpath),
+    against a from-scratch `cargo build --release` of CratonVM at `dev` tip `56728b1a` (confirmed via
+    `git merge-base --is-ancestor fb15be63 origin/dev` that the fix commit is an ancestor). Ran the
+    real `ImportSelectorTests` class (`MethodRun`/JUnit-Platform-launcher pattern), both individually
+    per previously-crashing method and as the full 9-method class, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`,
+    real JDK 25: **`RESULT started=9 succeeded=9 failed=0`, twice in a row, zero corruption-signature
+    log lines, zero `StackOverflowError`.** Confirms the FIXED status is real, not an artifact of a
+    stale/shared build. **Bonus finding for future sessions** (unrelated to this bug, cost real time
+    to diagnose): a `NoClassDefFoundError` on `StandardBeanExpressionResolver$1` reproduced
+    deterministically on the *first* Gradle-cache-restored build of `spring-context` (`FROM-CACHE`
+    task outputs) even though the `.class` file was verifiably present on disk -- traced to Gradle's
+    build-cache restore silently producing an incomplete `classes/java/main` tree, almost certainly
+    because this host's chronic root-filesystem (`/`) 100%-full episodes corrupted an in-progress
+    cache extraction earlier in the session. Forcing `--rerun-tasks --no-build-cache` on
+    `:spring-context:compileJava`/`testClasses`/`jar`/`testFixturesJar` produced a correct tree and
+    made the error disappear; this had nothing to do with the Mockito/GC bug and would be worth its
+    own throwaway-repro note if it recurs. Also note for reproducing on this host: `GRADLE_USER_HOME`
+    and `-Djava.io.tmpdir` both need to be redirected off `/` (e.g. to `/data/tmp`) -- Mockito's
+    self-attach boot-jar write and Gradle's own caches both fail with `IOException: No space left on
+    device` on the chronically-full root filesystem otherwise, which can otherwise be misread as a
+    CratonVM bug.
   *   **2026-07-16 pre-fix status (superseded above, kept for history)**: symptom shape changed
     2026-07-16. On a fresh `dev` tip (`6c517cd9`), the
     original isolated repro (`SpyDLBFProbe.java`: `spy(new DefaultListableBeanFactory())` + one
@@ -220,7 +248,7 @@ the WRONG same-named copy. Eight fixes landed on
 | `ApplicationContextAotGeneratorTests` | ABEND (CGLIB load) | **2026-07-16 joint verification: LOADERR FIXED** — `found=40 succ=25 fail=15`, 0 corruption-signature lines, see below |
 | `BeanDefinitionMethodGeneratorTests` | FAIL 34/3 | **OK 34/34** |
 | `ConfigurationClassPostProcessorAotContributionTests` | FAIL 20/8 | **OK-ish 20/15/5** (5 residual = host ClassFile gap, see below) |
-| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-16 re-triage: FAIL 8/2/6** (was briefly hidden behind an unrelated GC crash, see below — now the SAME shape as before, 1 pre-existing cold-attach + 5 narrowed ByteBuddy-generics residual) |
+| `PersistenceAnnotationBeanPostProcessorAotContributionTests` | FAIL 8/0 (NCDFE) | **2026-07-17 re-triage: FAIL 8/3/5** — the two previously-documented failure modes ((a) cold-attach, (b) ByteBuddy "Cannot resolve T") are CONFIRMED GONE on current dev tip; a third, distinct, NOT-yet-root-caused AssertJ reflection residual now blocks the remaining 5, see below |
 | `TestContextAotGeneratorIntegrationTests` | FAIL 4/0 @393 s | **2026-07-16 re-triage: FAIL 4/0 @8.3 s** (was a genuine ~393 s slowdown, now fast; 4 distinct root causes, see below) |
 | `BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (throughput, see below) |
 
@@ -411,6 +439,115 @@ the WRONG same-named copy. Eight fixes landed on
     `TypeDescription.Generic.Visitor.Substitutor`) round-trips a method-scoped
     (not class-scoped) type variable, a narrower and more specific target than
     this doc's original "(b)" description.
+
+    **2026-07-17 re-triage: (a) and (b) above are BOTH CONFIRMED RESOLVED on
+    current dev tip — no longer reproduce at all.** Fresh isolated
+    worktree/binary (`/data/data/wt-persistannobpp-bb2-20260717`, Azure
+    host), rebuilt twice: once at dev tip `56728b1a` and again after
+    fast-forwarding to `3cb39d87` (which pulled in the same-day
+    `0a1ec47b` "fix(gc): close remaining unrooted-ObjectRef gaps in
+    generics.rs (enum/type-var builders)" — a highly relevant-looking
+    candidate given (b)'s generics/TypeVariable machinery, checked
+    explicitly, see below). Both binaries gave the **same** result.
+
+    Root-cause dead ends explored first (both refuted the "still needs a
+    fix" hypothesis before the real end-to-end run was attempted): a
+    standalone `EMFTypeVarProbe.java` comparing reflective
+    `Method.getTypeParameters()` vs ByteBuddy `TypeDescription.ForLoadedType`
+    vs ByteBuddy `TypePool` (bytecode-parsed) views of
+    `EntityManagerFactory.unwrap` all agreed (1 type variable each, matching
+    HotSpot exactly — the TypePool-vs-reflection divergence hypothesis from
+    the "Next step" note above is REFUTED); a standalone `EMFMockProbe`/
+    `EMFMockLoopProbe`/`EMFForkProbe.java` (the last replicating Spring's
+    real `CompileWithForkedClassLoaderClassLoader` delegation policy exactly,
+    verified line-for-line against
+    `spring-core-test/src/main/java/org/springframework/core/test/tools/
+    CompileWithForkedClassLoaderClassLoader.java`) ran `Mockito.mock
+    (EntityManagerFactory.class)` 6× across 6 fresh fork loaders with **zero
+    failures** — neither the cold-attach IllegalStateException nor the
+    "Cannot resolve T" ByteBuddy crash reproduced in isolation.
+
+    The real end-to-end confirmation: built the actual `spring-orm` test
+    module (real JDK 25 at `/data/jdk25-real-20260717`, Gradle 9.6.1 via a
+    shared `GRADLE_USER_HOME` at `/data/gradle-home-baseline-20260716` —
+    the host's root filesystem was at 100% full/0 bytes free for most of
+    this session, which breaks a bare `~/.gradle` build outright; routing
+    `GRADLE_USER_HOME`/`TMPDIR` to the separate, non-full `/data` mount
+    worked around it) and ran
+    `PersistenceAnnotationBeanPostProcessorAotContributionTests` for real
+    through `KRun` against both binaries: **`found=8 succ=3 fail=5`,
+    identical on both.** None of the 5 failures are (a) or (b) — the
+    cold-attach `IllegalStateException` and the ByteBuddy `Cannot resolve T`
+    crash are simply **gone**; 3 methods now pass outright (previously all
+    were folded into the 2/6 fail/other bucket in the pre-this-session
+    baseline). Most likely explanation: one or more of the loader-identity
+    and reflection fixes that landed between the last dedicated re-triage
+    and now (`aca7f635` declaring-class loader-aware,
+    `4cb070e5`/`b50c3d54` `getTypeParameters()` identity-stability,
+    `19d7f417` getstatic/putstatic loader-aware, `d5544133` panama
+    `segment_address()`, `0a1ec47b` generics.rs GC-rooting, or some
+    combination) fixed this as a side effect; not independently
+    re-attributed to a single commit since neither (a) nor (b) reproduce in
+    isolation anymore to bisect against.
+
+    **A third, DIFFERENT, NOT-yet-root-caused residual now blocks the
+    remaining 5/8.** All 5 fail with the identical shape —
+    `org.assertj.core.util.introspection.IntrospectionError: No getter for
+    property '<name>'` — thrown from AssertJ's own
+    `PropertyOrFieldSupport.getSimpleValue()` (`extracting("fieldName")`):
+    AssertJ tries the JavaBean getter first (expected to fail — none of
+    these fields have public getters, that's normal/by design), then falls
+    back to direct reflective field access, and **the field fallback also
+    throws**, so AssertJ re-raises the original (misleading) "No getter"
+    message rather than a field-specific one. Two of the five are on
+    ordinary test-fixture nested classes (`DefaultPersistenceUnitMethod`,
+    `DefaultPersistenceContextField`, `SeveralPersistenceContextField`,
+    `DefaultPersistenceUnitField` — private fields `emf`/`entityManager`/
+    `customEntityManager`), and one is on a real, non-test-fixture
+    application class (`org.springframework.orm.jpa.
+    SharedEntityManagerCreator$SharedEntityManagerInvocationHandler`,
+    private field `properties`) — ruling out "only synthetic test fixtures
+    are affected". All 5 fire from inside the `Invoker.accept()` callback,
+    i.e. **after** `TestCompiler.compile()` has done a real in-process javac
+    compile of the AOT-generated bean-registration code and invoked its
+    generated static `apply(RegisteredBean, Object)` method reflectively on
+    the target instance — the same GC/allocation-heavy real-javac-compile
+    choke point flagged elsewhere in this doc as the trigger for the
+    unrelated `fb15be63` GC young-walk bug and the `0a1ec47b` generics.rs
+    unrooted-ObjectRef fix.
+
+    Three targeted standalone repro attempts to isolate this in a minimal
+    probe **all failed to reproduce it** (i.e. all passed cleanly on
+    CratonVM): (1) a bare private field + `Field.get()` on a nested static
+    class, no forking; (2) the same field access from **inside** a
+    `ForkFieldProbe`-style forked classloader (private field defined by the
+    fork loader, read via real `org.assertj.core.api.Assertions.assertThat
+    (...).extracting(...)` loaded by the parent/system loader — i.e. a
+    genuine cross-classloader reflective field read); (3) a reflective
+    `Field.set()` (simulating what AOT-generated injection code does)
+    immediately followed by an `extracting()` read of the same field, single
+    classloader. None reproduced, so the trigger needs the **combination**
+    of forked classloader + a real dynamically-`javac`-compiled-and-loaded
+    third classloader layer (`TestCompiler`'s own `DynamicClassLoader`) +
+    the GC pressure from that real compile — a minimal isolated repro was
+    not achieved this session. Rebuilding at `0a1ec47b` (the freshest
+    landed generics/GC-rooting fix, the most obviously relevant candidate)
+    made **no difference** — identical `found=8 succ=3 fail=5` with the
+    same 5 property names, so this is confirmed to be a genuinely different
+    bug from the ones `0a1ec47b` closed, not a partial/incomplete fix of it.
+
+    **OPEN — not fixed, not fully root-caused.** Next step for whoever picks
+    this up: reproduce with `CRATONVM_DBG_STALE_OBJREF=1` and/or
+    `CRATONVM_DBG_GC_STRESS` set for a run of just this class (mirroring the
+    technique that cracked `0a1ec47b`/`fb15be63`) to check whether this is
+    another instance of the same stale-ObjectRef-after-real-javac-compile
+    family rather than a distinct reflection/access-control gap; if that's
+    negative, instrument `Class.getDeclaredField()`/`Field.setAccessible()`/
+    `Field.get()` (`native-builtins/src/lang_class.rs`) specifically for
+    calls made against a class loaded by a `CompileWithForkedClassLoader`-
+    style loader from calling code loaded by a *different* loader in the
+    same process, since the one common thread across all 5 failures is that
+    exact cross-loader-reflection shape post-real-compile.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,
@@ -880,14 +1017,29 @@ the WRONG same-named copy. Eight fixes landed on
 
 ## 3. Untriaged Clusters & Per-Class Details
 
-*Note: this section was accidentally truncated in the 2026-07-14 rewrite; the
-full 1013-line per-class detail lives in git history as
-`CRATONVM-SPRING-GENUINE-BUGLIST-125.md` (deleted in `ccab25c6`). 21 classes
-related to `HIB-CV-32` heap corruption remain filtered out as load-dependent
-side-effects tracked separately. The still-open non-AOT clusters from that
-list (WebFlux backend failures, Groovy scripting cluster, WebFlux
-EMPTY-discovery family, 6 found=0 ABENDs, and the per-class FAIL details)
-are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
+**Recovered 2026-07-16/17.** The truncated 1013-line historical detail
+(`CRATONVM-SPRING-GENUINE-BUGLIST-125.md`, deleted in `ccab25c6`) was pulled
+back from git history (`git show ccab25c6~1:docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST-125.md`,
+full 1013 lines, still available at that path in git history) and
+cross-referenced class-by-class against the ~310 commits and the extensive
+AOT (§2) and reactive-cluster (§4) investigations that landed on `dev` since
+that 2026-07-14 snapshot. Two of the four named clusters turn out to be
+**already fully covered/resolved elsewhere in this document**; the other two
+are **still genuinely open and were NOT previously tracked anywhere** — the
+placeholder's claim that all 21 HIB-CV-32-filtered classes were "tracked
+separately" was only true for 12 of them. Live re-run of the still-open
+classes on a fresh `dev`-tip binary was attempted this session but blocked
+by a severe, host-wide disk-full crisis on the Azure build host's root
+filesystem (repeatedly hit 0 bytes free, corrupting several other sessions'
+scratch files and pruning ~20 concurrent git worktrees including this
+investigation's own two build worktrees mid-session) which also wiped every
+surviving pre-built `spring-framework` test classpath on the host — rebuilding
+one from scratch (`./gradlew jar testFixturesJar testClasses`) was out of
+scope for the remaining time budget. The status below is therefore the most
+accurate currently-available synthesis of doc + git evidence, but the
+"still open, unconfirmed" classes marked below need a live rerun as the
+concrete next step, once a `spring-framework` test classpath exists on the
+host again.
 
 ### WebFlux Backend-Specific Failures
 (`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`, `RequestMappingMessageConversionIntegrationTests`)
@@ -916,6 +1068,115 @@ are unchanged by the 2026-07-15 AOT work — consult the historical doc.*
     CPU) — an already-documented, deliberately-deferred architectural item (see `gc/src/arena.rs`'s
     `Arena::reset` doc comment), not a quick-fix bug. Full detailed writeup, all numbers, and the
     concrete next step further down in this document, section 2, same bullet.
+
+### WebFlux EMPTY-discovery family — RESOLVED (superseded by §4's 2026-07-15 reactive sweep)
+
+The historical doc characterized (2026-07-11, dev `9948295e`) a cluster of `web.reactive.result.method.annotation.*`
+and `web.reactive.result.view.*` classes that loaded (`found=1`) but discovered **zero runnable
+test methods** — a JUnit-discovery/filtering gap specific to WebFlux's reactive test style, distinct
+from ordinary FAILs. Named examples: `GlobalCorsConfigIntegrationTests`, `MessageReaderArgumentResolverTests`,
+`ProtobufIntegrationTests`, `FreeMarkerMacroTests`.
+
+**§4's full 295-class reactive sweep (2026-07-15) supersedes this with a direct, explicit finding**: after
+that session's 7 (then 8) VM fixes, "the only EMPTY classes are the same 4 abstract classes HotSpot
+reports EMPTY" — i.e. the WebFlux-specific EMPTY-discovery anomaly is gone; every previously-EMPTY
+concrete WebFlux test class now discovers and runs its real test methods, matching HotSpot's own
+EMPTY set (legitimately-abstract base classes only) exactly. Treated as **FIXED/RETIRED** — no
+separate tracking needed; see §4 for the full fix list and verification detail.
+
+### HIB-CV-32-filtered 21-class list — reconciled
+
+The historical doc filtered 21 classes out of its main "still open" count as exclusively-ABEND,
+`rc=139`-SIGSEGV crashes carrying the generic `gen_heap::read_slot: corrupt Value cell` guard message
+— informally shorthanded "the HIB-CV-32 family" — on the theory they were a shared, load-dependent
+batch-corruption artifact rather than 21 independent bugs. Two important corrections from this
+session's research:
+
+1. **The name is a red herring.** The literal `HIB-CV-32` defect (`docs/internal/hibernate-bugs/run-20260622/HIB-CV-32-sigsegv-blob-bytearray-bind.md`)
+   — a GC-corruptor triggered by `promotion_oom_risk` diverting `--nojit` young collections into a
+   corrupting non-moving sweep — was already root-caused and **fixed weeks earlier, 2026-06-23,
+   commit `c9258e17`**, well before the 2026-07-09 Spring 125-class baseline even existed. What the
+   Spring doc calls "the HIB-CV-32 family" is really every crash that trips the *diagnostic guard*
+   that fix's defense-in-depth left behind (`read_value_checked`/`gen_heap::read_slot`'s "corrupt
+   Value cell" log line) — a generic heap-integrity tripwire, not evidence of one shared root cause.
+   §4's Round 3 investigation independently confirms this guard is "pre-existing, deliberately-built
+   forensic instrumentation... a conservative-scan heuristic that sometimes misclassifies a live
+   region as corrupt... a SAFE recovery path by design, not silent data corruption" — consistent with
+   different classes in this 21-class list having entirely different underlying causes.
+
+2. **Only 12 of the 21 are actually accounted for elsewhere in this document; 9 are not tracked
+   anywhere and are genuinely still open/untriaged.**
+
+   | # | Class | Current status |
+   |---|---|---|
+   | 1-9 | `web.reactive.function.client.support.WebClientProxyRegistryIntegrationTests`, `web.reactive.function.server.InvalidHttpMethodIntegrationTests`, `web.reactive.config.WebFluxConfigurationSupportTests`, `web.reactive.config.WebFluxViewResolutionIntegrationTests`, `web.reactive.result.method.annotation.GlobalCorsConfigIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingDataBindingIntegrationTests`, `web.reactive.result.method.annotation.RequestMappingViewResolutionIntegrationTests`, `web.reactive.result.view.LocaleContextResolverIntegrationTests`, `web.reactive.result.view.freemarker.FreeMarkerMacroTests` | **FIXED** — covered by §4's 295-class reactive sweep (reached HotSpot parity for the whole `web.reactive.*` scope) |
+   | 10 | `messaging.rsocket.RSocketBufferLeakTests` | **FIXED** — same §4 sweep (`messaging.rsocket.*` explicitly in scope) |
+   | 11 | `test.web.reactive.server.samples.JsonContentTests` | **FIXED** — same §4 sweep (`test.web.reactive.*` explicitly in scope) |
+   | 12 | `web.socket.WebSocketHandshakeTests` | **STILL OPEN, but no longer ABEND** — confirmed via this session's own STOMP investigation (§3 "STOMP Message Hang" note): no longer crashes, now `FAIL 4/6` on real "Blocking write timeout" failures, "not investigated further this session." Genuine progress, not closed. |
+   | 13 | `cache.jcache.JCacheEhCacheAnnotationTests` | **UNKNOWN / genuinely untracked** — zero mentions anywhere in current `dev`, no dedicated fix commit found (`git log --grep`). Not reactive, not AOT — outside every investigation that has landed since 2026-07-09. Needs a live rerun. |
+   | 14 | `http.client.JettyClientHttpRequestFactoryTests` | **UNKNOWN / genuinely untracked** — same reasoning; this is the blocking `http.client` module, not `http.client.reactive` (which §4 covered), so it fell outside every session's scope. Needs a live rerun. |
+   | 15 | `jdbc.config.JdbcNamespaceIntegrationTests` | **UNKNOWN / genuinely untracked** — original crash signature was an out-of-bounds field read on `org/hsqldb/RangeGroup$RangeGroupEmpty` (`real_field_count=Some(0)`), a shape plausibly touched by the broad `fb15be63` GC exact-walk fix (see below) but never re-verified. Needs a live rerun. |
+   | 16-21 | `test.context.groovy.AbsolutePathGroovySpringContextTests`, `DefaultScriptDetectionGroovySpringContextTests`, `GroovySpringContextTests`, `MixedXmlAndGroovySpringContextTests`, `RelativePathGroovySpringContextTests`, `test.context.web.BasicGroovyWacTests` | **LIKELY STILL OPEN** — see "Groovy scripting cluster" below; same family as the 8-9 already-characterized Groovy classes, no dedicated fix landed for any of it. |
+
+   Net: **12/21 resolved or improved** (11 fixed outright via the reactive sweep, 1 improved from
+   crash to ordinary FAIL), **9/21 remain open and, contrary to the previous placeholder text, were
+   never actually "tracked separately" anywhere** — 3 are entirely unique untracked classes and 6
+   belong to the Groovy cluster below.
+
+### Groovy scripting cluster — STILL OPEN (no dedicated fix has landed)
+
+The historical doc (2026-07-11 characterization) named 8 classes as a systemic Groovy-script-loading
+gap (high per-method failure ratios, e.g. `GroovyBeanDefinitionReaderTests` 35/36 methods failing),
+plus 6 more in the HIB-CV-32-filtered list that share the same root area (`test.context.groovy.*`,
+`test.context.web.BasicGroovyWacTests`) — 10 distinct classes total once de-duplicated:
+
+- `scripting.groovy.GroovyAspectTests` — ABEND `rc=139` (2026-07-09 baseline; dumped core)
+- `scripting.groovy.GroovyAspectIntegrationTests` — ABEND `rc=139` (dumped core)
+- `scripting.groovy.GroovyScriptFactoryTests` — ABEND `rc=139` / TIMEOUT (dumped core)
+- `scripting.config.ScriptingDefaultsTests` — ABEND `rc=139` (dumped core; part of the "6 found=0 ABENDs" cluster below, same family)
+- `context.groovy.GroovyBeanDefinitionReaderTests` — ABEND `rc=139` (dumped core)
+- `test.context.groovy.AbsolutePathGroovySpringContextTests` / `DefaultScriptDetectionGroovySpringContextTests` / `GroovySpringContextTests` / `MixedXmlAndGroovySpringContextTests` / `RelativePathGroovySpringContextTests` — all ABEND `rc=139`
+- `test.context.web.BasicGroovyWacTests` — ABEND `rc=139`
+
+**No dedicated fix for this cluster has landed on `dev`** — `git log --oneline ccab25c6..origin/dev
+-i --grep=groovy` across the ~310 commits since the historical snapshot turns up only incidental
+touches (a ByteBuddy field-lookup fix, an enclosing-class loader-awareness fix), nothing that
+addresses Groovy script/classloader integration directly.
+
+**Stronger evidence it's still broken, found this session**: the AOT cluster's 2026-07-16 re-triage of
+`TestContextAotGeneratorIntegrationTests` (§2) independently hit a **new, different, unfixed Groovy
+defect** in the exact same area — `processAheadOfTimeWithXmlTests` throws `ExceptionInInitializerError`
+from `GroovyBeanDefinitionReader.<init>`, caused by an `ArrayStoreException: arraycopy: source element
+at index 1 is not assignable to destination component type` inside `groovy/lang/GroovySystem`'s
+`<clinit>` — explicitly documented as **NOT** the already-fixed `GroovySystem.<clinit>` NPE
+(`docs/internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`, a `Module`-descriptor-null
+issue referenced in this doc's Executive Summary), a different exception type and mechanism, "newly
+observed; not investigated further." This directly implicates `GroovyBeanDefinitionReader` — the same
+class `context.groovy.GroovyBeanDefinitionReaderTests` exercises — and is consistent with the whole
+cluster still being broken, just with the crash shape likely shifted from a hard `rc=139` SIGSEGV
+(2026-07-09 baseline) to a catchable `ExceptionInInitializerError`/`ArrayStoreException` now, given
+the general heap-corruption-guard fixes (`fb15be63`, HIB-CV-26 `Class.forName` fix) that have landed
+in between. **Not confirmed via live rerun this session** (blocked by the host disk crisis and the
+loss of the `spring-framework` test classpath, see the section-3 recovery note above) — flagged as
+the highest-value next step: re-run these 10 classes on a fresh binary and characterize the current
+crash/fail shape before attempting a fix.
+
+### 6 found=0 ABEND cluster — reconciled
+
+The historical doc separately flagged 6 classes that crashed **before any test method was discovered**
+(immediate crash on class load) as a distinct shape from the mid-run HIB-CV-32-guard crashes above:
+
+| Class | 2026-07-09 baseline | Current status |
+|---|---|---|
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | LOADERR — `OutOfMemoryError: Java heap space` | **FIXED** — confirmed `OK 44/44` in §2's AOT-cluster validation table (one of the 8 loader-identity fixes' beneficiaries) |
+| `core.codec.ResourceRegionEncoderTests` | ABEND `rc=139` | **UNKNOWN / untracked** — not `web.reactive.*` by package name, so likely (but not confirmed) outside §4's reactive-sweep scope even though `ResourceRegionEncoder` is reactive-stack machinery; needs a live rerun to confirm either way |
+| `jdbc.config.JdbcNamespaceIntegrationTests` | ABEND `rc=1` — hsqldb `RangeGroup$RangeGroupEmpty` OOB field read | **UNKNOWN / untracked** (also HIB-CV-32-list #15 above) |
+| `scheduling.quartz.QuartzSupportTests` | TIMEOUT (120s) | **UNKNOWN / untracked** — zero mentions anywhere in current `dev` |
+| `scripting.config.ScriptingDefaultsTests` | ABEND `rc=139` (dumped core) | **LIKELY STILL OPEN** — same Groovy/scripting family as above, no dedicated fix |
+| `test.web.servlet.htmlunit.MockWebResponseBuilderTests` | Actually **FAIL**, not ABEND, in the per-class detail (`buildContent() :: AssertionFailedError`, single method) — the historical doc's own summary and per-class sections disagree on this one's shape | **UNKNOWN / untracked**, but looks like a narrow single-assertion bug (same pattern as several other now-fixed single-method FAILs in this doc) — a plausible quick-fix candidate for a future session with a working classpath |
+
+Net: **1/6 fixed**, **5/6 unconfirmed/likely still open**, none of them tracked anywhere else in this
+document prior to this recovery pass.
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 

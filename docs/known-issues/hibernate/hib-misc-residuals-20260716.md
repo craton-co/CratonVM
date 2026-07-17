@@ -5,43 +5,106 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — OPEN: real, deterministic reflection/GC corruption in JAXB model-building (re-investigated 2026-07-16)
+## `DefaultCatalogAndSchemaTest` — CLOSED (corruption); real, distinct `ArrayIndexOutOfBoundsException`/`InvalidMappingException` bug now exposed, NEW and OPEN (2026-07-16)
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
-**Status:** OPEN — confirmed NOT a one-off flake, NOT the old getfield
-regression, and NOT the HIB-CV-33 GC-sweep corruptor. Re-investigated
-against the frozen `dev@dcb24161` baseline on the shared Azure Linux host
-(15+ solo reruns across `--nojit`, JIT-on, and
-`CRATONVM_DBG_FORCE_MOVING=1`): the class fails **100% deterministically**
-(15/15, host load ranging 8–70 across runs, so not load-dependent either) —
-but the failure shape is not the originally-reported `HANG (rc=124)`. It
-completes quickly (40–90s) with `rc=0` and a **silent zero-test discovery
-failure**:
-```
-@@RESULT 0 ...DefaultCatalogAndSchemaTest found=0 started=0 ok=0 failed=0 aborted=0 skipped=0 ms=... loaderror=java.lang.NullPointerException
-```
-The underlying exception varies by exact harness bootstrap class used
-(`Cannot invoke "EngineExecutionListener.executionStarted(...)" because
-"this.delegate" is null` via the `CratonRunner` harness; `AbstractMethodError:
-TestEngine.getId()...has no Code attribute` via a minimal standalone
-`Launcher.execute()` probe) — both are **the same underlying cause seen
-through different victims**: `CRATONVM_DBG_NOCODE=1`/`CRATONVM_DBG_STALE_RECV=1`
-show the AME's receiver reads back as a zeroed header
-(`recv_cid=0 recv_class=java/lang/Object`), and the interpreter logs
-`Stale pointer detected in invokevirtual receiver (ptr=..., all-zero
-header)` immediately before it. A genuine `rc=124` timeout was also
-observed once under extreme host contention (load average 60+), so the
-originally-reported HANG can still occur too — it is a secondary/rarer
-presentation of the same underlying corruption, not a separate bug.
+**Status: the GC-corruption/crash family tracked in this section is CLOSED.**
+Fixed jointly by two independent, concurrent 2026-07-16 sessions whose work
+landed together on `dev`:
 
-**A one genuine hang WAS reproduced** during this investigation (rc=124,
-60s timeout, host load 60.76 at the time) — corroborating the original
-doc's `HANG (rc=124)` report as a real (if less common) presentation of
-this same defect under heavy contention, not an unrelated environmental
-fluke.
+1. This session's `fix/hib-reflection-gc-sweep-20260716` (merged at
+   `a0c60214`): swept `native-builtins/src/generics.rs`, which had **never**
+   used the `pin_native_root`/`read_native_pin` idiom anywhere — every
+   `Type`/`TypeVariable`/`WildcardType`/`ParameterizedType` builder held a
+   freshly-allocated object or array in a Rust local across further
+   allocating calls (`create_string`, nested `typesig_to_real_type`/
+   `typearg_to_real_type` recursion, `new_type_array`) before it became
+   reachable from a Java root. This is the "enum/type-var builders" residual
+   gap flagged (but never swept) in
+   `docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`
+   after `db047d38` (see below) closed the sibling
+   `collect_public_fields`/`methods`, `getParameterAnnotations`, and
+   `create_annotation_proxy` gaps. Fixed: `type_sig_to_java`
+   (ParameterizedType/TypeVariable/GenericArrayType arms), `type_arg_to_java`
+   (Extends/Super/Unbounded WildcardType arms), `type_param_to_java`,
+   `typesig_to_real_type` (ParameterizedTypeImpl), and
+   `typearg_to_real_type`/`real_wildcard_type` (WildcardTypeImpl); plus 4
+   `lang_class.rs` callers that filled a `TypeVariable[]`/`Type[]` array via
+   these builders without pinning the destination array across the loop
+   (`native_class_get_type_parameters`, `native_class_get_generic_interfaces`,
+   `native_method_get_generic_param_types`,
+   `native_method_get_type_parameters`), and the
+   `AnnotationElementValue::Enum` arm of `annotation_element_to_java_typed`
+   (`class_mirror` held across `create_string` + `Enum.valueOf` invoke).
+2. A concurrent session's `fix/wildfly-cce0079-close-20260716` (root-cause
+   writeup: `docs/internal/fixed-suite-bugs/wildfly-cce0079-young-start-set-truncation-FIXED.md`):
+   fixed the actual GC-level bug this whole family's corruption cascade rode
+   on — `gc/src/gen_heap.rs`'s moving-young-GC `young_object_starts`
+   pre-forwarding walk assumed a contiguous bump-allocated young space and
+   `break`'d out silently the first time it hit a legitimate non-object gap
+   (a free-list block, reserved TLAB tail, or GAP-filler sentinel), leaving
+   **every young object above that break point excluded from the
+   forwardable set for that entire collection** — for every root, including
+   `native_pin_roots` pins. This session's own live tracing
+   (`CRATONVM_DBG_STALE_RECV=1` + `CRATONVM_DBG_GC_STRESS=65536`) caught this
+   exact mechanism red-handed on `DefaultCatalogAndSchemaTest`: `GC: young
+   object-start walk stopped at an implausible extent` firing at offsets as
+   small as ~500 bytes–4MB into a ~585MB young generation, followed
+   immediately by a broad `Stale pointer detected in invokevirtual receiver`
+   cascade touching dozens of unrelated live objects in one collection
+   (`org/hibernate/mapping/PersistentClass`, JUnit's `ThrowableCollector`,
+   `java/util/List`/`Map`/`Optional`, `java/lang/Class`, etc.) — this is why
+   the earlier "one more unrooted reflection site" hypothesis (below) kept
+   finding a *different* victim each session: the reflection-heavy scan was
+   just an efficient way to reach the next forced young GC, not the site of
+   the actual defect.
 
-**Ruled out:**
+**Verification (this session, `dev`-tip binary = `a0c60214` merged with the
+`cce0079` GC fix, built and tested against `/data/hibsrc-baseline-20260716`):**
+before this merge, the class deterministically failed at test-*discovery*
+with `found=0`/`ClassCastException: java.lang.Object cannot be cast to
+org.junit.platform.engine.TestExecutionResult$Status` (confirmed
+reproducing on `a0c60214` alone, i.e. this session's `generics.rs` fix by
+itself was real but insufficient — matching this doc's own "verified real
+but insufficient" history below). After merging in the `cce0079` GC fix and
+rebuilding: **zero** `Stale pointer detected` occurrences, and the class now
+correctly discovers and runs its full `found=132` — up from `found=0`:
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=26 failed=106 aborted=0 skipped=0 ms=218539
+```
+Reproduced twice (a third run was interrupted mid-flight when the shared
+Hibernate fixture's `target/` build output was wiped by unrelated host
+activity — not a regression, just lost test infrastructure; see the
+`NEW, OPEN` item below for what a follow-up session needs to rebuild before
+continuing).
+
+**NEW, OPEN (2026-07-16): 106/132 real `ArrayIndexOutOfBoundsException`/`InvalidMappingException` failures, unrelated to GC corruption.**
+Now that the class can actually run instead of crashing at discovery, it
+exposes a genuine, different correctness bug:
+```
+java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+org.hibernate.boot.InvalidMappingException: Could not parse mapping document: null (INPUT_STREAM)
+```
+Not investigated further this session (out of scope/time — the task this
+session was scoped to was the GC-corruption family, now closed). Given this
+class exercises legacy `<hibernate-mappings/>` HBM-XML in addition to
+annotations (per its own `HHH90000028` deprecation warnings), the
+`InvalidMappingException`/`INPUT_STREAM` shape is a plausible lead: an HBM
+mapping resource failing to resolve/open via some loader path, cascading
+into the array-index failures downstream. **Next step:** rebuild the
+Hibernate fixture (`cd /data/hibsrc-baseline-20260716 && GRADLE_USER_HOME=/data/gradle-home-baseline-20260716
+./gradlew hibernate-core:testClasses` — this session's attempt hit an
+unrelated toolchain error, `Toolchain installation
+'/usr/lib/jvm/java-21-openjdk-amd64' does not provide the required
+capabilities: [JAVA_COMPILER]`, needs a working JDK toolchain pointed at
+first), then get a `-Dcraton.trace=true` stack trace for one of the 106
+failures to find the actual throw site.
+
+<details>
+<summary>Original investigation history (superseded — kept for context)</summary>
+
+**Ruled out (original investigation):**
 - The already-fixed JIT guarded-inline-getfield regression (`93b33576`) —
   reproduces identically with `--nojit`, so JIT is not involved.
 - The HIB-CV-33/HIB-CV-22 non-moving-young-sweep GC corruptor — reproduces
@@ -52,21 +115,13 @@ fluke.
   (`LockTest`, `JarVisitorTest`) run against the exact same binary/load show
   **zero** occurrences of this signature.
 
-**Root cause (partially fixed this session, 2026-07-16):** `CRATONVM_DBG_STALE_RECV=1`
+**Root cause (partially fixed pre-session, 2026-07-16):** `CRATONVM_DBG_STALE_RECV=1`
 traces every occurrence into
 `org.glassfish.jaxb.runtime.v2.model.impl.ClassInfoImpl.findGetterSetterProperties`
 — JAXB's reflection-heavy getter/setter/annotation scan over this test's
-many HBM-XML-mapped entity classes (this class alone exercises legacy
-`<hibernate-mappings/>` XML mapping in addition to annotations, per the
-`HHH90000028` deprecation warnings in its own log, unlike the two control
-classes). This is the same "unrooted native `ObjectRef` accumulated across
-an allocating call" family as several already-fixed sibling bugs in
-`native-builtins/src/lang_class.rs` (see
-`docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md`'s
-"residual gap" list, and
-`docs/internal/fixed-suite-bugs/wildfly-standalone-managed-server-boot-fails-under-surefire-fork.md`'s
-6-site long-tail). Found and fixed **3 more, previously-unswept sites**
-(commit `db047d38`, merged to `dev` at `6178c36f`):
+many HBM-XML-mapped entity classes. Found and fixed **3 more,
+previously-unswept sites** (commit `db047d38`, merged to `dev` at
+`6178c36f`):
 1. `collect_public_fields`/`collect_public_methods` (backing
    `Class.getFields()`/`getMethods()`) pushed freshly-created Field/Method
    mirror `ObjectRef`s into a plain, unrooted `Vec` during the
@@ -84,27 +139,17 @@ an allocating call" family as several already-fixed sibling bugs in
    lookups) between allocation and the point it becomes reachable from a
    Java root.
 
-**Verified real but insufficient:** `CRATONVM_DBG_STALE_RECV=1` on the
-fixed binary shows the first corruption in `findGetterSetterProperties`
-moved from bytecode offset `pc=170` to `pc=64` in an earlier build then to
-receiving a **different** local variable later in the same method
-(`java/util/Map.keySet()` instead of `ClassInfoImpl.nav()`) — i.e. the fix
-demonstrably reduced/deferred the corruption, confirming these are real
-bugs, but **at least one more unrooted site remains** in the same method's
-continued reflection/annotation scanning. `DefaultCatalogAndSchemaTest`
-itself still reproduces the `found=0`/`loaderror=NullPointerException`
-failure 100% of the time even on the merged-and-rebuilt `dev` tip.
+**Verified real but insufficient (pre-session finding, since superseded):**
+`CRATONVM_DBG_STALE_RECV=1` on the fixed binary showed the first corruption
+in `findGetterSetterProperties` moving to a different local variable each
+time a site got fixed — this doc originally concluded "at least one more
+unrooted site remains" and recommended a systematic `lang_class.rs` sweep.
+That sweep (this session's `generics.rs` fix) was real and necessary but,
+per the verification above, **not sufficient on its own** — the GC-level
+`young_object_starts` walk bug was the deeper root cause the "different
+victim every time" pattern was actually pointing at.
 
-**Next step for a follow-up session:** re-run
-`CRATONVM_DBG_STALE_RECV=1` against current `dev` on this exact class,
-find the (now later, still-unidentified) call site inside
-`ClassInfoImpl.findGetterSetterProperties`'s continued execution after the
-property-Map lookup, and audit it for the same pin/re-read pattern. Given
-the "different receiver each time" progression, a systematic sweep of
-remaining `lang_class.rs` natives that allocate-then-use an `ObjectRef`
-without `pin_native_root` (matching the audit already done for the
-sibling constructor helpers) is likely higher-leverage than continuing to
-chase individual call sites one at a time.
+</details>
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
@@ -307,6 +352,45 @@ a 5-second-budget test hard to trust in isolation — though the
 trustworthy signal gathered this round, and it points at JIT-on overhead
 (compile activity and/or bookkeeping), not host noise, as the residual
 cause.
+
+## Update (2026-07-17, throughput-profiling session): `LockTest` reconfirmed on a much later dev tip -- same mechanism, still OPEN, no new fix attempted
+
+Re-ran this class's known bisection (as part of a session tasked with
+`InsertOrderingRCATest`/`LiteralRenderingTest`/`LockTest` throughput
+profiling -- see the other two classes' writeup in
+[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md))
+against `dev@33df5d3c`, many commits ahead of this section's original
+`dcb24161`/later-session tips. Result: **identical mechanism, still
+reproduces.**
+
+- Default (JIT on): whole-class solo run `found=23 started=15 ok=14
+  failed=1 aborted=0 skipped=8 ms=36861`, the sole failure being
+  `testFindWithPessimisticWriteLockTimeoutException` --
+  `AssertionFailedError: execution exceeded timeout of 5000 ms by 18055 ms`
+  (host load ~7-8 at the time, so this is a real, not purely
+  contention-driven, overshoot -- consistent with the "JIT-on overhead, not
+  host noise" conclusion already reached below).
+- `--nojit`: whole-class solo run `found=23 started=15 ok=15 failed=0
+  ms=9770` -- clean pass, and ~3.8x *faster* than the JIT-on run. Matches
+  this section's original bisection exactly (JIT-on is both slower and
+  incorrect for this short-lived process; JIT-off is both faster and
+  correct).
+- Confirmed the `c1_threshold=1500`/`c2_threshold=20000` mitigation from
+  `fix/jit-compile-time-tax-20260716` is still the default on this tip
+  (`jit/src/tiered.rs`) -- so the residual gap this section already
+  documented (mitigation reduces but does not suppress compile volume for
+  reflection/JDBC-heavy short processes) is confirmed still the live state,
+  not something that regressed or improved incidentally since the last
+  update.
+
+**No new fix attempted this session** -- this reconfirmation used the same
+`--nojit` A/B this section already ran, and the "next step" this section
+already calls for (a fundamentally different tiering heuristic, or a much
+more aggressive threshold validated across the broader benchmark suite) is
+unchanged and still a bigger undertaking than a profiling-focused session's
+time budget allows. Filed here purely as evidence that the mechanism is
+stable across a large `dev` delta, so a future session picking this up can
+trust the existing root-cause writeup below without re-deriving it.
 
 ## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
