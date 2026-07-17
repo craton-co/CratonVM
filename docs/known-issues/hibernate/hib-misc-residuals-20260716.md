@@ -2738,6 +2738,32 @@ documented ~1/70) is a genuine, distinct, still-open CratonVM concurrency
 bug, confirmed NOT fixed by `cce6e1c6`. Self-contained repro and analysis
 left for whoever picks it up next.
 
+**UPDATE (2026-07-17, follow-up session):** root-caused and FIXED -- NOT
+the same defect class as the GC-barrier livelock (`cce6e1c6`), despite
+both being CountDownLatch-shaped and GC-pressure-sensitive. The real bug:
+`native-builtins/src/lib.rs`'s `populate_real_thread_holder` (the native
+override backing `new Thread(Runnable, String)`) pins the freshly
+allocated `Thread$FieldHolder` object across a nested native-builtin
+`FieldHolder.<init>` invoke, but never re-read the pin before using it to
+build that invoke's `args` -- only after. A GC landing in the unguarded
+window (routinely hit on the FIRST-ever `new Thread(...)` in a process,
+whose `ensure_class_initialized("java/lang/Thread$FieldHolder")` call
+loads that class for the first time) left the constructor writing
+`task`/`group`/etc. into an abandoned, structurally-still-valid from-space
+copy, so `Thread.holder.task` read back as a genuine zero forever and that
+worker's `Runnable.run()` (and therefore its own `countDown()`) was never
+invoked -- explaining the "3 of 4 threads count down, one silently never
+does" symptom. Fixed by re-reading the pin immediately before use, twice
+(matching the "re-read right before every use" discipline the sibling
+`CRATONVM-SPRING-GENUINE-BUGLIST.md` doc keeps having to reapply). 20/20 +
+10/10 clean stress runs post-fix; full writeup at
+`docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md` section 5.8
+follow-up #7 (the authoritative writeup lives there, not here -- this is
+only a cross-reference since the bug was found as a side-effect of this
+doc's own BigInteger/AIOOBE investigation). The BigInteger AIOOBE item
+above remains separately OPEN and is NOT connected to this fix -- do not
+conflate the two.
+
 No code change landed for the AIOOBE this session. `git fetch origin dev`
 immediately before this edit confirms tip `cce6e1c6`; no other session has
 touched this doc's `DefaultCatalogAndSchemaTest` section since the entry
