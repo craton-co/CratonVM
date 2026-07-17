@@ -1198,6 +1198,103 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
 /// the caller still needs is rooted AND remapped across the block (frame
 /// slots are; immutable `&[Value]` arg slices are NOT — see the
 /// synchronized-method prologue, which deliberately does not use this).
+/// cceres3 FIX (leaked blocked-region exit self-heal): apply any pending
+/// blocked-window fixup chain + exact slot-origin write-backs to this
+/// thread's frames and thread-level refs, WITHOUT touching the blocked flag
+/// or barrier accounting. Normally `check_post_block_gc` consumes these on
+/// wake; a blocked-region exit path that skips it (observed live: an EQE
+/// worker ran 43 frames -> 1 frame with fixup_pending=44 across four
+/// deposits) leaves the thread executing on stale frames and poisons every
+/// object graph it touches. Calling this from the safepoint publish bounds
+/// that damage to one safepoint interval. Returns the number of chain
+/// entries + write-backs applied.
+pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
+    use crate::memory::gc::update_value_ref;
+    let fixup = {
+        let mut f = thread.gc_block_state.fixup.lock();
+        std::mem::take(&mut *f)
+    };
+    let origins = {
+        let mut o = thread.gc_block_state.slot_origins.lock();
+        std::mem::take(&mut *o)
+    };
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+        return 0;
+    }
+    let mut applied = 0usize;
+    if !fixup.is_empty() {
+        applied += fixup.len();
+        for frame in &mut thread.frames {
+            frame.update_local_refs(&fixup, &shared.heap);
+            frame.stack.update_object_refs(&fixup, &shared.heap);
+            if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for val in &mut thread.printed {
+            update_value_ref(val, &fixup);
+        }
+        for slot in [
+            &mut thread.java_thread_obj,
+            &mut thread.native_pending_return,
+            &mut thread.pending_async_exception,
+        ] {
+            if let Some(obj_ref) = slot.as_mut() {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for obj_ref in thread
+            .native_pin_roots
+            .iter_mut()
+            .chain(thread.native_alloc_pool.iter_mut())
+        {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = fixup.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        for (_key_id, key_ref, val) in &mut thread.scoped_values {
+            if let Some(obj_ref) = key_ref {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            update_value_ref(val, &fixup);
+        }
+        crate::native::jni::update_local_refs_after_gc(&fixup);
+    }
+    for so in &origins {
+        if so.cur == so.orig {
+            continue;
+        }
+        let fi = so.frame as usize;
+        let Some(fr) = thread.frames.get_mut(fi) else {
+            continue;
+        };
+        if so.is_stack {
+            if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) {
+                applied += 1;
+            }
+        } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+            if o.as_ptr() as usize == so.orig {
+                fr.set_local(
+                    so.idx as u16,
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(so.cur as *mut u8) })),
+                );
+                applied += 1;
+            }
+        }
+    }
+    applied
+}
+
 pub(crate) fn monitor_enter_blocking(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -2028,6 +2125,16 @@ impl<'a> NativeContextImpl<'a> {
                     pending,
                     stale_n,
                 );
+                if pending > 0 {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        eprintln!(
+                            "[blockgc] deposit-with-pending tid={} caller:\n{}",
+                            self.thread.thread_id.0,
+                            std::backtrace::Backtrace::force_capture(),
+                        );
+                    }
+                }
             }
         }
         // Mark the blocked region AFTER the snapshot is complete: from this
@@ -2846,7 +2953,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // the existing blocking-path deposit mechanism without actually
     // blocking.
     fn refresh_root_snapshot(&mut self) {
-        self.deposit_root_snapshot();
+        // cceres3 ROOT FIX (WildFly boot CCE long tail): this is a
+        // NON-blocking republish — the caller (the native-collections stream
+        // drain loops) keeps executing Java right after it. The old
+        // `deposit_root_snapshot()` call was the raise=true variant: it set
+        // `in_blocked_region` and nothing ever consumed it, so the identity
+        // census EXCLUDED the running thread from every subsequent STW pause
+        // (moving collections completed under its feet), its
+        // `gc_block_state.fixup` accumulated unconsumed (observed live:
+        // fixup_pending=44 across four raise=true deposits while running 43
+        // frames deep in infinispan/management-model stream work), and every
+        // frame ref it held or stored went stale — the poisoned-island
+        // producer behind the WFLYCTL0079 / "Object cannot be cast to X"
+        // family. The no-flag variant republishes pins/snapshot without
+        // touching the flag — exactly what a still-running thread needs.
+        self.deposit_root_snapshot_no_flag();
     }
 
     fn load_class(&mut self, name: &str) -> MethodCallResult {

@@ -2495,6 +2495,53 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
 }
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
+    // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
+    // native returned without `check_post_block_gc` (unpaired exit), this
+    // thread is running with an unconsumed fixup chain / slot-origin set —
+    // its frames still hold from-space addresses from every GC it slept
+    // through. Apply them here, at the first safepoint publish, before this
+    // thread's stale refs can leak into reachable object graphs.
+    {
+        let pending = !thread.gc_block_state.fixup.lock().is_empty()
+            || thread
+                .gc_block_state
+                .slot_origins
+                .lock()
+                .iter()
+                .any(|so| so.cur != so.orig);
+        if pending {
+            let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
+            if n > 0 && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-HEAL tid={} applied {} pending fixups (leaked blocked-region exit upstream)",
+                    thread.thread_id.0, n,
+                );
+            }
+        }
+        // A raised flag at an interpreter safepoint means some raise site's
+        // exit skipped `check_post_block_gc` (the monitor_wait early-return
+        // bug class): this thread is RUNNING, yet every census still excludes
+        // it, so moving collections keep completing under its feet. Restore
+        // the invariant: wait out any in-flight pause and clear the flag
+        // (idempotent with the eventual legitimate wake, whose fixup-take
+        // then finds an empty map).
+        if thread
+            .gc_block_state
+            .in_blocked_region
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            shared.gc_barrier.leave_blocked_region_flagged(
+                thread.thread_id,
+                &thread.gc_block_state.in_blocked_region,
+            );
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] SAFEPOINT-FLAG-CLEAR tid={} - in_blocked_region was raised on a running thread",
+                    thread.thread_id.0,
+                );
+            }
+        }
+    }
     // DIAGNOSTIC-ONLY (cceres3): first-miss hunter. Once per GC epoch per
     // thread, verify no frame slot holds an already-forwarded (quarantined)
     // address at the safepoint publish. A hit here bounds the miss window to

@@ -1002,7 +1002,18 @@ impl ThreadRegistry {
     pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
         let threads = self.threads.lock();
         if let Some(entry) = threads.get(&thread_id) {
-            entry.gc_block_state.fixup.lock().clear();
+            {
+                let mut f = entry.gc_block_state.fixup.lock();
+                if !f.is_empty() && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                    eprintln!(
+                        "[blockgc] native-unblock DISCARDS {} fixups tid={}",
+                        f.len(),
+                        thread_id.0,
+                    );
+                }
+                f.clear();
+            }
+            entry.gc_block_state.slot_origins.lock().clear();
             entry.root_snapshot.lock().clear();
             entry
                 .gc_block_state
