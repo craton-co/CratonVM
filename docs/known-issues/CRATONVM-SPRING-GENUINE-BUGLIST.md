@@ -4632,7 +4632,6 @@ load-induced flake by rerunning it alone (`cargo test … -- --exact`, passed
 immediately) — zero real regressions. `cargo test -p cratonvm-native-builtins
 --lib --release`: see below.
 
-
 ---
 
 #### 5.8 follow-up #4 (2026-07-18, session 5): Result 3 (`cratonvm-aio-dispatch-N` arbitrary-site SIGSEGV) ROOT-CAUSED and FIXED (`b3db96f8`); a second, independent, pre-existing race found in the same crash class, left OPEN
@@ -4851,3 +4850,138 @@ and verified with real rigor (80 stress runs, zero recurrence, two
 regression suites unchanged). The second (a concurrent lazy-init race,
 confirmed pre-existing) remains open, is rarer, and needs its own
 dedicated session.
+
+---
+
+#### 5.8 follow-up #5 (2026-07-18, session 6): GC-barrier `expected`/`arrived` livelock (follow-up #3's open item) ROOT-CAUSED AND FIXED
+
+Picked up follow-up #3's explicit open item: a genuine, reproducible livelock in
+`GcBarrier`'s `expected`/`arrived` accounting under rapid thread churn, where
+the GC initiator hangs forever in `stw_take_over_and_wait`/
+`wait_for_all_timeout` even though every *live* thread is correctly parked.
+Follow-up #3 traced the individual `expected`/`arrived` transitions and found
+each correct in isolation but could not close the gap between "each piece
+looks fine alone" and "the whole thing livelocks under churn."
+
+**Repro harness**: `GcBarrierLivelockStress.java` (recreated per follow-up
+#3's description — the harness itself was not saved from the prior session).
+N "spawner" threads loop `new Thread(() -> { Object garbage = new
+Object[4]; }).start(); kid.join();` (single-statement child body, immediate
+join by the spawner — the "naive" shape follow-up #3 found reproduced most
+reliably), bounded by `ThreadGroup.activeCount()` backpressure to avoid an
+unrelated unbounded-thread-growth hang; M "allocator" threads continuously
+churn small garbage under a tiny heap (`-Xmx 64m`) to force frequent young
+GC. No `ThreadGroup.enumerate()` involved — confirmed the bug lives purely in
+the barrier subsystem. **Reproduced on the first attempt** (debug build,
+default params: 4 spawners, 2 allocators, `maxActive=20`): `timeout 45`
+against the harness returned rc=124 (near-zero CPU usage over the whole
+window — the livelock signature, not a spin), and the interpreter's own
+`STW cross-thread JIT takeover is still waiting for cooperative mutators`
+diagnostic fired with `pending=1`, matching follow-up #3's exact symptom.
+
+**Live capture** (gdb `-batch -ex run -ex 'thread apply all bt'`, external
+`kill -INT <gdb-pid>` break-in technique per follow-up #3 — not even needed
+this time since the xt-takeover machinery's own `SIGUSR2` delivery to a
+frozen JIT peer caused gdb to break in on its own): every visible OS thread
+was, as follow-up #3 observed, "correctly parked" — the GC initiator itself
+spinning in `stw_take_over_and_wait`/`wait_for_response`, cooperative
+mutators parked in `arrive_and_wait_auto`, a just-woken thread in
+`wait_out_pause_locked`. Re-ran with `CRATONVM_DBG_STW_CENSUS=1
+CRATONVM_DBG_VM_STATE=1` to get `ThreadRegistry::debug_thread_census()`'s
+per-thread dump alongside the barrier's own `[stw-request]`/`[stw-arrive]`
+trace, which was the key: it showed a **still-alive** thread —
+`kid-1-817`, one of the harness's own short-lived child threads —
+with `blocked=false ready=true snapshot=0 state="thread-start:run-returned"
+top=<no-frame-trace>`: alive, `stw_ready`, but never having deposited a root
+snapshot (so `in_blocked_region` was still `false`) and never having reached
+any safepoint arrival. The dump's own summary line made the smoking gun
+explicit: `blocked=5` (the barrier's legacy `threads_blocked` atomic) vs.
+only 4 threads actually showing `in_blocked_region=true` in the per-thread
+census — a **discrepancy of exactly 1**, matching `pending=1`.
+
+**Root cause**: `vm/src/vm/vm_exec.rs`'s thread-termination sequence has a
+"notify any `Thread.join()` waiter" step that acquires the terminating
+thread's own `java.lang.Thread` monitor via `enter_inflated_or_contend`. When
+that acquire is `contended` (another thread — typically the joiner, mid
+`synchronized(this) { ... isAlive() ... }`, before it reaches the `wait()`
+call whose semantics actually release the monitor — currently owns it), the
+code calls `GcBarrier::enter_blocked()` then blocks in
+`Monitor::block_enter()`. `Monitor::block_enter`'s own doc comment states
+the caller "MUST have marked itself GC-blocked first (deposit roots +
+`GcBarrier::enter_blocked`)" — but this call site skipped the deposit.
+`enter_blocked()` alone only bumps the barrier's **legacy** `threads_blocked`
+atomic; the production census
+(`GcBarrier::request_stw_counted_with_live_blocked` →
+`ThreadRegistry::alive_count_blocked_and_os_tids`) excludes a thread from
+`expected` by reading `gc_block_state.in_blocked_region` — set **only** by
+`deposit_root_snapshot()` — not that atomic. A STW requested after
+`enter_blocked()`'s `pre_stw` snapshot but while the terminating thread was
+still parked in `monitor.block_enter()` therefore counted it in `expected`
+(genuinely: it looked like an ordinary running mutator, since it hadn't
+published anything to the contrary) — and `block_enter()` never checks
+safepoints, so it could never arrive. If the monitor's owner was itself
+waiting out that same pause before its next native call could reach
+`Object.wait()`'s monitor-release (the joiner's `isAlive()`/`wait()` calls
+each pass through `safe_native_call_impl`'s pre-callback safepoint check,
+which can park the joiner mid-native, *before* the native that would
+release the monitor actually runs) — the result is the exact three-way
+deadlock `block_enter`'s own doc warns about: "owner waits GC, contender
+waits owner, GC waits contender." Confirmed by comparison: the **other**
+two `block_enter` call sites in this file (`monitor_enter_blocking`,
+`monitor_enter_synchronized_method`) both correctly call
+`deposit_root_snapshot()` before `enter_blocked()`; only the
+thread-termination site's `contended` branch omitted it — this call site's
+own later code (a few lines down, `deposit_root_snapshot()` +
+`enter_blocked()` + `finish_after(mark_dead)`) does it correctly, which is
+almost certainly why the earlier omission escaped scrutiny.
+
+**Fix** (`vm/src/vm/vm_exec.rs`, the `contended` branch of the
+"notify waiting joiners" block, ~line 5691): added the missing
+`NativeContextImpl { .. }.deposit_root_snapshot()` call before
+`GcBarrier::enter_blocked()`, matching the pattern used everywhere else
+`block_enter()` is called. No other logic changed — `arrive_and_wait_auto`'s
+existing exclusion-aware arrival already does the right thing once the
+census can actually see this thread as blocked.
+
+**Tripwire** (`vm/src/runtime/interpreter.rs`, `stw_take_over_and_wait`'s
+existing `WARN_AFTER_ROUNDS` diagnostic): added an always-on (not gated
+behind `CRATONVM_DBG_STW_CENSUS`) cross-check comparing the barrier's legacy
+`blocked_count()` against the registry's authoritative
+`in_blocked_region`-based census count whenever the takeover loop has been
+stuck for 64+ rounds. A mismatch (`legacy > census`) means some call site
+reached `enter_blocked()`/`mark_blocked_region_enter()` without first
+depositing a root snapshot — the exact bug class fixed here — at any OTHER
+site, present or future. Prints the full per-thread census on trip.
+
+**Verification**: pre-fix, the bug reproduced on the very first attempt —
+within the first ~45s window, near-zero CPU usage the whole time — matching
+follow-up #3's "reliable" characterization of this harness shape, and was
+root-caused via a single live capture plus one `CRATONVM_DBG_STW_CENSUS`
+re-run. Post-fix, ran the harness repeatedly on the debug build across
+several independent capture attempts (gdb-attached and plain) plus 15
+further sequential single-shot runs (13/15 completed cleanly printing
+`DONE totalKids=...`); none of the post-fix runs — including the 2/15 that
+still hit their outer `timeout` — ever reproduced the original
+`blocked=false, snapshot=0, state="thread-start:run-returned"` ghost-thread
+signature, and the new tripwire never fired once. Both timed-out runs were
+individually inspected and showed **zero** output beyond the VM's startup
+banner for the entire timeout window — i.e. never scheduled meaningfully at
+all, not stuck after making progress. This is consistent with (not
+contrary to) host-level starvation: this session's host was independently
+confirmed via `ps aux --sort=-%cpu` to be concurrently running 5+ other
+sessions' CPU-bound `cargo build --release -C codegen-units=1` / test-suite
+processes at 90-100% CPU, matching the task brief's own "host reported
+severe distress this week" warning. A genuine barrier livelock, by
+contrast, reliably produced hundreds of GC generations' worth of real
+progress (confirmed via `CRATONVM_DBG_STW_CENSUS`'s
+`[stw-request]`/`[stw-arrive]` trace reaching generation 150+) before
+wedging — categorically different from zero bytes of output for the whole
+window. `cargo test -p cratonvm-vm --lib --release`: 2200 passed / 17
+failed — the exact same 17 (7 `jit::skip_list` + 1 `native::jni` load flake
++ 9 `runtime::lock_order`) as the pre-existing documented debug-assertion
+baseline, zero regressions. `cargo test -p cratonvm-gc --lib --release`:
+791/791, matching the documented baseline exactly.
+
+Files: `vm/src/vm/vm_exec.rs` (fix, `contended` branch of the
+thread-termination "notify waiting joiners" block), `vm/src/runtime/interpreter.rs`
+(tripwire, `stw_take_over_and_wait`'s `WARN_AFTER_ROUNDS` block).

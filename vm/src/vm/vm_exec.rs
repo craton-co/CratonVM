@@ -5689,13 +5689,57 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let term_monitor = match shared_arc.monitors.enter_inflated_or_contend(wake_obj, tid) {
                 Ok((monitor, contended)) => {
                     if contended {
+                        // GCBARRIER-LIVELOCK-FIX (2026-07-18): every other
+                        // `block_enter` call site in this codebase (see
+                        // `monitor_enter_blocking`, `monitor_enter_synchronized_method`)
+                        // deposits a root snapshot — which raises
+                        // `gc_block_state.in_blocked_region` — BEFORE calling
+                        // `GcBarrier::enter_blocked()`, exactly as
+                        // `Monitor::block_enter`'s own doc comment requires
+                        // ("The caller MUST have marked itself GC-blocked
+                        // first (deposit roots + `GcBarrier::enter_blocked`)").
+                        // This call site skipped the deposit: `enter_blocked()`
+                        // alone only bumps the barrier's legacy `threads_blocked`
+                        // atomic, but the production census
+                        // (`request_stw_counted_with_live_blocked` /
+                        // `alive_count_blocked_and_os_tids`) excludes a thread
+                        // from `expected` by reading `in_blocked_region`, NOT
+                        // that atomic. A STW requested AFTER `enter_blocked()`'s
+                        // `pre_stw` snapshot but WHILE this thread is still
+                        // parked in `monitor.block_enter()` below therefore
+                        // counted this (terminating) thread in `expected` —
+                        // and `block_enter()` never checks safepoints, so it
+                        // could never arrive. If the monitor's current owner
+                        // (e.g. a `Thread.join()` caller) was itself waiting
+                        // out that same pause before its next native call
+                        // could release the monitor (`Object.wait()`'s
+                        // release happens only once the native actually
+                        // runs), the result was the exact three-way deadlock
+                        // `block_enter`'s doc warns about — "owner waits GC,
+                        // contender waits owner, GC waits contender" — except
+                        // here the GC-blocked prerequisite was never met, so
+                        // the barrier's `expected` count permanently included
+                        // a slot no thread could ever satisfy: a real,
+                        // reproducible livelock under rapid thread churn
+                        // (root-caused live via gdb + `CRATONVM_DBG_STW_CENSUS`,
+                        // caught as a `blocked=false` alive thread wedged
+                        // between `thread-start:run-returned` and the
+                        // termination sequence's own later, correct
+                        // `deposit_root_snapshot()`).
+                        NativeContextImpl {
+                            shared: &shared_arc,
+                            thread: &mut jvm_thread,
+                        }
+                        .deposit_root_snapshot();
                         let blk = shared_arc.gc_barrier.enter_blocked();
                         if blk.pre_stw {
                             // GCAUDIT-0711-FIX (finding 1a): `_auto` for
                             // uniformity with every other barrier arrival —
-                            // this thread never raises `in_blocked_region`
-                            // before this point, so it resolves identically
-                            // to the old `arrive_and_wait`.
+                            // the deposit above just raised `in_blocked_region`,
+                            // so this pause's own census may have already
+                            // excluded us; only the exclusion snapshot the
+                            // census recorded (not this thread's guess) can
+                            // say which.
                             let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
                         }
                         monitor.block_enter(tid);

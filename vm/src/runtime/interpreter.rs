@@ -639,6 +639,40 @@ fn stw_take_over_and_wait(
                 taken = taken.count(),
                 "STW cross-thread JIT takeover is still waiting for cooperative mutators"
             );
+            // GCBARRIER-LIVELOCK-FIX (2026-07-18) tripwire: cross-check the
+            // barrier's legacy `threads_blocked` atomic (bumped by any
+            // `GcBarrier::enter_blocked()` / `mark_blocked_region_enter()`
+            // call) against the registry's authoritative `in_blocked_region`
+            // census — the ONLY signal the production `expected` computation
+            // (`request_stw_counted_with_live_blocked` /
+            // `alive_count_blocked_and_os_tids`) actually excludes threads
+            // on. A caller that reaches `enter_blocked()` without first
+            // depositing a root snapshot (`in_blocked_region` stays false)
+            // bumps the legacy counter but stays invisible to the census —
+            // silently inflating `expected` by one uncounted mutator that can
+            // never arrive. This is the exact shape of a livelock fixed at
+            // this date in `vm/src/vm/vm_exec.rs`'s thread-termination
+            // "notify waiting joiners" block (a `block_enter()` call missing
+            // the `deposit_root_snapshot()` its own doc comment requires).
+            // Always-on (not gated behind CRATONVM_DBG_STW_CENSUS) because it
+            // only runs once takeover is already stuck for 64+ rounds — a
+            // rare, already-anomalous path — and a mismatch here is the
+            // single fastest signal to root-cause a recurrence of this bug
+            // class at any OTHER call site.
+            let (census_alive, census_blocked, _tids, _blocked_tids) =
+                shared.thread_registry.alive_count_blocked_and_os_tids();
+            let legacy_blocked = shared.gc_barrier.blocked_count() as usize;
+            if legacy_blocked > census_blocked {
+                eprintln!(
+                    "[gcbarrier-tripwire] legacy blocked_count()={legacy_blocked} > \
+                     census in_blocked_region count={census_blocked} (alive={census_alive}) \
+                     -- a thread called GcBarrier::enter_blocked()/mark_blocked_region_enter() \
+                     WITHOUT first depositing a root snapshot, so it is invisible to the \
+                     production STW census but still occupies an `expected` slot no arrival \
+                     can ever satisfy. Set CRATONVM_DBG_STW_CENSUS=1 for a full per-thread dump.\n{}",
+                    shared.thread_registry.debug_thread_census()
+                );
+            }
             if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some()
                 || std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
             {
