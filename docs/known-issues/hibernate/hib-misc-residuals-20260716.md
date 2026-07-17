@@ -326,6 +326,179 @@ to fabricate a speculative fix for either. Probe sources left at
 `/data/data/tmp/MiniProbe.java` and `/data/data/tmp/MethodProbeRunner.java`
 on the shared host for the next session to reuse directly.
 
+## Update 2026-07-17 (scaling-investigation session): the "severe whole-class-discovery performance cliff" above is REFUTED — host-noise artifact, not a CratonVM defect. Growth curve is linear. But a real, previously-missed correctness bug was found and root-cause-narrowed in the process.
+
+Picked up this doc's own "next step" from the entry immediately above: empirically
+measure whether execution time scales linearly or superlinearly with the number of
+`@Test` methods run together in one process, to determine whether the "whole-class
+run never produces even one `@@RESULT` in 6-11 minutes" symptom is a real CratonVM
+scaling defect or host noise. Reused the prior session's
+`/data/data/tmp/MethodProbeRunner.java` recipe and added a new
+`/data/data/tmp/MultiMethodProbeRunner.java` (JUnit5 Platform Launcher,
+`DiscoverySelectors.selectMethod(...)` — one selector per requested `@Test` method,
+all in a single `LauncherDiscoveryRequest`/`Launcher.execute()` call, with a
+`TestExecutionListener` emitting a `@@PROGRESS n=... sinceStart_ms=... id=...` line
+on every individual test start/finish) against the same
+`wt-hib-defaultcatalog-hbmxml-20260717` binary (`dev@f0a74645`) used by the prior
+session, on the same shared host (load average 9-36 this session — calmer than the
+previous session's 8-64, but still real contention, not quiet).
+
+**Growth curve (from a single 132-execution run, all 11 `@Test` methods requested
+together — cumulative `sinceStart_ms` at each checkpoint):**
+
+| n (test #) | cumulative ms | ms/test so far | interval ms/test (prev 10) |
+|---|---|---|---|
+| 10 | 107,146 | 10.7k | 10.7k |
+| 20 | 175,250 | 8.8k | 6.8k |
+| 30 | 216,659 | 7.2k | 4.1k |
+| 40 | 250,508 | 6.3k | 3.4k |
+| 50 | 280,318 | 5.6k | 3.0k |
+| 60 | 329,946 | 5.5k | 5.0k |
+| 70 | 363,294 | 5.2k | 3.3k |
+| 80 | 413,958 | 5.2k | 5.1k |
+| 90 | 457,755 | 5.1k | 4.4k |
+| 100 | 513,245 | 5.1k | 5.5k |
+| 110 | 547,454 | 5.0k | 3.4k |
+| 120 | 611,256 | 5.1k | 6.4k |
+| 130 | 656,745 | 5.1k | 4.5k |
+| 132 | 668,923 (final `@@MMRESULT`) | 5.07k | — |
+
+Per-test cost **falls** from 10.7k ms/test (n=1-10, includes one-time JVM/JUnit
+warmup) to ~5k ms/test by n=40 and then stays flat (±30% noise band, consistent
+with host contention) all the way to n=132 — the opposite of a cliff. There is no
+inflection point, no monotonic growth, no point where forward progress stops. This
+directly falsifies the "superlinear/quadratic descriptor-count scaling" hypothesis
+from the prior entry.
+
+**Decisive check: the *actual* real-harness `selectClass`-based invocation
+(`CratonRunner`, exactly what the harness uses) was re-run standalone against this
+same class, same binary, same host, this session** — the earlier session's own
+recipe, just re-tried when host load happened to be lower (9-16 vs 8-64):
+```
+@@RESULT 0 ...DefaultCatalogAndSchemaTest found=132 started=132 ok=70 failed=62 aborted=0 skipped=0 ms=579598
+```
+**It completed in 579.6s (9.66 minutes)** — well inside the prior session's own
+"~20 minutes" linear-extrapolation estimate, and *faster* than this session's
+`selectMethod`-list run (668.9s) covering the identical 132 executions. `discover()`
+alone (no execution) for the same `selectClass` request was also separately timed:
+**696ms** — ruling out a discovery-phase bottleneck as well.
+
+**Conclusion: the "severe whole-class-discovery performance cliff" is CLOSED —
+refuted, not a CratonVM defect.** The prior session's 3 attempts that "never
+produced even one `@@RESULT` in 6-11 minutes" happened on a much more extremely
+contended host (load 8-64, active OOM-kills of unrelated processes, `free -m` under
+500MB at one point, per that session's own notes) — this session's clean,
+`selectClass`-based, real-harness-driver reproduction on a calmer host completed
+the exact same class in under 10 minutes with no anomaly. No CratonVM-side
+cache/collection scaling fix is needed. This resolves the prior entry's open
+"Next step" (profile `selectClass` to find the scaling exponent) — there is no
+scaling exponent to find; growth is linear.
+
+**However: a real, substantial, previously-missed correctness bug was found in
+the process, which is very likely the true, complete explanation for this doc's own
+"AIOOBE/InvalidMappingException NOT independently reproduced across 60/132"
+conclusion above being wrong.**
+
+Both the `selectClass` harness run and the `selectMethod`-list run above show the
+exact same signature, at a strikingly consistent rate (62/132 and 69/132
+respectively, ~47-52%):
+```
+java.lang.ArrayIndexOutOfBoundsException: Index 2 out of bounds for length 2
+	at java.math.BigInteger.smallToString(BigInteger.java:4170)
+	at java.math.BigInteger.toString(BigInteger.java:4223)
+	at java.math.BigInteger.toString(BigInteger.java:4118)
+	at org.hibernate.boot.model.naming.NamingHelper.hashedName(NamingHelper.java:143)
+	at org.hibernate.boot.model.naming.NamingHelper.generateHashedFkName(...)
+	... (or generateHashedConstraintName)
+	at org.hibernate.boot.model.naming.ImplicitNamingStrategyJpaCompliantImpl...
+	at org.hibernate.boot.internal.InFlightMetadataCollectorImpl.secondPassCompileForeignKeys(...)
+	at org.hibernate.boot.model.process.spi.MetadataBuildingProcess.build(...)
+	at org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest.produceModel(DefaultCatalogAndSchemaTest.java:291)
+```
+This is `NamingHelper.hashedName`'s `new BigInteger(1, md5Digest).toString(35)` call
+(base-35 encoding of a 16-byte MD5 digest, used to generate implicit FK/unique-key
+constraint names) throwing inside real-JDK `BigInteger`'s own `smallToString`
+digit-group loop (`digitGroups[numGroups++] = r2.longValue();`, JDK25
+`BigInteger.java:4170` per `jdk25/lib/src.zip`) — i.e. a genuine CratonVM bug in
+`java.math.BigInteger`/`MutableBigInteger` execution, **not** a Hibernate or
+mapping bug, and unrelated to the GC-corruption family this section previously
+tracked.
+
+**Why the prior session's "0/60 failures across 5 individually-scoped methods"
+finding missed this:** that session always scoped `selectMethod` to exactly *one*
+`@Test` method at a time (looping the same single method through all 12 parameter
+combos). This session's finding is that the bug requires **multiple different
+`@Test` methods running together, interleaved, in the same process** — a minimal
+2-method repro (`tableGenerator` + `sequenceGenerator`, interleaved per parameter
+combo via `MultiMethodProbeRunner`, 24 total executions) reproduces it reliably
+(3/24 AIOOBE, onset around the 22nd-26th execution in every attempt), while either
+method alone (12 executions, previously verified in the prior session) never does.
+The failure pattern across a full 132-execution run is **not** a one-time
+corruption-then-stuck-broken-forever shape — it **oscillates**: a run of the same
+two methods showed SUCCESS for executions 1-21, FAILED for 22-24; the full
+132-execution run showed FAILED 26-36, SUCCESS 37-42, FAILED 43-54, SUCCESS 55+,
+etc. The same (method, parameter-combo) pair can pass in one process and fail in
+another, ruling out a purely input-dependent (deterministic on the MD5 digest
+bytes) explanation.
+
+**Root cause narrowed but not fully pinned — JIT-tiering-related, not GC-corruption,
+not a simple deterministic algorithm bug:**
+- **`--nojit` bisection on the minimal 2-method repro: 24/24 pass (zero failures)
+  vs JIT-on 21/24 (3 AIOOBE failures)**, otherwise identical — strong evidence the
+  bug requires the JIT to be involved (either a JIT-compiled miscompilation of
+  `BigInteger.smallToString`/`MutableBigInteger.divide`'s bytecode, or a
+  tier-up-timing-sensitive interaction).
+- **However, an isolated, Hibernate-free repro does NOT reproduce it**: a
+  standalone program (`/data/data/tmp/BigIntRepro.java`) looping
+  `new BigInteger(1, md5(input)).toString(35)` 200,000 times over varied inputs
+  (single-threaded, JIT-on, default binary) produced **zero** failures. This rules
+  out "any sufficiently long-running JIT-compiled call site of this exact method
+  eventually miscompiles" as the mechanism — the bug needs something about
+  Hibernate's broader concurrent allocation/GC/class-loading context that a tight
+  isolated loop doesn't reproduce, which combined with the `--nojit` result and the
+  oscillating (not input-deterministic) failure pattern is most consistent with a
+  **JIT-compilation-timing/GC-interaction bug** (a live-compiled version of
+  `smallToString`/`divide`/`MutableBigInteger` internals being installed or read at
+  a bad moment relative to a concurrent background-compiler or GC event) rather
+  than a static miscompilation of one method in isolation.
+- A live `CRATONVM_DBG_GC_STRESS=65536` / `CRATONVM_DBG_STALE_RECV=1` attempt
+  (the technique that closed this exact test class's earlier GC-corruption family)
+  was tried this session but did not complete within a reasonable bounded window —
+  the stress level made even the first test take minutes; not pursued further given
+  session time budget. A follow-up session should retry with a lower stress
+  divisor (e.g. `CRATONVM_DBG_GC_STRESS=2097152` / 2MB, tried but not completed
+  this session either — needs its own dedicated time budget) or a `perf`/sampling
+  profile of the JIT compiler thread during the minimal 2-method repro to catch
+  the actual bad compile/install event.
+- Checked `native-builtins/src/biginteger_intrinsics.rs` (the `T19_H13` native
+  overrides for `BigInteger`'s `@IntrinsicCandidate` methods `implSquareToLen`,
+  `mulAdd`, `addOne`, `primitiveLeftShift`/`shiftLeftImplWorker`,
+  `primitiveRightShift`/`shiftRightImplWorker`) as a candidate culprit, since these
+  are exactly the kind of hand-written Rust replacement that has caused subtle
+  bugs elsewhere in this codebase. Per JDK25's actual source
+  (`jdk25/lib/src.zip:java.base/java/math/BigInteger.java`), these specific methods
+  are used by `BigInteger.square()`/`shiftLeft()`/`shiftRight()`, **not** by
+  `smallToString()` or `MutableBigInteger.divide()` (the actual call path in the
+  crash) — so this module is very unlikely to be the direct culprit, though
+  `longRadix[35]`'s lazy static initialization (used by `smallToString`) may
+  itself be computed via `pow()`/`square()` and could theoretically be a shared
+  suspect; not confirmed either way this session.
+
+**Next step for a follow-up session:** get a `-Dcraton.trace=true` capture across
+several failures from the `MultiMethodProbeRunner tableGenerator sequenceGenerator`
+2-method repro (fast, ~2 min, reliable ~3/24 failure rate) plus a JIT compile-event
+trace (whatever this codebase's equivalent of `-XX:+PrintCompilation`/
+`CRATONVM_DBG_TIER_ENQUEUE` is) correlated against the exact executions that fail,
+to catch which JIT tier/compile event coincides with a failure vs a
+same-method-same-combo success elsewhere in the same run. Do **not** speculatively
+patch `biginteger_intrinsics.rs` without first confirming it's actually on the hot
+call path — it very likely is not, per the JDK source cross-check above.
+
+No code change made this session for the BigInteger bug (root cause narrowed, not
+pinned to a specific faulty line — declined to guess). Probe sources left at
+`/data/data/tmp/MultiMethodProbeRunner.java`, `/data/data/tmp/DiscoveryOnlyProbe.java`,
+and `/data/data/tmp/BigIntRepro.java` on the shared host for reuse.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
