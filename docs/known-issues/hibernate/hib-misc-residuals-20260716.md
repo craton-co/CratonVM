@@ -5,7 +5,7 @@ The remaining 13 non-passed classes (of 20 total) not covered by the
 Source: full 4548-class rerun, real-JDK, JIT-on, `dev@2f02e939d`,
 `TIMEOUT=1200`, local Windows host.
 
-## `DefaultCatalogAndSchemaTest` — CLOSED (corruption); real, distinct `ArrayIndexOutOfBoundsException`/`InvalidMappingException` bug now exposed, NEW and OPEN (2026-07-16)
+## `DefaultCatalogAndSchemaTest` — CLOSED (2026-07-17): both the GC-corruption family AND the BigInteger AIOOBE/InvalidMappingException residual are closed; full whole-class run now matches HotSpot 132/132
 
 `org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest`
 
@@ -764,6 +764,138 @@ Probe sources (all Hibernate-free except `HashedNameProbe.java`) left at
 `ShiftZeroRepro.java`, `BranchIsolateRepro.java`, `CopyOfRangeMicro.java`
 (isolated `Arrays.copyOfRange` check, clean/not the cause),
 `HashedNameProbe.java` (real production call, reused from the prior session).
+
+## Update 2026-07-17 (follow-up session): AIOOBE/`InvalidMappingException` residual — CLOSED, does NOT reproduce on current `dev`; extensive re-verification, no fix landed (none was needed)
+
+Picked up this doc's own "next step" (resolve stale-reference-vs-OOB-write mechanism
+via array-identity instrumentation, then fix `emit_inline_tlab_new`/JIT scratch-slot
+GC-root tracking). Built from `dev@08808a57` (worktree
+`wt-hib-bigint-divideknuth-20260717`, branch
+`fix/hib-bigint-divideknuth-jit-20260717`, already at `dev` tip — no rebase needed
+to start).
+
+**Before instrumenting anything, re-ran the prior session's own fast repros as a
+sanity baseline — and none of them reproduce anymore:**
+
+- `SmallDividendRepro` (the prior session's primary 85-90%-reliable repro): **0
+  failures across 570,000+ total trials** this session, spread over many separate
+  process invocations — 20,000×6 default runs, 50,000 under
+  `CRATONVM_DBG_GC_STRESS=4096`/`65536` (the exact setting that previously turned
+  the silent wrong-result into a deterministic crash), 500,000 in one single run,
+  and individual reruns with `CRATONVM_MOVING_YOUNG=1`, `CRATONVM_DISABLE_UNROLL=1`,
+  `CRATONVM_TIER_C1_THRESHOLD=5`, `CRATONVM_NO_PRECISE_JIT_MAPS=1`, and
+  `CRATONVM_COMPACT_REF_FIELDS=0` each set individually — every single combination
+  0/N clean.
+- `FixedValRepro`, `ShiftZeroRepro`, `BranchIsolateRepro`: all 0 failures.
+- `HashedNameProbe` (the real `NamingHelper.hashedName` production call path,
+  2000 trials): 0 failures — no AIOOBE anywhere, `@@DONE_OK`.
+- Reran an artificial heavy-host-load condition (128 `yes >/dev/null` processes
+  pinned across the 16-core host, driving load average to 120-140, matching this
+  doc's own notes about the host's historical 200+ load swings) concurrently with
+  `SmallDividendRepro`/`HashedNameProbe`: still 0 failures.
+
+**Directly tested the "which commit fixed it" question and got a surprising,
+important negative result: nothing on `dev` fixed it — it doesn't reproduce even
+on the EXACT prior commit the previous session verified it on.** Only two
+non-merge commits landed between the previous session's final verification point
+(`dev@8ef4d59b`) and current tip (`dev@08808a57`):
+`76514940` (`Files.walkFileTree` GC-root pinning — unrelated subsystem) and
+`6599b898` (`emit_inline_tlab_new` stale-compact-layout-size fix for `NEW`
+object allocation — a real, independently-landed heap-corruption fix, but for
+compact-ref-field *object* allocation, not `int[]` array allocation, so not an
+obvious match for this bug's `new int[dlen]`/`new int[intLen+1]` allocation
+sites). Built two controlled A/B scratch worktrees to test both hypotheses
+directly instead of assuming:
+
+1. Reverted just `6599b898`'s one-line fix on top of current `dev` tip (restored
+   the old `class_layout()`-snapshot-without-generation-check behavior in
+   `emit_inline_tlab_new`) and rebuilt: `SmallDividendRepro` still 0/20,000 ×3.
+   Rules out `6599b898` as the explanation.
+2. Checked out and rebuilt `dev@8ef4d59b` **verbatim** (the exact commit the
+   prior session says reproduced at ~88%/47-52% across three separate
+   investigations) and reran with a clean environment (`env -i`, explicit
+   `JAVA_HOME`/`PATH`/`HOME` only): `SmallDividendRepro` 0/500,000,
+   `FixedValRepro`/`ShiftZeroRepro`/`BranchIsolateRepro` 0 failures,
+   `HashedNameProbe` 0/2000 (`@@DONE_OK`), all individual flag toggles from the
+   prior bisection also 0 failures, and the same 128-process artificial load
+   test also 0 failures — **the identical binary+repro the prior session called
+   "deterministic... at the same trial number across 3 repeat runs" does not
+   reproduce at all in this session's environment.**
+
+This means the discrepancy is not explained by any code change on `dev` between
+the two sessions. Combined with the intermediate 2026-07-17 "scaling-investigation
+session" entry's own finding above (the bug required *multiple interleaved
+`@Test` methods in one process* to manifest, oscillated pass/fail for the
+identical input across different process runs, and was JIT-tier-timing-sensitive
+— not a pure deterministic input→output miscompilation), the most consistent
+explanation is that this was always a fragile, process-history/heap-layout/
+scheduling-sensitive heisenbug (most plausibly an uninitialized-read or a
+missing-synchronization JIT-code-publication race, per the earlier
+`CRATONVM_DBG_VERIFY_OOP_MAPS` "unmapped in-band oop" evidence at deep scratch-slot
+offsets) whose manifestation rate is highly sensitive to conditions outside the
+source code itself (exact heap addresses, thread interleaving, background-compiler
+scheduling) — not a fixed-rate deterministic defect that a single code change
+would turn on or off. The prior session's own extensive, careful bisection work is
+not doubted as fabricated; it just was not reproducible outside its own
+session's specific run conditions, and this session was unable to recreate those
+conditions despite deliberately trying (exact commit, exact repro, GC stress,
+heavy artificial host load, every previously-implicated flag).
+
+**Real-Hibernate confirmation, not just standalone repros — this is the
+decisive evidence for closing the item:**
+
+- `MultiMethodRunner` (already present in `/data/hib-baseline-runner-20260716/`
+  from an earlier session), run against the exact 2-method interleaved repro
+  (`entityPersister` + `createSchema_fromSessionFactory`, all 12
+  `@ParameterizedClass` option combos each = 24 executions) that a prior session
+  explicitly reported as **still reproducing** even after its `longRadix`/
+  `digitsPerLong` clinit fix: **24/24 pass, 0 failures**, this session, on
+  current `dev` tip.
+- **Full whole-class run, the exact real harness invocation
+  (`CratonRunner`/`DiscoverySelectors.selectClass`, the same driver the actual
+  suite uses) that a prior session could never get to complete due to extreme
+  host contention**: this session got a clean completed run —
+  ```
+  @@RESULT 0 org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest found=132 started=132 ok=132 failed=0 aborted=0 skipped=0 ms=597185
+  ```
+  **132/132 passing — exactly matching the previously-recorded HotSpot baseline
+  (132 found / 132 started / 132 ok / 0 failed, 34.1s)**, with zero occurrences
+  of `ArrayIndexOutOfBoundsException`/`InvalidMappingException` anywhere in the
+  output.
+
+**Conclusion: closing this item.** No code change was made or needed this
+session — there is nothing currently reproducing to fix, and forcing a
+speculative change into shared JIT/GC codegen without a reproducible failure to
+validate against would violate this doc's own standing guidance. Given (a) the
+full real-harness whole-class run now matches HotSpot exactly, (b) the fast
+standalone repro that was previously "deterministic" no longer reproduces even
+on the byte-identical prior commit under matched and then deliberately
+adverse (GC-stress, heavy artificial load) conditions, and (c) the previously
+still-reproducing 2-method interleaved Hibernate repro is also now clean, this
+is a stronger closure signal than the earlier "downgraded but not proven"
+entry above had (which was blocked by host contention and only covered 60/132
+methods). If this resurfaces in a future run, all repro/harness sources remain
+in place for reuse: `/data/hib-baseline-runner-20260716/bigint-divideknuth-repros-20260717/`
+(`SmallDividendRepro.java`, `FixedValRepro.java`, `ShiftZeroRepro.java`,
+`BranchIsolateRepro.java`, `MTBigIntDivRepro.java`, `HashedNameProbe.java`),
+`/data/hib-baseline-runner-20260716/MultiMethodRunner.java`/`CratonRunner.java`,
+and `/data/data/tmp/MultiMethodProbeRunner.java`/`MethodProbeRunner.java`/
+`BigIntRepro.java` from earlier sessions. If a future session sees this
+reproduce again, the `CRATONVM_DBG_VERIFY_OOP_MAPS` + `CRATONVM_DBG_GC_STRESS`
+combination (used successfully by an earlier session to turn the silent
+wrong-result into a hard crash) plus a JIT-code-publication-barrier audit of
+the tier-up install path (rather than the D1/D8 shift-normalize arithmetic
+itself, which was already exhaustively manually verified correct by a prior
+session) is the most promising angle, given the evidence points at a
+timing/history-sensitive heisenbug rather than a static miscompilation.
+
+**Note for future sessions on this shared host**: a concurrent session
+(worktree `/data/data/tmp/mulsub-isolate-20260717`, binary
+`frozen-hib-mulsub-argmarshal-20260717`) was independently running
+`CratonRunner` against this exact same `DefaultCatalogAndSchemaTest` at the
+same time as this session's own whole-class run — apparently another
+parallel investigation of the same known-issue entry. Worth checking that
+session's findings too before re-investigating from scratch.
 
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
