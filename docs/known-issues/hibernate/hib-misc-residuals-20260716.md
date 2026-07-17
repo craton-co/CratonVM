@@ -353,6 +353,45 @@ trustworthy signal gathered this round, and it points at JIT-on overhead
 (compile activity and/or bookkeeping), not host noise, as the residual
 cause.
 
+## Update (2026-07-17, throughput-profiling session): `LockTest` reconfirmed on a much later dev tip -- same mechanism, still OPEN, no new fix attempted
+
+Re-ran this class's known bisection (as part of a session tasked with
+`InsertOrderingRCATest`/`LiteralRenderingTest`/`LockTest` throughput
+profiling -- see the other two classes' writeup in
+[hib-120s-junit-timeout-cluster-20260716.md](hib-120s-junit-timeout-cluster-20260716.md))
+against `dev@33df5d3c`, many commits ahead of this section's original
+`dcb24161`/later-session tips. Result: **identical mechanism, still
+reproduces.**
+
+- Default (JIT on): whole-class solo run `found=23 started=15 ok=14
+  failed=1 aborted=0 skipped=8 ms=36861`, the sole failure being
+  `testFindWithPessimisticWriteLockTimeoutException` --
+  `AssertionFailedError: execution exceeded timeout of 5000 ms by 18055 ms`
+  (host load ~7-8 at the time, so this is a real, not purely
+  contention-driven, overshoot -- consistent with the "JIT-on overhead, not
+  host noise" conclusion already reached below).
+- `--nojit`: whole-class solo run `found=23 started=15 ok=15 failed=0
+  ms=9770` -- clean pass, and ~3.8x *faster* than the JIT-on run. Matches
+  this section's original bisection exactly (JIT-on is both slower and
+  incorrect for this short-lived process; JIT-off is both faster and
+  correct).
+- Confirmed the `c1_threshold=1500`/`c2_threshold=20000` mitigation from
+  `fix/jit-compile-time-tax-20260716` is still the default on this tip
+  (`jit/src/tiered.rs`) -- so the residual gap this section already
+  documented (mitigation reduces but does not suppress compile volume for
+  reflection/JDBC-heavy short processes) is confirmed still the live state,
+  not something that regressed or improved incidentally since the last
+  update.
+
+**No new fix attempted this session** -- this reconfirmation used the same
+`--nojit` A/B this section already ran, and the "next step" this section
+already calls for (a fundamentally different tiering heuristic, or a much
+more aggressive threshold validated across the broader benchmark suite) is
+unchanged and still a bigger undertaking than a profiling-focused session's
+time budget allows. Filed here purely as evidence that the mechanism is
+stable across a large `dev` delta, so a future session picking this up can
+trust the existing root-cause writeup below without re-deriving it.
+
 ## `CriteriaBuilderNonStandardFunctionsTest` — RESOLVED: original symptom stale, residual is JIT compile-time tax (2026-07-16)
 
 `org.hibernate.orm.test.query.criteria.CriteriaBuilderNonStandardFunctionsTest`
