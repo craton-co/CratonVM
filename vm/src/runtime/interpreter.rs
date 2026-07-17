@@ -36292,11 +36292,21 @@ mod tests {
     #[test]
     fn buffered_input_stream_real_jdk_uses_its_own_bytecode() {
         let buffered = "java/io/BufferedInputStream";
+        // 995ff48c (Tomcat silent-hang scanner fix, see
+        // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md):
+        // the two read overloads are now DELIBERATELY forced to the registered
+        // native — interpreted per-byte read dispatch dominated the scanner's
+        // hot path. Everything else (ctor/mark/reset/skip/...) still runs its
+        // real-JDK bytecode so buffer/mark state stays bytecode-owned.
+        for (name, descriptor) in [("read", "()I"), ("read", "([BII)I")] {
+            assert!(
+                force_native_over_real_jdk_bytecode(buffered, name, descriptor),
+                "BufferedInputStream.{name}{descriptor} is forced native per 995ff48c"
+            );
+        }
         for (name, descriptor) in [
             ("<init>", "(Ljava/io/InputStream;)V"),
             ("<init>", "(Ljava/io/InputStream;I)V"),
-            ("read", "()I"),
-            ("read", "([BII)I"),
             ("skip", "(J)J"),
             ("available", "()I"),
             ("mark", "(I)V"),
