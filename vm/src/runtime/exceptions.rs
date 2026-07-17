@@ -874,6 +874,39 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
     }
 }
 
+/// Resolve `Throwable.cause` (or any inherited Throwable field by that
+/// name) and write `cause_ref` to it. Same by-name hierarchy walk as
+/// `set_detail_message_by_name` just above, reused so a cause can be
+/// attached to a freshly built `create_exception_object` result without
+/// needing to know the field's numeric slot (differs between real-JDK and
+/// synthetic layouts). See `raise_no_class_def_found_with_cause`.
+fn set_cause_by_name(shared: &SharedVm, obj: ObjectRef, cause_ref: ObjectRef) {
+    let class_id = shared.heap.class_id_of(obj);
+    let cm = shared.class_manager.read();
+    let mut walk = Some(class_id);
+    while let Some(cid) = walk {
+        let Some(cls) = cm.get_class(cid) else {
+            break;
+        };
+        let mut inst = 0usize;
+        for f in &cls.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == "cause" {
+                let idx = cls.first_field_index + inst;
+                drop(cm);
+                shared
+                    .heap
+                    .set_field(obj, idx, Value::Object(Some(cause_ref)));
+                return;
+            }
+            inst += 1;
+        }
+        walk = cls.superclass;
+    }
+}
+
 /// Create a Java exception object on the heap.
 ///
 /// Steps:
@@ -1525,6 +1558,51 @@ pub fn raise_no_class_def_found(
     }
 }
 
+/// Same as [`raise_no_class_def_found`], but for the "requested class
+/// exists, a dependency failed to resolve" case (JVMS §5.3/§5.4):
+/// `missing_internal` names the actual missing supertype/interface (in
+/// internal/slash form), and the thrown `NoClassDefFoundError` carries a
+/// `ClassNotFoundException(missing_internal)` cause -- matching real JDK25's
+/// shape for this exact scenario (verified 2026-07-17 against `~/jdk25`; see
+/// `native-builtins/src/classloader_real.rs::no_class_def_found_error`, the
+/// `ClassLoader.loadClass`-path sibling of this opcode-resolution-boundary
+/// fix reached via `convert_class_not_found`). Falls back to the
+/// message-only `raise_no_class_def_found` if the `NoClassDefFoundError`
+/// itself cannot be built (e.g. under heap pressure); a failure to build the
+/// `ClassNotFoundException` cause is non-fatal -- the `NoClassDefFoundError`
+/// is still thrown, just without a cause.
+#[cold]
+pub fn raise_no_class_def_found_with_cause(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    missing_internal: &str,
+) -> MethodCallFailed {
+    let ncdfe = match create_exception_object(
+        shared,
+        thread,
+        "java/lang/NoClassDefFoundError",
+        Some(missing_internal),
+    ) {
+        Ok(obj) => obj,
+        Err(e) => return e,
+    };
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(ncdfe);
+    let dotted = missing_internal.replace('/', ".");
+    let cause_result = create_exception_object(
+        shared,
+        thread,
+        "java/lang/ClassNotFoundException",
+        Some(&dotted),
+    );
+    let ncdfe = thread.native_pin_roots[pin_base];
+    thread.native_pin_roots.truncate(pin_base);
+    if let Ok(cause) = cause_result {
+        set_cause_by_name(shared, ncdfe, cause);
+    }
+    MethodCallFailed::ExceptionThrown(ncdfe)
+}
+
 fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
     match error {
         LinkageError::NoClassDefFoundError { class_name } => {
@@ -1640,9 +1718,27 @@ pub fn convert_class_not_found(
         }
     }
     match err {
+        // `ClassManager::load_class` propagates a recursive supertype/
+        // interface load failure UNCHANGED (see `resolve_supertype` in
+        // classloading/src/class_manager.rs), so `missing` here names
+        // whichever class in the hierarchy actually failed to resolve, not
+        // necessarily `class_name` (the class this opcode is resolving).
+        // When they differ, `class_name` itself was found and only a
+        // dependency is missing -- JVMS §5.3/§5.4 NoClassDefFoundError
+        // naming the dependency, not a same-named CNFE-flavoured NCDFE on
+        // `class_name`. Sibling fix to the `ClassLoader.loadClass` path in
+        // `native-builtins/src/classloader_real.rs::load_class_visible_to`
+        // (2026-07-17); this is the opcode-resolution-boundary occurrence of
+        // the same gap (`new`/`getstatic`/`putstatic`/`checkcast`/...).
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
-            ..
-        })) => raise_no_class_def_found(shared, thread, class_name),
+            class_name: missing,
+        })) => {
+            if missing == class_name {
+                raise_no_class_def_found(shared, thread, class_name)
+            } else {
+                raise_no_class_def_found_with_cause(shared, thread, &missing)
+            }
+        }
         MethodCallFailed::InternalError(VmError::Linkage(
             crate::error::LinkageError::NoClassDefFoundError { .. },
         )) => raise_no_class_def_found(shared, thread, class_name),

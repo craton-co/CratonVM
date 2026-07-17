@@ -1083,10 +1083,26 @@ fn safe_native_call_impl(
                 {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    // The cached-dispatch callback pointer often has no ring
+                    // name; the top Java frame names the method this native
+                    // implements, which is the actionable identity.
+                    let java_site = thread
+                        .frames
+                        .last()
+                        .map(|f| {
+                            format!(
+                                "{}.{}{}",
+                                f.class_name(),
+                                f.method_name(),
+                                f.method_descriptor()
+                            )
+                        })
+                        .unwrap_or_default();
                     tracing::warn!(
-                        "CRATONVM_DBG_STALE_OBJREF: native {} returned a stale \
-                         (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
+                        "CRATONVM_DBG_STALE_OBJREF: native {} (invoked from {}) returned a \
+                         stale (already-evacuated) ref 0x{:x} — healed to 0x{:x}",
                         callee,
+                        java_site,
                         o.as_ptr() as usize,
                         healed.as_ptr() as usize,
                     );

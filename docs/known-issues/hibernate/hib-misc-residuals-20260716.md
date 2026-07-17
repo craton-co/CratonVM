@@ -151,6 +151,181 @@ victim every time" pattern was actually pointing at.
 
 </details>
 
+
+## Update 2026-07-17 (this session): AIOOBE/InvalidMappingException NOT independently reproduced across 60/132 real executions; NEW severe whole-class-discovery performance cliff found, blocking full confirmation
+
+Picked up this doc's own "Next step" from the entry above (root-cause the
+`ArrayIndexOutOfBoundsException`/`InvalidMappingException` 106/132 failures
+now that the GC-corruption family is closed). Built a fresh binary from
+`dev` (worktree `wt-hib-defaultcatalog-hbmxml-20260717`, branch
+`fix/hib-defaultcatalog-hbmxml-20260717`, merged through `732241c8` — i.e.
+several commits later than the `a0c60214`-based baseline that produced the
+`found=132 ok=26 failed=106` result quoted above).
+
+**HotSpot baseline (this session, same classpath/props via `common.args`):**
+whole-class solo run, `132 found / 132 started / 132 ok / 0 failed`, `34.1s`
+flat. Confirms real HotSpot has no legitimate skips/failures here — any
+CratonVM failure is CratonVM-specific.
+
+**Whole-class run on CratonVM: could not obtain a completed result this
+session**, on an extremely contended shared host (`uptime` load average
+swinging 8 → 64 over the session; `free -m` down to <500MB available at one
+point; `dmesg` shows the host OOM-killing unrelated processes —
+`systemd`/`(sd-pam)`/`rustc` from other concurrent sessions, and once one of
+this session's own probe processes — throughout). Three separate whole-class
+attempts (`DiscoverySelectors.selectClass`, exactly what `CratonRunner`/the
+harness uses), JIT-on ×2 and `--nojit` ×1, **never produced a single
+`@@RESULT` line** — not even for the first of 132 tests — within 6-11
+minutes each (one bounded run was left to 600s and still hadn't produced a
+result when this update was written). This is *slower*, not hung: live
+`gdb -p <pid> -ex 'thread apply all bt'` snapshots taken several times
+during these stalls each landed in a **different**, legitimate code path —
+GC conservative-root scanning of JIT frames
+(`gc::gen_heap::is_object_address` via `scan_active_jit_frames`),
+`Throwable`-style full-stack-trace capture
+(`vm::runtime::stackwalker::capture_full_trace` walking `LazyAttribute`/line
+tables), and `HashMap.computeIfAbsent`-driven string hashing
+(`native_map_compute_if_absent` → `map_hash_key` → `read_string`) — ruling
+out a deadlock/livelock. Two of these whole-class attempts' processes were
+independently confirmed still alive and CPU-bound (98-100%) via `ps`
+immediately before being killed to free the host; RSS grew from ~1GB to
+5-8GB over each attempt's lifetime without ever finishing test #0.
+
+**To get a faster, more surgical signal, bypassed the whole-class
+`@ParameterizedClass` discovery** with two standalone Java probes compiled
+against the harness classpath and run through the real `cratonvm` binary
+(source kept at
+`/data/data/tmp/MiniProbe.java`/`/data/data/tmp/MethodProbeRunner.java` on
+the shared host; not committed, since they're throwaway diagnostic
+harnesses, not product code):
+
+- `MiniProbe.java` — calls `MetadataSources.buildMetadata()` →
+  `SessionFactoryBuilder.build()` → `SchemaExport.doExecution(CREATE, …)`
+  directly (no JUnit5 launcher at all), for 2 of the fixture's `xmlMapping`
+  variants (`null` and `implicit-global-catalog-and-schema.orm.xml`),
+  reproducing exactly the `addInputStream`/`addAnnotatedClasses` fixture
+  from `DefaultCatalogAndSchemaTest.produceModel()`. **Zero exceptions**,
+  both variants: metadata build 14.7s/3.9s (CratonVM) vs 2.0s/0.13s
+  (HotSpot); SessionFactory build 7.1s/1.4s vs 1.0s/0.08s; DDL-create export
+  129ms/112ms vs 21ms/3ms — a genuine but unremarkable ~7-20x CratonVM/
+  HotSpot ratio, consistent with this project's known general interpreter
+  overhead, not a correctness gap.
+- `MethodProbeRunner.java` — uses
+  `DiscoverySelectors.selectMethod(className, methodName, paramTypes)`
+  instead of `selectClass`, so the *real* JUnit5 launcher + Jupiter engine +
+  `@ParameterizedClass`/`@MethodSource("options")` + Hibernate's
+  `ServiceRegistryFunctionalTesting`/`DomainModelFunctionalTesting`/
+  `SessionFactoryFunctionalTesting` extensions still run exactly as they do
+  in a whole-class run — just scoped to **one** `@Test` method (still all
+  12 `Options` combos for that method).
+
+  Ran 5 of the class's 11 `@Test` methods this way — `entityPersister`
+  (127.7s), `createSchema_fromSessionFactory` (117.5s),
+  `updateSchema_fromSessionFactory` (140.3s), `tableGenerator` (64.7s),
+  `sequenceGenerator` (60.7s) — **60 of the 132 total parameterized test
+  executions, 60/60 passing** (`found=12 started=12 ok=12 failed=0` each),
+  matching HotSpot's per-method 12/12 pass shape exactly. This covers DDL
+  create-script generation via both the `SchemaManagementToolCoordinator`
+  path and (indirectly, via `MiniProbe`) the `SchemaExport` path,
+  entity-persister catalog/schema-qualifier resolution across every entity
+  variant in the fixture (annotations, `orm.xml`, `hbm.xml`, joined/
+  table-per-class inheritance, custom-SQL, identity/table/sequence/
+  increment/enhanced-sequence generators), and DDL update-script generation
+  against live `DatabaseMetaData`. **Zero
+  `ArrayIndexOutOfBoundsException`/`InvalidMappingException` anywhere**
+  across these 60 real, varied executions. (A 6th method,
+  `createSchema_fromMetadata`, was mid-run — already past 6 minutes,
+  further into its run than the other five typically needed to finish —
+  when the host ran out of memory entirely; `dmesg` confirms `Out of
+  memory: Killed process … (cratonvm-hbmxml)` for this probe's PID at the
+  same timestamp several unrelated processes on the host were also
+  OOM-killed. Inconclusive — not attributable to this class or this fix,
+  just lost to host contention.)
+
+**Assessment:** given (a) the sibling session's `found=132 ok=26 failed=106`
+capture was against an earlier `dev` tip than this session's binary, (b)
+several additional GC/reflection correctness fixes have landed on `dev` in
+the interim (this doc's own `Update` sections above/below this one catalog
+some of them), and (c) 60 of the 132 real parameterized executions —
+spanning DDL generation, entity-persister reflection, and three different
+ID-generator strategies — all pass cleanly on the current tip with zero
+occurrences of the reported exception, **the AIOOBE/InvalidMappingException
+bug most likely no longer reproduces on current `dev`**, probably fixed
+incidentally by later, unrelated correctness work rather than by anything
+landed this session. This is **not proven** with a full clean 132/132 run —
+the whole-class run itself could not complete this session, for the
+separate reason below, compounded by extreme host contention. Leaving this
+sub-item **OPEN but downgraded**: a follow-up session (ideally on a quiet
+host) should get one clean whole-class `found=132 … failed=0` run to close
+it formally, or, if it still reproduces, get a `-Dcraton.trace=1` stack
+trace for it — the `MethodProbeRunner.java` recipe above will get there
+much faster than a whole-class run (a fresh `git worktree`, one
+`cargo build --release -p cratonvm-cli`, then loop `MethodProbeRunner
+org.hibernate.orm.test.boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest
+<method> [paramType]` over the remaining 6 untested methods:
+`updateSchema_fromSessionFactory` done; still untested:
+`dropSchema_fromSessionFactory`, `createSchema_fromMetadata`,
+`dropSchema_fromMetadata`, `incrementGenerator`, `enhancedTableGenerator`,
+`enhancedSequenceGenerator`).
+
+**NEW finding this session: a severe, reproducible performance cliff
+specific to whole-class (`DiscoverySelectors.selectClass`) discovery, most
+likely the real reason full harness runs of this class have historically
+hung / timed out / exited silently with `rc=0` and no `@@RESULT`
+(previously misread as a hang or a harness artifact).** The arithmetic does
+not close: summing the five confirmed-clean per-method
+`MethodProbeRunner` runs above gives ~510s of CratonVM time for 60/132
+executions (~8.5s/execution average) — linear extrapolation to all 132
+suggests the whole class should complete in well under 20 minutes even on
+this contended host. Instead, three separate whole-class attempts never
+produced even one `@@RESULT` in up to 11 minutes (one left running 600s
+unresolved as of writing). The qualitative difference between "one
+`Launcher.execute()` covering 12 descriptors" (`selectMethod`, fast) and
+"one `Launcher.execute()` covering 132 descriptors" (`selectClass`, the
+harness's actual invocation, never seen to finish even test #0) points at
+JUnit5's `@ParameterizedClass` discovery/execution-tree bookkeeping scaling
+far worse than linearly with total descriptor count specifically on
+CratonVM. Two candidate contributing native hot paths were observed live
+but **not confirmed as the dominant cost** (no profiler available on this
+host this session):
+- A recurring `cratonvm::gc::guard` WARN, seen in every whole-class stall
+  this session: `gen_heap::get_field: out-of-bounds field read dropped
+  (caller used slot index past receiver's layout — … typically a
+  speculative collection-layout probe dispatched on a non-matching receiver
+  type) … class_name=org/junit/jupiter/engine/execution/
+  InterceptingExecutableInvoker … real_field_count=Some(0)` — some native
+  fast path is speculatively probing JUnit5's reflective method-invocation
+  wrapper as if it were a collection, on every reflective test/lifecycle
+  invocation. The guard fails safe (no correctness impact, the read is
+  dropped rather than corrupting anything) but the wasted speculative
+  attempt itself is pure overhead paid on every single reflective
+  invocation JUnit5 makes — and a whole-class run makes ~11x more of them
+  than a single-method run.
+- The already-documented, still-open, uncached
+  `al_slots_for`/`is_subclass_of` per-call `FxHashSet` allocation flagged in
+  this doc's `CriteriaBuilderNonStandardFunctionsTest` entry below (caught
+  live via gdb mid-stall in *that* investigation) is structurally the same
+  kind of "cheap-looking speculative check that isn't actually cheap"
+  waste, and worth checking whether it's the same code path.
+
+Next step for a follow-up session (ideally on a quiet host, so wall-clock
+numbers are trustworthy): profile a `selectClass`-based whole-class run
+directly (e.g. `perf record`/sampling, or `CRATONVM_DBG_TIER_ENQUEUE`-style
+targeted counters) to find the actual dominant cost, and/or run
+`MethodProbeRunner`-style probes selecting 2, 4, 6, 8, 11 methods together
+in one `Launcher.execute()` call (rather than 1 method 11 times) to
+empirically find the scaling exponent before attempting a fix — if it's
+genuinely superlinear in descriptor count, the fix likely belongs in a
+CratonVM-side cache/collection used by the JUnit5 reflection/invocation
+path (candidates above), not in Hibernate or in this test.
+
+No code change made this session — did not pin down a specific line to fix
+for either the (likely-already-resolved) AIOOBE or the (newly-found, real,
+but not yet root-caused to a specific line) performance cliff, and declined
+to fabricate a speculative fix for either. Probe sources left at
+`/data/data/tmp/MiniProbe.java` and `/data/data/tmp/MethodProbeRunner.java`
+on the shared host for the next session to reuse directly.
+
 ## `JarVisitorTest` — RESOLVED: confirmed harness-artifact + underlying non-issue (2026-07-16)
 
 `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest`
@@ -635,3 +810,141 @@ worth a dedicated follow-up starting from `Timezones.toTimeZone`/
 `ZONE_UTC_MINUS_8` and whichever `java.time`/H2 conversion path handles
 fixed-offset (non-region) zones differently from `LocalDateTimeTest`'s
 zone-less values.
+
+## Update 2026-07-17 (follow-up session): `ZoneId.systemDefault()` host-timezone-leak FIXED — 63→20/608, new narrower residual identified
+
+**Root cause found and fixed.** The 63 failures noted above were **not**
+"specific to `UTC-8`" or a general "zone-offset handling"/H2-conversion
+bug as speculated — they were a single, systemic native bug:
+`java.time.ZoneId.systemDefault()`, in CratonVM's real-JDK-mode boot path,
+was permanently intercepted to return a hardcoded synthetic UTC
+`ZoneOffset` (`native-builtins/src/lib.rs::register_essential_natives`,
+originally landed to fix an unrelated log4j boot-time NPE), **completely
+ignoring every `TimeZone.setDefault(...)` call the running program made**.
+`Timezones.withDefaultTimeZone()` (used by every `@Test` method in this
+class and `LocalDateTimeTest`) calls `TimeZone.setDefault(...)` then the
+test's own expected-value computation reads it back via
+`ZoneId.systemDefault()` directly — which always resolved to UTC
+regardless of what was set, producing an N-hour skew matching whichever
+zone the parameterized test happened to configure (`UTC-8`, `Europe/Paris`,
+`Pacific/Auckland` — not just `UTC-8`; the original doc's framing that it
+was "specific to `UTC-8`" was based on an incomplete sample of the 63
+failures' `@@FAIL` lines, which don't carry parameter values — a
+`DisplayNameRunner` JUnit5 launcher variant, capturing the live
+`TestPlan`'s `TestIdentifier` display names on `executionFinished`, was
+needed to see the actual per-parameter breakdown).
+
+Full root-cause + fix writeup:
+[hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md](../../internal/fixed-suite-bugs/hib-zoneddatetime-systemdefault-host-timezone-leak-FIXED.md).
+Fix commit: `81c66806` (branch `fix/hib-zoneddatetime-offset-skew-20260716`,
+merged to `dev`).
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=384
+failed=20 aborted=204 skipped=0` — stable across 4 independent solo
+reruns (pre- and post-merge onto `dev`), down from `failed=63`.
+`LocalDateTimeTest` (`found=162 ok=90 failed=0 aborted=72`) and
+`InstantTests` (`found=204 ok=112 failed=0 aborted=92`): no regression.
+
+**New residual — OPEN, distinct bug, not fixed by the above:** the
+remaining 20/608 failures are **100% isolated** to one narrow parameter
+cluster: `env=Europe/Paris` combined with dates at the 1904-12-31/1905-01-01
+boundary (the test's own data comments call this out: "Also test dates
+around 1905-01-01, because the code behaves differently before and after
+1905"). Real pre-1911 `Europe/Paris` used Local Mean Time, UTC+00:09:21
+(9 minutes 21 seconds), not a flat-hour offset — real HotSpot's tzdb
+correctly applies this historical fractional offset; CratonVM instead
+produces a rounded flat-hour value:
+
+```
+expected: <1905-01-01T01:09:20+00:09:21[Europe/Paris]> but was: <1905-01-01T00:18:41+00:09:21[Europe/Paris]>
+expected: <1905-01-01 01:09:21.0> but was: <1905-01-01 02:00:00.0>
+```
+
+Notably the `+00:09:21` offset **is** present and correct in the
+`ZonedDateTime` zone/offset portion itself (confirming `ZoneId.of("Europe/Paris")`
+and the general zone-rules machinery, and this session's
+`ZoneId.systemDefault()` fix, correctly resolve the *zone identity* even
+for this historical case) — the bug is narrower, in the actual
+instant/local-time arithmetic applied for dates before the 1911
+standardization. This is the exact same underlying date range flagged as
+producing an unexplained `InternalError: CloneNotSupportedException` in
+this doc's original (pre-livelock-fix) investigation: with the
+`ZoneId.systemDefault()` fix now letting the class run far enough to
+reach these parameters reliably, that exception reproduces intermittently
+(1 of 4 reruns hit it on 4 of the 20 failing methods; the other 3 reruns
+produced plain `AssertionFailedError`/`AssertionError` for the exact same
+parameters instead) — timing/GC-dependent, consistent with a
+stale-object or clone-support gap rather than a deterministic value bug,
+though the flat-hour-rounding `AssertionFailedError` shape is the
+dominant/majority presentation. Not investigated further this session
+(distinct subsystem — historical tzdb rule precision / possible
+`Object.clone()` gap for a real JDK date class — from the
+`ZoneId.systemDefault()` fix above). **Next step for a follow-up
+session:** reproduce a bare (non-Hibernate) `ZonedDateTime.of(1905, 1, 1,
+0, 0, 0, 0, ZoneId.of("Europe/Paris")).withZoneSameInstant(ZoneId.of("Europe/Paris"))`-style
+micro-repro to confirm whether the `+00:09:21` LMT rule is applied
+correctly by bare `java.time` arithmetic outside Hibernate (narrowing
+core `java.time`/tzdb vs. Hibernate/JDBC layer, per this doc's original
+investigation template), then chase the intermittent
+`CloneNotSupportedException` with `CRATONVM_DBG_STALE_OBJREF`/a targeted
+`Object.clone()` native-support audit if the micro-repro confirms a
+CratonVM-side (not test-data) defect.
+
+## Update 2026-07-17 (follow-up session): Europe/Paris pre-1911 LMT precision — FIXED, `ZonedDateTimeTest` now 608/608 matching HotSpot
+
+**Status: CLOSED.** The 20/608 residual above is fixed. Full root-cause +
+fix writeup:
+[hib-paris-lmt-precision-FIXED.md](../../internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+Fix commit: `31544c27` (branch `fix/hib-paris-lmt-precision-20260717`,
+merged to `dev` at `03d7e98f`).
+
+**Root cause, in short:** not a `java.time`/tzdata bug at all — a
+standalone HotSpot-comparison micro-repro proved CratonVM's
+`ZonedDateTime`/`ZoneId`/`ZoneRules` arithmetic for the pre-1911 LMT case
+is already byte-for-byte correct. The bug was in the **separate, legacy**
+`java.util.TimeZone`/`Calendar`/`SimpleTimeZone` API family that
+`java.sql.Timestamp`'s deprecated constructor and
+`GregorianCalendar.computeTime()`/`.computeFields()` use for the actual
+JDBC round-trip: CratonVM's real-JDK-mode `TimeZone` is synthesized
+(`alloc_synth_timezone` in `native-builtins/src/lib.rs`, a workaround for
+an unrelated `ZoneInfoFile`/`tzdb.dat` bootstrap gap) as a real
+`java.util.SimpleTimeZone` with the zone's *modern* standard offset plus
+an annual DST rule — structurally incapable of expressing a one-time
+historical cutover like Paris's 1911-03-11 LMT→WET switch, since
+`SimpleTimeZone.getOffsets(long, int[])` (the method
+`GregorianCalendar` actually calls) only ever consults the fixed
+`rawOffset` field, with no date parameter.
+
+**Fix:** a small explicit `historical_lmt_offset(zone_id)` table plus a
+native override of `SimpleTimeZone.getOffsets(long, int[])`, returning the
+historical LMT offset for instants strictly before a zone's cutover and
+deferring to the real bytecode (`invoke_virtual_bytecode_only`) otherwise.
+Deliberately limited to `Europe/Paris` — a `GeneralityRepro.java`
+HotSpot-comparison probe showed real HotSpot's own legacy Calendar path
+(not just `java.time`) correctly resolves Paris's LMT, but does **not**
+resolve the analogous `Europe/Amsterdam`/`Europe/Oslo` cutovers (their
+compiled legacy zoneinfo data apparently omits the pre-1892/1893 LMT rule
+even though `java.time`'s `ZoneRules` has it) — adding those would have
+made CratonVM diverge from real HotSpot instead of matching it. See the
+fix commit/writeup for why "real IANA tzdata has a cutover" doesn't imply
+"HotSpot's legacy Calendar path resolves it".
+
+**Verification:** `ZonedDateTimeTest` `found=608 started=608 ok=404
+failed=0 aborted=204 skipped=0` — matches real HotSpot's exact shape
+(`ok=404 failed=0 aborted=204`), stable across 5 independent solo reruns
+(pre-merge and post-merge onto `dev`, `--nojit`). `LocalDateTimeTest`
+(`found=162 ok=90 failed=0 aborted=72`) and `InstantTests` (`found=204
+ok=112 failed=0 aborted=92`): no regression, both re-verified against the
+merged-`dev` tip. The intermittent `CloneNotSupportedException` flagged in
+the update above did not reproduce in any of the 5 post-fix reruns
+(previously ~1-in-4) — plausibly a side effect of the same
+offset-miscomputation retry path, though not separately root-caused; flag
+if it resurfaces.
+
+A separate, unrelated, out-of-scope bug was found incidentally while
+probing generality: CratonVM's synthetic `SimpleTimeZone` construction
+retroactively applies the *modern* EU DST rule to 19th-century dates that
+predate real DST adoption in that region (e.g. `Europe/Amsterdam` at
+1892-04-01 returns +2:00 on CratonVM vs. real HotSpot's +1:00 — DST wasn't
+introduced there until 1916). Not investigated further (not blocking any
+known test), flagged for a future session.
