@@ -36452,6 +36452,74 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
+    // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
+    // offsets for zones whose real IANA tzdata models a historical LMT-style
+    // offset before their first modern standardization transition.
+    // `tz_standard_offset_seconds`/`tz_dst_rule` above only know the
+    // CURRENT/modern standard offset and (for zones with a recurring annual
+    // DST rule) a `java.util.SimpleTimeZone`-representable rule — neither
+    // can express a ONE-TIME historical cutover, because SimpleTimeZone's
+    // `getOffsets(long, int[])` (what `GregorianCalendar.computeTime()`/
+    // `.computeFields()` actually call for a non-`ZoneInfo` zone — see
+    // `TimeZone.getOffsets`) only ever consults `rawOffset` (fixed at
+    // construction, no date parameter) plus the DST rule; there is no
+    // structural way to make `rawOffset` itself date-dependent. This table
+    // plus the `SimpleTimeZone.getOffsets` override below patches in the
+    // exact historical cutover(s) real HotSpot's tzdb encodes for the
+    // zones this project's Hibernate ORM suite exercises pre-standardization
+    // dates for (`ZonedDateTimeTest`'s 1904/1905 Europe/Paris boundary
+    // cases — see docs/known-issues/hibernate/hib-misc-residuals-20260716.md
+    // and docs/internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
+    //
+    // Values cross-checked against real HotSpot JDK 25's
+    // `ZoneId.of(id).getRules().getTransitions()` — the earliest transition
+    // each zone's tzdb rule-set models, i.e. the exact instant HotSpot
+    // itself switches away from the zone's Local Mean Time. Returns
+    // `(cutover_epoch_millis, pre_cutover_offset_seconds)`: for any queried
+    // instant strictly before `cutover_epoch_millis`, the real/correct
+    // offset is `pre_cutover_offset_seconds`, not the zone's modern
+    // rawOffset/DST rule. This is intentionally a small, explicit table
+    // (not full historical tzdata) — it only covers zones actually
+    // exercised pre-cutover by this codebase's test suites; a zone not
+    // listed here simply keeps the existing (correct, post-standardization)
+    // rawOffset/DST-rule behavior for every date, unchanged from before this
+    // fix.
+    fn historical_lmt_offset(zone_id: &str) -> Option<(i64, i32)> {
+        match zone_id {
+            // Europe/Paris: Paris Mean Time (+00:09:21) until the
+            // 1911-03-11 00:00 local switch to WET (UTC+0). Confirmed via
+            // `GeneralityRepro.java` that real HotSpot JDK 25's OWN legacy
+            // `TimeZone.getOffset(long)`/`GregorianCalendar` path (not just
+            // `java.time`) correctly resolves this to 561s pre-cutover —
+            // i.e. adding this entry makes CratonVM MATCH real HotSpot.
+            //
+            // Deliberately NOT extended to Europe/Amsterdam (+00:17:30
+            // until 1892-05-01) or Europe/Oslo (+00:53:28 until
+            // 1893-03-31), even though those zones have an analogous
+            // historical LMT cutover in real IANA tzdata and in
+            // `java.time`'s `ZoneRules`: probed with the same
+            // `GeneralityRepro.java` against real HotSpot JDK 25, and
+            // unlike Paris, HotSpot's own *legacy* `TimeZone`/
+            // `GregorianCalendar` path returns the flat MODERN offset
+            // (3600s) for both zones even strictly before their cutover
+            // instant — real HotSpot's compiled legacy `ZoneInfo` binary
+            // tzdata apparently doesn't carry these zones' pre-1892/1893
+            // LMT rule at all, even though `java.time`'s separate,
+            // text-tzdata-backed `ZoneRules` does. Adding a table entry
+            // for these two would make CratonVM's legacy path *more
+            // textbook-correct than real HotSpot* — i.e. diverge from the
+            // reference JVM this project targets bug-for-bug compatibility
+            // with, not converge on it. If a future test genuinely needs
+            // one of these (or another zone's) legacy-path LMT precision
+            // matched, re-verify against real HotSpot with
+            // `GeneralityRepro.java`-style probing FIRST — do not assume
+            // "real IANA tzdata has a cutover" implies "HotSpot's legacy
+            // Calendar path resolves it".
+            "Europe/Paris" => Some((-1855958961_000, 9 * 60 + 21)),
+            _ => None,
+        }
+    }
+
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
         // current recurring DST rule is known (`tz_dst_rule`), construct a
@@ -36687,6 +36755,59 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    // HIB-PARIS-LMT (2026-07-17): SimpleTimeZone.getOffsets(long, int[]) —
+    // the package-private method GregorianCalendar.computeTime()/
+    // computeFields() actually call (via TimeZone.getOffsets / directly) for
+    // any zone that isn't a `sun.util.calendar.ZoneInfo` — which, per
+    // `alloc_synth_timezone` above, is every zone with a known
+    // `tz_dst_rule` (all the `Europe/*` zones the Hibernate ORM
+    // `ZonedDateTimeTest`/`LocalDateTimeTest` suites exercise). For dates
+    // strictly before a zone's `historical_lmt_offset` cutover, return the
+    // historical LMT offset directly; otherwise defer to the real
+    // SimpleTimeZone bytecode (its existing, already-correct
+    // rawOffset/DST-rule computation) via `invoke_virtual_bytecode_only` —
+    // skipping the native-override check so this doesn't re-enter itself.
+    // See `historical_lmt_offset` for why this can't be expressed by
+    // overriding `getRawOffset()` instead (no date parameter to key off).
+    registry.register(
+        "java/util/SimpleTimeZone",
+        "getOffsets",
+        "(J[I)I",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
+
+            let id = match ctx.get_field_by_name(this, "ID") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+
+            if let Some((cutover_millis, pre_offset_secs)) = historical_lmt_offset(&id) {
+                if date < cutover_millis {
+                    let offset_ms = pre_offset_secs.saturating_mul(1000);
+                    if let Value::Object(Some(arr)) = offsets_arr {
+                        ctx.set_array_element(arr, 0, Value::Int(offset_ms));
+                        ctx.set_array_element(arr, 1, Value::Int(0));
+                    }
+                    return Ok(Some(Value::Int(offset_ms)));
+                }
+            }
+
+            ctx.invoke_virtual_bytecode_only(
+                this,
+                "getOffsets",
+                "(J[I)I",
+                &[Value::Long(date), offsets_arr],
+            )
+        },
     );
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
