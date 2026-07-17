@@ -1349,43 +1349,146 @@ session's research:
    never actually "tracked separately" anywhere** — 3 are entirely unique untracked classes and 6
    belong to the Groovy cluster below.
 
-### Groovy scripting cluster — STILL OPEN (no dedicated fix has landed)
+### Groovy scripting cluster — RE-VERIFIED 2026-07-17, one root cause fixed, one still OPEN
 
-The historical doc (2026-07-11 characterization) named 8 classes as a systemic Groovy-script-loading
-gap (high per-method failure ratios, e.g. `GroovyBeanDefinitionReaderTests` 35/36 methods failing),
-plus 6 more in the HIB-CV-32-filtered list that share the same root area (`test.context.groovy.*`,
-`test.context.web.BasicGroovyWacTests`) — 10 distinct classes total once de-duplicated:
+**Status: partially fixed.** All 10 classes re-verified live on a fresh `dev`-tip build
+(branch `fix/groovy-cluster-20260717`). The full historical per-class list, recovered from
+`git show ccab25c6~1:docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST-125.md`:
 
-- `scripting.groovy.GroovyAspectTests` — ABEND `rc=139` (2026-07-09 baseline; dumped core)
-- `scripting.groovy.GroovyAspectIntegrationTests` — ABEND `rc=139` (dumped core)
-- `scripting.groovy.GroovyScriptFactoryTests` — ABEND `rc=139` / TIMEOUT (dumped core)
-- `scripting.config.ScriptingDefaultsTests` — ABEND `rc=139` (dumped core; part of the "6 found=0 ABENDs" cluster below, same family)
-- `context.groovy.GroovyBeanDefinitionReaderTests` — ABEND `rc=139` (dumped core)
-- `test.context.groovy.AbsolutePathGroovySpringContextTests` / `DefaultScriptDetectionGroovySpringContextTests` / `GroovySpringContextTests` / `MixedXmlAndGroovySpringContextTests` / `RelativePathGroovySpringContextTests` — all ABEND `rc=139`
-- `test.context.web.BasicGroovyWacTests` — ABEND `rc=139`
+- `scripting.groovy.GroovyAspectTests`
+- `scripting.groovy.GroovyAspectIntegrationTests`
+- `scripting.groovy.GroovyScriptFactoryTests`
+- `context.groovy.GroovyBeanDefinitionReaderTests`
+- `test.context.groovy.AbsolutePathGroovySpringContextTests`
+- `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests`
+- `test.context.groovy.GroovySpringContextTests`
+- `test.context.groovy.MixedXmlAndGroovySpringContextTests`
+- `test.context.groovy.RelativePathGroovySpringContextTests`
+- `test.context.web.BasicGroovyWacTests`
 
-**No dedicated fix for this cluster has landed on `dev`** — `git log --oneline ccab25c6..origin/dev
--i --grep=groovy` across the ~310 commits since the historical snapshot turns up only incidental
-touches (a ByteBuddy field-lookup fix, an enclosing-class loader-awareness fix), nothing that
-addresses Groovy script/classloader integration directly.
+All 10 were `ABEND rc=139` (SIGSEGV, dumped core) on the 2026-07-09 baseline. **Re-run this
+session (fresh Spring Framework 7.1.0-SNAPSHOT checkout, Groovy 5.0.7, real JDK 25, `KRun`
+JUnit-Platform harness) against unmodified `dev` tip `67c85b3c`: all 10 classes now complete
+without crashing** — a genuine, if partial, improvement since 2026-07-09 — **but all 10 still
+FAIL** (0-16 of N methods passing per class; e.g. `GroovyBeanDefinitionReaderTests` 1/36,
+`GroovyScriptFactoryTests` 16/38). Two independent, unrelated root causes were found this
+session.
 
-**Stronger evidence it's still broken, found this session**: the AOT cluster's 2026-07-16 re-triage of
-`TestContextAotGeneratorIntegrationTests` (§2) independently hit a **new, different, unfixed Groovy
-defect** in the exact same area — `processAheadOfTimeWithXmlTests` throws `ExceptionInInitializerError`
-from `GroovyBeanDefinitionReader.<init>`, caused by an `ArrayStoreException: arraycopy: source element
-at index 1 is not assignable to destination component type` inside `groovy/lang/GroovySystem`'s
-`<clinit>` — explicitly documented as **NOT** the already-fixed `GroovySystem.<clinit>` NPE
-(`docs/internal/spring/spring-boot-groovy-indy-mockito-mock-dispatch.md`, a `Module`-descriptor-null
-issue referenced in this doc's Executive Summary), a different exception type and mechanism, "newly
-observed; not investigated further." This directly implicates `GroovyBeanDefinitionReader` — the same
-class `context.groovy.GroovyBeanDefinitionReaderTests` exercises — and is consistent with the whole
-cluster still being broken, just with the crash shape likely shifted from a hard `rc=139` SIGSEGV
-(2026-07-09 baseline) to a catchable `ExceptionInInitializerError`/`ArrayStoreException` now, given
-the general heap-corruption-guard fixes (`fb15be63`, HIB-CV-26 `Class.forName` fix) that have landed
-in between. **Not confirmed via live rerun this session** (blocked by the host disk crisis and the
-loss of the `spring-framework` test classpath, see the section-3 recovery note above) — flagged as
-the highest-value next step: re-run these 10 classes on a fresh binary and characterize the current
-crash/fail shape before attempting a fix.
+#### Root cause #1 (FIXED this session): JIT inline-TLAB `new` bakes a stale compact-object size
+
+**Not the cluster's current top-level symptom** (see #2), but a real, independently-confirmed
+heap-corruption bug hit by this exact code shape (large ANTLR/Groovy-generated classes), and the
+most probable explanation for the 2026-07-09 baseline's `rc=139` ABENDs.
+
+`git bisect run` (automated build+probe over ~1600 commits between the last confirmed-green
+Groovy state, `32786958` 2026-07-07, and `dev` tip) isolated the regression to a single commit,
+**`c8c1dd54` "Improve binary trees allocation throughput" (2026-07-09)** — the same day as the
+125-class ABEND baseline. That commit flipped `compact_ref_fields_enabled()`
+(`types/src/field_layout.rs`) from opt-in to **default-on**, and added an inline-TLAB bump-pointer
+fast path for JIT-compiled `new` (`jit/src/x64.rs::emit_inline_tlab_new`) that queries
+`cratonvm_types::class_layout(class_id_raw)` **once, at JIT-compile time**, and bakes the returned
+`body_size` (and therefore the allocation's total size and its `GC_FLAG_COMPACT`/`array_length`
+header fields) as **immutable machine-code constants**.
+
+Unlike that same fast path's sibling consumers — the interpreter (`vm/src/vm/vm_exec.rs`) and the
+GC scan (`gc/src/gen_heap.rs`, `gc/src/heap.rs`) both validate their cached layout against
+`cratonvm_types::layout_generation()` (a monotonic counter bumped on every
+`register_class_layout`/redefine) before trusting it — `emit_inline_tlab_new` has no such check.
+When a class's registered compact layout is later **replaced** (`classloading/src/class_manager.rs`'s
+`recompute_subclass_layouts` / `register_compact_layout_if_enabled`, exercised whenever a
+synthetic-stub class is upgraded to real bytecode with a different field count — exactly the shape
+of CratonVM's synthetic-then-real-JDK class model applied to ANTLR/Groovy-generated parser
+classes), any already-JIT-compiled `new` site for that class keeps allocating objects at the OLD,
+now-wrong size, while field-access code (correctly, dynamically, per-object) uses the CURRENT
+layout — a heap buffer overflow.
+
+**Proven, not just theorized:** built the last-known-good pre-regression commit (`c769377f`,
+parent of `c8c1dd54`) and force-enabled the (there still opt-in) compact-layout flag
+(`CRATONVM_COMPACT_REF_FIELDS=1`) against a minimal repro (`GroovyShell.evaluate("println 1")`,
+no Spring involved) — reproduces the **exact same `rc=139` SIGSEGV** as the 2026-07-09 baseline.
+`--nojit` on that same forced-flag build does *not* crash (confirming the bug is JIT-exclusive).
+A core-dump backtrace (`gdb` on a captured core) shows the fault inside JIT-generated code
+(no symbols) with `RAX` holding a garbage sign-extended 32-bit value being dereferenced as a
+pointer — consistent with a field read landing on the wrong byte offset inside an
+undersized/mis-tagged object.
+
+**Fix** (`jit/src/x64.rs::emit_inline_tlab_new`): disabled the compile-time-baked compact-body
+size computation for this one allocation fast path (`compact_body` is now always `None` there),
+falling back to the always-correct legacy-sized bump allocation — still avoiding the helper call
+for the common case, just without the ~22% footprint win for JIT'd `new` on compact-eligible
+classes. A full fix would thread `layout_generation()` through this fast path the same way the
+interpreter and GC already do (deopt/fall back to the helper when the generation has moved since
+compile time); out of scope for this session's time budget given the risk of touching hot,
+widely-shared JIT/GC code without a slower, more thorough validation pass.
+
+**Verified regression-clean**: `cargo test -p cratonvm-native-builtins --lib --release` —
+3000 passed / 0 failed / 6 ignored (matches documented baseline exactly).
+`cargo test -p cratonvm-vm --lib --release` — 2200 passed / 17 failed; 16 of the 17 match this
+doc's already-documented pre-existing baseline (9 `lock_order` debug-only-panic tests + 7
+`jit::skip_list` tests); the 17th (`buffered_input_stream_real_jdk_uses_its_own_bytecode`)
+reproduces identically on an unmodified `dev`-tip build via a `git stash`-based A/B rerun —
+pre-existing, unrelated to this fix, not a regression.
+
+#### Root cause #2 (STILL OPEN, not this session's fix): Groovy's ANTLR parser rejects basic literals
+
+This is the cluster's actual current-day blocker — the reason all 10 classes still FAIL even
+after root cause #1's fix. Isolated to a minimal, Spring-free repro:
+`new GroovyShell().evaluate("println 1")` **fails to parse** under CratonVM
+(`org.codehaus.groovy.control.MultipleCompilationErrorsException: ... Unexpected input: '1' @
+line 1, column 9`) while the identical script/classpath parses and runs fine under real HotSpot
+(JDK 25). Further isolation:
+
+- `println 1`, `x=5`, `x='a'`, `foo(1)`, `def x=1`, `1+1` — all fail to parse (`Unexpected input`
+  pointing at the integer/string literal or, for `1+1`, at the leading digit itself).
+- `true`, `x=true`, `def x`, `foo()`, `class X {}` — all parse and run fine.
+- Reproduces identically with JIT on or `--nojit`, and with `CRATONVM_COMPACT_REF_FIELDS` set to
+  either `0` or `1` — i.e. **independent of root cause #1 and of the compact-ref-field-layout
+  feature entirely**. Confirmed via a `git stash`-based test that this is not a side effect of
+  this session's fix (reproduces identically before and after).
+
+The failure shape (a real, non-boolean literal token specifically failing where boolean keywords
+and no-arg calls succeed) points at Groovy 5's ANTLR4-based lexer/parser (`groovyjarjarantlr4`,
+the tunnelvisionlabs shaded fork) mishandling number/string literal recognition or the adaptive
+prediction around it — plausibly related to, but distinct from, the already-`docs/internal/
+groovy-atn-shim-fork-layout-and-isPresent-stub-removal.md`-documented (2026-07-07, merged
+`32786958`) `ATNConfig` slot-layout bug, since `CRATONVM_DBG_OOBFIELD=ATNConfig` shows **zero**
+`ATNConfig` out-of-bounds field events during this exact failure — so it is not a recurrence of
+that specific bug, but something else in the same subsystem. **Not investigated further this
+session** (time budget exhausted after root-causing and fixing #1); the minimal repro above
+(`GroovyParseProbe4`-style: a fresh `GroovyShell`, `.evaluate("println 1")`, one JDK 25 process,
+groovy-5.0.7.jar on the classpath, no Spring needed) is the concrete starting point for a
+follow-up session.
+
+The originally-reported lead for this investigation —
+`TestContextAotGeneratorIntegrationTests::processAheadOfTimeWithXmlTests` hitting
+`ExceptionInInitializerError` from `GroovyBeanDefinitionReader.<init>` via an `ArrayStoreException`
+in `GroovySystem.<clinit>` — **did not reproduce** in any of the 10 cluster classes or the minimal
+repro above (`GroovySystem.<clinit>` completes without incident in every repro tried this
+session). That AOT-specific `ArrayStoreException` is very likely a genuinely separate, third bug
+tied to the `@CompileWithForkedClassLoader` fork-loader path used only by that AOT test class —
+still open, not further investigated here; see §2's `TestContextAotGeneratorIntegrationTests`
+entry for the original finding.
+
+**Per-class re-verification detail** (fresh `dev` tip + this session's fix, real JDK 25, Groovy
+5.0.7, `KRun` harness):
+
+| Class | 2026-07-09 baseline | 2026-07-17 re-verify |
+|---|---|---|
+| `scripting.groovy.GroovyAspectTests` | ABEND `rc=139` | FAIL, 0/4 |
+| `scripting.groovy.GroovyAspectIntegrationTests` | ABEND `rc=139` | FAIL, 1/4 |
+| `scripting.groovy.GroovyScriptFactoryTests` | ABEND `rc=139` / TIMEOUT | FAIL, 16/38 |
+| `context.groovy.GroovyBeanDefinitionReaderTests` | ABEND `rc=139` | FAIL, 1/36 |
+| `test.context.groovy.AbsolutePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
+| `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 |
+| `test.context.groovy.GroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
+| `test.context.groovy.MixedXmlAndGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 |
+| `test.context.groovy.RelativePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
+| `test.context.web.BasicGroovyWacTests` | ABEND `rc=139` | FAIL, 0/2 |
+
+All FAILs share the same root cause #2 above (Groovy DSL scripts using bean-definition
+command-chain syntax, e.g. `beans { ... }`, fail to parse with the identical `Unexpected input`
+signature at the `{`/literal token). None of the 10 are closed; 0/10 pass end-to-end. The
+improvement is real but partial: crash → catchable, deterministic parse failure.
 
 ### 6 found=0 ABEND cluster — reconciled
 
