@@ -64346,6 +64346,19 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(this, "loggerName", Value::Object(None));
             ctx.set_field_by_name(this, "thrown", Value::Object(None));
             ctx.set_field_by_name(this, "parameters", Value::Object(None));
+            // Real JDK stamps the constructing thread's id into
+            // threadID/longThreadID. Without it, records report
+            // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
+            // that 0 to ThreadMXBean.getThreadInfo(long), which rejects
+            // non-positive ids ("Invalid thread ID parameter") on every
+            // AsyncFileHandler format. The mirror lookup may allocate, so
+            // keep this pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let tid = crate::current_java_thread_tid(ctx);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "threadID", Value::Int(crate::short_thread_id(tid)));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );

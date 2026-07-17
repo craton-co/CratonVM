@@ -46,12 +46,20 @@
 > remaining 2/5 fail on the same pre-existing `java.lang.classfile.ClassFile`
 > JDK24+ host gap noted below for the two "environmental, not a CratonVM bug"
 > items. Full verification detail in `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s
-> dedicated entry.
+> dedicated entry. Also now **FIXED**: `context.annotation.ImportSelectorTests`
+> (Mockito `spy()` heap-corruption abort on its 2 "nested group" sub-tests) —
+> same `fb15be63` GC fix closed it too, NOT the `MockMethodAdvice
+> .isOverridden` hypothesis originally suspected (that hypothesis was never
+> confirmed and turned out not to be needed). Verified twice independently:
+> once in the 2026-07-16 joint-verification session below, and again
+> 2026-07-17 from a completely fresh `spring-framework` clone + fresh
+> CratonVM build — both report `9/9` passing with zero corruption-signature
+> log lines. See `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s dedicated entry and
+> the "2026-07-16 joint verification addendum" in this doc's own
+> `ImportSelectorTests` section for full detail.
 >
 > **Still genuinely OPEN** (tracked as active tasks in this session,
-> 2026-07-16): `context.annotation.ImportSelectorTests` (Mockito `spy()`
-> `StackOverflowError`, root cause narrowed to `MockMethodAdvice
-> .isOverridden`);
+> 2026-07-16):
 > `web.socket.messaging
 > .StompWebSocketIntegrationTests` (STOMP message never arrives — functional
 > gap, not investigated); `orm.jpa.support
@@ -774,6 +782,64 @@ confirmation, corroborating the `PersistenceAnnotationBeanPostProcessorAotContri
 classes, three independent investigating sessions, one shared root cause,
 one fix. See `CRATONVM-SPRING-GENUINE-BUGLIST.md`'s `ApplicationContextAotGeneratorTests`
 entry for the sibling verification detail.
+
+### 2026-07-17 second independent re-confirmation — separate task, separate host state, still 9/9
+
+A separate, later task was assigned to root-cause and fix this exact bug from
+the original briefing (Mockito `spy()` corruption, `isOverridden` prime
+suspect) without initially being told it was already closed. Rather than
+trust the FIXED status above at face value, it re-verified from scratch with
+a deliberately maximally-independent setup, since by this point in the
+session the host's disk-pressure cleanup had deleted *every* prior
+`spring-framework` checkout, worktree, and `cratonvm-testcp.txt` on the host
+(including `/data/data/wt-gcbug-verify-20260716` referenced above) — nothing
+could be reused even if desired.
+
+Setup: fresh `git clone` of upstream `spring-projects/spring-framework`
+(`7.1.0-SNAPSHOT`, current HEAD as of 2026-07-17), fresh `cargo build
+--release` of CratonVM at `origin/dev` tip `56728b1a` (`fb15be63` confirmed an
+ancestor via `git merge-base --is-ancestor`), fresh `:spring-context:testClasses`
+Gradle build (dependency cache reused via a copied, not symlinked,
+`GRADLE_USER_HOME/caches/modules-2` — a straight symlink back onto the
+host's chronically-full root filesystem fails on any new dependency
+resolution with `No space left on device`), single `byte-buddy-1.18.3` /
+`mockito-core-5.23.0` on the classpath (verified no duplicate versions),
+`MethodRun`/JUnit-Platform-launcher pattern, real JDK 25,
+`CRATONVM_DEFAULT_HEAP_MAX_MB=2048`.
+
+**Result, run twice for determinism: `RESULT started=9 succeeded=9 failed=0`
+both times**, including both individually-run and full-class invocations of
+`importSelectorsWithNestedGroup`/`importSelectorsWithNestedGroupSameDeferredImport`,
+zero corruption-signature log lines, zero `StackOverflowError`. Independently
+corroborates the FIXED status — three investigating sessions, three
+independently-built environments, one shared root cause (`fb15be63`), always
+`9/9`.
+
+Two environment gotchas hit and worked around, both host-state artifacts and
+not CratonVM bugs, recorded here since they cost real time and could bite
+future sessions on this host: **(1)** a Gradle build-cache-restored
+(`FROM-CACHE`) `:spring-context:compileJava`/`testClasses` produced an
+incomplete `classes/java/main` tree on the very first attempt — a real
+`.class` file (`StandardBeanExpressionResolver$1`) was present on disk yet
+CratonVM raised `NoClassDefFoundError` loading it, reproducing on **every**
+`spy()`-using test including previously-green ones (`importSelectors`), which
+made it look like a regression at first. This is not a CratonVM bug: forcing
+`--rerun-tasks --no-build-cache` on the affected Gradle tasks produced a
+correct tree and the error vanished on every subsequent run, strongly
+suggesting the cached build-cache entry itself was corrupted by one of this
+session's many root-filesystem-100%-full episodes during extraction.
+**(2)** both `GRADLE_USER_HOME` and `-Djava.io.tmpdir` need to be redirected
+off `/` (e.g. to `/data/tmp`) on this host — Mockito's self-attach boot-jar
+write and Gradle's own dependency-cache writes both throw `IOException`/
+`No space left on device` on the chronically-full root filesystem otherwise,
+which surfaces as `IllegalStateException: Mockito could not self-attach...`
+or a Gradle configuration failure that has nothing to do with either the
+Mockito recursion bug or the GC bug.
+
+**Not this task's fix either; attributing correctly.** No CratonVM source was
+changed by this task. This addendum's only contribution is a second,
+maximally-independent confirmation that the FIXED status holds, plus the two
+environment gotchas above for future sessions.
 
 ## 2026-07-13 local investigation — `web.service.registry.*` residuals (both root-caused, neither fixed — still OPEN)
 

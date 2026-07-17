@@ -371,7 +371,46 @@ fn deliver_future_completion(ctx: &mut dyn NativeContext, c: FutureCompletion) {
                 .unwrap_or(0);
             Ok(box_int(ctx, n))
         }
-        FutureOutcome::Count(n) => Ok(box_int(ctx, n)),
+        FutureOutcome::Count(n) => {
+            // BUG FIX (2026-07-17, StompWebSocketIntegrationTests premature-close
+            // investigation): `Count(n)` is how `aio_asc_write_future`'s real
+            // completion (`Job::WriteFutureFd`, below) reports a successful
+            // write back to the Future -- but until this fix, that path never
+            // advanced the SOURCE `ByteBuffer`'s `position`, unlike the sibling
+            // `Bytes(..)` (read) arm above which correctly calls
+            // `write_into_buffer_and_advance`. That violates
+            // `AsynchronousByteChannel.write`'s documented contract ("the
+            // buffer's position is updated to reflect the bytes written").
+            // A conforming caller that loops `while (buf.hasRemaining())
+            // channel.write(buf).get()` -- exactly Tomcat's own
+            // `WsRemoteEndpointImplBase`/`WsRemoteEndpointImplClient` write
+            // path -- therefore saw the SAME unconsumed-looking buffer after
+            // every "successful" write and resubmitted it, physically
+            // resending the same frame bytes on the wire many times (confirmed
+            // via `CRATONVM_DBG_SC_READ`: a single server-side read of one
+            // Jetty-backed connection contained the client's 35-byte STOMP
+            // CONNECT WebSocket frame repeated exactly 67 times back-to-back,
+            // 2345 = 35*67; the Tomcat backend hit the same bug thousands of
+            // times per its own retry cadence). The server correctly rejects
+            // each redundant CONNECT with STOMP's "Session already exists"
+            // guard and closes -- the premature close chased across the
+            // 2026-07-16 sessions. `Count(n)` is otherwise only ever produced
+            // with `n == 0` for two degenerate early-outs (an empty write
+            // buffer here, and `aio_asc_read_future`'s zero-capacity
+            // destination case), so advancing by `n` is a harmless no-op
+            // there and the correct fix for the real (n > 0) write-completion
+            // case.
+            if n > 0 {
+                if let Some(bb) = ctx.resolve_global_root(buffer_gref) {
+                    let position = match ctx.get_field_by_name(bb, "position") {
+                        Value::Int(v) if v >= 0 => v,
+                        _ => 0,
+                    };
+                    ctx.set_field_by_name(bb, "position", Value::Int(position + n));
+                }
+            }
+            Ok(box_int(ctx, n))
+        }
         FutureOutcome::Eof => Ok(box_int(ctx, -1)),
         FutureOutcome::Error(message) => Err(message),
     };

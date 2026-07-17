@@ -34523,6 +34523,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 args.get(2).copied().unwrap_or(Value::Object(None)),
             );
             ctx.set_field_by_name(this, "needToInferCaller", Value::Int(0));
+            // Real JDK stamps the constructing thread's id into
+            // threadID/longThreadID. Without it, records report
+            // getLongThreadID() == 0 and Tomcat JULI's OneLineFormatter feeds
+            // that 0 to ThreadMXBean.getThreadInfo(long), which rejects
+            // non-positive ids ("Invalid thread ID parameter") on every
+            // AsyncFileHandler format. The mirror lookup may allocate, so
+            // keep this pinned across it.
+            let this_pin = ctx.pin_native_root(this);
+            let tid = current_java_thread_tid(ctx);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "threadID", Value::Int(short_thread_id(tid)));
+            ctx.set_field_by_name(this, "longThreadID", Value::Long(tid));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -46263,6 +46276,33 @@ fn next_java_thread_tid() -> i64 {
     let tid = (*entry).max(1);
     *entry = tid.saturating_add(1);
     tid
+}
+
+/// Current thread's Java `Thread.tid` (what `Thread.currentThread().threadId()`
+/// returns): read it off the current thread's mirror so native-built
+/// `LogRecord`s carry the same id that thread-keyed consumers (JULI's
+/// `OneLineFormatter` -> `ThreadMXBean.getThreadInfo(long)`) resolve against.
+/// Falls back to the VM thread id when the mirror exposes no positive `tid`
+/// (e.g. synthetic Thread layouts) -- `threadId()` must stay positive.
+pub(crate) fn current_java_thread_tid(ctx: &mut dyn NativeContext) -> i64 {
+    let thread_obj = ctx.current_thread_object();
+    match ctx.get_field_by_name(thread_obj, "tid") {
+        Value::Long(id) if id > 0 => id,
+        Value::Int(id) if id > 0 => id as i64,
+        _ => ctx.thread_id().max(1) as i64,
+    }
+}
+
+/// The JDK's legacy int thread id for a long tid: ids that fit keep their
+/// value, larger (e.g. VM-fabricated high-range) tids collapse onto the
+/// same "above Integer.MAX_VALUE/2" convention `LogRecord.shortThreadID`
+/// uses. The exact high-range value is only ever a display label.
+pub(crate) fn short_thread_id(tid: i64) -> i32 {
+    if tid <= (i32::MAX / 2) as i64 {
+        tid as i32
+    } else {
+        i32::MAX / 2 + 1
+    }
 }
 
 /// Lock the shard that owns `key` in a `usize`-keyed sharded map.

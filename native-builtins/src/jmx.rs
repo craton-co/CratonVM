@@ -2443,8 +2443,10 @@ fn alloc_basic_thread_info(
     thread_id: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
     if thread_id <= 0 {
+        // Match HotSpot's sun.management.ThreadImpl wording (id included) so
+        // triage can see WHICH bad id a caller fed us.
         return Err(RuntimeError::IllegalArgumentException {
-            message: "Invalid thread ID parameter".into(),
+            message: format!("Invalid thread ID parameter: {thread_id}"),
         }
         .into());
     }
@@ -2674,8 +2676,11 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
                 })
                 .unwrap_or_else(|| ctx.thread_id().max(1) as i64);
             if thread_id <= 0 {
+                // Same wording as HotSpot's sun.management.ThreadImpl
+                // verifier, id included, so triage can see WHICH bad id a
+                // caller fed us.
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: "Invalid thread ID parameter".into(),
+                    message: format!("Invalid thread ID parameter: {thread_id}"),
                 }
                 .into());
             }

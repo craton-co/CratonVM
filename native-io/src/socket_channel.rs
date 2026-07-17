@@ -1393,6 +1393,19 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 ///   * Ok(None) when EAGAIN/WouldBlock
 ///   * Ok(Some(-1)) on EOF
 ///   * Err(...) on hard error
+/// FNV-1a 64-bit hash, used only by the `CRATONVM_DBG_SC_READ` diagnostic
+/// below to cheaply fingerprint the bytes a given `sc_read` call actually
+/// delivered, so two calls can be compared for byte-identical content
+/// without dumping full hex payloads into the log.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
     match s.read(buf) {
@@ -1490,7 +1503,93 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     if n > 0 {
         crate::net::socket_capture('r', id, &buf[..n as usize]);
+        // Reload `bb` through the pin BEFORE touching it again: the blocking
+        // read above may have crossed a GC pause that relocated the object,
+        // so the original `bb` reference could be stale here (see
+        // `pin_native_root`'s doc comment on this exact hazard). Both the
+        // diagnostic below and the real write path use this reloaded ref.
         let bb = ctx.read_native_pin(bb_pin, bb);
+        // Diagnostic (CRATONVM_DBG_SC_READ=1, added 2026-07-17 continuing the
+        // StompWebSocketIntegrationTests premature-close investigation): the
+        // prior session pinned the failure to the server dispatching one
+        // client-written STOMP CONNECT frame to Spring's
+        // handleMessageFromClient TWICE, with live gdb confirming exactly 2
+        // physical `sc_read` calls occur before either dispatch (Jetty
+        // backend) — i.e. this native genuinely gets invoked twice, each
+        // apparently returning a real, non-empty payload. Fingerprint every
+        // real (n>0) read with an FNV-1a hash + byte count + the buffer's
+        // `position` field before/after, so a rerun can show directly
+        // whether the two reads return byte-identical content (a
+        // duplicate-delivery bug below `try_read_nb`/the OS socket) or two
+        // genuinely different byte ranges (pointing the remaining
+        // investigation at Jetty's/Tomcat's own frame-parser instead). Kept
+        // as a permanent opt-in hook, zero cost when unset, matching
+        // CRATONVM_DBG_SC_CLOSE's precedent in this same file.
+        if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+            let pos_before = match ctx.get_field_by_name(bb, "position") {
+                Value::Int(v) => v,
+                _ => -1,
+            };
+            let (local, peer) = match tcp_registry().read().get(&id) {
+                Some(TcpHandle::Stream(s)) => (
+                    s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    s.peer_addr().map(|a| a.to_string()).unwrap_or_default(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let hash = fnv1a64(&buf[..n as usize]);
+            let dump_len = (n as usize).min(64);
+            let hex: String = buf[..dump_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            eprintln!(
+                "[SC_READ] t={ms} id={id:#x} local={local} peer={peer} n={n} pos_before={pos_before} fnv1a={hash:#018x} hex[0..{dump_len}]={hex}"
+            );
+            // 2026-07-17 continuation: a live rerun of StompWebSocketIntegrationTests
+            // against this diagnostic found the Tomcat parameterization's `sc_read`
+            // returning the SAME (id, byte-content) pair dozens of times in a row
+            // (identical FNV-1a hash) at a steady ~20-60ms cadence -- i.e. the
+            // native read layer itself, not just Spring's message dispatch, sees
+            // byte-identical "new" reads. Capture ONE Java stack trace the first
+            // time a read's hash repeats the immediately preceding read on the
+            // same channel id, to pin the exact Tomcat call site re-issuing the
+            // read (only once per repeat streak, to avoid flooding the log across
+            // a long redelivery spin).
+            fn last_read_hash() -> &'static parking_lot::Mutex<HashMap<i32, (u64, bool)>> {
+                static T: OnceLock<parking_lot::Mutex<HashMap<i32, (u64, bool)>>> = OnceLock::new();
+                T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+            }
+            let mut streak_started = false;
+            {
+                let mut m = last_read_hash().lock();
+                let entry = m.entry(id).or_insert((0, false));
+                if entry.0 == hash && !entry.1 {
+                    entry.1 = true;
+                    streak_started = true;
+                } else if entry.0 != hash {
+                    *entry = (hash, false);
+                }
+            }
+            if streak_started {
+                let raw_trace = ctx.capture_stack_trace(0);
+                eprintln!(
+                    "[SC_READ_REPEAT_STACK] t={ms} id={id:#x} n={n} fnv1a={hash:#018x} ({} frames)",
+                    raw_trace.len()
+                );
+                for entry in raw_trace.iter().rev() {
+                    let file = entry.source_file.as_deref().unwrap_or("?");
+                    eprintln!(
+                        "  at {}.{}({}:{})",
+                        entry.class_name, entry.method_name, file, entry.line_number
+                    );
+                }
+            }
+        }
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
@@ -2036,6 +2135,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // from that side-channel first so we don't block on a queue that
     // has already been emptied.
     let preaccepted = crate::nio_selector::take_any_pending_accepted(id);
+    let preaccepted_used = preaccepted.is_some();
 
     // Clone listener out so the registry lock isn't held across blocking accept.
     let listener_clone = {
@@ -2083,6 +2183,25 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some((stream, peer)) = accepted else {
         return Ok(Some(Value::Object(None)));
     };
+    // Diagnostic (CRATONVM_DBG_SC_READ=1, shares the read diagnostic's env
+    // var — same investigation): log every successful accept() with the
+    // NEW child id and whether it came from the selector's pre-drained
+    // `pending_accepted` side-channel or a fresh OS `accept()` call. If the
+    // StompWebSocketIntegrationTests repro ever shows TWO child ids for
+    // what should be one client connection (same peer port), that is a
+    // double-accept bug upstream of `sc_read` entirely; if it shows only
+    // ONE id (as expected), the duplicate-CONNECT-dispatch investigation
+    // stays focused on `sc_read` / the buffer fill-and-parse path.
+    if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!(
+            "[SC_ACCEPT] t={ms} listener_id={id:#x} peer={peer} source={}",
+            if preaccepted_used { "preaccepted" } else { "fresh" }
+        );
+    }
 
     // Inherit non-blocking flag of the parent channel.
     let _ = stream.set_nonblocking(!blocking);
