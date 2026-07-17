@@ -1,7 +1,17 @@
 # `ServletWebServerApplicationContext.getWebServerFactory()` native Tomcat shim crashes non-Tomcat (Jetty/generic) test modules — `TomcatServletWebServerFactory` class-not-found process abort
 
-**Status: OPEN**
+**Status: FIXED (2026-07-17)**
 **Severity: HIGH** (10 fatal process CRASHes across two Gradle modules whose real classpath never contains the referenced class)
+
+## Resolution
+
+The native registrations now execute the real Spring Boot
+`getWebServerFactory()` bytecode body through
+`NativeContext::invoke_special_bytecode_only`, rather than allocating a
+Tomcat factory unconditionally. This preserves the framework's backend
+selection and Java-level error behavior for Jetty, Undertow, and generic
+contexts while avoiding native re-entry.
+
 
 | | |
 |---|---|
