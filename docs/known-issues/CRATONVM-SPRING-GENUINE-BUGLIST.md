@@ -1286,6 +1286,154 @@ the WRONG same-named copy. Eight fixes landed on
        test.context.env.YamlTestPropertySourceTests` (an ordinary,
        non-forked-loader `@YamlTestProperties` consumer) 4/4 OK (confirms
        the normal YAML-loading path was never broken and stays unaffected).
+
+       **2026-07-17 addendum — JavaPoet `LineWrapper$FlushType` NPE: interpreter
+       path FIXED, JIT-only residual OPEN.** Investigated the NPE flagged
+       above (`NullPointerException: Cannot invoke
+       "org.springframework.javapoet.LineWrapper$FlushType.ordinal()" because
+       "flushType" is null`, at `LineWrapper.flush(LineWrapper.java:127)` <-
+       `CodeWriter.emitAndIndent` <- `CodeWriter.emit` <- ... <- `JavaFile.writeTo`).
+       Fresh worktree `/data/data/wt-javapoet-linewrapper-20260717`, branch
+       `fix/javapoet-linewrapper-20260717`, `origin/dev` tip `08808a57`.
+       Reproduced with a single-method `MRun` launcher (`DiscoverySelectors
+       .selectMethod`) against a from-scratch `spring-test`
+       `sourceSets.test.runtimeClasspath` dump (`persistbb-springfw-20260717`
+       checkout, real JDK 25) -- 100% reliable, both under default settings
+       (JIT on) and `--nojit`.
+
+       **Root cause (interpreter path, FIXED):** `LineWrapper` (repackaged
+       `com.palantir.javapoet` -> `org.springframework.javapoet` at Spring's
+       build time) has 8 instance fields mixing references and primitives
+       (`out`, `indent` -- refs; `columnLimit`, `closed` -- primitives;
+       `buffer` -- ref; `column`, `indentLevel` -- primitives; `nextFlush` --
+       a ref, and the *last* declared field). Under the default-on compact
+       reference-field layout (`CRATONVM_COMPACT_REF_FIELDS`,
+       `docs/feature-designs/compact-ref-field-layout.md`), this object's
+       true body size is 96 bytes (4 ref fields x 8B + 4 primitive fields x
+       16B). `gc/src/g1.rs`, `gc/src/gc.rs`, and `gc/src/region.rs` each
+       independently duplicate an `object_total_size(header)` helper that --
+       unlike the already-correct `gc/src/gen_heap.rs::gen_object_total_size`
+       -- never checks the per-object `GC_FLAG_COMPACT` header bit, and
+       unconditionally computed `HEADER_SIZE + num_slots * SLOT_SIZE` (the
+       *legacy* 16-bytes-per-field formula): 128 bytes instead of the true 96
+       -- a 32-byte overestimate for this exact class shape (a compact object
+       whose last field is a reference following an odd mix of primitives).
+       `g1.rs::evacuate_object` uses this inflated size both to reserve
+       destination space for the copy *and* as the `copy_nonoverlapping`
+       length, so every young-GC evacuation of a live `LineWrapper` (heavy
+       during `TestCompiler`'s real in-process javac compile-and-verify GC
+       churn) over-read past the object's true end and de-synced the
+       region's per-object stride for everything evacuated after it --
+       eventually manifesting as `nextFlush` reading back `null` even though
+       every `LineWrapper` method that sets it (`wrappingSpace`,
+       `zeroWidthSpace`) is only ever called with a non-null argument.
+       Confirmed empirically, not just by code inspection: with
+       `CRATONVM_COMPACT_REF_FIELDS=0` (opts out of compact layout
+       entirely, sidestepping the bug) the `--nojit` repro passes 3/3
+       reliably; with the flag at its default the `--nojit` repro fails 3/3
+       reliably with the exact NPE above.
+
+       **Fix** (`gc/src/g1.rs`, `gc/src/gc.rs`, `gc/src/region.rs`,
+       `object_total_size`): replaced the `else` arm's
+       `HEADER_SIZE + header.num_slots as usize * SLOT_SIZE` with
+       `HEADER_SIZE + crate::object_body_size(header)` -- the canonical
+       compact-aware helper (`types/src/field_layout.rs`) that `gen_heap.rs`
+       already used, reads the per-object `GC_FLAG_COMPACT` bit and returns
+       the true (possibly-compact) body size. Minimal, mechanical, no new
+       control flow. **Verified**: with the fix, `--nojit` against the exact
+       same repro no longer throws the JavaPoet NPE anywhere (3/3 clean
+       reruns) -- the method progresses further, now failing on an unrelated,
+       later assertion (`AssertionError: [Environment] Expecting actual not
+       to be null` in `assertContextForBasicTests`, a separate Spring
+       environment-property issue not investigated here).
+
+       **JIT-only residual -- OPEN, root-caused down to the call site, not
+       yet fixed.** With JIT enabled (the default), the identical NPE
+       *still reproduces* even with the fix above, and even with
+       `CRATONVM_COMPACT_REF_FIELDS=0` (i.e. it is independent of the
+       compact-layout bug just fixed -- a second, unrelated defect). Bisected
+       precisely via `CRATONVM_JIT_BISECT_SKIP` (format is
+       `Class.method`, comma-separated -- an earlier attempt using a bare
+       class-name prefix silently matched nothing due to the required `.`
+       separator, a trap worth flagging for whoever picks this up):
+       - `CRATONVM_JIT_BISECT_SKIP=org/springframework/javapoet/LineWrapper.append`
+         (forcing only `append(String)` to stay interpreted) -- **NPE gone**,
+         3/3.
+       - `CRATONVM_JIT_BISECT_SKIP=org/springframework/javapoet/LineWrapper.flush`
+         (forcing only `flush(FlushType)` to stay interpreted) -- **NPE still
+         reproduces**.
+
+       So the bug is specifically in the JIT-compiled machine code of
+       `LineWrapper.append(String)`, not `flush`. `append`'s bytecode
+       computes `flush(shouldWrap ? FlushType.WRAP : this.nextFlush)`: an
+       unconditional `aload_0` (receiver) followed by a two-way branch that
+       pushes either a `getstatic` (the enum constant `WRAP`) or a second
+       `aload_0` + `getfield nextFlush`, joining right before the
+       `invokevirtual flush` (encoded `invokevirtual`, not `invokespecial`,
+       per modern javac's private-instance-method bytecode shape -- see
+       `vm/src/runtime/interpreter.rs`'s `resolved_private_invokevirtual_target`
+       and its regression test `vm/tests/private_invokevirtual_shadow.rs`,
+       which -- note for the next session -- only exercises `--nojit`, so it
+       gives **no coverage** of the JIT path at all).
+       `CRATONVM_DBG_JITC=1` confirms `flush` itself always
+       `compile-bail`s (`backend_attempted=true`, never gets a compiled
+       entry, likely the internal `tableswitch` over `FlushType.ordinal()`),
+       so the call from JIT-compiled `append` must cross the JIT->interpreter
+       boundary via the virtual-call MIC/PIC dispatch machinery
+       (`jit_invoke_virtual_mic`, `vm/src/jit/helpers.rs`). A live
+       `CRATONVM_DBG_JIT_DISASM=LineWrapper.append` dump (NASM-formatted,
+       `vm/src/jit/disasm.rs`) located the exact merge-point machine code --
+       the compact/legacy guarded `getfield` for `nextFlush` (offsets
+       `[reg+80h]` compact / `[reg+0A0h]` legacy, matching field index 7 --
+       correct) feeding into a 3-slot polymorphic inline-cache dispatch
+       stub before the call -- but did not conclusively pin why the value
+       becomes null by the time it reaches the callee: a targeted
+       instrumentation experiment in `jit_invoke_virtual_mic`'s argument
+       decode (`decode_values`, the `is_object_address`-validated-else-null
+       downgrade for reference args) showed **zero** downgrade events during
+       the failing run, ruling that specific mechanism out -- the argument
+       must already be raw zero by the time the JIT->interpreter call helper
+       receives it, so the corruption happens earlier, inside the
+       JIT-compiled `append` machine code itself (most likely in how the
+       receiver/argument pair for the `shouldWrap ? WRAP : nextFlush`
+       merge gets threaded through the stack-slot/register allocator into
+       the two arguments handed to the virtual-call dispatch stub). Toggled
+       a wide sweep of JIT feature flags with no effect (`CRATONVM_JIT_LICM`,
+       `_REASSOC`, `_UNROLL`, `_IR_CALL_VIRTUAL`, `_SCALAR_NEW`, `_IR_CALL`,
+       `_NO_CALLEE_OOP_FLUSH`, `_NO_SLOT_MIRROR`, `_NO_SELF_CACHE_INHERIT`,
+       `_NO_STACK_BANG`, `_NO_DUP_X`, `_NO_BCE`,
+       `_DISABLE_INLINE_NEW` -- the last one specifically to re-rule-out the
+       already-landed `6599b898` inline-TLAB-new compact-size fix, confirmed
+       unrelated). A minimal standalone repro replicating the exact bytecode
+       shape (a `final` class, an enum field, a private method invoked via
+       the same `invokevirtual`-on-private encoding, reached through the
+       identical two-branch-merge-before-call pattern, JIT-warmed with
+       millions of alternating-branch iterations) did **not** reproduce --
+       so the trigger needs something more specific to `LineWrapper`'s full
+       method body (likely the heavier surrounding code: the inlined
+       `String.indexOf`/`length` intrinsic sequences also visible in the
+       disassembly) that a bare-bones repro didn't capture.
+
+       **Next step for whoever picks this up:** get `pc_to_native`
+       annotations into the `CRATONVM_DBG_JIT_DISASM` dump for `append` (the
+       plain `maybe_dump` call site at `vm/src/runtime/interpreter.rs`
+       `full-compile`, ~line 31117, doesn't pass them; the annotated variant
+       exists at `maybe_dump_annotated`, used elsewhere) to map the raw
+       instruction offsets straight to bytecode PCs 99-117 without manual
+       byte-counting, then trace exactly which register/stack-slot backs the
+       `flush` argument at the call and where it diverges from the
+       `nextFlush` getfield's result. `CRATONVM_JIT_BISECT_SKIP=org/
+       springframework/javapoet/LineWrapper.append` is a reliable, isolated,
+       single-line workaround in the meantime.
+
+       Regression-checked clean on the `object_total_size` fix alone:
+       `cratonvm-native-builtins --lib --release` 3000/0 (0 failed, 6
+       ignored, matches baseline exactly); `cratonvm-vm --lib --release`
+       2201 passed/16 failed -- all 16 match the documented pre-existing
+       `lock_order`/`jit::skip_list` release-mode baseline exactly (one
+       fewer failure than the `6599b898`-era baseline of 17, consistent with
+       the independently-tracked `buffered_input_stream_real_jdk_uses_its_own_bytecode`
+       flake having since been fixed by a concurrent session).
     4. ~~`endToEndTests` — `ClassCastException:
        org.springframework.test.context.hint.StandardTestRuntimeHints cannot be
        cast to org.springframework.test.context.aot.TestRuntimeHintsRegistrar`~~
@@ -1593,7 +1741,7 @@ doc's already-documented pre-existing baseline (9 `lock_order` debug-only-panic 
 reproduces identically on an unmodified `dev`-tip build via a `git stash`-based A/B rerun —
 pre-existing, unrelated to this fix, not a regression.
 
-#### Root cause #2 (STILL OPEN, not this session's fix): Groovy's ANTLR parser rejects basic literals
+#### Root cause #2 -- FIXED 2026-07-17 (commit `394f9c93`): `ArrayList$ListItr.set/add/remove` were hardcoded no-op stubs
 
 This is the cluster's actual current-day blocker — the reason all 10 classes still FAIL even
 after root cause #1's fix. Isolated to a minimal, Spring-free repro:
@@ -1633,26 +1781,84 @@ tied to the `@CompileWithForkedClassLoader` fork-loader path used only by that A
 still open, not further investigated here; see §2's `TestContextAotGeneratorIntegrationTests`
 entry for the original finding.
 
-**Per-class re-verification detail** (fresh `dev` tip + this session's fix, real JDK 25, Groovy
-5.0.7, `KRun` harness):
+**Real root cause (found via a from-scratch investigation, not the originally-hypothesized
+`ArrayStoreException`/`ATNConfig` leads -- both explicitly ruled out; see below):**
+`native-builtins/src/lib.rs` registered `java/util/ArrayList$ListItr`'s `set(Object)`,
+`add(Object)`, and `remove()` natives as literal `|_ctx, _args| Ok(None)` closures -- a leftover
+from an earlier, genuinely-immutable snapshot-iterator design. But `native_arraylist_list_iterator`
+(registered right above) and the sibling `next`/`previous` natives already carry a LIVE backing-
+`ArrayList` reference in the `this$0`-equivalent slot, so the iterator returned by
+`ArrayList.listIterator()` is not actually a frozen snapshot -- silently dropping `set`/`add`/
+`remove` produced silent data loss (no exception, no mutation, the call just vanished) for any
+real-JDK bytecode using `List.listIterator()` mutators.
 
-| Class | 2026-07-09 baseline | 2026-07-17 re-verify |
-|---|---|---|
-| `scripting.groovy.GroovyAspectTests` | ABEND `rc=139` | FAIL, 0/4 |
-| `scripting.groovy.GroovyAspectIntegrationTests` | ABEND `rc=139` | FAIL, 1/4 |
-| `scripting.groovy.GroovyScriptFactoryTests` | ABEND `rc=139` / TIMEOUT | FAIL, 16/38 |
-| `context.groovy.GroovyBeanDefinitionReaderTests` | ABEND `rc=139` | FAIL, 1/36 |
-| `test.context.groovy.AbsolutePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
-| `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 |
-| `test.context.groovy.GroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
-| `test.context.groovy.MixedXmlAndGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 |
-| `test.context.groovy.RelativePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 |
-| `test.context.web.BasicGroovyWacTests` | ABEND `rc=139` | FAIL, 0/2 |
+Traced step by step against a real-JDK-25 baseline, using an isolated `GroovyShell.evaluate
+("println 1")` repro plus reflection-driven ATN introspection (no Spring, no Groovy suite):
+Groovy's ANTLR4-generated lexer tokenizes identically on both platforms; the raw ATN
+deserialization (`ATNDeserializer.deserialize`, `optimize=false`) is byte-identical between
+platforms; `ATNDeserializer.optimizeSets()` (called after `inlineSetRules`/`combineChainedEpsilons`,
+both bit-identical) is where the two platforms first diverge -- CratonVM's first `optimizeSets`
+pass merged only 6 of the 15 mergeable decision-state transitions HotSpot merges. `optimizeSets()`
+builds its per-decision merge set via `IntervalSet.add(int)` called once per candidate index, then
+walks the result with a `ListIterator` to splice/merge adjacent intervals -- confirmed with an
+isolated, Groovy/ANTLR-free `java.util.ArrayList` probe: sequential `IntervalSet.add(0..3)` drops
+every value that would extend the previously-added interval, the exact merge path that runs
+through `ArrayList$ListItr.set()`. Traced through `execute_invoke_kind` -> `try_stackless_invoke`'s
+`native_cb` resolution (`vm/src/runtime/interpreter.rs`) to the actual registered callback: the
+hardcoded `Ok(None)` stub above.
 
-All FAILs share the same root cause #2 above (Groovy DSL scripts using bean-definition
-command-chain syntax, e.g. `beans { ... }`, fail to parse with the identical `Unexpected input`
-signature at the `{`/literal token). None of the 10 are closed; 0/10 pass end-to-end. The
-improvement is real but partial: crash → catchable, deterministic parse failure.
+**Fix** (`native-builtins/src/lib.rs`): replaced the three stubs with
+`native_arraylist_list_itr_set`/`_add`/`_remove`, which read the real `this$0`-equivalent backing-
+list slot (via the existing `native_arraylist_list_itr_list` helper) and delegate to the
+already-correct `native_al_set`/`native_al_add_at`/`native_al_remove_at`, mirroring real-JDK
+`ArrayList$ListItr`'s cursor/`lastRet`/`IllegalStateException` semantics.
+
+Confirmed NOT the originally-hypothesized `ArrayStoreException` in `GroovySystem.<clinit>` (never
+reproduced this session) and NOT a recurrence of the already-fixed `ATNConfig` slot-layout bug
+(`CRATONVM_DBG_OOBFIELD=ATNConfig` showed zero out-of-bounds events in every repro) -- genuinely a
+different bug in the same general "ATN execution machinery" area.
+
+**Verified**: the isolated `IntervalSet.add` probe now matches real JDK 25 byte-for-byte (identical
+size/interval-count/`containsBitmap` for every tested input), and `GroovyShell.evaluate` on
+`println 1` / `x=5` / `x='a'` / `1+1` / `def x=1` all parse and run correctly (previously:
+`Unexpected input` `MultipleCompilationErrorsException` for every one).
+`cargo test -p cratonvm-native-builtins --lib --release`: 2999/3000 (1 pre-existing
+environment-flaky `ProcessBuilder`/`SecurityManager` test, unrelated).
+`cargo test -p cratonvm-vm --lib --release`: 2201/2217 (the same 16 pre-existing documented
+failures -- 9 `lock_order` debug-only-panic tests + 7 `jit::skip_list` tests -- zero new failures).
+
+**Per-class re-verification detail** (fresh `dev` tip + this fix, real JDK 25, Groovy 5.0.7, `KRun`
+harness):
+
+| Class | 2026-07-09 baseline | 2026-07-17 (root cause #1 only) | 2026-07-17 (root cause #2 fixed) |
+|---|---|---|---|
+| `scripting.groovy.GroovyAspectTests` | ABEND `rc=139` | FAIL, 0/4 | FAIL, **3/4** |
+| `scripting.groovy.GroovyAspectIntegrationTests` | ABEND `rc=139` | FAIL, 1/4 | FAIL, **3/4** |
+| `scripting.groovy.GroovyScriptFactoryTests` | ABEND `rc=139` / TIMEOUT | FAIL, 16/38 | FAIL, **21/38** |
+| `context.groovy.GroovyBeanDefinitionReaderTests` | ABEND `rc=139` | FAIL, 1/36 | FAIL, **33/36** |
+| `test.context.groovy.AbsolutePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.groovy.DefaultScriptDetectionGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 | **OK 1/1** |
+| `test.context.groovy.GroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.groovy.MixedXmlAndGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/1 | **OK 1/1** |
+| `test.context.groovy.RelativePathGroovySpringContextTests` | ABEND `rc=139` | FAIL, 0/6 | **OK 6/6** |
+| `test.context.web.BasicGroovyWacTests` | ABEND `rc=139` | FAIL, 0/2 | FAIL, 0/2 (unrelated -- see below) |
+
+**5 of the 10 classes are now fully closed (100% pass), up from 0/10.** Aggregate pass rate across
+all 10 classes' methods: **80/104**, up from 18/104 before this fix (and 0/104 crash-before-this-
+session's root-cause-#1 fix). Every remaining failure is a distinct, unrelated, pre-existing issue
+-- zero `Unexpected input` failures anywhere in the re-run:
+- `GroovyAspectTests`/`GroovyAspectIntegrationTests` residuals: CGLIB proxy generation
+  (`AopConfigException: Could not generate CGLIB subclass ...`) / a `BeanPostProcessor before
+  instantiation` failure -- unrelated AOP/CGLIB subsystem, not investigated further here.
+- `GroovyScriptFactoryTests` residuals: JSR223 script-tag bean-creation failures and one
+  `AspectJPointcutAdvisor` inner-bean-creation failure -- unrelated, not investigated further.
+- `GroovyBeanDefinitionReaderTests` residuals: one real Groovy-script-evaluation error
+  (`useTwoSpringNamespaces`) plus two bare `AssertionError`s -- unrelated, not investigated
+  further.
+- `BasicGroovyWacTests`: `NoClassDefFoundError: jakarta/servlet/ServletContext` -- a missing
+  `jakarta.servlet-api` jar on this session's hand-assembled classpath (the shared `gradle-home`
+  dependency cache was partially evicted mid-session, consistent with this week's documented host
+  disk instability), not a VM bug; needs a rerun with a complete classpath to confirm either way.
 
 ### 6 found=0 ABEND cluster — reconciled
 
