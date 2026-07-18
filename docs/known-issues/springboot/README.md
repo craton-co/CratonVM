@@ -125,8 +125,7 @@ open each doc for the full picture):
 | [`inetaddressfilter-null-socketaddress-overload-not-throwing.md`](inetaddressfilter-null-socketaddress-overload-not-throwing.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed to file:line) |
 | [`instant-force-native-factory-synthetic-tostring-cluster.md`](instant-force-native-factory-synthetic-tostring-cluster.md) | OPEN — found 2026-07-17 (confirmed at source level) |
 | [`integration-mbeanserver-getdomains-missing-native-abstractmethoderror.md`](integration-mbeanserver-getdomains-missing-native-abstractmethoderror.md) | OPEN — found 2026-07-17 |
-| [`invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow.md`](invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow.md) | OPEN — found 2026-07-17 (root cause CONFIRMED at file:line) |
-| [`jacksonmixinmoduleentries-aot-testcompiler-mismatch.md`](jacksonmixinmoduleentries-aot-testcompiler-mismatch.md) | OPEN — found 2026-07-17, not root-caused |
+| [`Jackson/Json Mixin Module Entries AOT TestCompiler mismatch`](../../internal/springboot/jacksonmixinmoduleentries-aot-testcompiler-mismatch-FIXED.md) | FIXED — 2026-07-18; the Spring AOT descriptor loader-identity repair also resolves both sibling Jackson AOT classes |
 | [`jarmode-tools-extractlayers-timestamp-preservation.md`](jarmode-tools-extractlayers-timestamp-preservation.md) | OPEN — found 2026-07-17. Hypothesis only, not confirmed. |
 | [`jarmode-tools-manifest-start-class-lost.md`](jarmode-tools-manifest-start-class-lost.md) | OPEN — found 2026-07-17 |
 | [`jdbc-classloader-hide-override-not-honored-cluster.md`](jdbc-classloader-hide-override-not-honored-cluster.md) | OPEN — found 2026-07-17 |

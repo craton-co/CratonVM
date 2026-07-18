@@ -1235,6 +1235,25 @@ fn sc_connect_bound(
     let (mut stream, connected) = match started {
         crate::nb_connect::StartConnect::Connected(stream) => (stream, true),
         crate::nb_connect::StartConnect::InProgress(stream) if !allow_block => (stream, false),
+        crate::nb_connect::StartConnect::DeferredFailure(stream, error) if !allow_block => {
+            // Keep the terminal error on the retained OS descriptor. This
+            // mirrors the unbound non-blocking path: the Java reactor must
+            // reach finishConnect()/its first write and observe the saved
+            // failure, rather than receiving a synchronous connect exception.
+            tcp_registry()
+                .write()
+                .insert(id, TcpHandle::ConnectFailed(stream, error));
+            tcp_blocking_state().write().insert(id, false);
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local.port() as i32));
+            let host_str = ctx.create_string(host);
+            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            return Ok(true);
+        }
+        crate::nb_connect::StartConnect::DeferredFailure(_stream, error) => {
+            return Err(map_err(&target, error));
+        }
         crate::nb_connect::StartConnect::InProgress(stream) => {
             let deadline = std::time::Instant::now() + crate::outbound_policy::connect_timeout();
             ctx.begin_blocking_region();

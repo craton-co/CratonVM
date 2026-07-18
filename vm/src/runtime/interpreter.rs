@@ -21672,7 +21672,13 @@ pub(crate) fn try_lambda_dispatch(
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
-            let result = invoke_on_class_shared(
+            // A REF_invokeSpecial lambda target is statically bound to its
+            // implementation owner.  In particular, an Interface.super::m
+            // method reference must reach that interface default method even
+            // when the receiver overrides m.  Retargeting here can resolve a
+            // same-named synthetic lambda helper on the receiver instead and
+            // recurse through the default method indefinitely.
+            let result = crate::vm::invoke_on_class_shared_no_retarget(
                 shared,
                 thread,
                 class_id,
