@@ -2749,6 +2749,57 @@ pub fn set_kernel_reg_homes_request(on: bool) {
 }
 
 thread_local! {
+    /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
+    /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
+    static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Request pure-kernel GPR local homes for the NEXT OSR-artifact compile on
+/// this thread (perf/halfgap-20260717).
+///
+/// The original kernel-homes rollout vetoed OSR bodies wholesale ("publishes
+/// NO OSR entries") as blanket caution while the feature soaked on the
+/// method-entry tier. The machinery for a register-homed OSR ENTRY has
+/// always existed, though: the OSR trampoline seeds each interpreter local
+/// into `osr_local_assignments[i]`'s register (that is the normal
+/// graph-coloring entry contract), and with kernel homes those assignments
+/// ARE the kernel's callee-saved homes (reference locals are masked back to
+/// frame homes, so GC visibility is unchanged). A pure-kernel body accepted
+/// by the same call/field/alloc/typecheck/spec-BCE-free conditions has no
+/// in-body transition that could observe a stale frame slot. This matters
+/// because once-invoked benchmark-style kernels (`benchArithmetic`,
+/// `matmul`) live their entire life inside the OSR artifact and previously
+/// ran memory-homed. Opt out with `CRATONVM_JIT_KERNEL_REG_OSR=0`.
+pub fn set_kernel_reg_homes_osr_request(on: bool) {
+    KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
+}
+
+/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **OFF**, opt in with `=1`) —
+/// see [`set_kernel_reg_homes_osr_request`].
+///
+/// Measured 2026-07-18 on the QuickBench kernels this was built for:
+/// Arithmetic showed no wall-clock change (the kernel is long-division
+/// bound — `i/2` + `i%7` chains dwarf the local load/store traffic register
+/// homes remove), and no other kernel demonstrated a win before the round
+/// closed. Given the callee-saved-GPR family's miscompile history, an
+/// unproven-benefit default stays opt-in; bt18/QuickBench checksums were
+/// correct under it in the runs taken (68332206 et al.), so the lever is
+/// safe to experiment with.
+fn kernel_reg_osr_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_KERNEL_REG_OSR")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
+thread_local! {
     /// Internal handshake between `compile_with_param_slots` (which decides
     /// whether the pure-kernel GPR local homes engage) and `Compiler::new`
     /// (which owns the legacy env-flag gate that would otherwise zero the
@@ -26380,6 +26431,12 @@ pub fn compile_with_param_slots(
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
+    // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
+    // but the published artifact KEEPS its OSR entries — the trampoline's
+    // register-seeded entry contract is exactly what the assignments
+    // describe. See `set_kernel_reg_homes_osr_request`.
+    let kernel_reg_homes_osr_requested =
+        KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
 
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -26654,7 +26711,7 @@ pub fn compile_with_param_slots(
     // field/static ops, no allocation, no typechecks, no inline sites, and no
     // speculative BCE guards (those deopt with frame-stashed state). Reference
     // locals are masked back to frame homes, so GC visibility is unchanged.
-    let kernel_reg_homes = kernel_reg_homes_requested
+    let kernel_reg_homes = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
         && kernel_reg_locals_enabled()
         && !callee_saved_gpr_local_homes_enabled()
         && invoke_info.is_empty()
@@ -27231,10 +27288,16 @@ pub fn compile_with_param_slots(
     // pipeline compiles its own separate, memory-homed artifact
     // (`compile_osr_artifact` never requests kernel homes), so loop-hot
     // methods still get OSR service.
-    cm.osr_pc_to_native = if kernel_reg_homes {
-        // Same length, every entry -1: `can_osr_enter` refuses every pc.
+    cm.osr_pc_to_native = if kernel_reg_homes && !kernel_reg_homes_osr_requested {
+        // Method-entry kernel homes: same length, every entry -1 —
+        // `can_osr_enter` refuses every pc (the method-entry body was never
+        // built for trampoline entry).
         Some(vec![-1; compiler.osr_entry_native.len()])
     } else {
+        // Ordinary bodies AND OSR-tier kernel-homed bodies publish real
+        // entries: the OSR trampoline seeds every local into its
+        // `osr_local_assignments` register (or frame slot for `None`/ref
+        // locals), which for a kernel-homed body is exactly its homes.
         Some(compiler.osr_entry_native)
     };
     cm.osr_num_locals = compiler.num_locals;

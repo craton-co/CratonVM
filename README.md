@@ -42,140 +42,61 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark                          | JDK 25 C2     | CratonVM default | Default ratio |
 |-------------------------------------|---------------|-------------------|---------------|
-| Arithmetic (2B ops)                 | 2,069 ms      | 4,109 ms          | 1.99x         |
-| Fibonacci(44)                       | 1,438 ms      | 4,231 ms          | 2.94x¹        |
-| Sieve (100K x 20,000)               | 2,742 ms      | 5,567 ms          | 2.03x         |
-| Matrix 1280x1280                    | 2,085 ms      | 5,583 ms          | 2.68x         |
-| **QuickBench TOTAL**                | **8,330 ms**  | **19,491 ms**     | **2.34x**     |
-| HashMap (1M put/get, isolated)      | 42 ms         | 264 ms            | 6.29x         |
-| String/Regex (1M, isolated)         | 144 ms        | 3,468 ms          | 24.1x         |
-| Binary Trees (depth=18, isolated)   | 382 ms        | 4,916 ms          | 12.9x         |
+| Arithmetic (2B ops)                 | 1,831 ms      | 6,488 ms          | 3.54x         |
+| Fibonacci(44)                       | 1,442 ms      | 4,247 ms          | 2.95x¹        |
+| Sieve (100K x 20,000)               | 2,346 ms      | 5,984 ms          | 2.55x         |
+| Matrix 1280x1280                    | 2,094 ms      | 5,629 ms          | 2.69x         |
+| **QuickBench TOTAL**                | **7,713 ms**  | **22,348 ms**     | **2.90x**     |
+| HashMap (1M put/get, isolated)      | 45 ms         | 232 ms            | 5.16x         |
+| String/Regex (1M, isolated)         | 143 ms        | 2,231 ms          | 15.6x         |
+| Binary Trees (depth=18, isolated)   | 192 ms        | 11,150 ms         | 58.1x²        |
 
-*Arithmetic/Fibonacci/Sieve/Matrix/TOTAL and HashMap remeasured 2026-07-14 on the
-Azure Linux benchmark host, pinned to logical CPU 14 with `taskset`, as the median
-of three (combined run) / five (HashMap) freshly launched alternating processes
-against Temurin JDK 25.0.3 C2 and a CratonVM candidate with default settings.
-Checksums matched on every run. The Sieve row's 16,711 ms → 5,567 ms and the
-combined TOTAL's 31,064 ms → 19,491 ms come from a tier-scheduling fix (an OSR
-compile no longer starves the method-entry compile) plus two single-pass codegen
-upgrades (adjacent store→load reload elision; callee-saved register homes for
-non-reference locals of pure array/arithmetic kernels) — see
-[`docs/internal/performance/hashmap-sieve-half-gap-20260714.md`](docs/internal/performance/hashmap-sieve-half-gap-20260714.md).
-¹ Fibonacci's CratonVM time improved (4,283 ms → 4,231 ms); the ratio moved because
-this session's Temurin reference ran ~1,440 ms in every round where the 2026-07-13
-median was 2,486 ms (JDK-side bimodality, not a CratonVM change). The earlier OSR
-scheduling and guarded scalar self-recursion work behind the first four rows is
-documented in
-[`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md).
-String/Regex was freshly remeasured at 1M entries on 2026-07-14 as the median
-of nine alternating-order paired runs pinned to logical CPU 14; Binary Trees
-retains its prior isolated snapshot. All three are measured as **separate, isolated,
-freshly-launched processes** (not part of the combined run above, median/mean of
-several rounds, checksums identical every round) — mixing any of them
-into the combined run inflates its ratio via accumulated GC/heap pressure from the
-preceding kernels in the same process, so each is kept isolated for a representative
-number (same rationale `bench/BenchSuite` already used for Binary Trees; HashMap and
-String/Regex were originally folded into the combined run before that inflation was
-understood — see their sections below). Checksums verified identical between CratonVM
-and JDK in every configuration measured. `CRATONVM_JIT_OSR` back-edge OSR is
-default-on; `guarded_inline_getfield_enabled()` is the single largest lever in the
-first 4 rows — see [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for its
-find/fix history.
+*All rows remeasured 2026-07-18 on the Azure Linux benchmark host (post-reboot
+hardware: EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians
+of alternating freshly-launched JDK/CratonVM process pairs (7 rounds for the
+isolated rows, 3 for the combined run) against Temurin JDK 25.0.3 C2 and a
+CratonVM candidate at default settings. Checksums matched on every run. The
+host was re-provisioned around 2026-07-14: absolute times are NOT comparable
+with the previous table (same-binary A/B showed identical code ~1.7x slower on
+the new host for CratonVM's memory-heavy paths while JDK barely moved), so
+every row was re-based; ratios are the durable content. The isolated harnesses
+(`bench/HashMapOnly.java`, `bench/StringRegexOnly.java`,
+`bench/BinTreesClassic.java`, `bench/QuickBenchLong2.java`) are now committed —
+bench/ is gitignored, which is how earlier copies kept getting lost.*
 
-**HashMap and String/Regex were known-slow outliers as of 2026-07-10 (365x and 247x in
-the original combined-run measurement); both are now root-caused and substantially
-fixed.**
+¹ Fibonacci is recursion-bound (self-call dispatch), unaffected by this
+round's loop-kernel work.
+² Binary Trees at `-Xmx8g` (same flags both sides). At default heap the run
+is dominated by an allocation-slow-path wedge whose full fix (forced
+coalescing collections from the TLAB refill path) is quarantined behind
+`CRATONVM_TLAB_GC_TRIGGER` pending a latent young-walk defect — see
+`docs/known-issues/tlab-trigger-gc-young-walk-corruption.md`.
 
-String/Regex's O(n²)-shaped scaling (18.8x at 1K entries → 238.8x at 10K in the
-original profiling) was a `Matcher` native find()/group() path and a
-substring-from-large-parent allocation path, both quadratic-allocation bugs, not
-interpreter overhead — see
-[`docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-native-full-input-redecode-quadratic-FIXED.md)
-and
-[`docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md`](docs/internal/fixed-suite-bugs/substring-large-parent-quadratic-allocation-FIXED.md)
-(merged `a87901e6`). That landed the algorithmic (O(n²)→O(n)) fix and left a
-**37.6x** constant-factor gap (11 ms JDK / 414 ms CratonVM) — the interpreted
-`java.util.regex` engine itself, one JIT-tier-up/intrinsic layer short of HotSpot's
-compiled state machine.
+**This round (2026-07-17/18, `docs/internal/performance/halfgap-20260717.md`):**
+HashMap 7.3x→5.2x (BLOCKGC debug-probe getenv cache — it ran on EVERY native
+call; guarded restore of the JIT inline-compact allocation that a Groovy
+stale-layout fix had disabled, now safe behind a per-class layout-replace
+counter baked into the code; exact-HashMap `put`/`get` thin direct calls with
+a wrapper-free Integer-overlay fast path, wired in BOTH compile tiers — the
+OSR-tier site is the one benchmark-style once-invoked methods actually use).
+String/Regex 24x→15.6x (the OSR-artifact compiler silently bailed on ANY
+method containing a string constant — `ldc` String was "not yet wired" — and
+permanently OSR-denied it, so `StringRegexOnly.run`'s whole workload ran
+interpreted; failure now prints under `CRATONVM_DBG_JITC`). Binary Trees
+~110x→58x (second TLAB-remnant wedge: the free list degrades to blocks just
+under the refill floor — 10.5M consecutive refill failures with ONE young GC
+in a 23s run; fragmentation-floor mini-TLABs re-enable bump allocation, and
+the mark phase's exact-object oracle now materializes ranges only for
+conservative candidates instead of an ~800MB per-GC Vec of every young
+object, with precise heap edges bypassing it entirely — mark phase
+2,098→474 ms).
 
-That remaining constant-factor gap is now also closed, most of the way:
-`CRATONVM_NATIVE_MATCHER_FIND` (**default-ON** since 2026-07-11) routes the explicit
-`Pattern.compile(...).matcher(...)` + `while (m.find()) { ...; m.group(N); }` idiom —
-the shape `bench/StringRegexOnly.java` exercises, and the common shape in real
-parsers/tokenizers — to a Rust-native fast path operating directly on the real OpenJDK
-`Matcher`/`Pattern` object layout (fields resolved by name, never a hardcoded slot
-index, so it can't corrupt a real object the way the pre-2026-07-11 legacy synthetic
-bridge would have). Covers `find()`, `find(int)`, `start()`, `start(int)`, `end()`,
-`end(int)`, `group()`, `group(int)` — the same hot loop's `start`/`end`/`group` calls
-dominated the *remaining* per-iteration cost once `find()` alone was fast, so all
-eight are accelerated together. See
-[`docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md`](docs/internal/fixed-suite-bugs/matcher-find-realjdk-fastpath-FIXED.md)
-for the full design (UTF-16↔UTF-8 offset bridging, bail-to-real-bytecode escape hatch,
-and the one documented residual: `hitEnd()`/`requireEnd()`, used almost exclusively by
-`java.util.Scanner`'s stream-refill logic, are a best-effort approximation rather than
-bit-identical to HotSpot's backtracking-engine bookkeeping — verified against a 141-case
-parity battery to have zero effect on `find`/`group`/`start`/`end` correctness).
-`CRATONVM_NATIVE_MATCHER_FIND=0` reverts to real JDK bytecode as the safety net.
-
-The table above now uses a freshly verified **24.1x** at 1M entries (144 ms JDK /
-3,468 ms CratonVM, median of nine alternating-order paired runs,
-`bench/StringRegexOnly.java` standalone, `CRATONVM_NATIVE_MATCHER_FIND` at its default).
-Every run returned checksum `500000500000`. This steady-state follow-up reduces the
-previous 1M CratonVM median from 4,785 ms to 3,468 ms (**27.5%**) and its ratio from
-32.8x to 24.1x. The earlier 100K measurement was 58 ms JDK / 476 ms CratonVM
-(**8.21x**); the 1M row still exposes the remaining throughput gap after startup and
-tiering costs are amortized.
-
-The residual was not generic native-dispatch tax. The fast path compared Rust's
-semantic capture count with `Matcher.groups.length / 2`; the real runtime layout can
-overallocate that backing array to ten capture pairs even when the pattern has only
-one explicit group. That capacity/semantic-count mismatch made every `find()` bail to
-real bytecode. The guard now compares against `Pattern.capturingGroupCount` and treats
-`groups[]` only as a capacity bound; indexed accessors use the same semantic count so
-the extra slots never make invalid groups legal. See
-[`docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md`](docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md)
-for the implementation, raw measurements, artifact hash, and semantic validation.
-
-The 1M follow-up removes fixed work that remained on every successful match: capture
-ranges are written without an intermediate allocation; decoded text, compiled regex,
-semantic capture count, and scalar Matcher state are reused behind exact object/layout
-and `modCount` guards; captured ASCII strings use a bulk compact-String allocator; and
-StringBuilder input construction uses one checked bulk char-array write per append.
-The complete raw paired sample set, retained artifact hash, and parity coverage are
-recorded in the same performance note.
-
-HashMap's slowdown was a *different* shape of bug — flat across sizes (not O(n²)), and
-cdb stack-sampling showed it was NOT allocation/GC-bound (only ~9% of sampled stacks in
-allocation/boxing paths, vs ~90% for an allocation-bound workload like `bintrees`
-elsewhere in this repo) but fixed per-native-call overhead in the JIT-to-native
-dispatch path: `HashMap.put/get` and `Integer.hashCode()/valueOf()` are native Rust
-functions, and every call paid for conservative JIT-frame root scanning, RwLock-guarded
-class/field-layout lookups, and generic dispatch-machinery overhead that a pure-bytecode
-workload like `bintrees` never touches. Two rounds of fixes landed: first, three
-narrow, behavior-preserving reorders/caches for the safely-addressable slice of that
-overhead (root scanning and the SATB GC flush were deliberately left alone —
-correctness-critical, with a real prior crash/heap-corruption history in this codebase);
-then a larger follow-up addressed the root-publication and dispatch residual directly,
-plus added a GC-integrated fast-path overlay for `Integer`-keyed maps. Combined,
-isolated ratio (13 rounds, median): **29.6x** — down from the original 357x isolated /
-365x combined-run figures. See
-[`docs/internal/hashmap-native-dispatch-overhead.md`](docs/internal/hashmap-native-dispatch-overhead.md)
-for the full implementation and validation record. A 2026-07-14 round took the
-isolated ratio from 8.01x to the table's **6.52x** (274 ms): the cached
-exact-HashMap dispatch check moved ahead of the (always-futile for native callees)
-virtual-dispatch probes, `alloc_object`'s field-count clamp lookup is now served
-from a layout-generation-validated thread-local cache, `Integer.valueOf`/`intValue`
-JIT callsites compile to thin direct helper calls, and `safe_native_call` no longer
-heap-allocates two scratch Vecs per call. A second round took the row to **6.29x**
-(264 ms): `Integer.valueOf` boxing allocates via a direct TLAB bump, and the map
-dispatch cache is the first per-callsite probe. The 1M row is also the WORST size
-for CratonVM: the fixed per-op dispatch/boxing tax amortizes against HotSpot's
-growing cache-miss cost at larger sizes — 10M put/get measures **2.82x**
-(2,767 ms vs 980 ms, checksums equal) — until the overlay's 16M dense-key cap
-sends keys to a sparse fallback (30M at matched `-Xmx16g`: 4.21x). The remaining
-1M residual is boxing-allocation and map-native internals; follow-ups (and one
-measured-and-rejected design) are listed in
-[`docs/internal/performance/hashmap-sieve-half-gap-20260714.md`](docs/internal/performance/hashmap-sieve-half-gap-20260714.md).*
+Earlier rounds' full find/fix histories:
+[`docs/internal/performance/halfgap-20260717.md`](docs/internal/performance/halfgap-20260717.md) (this round),
+[`docs/internal/performance/hashmap-sieve-half-gap-20260714.md`](docs/internal/performance/hashmap-sieve-half-gap-20260714.md),
+[`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md),
+[`docs/internal/hashmap-native-dispatch-overhead.md`](docs/internal/hashmap-native-dispatch-overhead.md), and
+[`docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md`](docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md).
 
 See [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) for the full 26-round JIT optimization journey.
 
