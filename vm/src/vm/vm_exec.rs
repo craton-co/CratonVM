@@ -13669,6 +13669,31 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // `ServerSocket.accept()` has a native parent implementation, so the
+    // later abstract-method rescue cannot displace it. A synthetic
+    // SSLServerSocket owns a separate TLS listener registry and must always
+    // prefer its concrete bridge before inherited-native lookup.
+    if method_name == "accept" && descriptor == "()Ljava/net/Socket;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLServerSocket" {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        .find(&receiver_name, method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // The real-JDK Thread methods read the host field layout directly.  A
     // CratonVM Thread can instead carry a stale/mis-slotted value there, which
     // made Mockito plugin discovery dispatch `getResources` on a String.
