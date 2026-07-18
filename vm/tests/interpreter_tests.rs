@@ -2933,6 +2933,11 @@ s20_test!(
 );
 s20_test!(test_s20_stream_of_count, "testStreamOfCount", 5);
 s20_test!(test_s20_reduce_with_identity, "testReduceWithIdentity", 15);
+s20_test!(
+    test_s20_reduce_with_accumulator_and_combiner,
+    "testReduceWithAccumulatorAndCombiner",
+    3
+);
 s20_test!(test_s20_for_each, "testForEach", 60);
 s20_test!(test_s20_collect_to_set, "testCollectToSet", 3);
 s20_test!(test_s20_find_first, "testFindFirst", 10);

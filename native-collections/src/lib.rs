@@ -14121,6 +14121,16 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
         native_stream_reduce_identity,
     );
+    // `Stream.reduce(U, BiFunction<U, ? super T, U>, BinaryOperator<U>)`
+    // is a distinct default-interface overload. Synthetic CratonVM streams
+    // dispatch through this interface registration, so omitting it falls back
+    // to Stream's no-Code declaration and throws AbstractMethodError.
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+        native_stream_reduce_accumulator_combiner,
+    );
     r.register(
         c,
         "reduce",
@@ -16005,6 +16015,68 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
     let acc = read_pinned_elem(ctx, acc_handle, acc);
     ctx.unpin_native_roots(op_pin);
+    Ok(Some(acc))
+}
+
+/// Implements `Stream.reduce(U, BiFunction<U, ? super T, U>, BinaryOperator<U>)`.
+///
+/// Synthetic streams are sequential, so the combiner is deliberately not invoked:
+/// this follows the JDK's sequential reduction behaviour. It is still part of the
+/// registered descriptor so interface dispatch reaches executable native code.
+fn native_stream_reduce_accumulator_combiner(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(args.get(1).copied()),
+    };
+    let identity = args.get(1).copied().unwrap_or(Value::Object(None));
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(identity)),
+    };
+
+    // The accumulator and its return value can move while an invoked lambda
+    // allocates, exactly as in the two-argument reduce implementation above.
+    let accumulator_pin = ctx.pin_native_root(accumulator);
+    let mut acc = identity;
+    let mut acc_handle = match acc {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    };
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(accumulator_pin);
+            return Err(e);
+        }
+    };
+    let (_, elem_handles) = pin_value_slice(ctx, &elements);
+    for i in 0..elements.len() {
+        let accumulator = ctx.read_native_pin(accumulator_pin, accumulator);
+        let acc_arg = read_pinned_elem(ctx, acc_handle, acc);
+        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+        let result = match ctx.invoke_virtual(
+            accumulator,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[acc_arg, elem],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(accumulator_pin);
+                return Err(e);
+            }
+        };
+        acc = result.unwrap_or(Value::Object(None));
+        acc_handle = match acc {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+    }
+    let acc = read_pinned_elem(ctx, acc_handle, acc);
+    ctx.unpin_native_roots(accumulator_pin);
     Ok(Some(acc))
 }
 
@@ -44378,6 +44450,20 @@ mod tests {
             )
             .is_some(),
             "BinaryOperator.apply"
+        );
+    }
+
+    #[test]
+    fn stream_three_argument_reduce_registered() {
+        let r = build_registry();
+        assert!(
+            r.find(
+                "java/util/stream/Stream",
+                "reduce",
+                "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+            )
+            .is_some(),
+            "Stream.reduce(U, BiFunction, BinaryOperator)"
         );
     }
 

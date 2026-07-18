@@ -1,6 +1,6 @@
 # `HttpMessageConvertersAutoConfigurationTests` — `Stream.reduce(identity, accumulator, combiner)` "has no Code attribute"
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-18**
 
 ## Symptom
 
@@ -19,7 +19,7 @@ but context failed to start:
 
 Full log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260717/shard3/logs/module_spring-boot-http-converter.org.springframework.boot.http.converter.autoconfigure.HttpMe-26a1ff7207f2.out.log`
 
-## Root cause (hypothesis — the message itself pins the defect class, but the CratonVM registration site was not located in this pass)
+## Root cause (confirmed)
 
 "Method X has no Code attribute" is CratonVM's own diagnostic for invoking a
 method whose class-file entry is `abstract`/has no bytecode body and for
@@ -36,22 +36,34 @@ the simpler 1-arg (`reduce(BinaryOperator)`) and/or 2-arg
 failure across the whole batch, and `Stream` is used pervasively elsewhere
 in this suite without incident) but not this specific 3-arg signature.
 
-**Not root-caused to a specific `native-builtins`/interpreter file:line in
-this pass** — the `Stream` native-registration source (likely
-`native-builtins/src/lang_stream.rs` or similar, not opened in this
-investigation) was not read to confirm which `reduce` overloads are wired
-up and which are missing.
+The original report did not locate the registration site. It is now confirmed
+in `native-collections/src/lib.rs`; the exact missing descriptor and its
+native implementation are documented below.
 
-**What would confirm/refute:** grep the `Stream`-related native registration
-table for all `"reduce"` entries and compare their descriptors against the
-three real JDK `Stream.reduce` overloads
-(`reduce(BinaryOperator)`, `reduce(T,BinaryOperator)`,
-`reduce(U,BiFunction,BinaryOperator)`); a standalone one-liner
-(`Stream.of(1,2,3).reduce(0, (a,b) -> a+b, Integer::sum)`) would reproduce
-in isolation if confirmed missing.
+## Fix
+
+The confirmed registration site is `native-collections/src/lib.rs`'s
+`register_stream_natives`. It had registrations for the one-argument and
+two-argument `reduce` overloads but not
+`(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;`.
+The fallback to the bare `Stream` interface declaration therefore produced the
+reported no-Code `AbstractMethodError`.
+
+The missing registration and its sequential `BiFunction`-accumulator native
+implementation are now present, with moving-GC roots pinned across callback
+execution. The same fix closes the HATEOAS and REST Docs reports because they
+all dispatch the identical interface method.
 
 ## Affected classes
 
 | Module | Class | Failing tests |
 |---|---|---|
 | `module/spring-boot-http-converter` | `org.springframework.boot.http.converter.autoconfigure.HttpMessageConvertersAutoConfigurationTests` | 1 of 38 (`typeConstrainedConverterFromSpringDataDoesNotPreventAutoConfigurationOfJacksonConverter`) |
+
+## Validation
+
+`HttpMessageConvertersAutoConfigurationTests` passed all 38 tests with the
+fix in both JIT (111.725s) and `--nojit` (103.264s) mode. It was run together
+with the four HATEOAS/REST Docs classes sharing this descriptor; all 48 tests
+passed in each mode, and neither run reported the former no-Code
+`AbstractMethodError`.

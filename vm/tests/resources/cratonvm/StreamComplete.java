@@ -59,6 +59,17 @@ public class StreamComplete {
         return sum; // 15
     }
 
+    // ---- Test 3a: reduce(U, BiFunction, BinaryOperator) ----
+
+    // This is deliberately the three-argument overload, not
+    // reduce(T, BinaryOperator). Its second argument is a BiFunction in the
+    // emitted descriptor; Spring HATEOAS uses that exact interface method
+    // while building media-type settings.
+    public static int testReduceWithAccumulatorAndCombiner() {
+        return Stream.of("a", "b", "c")
+            .reduce(0, (count, ignored) -> count + 1, (left, right) -> left + right);
+    }
+
     // ---- Test 4: forEach() ----
 
     static int forEachSum = 0;
