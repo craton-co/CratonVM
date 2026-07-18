@@ -607,6 +607,27 @@ fn check_reflection_module_access(
     target_class_name: &str,
     accessible_override: bool,
 ) -> Result<(), String> {
+    check_reflection_module_access_with_target_id(
+        ctx,
+        target_class_name,
+        None,
+        accessible_override,
+    )
+}
+
+/// Exact-identity variant of [`check_reflection_module_access`]. A reflective
+/// object already carries its declaring `Class` mirror; callers that have
+/// decoded that mirror must preserve its `ClassId` rather than looking the
+/// binary name up again. The latter is ambiguous when two child loaders define
+/// the same non-public class (Mockito's sequential modified-classpath forks
+/// are one such case), and can turn a valid same-loader constructor call into
+/// a spurious "cannot resolve target class" access failure.
+fn check_reflection_module_access_with_target_id(
+    ctx: &mut dyn NativeContext,
+    target_class_name: &str,
+    target_class_id: Option<ClassId>,
+    accessible_override: bool,
+) -> Result<(), String> {
     if accessible_override {
         // Once setAccessible(true) has been granted, subsequent reflective
         // operations trust the override flag (JEP 403 В§"API changes").
@@ -642,7 +663,7 @@ fn check_reflection_module_access(
     }
 
     // From here on the caller is user code (Application / UserDefined loader).
-    let target_cid = match ctx.class_id_by_name(target_class_name) {
+    let target_cid = match target_class_id.or_else(|| ctx.class_id_by_name(target_class_name)) {
         Some(cid) => cid,
         // Fail CLOSED for user-initiated reflection when the target class is
         // not loaded: we cannot evaluate the module edge, and user code must
@@ -2388,6 +2409,22 @@ fn loader_aware_reflect_assignable(
 
     if ctx.class_name_of_id(source_class_id).as_deref() == Some(target_class_name) {
         return true;
+    }
+
+    // A child loader can define an entry-point class while its resolved
+    // superclass comes from the application loader.  If reflection then
+    // resolves the target through the child namespace, the two
+    // `RegistrationBean` mirrors have different ClassIds even though the
+    // source hierarchy already contains the application-loader class of that
+    // exact name.  Walk the superclass chain by name before considering the
+    // interface graph so Class.isAssignableFrom keeps the same loader-aware
+    // contract as reflective descriptor resolution.
+    let mut current = Some(source_class_id);
+    while let Some(class_id) = current {
+        if ctx.class_name_of_id(class_id).as_deref() == Some(target_class_name) {
+            return true;
+        }
+        current = ctx.superclass_of(class_id);
     }
 
     if !ctx.is_interface_class(target_class_id) {
@@ -8323,7 +8360,12 @@ pub(crate) fn native_constructor_new_instance(
     };
     let ctor_is_public = (ctor_modifiers & 0x0001) != 0;
     if !ctor_is_public {
-        if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
+        if let Err(msg) = check_reflection_module_access_with_target_id(
+            ctx,
+            &class_name,
+            declaring_cid,
+            accessible,
+        ) {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalAccessException {
                     message: format!("Constructor.newInstance: {class_name}: {msg}"),
@@ -10591,6 +10633,45 @@ pub(crate) fn annotation_element_to_java(
     annotation_element_to_java_typed(ctx, val, None, None)
 }
 
+/// Preserve the declared array shape when the class-file annotation reader
+/// reports a lone nested annotation as a scalar element. Java permits the
+/// shorthand `member = @Nested(...)` for a `Nested[]` member, but consumers
+/// such as Spring still receive the declared array type at runtime.
+fn normalize_single_annotation_array(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    return_type_desc: Option<&str>,
+) -> Value {
+    let Some(component_name) = return_type_desc
+        .and_then(|desc| desc.strip_prefix("[L"))
+        .and_then(|desc| desc.strip_suffix(';'))
+    else {
+        return value;
+    };
+    let component_id = ctx.class_id_by_name(component_name).or_else(|| {
+        let _ = ctx.load_class(component_name);
+        ctx.class_id_by_name(component_name)
+    });
+    let Some(component_id) = component_id else {
+        return value;
+    };
+    let value_pin = match value {
+        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+        _ => None,
+    };
+    let array = ctx.new_ref_array(component_id, 1);
+    let element = match (value, value_pin) {
+        (Value::Object(Some(object)), Some(pin)) => {
+            let forwarded = ctx.read_native_pin(pin, object);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(forwarded))
+        }
+        (other, _) => other,
+    };
+    ctx.set_array_element(array, 0, element);
+    Value::Object(Some(array))
+}
+
 /// S111r19 вЂ” typed variant: when called for a known annotation-element method,
 /// the caller passes the method's return-type descriptor (e.g.
 /// `[Ljava/lang/String;`).  Used to recover the array component class for
@@ -10832,7 +10913,7 @@ pub(crate) fn annotation_element_to_java_typed(
         }
         AnnotationElementValue::Annotation(nested) => {
             let proxy = create_annotation_proxy(ctx, nested, container_loader);
-            Value::Object(Some(proxy))
+            normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
             // Pick a component class for the array based on the element kind so

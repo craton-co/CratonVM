@@ -12084,7 +12084,22 @@ pub(crate) fn annotation_proxy_invoke_shared(
     // `AnnotationAttributes[]`, surfacing as the `TypeFilterUtils.java:77`
     // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
     // (`@Filter` attribute is null).
+    if method_name == "asAnnotationAttributes" {
+        // `MergedAnnotation.asAnnotationAttributes(Adapt...)` has one
+        // argument: the Adapt[] varargs array. `annotation_proxy_as_map`
+        // accepts `(Function factory, Adapt[] adapts)`, so preserve the
+        // adaptation array in its second slot and use no factory.
+        let adapts = args.first().copied().unwrap_or(Value::Object(None));
+        return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+    }
     if method_name == "asMap" {
+        // The `asMap(Adapt...)` overload similarly has no factory. Without
+        // this routing, CLASS_TO_STRING is mistaken for a factory argument
+        // and Class[] values leak into AnnotationAttributes.
+        if args.len() <= 1 {
+            let adapts = args.first().copied().unwrap_or(Value::Object(None));
+            return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+        }
         return annotation_proxy_as_map(shared, thread, proxy, args);
     }
     // Annotation equality is symmetric, but our native `AnnotationProxy` equals
@@ -12253,6 +12268,66 @@ fn annotation_proxy_as_map(
     Ok(Some(Value::Object(Some(dest_map))))
 }
 
+/// Materialize a real or synthetic annotation proxy as a one-element
+/// `AnnotationAttributes[]`. This is used at Spring's scalar-to-array
+/// metadata boundary for a nested annotation that the forked class-path
+/// reader reports without its declared array wrapper.
+pub(crate) fn annotation_proxy_to_annotation_attributes_array(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let attrs_cid = shared
+        .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
+    // The servlet API's `WebFilter.initParams()` default is an empty array.
+    // In the forked class-path reader it can appear as a zero-field
+    // WebInitParam placeholder rather than a real annotation proxy. It holds
+    // no member data, so its faithful AnnotationAttributes representation is
+    // the declared empty array.
+    if class_name_is(shared, value, "jakarta/servlet/annotation/WebInitParam")
+        && shared.heap.num_fields(value) == 0
+    {
+        return Ok(Some(shared.heap.alloc_array(
+            attrs_cid,
+            cratonvm_types::ArrayElementType::Reference,
+            0,
+        )));
+    }
+    let proxy = if class_name_is(shared, value, "java/lang/annotation/AnnotationProxy") {
+        Some(value)
+    } else {
+        match shared.heap.get_field(value, 0) {
+            Value::Object(Some(handler))
+                if class_name_is(shared, handler, "java/lang/annotation/AnnotationProxy") =>
+            {
+                Some(handler)
+            }
+            _ => None,
+        }
+    };
+    let Some(proxy) = proxy else {
+        return Ok(None);
+    };
+    let attrs = match annotation_proxy_as_map(
+        shared,
+        thread,
+        proxy,
+        &[Value::Object(None), Value::Object(None)],
+    )? {
+        Some(Value::Object(Some(attrs))) => attrs,
+        _ => return Ok(None),
+    };
+    let array = shared
+        .heap
+        .alloc_array(attrs_cid, cratonvm_types::ArrayElementType::Reference, 1);
+    shared
+        .heap
+        .set_array_element(array, 0, Value::Object(Some(attrs)))
+        .ok();
+    Ok(Some(array))
+}
+
 /// Test whether the given (possibly-null) Adapt[] varargs array contains
 /// an enum constant whose `name` slot equals `target_name`.
 fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: &str) -> bool {
@@ -12295,7 +12370,7 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
 /// return `val` unchanged. Implements the `Adapt.CLASS_TO_STRING` semantics
 /// for `MergedAnnotation.asMap` so that downstream
 /// `AnnotationAttributes.getStringArray("basePackageClasses")` succeeds.
-fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
+pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
     use crate::memory::heap::ObjectKind;
     let obj = match val {
         Value::Object(Some(o)) => o,
@@ -15427,6 +15502,26 @@ fn invoke_on_class_shared_inner(
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
                         || crate::runtime::interpreter::is_undertow_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_netty_event_executor_group_shutdown_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_destroy_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_customize_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_datagram_channel_open_native_override(
                             class_name,
                             method_name,
                             descriptor,

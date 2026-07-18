@@ -9022,6 +9022,25 @@ mod context_class_loader_tests {
     }
 
     #[test]
+    fn essential_registers_netty_event_executor_shutdown_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        for class_name in [
+            "io/netty/util/concurrent/EventExecutorGroup",
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "io/netty/channel/MultiThreadIoEventLoopGroup",
+        ] {
+            assert!(registry
+                .find(
+                    class_name,
+                    "shutdownGracefully",
+                    "()Lio/netty/util/concurrent/Future;"
+                )
+                .is_some());
+        }
+    }
+
+    #[test]
     fn essential_define_class2_registration_uses_bytebuffer_handler() {
         let mut registry = NativeMethodRegistry::new();
         register_essential_natives(&mut registry);
@@ -37340,31 +37359,117 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `NoClassDefFoundError: io/netty/resolver/dns/DnsServerAddressStreamProviders$DefaultProviderHolder`
     // for every later reference, breaking Reactor-Netty-based HTTP client
     // tests entirely. We don't surface real OS DNS config (no IP Helper API
-    // integration), so leave `os_searchlist`/`os_nameservers` as their
-    // default null — `loadConfig()`'s `stringToList`/`addressesToList` treat
-    // a null input as "empty", giving an empty search list. Netty's own
-    // resolver falls back to platform-default nameservers when this
-    // courtesy list is empty, so plain loopback/localhost resolution (all
-    // this suite needs) is unaffected. `notifyAddrChange0()` (address-change
-    // notification handle) is only consulted by an optional network-change
-    // listener our tests don't exercise; 0 is a harmless placeholder.
+    // integration), so publish empty *strings* for both OS-provided values.
+    // This is deliberately not null: the real JDK's `loadConfig()` calls
+    // `stringToList(os_nameservers)` unconditionally, and its implementation
+    // calls `String.split` without a null guard. An empty string preserves the
+    // intended empty-config semantics for Netty while also allowing the
+    // MongoDB driver's JNDI TXT resolver to reach its ordinary no-nameserver
+    // path instead of failing during resolver initialization.
+    // `notifyAddrChange0()` (address-change notification handle) is only
+    // consulted by an optional network-change listener our tests don't
+    // exercise; 0 is a harmless placeholder.
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "init0",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, _args| {
+            let searchlist = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_searchlist",
+                Value::Object(Some(searchlist)),
+            );
+            let nameservers = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_nameservers",
+                Value::Object(Some(nameservers)),
+            );
+            Ok(None)
+        },
     );
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "loadDNSconfig0",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, _args| {
+            let searchlist = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_searchlist",
+                Value::Object(Some(searchlist)),
+            );
+            let nameservers = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_nameservers",
+                Value::Object(Some(nameservers)),
+            );
+            Ok(None)
+        },
     );
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "notifyAddrChange0",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // JNDI DNS uses PortConfig to select a UDP source port. These are native
+    // JDK methods (not Java fallbacks), so real-JDK mode otherwise stops at an
+    // UnsatisfiedLinkError before the TXT query can be issued.
+    registry.register(
+        "sun/net/PortConfig",
+        "getLower0",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().0))),
+    );
+    registry.register(
+        "sun/net/PortConfig",
+        "getUpper0",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().1))),
+    );
+
+    // MongoDB Reactive Streams 5.7 uses Netty 4.2's
+    // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
+    // client has closed, a monitor callback can keep re-enqueuing work in
+    // CratonVM's event-loop implementation, so Netty's ordinary two-second
+    // quiet period never becomes quiet and Spring's context destroy callback
+    // waits indefinitely. Restrict the bridge to that concrete Netty 4.2
+    // group: it invokes Netty's own three-argument shutdown bytecode with a
+    // zero quiet period. Other EventExecutorGroup implementations retain
+    // their original no-argument bytecode unchanged.
+    registry.register(
+        "io/netty/util/concurrent/EventExecutorGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "io/netty/util/concurrent/AbstractEventExecutorGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+        "customize",
+        "(Lcom/mongodb/MongoClientSettings$Builder;)V",
+        native_springboot_mongo_reactive_customizer_customize,
+    );
+    registry.register(
+        "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+        "destroy",
+        "()V",
+        native_springboot_mongo_reactive_customizer_destroy,
     );
 
     // `sun/nio/ch/NativeThread.supportPendingSignals0()Z` — a Linux-only
@@ -42789,6 +42894,222 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
     } else {
         format!("lib{}.so", name)
     }
+}
+
+fn native_netty_event_executor_group_shutdown_gracefully(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+    if class_name.as_deref() != Some("io/netty/channel/MultiThreadIoEventLoopGroup") {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "shutdownGracefully",
+            "()Lio/netty/util/concurrent/Future;",
+            &[],
+        );
+    }
+
+    let time_unit = ctx.ensure_class_initialized("java/util/concurrent/TimeUnit")?;
+    let milliseconds_field = ctx
+        .static_field_index_by_name(time_unit, "MILLISECONDS")
+        .ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "java/util/concurrent/TimeUnit.MILLISECONDS static field not found"
+                    .to_string(),
+            })
+        })?;
+    let milliseconds = ctx.get_static_field(time_unit, milliseconds_field);
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "shutdownGracefully",
+        "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;",
+        &[Value::Long(0), Value::Long(0), milliseconds],
+    )
+}
+
+fn native_springboot_mongo_reactive_customizer_destroy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Spring Boot 4.0's customizer blocks here in
+    // `shutdownGracefully().awaitUninterruptibly()`. In this runtime Netty's
+    // worker threads can already have exited while its promise remains
+    // incomplete, leaving application-context destruction stuck forever.
+    // Request the ordinary zero-quiet-period graceful shutdown, but do not
+    // await its stale termination promise. The matching `customize` bridge
+    // creates this one lifecycle-owned group with daemon workers, so those
+    // workers cannot retain the VM after the Spring context has returned.
+    if let Value::Object(Some(event_loop_group)) = ctx.get_field_by_name(this, "eventLoopGroup") {
+        native_netty_event_executor_group_shutdown_gracefully(
+            ctx,
+            &[Value::Object(Some(event_loop_group))],
+        )?;
+        ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(None));
+    }
+    Ok(None)
+}
+
+fn native_springboot_mongo_reactive_customizer_customize(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let builder = match args.get(1).copied() {
+        Some(Value::Object(Some(builder))) => builder,
+        _ => return Ok(None),
+    };
+
+    // Preserve Spring Boot's opt-out for user-provided transport settings.
+    if let Value::Object(Some(provider)) = ctx.get_field_by_name(this, "settings") {
+        if let Some(Value::Object(Some(settings))) =
+            ctx.invoke_virtual(provider, "getIfAvailable", "()Ljava/lang/Object;", &[])?
+        {
+            if matches!(
+                ctx.invoke_virtual(
+                    settings,
+                    "getTransportSettings",
+                    "()Lcom/mongodb/connection/TransportSettings;",
+                    &[],
+                )?,
+                Some(Value::Object(Some(_)))
+            ) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // A TLS-enabled Mongo client can still be completing its asynchronous
+    // bootstrap when Spring destroys this bean. Netty's termination promise is
+    // then left incomplete by CratonVM even after all useful work is done. Use
+    // a daemon factory only for this Spring-owned client group, preserving the
+    // normal non-daemon policy for application-managed Netty groups.
+    let thread_factory = match ctx.new_object("io/netty/util/concurrent/DefaultThreadFactory")? {
+        Some(Value::Object(Some(factory))) => factory,
+        _ => return Ok(None),
+    };
+    let factory_pin = ctx.pin_native_root(thread_factory);
+    let pool_name = ctx.create_string("cratonvm-mongo-reactive");
+    let pool_name_pin = ctx.pin_native_root(pool_name);
+    let factory = ctx.read_native_pin(factory_pin, thread_factory);
+    let pool_name = ctx.read_native_pin(pool_name_pin, pool_name);
+    ctx.invoke(
+        "io/netty/util/concurrent/DefaultThreadFactory",
+        "<init>",
+        "(Ljava/lang/String;ZI)V",
+        &[
+            Value::Object(Some(factory)),
+            Value::Object(Some(pool_name)),
+            Value::Int(1),
+            Value::Int(5),
+        ],
+    )?;
+    ctx.unpin_native_roots(pool_name_pin);
+
+    let handler_factory = match ctx.invoke(
+        "io/netty/channel/nio/NioIoHandler",
+        "newFactory",
+        "()Lio/netty/channel/IoHandlerFactory;",
+        &[],
+    )? {
+        Some(Value::Object(Some(handler_factory))) => handler_factory,
+        _ => {
+            ctx.unpin_native_roots(factory_pin);
+            return Ok(None);
+        }
+    };
+    let handler_pin = ctx.pin_native_root(handler_factory);
+    let event_loop_group = match ctx.new_object("io/netty/channel/MultiThreadIoEventLoopGroup")? {
+        Some(Value::Object(Some(group))) => group,
+        _ => {
+            ctx.unpin_native_roots(handler_pin);
+            ctx.unpin_native_roots(factory_pin);
+            return Ok(None);
+        }
+    };
+    let group_pin = ctx.pin_native_root(event_loop_group);
+    let event_loop_group = ctx.read_native_pin(group_pin, event_loop_group);
+    let thread_factory = ctx.read_native_pin(factory_pin, thread_factory);
+    let handler_factory = ctx.read_native_pin(handler_pin, handler_factory);
+    ctx.invoke(
+        "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "<init>",
+        "(Ljava/util/concurrent/ThreadFactory;Lio/netty/channel/IoHandlerFactory;)V",
+        &[
+            Value::Object(Some(event_loop_group)),
+            Value::Object(Some(thread_factory)),
+            Value::Object(Some(handler_factory)),
+        ],
+    )?;
+    let event_loop_group = ctx.read_native_pin(group_pin, event_loop_group);
+    ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(Some(event_loop_group)));
+    ctx.unpin_native_roots(group_pin);
+    ctx.unpin_native_roots(handler_pin);
+    ctx.unpin_native_roots(factory_pin);
+
+    let transport_builder = match ctx.invoke(
+        "com/mongodb/connection/TransportSettings",
+        "nettyBuilder",
+        "()Lcom/mongodb/connection/NettyTransportSettings$Builder;",
+        &[],
+    )? {
+        Some(Value::Object(Some(transport_builder))) => transport_builder,
+        _ => return Ok(None),
+    };
+    let transport_builder_pin = ctx.pin_native_root(transport_builder);
+    let event_loop_group = match ctx.get_field_by_name(this, "eventLoopGroup") {
+        Value::Object(Some(group)) => group,
+        _ => {
+            ctx.unpin_native_roots(transport_builder_pin);
+            return Ok(None);
+        }
+    };
+    let transport_builder = ctx.read_native_pin(transport_builder_pin, transport_builder);
+    ctx.invoke_virtual(
+        transport_builder,
+        "eventLoopGroup",
+        "(Lio/netty/channel/EventLoopGroup;)Lcom/mongodb/connection/NettyTransportSettings$Builder;",
+        &[Value::Object(Some(event_loop_group))],
+    )?;
+    let transport_builder = ctx.read_native_pin(transport_builder_pin, transport_builder);
+    let transport_settings = match ctx.invoke_virtual(
+        transport_builder,
+        "build",
+        "()Lcom/mongodb/connection/NettyTransportSettings;",
+        &[],
+    )? {
+        Some(Value::Object(Some(transport_settings))) => transport_settings,
+        _ => {
+            ctx.unpin_native_roots(transport_builder_pin);
+            return Ok(None);
+        }
+    };
+    let transport_settings_pin = ctx.pin_native_root(transport_settings);
+    let transport_settings = ctx.read_native_pin(transport_settings_pin, transport_settings);
+    ctx.invoke_virtual(
+        builder,
+        "transportSettings",
+        "(Lcom/mongodb/connection/TransportSettings;)Lcom/mongodb/MongoClientSettings$Builder;",
+        &[Value::Object(Some(transport_settings))],
+    )?;
+    ctx.unpin_native_roots(transport_settings_pin);
+    ctx.unpin_native_roots(transport_builder_pin);
+    Ok(None)
+}
+
+fn system_ephemeral_port_range() -> (i32, i32) {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| {
+            let mut ports = range.split_whitespace().filter_map(|port| port.parse::<i32>().ok());
+            Some((ports.next()?, ports.next()?))
+        })
+        .filter(|(lower, upper)| (0..=*upper).contains(lower) && *upper <= 65_535)
+        // IANA's dynamic/private range is the portable fallback when the host
+        // has no Linux procfs port-range setting (for example on Windows).
+        .unwrap_or((49_152, 65_535))
 }
 
 pub(crate) fn obj_arg(

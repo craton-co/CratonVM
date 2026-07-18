@@ -11924,6 +11924,33 @@ fn p57_trim_file_trailing_separator(path: &str) -> String {
     trimmed.to_string()
 }
 
+/// WindowsPath removes trailing separators from ordinary paths at construction
+/// time, but retains them for filesystem roots. Keep that representation
+/// invariant in CratonVM's synthetic Path objects so every consumer of a Path
+/// (including `Files.writeString`) sees the same canonical path.
+///
+/// Mounted jar/JRT paths use their trailing `/` as an in-filesystem entry
+/// marker, so they deliberately retain it.
+fn p57_trim_windows_path_trailing_separator(path: &str) -> String {
+    if !cfg!(windows) || vfs_decode(path).is_some() {
+        return path.to_string();
+    }
+
+    let canonical = path.replace('\\', "/");
+    if !canonical.ends_with('/') && !canonical.ends_with('\\') {
+        return canonical;
+    }
+
+    // Roots (drive, UNC, drive-less, and verbatim) must retain their terminal
+    // separator. Every non-root path has at least one name element.
+    let (_, names) = p57_parse_win_root(&canonical);
+    if names.is_empty() {
+        canonical
+    } else {
+        canonical.trim_end_matches(['/', '\\']).to_string()
+    }
+}
+
 #[cfg(windows)]
 fn p57_windows_absolute_path_string(path: &str) -> String {
     let s = path.replace('\\', "/");
@@ -12136,7 +12163,25 @@ mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    use super::{p57_win_is_absolute, p57_win_parent_of};
+    use super::{p57_trim_windows_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
+
+    #[test]
+    fn trailing_separator_is_removed_only_from_non_roots() {
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("C:/work/one/two/"),
+            "C:/work/one/two"
+        );
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("one\\two\\"),
+            "one/two"
+        );
+        assert_eq!(p57_trim_windows_path_trailing_separator("C:/"), "C:/");
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("//server/share/"),
+            "//server/share/"
+        );
+        assert_eq!(p57_trim_windows_path_trailing_separator("/"), "/");
+    }
 
     #[test]
     fn is_absolute_matches_hotspot() {
@@ -12330,11 +12375,7 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // encoded strings carry a sentinel + their own '/'-separated entry, so
     // never rewrite those.
     #[cfg(windows)]
-    let stored = if jarfs_decode(path).is_some() {
-        path.to_string()
-    } else {
-        path.replace('\\', "/")
-    };
+    let stored = p57_trim_windows_path_trailing_separator(path);
     #[cfg(not(windows))]
     let stored = path.to_string();
     // Pin across the create_string below — a moving young GC there would
