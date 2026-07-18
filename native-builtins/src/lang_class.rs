@@ -18176,6 +18176,35 @@ mod tests {
     }
 
     #[test]
+    fn spring_graphql_lambda_get_package_uses_defining_host_package() {
+        let mut ctx = mock_ctx();
+        // The mock's legacy Class-mirror representation stores ids in a
+        // signed Java int, so use a low synthetic id here. Production lambda
+        // ids are high-bit values resolved through the VM reverse map.
+        let lambda_id = ClassId::new(42);
+        ctx.set_lambda_proxy_host(
+            lambda_id,
+            "org/springframework/graphql/execution/ContextDataFetcherDecorator",
+        );
+        // A synthetic lambda has a Class mirror but no class-store name.
+        let mirror = make_class_mirror_with_package(&mut ctx, lambda_id.as_u32(), "");
+
+        let r = native_class_get_package(&mut ctx, &[Value::Object(Some(mirror))]).unwrap();
+        let pkg = match r {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected non-null Package for lambda, got {other:?}"),
+        };
+        let name_obj = match ctx.get_field(pkg, 0) {
+            Value::Object(Some(s)) => s,
+            other => panic!("expected Package.name string, got {other:?}"),
+        };
+        assert_eq!(
+            ctx.read_string(name_obj).as_deref(),
+            Some("org.springframework.graphql.execution")
+        );
+    }
+
+    #[test]
     fn t19_h10_get_package_default_package_returns_empty_name() {
         // Class without a package (e.g. `Foo` at the default package) gets
         // a Package with empty name.
