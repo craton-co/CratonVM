@@ -24837,6 +24837,34 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.net.URLClassLoader` declares its OWN `getResourceAsStream`
+    // override (unlike `getResource`/`getResources`/`findResource`, which it
+    // leaves to `ClassLoader`/its own `findResource` extension point) — real
+    // OpenJDK wraps the stream so it can be tracked in the `closeables`
+    // WeakHashMap for `close()`. That means the check above, keyed on
+    // declaring class `java/lang/ClassLoader`, never matches a plain
+    // `URLClassLoader` (or subclass that doesn't itself override
+    // `getResourceAsStream`) instance's call — its declaring class resolves
+    // to `java/net/URLClassLoader` instead, so real bytecode ran unforced.
+    // That bytecode still depends on the same unpopulated `ucp`
+    // (`URLClassPath`) internals the comment above describes, but ALSO
+    // doesn't do the parent-delegation the native bridge implements: a
+    // `new URLClassLoader(urls, parent)` whose only own URL is e.g. a
+    // `@TempDir` holding a generated `META-INF/spring.components` index
+    // (Spring Boot's `ServletComponentScanIntegrationTests
+    // .indexedComponentsAreRegistered`) found the index fine via
+    // `getResource`/`findResource` (both correctly native-forced already)
+    // but got `null` from `getResourceAsStream` for every `.class` resource
+    // that only the PARENT classloader's classpath actually holds —
+    // `ClassPathResource.getInputStream()` then threw `FileNotFoundException`
+    // reading an indexed component class that plainly exists. Force native
+    // dispatch here too so `URLClassLoader.getResourceAsStream` resolves via
+    // the same delegation-aware bridge (`classloader::cl_get_resource_as_stream`)
+    // as the base-class methods above.
+    if class_name == "java/net/URLClassLoader" && method_name == "getResourceAsStream" {
+        return true;
+    }
+
     // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading

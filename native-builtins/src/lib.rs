@@ -35230,6 +35230,39 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             classloader::cl_get_resource_as_stream_essential,
         );
     }
+    // `java.net.URLClassLoader` declares its OWN `getResourceAsStream`
+    // override in real bytecode (unlike `getResource`/`getResources`/
+    // `findResource`, left to `ClassLoader`/its own extension point), so the
+    // `java/lang/ClassLoader` registration above never gets consulted for a
+    // URLClassLoader-typed receiver — dispatch resolves the declaring class
+    // to `java/net/URLClassLoader` itself. The equivalent registration for
+    // this exact class previously lived ONLY in
+    // `classloader::register_classloader_natives`/`servlet::register_s1_classloading`,
+    // both nested inside `register_synthetic_overrides` — a no-op stub in
+    // the default real-JDK `cratonvm-cli` build (`vm/src/native/builtins.rs`,
+    // `#[cfg(feature = "synthetic-jdk")]`-gated) — so this override was
+    // effectively dead in real-JDK mode despite `force_native_over_real_jdk_bytecode`
+    // (vm/src/runtime/interpreter.rs) and the `check_override` allow-list
+    // (vm/src/vm/vm_exec.rs) both correctly forcing native dispatch: the
+    // force-check passed but the registry lookup then found nothing to call,
+    // silently falling through to real (broken, unpopulated-`ucp`-backed,
+    // non-parent-delegating) bytecode. Concretely this broke Spring Boot's
+    // `StaticResourceJarsTests`-adjacent `ServletComponentScanIntegrationTests
+    // .indexedComponentsAreRegistered` / `MockWebEnvironmentServletComponentScanIntegrationTests`:
+    // a `new URLClassLoader(urls, parent)` wrapping only a `@TempDir`-generated
+    // `META-INF/spring.components` index (parented to the real test
+    // classloader) resolved `.class` resources fine via `getResource` but got
+    // `null` from `getResourceAsStream` for every one the PARENT actually
+    // holds, so `ClassPathResource.getInputStream()` threw
+    // `FileNotFoundException` reading an indexed component that plainly
+    // exists. Register the always-real-JDK-mode-active essential native here
+    // instead.
+    registry.register(
+        "java/net/URLClassLoader",
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::cl_get_resource_as_stream_essential,
+    );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
     // resolves the `.kotlin_builtins` protobuf resources via
