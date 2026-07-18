@@ -6815,7 +6815,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `getFileAttributeView(dir, DosFileAttributeView.class).setReadOnly(true)`;
     // an unregistered setter → AbstractMethodError aborted the cache-dir setup
     // → the bogus "… is not a directory" leaf (SB-14). No-ops are sufficient
-    // (the JDK call only needs to not throw). `setTimes` applies to both views.
+    // (the JDK call only needs to not throw). `setTimes` applies real
+    // filesystem timestamps on both views.
     for vclass in [
         "java/nio/file/attribute/BasicFileAttributeView",
         "java/nio/file/attribute/DosFileAttributeView",
@@ -6824,7 +6825,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             vclass,
             "setTimes",
             "(Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;)V",
-            |_ctx, _args| Ok(None),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let path_value = ctx.get_field(this, 0);
+                let path = extract_path_string(ctx, Some(&path_value));
+                let modified = args.get(1).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                let access = args.get(2).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                let creation = args.get(3).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                set_file_attribute_times(&path, creation, access, modified)
+                    .map_err(|error| p57_io_error(&error))?;
+                Ok(None)
+            },
         );
     }
     for setter in ["setReadOnly", "setHidden", "setSystem", "setArchive"] {
@@ -22770,13 +22790,159 @@ pub(crate) struct JarEntryRec {
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
+    pub(crate) times: JarEntryTimes,
     pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// ZIP extended timestamp fields are authoritative when a JDK-created entry
+/// has a DOS date of 1980. The latter is a lossy fallback, while the extra
+/// fields retain the actual FileTime values.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JarEntryTimes {
+    pub(crate) modified: Option<i64>,
+    pub(crate) access: Option<i64>,
+    pub(crate) creation: Option<i64>,
 }
 
 /// Whole-jar parsed contents: per-name records plus central-directory order.
 pub(crate) struct JarContents {
     pub(crate) by_name: std::collections::HashMap<String, JarEntryRec>,
     pub(crate) order: Vec<String>,
+}
+
+fn p59_zip_entry_times(entry: &zip::read::ZipFile<'_>) -> JarEntryTimes {
+    let mut times = JarEntryTimes::default();
+    for field in entry.extra_data_fields() {
+        let parsed = match field {
+            zip::extra_fields::ExtraField::ExtendedTimestamp(timestamp) => JarEntryTimes {
+                modified: timestamp.mod_time().map(|time| i64::from(time) * 1_000),
+                access: timestamp.ac_time().map(|time| i64::from(time) * 1_000),
+                creation: timestamp.cr_time().map(|time| i64::from(time) * 1_000),
+            },
+            zip::extra_fields::ExtraField::Ntfs(timestamp) => JarEntryTimes {
+                modified: Some(p59_windows_filetime_to_unix_millis(timestamp.mtime())),
+                access: Some(p59_windows_filetime_to_unix_millis(timestamp.atime())),
+                creation: Some(p59_windows_filetime_to_unix_millis(timestamp.ctime())),
+            },
+        };
+        p59_merge_zip_times(&mut times, parsed);
+    }
+    times
+}
+
+fn p59_windows_filetime_to_unix_millis(time: u64) -> i64 {
+    (i128::from(time) / 10_000 - 11_644_473_600_000i128) as i64
+}
+
+fn p59_merge_zip_times(target: &mut JarEntryTimes, source: JarEntryTimes) {
+    if source.modified.is_some() {
+        target.modified = source.modified;
+    }
+    if source.access.is_some() {
+        target.access = source.access;
+    }
+    if source.creation.is_some() {
+        target.creation = source.creation;
+    }
+}
+
+/// The JDK writes access and creation values into the local header's 0x5455
+/// extra field while the central directory often retains only modified time.
+fn p59_zip_local_entry_times(path: &str, entry: &zip::read::ZipFile<'_>) -> JarEntryTimes {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return JarEntryTimes::default();
+    };
+    if file.seek(SeekFrom::Start(entry.header_start())).is_err() {
+        return JarEntryTimes::default();
+    }
+    let mut header = [0u8; 30];
+    if file.read_exact(&mut header).is_err() || header[0..4] != *b"PK\x03\x04" {
+        return JarEntryTimes::default();
+    }
+    let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+    let extra_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
+    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
+        return JarEntryTimes::default();
+    }
+    let mut extra = vec![0u8; extra_len];
+    if file.read_exact(&mut extra).is_err() {
+        return JarEntryTimes::default();
+    }
+    p59_zip_extra_times(&extra)
+}
+
+fn p59_zip_extra_times(extra: &[u8]) -> JarEntryTimes {
+    let mut times = JarEntryTimes::default();
+    let mut offset = 0;
+    while offset + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
+        let len = usize::from(u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]));
+        offset += 4;
+        let Some(data) = extra.get(offset..offset + len) else {
+            break;
+        };
+        match tag {
+            0x5455 if !data.is_empty() => {
+                let flags = data[0];
+                let mut cursor = 1;
+                let mut read_time = |enabled: bool| {
+                    if !enabled || cursor + 4 > data.len() {
+                        return None;
+                    }
+                    let time = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?);
+                    cursor += 4;
+                    Some(i64::from(time) * 1_000)
+                };
+                times.modified = read_time(flags & 0x01 != 0 || data.len() == 5);
+                times.access = read_time(flags & 0x02 != 0);
+                times.creation = read_time(flags & 0x04 != 0);
+            }
+            0x000a if data.len() >= 32 && data[4..6] == [0x01, 0x00] && data[6..8] == [24, 0] => {
+                times.modified = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[8..16].try_into().unwrap(),
+                )));
+                times.access = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[16..24].try_into().unwrap(),
+                )));
+                times.creation = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[24..32].try_into().unwrap(),
+                )));
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+    times
+}
+
+fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times: JarEntryTimes) {
+    let entry_pin = ctx.pin_native_root(entry);
+    for (field, millis) in [
+        ("mtime", times.modified),
+        ("atime", times.access),
+        ("ctime", times.creation),
+    ] {
+        let Some(millis) = millis else {
+            continue;
+        };
+        let time = match ctx.invoke(
+            "java/nio/file/attribute/FileTime",
+            "fromMillis",
+            "(J)Ljava/nio/file/attribute/FileTime;",
+            &[Value::Long(millis)],
+        ) {
+            Ok(Some(Value::Object(Some(time)))) => time,
+            _ => continue,
+        };
+        let time_pin = ctx.pin_native_root(time);
+        let entry = ctx.read_native_pin(entry_pin, entry);
+        let time = ctx.read_native_pin(time_pin, time);
+        ctx.set_field_by_name(entry, field, Value::Object(Some(time)));
+        ctx.unpin_native_roots(time_pin);
+    }
+    ctx.unpin_native_roots(entry_pin);
 }
 
 /// Per-path cache of a JAR's parsed central directory + decompressed entries.
@@ -22826,6 +22992,8 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         #[allow(deprecated)]
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let mut times = p59_zip_entry_times(&entry);
+        p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
         let mut buf = Vec::with_capacity(entry.size() as usize);
         if entry.read_to_end(&mut buf).is_err() {
             continue;
@@ -22838,6 +23006,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 csize,
                 method,
                 crc,
+                times,
                 bytes: Arc::new(buf),
             },
         );
@@ -22875,7 +23044,8 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc) = (rec.size, rec.csize, rec.method, rec.crc);
+        let (size, csize, method, crc, times) =
+            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
         let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
@@ -22897,6 +23067,7 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
+        p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
     // Re-read every entry to its current (post-GC) address before returning.
@@ -22919,13 +23090,14 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc) = match contents.by_name.get(entry_name) {
+    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
             rec.size,
             rec.csize,
             rec.method,
             rec.crc,
+            rec.times,
         ),
         None => return Value::Object(None),
     };
@@ -22950,6 +23122,7 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
+    p59_set_jar_entry_times(ctx, je, times);
     Value::Object(Some(je))
 }
 
@@ -26553,6 +26726,101 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
         Value::Long(v) => v,
         _ => 0,
     }
+}
+
+/// Apply the non-null fields passed to `BasicFileAttributeView.setTimes`.
+/// `filetime` provides portable access/modified-time updates; Windows also
+/// exposes a mutable creation time, which is handled with `SetFileTime`.
+fn set_file_attribute_times(
+    path: &str,
+    creation_millis: Option<i64>,
+    access_millis: Option<i64>,
+    modified_millis: Option<i64>,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        return set_file_attribute_times_windows(
+            path,
+            creation_millis,
+            access_millis,
+            modified_millis,
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = creation_millis;
+        if let Some(access_millis) = access_millis {
+            filetime::set_file_atime(path, filetime_from_millis(access_millis))?;
+        }
+        if let Some(modified_millis) = modified_millis {
+            filetime::set_file_mtime(path, filetime_from_millis(modified_millis))?;
+        }
+        Ok(())
+    }
+}
+
+fn filetime_from_millis(millis: i64) -> filetime::FileTime {
+    let seconds = millis.div_euclid(1_000);
+    let nanos = (millis.rem_euclid(1_000) * 1_000_000) as u32;
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+#[cfg(windows)]
+fn set_file_attribute_times_windows(
+    path: &str,
+    creation_millis: Option<i64>,
+    access_millis: Option<i64>,
+    modified_millis: Option<i64>,
+) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    unsafe extern "system" {
+        fn SetFileTime(
+            file: *mut std::ffi::c_void,
+            creation: *const FileTime,
+            access: *const FileTime,
+            modified: *const FileTime,
+        ) -> i32;
+    }
+
+    fn as_filetime(millis: i64) -> FileTime {
+        let ticks = (i128::from(millis) + 11_644_473_600_000i128) * 10_000i128;
+        let ticks = ticks as u64;
+        FileTime {
+            low: ticks as u32,
+            high: (ticks >> 32) as u32,
+        }
+    }
+
+    let creation = creation_millis.map(as_filetime);
+    let access = access_millis.map(as_filetime);
+    let modified = modified_millis.map(as_filetime);
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)?;
+    let result = unsafe {
+        SetFileTime(
+            file.as_raw_handle().cast(),
+            creation.as_ref().map_or(ptr::null(), |time| time),
+            access.as_ref().map_or(ptr::null(), |time| time),
+            modified.as_ref().map_or(ptr::null(), |time| time),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Allocate a real platform `BasicFileAttributes` implementation.
