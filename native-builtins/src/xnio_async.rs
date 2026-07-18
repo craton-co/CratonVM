@@ -182,7 +182,16 @@ impl OptionValue {
 
 #[derive(Debug, Default)]
 pub(crate) struct OptionMapInner {
-    pub(crate) entries: HashMap<OptionKey, OptionValue>,
+    /// Family-1 fix (cce0079 tree-key tail): `OptionValue::Obj` variants hold
+    /// raw heap `ObjectRef`s in this Rust-side registry — invisible to field
+    /// tracing. They must be rooted AND remapped by every moving GC (see
+    /// `gc_scan_xnio_future_roots`/`gc_update_xnio_future_refs`), which
+    /// requires interior mutability — hence the leaf Mutex (same pattern as
+    /// `FutureState`/`BuilderInner.pending`). Readers must COPY the entry out
+    /// and drop the guard before any GC-capable call (allocation/boxing):
+    /// the GC's own scan takes this lock, so holding it across a safepoint
+    /// deadlocks the collection.
+    pub(crate) entries: Mutex<HashMap<OptionKey, OptionValue>>,
 }
 
 impl OptionMapInner {
@@ -191,7 +200,7 @@ impl OptionMapInner {
         EMPTY
             .get_or_init(|| {
                 Arc::new(OptionMapInner {
-                    entries: HashMap::new(),
+                    entries: Mutex::new(HashMap::new()),
                 })
             })
             .clone()
@@ -590,6 +599,32 @@ pub fn gc_scan_xnio_future_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
         }
         true
     });
+    // Family-1 fix (cce0079 tree-key tail): registered OptionMap snapshots
+    // and un-consumed Builders hold `OptionValue::Obj` raw refs — reachable
+    // ONLY through these Rust-side registries. Root them like the futures
+    // above (remap companion below visits the identical set). Clone the
+    // Arc lists first so the registry locks are not held while the entry
+    // locks are taken.
+    let maps: Vec<Arc<OptionMapInner>> = registries().maps.lock().values().cloned().collect();
+    for m in maps {
+        for v in m.entries.lock().values() {
+            if let OptionValue::Obj(Some(r)) = v {
+                if !r.as_ptr().is_null() {
+                    roots.push(*r);
+                }
+            }
+        }
+    }
+    let builders: Vec<Arc<BuilderInner>> = registries().builders.lock().values().cloned().collect();
+    for b in builders {
+        for v in b.pending.lock().values() {
+            if let OptionValue::Obj(Some(r)) = v {
+                if !r.as_ptr().is_null() {
+                    roots.push(*r);
+                }
+            }
+        }
+    }
 }
 
 /// Post-move remap (companion to [`gc_scan_xnio_future_roots`]). After a moving
@@ -629,6 +664,23 @@ pub fn gc_update_xnio_future_refs(map: &std::collections::HashMap<usize, usize>)
         }
         true
     });
+    // Remap companion for the OptionMap/Builder registries (scan above).
+    let maps: Vec<Arc<OptionMapInner>> = registries().maps.lock().values().cloned().collect();
+    for m in maps {
+        for v in m.entries.lock().values_mut() {
+            if let OptionValue::Obj(Some(r)) = v {
+                remap(r);
+            }
+        }
+    }
+    let builders: Vec<Arc<BuilderInner>> = registries().builders.lock().values().cloned().collect();
+    for b in builders {
+        for v in b.pending.lock().values_mut() {
+            if let OptionValue::Obj(Some(r)) = v {
+                remap(r);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -949,9 +1001,19 @@ fn native_builder_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     check_builder_live(&b)?;
     let source_inner = inner_from_map_any(ctx, source)?;
 
+    // Copy the source snapshot out before touching the builder lock — no
+    // GC-capable call happens here, but keeping the two leaf locks disjoint
+    // avoids any ordering coupling with the GC scan (which takes each
+    // `entries` lock).
+    let source_entries: Vec<(OptionKey, OptionValue)> = source_inner
+        .entries
+        .lock()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let mut pending = b.pending.lock();
-    for (key, value) in source_inner.entries.iter() {
-        pending.insert(key.clone(), value.clone());
+    for (key, value) in source_entries {
+        pending.insert(key, value);
     }
 
     Ok(Some(Value::Object(Some(this))))
@@ -966,7 +1028,9 @@ fn native_builder_get_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return Err(ise("Builder.getMap: already consumed"));
     }
     let entries = b.pending.lock().clone();
-    let inner = Arc::new(OptionMapInner { entries });
+    let inner = Arc::new(OptionMapInner {
+        entries: Mutex::new(entries),
+    });
     let obj = alloc_option_map(ctx, inner);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -1121,7 +1185,9 @@ fn inner_from_map_any(
         return Ok(remember_option_map_inner(
             ctx,
             this,
-            Arc::new(OptionMapInner { entries }),
+            Arc::new(OptionMapInner {
+                entries: Mutex::new(entries),
+            }),
         ));
     }
 
@@ -1240,25 +1306,27 @@ fn option_value_as_bool(ctx: &dyn NativeContext, value: &OptionValue) -> Option<
 fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
 
-    match inner.entries.get(&key) {
+    // Copy the entry OUT and drop the guard before boxing/string allocation
+    // (GC-capable) — the GC scan takes the same `entries` lock, so holding
+    // it across a safepoint would deadlock the collection.
+    let entry = inner.entries.lock().get(&key).cloned();
+    match entry {
         Some(OptionValue::Int(n)) => {
-            Ok(Some(crate::lang_class::box_value(ctx, Value::Int(*n), "I")))
+            Ok(Some(crate::lang_class::box_value(ctx, Value::Int(n), "I")))
         }
-        Some(OptionValue::Long(n)) => Ok(Some(crate::lang_class::box_value(
-            ctx,
-            Value::Long(*n),
-            "J",
-        ))),
+        Some(OptionValue::Long(n)) => {
+            Ok(Some(crate::lang_class::box_value(ctx, Value::Long(n), "J")))
+        }
         Some(OptionValue::Bool(b)) => Ok(Some(crate::lang_class::box_value(
             ctx,
-            Value::Int(if *b { 1 } else { 0 }),
+            Value::Int(if b { 1 } else { 0 }),
             "Z",
         ))),
         Some(OptionValue::Str(s)) => {
-            let js = ctx.create_string(s);
+            let js = ctx.create_string(&s);
             Ok(Some(Value::Object(Some(js))))
         }
-        Some(OptionValue::Obj(o)) => Ok(Some(Value::Object(*o))),
+        Some(OptionValue::Obj(o)) => Ok(Some(Value::Object(o))),
         None => {
             if let Some(dv) = default_val {
                 Ok(Some(dv))
@@ -1273,10 +1341,11 @@ fn native_option_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn native_option_map_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
     let default_int = default_val.and_then(|v| value_as_int(ctx, v)).unwrap_or(0);
-    let value = inner
-        .entries
-        .get(&key)
-        .and_then(|v| option_value_as_int(ctx, v))
+    // Copy-out before the (non-allocating but heap-reading) unbox — keeps
+    // the guard's critical section trivially GC-free.
+    let entry = inner.entries.lock().get(&key).cloned();
+    let value = entry
+        .and_then(|v| option_value_as_int(ctx, &v))
         .unwrap_or(default_int);
     Ok(Some(Value::Int(value)))
 }
@@ -1285,10 +1354,9 @@ fn native_option_map_get_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 fn native_option_map_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let (inner, key, default_val) = option_map_get_key(ctx, args)?;
     let default_long = default_val.and_then(|v| value_as_long(ctx, v)).unwrap_or(0);
-    let value = inner
-        .entries
-        .get(&key)
-        .and_then(|v| option_value_as_long(ctx, v))
+    let entry = inner.entries.lock().get(&key).cloned();
+    let value = entry
+        .and_then(|v| option_value_as_long(ctx, &v))
         .unwrap_or(default_long);
     Ok(Some(Value::Long(value)))
 }
@@ -1299,10 +1367,9 @@ fn native_option_map_get_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let default_bool = default_val
         .and_then(|v| value_as_bool(ctx, v))
         .unwrap_or(false);
-    let value = inner
-        .entries
-        .get(&key)
-        .and_then(|v| option_value_as_bool(ctx, v))
+    let entry = inner.entries.lock().get(&key).cloned();
+    let value = entry
+        .and_then(|v| option_value_as_bool(ctx, &v))
         .unwrap_or(default_bool);
     Ok(Some(Value::Int(if value { 1 } else { 0 })))
 }
@@ -1320,25 +1387,26 @@ fn native_option_map_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         declaring_class: decl,
         name,
     };
-    Ok(Some(Value::Int(if inner.entries.contains_key(&key) {
-        1
-    } else {
-        0
-    })))
+    let present = inner.entries.lock().contains_key(&key);
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
 
 /// `OptionMap.size()I`
 fn native_option_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let inner = inner_from_map_any(ctx, this)?;
-    Ok(Some(Value::Int(inner.entries.len() as i32)))
+    let len = inner.entries.lock().len() as i32;
+    Ok(Some(Value::Int(len)))
 }
 
 fn native_option_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let inner = inner_from_map_any(ctx, this)?;
-    let mut opts = Vec::with_capacity(inner.entries.len());
-    for key in inner.entries.keys() {
+    // Copy the keys out and drop the guard BEFORE the per-key allocations
+    // below (GC scan takes the same lock — see `OptionMapInner.entries`).
+    let keys: Vec<OptionKey> = inner.entries.lock().keys().cloned().collect();
+    let mut opts = Vec::with_capacity(keys.len());
+    for key in &keys {
         let opt = alloc_concurrent_synthetic(ctx, "org/xnio/Option", 3);
         let declaring = ctx.create_string(&key.declaring_class);
         ctx.set_field(opt, OPT_DECLARING_CLASS, Value::Object(Some(declaring)));
@@ -2407,14 +2475,14 @@ mod tests {
             },
             OptionValue::Int(7),
         );
-        let h = register_map(Arc::new(OptionMapInner { entries }));
+        let h = register_map(Arc::new(OptionMapInner { entries: Mutex::new(entries) }));
         write_handle_slot_if_present(&ctx, m, OM_ENTRIES_HANDLE, h);
         remember_map_handle(&ctx, m, h);
 
         assert_eq!(ctx.object_num_fields(m), 1);
         assert_eq!(read_handle_slot(&ctx, m, OM_ENTRIES_HANDLE), 0);
         let inner = inner_from_map(&ctx, m).unwrap();
-        assert_eq!(inner.entries.len(), 1);
+        assert_eq!(inner.entries.lock().len(), 1);
     }
 
     #[test]
@@ -3004,7 +3072,7 @@ mod tests {
             },
             OptionValue::Obj(Some(boxed_true)),
         );
-        let map = alloc_option_map(&mut ctx, Arc::new(OptionMapInner { entries }));
+        let map = alloc_option_map(&mut ctx, Arc::new(OptionMapInner { entries: Mutex::new(entries) }));
 
         let got = native_option_map_get_bool(
             &mut ctx,

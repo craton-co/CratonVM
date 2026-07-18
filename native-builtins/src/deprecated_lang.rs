@@ -37,35 +37,40 @@ pub(crate) static ALLOW_THREAD_STOP: AtomicBool = AtomicBool::new(false);
 /// GC note (gc-followups-20260706): effectively WRITE-ONLY today — the only
 /// reader, `take_stop_throwable`, is `#[allow(dead_code)]` with no callers,
 /// and the writer is further gated behind `ALLOW_THREAD_STOP` (default off).
-/// The stored throwable refs are neither GC roots nor remapped, and the
-/// raw-address key goes stale when the Thread moves — before wiring a real
-/// consumer, re-key by identity hash and adopt the `(identity_key,
-/// ObjectRef)` var-handle-root pattern (ASYNC_POOL in lib.rs).
-static THREAD_STOP_REQUESTS: Mutex<Option<std::collections::HashMap<u64, ObjectRef>>> =
+/// GC note (cce0079 follow-up, applied per this comment's own prescription):
+/// keyed by the Thread's identity hash; the throwable value is a
+/// `(identity_key, last_addr)` VarHandle-root pair — rooted at store, and
+/// the (future) consumer must resolve the CURRENT address via
+/// `ctx.read_var_handle_root(identity_key)`.
+static THREAD_STOP_REQUESTS: Mutex<Option<std::collections::HashMap<u64, (i32, ObjectRef)>>> =
     Mutex::new(None);
 
 fn thread_stop_map(
-) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, ObjectRef>>> {
+) -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<u64, (i32, ObjectRef)>>> {
     THREAD_STOP_REQUESTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn store_stop_throwable(thread_id: u64, throwable: ObjectRef) {
+fn store_stop_throwable(ctx: &mut dyn NativeContext, thread_key: u64, throwable: ObjectRef) {
+    ctx.register_var_handle_root(throwable);
+    let vkey = ctx.identity_hash_code(throwable);
     let mut guard = thread_stop_map();
     let map = guard.get_or_insert_with(Default::default);
-    map.insert(thread_id, throwable);
+    map.insert(thread_key, (vkey, throwable));
 }
 
 /// Read (and consume) the pending stop-throwable for a thread, if any.
+/// Returns the `(identity_key, last_addr)` pair — resolve the CURRENT
+/// address via `ctx.read_var_handle_root(identity_key)` before use.
 #[allow(dead_code)]
-pub(crate) fn take_stop_throwable(thread_id: u64) -> Option<ObjectRef> {
+pub(crate) fn take_stop_throwable(thread_key: u64) -> Option<(i32, ObjectRef)> {
     let mut guard = thread_stop_map();
-    guard.as_mut().and_then(|m| m.remove(&thread_id))
+    guard.as_mut().and_then(|m| m.remove(&thread_key))
 }
 
 /// `Thread.stop0(Object throwable)V` — the HotSpot-internal native.
-fn native_thread_stop0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_thread_stop0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_STOP.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.stop() is not supported".to_string(),
@@ -75,8 +80,9 @@ fn native_thread_stop0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // args[0] = this (Thread), args[1] = throwable object
     let this = obj_arg(args, 0)?;
     let throwable = obj_arg(args, 1)?;
-    let thread_id = this.as_ptr() as u64;
-    store_stop_throwable(thread_id, throwable);
+    // GC-stable key (cce0079 follow-up): identity hash, not the raw address.
+    let thread_key = ctx.identity_hash_code(this) as u64;
+    store_stop_throwable(ctx, thread_key, throwable);
     Ok(None)
 }
 
@@ -89,9 +95,14 @@ fn native_thread_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .into());
     }
     let this = obj_arg(args, 0)?;
+    // Family-1 fix (cce0079): the ThreadDeath alloc can move `this` — pin
+    // and refresh before the identity read. GC-stable key as in stop0.
+    let this_pin = ctx.pin_native_root(this);
     let thread_death = alloc_concurrent_synthetic(ctx, "java/lang/ThreadDeath", 0);
-    let thread_id = this.as_ptr() as u64;
-    store_stop_throwable(thread_id, thread_death);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    let thread_key = ctx.identity_hash_code(this) as u64;
+    store_stop_throwable(ctx, thread_key, thread_death);
     Ok(None)
 }
 
@@ -111,7 +122,7 @@ fn suspended_map(
 /// Whether deprecated suspend/resume is allowed.  Default: false (JDK 25).
 pub(crate) static ALLOW_THREAD_SUSPEND: AtomicBool = AtomicBool::new(false);
 
-fn native_thread_suspend0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_thread_suspend0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_SUSPEND.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.suspend() is not supported".to_string(),
@@ -119,7 +130,9 @@ fn native_thread_suspend0(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         .into());
     }
     let this = obj_arg(args, 0)?;
-    let tid = this.as_ptr() as u64;
+    // GC-stable key (cce0079 follow-up): identity hash, not the raw address
+    // (which went stale on the first moving GC, stranding the flag).
+    let tid = ctx.identity_hash_code(this) as u64;
     let mut guard = suspended_map();
     let map = guard.get_or_insert_with(Default::default);
     map.entry(tid)
@@ -128,7 +141,7 @@ fn native_thread_suspend0(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
-fn native_thread_resume0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_thread_resume0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if !ALLOW_THREAD_SUSPEND.load(Ordering::Relaxed) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: "Thread.resume() is not supported".to_string(),
@@ -136,7 +149,8 @@ fn native_thread_resume0(_ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .into());
     }
     let this = obj_arg(args, 0)?;
-    let tid = this.as_ptr() as u64;
+    // GC-stable key — see `native_thread_suspend0`.
+    let tid = ctx.identity_hash_code(this) as u64;
     let mut guard = suspended_map();
     if let Some(map) = guard.as_mut() {
         if let Some(flag) = map.get(&tid) {
@@ -519,7 +533,8 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
         let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Throwable", 0);
-        let tid = thr.as_ptr() as u64;
+        // GC-stable keying: the natives key by identity hash now.
+        let tid = ctx.identity_hash_code(thr) as u64;
 
         let res = call_native(
             &reg,
@@ -532,7 +547,7 @@ mod tests {
         assert!(res.is_ok());
         let taken = take_stop_throwable(tid);
         assert!(taken.is_some(), "Expected stored throwable");
-        assert_eq!(taken.unwrap(), exc);
+        assert_eq!(taken.unwrap().1, exc);
 
         // Clean up
         ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
@@ -545,7 +560,8 @@ mod tests {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
-        let tid = thr.as_ptr() as u64;
+        // GC-stable keying: the natives key by identity hash now.
+        let tid = ctx.identity_hash_code(thr) as u64;
 
         let res = call_native(
             &reg,

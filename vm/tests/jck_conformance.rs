@@ -293,6 +293,11 @@ const CORPUS: &[TckTest] = &[
     tck(UTIL, "cratonvm/TckCollections", "max_min"),
     tck(UTIL, "cratonvm/TckCollections", "reverse"),
     tck(UTIL, "cratonvm/TckCollections", "singleton_map"),
+    tck(
+        UTIL,
+        "cratonvm/TckCollections",
+        "singleton_wrappers_are_real_and_immutable",
+    ),
     // T4.2.6 — TckAtomic (concurrent.atomic)
     tck(CONCURRENT, "cratonvm/TckAtomic", "atomic_int_get_set"),
     tck(CONCURRENT, "cratonvm/TckAtomic", "atomic_int_getAndSet"),

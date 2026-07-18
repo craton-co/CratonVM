@@ -42,7 +42,7 @@ covered in the [Security](../security/overview.md) chapters.
 - **Best-effort, not constant-time everywhere.** Digests, HMAC, AES/AES-GCM are
   implemented with audited constant-time crates; RSA private-key operations use
   base blinding but are not fully constant-time, and ECDSA scalar paths are
-  variable-time. Several algorithms (DSA, DH/ECDH key agreement, some KDFs) are
+  variable-time. Several algorithms (DH/ECDH key agreement, some KDFs) are
   not supported. The full per-algorithm matrix is in
   [Cryptography](../security/cryptography.md).
 

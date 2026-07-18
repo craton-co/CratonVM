@@ -26,7 +26,7 @@ spanning the Java SE standard library.
 | `java.nio` | `ByteBuffer`, `FileChannel`, channels and selectors (see the [Platform Support Matrix](../reference/platform-support.md)) |
 | `java.time` | `LocalDate`, `LocalTime`, `LocalDateTime`, `Instant`, `Duration`, `Period` |
 | `java.lang.ref` | `WeakReference`, `SoftReference`, `PhantomReference`, `ReferenceQueue` |
-| `java.security` / `javax.crypto` | Digests, HMAC, AES/AES-GCM, RSA, ECDSA/Ed25519, PBKDF2, ML-KEM/ML-DSA (see [Cryptography](../security/cryptography.md)) |
+| `java.security` / `javax.crypto` | Digests, HMAC, AES/AES-GCM, RSA, DSA, ECDSA/Ed25519, PBKDF2, ML-KEM/ML-DSA (see [Cryptography](../security/cryptography.md)) |
 
 ## Networking & I/O
 

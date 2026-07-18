@@ -3429,11 +3429,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             }
         }
-        self.thread
+        let entry = self
+            .thread
             .native_pin_roots
             .get(handle)
             .copied()
-            .unwrap_or(fallback)
+            .unwrap_or(fallback);
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): the PIN-STALE canary
+        // covers pin TIME; this covers READ time — a forwarded address
+        // sitting in the pin table means a GC between pin and read failed
+        // to remap THIS entry (initiator/arrive/fold writeback gap), which
+        // no other canary distinguishes from caller-side misuse.
+        if handle != usize::MAX && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(entry.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-TABLE-STALE tid={} handle={} len={} 0x{:x}->0x{new:x} \
+                         (pin-table entry missed a remap) reader:\n{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        entry.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        entry
     }
 
     fn unpin_native_roots(&mut self, base: usize) {
@@ -8503,7 +8530,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8561,7 +8588,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         &self,
         class_id: ClassId,
         field_name: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8583,7 +8610,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+    ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8598,6 +8625,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// `Class.getAnnotatedSuperclass()` / `Class.getAnnotatedInterfaces()`
+    /// (and their `getAnnotatedActualTypeArguments()` chains) — see
+    /// `extract_class_extends_type_annotations` for why this re-parses the
+    /// cached original bytes rather than reading from `Class`.
+    fn class_extends_type_annotations(
+        &self,
+        class_id: ClassId,
+        supertype_index: u16,
+    ) -> crate::native::registry::TypeArgAnnotations {
+        let bytes = {
+            let cm = self.shared.class_manager.read();
+            match cm.class_bytes_cache.get(&class_id) {
+                Some(b) => b.clone(),
+                None => return Default::default(),
+            }
+        };
+        extract_class_extends_type_annotations(&bytes, supertype_index)
     }
 
     fn method_annotation_default(
@@ -9550,14 +9596,40 @@ pub(super) fn extract_return_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting the method return type's direct
-/// TYPE ARGUMENTS (`target_type` 0x14, METHOD_RETURN) whose `type_path` is a
-/// single TYPE_ARGUMENT entry (`type_path_kind == 3`) -- e.g. an annotation on
-/// `String` in `List<@NotBlank String> getNames()`.
+/// Insert an `AnnotationData` into a `TypeArgAnnotations` forest at the
+/// position described by `path` (a `type_path` restricted to TYPE_ARGUMENT
+/// entries, per JVMS 4.7.20.2 — the caller has already filtered out any
+/// ARRAY/INNER_TYPE/WILDCARD_BOUND entries). `path` must be non-empty; each
+/// entry descends one nesting level (top-level index first), growing `tree`
+/// (and each level's `children`) as needed so arbitrarily deep generics
+/// (`ValueExtractor<ArgumentValue<@ExtractedValue ?>>`, two TYPE_ARGUMENT
+/// steps) land at the right node, not just the single-level case
+/// (`List<@NotBlank String>`) the extraction call sites used to hard-code.
+fn insert_type_arg_annotation(
+    tree: &mut Vec<crate::native::registry::TypeArgAnnotations>,
+    path: &[cratonvm_reader::attribute::TypePathEntry],
+    data: crate::native::registry::AnnotationData,
+) {
+    let idx = path[0].type_argument_index as usize;
+    if tree.len() <= idx {
+        tree.resize(idx + 1, Default::default());
+    }
+    if path.len() == 1 {
+        tree[idx].anns.push(data);
+    } else {
+        insert_type_arg_annotation(&mut tree[idx].children, &path[1..], data);
+    }
+}
+
+/// Extract TYPE_USE annotations targeting the method return type's TYPE
+/// ARGUMENTS, at any nesting depth (`target_type` 0x14, METHOD_RETURN, with a
+/// `type_path` made entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`)
+/// -- e.g. an annotation on `String` in `List<@NotBlank String> getNames()`,
+/// or a nested generic like `ValueExtractor<Wrapper<@Foo ?>>`.
 pub(super) fn extract_return_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_RETURN: u8 = 0x14;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9567,22 +9639,20 @@ pub(super) fn extract_return_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_RETURN {
+                if ta.target_type != TARGET_METHOD_RETURN || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
@@ -9632,24 +9702,23 @@ pub(super) fn extract_parameter_type_annotations(
 }
 
 /// Extract TYPE_USE annotations targeting method formal parameters'
-/// TYPE ARGUMENTS (`target_type` 0x16, METHOD_FORMAL_PARAMETER) whose
-/// `type_path` is a single TYPE_ARGUMENT entry (`type_path_kind == 3`) --
-/// i.e. an annotation on a generic type argument like the `@Valid` in
-/// `List<@Valid Person> persons`, as opposed to
+/// TYPE ARGUMENTS, at any nesting depth (`target_type` 0x16,
+/// METHOD_FORMAL_PARAMETER, with a `type_path` made entirely of
+/// TYPE_ARGUMENT entries, `type_path_kind == 3`) -- i.e. an annotation on a
+/// generic type argument like the `@Valid` in `List<@Valid Person> persons`,
+/// or a nested one like `Map<String, @Valid List<Person>>`, as opposed to
 /// [`extract_parameter_type_annotations`] which only keeps the
 /// empty-`type_path` (top-level parameter type) annotations.
 ///
 /// Outer `Vec` indexed by `formal_parameter_index`; inner `Vec` indexed by
-/// `type_argument_index` (0-based, JVMS 4.7.20.2). Multi-level nesting
-/// (e.g. `Map<String, @Valid List<Person>>`, `type_path` length > 1) is not
-/// modeled -- only a direct, single-level type argument is recognized,
-/// which covers the common `List<@Valid T>` / `Map<K, @Valid V>` cases.
-/// Backs `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
+/// the top-level `type_argument_index` (0-based, JVMS 4.7.20.2), with each
+/// entry's own `children` carrying the next nesting level. Backs
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
 /// for method parameters.
 pub(super) fn extract_parameter_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9659,19 +9728,18 @@ pub(super) fn extract_parameter_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<Vec<crate::native::registry::AnnotationData>>> = Vec::new();
+            let mut out: Vec<Vec<crate::native::registry::TypeArgAnnotations>> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER {
+                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || ta.type_path.is_empty() {
                     continue;
                 }
-                // Only a single-level type-argument path: exactly one
-                // type_path entry, and it must be a TYPE_ARGUMENT.
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 // target_info for METHOD_FORMAL_PARAMETER is a single u1 index.
                 let param_idx = match ta.target_info.first() {
                     Some(&i) => i as usize,
@@ -9681,11 +9749,7 @@ pub(super) fn extract_parameter_type_argument_annotations(
                     if out.len() <= param_idx {
                         out.resize(param_idx + 1, Vec::new());
                     }
-                    let type_args = &mut out[param_idx];
-                    if type_args.len() <= type_arg_idx {
-                        type_args.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    type_args[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out[param_idx], &ta.type_path, data);
                 }
             }
             return out;
@@ -9719,14 +9783,14 @@ pub(super) fn extract_field_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting a field type's direct TYPE ARGUMENTS
-/// (`target_type` 0x13, FIELD) whose `type_path` is a single TYPE_ARGUMENT
-/// entry (`type_path_kind == 3`) -- e.g. an annotation on `String` in
-/// `List<@NotBlank String> names`.
+/// Extract TYPE_USE annotations targeting a field type's TYPE ARGUMENTS, at
+/// any nesting depth (`target_type` 0x13, FIELD, with a `type_path` made
+/// entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`) -- e.g. an
+/// annotation on `String` in `List<@NotBlank String> names`.
 pub(super) fn extract_field_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_FIELD: u8 = 0x13;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9736,28 +9800,100 @@ pub(super) fn extract_field_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_FIELD {
+                if ta.target_type != TARGET_FIELD || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
         }
     }
     Vec::new()
+}
+
+/// Extract the runtime-visible TYPE_USE annotations targeting one of a
+/// class's declared supertypes (`target_type` 0x10, CLASS_EXTENDS) from its
+/// original `.class` bytes, re-parsed on demand.
+///
+/// Unlike methods/fields (whose per-member attribute lists survive on the
+/// loaded [`crate::classloading::class::Class`]), the class-level
+/// `RuntimeVisibleTypeAnnotations` attribute is folded away during class
+/// loading (JVMS §4.7 attributes not recognized by the `Class` struct's
+/// field-by-field fold are dropped) — so there is nowhere to read it from
+/// post-load. Re-parsing the cached original bytes (`class_bytes_cache`,
+/// already retained for JVMTI retransformation) is the least invasive way to
+/// recover it without adding a new field threaded through every `Class`
+/// construction site in the codebase. This runs lazily, only when a
+/// framework actually calls `Class.getAnnotatedSuperclass()` /
+/// `getAnnotatedInterfaces()`, so the cost of a second parse pass is
+/// immaterial. Returns an empty tree (not an error) if the bytes were
+/// evicted from the FIFO-capped cache or fail to re-parse.
+///
+/// `supertype_index` is JVMS `CLASS_EXTENDS`'s `u2 supertype_index`: `0xFFFF`
+/// selects the superclass, `0..n` selects the n-th entry of `interfaces`.
+pub(super) fn extract_class_extends_type_annotations(
+    class_bytes: &[u8],
+    supertype_index: u16,
+) -> crate::native::registry::TypeArgAnnotations {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_CLASS_EXTENDS: u8 = 0x10;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+
+    let class_file = match cratonvm_reader::class_reader::read_class(class_bytes) {
+        Ok(cf) => cf,
+        Err(_) => return Default::default(),
+    };
+    let cp = &class_file.constant_pool;
+    for lazy in &class_file.attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut tree = crate::native::registry::TypeArgAnnotations::default();
+            for ta in tas {
+                if ta.target_type != TARGET_CLASS_EXTENDS {
+                    continue;
+                }
+                let idx = match ta.target_info.as_slice() {
+                    [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+                    _ => continue,
+                };
+                if idx != supertype_index {
+                    continue;
+                }
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
+                let data = match convert_annotation(&ta.annotation, cp) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if ta.type_path.is_empty() {
+                    tree.anns.push(data);
+                } else {
+                    insert_type_arg_annotation(&mut tree.children, &ta.type_path, data);
+                }
+            }
+            return tree;
+        }
+    }
+    Default::default()
 }
 
 /// Convert a reader Annotation to our AnnotationData.

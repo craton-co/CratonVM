@@ -33613,6 +33613,51 @@ fn execute_invokevirtual_vtable_fast(
 
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
+    // A cold invokevirtual site in a lambda reaches this vtable fast path
+    // before the ordinary invoke interceptor.  ClassLoader's resource native
+    // owns the null-name contract, so invoke it directly for just this case;
+    // normal resource lookup remains eligible for the vtable cache.
+    if method_class_name.as_ref() == "java/lang/ClassLoader"
+        && matches!(
+            (method_name.as_ref(), method_descriptor.as_ref()),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
+        )
+        && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None))
+    {
+        let (args, _) = pop_coerced_invoke_args_virtual(
+            shared,
+            caller_class_id,
+            cp_index,
+            frame_idx,
+            thread,
+        )?;
+        let callback = match method_name.as_ref() {
+            "getResource" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
+            "getResources" => cratonvm_native_builtins::classloader::cl_get_resources_essential,
+            "getResourceAsStream" => {
+                cratonvm_native_builtins::classloader::cl_get_resource_as_stream_essential
+            }
+            // The callback is reached only with a null name, so it always
+            // throws before producing a URL-typed result. Reuse its canonical
+            // ClassLoader NPE construction for `resources(String)`.
+            "resources" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
+            "loadClass" => cratonvm_native_builtins::classloader::cl_load_class_essential,
+            _ => return Ok(CachedCallResult::CacheMiss),
+        };
+        let value = crate::vm::safe_native_call(shared, thread, callback, &args)?;
+        if let Some(value) = value {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, crate::jit::return_type(&method_descriptor)),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        return Ok(CachedCallResult::Handled);
+    }
     if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
         eprintln!(
             "[jetty2-vtfast] {}{} receiver={:?}",
@@ -34310,6 +34355,34 @@ fn execute_invokevirtual_cached(
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+
+    // A previous non-null invocation may have cached the real-JDK bytecode
+    // body of an inherited ClassLoader method.  That body does not reliably
+    // enforce the public null-name contract for a synthetic embedded loader,
+    // whereas the registered ClassLoader natives do.  Do this before reading
+    // the inline cache: otherwise `resources("...")` poisons the same CP
+    // entry and a later `resources(null)` silently returns a Stream.
+    if !is_special && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None)) {
+        if let Ok((method_class_name, method_name, method_descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if method_class_name.as_ref() == "java/lang/ClassLoader"
+                && matches!(
+                    (method_name.as_ref(), method_descriptor.as_ref()),
+                    ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                        | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                        | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                        | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                        | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
+                )
+            {
+                thread
+                    .invoke_cache
+                    .evict(caller_class_id, cp_index, is_special);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
 
     let target = match thread
         .invoke_cache

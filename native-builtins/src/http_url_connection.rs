@@ -210,8 +210,13 @@ fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
 /// response-perform path then reads the body from the old location.
 /// Follow-up: store `(identity_key, ObjectRef)` var-handle-root pairs
 /// (ASYNC_POOL pattern) and re-read at perform time.
-fn real_body_streams() -> &'static Mutex<HashMap<i32, ObjectRef>> {
-    static R: OnceLock<Mutex<HashMap<i32, ObjectRef>>> = OnceLock::new();
+/// GC note (cce0079 follow-up): values are `(identity_key, last_addr)`
+/// VarHandle-root pairs — registered at insert so the BAOS stays alive and
+/// registry-remapped across moving GCs; readers resolve the CURRENT address
+/// via `ctx.read_var_handle_root(identity_key)` with the stored address as
+/// fallback. (Keys were already GC-stable identity hashes.)
+fn real_body_streams() -> &'static Mutex<HashMap<i32, (i32, ObjectRef)>> {
+    static R: OnceLock<Mutex<HashMap<i32, (i32, ObjectRef)>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -282,7 +287,9 @@ fn real_body_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         .ok()
         .and_then(|t| t.get(&key).copied())
     {
-        Some(b) => b,
+        // Resolve the CURRENT address through the VarHandle-root registry
+        // (the stored copy is stale after any moving GC).
+        Some((vkey, stored)) => ctx.read_var_handle_root(vkey).unwrap_or(stored),
         None => return Vec::new(),
     };
     if let Value::Object(Some(arr)) = ctx.get_field(baos, 0) {
@@ -2071,19 +2078,28 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         });
         let key = ctx.identity_hash_code(this);
-        if let Some(existing) = real_body_streams()
+        if let Some((vkey, stored)) = real_body_streams()
             .lock()
             .ok()
             .and_then(|t| t.get(&key).copied())
         {
+            let existing = ctx.read_var_handle_root(vkey).unwrap_or(stored);
             return Ok(Some(Value::Object(Some(existing))));
         }
         let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
+        // Family-1 fix (cce0079): `new_array` below can move the
+        // still-unrooted `baos` — pin and refresh it before the field
+        // stores and the registry insert.
+        let baos_pin = ctx.pin_native_root(baos);
         let backing = ctx.new_array(ArrayElementType::Byte, 0);
+        let baos = ctx.read_native_pin(baos_pin, baos);
+        ctx.unpin_native_roots(baos_pin);
         ctx.set_field(baos, 0, Value::Object(Some(backing)));
         ctx.set_field(baos, 1, Value::Int(0));
+        ctx.register_var_handle_root(baos);
+        let vkey = ctx.identity_hash_code(baos);
         if let Ok(mut t) = real_body_streams().lock() {
-            t.insert(key, baos);
+            t.insert(key, (vkey, baos));
         }
         let streaming = real_reqs()
             .lock()

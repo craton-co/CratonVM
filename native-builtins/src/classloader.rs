@@ -1353,10 +1353,13 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("ClassLoader.loadClass name is null".to_string()),
-            }
-            .into());
+            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+                ctx,
+                "java/lang/NullPointerException",
+                1,
+                "ClassLoader.loadClass name is null",
+            );
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
         }
     };
 
@@ -1383,6 +1386,12 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     }
 
     cl_load_class_base_delegation(ctx, this, name_obj)
+}
+
+/// Canonical `ClassLoader.loadClass(String)` entry point for interpreter
+/// dispatches that must enforce the public null-name contract.
+pub fn cl_load_class_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    cl_load_class(ctx, args)
 }
 
 fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
@@ -1801,10 +1810,13 @@ fn cl_load_class_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("ClassLoader.loadClass name is null".to_string()),
-            }
-            .into());
+            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+                ctx,
+                "java/lang/NullPointerException",
+                1,
+                "ClassLoader.loadClass name is null",
+            );
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
         }
     };
     cl_load_class_base_delegation(ctx, this, name_obj)

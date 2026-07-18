@@ -79,7 +79,7 @@ are all **implemented**.
 | `SHA1withRSA`, `SHA256withRSA`, `SHA384withRSA`, `SHA512withRSA` | Implemented |
 | `SHA256withECDSA` (P-256), `SHA384withECDSA` (P-384) | Implemented |
 | `Ed25519` / `EdDSA` | Implemented |
-| `SHA256withDSA` | Recognised, not backed (verify fails) |
+| `SHA1withDSA` / `SHA256withDSA` | Implemented (routed to the JDK 25 SUN DSA SPIs) |
 | `SHA224withRSA`, `RSASSA-PSS`, `NONEwithRSA` | Not supported |
 | `Ed448`, `SHA512withECDSA` | Not supported |
 
@@ -92,7 +92,8 @@ Unrecognised signature algorithm names fail closed (`sign` returns empty,
 |-----------|--------|
 | `RSA` | Implemented (PKCS#8 / X.509 encoding) |
 | `EC` (P-256 / P-384) | Implemented |
-| `DSA`, `DH`, `X25519`, `X448` | Not supported |
+| `DSA` | Implemented (KeyPairGenerator / KeyFactory routed to JDK 25 SUN) |
+| `DH`, `X25519`, `X448` | Not supported |
 
 ## Key derivation
 

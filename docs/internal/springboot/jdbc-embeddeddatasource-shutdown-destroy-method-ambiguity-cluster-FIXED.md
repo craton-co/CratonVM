@@ -1,6 +1,6 @@
 # `EmbeddedDataSourceConfiguration`'s `dataSource` bean fails destroy-method resolution: `shutdown()` has "2 candidates" at the same arg count
 
-**Status: OPEN — found 2026-07-17. Discrepancy against a same-mechanism doc marked RESOLVED 2026-07-12 — see below.**
+**Status: FIXED — 2026-07-17.** The shared `Class.getMethods()` override shadowing defect was corrected in `native-builtins/src/lang_class.rs`; distinct `shutdown` overloads remain visible, but duplicate declarations of the same signature no longer reach Spring's destroy-method resolver. See [`class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md).
 
 ## Symptom
 

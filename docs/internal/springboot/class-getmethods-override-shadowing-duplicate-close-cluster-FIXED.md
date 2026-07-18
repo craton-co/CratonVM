@@ -1,6 +1,6 @@
 # `Class.getMethods()` doesn't shadow overridden methods — Spring's destroy-method resolution sees N duplicate `close()` candidates
 
-**Status: OPEN — found 2026-07-17 (refines/reopens a prior RESOLVED conclusion — see "Discrepancy" below)**
+**Status: FIXED — 2026-07-17.** The public-method collector now merges a method by its name and full descriptor while walking the class/interface hierarchy, retaining the most-specific declaration. The regression test covers class and interface overrides plus genuine overloads. A Java 25 Spring Boot probe passed `CompositeMeterRegistryAutoConfigurationTests` (4/4) in JIT and `--nojit` modes. The separately discovered Redis listener-factory residual was also fixed: the compatibility native delegates non-null factories to the real setter and keeps its narrow null bootstrap escape only; `DataRedisAutoConfigurationTests` then passed 56/56 in both modes.
 
 ## Symptom
 
