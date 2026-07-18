@@ -155,7 +155,7 @@ matches HotSpot bit-for-bit.
 | Benchmark (N = 2²⁴)                              | HotSpot C2 | TornadoVM GPU  | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
 |---------------------------------------------------|------------|----------------|-------------------|------------|--------------|
 | Integer div-chain (48 unvectorizable divs/elem)    | 1,910 ms   | 28 ms          | **9 ms**          | **212x**   | **3.1x**     |
-| Double div-chain (64 divs/elem, IEEE-exact)¹        | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
+| Double div-chain (64 divs/elem, IEEE-exact)¹       | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
 | 96 multiply-adds/elem (AVX2-vectorized on CPU)     | 8 ms       | 17 ms          | **11 ms**         | 0.7x       | 1.5x         |
 | Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented²  | **18 ms**         | 0.4x       | n/a²          |
 

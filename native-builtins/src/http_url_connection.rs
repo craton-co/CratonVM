@@ -851,9 +851,9 @@ fn build_header_map(
             groups.push((k.clone(), vec![v.clone()]));
         }
     }
-    let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])? {
+    let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
-        _ => return Err(ioex("getHeaderFields: could not allocate LinkedHashMap")),
+        _ => return Err(ioex("getHeaderFields: could not allocate HashMap")),
     };
     let map_pin = ctx.pin_native_root(map);
     for (k, vals) in &groups {
@@ -883,7 +883,7 @@ fn build_header_map(
         let list = ctx.read_native_pin(list_pin, list);
         let ks = ctx.read_native_pin(ks_pin, ks);
         ctx.invoke(
-            "java/util/LinkedHashMap",
+            "java/util/HashMap",
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[

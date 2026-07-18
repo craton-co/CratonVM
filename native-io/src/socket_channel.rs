@@ -3158,6 +3158,19 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ss_value))))
 }
 
+/// The address Netty publishes from a listener must be usable as a client
+/// destination. Windows rejects a connect to an unspecified (`0.0.0.0`/`::`)
+/// listener address with WSAEADDRNOTAVAIL, even though binding that wildcard is
+/// valid. A local in-process client should therefore receive the corresponding
+/// loopback address while concrete listener addresses remain unchanged.
+fn advertised_listener_host(addr: SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => "127.0.0.1".to_string(),
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => "::1".to_string(),
+        _ => addr.ip().to_string(),
+    }
+}
+
 fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -3193,7 +3206,7 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let host = match tcp_registry().read().get(&id) {
         Some(TcpHandle::Listener(l)) => l
             .local_addr()
-            .map(|a| a.ip().to_string())
+            .map(advertised_listener_host)
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         _ => "0.0.0.0".to_string(),
     };
@@ -3400,6 +3413,22 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 mod tests {
     use super::*;
     use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn advertised_listener_host_converts_only_wildcard_listener_addresses() {
+        assert_eq!(
+            advertised_listener_host("0.0.0.0:49152".parse().unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            advertised_listener_host("[::]:49152".parse().unwrap()),
+            "::1"
+        );
+        assert_eq!(
+            advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
+            "127.0.0.2"
+        );
+    }
 
     #[test]
     fn registers_without_panic() {
