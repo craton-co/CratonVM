@@ -4037,6 +4037,45 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod magic_div64_tests {
+    /// Software model of the emitted `emit_ldiv_magic64` sequence:
+    /// t = mulhi_signed(magic, n) (+ n when magic < 0);
+    /// q = (t >> shift) + (n logical>> 63).
+    fn model_q(n: i64, magic: i64, shift: u32) -> i64 {
+        let mut t = ((n as i128 * magic as i128) >> 64) as i64;
+        if magic < 0 {
+            t = t.wrapping_add(n);
+        }
+        (t >> shift).wrapping_add(((n as u64) >> 63) as i64)
+    }
+
+    #[test]
+    fn magic_signed_div64_matches_exact_division() {
+        let divisors: [i64; 14] = [2, 3, 5, 6, 7, 9, 10, 11, 12, 25, 100, 1000, 7919, 1_000_003];
+        let mut dividends: Vec<i64> = vec![0, 1, -1, 2, -2, i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1];
+        // Pseudo-random spread (deterministic LCG) incl. sign flips.
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for _ in 0..2000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            dividends.push(x as i64);
+        }
+        for &d in &divisors {
+            let (magic, shift) = super::Compiler::magic_signed_div64(d);
+            let mut extra = vec![d, -d, d - 1, 1 - d, d + 1, -d - 1, d * 3, -d * 3];
+            extra.extend_from_slice(&dividends);
+            for &n in &extra {
+                let expect = n / d; // Rust trunc-toward-zero == JVM ldiv
+                let got = model_q(n, magic, shift);
+                assert_eq!(
+                    got, expect,
+                    "n={n} d={d} magic={magic:#x} shift={shift}: got {got}, want {expect}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod array_receiver_local_tests {
     use super::{array_receiver_local, instruction_start_map};
 
@@ -7817,6 +7856,8 @@ struct Compiler {
     /// result is a pure function of the divisor, so caching is behavior-
     /// preserving.
     magic_div_memo: FxHashMap<i32, (i64, u32)>,
+    /// 64-bit sibling of `magic_div_memo` for the long const-div peephole.
+    magic_div64_memo: FxHashMap<i64, (i64, u32)>,
 
     /// JVM local slot of each incoming JIT argument, in argument order
     /// (`this` first for instance methods, then declared params). Because a
@@ -8677,6 +8718,7 @@ impl Compiler {
             ldc_string_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
             magic_div_memo: FxHashMap::default(),
+            magic_div64_memo: FxHashMap::default(),
             // Set by `compile_with_param_slots` after construction; empty/0
             // here preserves legacy "arg index == slot" behavior.
             param_jvm_slots: Vec::new(),
@@ -11811,6 +11853,271 @@ impl Compiler {
 
     /// Emit optimized signed division by power-of-2 constant.
     /// Result: EAX = EAX / 2^k (rounded toward zero), sign-extended to RAX.
+    /// Long (cat-2) sibling of [`Self::try_const_arith_peephole`]: fuse a
+    /// resolved `ldc2_w` long constant with the immediately following
+    /// `lmul`/`ldiv`/`lrem`/`ladd`/`lsub`. Same merge-point rule: never fuse
+    /// when the arith op is a branch target. The JVMS ArithmeticException
+    /// guard is unnecessary — the constant divisor is known non-zero — and
+    /// LONG_MIN / -1 cannot arise (only positive divisors fuse).
+    fn try_const_arith_peephole_long(
+        &mut self,
+        const_val: i64,
+        next_op_pc: usize,
+        code: &[u8],
+        code_len: usize,
+        branch_targets: &[bool],
+    ) -> bool {
+        if next_op_pc >= code_len {
+            return false;
+        }
+        if branch_targets.get(next_op_pc).copied().unwrap_or(true) {
+            return false;
+        }
+        let fits_i32 = (-0x8000_0000i64..=0x7FFF_FFFF).contains(&const_val);
+        match code[next_op_pc] {
+            // lmul: left * const
+            0x69 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if fits_i32 {
+                    self.rex_w();
+                    self.buf.emit_byte(0x69); // IMUL RAX, RAX, imm32
+                    self.modrm_reg(RAX, RAX);
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                } else {
+                    self.emit_mov_imm64(RDX, const_val);
+                    self.rex_w();
+                    self.buf.emit(&[0x0F, 0xAF, 0xC2]); // IMUL RAX, RDX
+                }
+                self.push_from_rax();
+                true
+            }
+            // ldiv: left / const — power-of-2
+            0x6d if const_val > 0
+                && (const_val & (const_val - 1)) == 0
+                && const_val - 1 <= i32::MAX as i64 =>
+            {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_ldiv_pow2(const_val);
+                self.push_from_rax();
+                true
+            }
+            // lrem: left % const — power-of-2
+            0x71 if const_val > 0
+                && (const_val & (const_val - 1)) == 0
+                && const_val - 1 <= i32::MAX as i64 =>
+            {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_lrem_pow2(const_val);
+                self.push_from_rax();
+                true
+            }
+            // ldiv: left / const — non-power-of-2 (64-bit magic, mulhi form)
+            0x6d if const_val >= 2 => {
+                let (magic, shift) = self.magic_div64_cached(const_val);
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_ldiv_magic64(magic, shift);
+                self.push_from_rax();
+                true
+            }
+            // lrem: left % const — non-power-of-2
+            0x71 if const_val >= 2 => {
+                let (magic, shift) = self.magic_div64_cached(const_val);
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_lrem_magic64(magic, shift, const_val);
+                self.push_from_rax();
+                true
+            }
+            // ladd: left + const (imm32 range only)
+            0x61 if fits_i32 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if const_val != 0 {
+                    self.rex_w();
+                    self.buf.emit(&[0x81, 0xC0]); // ADD RAX, imm32
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
+                self.push_from_rax();
+                true
+            }
+            // lsub: left - const (imm32 range only)
+            0x65 if fits_i32 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if const_val != 0 {
+                    self.rex_w();
+                    self.buf.emit(&[0x81, 0xE8]); // SUB RAX, imm32
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
+                self.push_from_rax();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Signed 64-bit division by 2^k rounding toward zero (RAX in/out).
+    fn emit_ldiv_pow2(&mut self, divisor: i64) {
+        debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
+        let k = divisor.trailing_zeros();
+        if k == 0 {
+            return; // div by 1 = no-op
+        }
+        let mask = divisor - 1; // caller guarantees fits i32
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF9, 0x3F]); // SAR RCX, 63
+        self.rex_w();
+        if mask <= 127 {
+            self.buf.emit(&[0x83, 0xE1, mask as u8]); // AND RCX, imm8 // Cast: x86-64 immediate encoding
+        } else {
+            self.buf.emit(&[0x81, 0xE1]); // AND RCX, imm32
+            self.buf.emit(&(mask as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xC8]); // ADD RAX, RCX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF8, k as u8]); // SAR RAX, k // Cast: x86-64 immediate encoding
+    }
+
+    /// Signed 64-bit remainder by 2^k (RAX in/out).
+    fn emit_lrem_pow2(&mut self, divisor: i64) {
+        debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
+        let k = divisor.trailing_zeros();
+        if k == 0 {
+            self.emit_xor_reg_self(RAX); // a % 1 == 0
+            return;
+        }
+        let mask = divisor - 1; // caller guarantees fits i32
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX (save original)
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC2]); // MOV RDX, RAX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xFA, 0x3F]); // SAR RDX, 63
+        self.rex_w();
+        if mask <= 127 {
+            self.buf.emit(&[0x83, 0xE2, mask as u8]); // AND RDX, imm8 // Cast: x86-64 immediate encoding
+        } else {
+            self.buf.emit(&[0x81, 0xE2]); // AND RDX, imm32
+            self.buf.emit(&(mask as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xD0]); // ADD RAX, RDX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF8, k as u8]); // SAR RAX, k // Cast: x86-64 immediate encoding
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xE0, k as u8]); // SHL RAX, k // Cast: x86-64 immediate encoding
+        self.rex_w();
+        self.buf.emit(&[0x29, 0xC1]); // SUB RCX, RAX
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC8]); // MOV RAX, RCX
+    }
+
+    /// Memoized [`Self::magic_signed_div64`].
+    fn magic_div64_cached(&mut self, d: i64) -> (i64, u32) {
+        if let Some(&pair) = self.magic_div64_memo.get(&d) {
+            return pair;
+        }
+        let pair = Self::magic_signed_div64(d);
+        self.magic_div64_memo.insert(d, pair);
+        pair
+    }
+
+    /// Compute the signed 64-bit magic number for division by constant
+    /// `d >= 2` (Hacker's Delight 10-4, W = 64, exact u128 arithmetic).
+    /// Returns `(magic, shift)` such that with `t = mulhi_signed(magic, n)`
+    /// (plus `n` when `magic < 0`):  `n / d = (t >> shift) + (n >>> 63)`.
+    fn magic_signed_div64(d: i64) -> (i64, u32) {
+        debug_assert!(d >= 2);
+        let ad = d as u128;
+        let two63: u128 = 1u128 << 63;
+        let anc = two63 - 1 - two63 % ad;
+
+        let mut p = 63u32;
+        let mut q1 = two63 / anc;
+        let mut r1 = two63 - q1 * anc;
+        let mut q2 = two63 / ad;
+        let mut r2 = two63 - q2 * ad;
+
+        loop {
+            p += 1;
+            q1 *= 2;
+            r1 *= 2;
+            if r1 >= anc {
+                q1 += 1;
+                r1 -= anc;
+            }
+            q2 *= 2;
+            r2 *= 2;
+            if r2 >= ad {
+                q2 += 1;
+                r2 -= ad;
+            }
+            let delta = ad - 1 - r2;
+            if q1 > delta || (q1 == delta && r1 == 0) {
+                break;
+            }
+            if p >= 127 {
+                break;
+            }
+        }
+
+        let magic = (q2 + 1) as u64 as i64; // two's-complement wrap intended
+        (magic, p - 64)
+    }
+
+    /// Signed 64-bit division by a non-power-of-2 constant via the mulhi
+    /// magic method (RAX in/out; clobbers RCX/RDX like the 32-bit variant).
+    fn emit_ldiv_magic64(&mut self, magic: i64, shift: u32) {
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX — save dividend
+        self.emit_mov_imm64(RDX, magic);
+        self.rex_w();
+        self.buf.emit(&[0xF7, 0xEA]); // IMUL RDX — RDX:RAX = RAX * RDX (signed)
+        if magic < 0 {
+            // d > 0 with a wrapped (negative-as-i64) magic: t += n.
+            self.rex_w();
+            self.buf.emit(&[0x01, 0xCA]); // ADD RDX, RCX
+        }
+        if shift > 0 {
+            self.rex_w();
+            self.buf.emit(&[0xC1, 0xFA, shift as u8]); // SAR RDX, shift // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xD0]); // MOV RAX, RDX
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xCA]); // MOV RDX, RCX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xEA, 0x3F]); // SHR RDX, 63 — sign bit of n
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xD0]); // ADD RAX, RDX — quotient
+    }
+
+    /// Signed 64-bit remainder by a non-power-of-2 constant (RAX in/out).
+    fn emit_lrem_magic64(&mut self, magic: i64, shift: u32, divisor: i64) {
+        self.emit_ldiv_magic64(magic, shift); // RAX = quotient; RCX = n
+        if (-0x8000_0000i64..=0x7FFF_FFFF).contains(&divisor) {
+            self.rex_w();
+            self.buf.emit_byte(0x69); // IMUL RAX, RAX, imm32
+            self.modrm_reg(RAX, RAX);
+            self.buf.emit(&(divisor as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        } else {
+            self.emit_mov_imm64(RDX, divisor);
+            self.rex_w();
+            self.buf.emit(&[0x0F, 0xAF, 0xC2]); // IMUL RAX, RDX
+        }
+        self.rex_w();
+        self.buf.emit(&[0x29, 0xC1]); // SUB RCX, RAX — n - q*d
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC8]); // MOV RAX, RCX
+    }
+
     fn emit_idiv_pow2(&mut self, divisor: i32) {
         debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
         let k = divisor.trailing_zeros();
@@ -18176,6 +18483,22 @@ impl Compiler {
                     let val = self.ldc2w_info_idx.get(&pc).map(|&i| self.ldc2w_info[i].1);
                     match val {
                         Some(v) => {
+                            // Long const-arith fusion (perf/halfgap residuals,
+                            // 2026-07-18): `ldc2_w K; l{mul,div,rem,add,sub}` is
+                            // the dominant shape of long arithmetic kernels
+                            // (`i * 3`, `i / 2`, `i % 7`). A long op as the next
+                            // opcode implies the constant is a long, not a
+                            // double (the verifier rejects the mix).
+                            if self.try_const_arith_peephole_long(
+                                v,
+                                pc + 3,
+                                code,
+                                code_len,
+                                &branch_targets,
+                            ) {
+                                pc += 4;
+                                continue;
+                            }
                             self.emit_mov_imm64(RAX, v);
                             self.push_from_rax();
                             pc += 3;
