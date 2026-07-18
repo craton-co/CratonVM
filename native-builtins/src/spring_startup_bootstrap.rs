@@ -536,44 +536,7 @@ fn dlbf_register_bean_definition(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// StandardConfigDataLocationResolver.resolve — null-safe shim.
-//
-// Spring Boot 4.x `StandardConfigDataLocationResolver.resolve(ctx, location)`
-// calls `location.split()` which returns a `ConfigDataLocation[]`.  Each
-// element is passed to `getReferences(ctx, loc)` which dereferences `loc`
-// via `loc.getResourceLocation(...)`.
-//
-// In CratonVM's partial bootstrap, one of the array entries ends up null
-// (likely because `StringUtils.delimitedListToStringArray` or `Properties`
-// returns a null mid-array).  The result is:
-//
-//     NullPointerException: Cannot invoke getResourceLocation on null
-//
-// Without application.yml/properties on the demo classpath, the correct
-// behaviour is to load no config-data resources.  We override the public
-// `resolve(ConfigDataLocationResolverContext, ConfigDataLocation)` to return
-// an empty `ArrayList` — Spring proceeds without any config-data overrides
-// from the standard locations.
 // ──────────────────────────────────────────────────────────────────────────────
-
-fn empty_arraylist(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let list = match ctx.new_object("java/util/ArrayList").ok().flatten() {
-        Some(Value::Object(Some(o))) => o,
-        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 8),
-    };
-    // GC-safety: the `<init>` invocation below can itself allocate; pin
-    // `list` and re-read the forwarded reference before returning it.
-    let list_pin = ctx.pin_native_root(list);
-    let _ = ctx.invoke(
-        "java/util/ArrayList",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(list))],
-    );
-    let list = ctx.read_native_pin(list_pin, list);
-    ctx.unpin_native_roots(list_pin);
-    Ok(Some(Value::Object(Some(list))))
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Spring Cloud AbstractEnvironmentDecrypt.decrypt — null-safe shim.
@@ -612,17 +575,6 @@ fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
 
 fn abstract_env_decrypt(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     empty_hashmap(ctx)
-}
-
-fn standard_config_data_resolve(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    empty_arraylist(ctx)
-}
-
-fn standard_config_data_resolve_profile_specific(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    empty_arraylist(ctx)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1130,16 +1082,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // override restores relaxed binding; any genuine null-getPropertyNames
     // source is a separate real bug to fix at its source, not to mask here.
 
-    // ── StandardConfigDataLocationResolver null-safe shim ──
-    // See comment block above standard_config_data_resolve for rationale.
-    const STD_CFG_RES: &str =
-        "org/springframework/boot/context/config/StandardConfigDataLocationResolver";
-    registry.register(
-        STD_CFG_RES,
-        "resolve",
-        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
-        standard_config_data_resolve,
-    );
     // ── Spring Cloud AbstractEnvironmentDecrypt null-safe shim ──
     // Override decrypt(TextEncryptor, PropertySources) to return an empty Map,
     // sidestepping the arraylength-on-null NPE from synthetic property sources
@@ -1151,13 +1093,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "decrypt",
         "(Lorg/springframework/security/crypto/encrypt/TextEncryptor;Lorg/springframework/core/env/PropertySources;)Ljava/util/Map;",
         abstract_env_decrypt,
-    );
-
-    registry.register(
-        STD_CFG_RES,
-        "resolveProfileSpecific",
-        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
-        standard_config_data_resolve_profile_specific,
     );
 
     // ── Hibernate Validator preinitialization shim ─────────────────────────
@@ -3737,6 +3672,27 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register(&mut r);
         r
+    }
+
+    #[test]
+    fn standard_config_data_resolver_uses_real_bytecode() {
+        let r = build_registry();
+        const CLASS: &str =
+            "org/springframework/boot/context/config/StandardConfigDataLocationResolver";
+        assert!(r
+            .find(
+                CLASS,
+                "resolve",
+                "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
+            )
+            .is_none());
+        assert!(r
+            .find(
+                CLASS,
+                "resolveProfileSpecific",
+                "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
+            )
+            .is_none());
     }
 
     #[test]
