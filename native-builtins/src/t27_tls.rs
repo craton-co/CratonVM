@@ -1068,8 +1068,14 @@ impl SniCertResolver {
 /// `config` before the caller sees it.
 pub(crate) struct TlsServerListenerEntry {
     pub(crate) listener: TcpListener,
-    pub(crate) config: Arc<ServerConfig>,
+    pub(crate) config: TlsServerConfig,
     pub(crate) local_port: u16,
+}
+
+#[derive(Clone)]
+pub(crate) enum TlsServerConfig {
+    Rustls(Arc<ServerConfig>),
+    Native(native_tls::TlsAcceptor),
 }
 
 pub(crate) struct ServerRegistry {
@@ -1098,11 +1104,16 @@ pub(crate) struct TlsClientStreamEntry {
 }
 
 pub(crate) struct TlsServerStreamEntry {
-    pub(crate) stream: StreamOwned<ServerConnection, TcpStream>,
+    pub(crate) stream: TlsServerStream,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
     pub(crate) negotiated_alpn: Option<String>,
+}
+
+pub(crate) enum TlsServerStream {
+    Rustls(StreamOwned<ServerConnection, TcpStream>),
+    Native(native_tls::TlsStream<TcpStream>),
 }
 
 impl Default for ServerRegistry {
@@ -2375,45 +2386,61 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let conn = ServerConnection::new(config)
-        .map_err(|e| format!("ServerConnection::new failed: {}", e))?;
-    let mut stream = StreamOwned::new(conn, tcp);
-
-    while stream.conn.is_handshaking() {
-        if stream.conn.wants_read() {
-            stream
-                .conn
-                .read_tls(&mut stream.sock)
-                .map_err(|e| format!("server handshake read: {}", e))?;
-            stream
-                .conn
-                .process_new_packets()
-                .map_err(|e| format!("server handshake process: {}", e))?;
-        }
-        if stream.conn.wants_write() {
-            stream
-                .conn
-                .write_tls(&mut stream.sock)
-                .map_err(|e| format!("server handshake write: {}", e))?;
-        }
-    }
-
-    let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
-    let negotiated_protocol = match stream.conn.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
-    }
-    .to_string();
-    let negotiated_cipher = stream
-        .conn
-        .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
-    let negotiated_alpn = stream
-        .conn
-        .alpn_protocol()
-        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
+        match config {
+            TlsServerConfig::Rustls(config) => {
+                let conn = ServerConnection::new(config)
+                    .map_err(|e| format!("ServerConnection::new failed: {e}"))?;
+                let mut stream = StreamOwned::new(conn, tcp);
+                while stream.conn.is_handshaking() {
+                    if stream.conn.wants_read() {
+                        stream
+                            .conn
+                            .read_tls(&mut stream.sock)
+                            .map_err(|e| format!("server handshake read: {e}"))?;
+                        stream
+                            .conn
+                            .process_new_packets()
+                            .map_err(|e| format!("server handshake process: {e}"))?;
+                    }
+                    if stream.conn.wants_write() {
+                        stream
+                            .conn
+                            .write_tls(&mut stream.sock)
+                            .map_err(|e| format!("server handshake write: {e}"))?;
+                    }
+                }
+                let sni = stream.conn.server_name().map(|s| s.to_string());
+                let protocol = match stream.conn.protocol_version() {
+                    Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+                    _ => "TLS",
+                }
+                .to_string();
+                let cipher = stream
+                    .conn
+                    .negotiated_cipher_suite()
+                    .map(|cs| format!("{:?}", cs.suite()))
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let alpn = stream
+                    .conn
+                    .alpn_protocol()
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok());
+                (TlsServerStream::Rustls(stream), sni, protocol, cipher, alpn)
+            }
+            TlsServerConfig::Native(acceptor) => {
+                let stream = acceptor
+                    .accept(tcp)
+                    .map_err(|e| format!("legacy TLS server handshake: {e}"))?;
+                (
+                    TlsServerStream::Native(stream),
+                    None,
+                    "TLSv1.2".to_string(),
+                    "UNKNOWN".to_string(),
+                    None,
+                )
+            }
+        };
 
     let entry = TlsServerStreamEntry {
         stream,
@@ -2435,7 +2462,10 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         return e.stream.read(buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        return match &mut e.stream {
+            TlsServerStream::Rustls(s) => s.read(buf),
+            TlsServerStream::Native(s) => s.read(buf),
+        };
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2450,7 +2480,10 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
         return e.stream.write(data);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return e.stream.write(data);
+        return match &mut e.stream {
+            TlsServerStream::Rustls(s) => s.write(data),
+            TlsServerStream::Native(s) => s.write(data),
+        };
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2466,8 +2499,15 @@ pub(crate) fn rustls_stream_close(id: i32) {
         let _ = e.stream.flush();
     }
     if let Some(mut e) = reg.server_streams.remove(&id) {
-        e.stream.conn.send_close_notify();
-        let _ = e.stream.flush();
+        match &mut e.stream {
+            TlsServerStream::Rustls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+            TlsServerStream::Native(s) => {
+                let _ = s.shutdown();
+            }
+        }
     }
 }
 
@@ -2622,7 +2662,16 @@ fn create_ssl_server_socket(
         false,
         None,
     )
-    .map_err(|error| RuntimeError::IOException { message: error })?;
+    .map(TlsServerConfig::Rustls)
+    .or_else(|rustls_error| {
+        native_tls::Identity::from_pkcs8(identity.cert_pem.as_bytes(), identity.key_pem.as_bytes())
+            .and_then(native_tls::TlsAcceptor::new)
+            .map(TlsServerConfig::Native)
+            .map_err(|native_error| {
+                format!("{rustls_error}; platform TLS fallback: {native_error}")
+            })
+    })
+    .map_err(|message| RuntimeError::IOException { message })?;
 
     let listener = TcpListener::bind((bind_address, port as u16)).map_err(|error| {
         RuntimeError::IOException {
