@@ -1,7 +1,6 @@
 package cratonvm;
 
 import java.io.InputStream;
-import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 
@@ -13,58 +12,40 @@ import java.net.SocketTimeoutException;
 public final class SocketInputStreamTimeout {
 
     private static final int READ_TIMEOUT_MILLIS = 100;
-    private static final int PEER_IDLE_MILLIS = 600;
 
     private SocketInputStreamTimeout() {
     }
 
     public static void main(String[] args) throws Exception {
-        expectTimeout("read()");
-        expectTimeout("read(byte[], off, len)");
-        expectTimeout("read(byte[])");
+        if (args.length != 1) {
+            throw new IllegalArgumentException("expected the externally hosted peer port");
+        }
+        int port = Integer.parseInt(args[0]);
+        expectTimeout(port, "read()");
+        expectTimeout(port, "read(byte[], off, len)");
+        expectTimeout(port, "read(byte[])");
         System.out.println("SOCKET_INPUT_STREAM_TIMEOUT_OK");
     }
 
-    private static void expectTimeout(String overload) throws Exception {
-        try (ServerSocket listener = new ServerSocket(0)) {
-            Throwable[] serverFailure = new Throwable[1];
-            Thread peer = new Thread(() -> {
-                try (Socket ignored = listener.accept()) {
-                    Thread.sleep(PEER_IDLE_MILLIS);
+    private static void expectTimeout(int port, String overload) throws Exception {
+        try (Socket socket = new Socket("127.0.0.1", port)) {
+            socket.setSoTimeout(READ_TIMEOUT_MILLIS);
+            InputStream input = socket.getInputStream();
+            try {
+                int actual;
+                if (overload.equals("read()")) {
+                    actual = input.read();
                 }
-                catch (Throwable ex) {
-                    serverFailure[0] = ex;
+                else if (overload.equals("read(byte[], off, len)")) {
+                    actual = input.read(new byte[4], 1, 2);
                 }
-            }, "socket-input-stream-timeout-peer");
-            peer.start();
-
-            try (Socket socket = new Socket("127.0.0.1", listener.getLocalPort())) {
-                socket.setSoTimeout(READ_TIMEOUT_MILLIS);
-                InputStream input = socket.getInputStream();
-                try {
-                    int actual;
-                    if (overload.equals("read()")) {
-                        actual = input.read();
-                    }
-                    else if (overload.equals("read(byte[], off, len)")) {
-                        actual = input.read(new byte[4], 1, 2);
-                    }
-                    else {
-                        actual = input.read(new byte[4]);
-                    }
-                    throw new AssertionError(overload + " returned " + actual + " instead of timing out");
+                else {
+                    actual = input.read(new byte[4]);
                 }
-                catch (SocketTimeoutException expected) {
-                    // This is the Java InputStream contract for SO_TIMEOUT.
-                }
+                throw new AssertionError(overload + " returned " + actual + " instead of timing out");
             }
-
-            peer.join(PEER_IDLE_MILLIS + 2_000L);
-            if (peer.isAlive()) {
-                throw new AssertionError("peer did not complete for " + overload);
-            }
-            if (serverFailure[0] != null) {
-                throw new AssertionError("peer failed for " + overload, serverFailure[0]);
+            catch (SocketTimeoutException expected) {
+                // This is the Java InputStream contract for SO_TIMEOUT.
             }
         }
     }

@@ -16,6 +16,6 @@ The real-JDK socket path was audited too. Its shared `re1_socket_read_stream` he
 
 - Map both `ErrorKind::TimedOut` and `ErrorKind::WouldBlock` to the concrete `RuntimeError::SocketTimeoutException` in all three legacy `SocketInputStream.read` overloads.
 - Map those same timeout forms in the shared real-JDK read helper, preserving the typed exception across `read()`, `read(byte[])`, and `read(byte[], off, len)`.
-- Add `SocketInputStreamTimeout`, a loopback regression probe covering every overload in synthetic and `CRATONVM_REAL_NET_SOCKETS=1` modes, with JIT and `--nojit` execution.
+- Add `SocketInputStreamTimeout`, a loopback regression probe with an external idle peer. It covers every overload in synthetic and `CRATONVM_REAL_NET_SOCKETS=1` modes, with JIT and `--nojit` execution.
 
 This restores the Java contract: a connected peer that supplies no data before `SO_TIMEOUT` throws `SocketTimeoutException`; only an actual zero-byte peer close returns EOF (`-1`).

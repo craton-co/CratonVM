@@ -3,8 +3,11 @@
 
 //! Regression coverage for SO_TIMEOUT on all SocketInputStream read overloads.
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const FIXTURE: &str = "SocketInputStreamTimeout";
 
@@ -34,6 +37,36 @@ fn cratonvm_binary() -> Option<PathBuf> {
 }
 
 fn run_probe(binary: &Path, nojit: bool, real_net_sockets: bool) {
+    // Keep the peer outside the VM. This makes a zero-byte read unambiguously
+    // a bug in the client socket path, rather than a side effect of a VM-side
+    // test server closing its socket early.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("failed to bind timeout probe peer");
+    let port = listener
+        .local_addr()
+        .expect("timeout probe peer has no local address")
+        .port();
+    let peer = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("failed to make timeout probe peer nonblocking");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut connections = 0;
+        while connections < 3 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_socket, _peer)) => {
+                    connections += 1;
+                    // The VM client has a 100 ms SO_TIMEOUT; this must keep
+                    // the connection alive substantially longer than that.
+                    thread::sleep(Duration::from_millis(600));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("timeout probe peer accept failed: {error}"),
+            }
+        }
+        connections
+    });
     let mut command = Command::new(binary);
     if nojit {
         command.arg("--nojit");
@@ -47,13 +80,19 @@ fn run_probe(binary: &Path, nojit: bool, real_net_sockets: bool) {
         .arg("-c")
         .arg(workspace_root().join("vm/tests/resources"))
         .arg(format!("cratonvm.{FIXTURE}"))
+        .arg(port.to_string())
         .output()
         .expect("failed to launch SocketInputStream timeout fixture");
+    let connections = peer.join().expect("timeout probe peer panicked");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success() && stdout.contains("SOCKET_INPUT_STREAM_TIMEOUT_OK"),
         "{FIXTURE} failed (nojit={nojit}, real_net_sockets={real_net_sockets}). stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        connections, 3,
+        "{FIXTURE} did not exercise every read overload"
     );
 }
 
