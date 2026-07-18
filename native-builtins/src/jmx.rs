@@ -173,6 +173,12 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
     );
     r.register(
         cls,
+        "getCanonicalName",
+        "()Ljava/lang/String;",
+        native_object_name_get_canonical_name,
+    );
+    r.register(
+        cls,
         "getDomain",
         "()Ljava/lang/String;",
         native_object_name_domain,
@@ -455,6 +461,22 @@ fn native_object_name_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(s))))
 }
 
+/// `ObjectName.getCanonicalName()` sorts key properties while retaining the
+/// domain and property-list wildcard semantics.  The synthetic ObjectName
+/// model keeps the original input text for `toString()`, but JMX identity is
+/// defined by this canonical form rather than the input order.
+fn native_object_name_get_canonical_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let canonical = canonical_object_name_text(&object_name_text(ctx, this));
+    Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))))
+}
+
 fn native_object_name_domain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -532,6 +554,65 @@ fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
     (domain.to_string(), props, is_pattern)
 }
 
+/// Split a key-property list on commas not protected by ObjectName quoting.
+/// This deliberately preserves each token verbatim: canonicalisation changes
+/// property *order*, never escaping or quoted values.
+fn split_object_name_properties(properties: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in properties.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            parts.push(&properties[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    parts.push(&properties[start..]);
+    parts
+}
+
+/// Return the canonical JMX identity text for an ObjectName.  ObjectName's
+/// real canonical form sorts key-property names, so names differing only by
+/// source order (for example `name=dataSource,type=HikariDataSource` versus
+/// `type=HikariDataSource,name=dataSource`) compare equal and map to the same
+/// MBean-server entry.
+fn canonical_object_name_text(text: &str) -> String {
+    let (domain, properties) = match text.split_once(':') {
+        Some(parts) => parts,
+        None => return text.to_string(),
+    };
+    let mut properties = split_object_name_properties(properties);
+    let property_list_pattern = matches!(properties.last(), Some(&"*"));
+    if property_list_pattern {
+        properties.pop();
+    }
+    properties.sort_unstable_by(|left, right| {
+        let left_key = left.split_once('=').map(|(key, _)| key).unwrap_or(left);
+        let right_key = right.split_once('=').map(|(key, _)| key).unwrap_or(right);
+        left_key.cmp(right_key).then_with(|| left.cmp(right))
+    });
+    let mut canonical = String::with_capacity(text.len());
+    canonical.push_str(domain);
+    canonical.push(':');
+    canonical.push_str(&properties.join(","));
+    if property_list_pattern {
+        if !properties.is_empty() {
+            canonical.push(',');
+        }
+        canonical.push('*');
+    }
+    canonical
+}
+
 /// `ObjectName.getCanonicalKeyPropertyListString()`: the canonical
 /// (domain-and-pattern-suffix-stripped) key-property-list portion of the
 /// name, e.g. `"type=MBeanServerDelegate"` for
@@ -547,7 +628,8 @@ fn native_object_name_get_canonical_key_property_list_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let text = object_name_text(ctx, this);
-    let props_str = text.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let canonical = canonical_object_name_text(&text);
+    let props_str = canonical.split_once(':').map(|(_, p)| p).unwrap_or("");
     let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
     let props_str = if props_str == "*" { "" } else { props_str };
     let s = ctx.create_string(props_str);
@@ -673,7 +755,8 @@ fn native_object_name_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(
-        (object_name_text(ctx, this) == object_name_text(ctx, other)) as i32,
+        (canonical_object_name_text(&object_name_text(ctx, this))
+            == canonical_object_name_text(&object_name_text(ctx, other))) as i32,
     )))
 }
 
@@ -683,7 +766,7 @@ fn native_object_name_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Int(0))),
     };
     let mut hash = 0i32;
-    for b in object_name_text(ctx, this).bytes() {
+    for b in canonical_object_name_text(&object_name_text(ctx, this)).bytes() {
         hash = hash.wrapping_mul(31).wrapping_add(b as i32);
     }
     Ok(Some(Value::Int(hash)))
@@ -3147,14 +3230,14 @@ fn object_name_key(ctx: &mut dyn NativeContext, name: Option<ObjectRef>) -> Stri
     ] {
         if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(name, m, d, &[]) {
             if let Some(text) = ctx.read_string(s) {
-                if !text.is_empty() {
-                    return text;
-                }
+            if !text.is_empty() {
+                return canonical_object_name_text(&text);
+            }
             }
         }
     }
     // Last resort: the object might itself be a String (synthetic stub).
-    ctx.read_string(name).unwrap_or_default()
+    canonical_object_name_text(&ctx.read_string(name).unwrap_or_default())
 }
 
 /// Read the current registry (names, beans) arrays off a server object.
@@ -4554,7 +4637,7 @@ mod jmx_tests {
         ctx.set_field(server, MBS_NAMES, Value::Object(Some(names)));
 
         assert_eq!(
-            mbs_domains(&ctx, server),
+            mbs_domains(&mut ctx, server),
             vec![
                 "org.springframework.integration",
                 "org.springframework.boot.integration.autoconfigure",
@@ -4575,6 +4658,28 @@ mod jmx_tests {
         );
         // Null name -> empty key, no panic.
         assert_eq!(object_name_key(&mut ctx, None), "");
+    }
+
+    #[test]
+    fn object_name_canonicalization_makes_key_order_semantic() {
+        let registered = "cratonvm.lazy:name=dataSource,type=HikariDataSource";
+        let queried = "cratonvm.lazy:type=HikariDataSource,name=dataSource";
+        assert_eq!(
+            canonical_object_name_text(registered),
+            "cratonvm.lazy:name=dataSource,type=HikariDataSource"
+        );
+        assert_eq!(
+            canonical_object_name_text(registered),
+            canonical_object_name_text(queried)
+        );
+    }
+
+    #[test]
+    fn object_name_canonicalization_preserves_quoted_commas_and_patterns() {
+        assert_eq!(
+            canonical_object_name_text("example:type=Cache,name=\"a,b\",*"),
+            "example:name=\"a,b\",type=Cache,*"
+        );
     }
 
     #[test]
