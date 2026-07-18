@@ -1756,7 +1756,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -4507,6 +4507,23 @@ const HUC_BODY: usize = 6;
 const HUC_DO_INPUT: usize = 7;
 const HUC_DO_OUTPUT: usize = 8;
 const HUC_CONNECTED: usize = 9;
+// Field 10 caches the `java/util/jar/JarFile` returned by
+// `JarURLConnection.getJarFile()` so repeat calls see the SAME instance
+// (matching `sun.net.www.protocol.jar.JarURLConnection`, which opens the
+// JarFile once and caches it). Without this, each call minted a fresh
+// JarFile, so closing the jar via one reference never affected another —
+// Spring Boot's `StaticResourceJarsTests.closesJarFromNonCachedConnection`
+// expects `getJarFile().getComment()` to see the CLOSED state after
+// `StaticResourceJars` already closed the connection's jar.
+const HUC_JAR_FILE: usize = 10;
+// Tracks `URLConnection.useCaches` for the `java/net/JarURLConnection`
+// carrier (see the class-scoped `setUseCaches`/`getUseCaches` registrations
+// below `getJarFile`). Reuses HUC_CODE's slot: never read or written by any
+// JarURLConnection-specific native (HUC_CODE only matters for an HTTP
+// response code), and — unlike field 11, which was tried first and proved
+// to silently not persist across calls — sits inside the confirmed-safe
+// 0..=10 field range for this carrier.
+const HUC_USE_CACHES: usize = HUC_CODE;
 
 struct HttpResponse {
     status: i32,
@@ -6116,6 +6133,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/util/jar/JarFile;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Cached from a prior call — return the SAME instance so a
+            // caller that closes it (e.g. `StaticResourceJars` on a
+            // non-cached connection) observes the closed state on every
+            // later `getJarFile()` call, matching real-JDK's cached
+            // `sun.net.www.protocol.jar.JarURLConnection.jarFile` field.
+            if let Value::Object(Some(cached)) = ctx.get_field(this, HUC_JAR_FILE) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
@@ -6183,6 +6208,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
             )?;
+            ctx.set_field(this, HUC_JAR_FILE, Value::Object(Some(jar_file)));
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
@@ -6293,6 +6319,55 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
+    // JarURLConnection.setUseCaches(boolean) / getUseCaches() — class-scoped
+    // override (more specific than the base-class no-op above, so it wins
+    // in dispatch for actual JarURLConnection-carrier instances) giving
+    // real get/set semantics instead of the base no-op / real-bytecode
+    // fallback, which always answered `false` regardless of what a caller
+    // set. That made `StaticResourceJars.isResourcesJar(JarURLConnection)`'s
+    // `closeJarFile = !connection.getUseCaches()` unconditionally close a
+    // cached JarFile (see HUC_JAR_FILE, above) even on a `useCaches(true)`
+    // connection, breaking `StaticResourceJarsTests
+    // .doesNotCloseJarFromCachedConnection` once `getJarFile()` started
+    // returning the same instance across calls.
+    //
+    // Storage: reuses HUC_USE_CACHES (field 2, aka HUC_CODE — never read or
+    // written by any JarURLConnection-specific native; only meaningful for
+    // an HTTP response code). Field 11 was tried first and DISCARDED: this
+    // carrier's real backing class (`java/net/JarURLConnection`) apparently
+    // reports a real total-field count of 11 (fields 0..=10), so index 11
+    // silently failed to persist across calls — confirmed empirically with
+    // a probe (`set` landed, the very next `get` read back the unset
+    // default). Field 2 sits well inside the confirmed-persisting 0..=10
+    // range (field 10, HUC_JAR_FILE, is proven reliable elsewhere in this
+    // file), so this is the safe choice, not merely the convenient one.
+    r.register(
+        "java/net/JarURLConnection",
+        "setUseCaches",
+        "(Z)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let v = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
+            ctx.set_field(this, HUC_USE_CACHES, Value::Int(if v { 1 } else { 0 }));
+            Ok(None)
+        },
+    );
+    r.register(
+        "java/net/JarURLConnection",
+        "getUseCaches",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Unset (never called setUseCaches): real-JDK default is `true`
+            // for every protocol except `file:`, which this carrier never
+            // represents (file: uses the real FileURLConnection class).
+            let v = match ctx.get_field(this, HUC_USE_CACHES) {
+                Value::Int(n) => n != 0,
+                _ => true,
+            };
+            Ok(Some(Value::Int(if v { 1 } else { 0 })))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLength",

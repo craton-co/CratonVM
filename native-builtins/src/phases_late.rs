@@ -16096,6 +16096,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .to_string();
             }
         }
+        // Decode percent-escapes (`%20` -> ` `, etc.) the way the real
+        // `URI.getPath()` accessor does — File(URI) calls that accessor, but
+        // both sources above (the by-name `path` field on a real-JDK URI,
+        // and the raw-text parse fallback) yield the RAW, still-encoded
+        // component. Without this, a jar/file path containing an encoded
+        // space or other reserved character never resolves to the real
+        // on-disk file (Spring Boot's `StaticResourceJars.toFile` silently
+        // treats the mis-decoded `File` as not found).
+        let path = crate::net_phase_e::uri_percent_decode(&path);
         // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
         let mut p = path;
         let chars: Vec<char> = p.chars().collect();
@@ -21945,6 +21954,23 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 0, Value::Object(None));
         }
         Ok(None)
+    });
+    // JarFile.getComment() — inherited from ZipFile in real bytecode, whose
+    // `ensureOpen()` throws `IllegalStateException("zip file closed")` once
+    // `close()` has run. Our synthetic 2-field JarFile has no real ZipFile
+    // backing fields for that bytecode to check, so unregistered dispatch
+    // returned normally with no exception at all — Spring Boot's
+    // `StaticResourceJarsTests.closesJarFromNonCachedConnection` expects the
+    // throw. Mirror `close()`'s closed-marker (path field cleared to null).
+    r.register(jf, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if matches!(ctx.get_field(this, 0), Value::Object(None)) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "zip file closed".to_string(),
+            }
+            .into());
+        }
+        Ok(Some(Value::Object(None)))
     });
     r.register(jf, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
