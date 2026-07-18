@@ -38775,132 +38775,34 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Apache commons-logging — Spring Boot 2.7 `SpringApplicationShutdownHook`
-    // static `Log logger = LogFactory.getLog(...)`. Real-JDK bytecode can NPE
-    // inside discovery; `vm_exec` forces these natives when registered.
-    let acl = "org/apache/commons/logging/LogFactory";
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    let acl_log = "org/apache/commons/logging/Log";
-    registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL WARN] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "warn",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
-    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
-    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
-    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL FATAL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "fatal",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "info",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "error",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // `org/apache/commons/logging/LogFactory.getLog`/`Log.info/debug/warn/
+    // error/etc.` used to be natively overridden here (as a `Bridge`, so
+    // `CRATONVM_NO_STUBS` could not drop it) to fabricate a throwaway 1-field
+    // synthetic `Log` whose `info`/`warn`/`error`/`fatal` routed through
+    // `ctx.record_printed_line` with a fake `"[ACL] "` prefix (bypassing
+    // System.out/err entirely) and whose `debug`/`trace` were pure no-ops.
+    // Every Spring Boot production class using the conventional
+    // `private final Log logger = LogFactory.getLog(getClass());` pattern
+    // (`ConditionEvaluationReportLogger`, `DockerComposeLifecycleManager`,
+    // `EndpointId`, `FreeMarkerAutoConfiguration`, the `Health*Indicator`
+    // family, …) got this fake `Log` — so its output could never reach a
+    // real Logback `ConsoleAppender`/`OutputStreamAppender`, and Spring
+    // Boot's `CapturedOutput` (which hooks `System.out`/`System.err`) always
+    // saw the empty string. This bridge predates, and was never revisited
+    // after, the `ch/qos/logback/classic/Logger`/`LoggerContext.getLogger`
+    // fix directly above — same overlay/real-class-layout mismatch family
+    // (see the note above that fix). Real `commons-logging` 1.3.x's own
+    // `LogFactory.getLog()` bytecode does its own SLF4J-bridge discovery at
+    // runtime and, with the `ch/qos/logback/classic/Logger` fix above in
+    // place, correctly hands back a real SLF4J-backed `Log` that reaches
+    // real Logback. This native override is dropped so that discovery runs
+    // for real. The original motivating case (`SpringApplicationShutdownHook`'s
+    // static `Log logger = LogFactory.getLog(...)`, which real-JDK bytecode
+    // was said to NPE inside) needs re-verification against a
+    // `SpringApplication.run()`-driving test (`SimpleMainTests`/
+    // `BannerTests`) after this change — see the doc for the verification
+    // run this was checked against.
 
     // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
     // real `java.base` bytecode from `--java-home` provides the anonymous
@@ -71933,38 +71835,37 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `LoggerContext` instance so Spring Boot's
     // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
     // class check passes. The instance is initialized through Logback's real
-    // constructor; `getLogger(String)` remains a lightweight logging bridge.
+    // constructor; `getLogger(String)` is now left to Logback's real
+    // bytecode (see below) instead of a native override.
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // `LoggerContext.getLogger(String)`/`getLogger(Class)` used to be
+    // natively overridden to fabricate a throwaway 2-field synthetic
+    // `ch.qos.logback.classic.Logger` (name + level only), completely
+    // bypassing the real object the caller's `LoggerContext` already
+    // constructed (its real `root` Logger, its real `loggerCache`, its real
+    // parent-chain walk). This ran unconditionally in real-JDK mode even
+    // when `ch/qos/logback/classic/LoggerContext` was fully real (per the
+    // `StaticLoggerBinder.getLoggerFactory` fix below, which already
+    // prefers `ctx.new_object_initialized` when the real class is
+    // loadable) — an overlay/real-class-layout mismatch in the same family
+    // as the already-fixed `loggerContextListenerList` corruption (see
+    // docs/internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md).
+    // Every `ch/qos/logback/classic/Logger` instance method below
+    // (`addAppender`, `info`/`warn`/`error`/etc., `filterAndLog_*`) was
+    // ALSO natively stubbed to a no-op, so even a caller holding a real
+    // `LoggerContext.root` reference could never attach a `ConsoleAppender`
+    // or have a log record actually reach one: `BasicConfigurator.configure()`
+    // would call `context.getLogger("ROOT")`, get a disposable synthetic
+    // Logger back, call `addAppender` on it (a no-op), and the REAL root
+    // logger inside `LoggerContext` never received the appender — so
+    // `OutputCaptureExtension`'s `CapturedOutput` (and every other consumer
+    // of Logback-routed log output) always saw the empty string, regardless
+    // of `System.out`/`System.err` redirection state. Removed the
+    // `getLogger` overrides here and every `ch/qos/logback/classic/Logger`
+    // no-op below so real Logback bytecode drives logger creation,
+    // appender attachment, and the whole `filterAndLog` → appender chain.
     let lb_ctx = "ch/qos/logback/classic/LoggerContext";
-    registry.register(
-        lb_ctx,
-        "getLogger",
-        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field_by_name(logger, "name", name);
-            ctx.set_field(logger, 0, name);
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
-    registry.register(
-        lb_ctx,
-        "getLogger",
-        "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name_val = match args.get(1) {
-                Some(Value::Object(Some(class_mirror))) => match ctx.get_field(*class_mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => Value::Object(Some(ctx.create_string("unknown"))),
-                },
-                _ => Value::Object(Some(ctx.create_string("unknown"))),
-            };
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field_by_name(logger, "name", name_val);
-            ctx.set_field(logger, 0, name_val);
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
     registry.register(lb_ctx, "getName", "()Ljava/lang/String;", |ctx, _| {
         Ok(Some(Value::Object(Some(ctx.create_string("default")))))
     });
@@ -71974,194 +71875,11 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
     registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
-    /* Historical rationale for the removed construction-bypass shims.
-     * LoggerContext now runs its real constructor, so Java owns ContextBase,
-     * BasicStatusManager, and TurboFilterList state again. Do not restore the
-     * old overrides below.
-     *
-    // ContextBase is the parent class of LoggerContext. Its real
-    // bytecode `getObject(String)` / `putObject(String, Object)` /
-    // `getCopyOfPropertyMap` reads a `HashMap` field that is null
-    // because we bypass the real `<init>` chain. Spring Boot's
-    // `LogbackLoggingSystem.beforeInitialize()` calls `getObject`
-    // (via `isAlreadyInitialized`) on the LoggerContext we hand out,
-    // so we need these accessor natives to short-circuit before the
-    // null-map dereference. Returning null from getObject is the
-    // documented "not present" contract; putObject becomes a no-op.
-
-    // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
-    // real bytecode reads a `BasicStatusManager` field set in <init>,
-    // which is null because we bypass real construction. Spring Boot's
-    // LogbackLoggingSystem.beforeInitialize routes through
-    // `ContextInitializer.statusOnResourceSearch` which calls
-    // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
-    // synthetic BasicStatusManager whose interface methods (add/clear/
-    // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
-
-    // BasicStatusManager surface — interface dispatch resolves to the
-    // receiver's runtime class. Provide no-op natives so any caller
-    // (Spring Boot, Joran, logback internals) that obtains the manager
-    // via getStatusManager() can invoke its methods without NPE.
-
-    // LoggerContext.getTurboFilterList — Spring Boot's
-    // LogbackLoggingSystem.beforeInitialize line 123 does
-    // `loggerContext.getTurboFilterList().add(FILTER)`. The real field
-    // is null because we bypass logback's <init>. Return a synthetic
-    // TurboFilterList with `add(Object)` no-op so Spring's filter
-    // registration succeeds silently.
-
-    // Logback Logger surface — paired with the LoggerContext.getLogger
-    // native above. Mirrors the SLF4J Logger no-ops registered higher
-    // in this fn but on the concrete `ch.qos.logback.classic.Logger`
-    // class so direct logback-typed callers (Spring Boot's
-    // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
-    // already routes through the SLF4J no-ops; user code that casts
-    // to logback's Logger needs these).
-     */
-    let lb_lg = "ch/qos/logback/classic/Logger";
-    registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let v = match ctx.get_field_by_name(this, "name") {
-            Value::Object(Some(s)) => Value::Object(Some(s)),
-            _ => match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string(""))),
-            },
-        };
-        Ok(Some(v))
-    });
-    registry.register(lb_lg, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isTraceEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isDebugEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isInfoEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isWarnEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isErrorEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        lb_lg,
-        "setLevel",
-        "(Lch/qos/logback/classic/Level;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        lb_lg,
-        "getLevel",
-        "()Lch/qos/logback/classic/Level;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        lb_lg,
-        "getEffectiveLevel",
-        "()Lch/qos/logback/classic/Level;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    // Plain (String,...) and Marker-variant overloads. Spring Boot's
-    // LogAdapter and direct logback-typed callers dispatch through any
-    // of these; all are routed to a no-op so we never enter logback's
-    // internal filterAndLog path (where filter/appender lists are null
-    // because we bypass logback's <init>).
-    for sig in [
-        "(Ljava/lang/String;)V",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)V",
-    ] {
-        registry.register(lb_lg, "trace", sig, slf4j_noop);
-        registry.register(lb_lg, "debug", sig, slf4j_noop);
-        registry.register(lb_lg, "info", sig, slf4j_noop);
-        registry.register(lb_lg, "warn", sig, slf4j_noop);
-        registry.register(lb_lg, "error", sig, slf4j_noop);
-    }
-    // LocationAwareLogger.log(Marker, fqcn, level, msg, args, t). Spring
-    // Boot's slf4j adapter routes here, which then internally calls
-    // filterAndLog_0_Or3Plus → NPE on our synthetic Logger (filter/
-    // appender lists are null). Stub to no-op so we never enter that
-    // path.
-    registry.register(
-        lb_lg,
-        "log",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;ILjava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    // Private filterAndLog_* helpers. Registered as belt-and-suspenders:
-    // if any other Logger entry point we missed reaches into filterAndLog
-    // directly, this short-circuits before touching the null filter/
-    // appender lists on our synthetic Logger.
-    registry.register(
-        lb_lg,
-        "filterAndLog_0_Or3Plus",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    registry.register(
-        lb_lg,
-        "filterAndLog_1",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    registry.register(
-        lb_lg,
-        "filterAndLog_2",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    // AppenderAttachableImpl-style methods that Spring Boot's
-    // LoggingSystem may invoke during bootstrap. Return safe defaults
-    // so callers that walk appenders see an empty list.
-    registry.register(
-        lb_lg,
-        "addAppender",
-        "(Lch/qos/logback/core/Appender;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        lb_lg,
-        "detachAppender",
-        "(Lch/qos/logback/core/Appender;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
-    registry.register(lb_lg, "detachAppender", "(Ljava/lang/String;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "detachAndStopAllAppenders", "()V", |_, _| Ok(None));
-    registry.register(
-        lb_lg,
-        "isAttached",
-        "(Lch/qos/logback/core/Appender;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
+    // `ch/qos/logback/classic/Logger` (getLogger, addAppender, info/warn/
+    // error/etc., filterAndLog_*) is intentionally NOT natively overridden
+    // here anymore — see the FIXED note above the `getLogger` removal.
+    // Real Logback bytecode now owns logger creation, appender attachment,
+    // and the filterAndLog → appender dispatch chain.
 }
 
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
@@ -72768,125 +72486,12 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- Apache Commons Logging ---
-    let acl = "org/apache/commons/logging/LogFactory";
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1)); // enabled
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    let acl_log = "org/apache/commons/logging/Log";
-    registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    // Commons-Logging debug — instance method, below default threshold
-    // so we discard arguments. NEW-6.
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL WARN] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
-    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
-    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
-    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL FATAL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "fatal",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "info",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "error",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // this duplicated (and, per the registry's last-write-wins semantics,
+    // was shadowed by) `register_essential_natives`'s now-removed
+    // `LogFactory.getLog`/`Log.*` overrides — see the longer note there.
+    // Removed here too so nothing re-registers the fake `Log`.
 
     // --- Log4j2 (org.apache.logging.log4j) ---
     let log4j_lm = "org/apache/logging/log4j/LogManager";
@@ -73011,72 +72616,20 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     });
 
     // --- Logback (ch.qos.logback) ---
-    let lb_factory = "ch/qos/logback/classic/LoggerContext";
-    /* Historical rationale for the removed constructor/context-state shims.
-     * LoggerContext now uses its bytecode constructor in every registration
-     * mode, so ContextBase owns its real maps and status manager.
-     *
-    // LoggerContext constructor — no fields to initialize. NEW-6.
-    // ContextBase.removeObject/putObject/getObject — the LoggerContext
-    // constructor override above leaves the `objectMap`/`propertyMap` fields
-    // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
-    // `ContextBase.removeObject("...")` on every environment-prepared event,
-    // which dereferences the null `objectMap` and NPEs as
-    // `Cannot invoke remove on null`. The NPE is fatal (crashes
-    // SimpleApplicationEventMulticaster), so override these accessors with
-    // no-ops since our synthetic Logback Logger doesn't track per-context
-    // properties anyway.
-    // Same overrides on the concrete subclass — invokevirtual resolution
-    // may not see ContextBase methods when the receiver class declares
-    // overrides; register on LoggerContext as well. Also stub the helper
-    // accessors LogbackLoggingSystem.cleanUp() chains through so the
-    // null `objectMap`/`propertyMap` fields are never dereferenced.
-     */
-    // Keep only the lightweight Logger bridge; do not override LoggerContext
-    // construction or its ContextBase state.
-    registry.register(
-        lb_factory,
-        "getLogger",
-        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field(logger, 0, name);
-            ctx.set_field(logger, 1, Value::Int(1)); // DEBUG
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
-
-    let lb_logger = "ch/qos/logback/classic/Logger";
-    registry.register(lb_logger, "debug", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "info", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "warn", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "error", "(Ljava/lang/String;)V", slf4j_log_msg);
-    // Logback trace — below default threshold, discard args. NEW-6.
-    registry.register(
-        lb_logger,
-        "trace",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(lb_logger, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    // setLevel — instance setter; our synthetic logger doesn't track
-    // per-instance level beyond its initial value. NEW-6.
-    registry.register(
-        lb_logger,
-        "setLevel",
-        "(Lch/qos/logback/classic/Level;)V",
-        native_noop_with_this,
-    );
-    registry.register(lb_logger, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_logger, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // this used to duplicate (and conflict with) `register_slf4j_binder_stubs_pub`'s
+    // now-removed `LoggerContext.getLogger`/`ch/qos/logback/classic/Logger`
+    // overrides with a SECOND, differently-shaped 2-field synthetic Logger
+    // (name + level) whose `debug`/`info`/`warn`/`error` routed through
+    // `slf4j_log_msg` (a fake "[LOG] name - message" formatter) instead of
+    // real Logback `filterAndLog` → appender dispatch. Neither synthetic
+    // Logger ever actually reached a `ConsoleAppender`/`OutputStreamAppender`,
+    // so any log line asserted on via Spring Boot's `CapturedOutput` (or any
+    // other real-appender consumer) was silently lost. See the longer note
+    // above `register_slf4j_binder_stubs_pub`'s (removed) `getLogger`
+    // overrides. Real Logback bytecode now owns `LoggerContext.getLogger`
+    // and every `ch/qos/logback/classic/Logger` instance method.
 }
 
 #[cfg(test)]
@@ -73115,12 +72668,64 @@ mod logback_construction_registration_tests {
                 "getTurboFilterList",
                 "()Lch/qos/logback/classic/spi/TurboFilterList;",
             ),
+            // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+            // LoggerContext.getLogger used to fabricate a throwaway synthetic
+            // Logger, and every Logger/Log instance method below was a
+            // native no-op — so log output never reached a real
+            // ConsoleAppender/System.out, and Spring Boot's CapturedOutput
+            // always saw the empty string. Guard against reintroducing any
+            // of these.
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getLogger",
+                "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getLogger",
+                "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "addAppender",
+                "(Lch/qos/logback/core/Appender;)V",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "info",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "debug",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "org/apache/commons/logging/LogFactory",
+                "getLog",
+                "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
+            ),
+            (
+                "org/apache/commons/logging/LogFactory",
+                "getLog",
+                "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
+            ),
+            (
+                "org/apache/commons/logging/Log",
+                "info",
+                "(Ljava/lang/Object;)V",
+            ),
+            (
+                "org/apache/commons/logging/Log",
+                "debug",
+                "(Ljava/lang/Object;)V",
+            ),
         ] {
             assert!(
                 registry
                     .find(class_name, method_name, descriptor)
                     .is_none(),
-                "{class_name}.{method_name}{descriptor} must use real Logback bytecode"
+                "{class_name}.{method_name}{descriptor} must use real Logback/commons-logging bytecode"
             );
         }
     }

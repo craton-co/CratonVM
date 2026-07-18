@@ -1,6 +1,72 @@
 # `CapturedOutput`/`OutputCaptureExtension` sees empty console output (cross-module FAIL cluster)
 
-**Status: OPEN — found 2026-07-17**
+**Status: OPEN (majority FIXED 2026-07-18) — found 2026-07-17**
+
+## Update 2026-07-18 — root cause fixed, most of this doc's classes now pass
+
+The root cause (not the "ConsoleAppender caches a stale `System.out`"
+hypothesis below, which was directly disproven by a standalone repro) was
+that `ch/qos/logback/classic/Logger`/`LoggerContext.getLogger` and
+`org/apache/commons/logging/LogFactory`/`Log` were natively overridden to
+hand back throwaway synthetic objects whose `addAppender`/`info`/`warn`/
+`error` never reached `System.out`/`System.err` at all — see
+`docs/internal/springboot/conditionevaluationreport-capturedoutput-empty-cluster-FIXED.md`
+for the full resolution writeup (filed against the sibling doc that first
+found this cluster). Fixed in `native-builtins/src/lib.rs` by removing
+those overrides so real Logback/commons-logging bytecode runs.
+
+Re-verified 2026-07-18 with binary `cratonvm-captured-output-fix-20260717.exe`
+(worktree `C:\craton\CratonVM-captured-output-cluster-20260717`, branch
+`fix/captured-output-empty-cluster-20260717`) against every class this
+doc lists:
+
+**Now PASS** (15 classes) — `RemoteClientConfigurationTests`,
+`RestartApplicationListenerTests`,
+`ServletManagementContextAutoConfigurationIntegrationTests`,
+`WebMvcObservationAutoConfigurationTests`, `WelcomePageHandlerMappingTests`,
+`ErrorMvcAutoConfigurationTests`, `GraphQlAutoConfigurationTests`,
+`EndpointIdTests`, `FreeMarkerAutoConfigurationTests`, `HealthEndpointTests`,
+`ReactiveHealthIndicatorImplementationTests`, `AbstractHealthIndicatorTests`,
+`AbstractReactiveHealthIndicatorTests`,
+`LoggingApplicationListenerIntegrationTests`.
+
+**Still FAIL** (7 classes, all in `core/spring-boot` specifically) — with
+several genuinely different shapes, not re-investigated at the source
+level this session (out of scope for the fix above, which targeted a
+different doc):
+- `SimpleMainTests`, `ConfigurationWarningsApplicationContextInitializerTests` —
+  still empty/wrong-content (`ConfigurationWarningsApplicationContextInitializerTests`:
+  actual `""`; `SimpleMainTests`: banner present but not the
+  `"Started SpringApplication in"` line) — same general family as this
+  doc's original symptom, but not yet root-caused to a specific remaining
+  native override.
+- `ConfigurationPropertiesTests`, `FailureAnalyzersIntegrationTests` — FAIL,
+  not yet triaged this session (only the class-level FAIL/PASS status was
+  captured, not the individual assertion diffs).
+- `DefaultSslBundleRegistryTests` — actual is only the Mockito self-attach
+  banner, still missing `"SSL bundle 'test1' has been updated..."` — same
+  "capture live, this logger's line specifically missing" shape as the
+  original doc, unclear if a residual of the same family or a distinct
+  logger-specific gap.
+- `ErrorPageFilterTests` — a **new, different** failure: actual now
+  contains a real `ArrayIndexOutOfBoundsException` thrown *by* Log4j2's
+  own `Appender STDOUT` machinery (`java.lang.String.checkOffset` /
+  `AbstractStringBuilder.insert`) instead of the expected error-page log
+  line — this is Log4j2-specific (this class apparently exercises the
+  Log4j2 backend, not Logback) and looks like a distinct, newly-exposed
+  Log4j2 appender bug, not the commons-logging/Logback issue this doc (or
+  its sibling) was about. Worth its own doc if reproduced again.
+- `GraylogExtendedLogFormatStructuredLogFormatterTests` (log4j2 and
+  logback variants) — still FAIL, not triaged this session.
+
+Given a substantial, multi-shaped residual remains concentrated in
+`core/spring-boot`, this doc stays OPEN rather than archiving — the 15
+now-passing classes are removed from the "Affected classes" table below;
+the 7 `core/spring-boot` classes remain listed pending further triage.
+
+---
+
+**Status (original, 2026-07-17): OPEN**
 
 ## Symptom
 
@@ -310,27 +376,30 @@ only broadens the affected-class list.
 
 ## Affected classes
 
+**FIXED 2026-07-18** (removed from this table — see the update at the top):
+`module/spring-boot-health`'s `HealthEndpointTests`,
+`ReactiveHealthIndicatorImplementationTests`, `AbstractHealthIndicatorTests`,
+`AbstractReactiveHealthIndicatorTests`; `module/spring-boot-devtools`'s
+`RemoteClientConfigurationTests`, `RestartApplicationListenerTests`;
+`module/spring-boot-servlet`'s
+`ServletManagementContextAutoConfigurationIntegrationTests`;
+`module/spring-boot-webmvc`'s `WebMvcObservationAutoConfigurationTests`,
+`WelcomePageHandlerMappingTests`, `ErrorMvcAutoConfigurationTests`;
+`module/spring-boot-graphql`'s `GraphQlAutoConfigurationTests`;
+`module/spring-boot-actuator`'s `EndpointIdTests`;
+`module/spring-boot-freemarker`'s `FreeMarkerAutoConfigurationTests`;
+`core/spring-boot`'s `LoggingApplicationListenerIntegrationTests`.
+
+Still OPEN (residual — see the 2026-07-18 update above for per-class
+detail):
+
 | Module | Class |
 |---|---|
-| `module/spring-boot-health` | `org.springframework.boot.health.actuate.endpoint.HealthEndpointTests` (added bin10, 1 of 27 tests) |
-| `module/spring-boot-health` | `org.springframework.boot.health.actuate.endpoint.ReactiveHealthIndicatorImplementationTests` (added bin10, 2 of 3 tests) |
-| `module/spring-boot-health` | `org.springframework.boot.health.contributor.AbstractHealthIndicatorTests` (added bin10, 5 of 6 tests) |
-| `module/spring-boot-health` | `org.springframework.boot.health.contributor.AbstractReactiveHealthIndicatorTests` (added bin10, 5 of 6 tests) |
-| `module/spring-boot-devtools` | `org.springframework.boot.devtools.remote.client.RemoteClientConfigurationTests` |
-| `module/spring-boot-devtools` | `org.springframework.boot.devtools.restart.RestartApplicationListenerTests` |
-| `module/spring-boot-servlet` | `org.springframework.boot.servlet.autoconfigure.actuate.web.ServletManagementContextAutoConfigurationIntegrationTests` |
-| `module/spring-boot-webmvc` | `org.springframework.boot.webmvc.autoconfigure.WebMvcObservationAutoConfigurationTests` (added bin8, 2 of its failing tests) |
-| `module/spring-boot-webmvc` | `org.springframework.boot.webmvc.autoconfigure.WelcomePageHandlerMappingTests` (added bin8) |
-| `module/spring-boot-webmvc` | `org.springframework.boot.webmvc.autoconfigure.error.ErrorMvcAutoConfigurationTests` (added bin8) |
-| `module/spring-boot-graphql` | `org.springframework.boot.graphql.autoconfigure.GraphQlAutoConfigurationTests` (added bin8) |
-| `module/spring-boot-actuator` | `org.springframework.boot.actuate.endpoint.EndpointIdTests` (added bin11) |
-| `module/spring-boot-freemarker` | `org.springframework.boot.freemarker.autoconfigure.FreeMarkerAutoConfigurationTests` (added bin11) |
-| `core/spring-boot` | `org.springframework.boot.SimpleMainTests` (added large-batch triage, 3 of 4 failing tests — the 4th, `basePackageScan`, is a different bug, see `core-spring-boot-configdata-resource-resolution-empty-cluster.md`) |
-| `core/spring-boot` | `org.springframework.boot.context.ConfigurationWarningsApplicationContextInitializerTests` (added large-batch triage, 4 tests) |
-| `core/spring-boot` | `org.springframework.boot.context.logging.LoggingApplicationListenerIntegrationTests` (added large-batch triage) |
-| `core/spring-boot` | `org.springframework.boot.context.properties.ConfigurationPropertiesTests` (added large-batch triage, 1 of 114 tests) |
-| `core/spring-boot` | `org.springframework.boot.diagnostics.FailureAnalyzersIntegrationTests` (added large-batch triage) |
-| `core/spring-boot` | `org.springframework.boot.ssl.DefaultSslBundleRegistryTests` (added large-batch triage) |
-| `core/spring-boot` | `org.springframework.boot.web.servlet.support.ErrorPageFilterTests` (added large-batch triage, 2 of 26 tests) |
-| `core/spring-boot` | `org.springframework.boot.logging.log4j2.GraylogExtendedLogFormatStructuredLogFormatterTests` (added large-batch triage, 1 of its failing tests) |
-| `core/spring-boot` | `org.springframework.boot.logging.logback.GraylogExtendedLogFormatStructuredLogFormatterTests` (added large-batch triage, 2 of its failing tests) |
+| `core/spring-boot` | `org.springframework.boot.SimpleMainTests` (3 of 4 failing tests — the 4th, `basePackageScan`, is a different bug, see `core-spring-boot-configdata-resource-resolution-empty-cluster.md`) |
+| `core/spring-boot` | `org.springframework.boot.context.ConfigurationWarningsApplicationContextInitializerTests` (4 tests) |
+| `core/spring-boot` | `org.springframework.boot.context.properties.ConfigurationPropertiesTests` (1 of 114 tests) |
+| `core/spring-boot` | `org.springframework.boot.diagnostics.FailureAnalyzersIntegrationTests` |
+| `core/spring-boot` | `org.springframework.boot.ssl.DefaultSslBundleRegistryTests` |
+| `core/spring-boot` | `org.springframework.boot.web.servlet.support.ErrorPageFilterTests` (2 of 26 tests — now a Log4j2 `ArrayIndexOutOfBoundsException` inside `Appender STDOUT`, a different/new shape, see 2026-07-18 update) |
+| `core/spring-boot` | `org.springframework.boot.logging.log4j2.GraylogExtendedLogFormatStructuredLogFormatterTests` (1 of its failing tests) |
+| `core/spring-boot` | `org.springframework.boot.logging.logback.GraylogExtendedLogFormatStructuredLogFormatterTests` (2 of its failing tests) |
