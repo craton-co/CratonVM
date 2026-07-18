@@ -4964,6 +4964,21 @@ fn huc_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     String::new()
 }
 
+/// Return the originating URL's external form for one of our synthetic
+/// HttpURLConnection carriers. Unlike `huc_url_string`, this deliberately uses
+/// `toExternalForm`: a real-JDK URL's field zero is only its protocol (for
+/// example, `file`), not a complete URL suitable for filesystem metadata.
+fn huc_origin_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let url = match ctx.get_field(this, HUC_URL) {
+        Value::Object(Some(u)) => u,
+        _ => return String::new(),
+    };
+    match ctx.invoke_virtual(url, "toExternalForm", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => huc_url_string(ctx, this),
+    }
+}
+
 fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     if ctx.get_field(this, HUC_CONNECTED).as_int().unwrap_or(0) != 0 {
         return Ok(None);
@@ -5744,18 +5759,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             if ext.contains("spring.factories") && spring_dbg_enabled() {
                 eprintln!("[CONN-DBG] URL.openConnection: {}", ext);
             }
-            // For `jar:` URLs, return a `java/net/JarURLConnection`-typed
-            // object. JarURLConnection is abstract, but `alloc_object`
-            // bypasses the abstract check; the only method ActiveMQ invokes
-            // is `getJarFileURL()` (registered below), and `getInputStream`
-            // delegates to URL.openStream via the HUC_URL field like the
-            // generic URLConnection path.
+            // For `jar:` URLs, retain the JarURLConnection carrier so callers
+            // that cast it continue to work. All other schemes need the
+            // concrete HttpURLConnection carrier, including `file:`. The
+            // abstract URLConnection base has real-JDK bytecode for
+            // getInputStream() which throws UnknownServiceException, and that
+            // bytecode wins over a native registered on the base class. The
+            // HttpURLConnection-specific native below instead dispatches to
+            // URL.openStream() for every non-http scheme.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
-            } else if ext.starts_with("http://") || ext.starts_with("https://") {
-                "java/net/HttpURLConnection"
             } else {
-                "java/net/URLConnection"
+                "java/net/HttpURLConnection"
             };
             let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
@@ -6465,6 +6480,54 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             ctx.set_field(stream, 2, Value::Int(0)); // mark
             ctx.set_field(stream, 3, Value::Int(len)); // count
             Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+    // The generic carrier for `file:` and other non-HTTP URLs is a synthetic
+    // HttpURLConnection so its getInputStream native wins over URLConnection's
+    // real-JDK default body. Its inherited metadata accessors would otherwise
+    // read uninitialised URLConnection fields and report zero. Preserve the
+    // actual file timestamp for both direct getLastModified() callers and the
+    // getHeaderFieldDate("last-modified", ...) shape used by Spring Boot's
+    // JarUrlConnectionTests and NestedUrlConnectionTests.
+    r.register(huc, "getLastModified", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url = huc_origin_url_string(ctx, this);
+        let value = if url.starts_with("http://") || url.starts_with("https://") {
+            0
+        } else {
+            synthetic_resource_url_last_modified(&url)
+        };
+        Ok(Some(Value::Long(value)))
+    });
+    r.register(
+        huc,
+        "getHeaderFieldDate",
+        "(Ljava/lang/String;J)J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name =
+                value_or_string(ctx, args.get(1).copied().unwrap_or(Value::Object(None)), "");
+            let fallback = match args.get(2).copied() {
+                Some(Value::Long(value)) => value,
+                _ => 0,
+            };
+            let url = huc_origin_url_string(ctx, this);
+            if !url.starts_with("http://")
+                && !url.starts_with("https://")
+                && name.eq_ignore_ascii_case("last-modified")
+            {
+                let modified = synthetic_resource_url_last_modified(&url);
+                // RFC 1123 dates carry whole-second precision. FileURLConnection
+                // therefore rounds the filesystem's millisecond timestamp down
+                // before exposing it as the `last-modified` header date.
+                let header_date = modified / 1_000 * 1_000;
+                return Ok(Some(Value::Long(if header_date == 0 {
+                    fallback
+                } else {
+                    header_date
+                })));
+            }
+            Ok(Some(Value::Long(fallback)))
         },
     );
     r.register(

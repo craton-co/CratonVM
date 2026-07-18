@@ -107,7 +107,7 @@ open each doc for the full picture):
 | [`docker-compose-regex-string-join-charsequence-truncation-cluster.md`](docker-compose-regex-string-join-charsequence-truncation-cluster.md) | OPEN — found 2026-07-17 |
 | [`docker-compose-socketinputstream-read-timedout-as-eof.md`](docker-compose-socketinputstream-read-timedout-as-eof.md) | OPEN — found 2026-07-17 |
 | [`encodepasswordcommandtests-cli-hang.md`](encodepasswordcommandtests-cli-hang.md) | OPEN — found 2026-07-17, not root-caused |
-| [`file-url-openconnection-getinputstream-unknownserviceexception.md`](file-url-openconnection-getinputstream-unknownserviceexception.md) | OPEN — found 2026-07-17 |
+| [`file-url-openconnection-getinputstream-unknownserviceexception-FIXED.md`](../../internal/springboot/file-url-openconnection-getinputstream-unknownserviceexception-FIXED.md) | FIXED — 2026-07-17 |
 | [`flyway-resourceprovidercustomizer-aot-substitution-not-applied.md`](flyway-resourceprovidercustomizer-aot-substitution-not-applied.md) | OPEN — found 2026-07-17, not root-caused |
 | [`graphql-datafetcher-getpackage-null-npe-cluster.md`](graphql-datafetcher-getpackage-null-npe-cluster.md) | OPEN — found 2026-07-17 |
 | [`graphql-security-autoconfiguration-early-hang.md`](graphql-security-autoconfiguration-early-hang.md) | OPEN — found 2026-07-17 |
