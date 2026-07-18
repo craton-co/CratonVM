@@ -34950,6 +34950,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.1 — SSLEngine RFC 8446 wrapping rustls 0.23 (TLS 1.3 + 1.2 fallback,
     //         mTLS, session resumption). Engine-handle registry pattern.
     t27_tls::register_sslengine_real(registry);
+    // T2.7 server-side TLS bridges. The real-JDK CLI also needs
+    // SSLServerSocketFactory/SSLServerSocket registrations: without this
+    // complete phase, a configured SSL server factory falls through to the
+    // plaintext ServerSocketFactory overloads (notably UnboundID LDAPS).
+    t27_tls::register_t27_natives(registry);
     // WP5.2 — real PKCS12 + JKS parser via the `p12` crate + hand-rolled JKS.
     keystore::register_keystore_real(registry);
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
