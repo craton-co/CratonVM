@@ -33,15 +33,15 @@ kept in a GC-stable side table.
 ## Spring Boot verification
 
 Using the compiled `spring-boot-security-saml2` fixture with the uniquely named
-release binary `cratonvm-saml2-package-x509-20260718-019f7606-r8.exe`:
+post-integration release binary `cratonvm-saml2-package-x509-20260718-019f7606-r9-integrated.exe`:
 
 | Mode | Class | Result |
 |---|---|---|
-| JIT | `Saml2RelyingPartyWebMvcTestIntegrationTests` | PASS, 1 test, 80.177s |
-| JIT | `Saml2RelyingPartyAutoConfigurationTests` | PASS, 21 tests, 281.307s |
-| --nojit | `Saml2RelyingPartyWebMvcTestIntegrationTests` | PASS, 1 test, 75.318s |
-| --nojit | `Saml2RelyingPartyAutoConfigurationTests` | PASS, 21 tests, 286.864s |
+| JIT | `Saml2RelyingPartyWebMvcTestIntegrationTests` | PASS, 1 test, 82.686s |
+| JIT | `Saml2RelyingPartyAutoConfigurationTests` | PASS, 21 tests, 316.551s |
+| --nojit | `Saml2RelyingPartyWebMvcTestIntegrationTests` | PASS, 1 test, 54.195s |
+| --nojit | `Saml2RelyingPartyAutoConfigurationTests` | PASS, 21 tests, 248.504s |
 
-The final combined no-JIT run encountered a timing outlier under parallel load;
-the standalone class runs above are the authoritative no-JIT evidence. No
+The final no-JIT verification was run sequentially after a parallel-load timing
+outlier; both classes completed under the post-integration binary above. No
 remaining failure was attributable to either fixed issue.
