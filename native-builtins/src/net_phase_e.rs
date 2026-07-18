@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -4554,6 +4554,30 @@ fn http_perform_request(
     body: &[u8],
     max_redirects: usize,
 ) -> std::io::Result<HttpResponse> {
+    http_perform_request_with_timeout(
+        method,
+        url,
+        headers,
+        body,
+        Duration::from_secs(30),
+        max_redirects,
+    )
+}
+
+/// Performs one logical HTTP request with an end-to-end deadline.  Redirects
+/// share the same deadline: `HttpRequest.timeout(Duration)` is a timeout for
+/// the request, not a fresh 30-second allowance for every hop.
+fn http_perform_request_with_timeout(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: Duration,
+    max_redirects: usize,
+) -> std::io::Result<HttpResponse> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"))?;
     let mut current_url = url.to_string();
     let mut current_method = method.to_string();
     let mut current_body = body.to_vec();
@@ -4589,6 +4613,7 @@ fn http_perform_request(
                 &current_method,
                 eff_headers,
                 &current_body,
+                deadline,
             )?
         } else {
             http_exchange_plain(
@@ -4598,6 +4623,7 @@ fn http_perform_request(
                 &current_method,
                 eff_headers,
                 &current_body,
+                deadline,
             )?
         };
         match resp.status {
@@ -4877,6 +4903,78 @@ fn re5_dbg() -> bool {
     std::env::var_os("CRATONVM_DBG_RE5").is_some()
 }
 
+fn http_timeout_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request timed out"))
+}
+
+fn http_connect_with_deadline(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+) -> std::io::Result<TcpStream> {
+    let mut last_error = None;
+    for address in (host, port).to_socket_addrs()? {
+        let remaining = http_timeout_remaining(deadline)?;
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "HTTP host resolved to no addresses",
+        )
+    }))
+}
+
+trait HttpDeadlineSocket: Read {
+    fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl HttpDeadlineSocket for TcpStream {
+    fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+impl HttpDeadlineSocket for native_tls::TlsStream<TcpStream> {
+    fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
+    }
+}
+
+/// Re-arms the operating-system receive timeout before every response read so
+/// a peer that drips bytes cannot extend a request deadline indefinitely.
+struct HttpDeadlineReader<S> {
+    stream: S,
+    deadline: Instant,
+}
+
+impl<S: HttpDeadlineSocket> Read for HttpDeadlineReader<S> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream
+            .set_http_read_timeout(Some(http_timeout_remaining(self.deadline)?))?;
+        match self.stream.read(buffer) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "request timed out",
+                ))
+            }
+            other => other,
+        }
+    }
+}
+
 fn http_exchange_plain(
     host: &str,
     port: u16,
@@ -4884,13 +4982,14 @@ fn http_exchange_plain(
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
+    deadline: Instant,
 ) -> std::io::Result<HttpResponse> {
     let dbg = re5_dbg();
     let t0 = if dbg { Some(Instant::now()) } else { None };
     if dbg {
         eprintln!("[RE5-DBG] {method} {host}:{port}{path} connecting...");
     }
-    let connect_result = TcpStream::connect((host, port));
+    let connect_result = http_connect_with_deadline(host, port, deadline);
     if dbg {
         eprintln!(
             "[RE5-DBG] {method} {host}:{port}{path} connect -> {:?} ({:?} elapsed)",
@@ -4899,8 +4998,7 @@ fn http_exchange_plain(
         );
     }
     let mut stream = connect_result?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
     let req = http_build_request(method, host, port, path, headers, body, 80);
     if dbg {
         eprintln!(
@@ -4923,7 +5021,10 @@ fn http_exchange_plain(
     if dbg {
         eprintln!("[RE5-DBG] {method} {host}:{port}{path} flushed, reading response...");
     }
-    let read_result = http_read_response(stream, method.eq_ignore_ascii_case("HEAD"));
+    let read_result = http_read_response(
+        HttpDeadlineReader { stream, deadline },
+        method.eq_ignore_ascii_case("HEAD"),
+    );
     if dbg {
         eprintln!(
             "[RE5-DBG] {method} {host}:{port}{path} read_response -> status={:?} err={:?} ({:?} elapsed)",
@@ -4942,20 +5043,27 @@ fn http_exchange_tls(
     method: &str,
     headers: &[(String, String)],
     body: &[u8],
+    deadline: Instant,
 ) -> std::io::Result<HttpResponse> {
     let connector = native_tls::TlsConnector::builder()
         .build()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS init: {e}")))?;
-    let tcp = TcpStream::connect((host, port))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(30)))?;
-    tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let tcp = http_connect_with_deadline(host, port, deadline)?;
+    tcp.set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
+    tcp.set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
     let mut tls = connector.connect(host, tcp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}"))
     })?;
     let req = http_build_request(method, host, port, path, headers, body, 443);
     tls.write_all(&req)?;
     tls.flush()?;
-    http_read_response(tls, method.eq_ignore_ascii_case("HEAD"))
+    http_read_response(
+        HttpDeadlineReader {
+            stream: tls,
+            deadline,
+        },
+        method.eq_ignore_ascii_case("HEAD"),
+    )
 }
 
 fn huc_extract_req_headers(ctx: &dyn NativeContext, hdrs: Value) -> Vec<(String, String)> {
@@ -7686,6 +7794,28 @@ fn re5_request_body_bytes(
     re5_collect_publisher_body(ctx, obj)
 }
 
+const RE5_REQUEST_TIMEOUT_FIELD: usize = 4;
+
+fn re5_request_timeout(
+    ctx: &mut dyn NativeContext,
+    request: ObjectRef,
+) -> Result<Duration, MethodCallFailed> {
+    let duration = match ctx.get_field(request, RE5_REQUEST_TIMEOUT_FIELD) {
+        Value::Object(Some(duration)) => duration,
+        _ => return Ok(Duration::from_secs(30)),
+    };
+    // Read the Duration through its public method instead of assuming the
+    // real-JDK object's field layout.
+    let millis = match ctx.invoke_virtual(duration, "toMillis", "()J", &[])? {
+        Some(Value::Long(millis)) => millis,
+        Some(Value::Int(millis)) => millis as i64,
+        _ => 0,
+    };
+    // A positive sub-millisecond Duration has a toMillis() value of zero, so
+    // use the smallest timeout the operating-system socket API can represent.
+    Ok(Duration::from_millis(millis.max(1) as u64))
+}
+
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7694,6 +7824,7 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let handler_tag = re5_handler_tag(ctx, handler_val);
     let method = read_field_string_or(ctx, req, 0, "GET");
     let uri = read_field_string_or(ctx, req, 1, "");
+    let request_timeout = re5_request_timeout(ctx, req)?;
     if re5_dbg() {
         eprintln!("[RE5-DBG] re5_do_request ENTER method={method} uri={uri}");
     }
@@ -7745,13 +7876,18 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // never on the Reactor-Netty/Jetty/HttpComponents connectors that don't
     // route through this raw-socket implementation).
     ctx.begin_blocking_region();
-    let perform_result = http_perform_request(&method, &uri, &headers, &body, 10);
+    let perform_result =
+        http_perform_request_with_timeout(&method, &uri, &headers, &body, request_timeout, 10);
     ctx.end_blocking_region();
     let resp = perform_result.map_err(|e| {
         if re5_dbg() {
             eprintln!("[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request FAILED: {e}");
         }
-        ioex(format!("HttpClient request failed: {e}"))
+        if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+            ioex("HttpClient request timed out")
+        } else {
+            ioex(format!("HttpClient request failed: {e}"))
+        }
     })?;
     if re5_dbg() {
         eprintln!(
@@ -8066,7 +8202,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
         |ctx, _args| {
-            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 4);
+            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             ctx.set_field(b, 1, Value::Object(None));
@@ -8080,7 +8216,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 4);
+            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             let uri = obj_arg(args, 0)?;
@@ -8091,6 +8227,18 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(b))))
         },
     );
+    r.register(req, "timeout", "()Ljava/util/Optional;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        match ctx.get_field(request, RE5_REQUEST_TIMEOUT_FIELD) {
+            Value::Object(Some(timeout)) => ctx.invoke(
+                "java/util/Optional",
+                "of",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[Value::Object(Some(timeout))],
+            ),
+            _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
+        }
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
@@ -8211,7 +8359,27 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         bl,
         "timeout",
         "(Ljava/time/Duration;)Ljava/net/http/HttpRequest$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let timeout = obj_arg(args, 1)?;
+            let is_zero = matches!(
+                ctx.invoke_virtual(timeout, "isZero", "()Z", &[])?,
+                Some(Value::Int(value)) if value != 0
+            );
+            let is_negative = matches!(
+                ctx.invoke_virtual(timeout, "isNegative", "()Z", &[])?,
+                Some(Value::Int(value)) if value != 0
+            );
+            if is_zero || is_negative {
+                return Err(iae("HttpRequest timeout must be positive"));
+            }
+            ctx.set_field(
+                this,
+                RE5_REQUEST_TIMEOUT_FIELD,
+                Value::Object(Some(timeout)),
+            );
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
     r.register(
         bl,
@@ -8228,8 +8396,8 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
 
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 4);
-        for i in 0..4 {
+        let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5);
+        for i in 0..5 {
             let v = ctx.get_field(this, i);
             ctx.set_field(req, i, v);
         }
@@ -11157,6 +11325,34 @@ mod tests {
         assert!(s.contains("Host: h"));
         assert!(s.contains("Content-Length: 5"));
         assert!(s.ends_with("hello"));
+    }
+
+    #[test]
+    fn re5_http_request_timeout_bounds_delayed_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+
+        let error = match http_perform_request_with_timeout(
+            "GET",
+            &format!("http://127.0.0.1:{port}/slow"),
+            &[],
+            &[],
+            Duration::from_millis(10),
+            0,
+        ) {
+            Ok(_) => panic!("a delayed response head must exceed the request deadline"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("timed out"));
+        server.join().unwrap();
     }
 
     #[test]
