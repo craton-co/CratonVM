@@ -7825,6 +7825,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             Ok(None)
                         }
                     } else {
+                        let private_impl_class =
+                            crate::runtime::interpreter::lambda_private_impl_dispatch_class(
+                                self.shared, &lcs,
+                            );
                         let rcv_id_opt = match &full_args[0] {
                             Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
                             _ => None,
@@ -7857,7 +7861,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         } else {
                             None
                         };
-                        let result = if let Some(rcv_cid) = vov {
+                        let result = if let Some(impl_cid) = private_impl_class {
+                            invoke_on_class_shared_no_retarget(
+                                self.shared,
+                                self.thread,
+                                impl_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        } else if let Some(rcv_cid) = vov {
                             invoke_on_class_shared(
                                 self.shared,
                                 self.thread,

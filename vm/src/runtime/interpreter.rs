@@ -20410,6 +20410,36 @@ pub(crate) fn lambda_impl_dispatch_override(
     })
 }
 
+/// Resolve a lambda implementation that is private in its declaring class.
+///
+/// LambdaMetafactory may encode a private synthetic lambda body as an
+/// `InvokeVirtual` method handle. That handle is nevertheless bound to the
+/// resolved owner method: virtual dispatch on the captured object's concrete
+/// subclass is incorrect when that subclass happens to declare a same-named
+/// synthetic `lambda$...` method. Preserve the declaring class in that case.
+pub(crate) fn lambda_private_impl_dispatch_class(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    let owner_id = lambda_impl_dispatch_override(shared, call_site).or_else(|| {
+        shared
+            .class_manager
+            .read()
+            .get_loaded_class_id(&call_site.impl_handle.class_name)
+    })?;
+    let cm = shared.class_manager.read();
+    let (method, declaring_id) = crate::classloading::find_method_recursive(
+        owner_id,
+        &call_site.impl_handle.member_name,
+        &call_site.impl_handle.descriptor,
+        &cm.class_store,
+    )?;
+    method
+        .access_flags
+        .contains(MethodAccessFlags::PRIVATE)
+        .then_some(declaring_id)
+}
+
 /// Try to run a concrete default method declared by a lambda proxy's
 /// functional interface.
 ///
@@ -21227,6 +21257,7 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
+            let private_impl_class = lambda_private_impl_dispatch_class(shared, &call_site);
             // Round 7 — if the receiver is itself a lambda proxy whose SAM
             // matches the impl_handle's member name, recurse through
             // try_lambda_dispatch directly. Without this, downstream
@@ -21333,7 +21364,7 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let cached_result = recv_class_id_opt
+            let cached_result = private_impl_class.is_none().then(|| recv_class_id_opt
                 .filter(|rcv| *rcv != ClassId::new(0))
                 .map(|rcv| {
                     try_invoke_cached_lambda_impl(
@@ -21347,9 +21378,18 @@ pub(crate) fn try_lambda_dispatch(
                     )
                 })
                 .transpose()?
-                .flatten();
+                .flatten()).flatten();
             let result = if let Some(result) = cached_result {
                 Ok(result)
+            } else if let Some(impl_cid) = private_impl_class {
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    impl_cid,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
             } else if let Some(rcv_cid) = virtual_override {
                 invoke_on_class_shared(
                     shared,
