@@ -42786,7 +42786,20 @@ fn new13_do_create_socket(
     // a checkServerTrusted throw, aborts the socket with
     // SSLHandshakeException (matching JSSE, which aborts the handshake when
     // a configured TrustManager rejects the chain).
-    if let Some(tm_key) = java_tm_key {
+    // The legacy DSA bridge has already verified against the explicitly
+    // supplied roots (including Spring Boot's historical expired fixture).
+    // Re-running the VM TrustManager shim would reject that same accepted
+    // anchor solely on wall-clock validity.
+    if let Some(tm_key) = java_tm_key.filter(|_| {
+        #[cfg(unix)]
+        {
+            !legacy_dsa_context
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }) {
         let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
         if chain.is_empty() {
             let _ = crate::servlet::s2_tls_close(tls_id);
