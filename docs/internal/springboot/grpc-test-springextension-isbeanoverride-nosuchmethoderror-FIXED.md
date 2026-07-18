@@ -1,6 +1,31 @@
 # `spring-boot-grpc-test`: `NoSuchMethodError: SpringExtension.isBeanOverride`
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-18**
+
+## Resolution (2026-07-18)
+
+`native_spring_extension_resolve_parameter` had kept an older Spring
+implementation shape, including `SpringExtension.isBeanOverride(Parameter)`.
+Spring Framework 7.0.7 no longer declares that method: its real
+`resolveParameter` delegates every parameter directly to
+`ParameterResolutionDelegate.resolveDependency(...)` after selecting the
+proper constructor context. The native mirror now follows that current shape
+and does not special-case `ApplicationContext` or bean overrides.
+
+Verification used a unique release binary
+`cratonvm-springextension-isbeanoverride-20260718.exe` built from this change:
+
+- `cargo test -p cratonvm-native-builtins --lib`: 3,005 passed, 0 failed.
+- Eight affected classes passed their documented parameter-resolution tests in
+  both JIT and `--nojit`: the two gRPC tests, both Micrometer tracing tests,
+  both Micrometer metrics tests, and each WebMVC class's
+  `shouldTestWithRestTestClient(RestTestClient)` test.
+
+The two WebMVC classes still have one separate failure each in
+`shouldNotFailIfFormattingValueThrowsException(CapturedOutput)`. That is
+already tracked independently in
+`docs/known-issues/springboot/webmvc-test-anonymous-tostring-override-not-dispatched.md`;
+it is not a residual of this SpringExtension linkage failure.
 
 **Update 2026-07-17 (bin3 rerun triage):** the byte-identical failure shape
 (same `ParameterResolutionException` wrapping the same missing
