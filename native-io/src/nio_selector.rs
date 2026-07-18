@@ -704,6 +704,18 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
             let _ =
                 unsafe { libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev) };
         }
+        // epoll_ctl(MOD) does not reliably interrupt an already-blocked
+        // epoll_wait. In particular, Tomcat arms OP_WRITE after a partial
+        // gathering write; without a nudge, the last HTTP/2 frame can remain
+        // queued until shutdown and the peer sees a truncated GOAWAY frame.
+        // Do not set the sticky `woken` bit: this is a readiness re-check, not
+        // a public Selector.wakeup() request.
+        if let Some(wfd) = st.wakeup_pipe_write {
+            let byte: u8 = b'I';
+            let _ = unsafe {
+                libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
+            };
+        }
     }
     Ok(())
 }
