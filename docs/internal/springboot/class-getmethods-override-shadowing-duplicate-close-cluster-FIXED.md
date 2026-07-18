@@ -7,7 +7,7 @@
 Module `module/spring-boot-micrometer-metrics`, 18 classes fully affected (every
 failure in the class is this signature) plus 1 partially affected (1 of 4
 failures; the other 3 are a different bug, see
-[`invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow.md`](invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow.md)):
+[`invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow-FIXED.md`](invokespecial-lambda-super-reference-retarget-selfrecursion-stackoverflow-FIXED.md)):
 
 | Class | Failures from this cause |
 |---|---:|
