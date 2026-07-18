@@ -34804,8 +34804,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let dest_len = ctx.array_length(dest) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
             let pos_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "pos")
                 .unwrap_or(1);
@@ -34815,8 +34822,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let buf_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "buf")
                 .unwrap_or(0);
-            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0) as usize;
-            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0) as usize;
+            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0);
+            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0);
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
             if pos >= count {
                 return Ok(Some(Value::Int(-1)));
             }
@@ -34824,14 +34834,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(arr)) => arr,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let avail = count - pos;
-            let to_read = len.min(avail);
+            let avail = (count - pos) as usize;
+            let to_read = (len as usize).min(avail);
             let mut bytes = vec![0u8; to_read];
-            let copied = ctx.read_byte_array_into(buf, pos, &mut bytes);
+            let copied = ctx.read_byte_array_into(buf, pos as usize, &mut bytes);
             if copied > 0 {
-                ctx.write_byte_array_from(dest, off, &bytes[..copied]);
+                ctx.write_byte_array_from(dest, off as usize, &bytes[..copied]);
             }
-            ctx.set_field(this, pos_idx, Value::Int((pos + copied) as i32));
+            ctx.set_field(this, pos_idx, Value::Int(pos + copied as i32));
             Ok(Some(Value::Int(copied as i32)))
         },
     );

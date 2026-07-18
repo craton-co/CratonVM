@@ -25044,11 +25044,19 @@ impl Compiler {
                                 self.buf.emit(&guard_class_id.to_le_bytes());
                                 bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
-                                // --- load running crc → ECX ---
+                                // --- load CRC state → ECX ---
                                 // MOV ECX, DWORD [RAX + pay_off]. The slot
-                                // holds a `Value::Int`; the running crc is
-                                // its 32-bit payload.
+                                // holds a `Value::Int`. CRC32C stores the
+                                // running (complemented) state, while real
+                                // JDK CRC32 stores the public value. The IEEE
+                                // folding helper consumes the former, so the
+                                // CRC32 path complements on either side.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, pay_off);
+                                if is_crc32_ieee {
+                                    // NOT ECX — public CRC32 value -> running
+                                    // reflected-CRC state before the fold.
+                                    self.buf.emit(&[0xF7, 0xD1]);
+                                }
 
                                 if is_byte_form {
                                     // --- update(I)V: fold one byte ---
@@ -25168,7 +25176,13 @@ impl Compiler {
                                     self.patch_rel32_to_here(done_patch);
                                 }
 
-                                // --- write running crc back to slot 0 ---
+                                if is_crc32_ieee {
+                                    // NOT ECX — running reflected-CRC state
+                                    // back to real JDK CRC32's public value.
+                                    self.buf.emit(&[0xF7, 0xD1]);
+                                }
+
+                                // --- write CRC state back to slot 0 ---
                                 // RAX = receiver again (reload — RAX was
                                 // clobbered by the array-length load / loop).
                                 self.emit_load_local(RAX, s_recv);
@@ -25178,7 +25192,8 @@ impl Compiler {
                                 // cell a well-formed Int even if a prior
                                 // write left a stale tag.
                                 self.emit_mov_dword_mem_disp32_imm32(RAX, tag_off, 0);
-                                // Payload word := ECX (running crc).
+                                // Payload word := ECX (the class-specific
+                                // state representation described above).
                                 // MOV DWORD [RAX + pay_off], ECX  (89 88 dd).
                                 self.buf.emit_byte(0x89);
                                 self.buf.emit_byte(0x88);

@@ -24091,6 +24091,16 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Real JDK CRC32.updateBytes is a small validation wrapper around the
+    // registered updateBytes0 native. Keep that boundary native in every
+    // dispatch mode: compiled archive writers otherwise risk applying the
+    // public CRC representation as the complemented running state.
+    if class_name == "java/util/zip/CRC32"
+        && method_name == "updateBytes"
+        && method_descriptor == "(I[BII)I"
+    {
+        return true;
+    }
     if class_name == "java/io/File"
         && matches!(
             (method_name, method_descriptor),
@@ -37019,6 +37029,11 @@ mod tests {
             "java/io/FileInputStream",
             "read",
             "([BII)I",
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/util/zip/CRC32",
+            "updateBytes",
+            "(I[BII)I",
         ));
         assert!(!force_native_over_real_jdk_bytecode(
             "org/apache/tomcat/unittest/TesterRequest",
