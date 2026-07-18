@@ -1261,7 +1261,7 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
     with_io_scratch(len_usize, |buf| {
-        let n = {
+        let read_result = {
             // The std impl is `impl Read for &TcpStream` so we can read through
             // a shared TcpStream without excluding a peer writer on this fd.
             let mut r = &*stream_handle;
@@ -1273,20 +1273,19 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             ctx.begin_blocking_region();
             let res = r.read(buf);
             ctx.end_blocking_region();
-            match res {
-                // `NioSocketImpl.timedRead` puts the fd into non-blocking
-                // mode, then expects the native dispatcher to return the JDK
-                // IOStatus.UNAVAILABLE sentinel (-2). It parks until data is
-                // available or its Java-level deadline expires. Blocking here
-                // instead delays the timeout until the peer closes, which
-                // turns an idle socket into a false EOF.
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => -2,
-                result => result.map_err(|error| net_err("read0", error))?,
-            }
+            res
         };
-        if n == -2 {
-            return Ok(Some(Value::Int(-2)));
-        }
+        // `NioSocketImpl.timedRead` puts the fd into non-blocking mode, then
+        // expects the native dispatcher to return the JDK IOStatus.UNAVAILABLE
+        // sentinel (-2). It parks until data is available or its Java-level
+        // deadline expires. Blocking here instead delays the timeout until the
+        // peer closes, which turns an idle socket into a false EOF.
+        let n = match read_result {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(Some(Value::Int(-2)));
+            }
+            result => result.map_err(|error| net_err("read0", error))?,
+        };
         if n == 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -1924,7 +1923,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
                     .lock()
                     .set_nonblocking(!blocking)
                     .map_err(|error| net_err("configureBlocking", error))?,
-                None => {}
+                _ => {}
             }
             Ok(None)
         },
