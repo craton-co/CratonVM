@@ -63038,16 +63038,26 @@ fn bc_bcrypt_ints_to_be_bytes(ints: &[i32]) -> Vec<u8> {
     out
 }
 
-fn bc_bcrypt_generate_raw(
+/// Execute the common BCrypt key schedule against a library's published P/S
+/// constants. Both Bouncy Castle and Spring Security expose the same standard
+/// Blowfish tables, but they use different class/field names and otherwise
+/// leave this deliberately expensive work in Java bytecode.
+fn bc_bcrypt_generate_raw_with_constants(
     ctx: &mut dyn NativeContext,
     password: &[u8],
     salt: &[u8],
     cost: i32,
+    class_name: &str,
+    p_fields: &[&str],
+    s_fields: &[&str],
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let class_id = ctx.ensure_class_initialized("org/bouncycastle/crypto/generators/BCrypt")?;
-    let mut p = bc_bcrypt_read_static_i32_array(ctx, class_id, "KP")?;
+    let class_id = ctx.ensure_class_initialized(class_name)?;
+    let mut p = Vec::new();
+    for field in p_fields {
+        p.extend_from_slice(&bc_bcrypt_read_static_i32_array(ctx, class_id, field)?);
+    }
     let mut s = Vec::with_capacity(1024);
-    for field in ["KS0", "KS1", "KS2", "KS3"] {
+    for field in s_fields {
         s.extend_from_slice(&bc_bcrypt_read_static_i32_array(ctx, class_id, field)?);
     }
     if p.len() != 18 || s.len() != 1024 {
@@ -63110,6 +63120,23 @@ fn bc_bcrypt_generate_raw(
     Ok(bc_bcrypt_ints_to_be_bytes(&text))
 }
 
+fn bc_bcrypt_generate_raw(
+    ctx: &mut dyn NativeContext,
+    password: &[u8],
+    salt: &[u8],
+    cost: i32,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    bc_bcrypt_generate_raw_with_constants(
+        ctx,
+        password,
+        salt,
+        cost,
+        "org/bouncycastle/crypto/generators/BCrypt",
+        &["KP"],
+        &["KS0", "KS1", "KS2", "KS3"],
+    )
+}
+
 fn bc_bcrypt_generate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let pw_arr = bc_bcrypt_byte_array_arg(ctx, args, 0, "pwInput and salt are required")?;
     let salt_arr = bc_bcrypt_byte_array_arg(ctx, args, 1, "pwInput and salt are required")?;
@@ -63134,6 +63161,58 @@ fn bc_bcrypt_generate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(out))))
 }
 
+/// Spring Security's BCrypt implementation spends virtually all of its time
+/// in `crypt_raw` repeatedly invoking its Java `encipher` loop. At the normal
+/// cost of 10, that is fast on HotSpot but takes minutes in the interpreter,
+/// turning ordinary password assertions into suite timeouts. Keep Spring's
+/// surrounding bytecode responsible for salt parsing, revision handling,
+/// output encoding, and comparison; replace only the standard key schedule.
+///
+/// `sign_ext_bug` is only used for the historical `$2x$` compatibility mode.
+/// Spring's supported `$2a$`, `$2b$`, and `$2y$` paths pass false and share the
+/// standard BCrypt schedule used below. Do not apply this intrinsic to `$2x$`:
+/// that obsolete compatibility variant must retain Spring's bytecode semantics.
+fn spring_security_bcrypt_crypt_raw(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let password_arr = bc_bcrypt_byte_array_arg(ctx, args, 1, "Bad password")?;
+    let salt_arr = bc_bcrypt_byte_array_arg(ctx, args, 2, "Bad salt length")?;
+    let cost = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let sign_ext_bug = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+    if sign_ext_bug {
+        return ctx.invoke_special_bytecode_only(
+            "org/springframework/security/crypto/bcrypt/BCrypt",
+            "crypt_raw",
+            "([B[BIZIZ)[B",
+            args,
+        );
+    }
+    if ctx.array_length(salt_arr) != 16 {
+        return Err(bc_bcrypt_illegal("Bad salt length"));
+    }
+    if !(4..=31).contains(&cost) {
+        return Err(bc_bcrypt_illegal("Bad number of rounds"));
+    }
+    let password = bc_bcrypt_read_byte_array(ctx, password_arr);
+    let salt = bc_bcrypt_read_byte_array(ctx, salt_arr);
+    let hash = bc_bcrypt_generate_raw_with_constants(
+        ctx,
+        &password,
+        &salt,
+        cost,
+        "org/springframework/security/crypto/bcrypt/BCrypt",
+        &["P_orig"],
+        &["S_orig"],
+    )?;
+    let out = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hash.len());
+    ctx.write_byte_array_from(out, 0, &hash);
+    Ok(Some(Value::Object(Some(out))))
+}
+
 pub(crate) fn register_bc_bcrypt_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -63142,6 +63221,12 @@ pub(crate) fn register_bc_bcrypt_generator(r: &mut NativeMethodRegistry) {
         "generate",
         "([B[BI)[B",
         bc_bcrypt_generate,
+    );
+    r.register(
+        "org/springframework/security/crypto/bcrypt/BCrypt",
+        "crypt_raw",
+        "([B[BIZIZ)[B",
+        spring_security_bcrypt_crypt_raw,
     );
     r.set_category(__prev_cat);
 }
