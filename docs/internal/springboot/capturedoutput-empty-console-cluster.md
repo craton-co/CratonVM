@@ -1,6 +1,24 @@
 # `CapturedOutput`/`OutputCaptureExtension` sees empty console output (cross-module FAIL cluster)
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-17**
+
+## Resolution
+
+Native framework logging now writes through the currently installed Java
+`System.out` stream, rather than only recording a VM-internal printed-line
+entry. That preserves Spring Boot's `OutputCaptureExtension` redirection.
+The bridge also retains `Throwable` text, evaluates Spring's lazy
+`LogMessage` formatters, and forwards INFO/WARN/ERROR calls made through both
+Commons Logging and the concrete Logback/SLF4J logger bridge.
+
+Validated remotely against the Spring Boot fixture using the unique
+`cratonvm-capturedoutput-empty-console-v11-20260717` binary on Java 25:
+
+- all 22 classes listed below pass in `--nojit` mode;
+- the same cluster passes with JIT enabled, apart from the separately tracked
+  `SimpleMainTests.basePackageScan` config-data resolution failure.
+
+The historical investigation is retained below for traceability.
 
 ## Symptom
 
