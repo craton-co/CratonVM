@@ -15241,7 +15241,8 @@ fn execute_instruction(
                         // (`getBean<T>()`, `getProperty<T>()`) failed. Dotted
                         // names contain no `/`, so group 3 captures the full
                         // FQN exactly as on HotSpot.
-                        let obj_binary = obj_class_name.replace('/', ".");
+                        let obj_binary = cce_display_class_name(shared, obj_ref, &obj_class_name)
+                            .replace('/', ".");
                         let target_binary = target_class_name.replace('/', ".");
                         // CRATONVM_DBG_CCE_BT: identify the failing receiver
                         // (address + classes) at the moment a checkcast CCE
@@ -19851,6 +19852,7 @@ fn checkcast_lambda_instantiated_args(
                 .get_class(shared.heap.class_id_of(obj_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
             let target_binary = inst_tok
                 .strip_prefix('L')
                 .and_then(|d| d.strip_suffix(';'))
@@ -19865,7 +19867,7 @@ fn checkcast_lambda_instantiated_args(
                 let via_pin = handles.get(idx).copied().flatten().is_some();
                 eprintln!(
                     "CRATONVM_DBG_CCE_BT: site=lambda_instantiated_args obj={} @0x{:x} target={} via_pin={via_pin}",
-                    obj_class_name.replace('/', "."),
+                    obj_display_name.replace('/', "."),
                     obj_ref.as_ptr() as usize,
                     target_binary
                 );
@@ -19875,7 +19877,7 @@ fn checkcast_lambda_instantiated_args(
             return Err(RuntimeError::ClassCastException {
                 message: format!(
                     "{} cannot be cast to {}",
-                    obj_class_name.replace('/', "."),
+                    obj_display_name.replace('/', "."),
                     target_binary
                 ),
             }
@@ -19883,6 +19885,43 @@ fn checkcast_lambda_instantiated_args(
         }
     }
     Ok(())
+}
+
+/// Return the Java-visible class name for a failed cast.
+///
+/// The immutable `Map.of` factories and `Collections.unmodifiableMap` use the
+/// same native storage stamp. `Object.getClass()` deliberately translates that
+/// stamp to the corresponding JDK implementation class, but a VM-generated
+/// `ClassCastException` previously exposed the private stamp instead. Besides
+/// being observably unlike HotSpot, that broke `LambdaSafe`: it identifies an
+/// erased-generic mismatch by comparing the exception prefix with
+/// `argument.getClass().getName()`.
+///
+/// Keep this mapping in lockstep with `native-builtins`' `getClass()` mapping
+/// for maps. The backing map's physical slot layout follows the loaded JDK
+/// class, so resolve its `size` field rather than assuming a fixed slot.
+fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+    if raw_name != "cratonvm/internal/UnmodifiableMap" {
+        return raw_name.to_string();
+    }
+    if !matches!(shared.heap.get_field(obj_ref, 1), Value::Int(1)) {
+        return "java/util/Collections$UnmodifiableMap".to_string();
+    }
+    let backing = match shared.heap.get_field(obj_ref, 0) {
+        Value::Object(Some(backing)) => backing,
+        _ => return "java/util/ImmutableCollections$MapN".to_string(),
+    };
+    let size = {
+        let class_id = shared.heap.class_id_of(backing);
+        let cm = shared.class_manager.read();
+        find_field_recursive(class_id, "size", &cm.class_store)
+            .map(|(field_index, _, _)| shared.heap.get_field(backing, field_index))
+    };
+    if matches!(size, Some(Value::Int(1))) {
+        "java/util/ImmutableCollections$Map1".to_string()
+    } else {
+        "java/util/ImmutableCollections$MapN".to_string()
+    }
 }
 
 /// `true` iff `obj_ref` is *provably* not an instance of the reference
