@@ -5957,7 +5957,7 @@ fn call_integer_native_raw(
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.heap.young_spill_pressure() {
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.heap.needs_gc()
+                        && vm.heap.needs_gc_for_jit_allocation()
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }

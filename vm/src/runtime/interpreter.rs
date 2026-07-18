@@ -2337,7 +2337,8 @@ fn tlab_alloc_object_inner(
         use std::sync::atomic::Ordering;
         const NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES: u64 = 65_536;
         let entries = TLAB_SLOWPATH_ENTRIES_SINCE_GC.fetch_add(1, Ordering::Relaxed) + 1;
-        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc() {
+        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc_for_jit_allocation()
+        {
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
             maybe_gc_forced(shared, thread);
@@ -32964,8 +32965,21 @@ fn resolve_inline_site(
     // Phase 2 — resolve field refs with NO class_manager guard held (see
     // the lock-order comment above).
     let mut field_info = Vec::new();
+    let mut compact_field_info = Vec::new();
     for (fpc, cp_idx, type_tag) in field_sites {
         if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
+            if cratonvm_types::compact_ref_fields_enabled() {
+                if let Some(layout) =
+                    cratonvm_types::class_layout(resolved.declaring_class_id.as_u32())
+                {
+                    if let (Some(off), Some(is_ref)) = (
+                        layout.field_offset(resolved.field_index),
+                        layout.field_is_ref(resolved.field_index),
+                    ) {
+                        compact_field_info.push((fpc, off, is_ref));
+                    }
+                }
+            }
             field_info.push((fpc, resolved.field_index, type_tag));
         }
     }
@@ -32990,6 +33004,7 @@ fn resolve_inline_site(
         callee_is_static: is_static,
         return_type,
         field_info,
+        compact_field_info,
         static_field_info,
         ldc_info,
         ldc2w_info,

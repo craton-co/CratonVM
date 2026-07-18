@@ -71911,6 +71911,7 @@ public class SkippedTest {
             callee_is_static: true,
             return_type: b'I',
             field_info: vec![(0, 3, b'I')],
+            compact_field_info: vec![(0, 24, false)],
             static_field_info: vec![(0, 42, 1, b'J', false)],
             ldc_info: vec![(1, 99)],
             ldc2w_info: vec![(2, 12345678)],
@@ -71927,6 +71928,7 @@ public class SkippedTest {
         assert!(site.callee_is_static);
         assert_eq!(site.return_type, b'I');
         assert_eq!(site.field_info.len(), 1);
+        assert_eq!(site.compact_field_info, vec![(0, 24, false)]);
         assert_eq!(site.static_field_info.len(), 1);
         assert_eq!(site.ldc_info.len(), 1);
         assert_eq!(site.ldc2w_info.len(), 1);

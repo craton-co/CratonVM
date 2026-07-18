@@ -2579,6 +2579,11 @@ pub struct InlineSite {
     pub return_type: u8,
     /// Resolved field access in callee bytecode: (callee_pc, field_index, type_tag).
     pub field_info: Vec<(usize, usize, u8)>,
+    /// Compact-layout metadata for resolved callee fields:
+    /// (callee_pc, byte_offset_from_object_body, is_reference).
+    /// Kept separate from `field_info` so legacy-layout compilation and
+    /// consumers that only need the abstract slot index stay unchanged.
+    pub compact_field_info: Vec<(usize, u32, bool)>,
     /// Resolved static field access: (callee_pc, class_id_raw, field_index, type_tag, is_volatile).
     pub static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     /// Resolved ldc constants: (callee_pc, i64_value).

@@ -49,9 +49,10 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | **QuickBench TOTAL**                | **8,925 ms**  | **23,068 ms**     | **2.58x**     |
 | HashMap (10M put/get, isolated)     | 1,471 ms      | 5,488 ms          | 3.73x         |
 | String/Regex (100K, isolated)       | 54 ms         | 193 ms            | 3.57x         |
-| Binary Trees (depth=18, isolated)   | 188 ms        | 3,855 ms          | 20.5x²        |
+| Binary Trees (depth=18, isolated)   | 176 ms        | 1,468 ms          | 8.34x²        |
 
-*All rows remeasured 2026-07-18 (residuals round) on the Azure Linux benchmark
+*Unless a row-specific footnote says otherwise, all rows were remeasured
+2026-07-18 (residuals round) on the Azure Linux benchmark
 host (EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians of
 5 alternating freshly-launched JDK/CratonVM process pairs against Temurin JDK
 25.0.3 C2 and a CratonVM candidate at default settings. Checksums matched on
@@ -76,19 +77,19 @@ bench/ is gitignored, which is how earlier copies kept getting lost.*
 a guarded DIRECT call (no dispatch helper); the remaining gap is register
 allocation and recursion inlining, which the template/IR backends do not do
 yet.
-² Binary Trees at `-Xmx8g` (same flags both sides), 3,842/3,855/3,883 ms
-(±0.5%). Two fixes landed for this row on 2026-07-18. First, the TLAB-refill
-GC triggers are **default ON** — the young-walk corruption that had them
-quarantined was root-caused (a non-8-aligned young-arena capacity desyncing
-the sweep's walk grid) and fixed
-(`docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md`). Second, the
-earlier ~56x reading was NOT all host-side as previously believed: a
-2026-07-15 hardening had re-routed every non-tail self-recursive call through
-the dispatch helper (per-call conservative-roots bookkeeping was >60% of the
-run — one dispatch round trip per allocated node). Direct self-recursive
-calls are restored under a compile-time loader-identity proof
-(builtin-loaded class whose name resolves to its own ClassId; custom-loader
-classes keep the loader-correct dispatch route).
+² Binary Trees at `-Xmx8g` (same flags both sides), measured in a quiet-window
+follow-up as seven alternating fresh-process pairs on CPU 13. HotSpot:
+175/177/176/176/191/176/175 ms (median 176); CratonVM:
+1,479/1,463/1,487/1,466/1,468/1,465/1,474 ms (median 1,468). Every checksum
+was `68332206`. This follow-up removes two remaining allocation-path costs:
+the JIT refill boundary now lets the non-moving young collector fill 90% of
+its active space before its O(heap) sweep (ordinary/moving cycles retain the
+50% Cheney-copy headroom), and compact reference `putfield` is default-on,
+including inlined constructor bodies. A verifier/resolver-backed first-store
+proof emits the two fresh `Node` stores with only compact-layout and old-gen
+guards; legacy, old, repeated, and otherwise ambiguous stores retain the
+barrier helper. Full evidence:
+`docs/internal/performance/binarytrees-half-gap-20260718.md`.
 
 **This round (2026-07-18 residuals,
 `docs/internal/performance/halfgap-residuals-20260718.md`):** the
