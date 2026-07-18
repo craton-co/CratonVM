@@ -1,6 +1,20 @@
 # `String.join(CharSequence, CharSequence...)` drops non-`String` `CharSequence` elements — collapses Spring Boot's hand-built `docker-compose` regexes to near-empty, so every `Pattern.matches()` fails
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-17**
+
+## Resolution
+
+`native_string_join` now retains its direct `String` fast path and invokes
+the element's virtual `toString()` for every other non-null `CharSequence`,
+matching the already-correct iterable overload. The native roots both the
+varargs array and the current element while the virtual call may allocate, so
+the fallback remains valid with a moving collector. A native regression test
+covers a custom `CharSequence` object plus a null element and verifies that
+all temporary roots are released.
+
+Validated with the Spring Boot suite runner on JDK 25 using the uniquely built
+CratonVM binary: all five affected Docker Compose classes passed in both JIT
+and `--nojit` modes (55 tests per mode, zero failures).
 
 ## Symptom
 
