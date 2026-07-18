@@ -25171,6 +25171,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    crate::tls::register_conscrypt_native_bridges(registry);
     register_ecj_problem_overrides(registry);
     registry.register(
         "org/apache/jasper/servlet/JspServlet",

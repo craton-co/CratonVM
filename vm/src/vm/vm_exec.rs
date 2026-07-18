@@ -8830,7 +8830,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
         #[cfg(windows)]
-        let skip_jni_onload_tcnative = basename_lc.contains("tcnative");
+        // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
+        // RegisterNatives-on-load pattern as tcnative on CratonVM.
+        let skip_jni_onload_tcnative = basename_lc.contains("tcnative")
+            || basename_lc.contains("conscrypt_openjdk_jni");
         #[cfg(not(windows))]
         let skip_jni_onload_tcnative = false;
 
