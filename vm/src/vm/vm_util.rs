@@ -523,9 +523,11 @@ pub fn ensure_class_initialized_shared(
                                     // released first — this non-reentrant
                                     // `RwLock` would otherwise self-deadlock.
                                     drop(cm);
-                                    return Err(crate::runtime::exceptions::raise_no_class_def_found(
-                                        shared, thread, &name,
-                                    ));
+                                    return Err(
+                                        crate::runtime::exceptions::raise_no_class_def_found(
+                                            shared, thread, &name,
+                                        ),
+                                    );
                                 }
                                 _ => {
                                     // Claim: set initializing_thread under the write lock.
@@ -1507,7 +1509,7 @@ fn initialize_class_shared(
                         // bare-NPEs originate during boot.
                         if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                             let h = shared.heap.identity_hash_code(*exc_ref);
-                            if let Some(frames) = thread.throwable_stacks.get(&h) {
+                            if let Some(frames) = shared.throwable_stack_trace(h) {
                                 for (i, f) in frames.iter().enumerate().take(20) {
                                     tracing::warn!(
                                         "  [SWALLOW-TRACE {}] at {}.{} ({}:{}) bci={}",
@@ -1656,10 +1658,10 @@ fn initialize_class_shared(
                                     "<clinit> failed вЂ” wrapping in ExceptionInInitializerError"
                                 );
                                 // Diagnostic: dump captured stack trace from
-                                // throwable_stacks so we can pinpoint where
+                                // the VM-wide Throwable trace registry so we can pinpoint where
                                 // bare-NPEs originate during boot.
                                 let h = shared.heap.identity_hash_code(*exc_ref);
-                                if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                if let Some(frames) = shared.throwable_stack_trace(h) {
                                     for (i, f) in frames.iter().enumerate().take(20) {
                                         tracing::warn!(
                                             "  [CLINIT-TRACE {}] at {}.{} ({}:{}) bci={}",
@@ -1756,7 +1758,7 @@ fn initialize_class_shared(
                                             cause_msg,
                                         );
                                         let ch = shared.heap.identity_hash_code(cause_obj);
-                                        if let Some(frames) = thread.throwable_stacks.get(&ch) {
+                                        if let Some(frames) = shared.throwable_stack_trace(ch) {
                                             for (i, f) in frames.iter().enumerate().take(15) {
                                                 tracing::warn!(
                                                     "    [CAUSE-TRACE {}] at {}.{} ({}:{}) bci={}",
@@ -2930,11 +2932,10 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             vec![(hex >> 32) as i32, (hex & 0xFFFF_FFFF) as i32]
                         };
                         if let Some(bi) = make_or_patch_bi(None, 1, &mag_words) {
-                            let _ = shared.heap.set_array_element(
-                                lr_arr,
-                                i,
-                                Value::Object(Some(bi)),
-                            );
+                            let _ =
+                                shared
+                                    .heap
+                                    .set_array_element(lr_arr, i, Value::Object(Some(bi)));
                         }
                     }
                     if set_static_by_name("longRadix", Value::Object(Some(lr_arr))) {

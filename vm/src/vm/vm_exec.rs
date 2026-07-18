@@ -1116,9 +1116,7 @@ fn safe_native_call_impl(
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
                 let healed = shared.heap.load_and_forward(*o);
-                if healed.as_ptr() != o.as_ptr()
-                    && cratonvm_gc::stale_objref_debug::enabled()
-                {
+                if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                     // The cached-dispatch callback pointer often has no ring
@@ -1878,6 +1876,24 @@ fn normalize_system_property_key(key: &str) -> &str {
 }
 
 impl<'a> NativeContextImpl<'a> {
+    fn capture_current_stack_trace(&self) -> Vec<StackTraceEntry> {
+        let cm = self.shared.class_manager.read();
+        let trace =
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
+        drop(cm);
+        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_CAP frames={} depth={}",
+                self.thread.frames.len(),
+                trace.len()
+            );
+            for (i, e) in trace.iter().enumerate() {
+                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
+            }
+        }
+        trace
+    }
+
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
@@ -3361,7 +3377,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // contain long-dead addresses). A hit here means the CALLER received
         // a stale value from upstream; the backtrace names it.
         if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
-            if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(obj.as_ptr() as usize)
+            {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
@@ -3440,7 +3460,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if base < self.thread.native_pin_roots.len() {
             if unpin_ring_enabled() {
                 let bt = format!("{}", std::backtrace::Backtrace::force_capture());
-                let short: String = bt.lines().skip(8).take(12).map(|l| format!("{l}\n")).collect();
+                let short: String = bt
+                    .lines()
+                    .skip(8)
+                    .take(12)
+                    .map(|l| format!("{l}\n"))
+                    .collect();
                 UNPIN_RING.with(|r| {
                     let mut r = r.borrow_mut();
                     if r.len() >= 6 {
@@ -4065,50 +4090,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry> {
-        // WP1.9: resolve source file + line number + BCI for each frame via
-        // the method's LineNumberTable attribute (see
-        // `crate::runtime::stackwalker::entry_from_frame`).
-        let cm = self.shared.class_manager.read();
-        let trace =
-            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
-        drop(cm);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
-            eprintln!(
-                "STTRACE_DBG_CAP hash={throwable_hash} frames={} depth={}",
-                self.thread.frames.len(),
-                trace.len()
-            );
-            for (i, e) in trace.iter().enumerate() {
-                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
-            }
-        }
-        // Hash 0 is the VM's ephemeral stack-walk sentinel used by
-        // StackWalker/caller-sensitive helpers. Those callers consume the
-        // returned trace immediately and never retrieve it through
-        // get_stack_trace(), so cloning the full vector into the throwable
-        // trace map on every walk only adds work to hot logging/framework
-        // bootstrap paths.
-        if throwable_hash != 0 {
-            self.thread
-                .throwable_stacks
-                .insert(throwable_hash, trace.clone());
-        }
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        self.capture_current_stack_trace()
+    }
+
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        let trace = self.capture_current_stack_trace();
+        self.shared
+            .store_throwable_stack_trace(throwable, trace.clone());
         trace
     }
 
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]> {
-        let r = self
-            .thread
-            .throwable_stacks
-            .get(&throwable_hash)
-            .map(|v| v.as_slice());
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        let r = self.shared.throwable_stack_trace(throwable_hash);
         if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
-                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={} keys={:?}",
+                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
                 r.is_some(),
-                r.map_or(0, |s| s.len()),
-                self.thread.throwable_stacks.keys().collect::<Vec<_>>()
+                r.as_ref().map_or(0, Vec::len),
             );
         }
         r
@@ -4249,7 +4248,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
         let cm = self.shared.class_manager.read();
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
@@ -9992,8 +9995,14 @@ pub fn invoke_or_native(
         && matches!(
             (method_name, descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         if let Some(callback) =
@@ -11765,9 +11774,7 @@ fn proxy_method_exception_types(
         .get(&declaring_mirror)
         .copied();
     let declared = declaring_class
-        .map(|class_id| {
-            proxy_method_declared_exceptions(shared, class_id, method_name, descriptor)
-        })
+        .map(|class_id| proxy_method_declared_exceptions(shared, class_id, method_name, descriptor))
         .unwrap_or_default();
     let exception_arr = shared.heap.alloc_array(
         class_component,
@@ -18328,16 +18335,26 @@ mod tests {
     }
 
     #[test]
-    fn native_context_capture_stack_trace() {
+    fn native_context_throwable_trace_survives_producer_thread_context() {
         let shared = test_shared();
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mut ctx = NativeContextImpl {
+        let throwable = shared.heap.alloc_object(ClassId::new(0), 0);
+        let hash = shared.heap.identity_hash_code(throwable);
+        {
+            let mut producer = JvmThread::new(ThreadId(1), "producer");
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut producer,
+            };
+            let trace = ctx.capture_throwable_stack_trace(throwable);
+            assert!(trace.is_empty());
+        }
+
+        let mut consumer = JvmThread::new(ThreadId(2), "consumer");
+        let ctx = NativeContextImpl {
             shared: &shared,
-            thread: &mut thread,
+            thread: &mut consumer,
         };
-        let trace = ctx.capture_stack_trace(123);
-        assert!(trace.is_empty());
-        let stored = ctx.get_stack_trace(123);
+        let stored = ctx.get_stack_trace(hash);
         assert!(stored.is_some());
         assert!(stored.unwrap().is_empty());
     }
