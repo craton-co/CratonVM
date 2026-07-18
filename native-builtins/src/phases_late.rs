@@ -42710,7 +42710,10 @@ fn p68_create_socket_inet_address(
     port_index: usize,
 ) -> MethodCallResult {
     let host = p68_inet_address_host(ctx, args, address_index)?;
-    let port = args.get(port_index).and_then(|value| value.as_int()).unwrap_or(443);
+    let port = args
+        .get(port_index)
+        .and_then(|value| value.as_int())
+        .unwrap_or(443);
     if !(0..=65535).contains(&port) {
         return Err(RuntimeError::IllegalArgumentException {
             message: format!("port out of range: {port}"),
@@ -42730,6 +42733,13 @@ fn new13_do_create_socket(
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
 ) -> MethodCallResult {
+    #[cfg(unix)]
+    let legacy_dsa_context = extra_root_ders.iter().any(|der| {
+        openssl::x509::X509::from_der(der)
+            .ok()
+            .and_then(|cert| cert.public_key().ok())
+            .is_some_and(|key| key.dsa().is_ok())
+    });
     let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
@@ -42748,6 +42758,13 @@ fn new13_do_create_socket(
     // heap alone does not suppress it either since young-gen collections
     // still fire from ordinary allocation churn on OTHER threads.
     ctx.begin_blocking_region();
+    #[cfg(unix)]
+    let connect_result = if legacy_dsa_context {
+        crate::servlet::s2_legacy_dsa_tls_connect(host, port)
+    } else {
+        crate::servlet::s2_tls_connect(&connector, host, port)
+    };
+    #[cfg(not(unix))]
     let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
     ctx.end_blocking_region();
     let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
