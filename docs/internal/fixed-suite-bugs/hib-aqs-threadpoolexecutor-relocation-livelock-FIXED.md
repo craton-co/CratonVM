@@ -206,7 +206,7 @@ timestamp bug.
 
 ## Related
 
-- `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` —
+- `docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md` —
   `ZonedDateTimeTest` entry updated to reflect this fix and the new
   timezone-offset residual.
 - `docs/internal/springboot/basiccontroller-stale-pointer-invokevirtual-aqs-conditionnode-crash-FIXED.md`

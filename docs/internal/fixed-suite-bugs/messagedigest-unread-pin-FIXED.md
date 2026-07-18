@@ -18,7 +18,7 @@ moving GC), and then use the *original, un-re-read* pin afterward. The audit
 was part of a session investigating the long-standing
 `DefaultCatalogAndSchemaTest` `BigInteger` `ArrayIndexOutOfBoundsException`
 (see
-`docs/known-issues/hibernate/hib-misc-residuals-20260716.md`), on the
+`docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md`), on the
 hypothesis that `NamingHelper.hashedName`'s `MessageDigest`/`BigInteger` call
 chain might route through a native builtin with this defect. That specific
 connection was **not** established (see the residuals doc for the full
@@ -142,7 +142,7 @@ allocating call, and `ctx.unpin_native_roots` at the end of each function.
 
 ## Related
 
-- `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` — the
+- `docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md` — the
   `DefaultCatalogAndSchemaTest` `BigInteger` `AIOOBE` investigation this fix
   was found as a side effect of. That item remains separately OPEN; this fix
   does **not** close it (see that doc's corresponding session update for the

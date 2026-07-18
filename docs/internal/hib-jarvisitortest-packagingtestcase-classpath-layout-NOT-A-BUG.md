@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | ✅ CONFIRMED NOT A BUG — harness classpath-layout limitation, reproduces identically on real HotSpot. |
-| **Discovered / closed** | 2026-07-16, re-verification of `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` `JarVisitorTest` entry. |
+| **Discovered / closed** | 2026-07-16, re-verification of `docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md` `JarVisitorTest` entry. |
 | **Class** | `org.hibernate.orm.test.bootstrap.scanning.JarVisitorTest` (and, structurally, every sibling that extends `PackagingTestCase`, e.g. `ScannerTest`). |
 
 ## Original report

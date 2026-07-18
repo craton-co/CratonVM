@@ -5411,6 +5411,13 @@ pub fn try_compile(
         return None;
     }
 
+    // Keep the final compiler admission gate aligned with the VM static
+    // skip-list. The tiered background worker bypasses VM-side eligibility and
+    // otherwise continued compiling MutableBigInteger after it was quarantined.
+    if tiered::is_biginteger_arithmetic_jit_denied(&cached.class_name) {
+        return None;
+    }
+
     // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
     // skip-list catches most eligibility paths, but tiered/background compile
     // can still reach this crate's final `try_compile` gate. The proven stable
@@ -7908,6 +7915,22 @@ fn hsqldb_jit_deny_matches_slash_and_dot_names() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hibernate_biginteger_final_guard_matches_internal_and_dotted_names() {
+        assert!(tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/MutableBigInteger"
+        ));
+        assert!(tiered::is_biginteger_arithmetic_jit_denied(
+            "java.math.MutableBigInteger"
+        ));
+        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/BigInteger"
+        ));
+        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/MutableBigInteger$Helper"
+        ));
+    }
 
     #[test]
     fn hibernate_temporal_jit_deny_matches_slash_and_dot_names() {
