@@ -128,7 +128,6 @@ open each doc for the full picture):
 | [`Jackson/Json Mixin Module Entries AOT TestCompiler mismatch`](../../internal/springboot/jacksonmixinmoduleentries-aot-testcompiler-mismatch-FIXED.md) | FIXED — 2026-07-18; the Spring AOT descriptor loader-identity repair also resolves both sibling Jackson AOT classes |
 | [`jarmode-tools-extractlayers-timestamp-preservation.md`](jarmode-tools-extractlayers-timestamp-preservation.md) | OPEN — found 2026-07-17. Hypothesis only, not confirmed. |
 | [`jarmode-tools-manifest-start-class-lost.md`](jarmode-tools-manifest-start-class-lost.md) | OPEN — found 2026-07-17 |
-| [`jdbc-classloader-hide-override-not-honored-cluster.md`](jdbc-classloader-hide-override-not-honored-cluster.md) | OPEN — found 2026-07-17 |
 | [`jdbc-hikari-mbean-not-registered-cluster.md`](jdbc-hikari-mbean-not-registered-cluster.md) | OPEN — found 2026-07-17 |
 | [`jdbc-hikariconfig-copystateto-field-access-cluster.md`](jdbc-hikariconfig-copystateto-field-access-cluster.md) | OPEN — found 2026-07-17 |
 | [`jdbc-mail-jndi-custom-initialcontextfactory-not-consulted-cluster.md`](jdbc-mail-jndi-custom-initialcontextfactory-not-consulted-cluster.md) | OPEN — found 2026-07-17 (confirms/root-causes an unconfirmed hypothe |
