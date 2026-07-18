@@ -434,16 +434,20 @@ fn check_access(
     )
 }
 
-/// Check access to a reflected field, including the ordinary Java-language
-/// access that the declaring class has to its own private members.
+/// Check a reflective field access using the caller-sensitive part of the
+/// ordinary Java member-access rules.
 ///
-/// `Field.get*` and `Field.set*` do not require `setAccessible(true)` when
-/// their immediate caller is the declaring class. HikariCP relies on that for
-/// its private-final `AtomicReference` during `HikariConfig.copyStateTo`:
-/// final fields are not made accessible because they are read, not reassigned.
-/// Keeping this separate from [`check_access`] avoids broadening the existing
-/// Method/Constructor policy while every Field entry point shares the correct
-/// caller-aware rule.
+/// `Field.get` is not intrinsically a deep-reflection operation.  In
+/// particular, code may reflectively read a private field it declares itself
+/// without first calling `setAccessible(true)`.  HikariConfig relies on this
+/// for its private-final `AtomicReference<Credentials>` while copying config
+/// state.  The old blanket non-public rejection incorrectly treated that
+/// legal same-class read as an access violation.
+///
+/// Keep the existing conservative rule for callers outside the declaring
+/// class: those still need a public member or the explicit accessible
+/// override.  JPMS/open-package validation remains in the caller after this
+/// check and continues to govern cross-class deep reflection.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
@@ -511,10 +515,11 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// `StackFrameBuffer` frame (allowed by `caller_is_jdk_internal`) instead of
 /// the user `main` further out, which previously produced a spurious
 /// `IllegalAccessException` (Spring Boot `deduceMainApplicationClass`).
+// Use exact frame ClassIds rather than resolving stack-trace display names:
+// two classes from different loaders can share a binary name.
 fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
-    let trace = ctx.capture_stack_trace(0);
-    for entry in trace.iter().rev() {
-        let name: &str = &entry.class_name;
+    for cid in ctx.frame_class_ids() {
+        let name = ctx.class_name_of_id(cid)?;
         let is_internal = REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
             if prefix.ends_with('/') {
                 name.starts_with(prefix)
@@ -525,9 +530,7 @@ fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
         if is_internal {
             continue;
         }
-        if let Some(cid) = ctx.class_id_by_name(name) {
-            return Some(cid);
-        }
+        return Some(cid);
     }
     None
 }
@@ -17443,6 +17446,45 @@ mod tests {
             )) => assert_eq!(message, "bad"),
             other => panic!("expected IllegalArgumentException, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn field_access_allows_private_field_from_its_declaring_class() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(vec![declaring]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn field_access_rejects_private_field_from_another_class_without_override() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/OtherCaller")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
     }
 
     // -----------------------------------------------------------------------
