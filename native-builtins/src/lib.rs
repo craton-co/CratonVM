@@ -28459,6 +28459,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_sem_acquire,
     );
+    registry.register(
+        surefire_sem,
+        "acquireUninterruptibly",
+        "(I)V",
+        native_sem_acquire_n,
+    );
     registry.register(surefire_sem, "release", "()V", native_sem_release);
     registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
     registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
@@ -58132,6 +58138,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sem, "acquire", "()V", native_sem_acquire);
     registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
     registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
+    registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
     registry.register(sem, "release", "()V", native_sem_release);
     registry.register(sem, "release", "(I)V", native_sem_release_n);
     registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);

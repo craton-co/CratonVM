@@ -297,6 +297,16 @@ public class JucComplete {
         return (remaining == 7 && sem.availablePermits() == 10) ? 1 : 0;
     }
 
+    // Hikari's SuspendResumeLock drains a fair semaphore with this overload.
+    // Keep it distinct from acquire(int), which is interruptible.
+    public static int testSemaphoreAcquireUninterruptiblyN() {
+        Semaphore sem = new Semaphore(2, true);
+        sem.acquireUninterruptibly(2);
+        int remaining = sem.availablePermits();
+        sem.release(2);
+        return (remaining == 0 && sem.availablePermits() == 2) ? 1 : 0;
+    }
+
     // 27: Semaphore isFair
     public static int testSemaphoreIsFair() {
         Semaphore fair = new Semaphore(1, true);

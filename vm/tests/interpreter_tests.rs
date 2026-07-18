@@ -2044,6 +2044,27 @@ fn test_s17_field_get_private() {
 }
 
 #[test]
+fn test_s17_field_get_own_private_final_reference_without_set_accessible() {
+    if !require_extended_interpreter_tests(
+        "test_s17_field_get_own_private_final_reference_without_set_accessible",
+    ) {
+        return;
+    }
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
 fn test_s17_field_set_private() {
     if !require_extended_interpreter_tests("test_s17_field_set_private") {
         return;
@@ -4660,6 +4681,10 @@ s49_test!(
     "testSemaphoreReleaseAboveInit"
 );
 s49_test!(test_s49_semaphore_acquire_n, "testSemaphoreAcquireN");
+s49_test!(
+    test_s49_semaphore_acquire_uninterruptibly_n,
+    "testSemaphoreAcquireUninterruptiblyN"
+);
 s49_test!(test_s49_semaphore_is_fair, "testSemaphoreIsFair");
 
 // --- CyclicBarrier ---

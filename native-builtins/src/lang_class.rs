@@ -434,6 +434,32 @@ fn check_access(
     )
 }
 
+/// Check access to a reflected field, including the ordinary Java-language
+/// access that the declaring class has to its own private members.
+///
+/// `Field.get*` and `Field.set*` do not require `setAccessible(true)` when
+/// their immediate caller is the declaring class. HikariCP relies on that for
+/// its private-final `AtomicReference` during `HikariConfig.copyStateTo`:
+/// final fields are not made accessible because they are read, not reassigned.
+/// Keeping this separate from [`check_access`] avoids broadening the existing
+/// Method/Constructor policy while every Field entry point shares the correct
+/// caller-aware rule.
+fn check_field_access(
+    ctx: &mut dyn NativeContext,
+    modifiers: i32,
+    accessible: bool,
+    declaring_class_id: ClassId,
+    member_desc: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if accessible || (modifiers & ACC_PUBLIC) != 0 {
+        return Ok(());
+    }
+    if resolve_caller_class_id(ctx) == Some(declaring_class_id) {
+        return Ok(());
+    }
+    check_access(modifiers, false, member_desc)
+}
+
 // ---------------------------------------------------------------------------
 // NEW-19: JPMS `opens` / `exports` enforcement for reflection (JEP 403)
 // ---------------------------------------------------------------------------
@@ -4415,7 +4441,13 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, &format!("Field.get({})", descriptor))?;
+    check_field_access(
+        ctx,
+        modifiers,
+        accessible,
+        class_id,
+        &format!("Field.get({})", descriptor),
+    )?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
 
@@ -4516,7 +4548,13 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
+    check_field_access(
+        ctx,
+        modifiers,
+        accessible,
+        class_id,
+        &format!("Field.set({})", descriptor),
+    )?;
     // WP2.1-field вЂ” final-field write check (must run AFTER access check
     // so the more specific error message wins on a public-final field).
     check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
@@ -4623,7 +4661,7 @@ fn field_get_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, "Field typed getter")?;
+    check_field_access(ctx, modifiers, accessible, class_id, "Field typed getter")?;
     // NEW-19: module-level opens check (JPMS).
     // `enforce_module_check_from_mirror` takes the slot index of the
     // declaring-class mirror on the Field object; still 0 historically,
@@ -4841,7 +4879,7 @@ fn field_set_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, "Field typed setter")?;
+    check_field_access(ctx, modifiers, accessible, class_id, "Field typed setter")?;
     // WP2.1-field вЂ” final-field write check (matches Field.set on the
     // generic `set(Object,Object)` path).
     check_final_for_set(modifiers, accessible, "Field typed setter")?;
