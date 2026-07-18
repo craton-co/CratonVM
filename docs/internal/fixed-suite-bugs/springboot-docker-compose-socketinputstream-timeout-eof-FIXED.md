@@ -21,7 +21,7 @@ The `CRATONVM_REAL_NET_SOCKETS=1` route has a distinct JDK-25 `NioSocketImpl` im
 - Map both `ErrorKind::TimedOut` and `ErrorKind::WouldBlock` to the concrete `RuntimeError::SocketTimeoutException` in all three legacy `SocketInputStream.read` overloads.
 - Map those same timeout forms in the shared real-JDK read helper, preserving the typed exception across `read()`, `read(byte[])`, and `read(byte[], off, len)`.
 - Preserve `Socket.setSoTimeout` instead of globally replacing it with a SocketChannel-adaptor no-op, and implement the real-JDK `configureBlocking`/`Net.poll` timeout cycle.
-- Retain an unconnected synthetic socket's timeout in a VM-scoped, GC-stable side table, apply it when `connect` installs the stream, expose it through `getSoTimeout`, and discard it on close.
+- Retain an unconnected synthetic socket's timeout in the GC-stable socket side table, apply it when `connect` installs the stream, and expose it through `getSoTimeout`.
 - Add `SocketInputStreamTimeout`, a loopback regression probe with an external idle peer. It covers every overload both before and after `connect`, in synthetic and `CRATONVM_REAL_NET_SOCKETS=1` modes, with JIT and `--nojit` execution.
 
 This restores the Java contract: a connected peer that supplies no data before `SO_TIMEOUT` throws `SocketTimeoutException`; only an actual zero-byte peer close returns EOF (`-1`).

@@ -14848,50 +14848,6 @@ const SOCK_LOCAL_PORT: usize = 2;
 const SOCK_CLOSED: usize = 3;
 const SOCK_STREAM_ID: usize = 4;
 
-/// `Socket.setSoTimeout` is allowed before `Socket.connect`. The synthetic
-/// socket field convention has no spare, layout-safe slot for that setting, so
-/// retain it in a VM-scoped, GC-stable side table until a stream is installed.
-/// Entries are consumed by a successful connect (or discarded by close), which
-/// prevents an unconnected socket from contaminating a later allocation.
-fn s2_pending_socket_read_timeouts(
-) -> &'static std::sync::Mutex<std::collections::HashMap<(usize, i32), i32>> {
-    static TIMEOUTS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(usize, i32), i32>>,
-    > = std::sync::OnceLock::new();
-    TIMEOUTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-#[inline]
-fn s2_socket_timeout_key(ctx: &dyn NativeContext, socket: ObjectRef) -> (usize, i32) {
-    (ctx.vm_identity(), ctx.identity_hash_code(socket))
-}
-
-fn s2_set_stream_read_timeout(stream_id: i32, millis: i32) {
-    let timeout = if millis > 0 {
-        Some(std::time::Duration::from_millis(millis as u64))
-    } else {
-        None
-    };
-    let registry = crate::servlet::s2_registry().lock();
-    if let Some(stream) = registry.streams.get(&stream_id) {
-        let _ = stream.set_read_timeout(timeout);
-    }
-}
-
-fn s2_apply_pending_socket_read_timeout(
-    ctx: &dyn NativeContext,
-    socket: ObjectRef,
-    stream_id: i32,
-) {
-    let timeout = s2_pending_socket_read_timeouts()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&s2_socket_timeout_key(ctx, socket));
-    if let Some(millis) = timeout {
-        s2_set_stream_read_timeout(stream_id, millis);
-    }
-}
-
 // ServerSocket field layout: port=0, backlog=1, closed=2, listener_id=3
 const SS_PORT: usize = 0;
 const SS_BACKLOG: usize = 1;
@@ -14949,7 +14905,6 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 let id = s2_alloc_stream(stream);
                 ctx.set_field(this, SOCK_STREAM_ID, Value::Int(id));
                 ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(local_port));
-                s2_apply_pending_socket_read_timeout(ctx, this, id);
             }
             Err(e) => {
                 return Err(RuntimeError::IOException {
@@ -14984,7 +14939,6 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                     let id = s2_alloc_stream(stream);
                     ctx.set_field(this, SOCK_STREAM_ID, Value::Int(id));
                     ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(local_port));
-                    s2_apply_pending_socket_read_timeout(ctx, this, id);
                 }
                 Err(e) => {
                     return Err(RuntimeError::IOException {
@@ -15020,7 +14974,6 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                     let id = s2_alloc_stream(stream);
                     ctx.set_field(this, SOCK_STREAM_ID, Value::Int(id));
                     ctx.set_field(this, SOCK_LOCAL_PORT, Value::Int(local_port));
-                    s2_apply_pending_socket_read_timeout(ctx, this, id);
                 }
                 Err(e) => {
                     return Err(RuntimeError::IOException {
@@ -15049,10 +15002,6 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
     });
     r.register(sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        s2_pending_socket_read_timeouts()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&s2_socket_timeout_key(ctx, this));
         let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
         if sid >= 0 {
             s2_registry().lock().streams.remove(&sid);
@@ -15156,20 +15105,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
     r.register(sock, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        if millis < 0 {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: "timeout can't be negative".into(),
-            }
-            .into());
-        }
         let sid = ctx.get_field(this, SOCK_STREAM_ID).as_int().unwrap_or(-1);
         if sid >= 0 {
-            s2_set_stream_read_timeout(sid, millis);
-        } else {
-            s2_pending_socket_read_timeouts()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(s2_socket_timeout_key(ctx, this), millis);
+            let reg = s2_registry().lock();
+            if let Some(stream) = reg.streams.get(&sid) {
+                let timeout = if millis > 0 {
+                    Some(std::time::Duration::from_millis(millis as u64))
+                } else {
+                    None
+                };
+                let _ = stream.set_read_timeout(timeout);
+            }
         }
         Ok(None)
     });
@@ -15183,13 +15129,6 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Int(dur.as_millis() as i32)));
                 }
             }
-        } else if let Some(millis) = s2_pending_socket_read_timeouts()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&s2_socket_timeout_key(ctx, this))
-            .copied()
-        {
-            return Ok(Some(Value::Int(millis)));
         }
         Ok(Some(Value::Int(0)))
     });
