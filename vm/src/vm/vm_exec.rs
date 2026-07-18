@@ -13650,6 +13650,23 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    if method_name == "createSocket" && std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
+        let receiver_name = args
+            .first()
+            .and_then(|value| match value {
+                Value::Object(Some(receiver)) => Some(shared.heap.class_id_of(*receiver)),
+                _ => None,
+            })
+            .and_then(|id| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(id)
+                    .map(|class| class.name.to_string())
+            })
+            .unwrap_or_else(|| "<static-or-null>".to_string());
+        eprintln!("[dbg-legacy-dsa] createSocket declared={class_name} receiver={receiver_name} descriptor={descriptor}");
+    }
     if class_name == "com/sun/tools/attach/VirtualMachine"
         && matches!(
             (method_name, descriptor),
