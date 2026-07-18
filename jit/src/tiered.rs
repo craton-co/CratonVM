@@ -105,6 +105,18 @@ pub fn clear_osr_deny_list_for_test() {
     osr_deny_list().write().clear();
 }
 
+/// HIB-BIGINTEGER-AIOOBE.1: the VM static skip-list and this tier manager
+/// must agree. The latter owns normal background-enqueue decisions and would
+/// otherwise repeatedly schedule a method that the final compiler gate has to
+/// reject. This is intentionally an exact implementation-class match: public
+/// `BigInteger` callers remain eligible for JIT.
+pub(crate) fn is_biginteger_arithmetic_jit_denied(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/math/MutableBigInteger" | "java.math.MutableBigInteger"
+    )
+}
+
 // ───────────────────────────────────────────────────────────────────────────────
 // CompilationTier
 // ───────────────────────────────────────────────────────────────────────────────
@@ -1339,6 +1351,13 @@ impl TieredCompilationManager {
         state: &MethodState,
         policy: &CompilationPolicy,
     ) -> Option<CompilationTier> {
+        // Keep the background compiler from queueing the known-corrupting
+        // BigInteger implementation. `try_compile` carries the same final
+        // guard for direct/manual queue paths that bypass this policy method.
+        if is_biginteger_arithmetic_jit_denied(&state.method_key.class_name) {
+            return None;
+        }
+
         // Give up after repeated compile-attempt failures (the attempt ran
         // but never published a body — see `complete_task`), matching the
         // "3+ deopts" convention `c2_bailout` already uses below. Without
@@ -1401,6 +1420,27 @@ mod tests {
             "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
         )
+    }
+
+    #[test]
+    fn hibernate_biginteger_divide_cluster_is_never_background_enqueued() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = MethodKey::new(
+            "java/math/MutableBigInteger",
+            "divideMagnitude",
+            "(Ljava/math/MutableBigInteger;Ljava/math/MutableBigInteger;)Ljava/math/MutableBigInteger;",
+        );
+
+        assert_eq!(mgr.on_method_invocation(&key), None);
+        assert!(
+            mgr.dequeue_compilation().is_none(),
+            "quarantined MutableBigInteger must not enter the background queue"
+        );
+        assert_eq!(mgr.current_tier(&key), CompilationTier::Interpreter);
     }
 
     // ── wire-tiered-manager Step 6: CRATONVM_TIER_* policy overrides ─────

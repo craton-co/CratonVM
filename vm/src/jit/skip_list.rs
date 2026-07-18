@@ -100,6 +100,10 @@ pub enum SkipReason {
     /// Method is being invoked from an unnamed thread (typically a test
     /// harness in early init), where thread-local JIT state may not be set up.
     UnnamedThread,
+    /// `MutableBigInteger` divide/normalization arithmetic has a confirmed
+    /// JIT-only array-index corruption residual. Keep the implementation
+    /// interpreted until the lowering defect is identified.
+    BigIntegerArithmetic,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -412,6 +416,25 @@ fn should_skip_jit_internal(
     }
     if !current_thread_named {
         return Some(SkipReason::UnnamedThread);
+    }
+
+    // HIB-BIGINTEGER-AIOOBE.1 (2026-07-17) — the real-JDK
+    // `MutableBigInteger` divide/normalization implementation is the only
+    // confirmed JIT-only surface behind Hibernate's intermittent
+    // `BigInteger.smallToString` AIOOBE ("Index 2 out of bounds for length
+    // 2").  The interpreter and `--nojit` execute the exact same bytecode
+    // correctly, while multiple live failures have shown a self-consistent
+    // bounds check against a two-element array after this class was JITed.
+    //
+    // This deliberately covers the whole implementation class rather than a
+    // guessed leaf such as `mulsub`: the reported frame is several calls
+    // above the corrupting write and the historical reproducer is bimodal.
+    // A class-local, unconditional fail-closed guard preserves JIT coverage
+    // for `BigInteger` callers and all application code, and cannot be lifted
+    // by `CRATONVM_JIT_ALLOW_PACKAGES` until the underlying x64 lowering bug
+    // has a deterministic regression reproducer.
+    if class_name == "java/math/MutableBigInteger" {
+        return Some(SkipReason::BigIntegerArithmetic);
     }
 
     // ANTLR-COLDPATH.1 — the Groovy-shaded ANTLR runtime blanket ban is
@@ -3000,6 +3023,46 @@ mod tests {
         assert_eq!(
             check("Foo", "bar", false, false, SkipPolicy::Aggressive),
             Some(SkipReason::UnnamedThread)
+        );
+    }
+
+    #[test]
+    fn hibernate_biginteger_divide_cluster_is_always_interpreted() {
+        // HIB-BIGINTEGER-AIOOBE.1: do not let a package-allow override or the
+        // aggressive policy re-enable the known-corrupting arithmetic class.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for method in [
+                "divideMagnitude",
+                "divideKnuth",
+                "mulsub",
+                "primitiveLeftShift",
+            ] {
+                assert_eq!(
+                    check_with(
+                        "java/math/MutableBigInteger",
+                        method,
+                        false,
+                        true,
+                        policy,
+                        &["java/math/"],
+                    ),
+                    Some(SkipReason::BigIntegerArithmetic),
+                    "{method} must remain interpreted under {policy:?}",
+                );
+            }
+        }
+
+        // Keep the quarantine scoped to the implementation class. Public
+        // callers such as BigInteger itself remain eligible for JIT.
+        assert_eq!(
+            check(
+                "java/math/BigInteger",
+                "smallToString",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+            ),
+            None,
         );
     }
 
