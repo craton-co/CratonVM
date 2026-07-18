@@ -42,20 +42,24 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 
 | Benchmark                          | JDK 25 C2     | CratonVM default | Default ratio |
 |-------------------------------------|---------------|-------------------|---------------|
-| Arithmetic (2B ops)                 | 1,831 ms      | 6,488 ms          | 3.54x         |
-| Fibonacci(44)                       | 1,442 ms      | 4,247 ms          | 2.95x¹        |
-| Sieve (100K x 20,000)               | 2,346 ms      | 5,984 ms          | 2.55x         |
-| Matrix 1280x1280                    | 2,094 ms      | 5,629 ms          | 2.69x         |
-| **QuickBench TOTAL**                | **7,713 ms**  | **22,348 ms**     | **2.90x**     |
-| HashMap (1M put/get, isolated)      | 45 ms         | 232 ms            | 5.16x         |
-| String/Regex (1M, isolated)         | 143 ms        | 2,231 ms          | 15.6x         |
-| Binary Trees (depth=18, isolated)   | 192 ms        | 11,150 ms         | 58.1x²        |
+| Arithmetic (2B ops)                 | 2,006 ms      | 4,895 ms          | 2.44x         |
+| Fibonacci(44)                       | 1,719 ms      | 4,790 ms          | 2.79x¹        |
+| Sieve (100K x 20,000)               | 2,851 ms      | 6,508 ms          | 2.28x         |
+| Matrix 1280x1280                    | 2,349 ms      | 6,875 ms          | 2.93x         |
+| **QuickBench TOTAL**                | **8,925 ms**  | **23,068 ms**     | **2.58x**     |
+| HashMap (1M put/get, isolated)      | 45 ms         | 201 ms            | 4.47x         |
+| String/Regex (1M, isolated)         | 147 ms        | 1,561 ms          | 10.6x         |
+| Binary Trees (depth=18, isolated)   | 188 ms        | 10,650 ms         | 56.6x²        |
 
-*All rows remeasured 2026-07-18 on the Azure Linux benchmark host (post-reboot
-hardware: EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians
-of alternating freshly-launched JDK/CratonVM process pairs (7 rounds for the
-isolated rows, 3 for the combined run) against Temurin JDK 25.0.3 C2 and a
-CratonVM candidate at default settings. Checksums matched on every run. The
+*All rows remeasured 2026-07-18 (residuals round) on the Azure Linux benchmark
+host (EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians of
+5 alternating freshly-launched JDK/CratonVM process pairs against Temurin JDK
+25.0.3 C2 and a CratonVM candidate at default settings. Checksums matched on
+every run. The shared host carried load ~7-10 during this sweep (vs ~5 for
+the previous table): both columns inflate together, but CratonVM's
+memory-heavy rows inflate more, so rows unchanged by this round (Fibonacci,
+Sieve, Matrix) moved within the ±10-15% contention noise band — their
+underlying code is identical to the previous measurement. The
 host was re-provisioned around 2026-07-14: absolute times are NOT comparable
 with the previous table (same-binary A/B showed identical code ~1.7x slower on
 the new host for CratonVM's memory-heavy paths while JDK barely moved), so
@@ -64,15 +68,40 @@ every row was re-based; ratios are the durable content. The isolated harnesses
 `bench/BinTreesClassic.java`, `bench/QuickBenchLong2.java`) are now committed —
 bench/ is gitignored, which is how earlier copies kept getting lost.*
 
-¹ Fibonacci is recursion-bound (self-call dispatch), unaffected by this
-round's loop-kernel work.
-² Binary Trees at `-Xmx8g` (same flags both sides). At default heap the run
-is dominated by an allocation-slow-path wedge whose full fix (forced
-coalescing collections from the TLAB refill path) is quarantined behind
-`CRATONVM_TLAB_GC_TRIGGER` pending a latent young-walk defect — see
-`docs/known-issues/tlab-trigger-gc-young-walk-corruption.md`.
+¹ Fibonacci is recursion-bound. Its recursive self-call already compiles to
+a guarded DIRECT call (no dispatch helper); the remaining gap is register
+allocation and recursion inlining, which the template/IR backends do not do
+yet.
+² Binary Trees at `-Xmx8g` (same flags both sides), taken from a same-day
+quiet-window (~load 5) triple — 10,642/10,644/10,663 ms, the row is by far
+the most contention-sensitive (it measured 12.6 s inside this sweep's loaded
+window). Default heap now behaves like `-Xmx8g`: the TLAB-refill GC triggers
+are **default ON** — the young-walk corruption that had them quarantined was
+root-caused (a non-8-aligned young-arena capacity desyncing the sweep's walk
+grid) and fixed; see
+`docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md`.
 
-**This round (2026-07-17/18, `docs/internal/performance/halfgap-20260717.md`):**
+**This round (2026-07-18 residuals,
+`docs/internal/performance/halfgap-residuals-20260718.md`):** the
+trigger-quarantining young-walk corruption root-caused and fixed (unaligned
+young capacity minting off-grid TLAB sizes + free blocks; mark oracle now
+fails safe above a truncated walk) — `CRATONVM_TLAB_GC_TRIGGER` default ON
+and default-heap Binary Trees no longer wedges. Arithmetic 3.54x→2.44x
+(64-bit constant div/rem strength reduction: `ldc2_w` + `lmul/ldiv/lrem`
+fusion — pow2 shifts and signed-magic mulhi, probe-verified against HotSpot
+across sign/overflow edges). String/Regex 15.6x→10.6x (StringBuilder joins
+the exact-receiver object-native cache: `append(I)/(C)/(String)` resolve the
+registry once per callsite; plus `ldc`-String wired in the early-compile
+path, which had been inserting every string-bearing method into the JIT skip
+set). HashMap 5.16x→4.47x (Integer boxing fast path writes the value cell
+raw on its freshly-allocated TLAB arm). Also fixed while in the BCE: a
+latent soundness hole where variable-stride (`j += i`) loop IVs were
+bounds-check-elided with no step-sign/overflow proof — steps are now
+provenance-proven and runtime-guarded; a sound inclusive-loop (`<=`) elision
+was built and probe-verified, but ships opt-in (`CRATONVM_JIT_INCLUSIVE_BCE`)
+because it measured as a net loss on the memory-homed template bodies.
+
+**Previous round (2026-07-17/18, `docs/internal/performance/halfgap-20260717.md`):**
 HashMap 7.3x→5.2x (BLOCKGC debug-probe getenv cache — it ran on EVERY native
 call; guarded restore of the JIT inline-compact allocation that a Groovy
 stale-layout fix had disabled, now safe behind a per-class layout-replace
@@ -92,7 +121,8 @@ object, with precise heap edges bypassing it entirely — mark phase
 2,098→474 ms).
 
 Earlier rounds' full find/fix histories:
-[`docs/internal/performance/halfgap-20260717.md`](docs/internal/performance/halfgap-20260717.md) (this round),
+[`docs/internal/performance/halfgap-residuals-20260718.md`](docs/internal/performance/halfgap-residuals-20260718.md) (this round),
+[`docs/internal/performance/halfgap-20260717.md`](docs/internal/performance/halfgap-20260717.md),
 [`docs/internal/performance/hashmap-sieve-half-gap-20260714.md`](docs/internal/performance/hashmap-sieve-half-gap-20260714.md),
 [`docs/internal/performance/quickbench-half-gap-3rows-20260713.md`](docs/internal/performance/quickbench-half-gap-3rows-20260713.md),
 [`docs/internal/hashmap-native-dispatch-overhead.md`](docs/internal/hashmap-native-dispatch-overhead.md), and
