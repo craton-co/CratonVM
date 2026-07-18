@@ -3402,10 +3402,15 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let resource_name = name.trim_start_matches('/');
 
-    // A URLClassLoader has a private, receiver-owned URL set. Route it to the
-    // local resolver before generic ClassLoader parent delegation; otherwise
-    // the generic fallback consults the flat application path and either leaks
-    // a sibling loader's entry or misses the receiver's own nested resource.
+    // A URLClassLoader has a private, receiver-owned URL set. Its public
+    // `getResource` is nevertheless parent-first: Spring's
+    // `FilteredClassLoader`, for example, has an empty local URL array and
+    // relies on its resource-bearing parent. Routing it straight to the local
+    // resolver skipped that parent and made a dynamically supplied
+    // `hazelcast.xml` invisible, so Hazelcast auto-configuration quietly
+    // registered no instance. Search the real parent first, then use the
+    // receiver-local resolver; never fall through to the generic flat path,
+    // which could leak sibling loader resources.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
         if object_extends(ctx, this_ref, "java/net/URLClassLoader") {
             let class_name = ctx
@@ -3418,6 +3423,32 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             if is_builtin_loader_class(&class_name) {
                 return ucl_find_resource(ctx, args);
             }
+            let this_pin = ctx.pin_native_root(this_ref);
+            let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
+            let this_live = ctx.read_native_pin(this_pin, this_ref);
+            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this_live, "parent") {
+                let parent_pin = ctx.pin_native_root(parent);
+                let parent_live = ctx.read_native_pin(parent_pin, parent);
+                let parent_result = ctx.invoke_virtual(
+                    parent_live,
+                    "getResource",
+                    "(Ljava/lang/String;)Ljava/net/URL;",
+                    &[name_for_parent],
+                );
+                ctx.unpin_native_roots(parent_pin);
+                if matches!(parent_result, Ok(Some(Value::Object(Some(_))))) {
+                    ctx.unpin_native_roots(this_pin);
+                    return parent_result;
+                }
+            }
+            let this_live = ctx.read_native_pin(this_pin, this_ref);
+            let name_for_local = Value::Object(Some(ctx.create_string(&name)));
+            let local_result = ucl_find_resource(
+                ctx,
+                &[Value::Object(Some(this_live)), name_for_local],
+            );
+            ctx.unpin_native_roots(this_pin);
+            return local_result;
         }
     }
 

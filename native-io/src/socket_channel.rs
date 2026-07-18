@@ -72,6 +72,11 @@ fn ipc_dbg(msg: impl AsRef<str>) {
 /// non-blocking semantics differ (accept vs read/write).
 pub enum TcpHandle {
     Stream(TcpStream),
+    /// A client socket after `SocketChannel.bind()` but before `connect()`.
+    /// Retaining the actual OS descriptor is essential: the later connect
+    /// must keep Hazelcast's requested outbound port instead of silently
+    /// opening a different ephemeral socket.
+    Bound(TcpStream),
     Listener(TcpListener),
     /// Non-blocking connect in progress. Holds a **real** OS socket whose
     /// `connect()` returned `WSAEWOULDBLOCK` / `EINPROGRESS`. Because it is a
@@ -105,6 +110,7 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
     match regs.get(&id) {
         Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
         Some(TcpHandle::Stream(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        Some(TcpHandle::Bound(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
         // A connect-in-progress socket is a live pollable fd: clone it as a
         // Stream so the selector polls it for write-readiness and surfaces
         // OP_CONNECT naturally once the OS completes (or refuses) the connect.
@@ -164,6 +170,16 @@ fn tcp_blocking_state() -> &'static RwLock<HashMap<i32, bool>> {
     FLAGS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Socket options that the real JDK's SocketAdaptor exposes through a
+/// SocketChannel. The standard library does not provide portable buffer-size
+/// accessors, so retain successful Java-level settings here as the channel's
+/// authoritative values. In particular, returning zero for SO_SNDBUF makes
+/// Hazelcast allocate a zero-capacity protocol encoder buffer.
+fn tcp_option_state() -> &'static RwLock<HashMap<(i32, String), i32>> {
+    static OPTIONS: OnceLock<RwLock<HashMap<(i32, String), i32>>> = OnceLock::new();
+    OPTIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 fn tcp_next_id() -> i32 {
     // Keep IDs distinct from the `Net::register_handle` counter (which starts
     // at 0x4000_0000) and the UDP / FdId counters (small positives).
@@ -180,6 +196,36 @@ fn tcp_register(h: TcpHandle) -> i32 {
 fn tcp_remove(id: i32) {
     tcp_registry().write().remove(&id);
     tcp_blocking_state().write().remove(&id);
+    tcp_option_state()
+        .write()
+        .retain(|(option_id, _), _| *option_id != id);
+}
+
+fn tcp_take_bound(id: i32) -> Option<TcpStream> {
+    let mut registry = tcp_registry().write();
+    let stream = match registry.remove(&id) {
+        Some(TcpHandle::Bound(stream)) => Some(stream),
+        Some(other) => {
+            registry.insert(id, other);
+            None
+        }
+        None => None,
+    };
+    drop(registry);
+    if stream.is_some() {
+        tcp_blocking_state().write().remove(&id);
+    }
+    stream
+}
+
+fn tcp_replace_connect_state(id: i32, stream: TcpStream, connected: bool, blocking: bool) {
+    let handle = if connected {
+        TcpHandle::Stream(stream)
+    } else {
+        TcpHandle::Connecting(stream)
+    };
+    tcp_registry().write().insert(id, handle);
+    tcp_blocking_state().write().insert(id, blocking);
 }
 
 const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
@@ -1118,7 +1164,7 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let local = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => s.local_addr().ok(),
+            Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => s.local_addr().ok(),
             _ => None,
         }
     };
@@ -1126,6 +1172,112 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(Some(Value::Object(None)));
     };
     new_resolved_inet_socket_address(ctx, &addr.ip().to_string(), addr.port() as i32)
+}
+
+/// `SocketChannel.bind(SocketAddress)`: create and retain a real bound client
+/// socket. Hazelcast binds its `SocketChannel.socket()` before handing the
+/// channel to its NIO connector; keeping this descriptor is what makes the
+/// later connect honour a configured outbound-port range.
+fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("bind: null channel"))?;
+    let sa = obj_or_none(args, 1).ok_or_else(|| ioex("bind: null SocketAddress"))?;
+    if read_reg_id(ctx, this).is_some() {
+        return Err(ioex("bind: channel is already bound or connected"));
+    }
+    let (host, port) = decode_socket_address(ctx, sa)?;
+    let bind_text = if host.is_empty() {
+        format!("0.0.0.0:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let bind_addr = bind_text
+        .to_socket_addrs()
+        .map_err(|e| map_err(&bind_text, e))?
+        .next()
+        .ok_or_else(|| ioex(format!("bind: no addresses resolved for {bind_text}")))?;
+    let stream = crate::nb_connect::bind(&bind_addr).map_err(|e| map_err(&bind_text, e))?;
+    let local_port = stream
+        .local_addr()
+        .map(|a| a.port() as i32)
+        .unwrap_or(port as i32);
+    let blocking = read_blocking_flag(ctx, this);
+    let id = tcp_register(TcpHandle::Bound(stream));
+    tcp_blocking_state().write().insert(id, blocking);
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn sc_connect_bound(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    id: i32,
+    stream: TcpStream,
+    host: &str,
+    port: u16,
+    allow_block: bool,
+) -> Result<bool, MethodCallFailed> {
+    let target = format!("{host}:{port}");
+    let local = stream
+        .local_addr()
+        .map_err(|e| map_err("bound local address", e))?;
+    let remote = resolve_and_vet(&target)?
+        .into_iter()
+        .find(|addr| addr.is_ipv4() == local.is_ipv4())
+        .ok_or_else(|| {
+            ioex(format!(
+                "connect: {target} has no address compatible with bound {local}"
+            ))
+        })?;
+    let blocking = read_blocking_flag(ctx, this);
+    let started =
+        crate::nb_connect::start_bound(stream, &remote).map_err(|e| map_err(&target, e))?;
+    let (mut stream, connected) = match started {
+        crate::nb_connect::StartConnect::Connected(stream) => (stream, true),
+        crate::nb_connect::StartConnect::InProgress(stream) if !allow_block => (stream, false),
+        crate::nb_connect::StartConnect::InProgress(stream) => {
+            let deadline = std::time::Instant::now() + crate::outbound_policy::connect_timeout();
+            ctx.begin_blocking_region();
+            let verdict = loop {
+                match crate::nb_connect::poll(&stream) {
+                    crate::nb_connect::ConnectPoll::Connected => break Ok(()),
+                    crate::nb_connect::ConnectPoll::Failed(e) => break Err(e),
+                    crate::nb_connect::ConnectPoll::Pending
+                        if std::time::Instant::now() >= deadline =>
+                    {
+                        break Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "bound connect timed out",
+                        ));
+                    }
+                    crate::nb_connect::ConnectPoll::Pending => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                }
+            };
+            ctx.end_blocking_region();
+            verdict.map_err(|e| map_err(&target, e))?;
+            (stream, true)
+        }
+    };
+    if connected && blocking {
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| map_err("set_nonblocking", e))?;
+    }
+    let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+    tcp_replace_connect_state(id, stream, connected, blocking);
+    cf_set(
+        ctx,
+        this,
+        F_CONNECTED,
+        Value::Int(if connected { 1 } else { 0 }),
+    );
+    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+    let host_str = ctx.create_string(host);
+    cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+    cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+    Ok(connected)
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,6 +1344,12 @@ fn sc_connect_inner(
     let (host, port) = decode_socket_address(ctx, sa)?;
     let target = format!("{host}:{port}");
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
+
+    if let Some(id) = read_reg_id(ctx, this) {
+        let bound = tcp_take_bound(id)
+            .ok_or_else(|| ioex("connect: channel is already connected or connecting"))?;
+        return sc_connect_bound(ctx, this, id, bound, &host, port, allow_block);
+    }
 
     if allow_block {
         // Task #16: SSRF hardening. Route through `policy_connect`, which
@@ -1846,6 +2004,10 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
     if total == 0 {
+        ipc_dbg(format!(
+            "write(gathering) empty id={id} buffers={} window={start}..{end}",
+            arr_len
+        ));
         for (pin, _, _) in chunks {
             ctx.unpin_native_roots(pin);
         }
@@ -2056,7 +2218,35 @@ fn apply_option(stream: &TcpStream, name: &str, val: i32) -> Result<(), std::io:
 fn read_option(stream: &TcpStream, name: &str) -> Result<i32, std::io::Error> {
     match name {
         "TCP_NODELAY" => Ok(if stream.nodelay()? { 1 } else { 0 }),
+        // Keep an intentionally conservative non-zero fallback for channels
+        // whose options are inspected before Java has set them. A zero buffer
+        // size is not a valid Socket API result and causes NIO frameworks to
+        // allocate zero-capacity codec buffers.
+        "SO_RCVBUF" | "SO_SNDBUF" => Ok(64 * 1024),
         _ => Ok(0),
+    }
+}
+
+/// `SocketChannel.setOption` is erased to `(SocketOption, Object)`, so real
+/// JDK callers provide a boxed Integer or Boolean rather than a raw int.
+fn socket_option_value(ctx: &mut dyn NativeContext, value: Value) -> i32 {
+    match value {
+        Value::Int(v) => v,
+        Value::Object(Some(object)) => {
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(object))
+                .unwrap_or_default();
+            let (method, descriptor) = if class_name == "java/lang/Boolean" {
+                ("booleanValue", "()Z")
+            } else {
+                ("intValue", "()I")
+            };
+            match ctx.invoke_virtual(object, method, descriptor, &[]) {
+                Ok(Some(Value::Int(v))) => v,
+                _ => 0,
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -2073,11 +2263,14 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         None => String::new(),
     };
     // Accept either Int or Boolean payloads — both arrive as Value::Int here.
-    let val = int_arg(args, 2);
+    let val = socket_option_value(ctx, args.get(2).copied().unwrap_or(Value::Int(0)));
 
     if let Some(id) = read_reg_id(ctx, this) {
+        tcp_option_state()
+            .write()
+            .insert((id, opt_name.clone()), val);
         let map = tcp_registry().read();
-        if let Some(TcpHandle::Stream(s)) = map.get(&id) {
+        if let Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) = map.get(&id) {
             if let Err(e) = apply_option(s, &opt_name, val) {
                 return Err(map_err(&format!("setOption({opt_name})"), e));
             }
@@ -2104,10 +2297,20 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // null, and the `SocketAdaptor` getters then `((Boolean) ...).booleanValue()`
     // → NPE. Box by the option's value type.
     let raw = if let Some(id) = read_reg_id(ctx, this) {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
-            _ => 0,
+        if let Some(value) = tcp_option_state()
+            .read()
+            .get(&(id, opt_name.clone()))
+            .copied()
+        {
+            value
+        } else {
+            let map = tcp_registry().read();
+            match map.get(&id) {
+                Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => {
+                    read_option(s, &opt_name).unwrap_or(0)
+                }
+                _ => 0,
+            }
         }
     } else {
         0
@@ -2499,6 +2702,24 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "implCloseSelectableChannel", "()V", sc_close);
         r.register(c, "implCloseChannel", "()V", sc_close);
         r.register(c, "connect", "(Ljava/net/SocketAddress;)Z", sc_connect);
+        // `SocketChannel.bind` covariantly returns SocketChannel. Hazelcast
+        // reaches it through SocketAdaptor.bind before registering its client
+        // connection; without this exact descriptor dispatch falls through to
+        // the abstract no-Code declaration and throws AbstractMethodError.
+        r.register(
+            c,
+            "bind",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
+            sc_bind,
+        );
+        // Keep the superinterface descriptor reachable too for callers whose
+        // invokeinterface resolution preserves NetworkChannel's declaration.
+        r.register(
+            c,
+            "bind",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/NetworkChannel;",
+            sc_bind,
+        );
         r.register(
             c,
             "blockingConnect",
@@ -3158,6 +3379,13 @@ mod tests {
                 "sun/nio/ch/SocketChannelImpl",
                 "configureBlocking",
                 "(Z)Ljava/nio/channels/SelectableChannel;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/nio/channels/SocketChannel",
+                "bind",
+                "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;"
             )
             .is_some());
         assert!(r

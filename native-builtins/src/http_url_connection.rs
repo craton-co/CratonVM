@@ -1971,14 +1971,20 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ByteArrayInputStream — which surfaces as `SAXParseException: Premature
     // end of file` in Logback's Joran parser (Cassandra NodeTool boot).
     if let Value::Object(Some(maybe_url)) = ctx.get_field(this, HUC_CONN_ID) {
-        // Real-JDK http(s) connection (robust external form via toExternalForm):
-        // perform the request from the real URL and return its buffered body.
+        // Recover the URL through its public external form first.  This works
+        // for both real-JDK URLs and Craton's synthetic resource URLs, whereas
+        // probing individual URL fields confuses a real `file:` URL's authority
+        // or path with the complete URL.  `URLClassLoader.getResourceAsStream`
+        // uses `openConnection().getInputStream()`, so treating a non-HTTP URL
+        // as the HTTP carrier's empty response body makes inherited resources
+        // appear as zero-byte streams (Hazelcast's filtered-loader XML config).
         if let Some(full) = huc_real_object_url(ctx, this) {
             if full.starts_with("http://") || full.starts_with("https://") {
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
                 return Ok(Some(make_byte_array_input_stream(ctx, &body)));
             }
+            return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
         // Peek at the external form via the URL's full-URL string field
         // (field 5 in our URL synthetic), falling back to field 0.

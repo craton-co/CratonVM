@@ -1,8 +1,42 @@
-# Hazelcast module: `SocketChannel.bind()` AbstractMethodError (confirmed) + server-side HANG (unconfirmed)
+# Hazelcast module: SocketChannel bind and server closure
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED - verified 2026-07-18**
 
-Two remaining, unrelated `module/spring-boot-hazelcast` failures not covered
+## Resolution
+
+The client failure was a real-socket `SocketChannel` coverage gap. CratonVM now
+implements and registers `bind`, local-address access, pre-connect ownership,
+and option handling for both `SocketChannel` and `NetworkChannel`; a bound
+channel keeps its selected local port when it begins the connection. Socket
+options now unbox Java `Integer` and `Boolean` values and retain their state,
+preventing Hazelcast's configured send buffer from becoming zero.
+
+The server residual had two independent causes discovered after the original
+hang was removed:
+
+- `URLClassLoader.getResourceAsStream` obtains its resource through
+  `URL.openConnection().getInputStream()`. The synthetic non-HTTP connection
+  path incorrectly treated real `file:` URLs as empty HTTP responses. It now
+  delegates all non-HTTP URLs back to `URL.openStream`, preserving dynamically
+  supplied `hazelcast.xml` content through Spring's filtered loader.
+- JIT compilation of the JDK-internal Xerces schema package corrupted
+  `SchemaGrammar`'s `SymbolHash` during Hazelcast XML validation. The package
+  is now consistently denied by both VM-side and final JIT admission gates,
+  while the rest of the workload remains JIT-enabled.
+
+Verification using the dedicated `cratonvm-hazelcast-socketclosure-20260718-001.exe`
+with real sockets enabled:
+
+- `HazelcastAutoConfigurationClientTests`: 12/12 PASS, with JIT and `--nojit`.
+- `HazelcastAutoConfigurationServerTests`: 20/20 PASS, with JIT and `--nojit`.
+
+The no-JIT final run was `hazelcast-socketclosure-20260718-001-nojit-final4`;
+the JIT final run (without diagnostic environment overrides) was
+`hazelcast-socketclosure-20260718-001-jit-final2`.
+
+## Historical observation at discovery
+
+Two remaining, unrelated `module/spring-boot-hazelcast` failures were not covered
 by
 [`getmethods-duplicate-destroy-candidate-cluster.md`](getmethods-duplicate-destroy-candidate-cluster.md).
 

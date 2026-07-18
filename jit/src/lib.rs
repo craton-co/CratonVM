@@ -5156,6 +5156,16 @@ fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
     }
 }
 
+fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
+    const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
 fn snakeyaml_emitter_emit_jit_deny_prefix(
     class_name: &str,
     method_name: &str,
@@ -5462,6 +5472,16 @@ pub fn try_compile(
     }
 
     if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    // Keep the final admission gate aligned with the VM-side Xerces parser
+    // guard. Background compilation bypasses the VM skip-list, and JITting
+    // this package corrupts SchemaGrammar's SymbolHash during Hazelcast XML
+    // schema validation.
+    if let Some(prefix) = xerces_schema_jit_deny_prefix(&cached.class_name) {
         if !jit_allow_package(prefix) {
             return None;
         }
@@ -8022,6 +8042,19 @@ mod tests {
             jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
             None
         );
+    }
+
+    #[test]
+    fn xerces_schema_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            xerces_schema_jit_deny_prefix("com/sun/org/apache/xerces/internal/util/SymbolHash"),
+            Some("com/sun/org/apache/xerces/internal/")
+        );
+        assert_eq!(
+            xerces_schema_jit_deny_prefix("com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar"),
+            Some("com.sun.org.apache.xerces.internal.")
+        );
+        assert_eq!(xerces_schema_jit_deny_prefix("com/sun/org/apache/xml/internal/Foo"), None);
     }
 
     #[test]

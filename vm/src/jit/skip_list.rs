@@ -737,6 +737,21 @@ fn should_skip_jit_internal(
             }
         }
 
+        // SPRING-HAZELCAST-XERCES-JIT.1 (2026-07-18): Hazelcast's schema
+        // validation passes the complete server suite interpreted, but JIT
+        // compilation of the JDK-internal Xerces graph corrupts
+        // `SchemaGrammar`'s SymbolHash state and raises an NPE in
+        // `getGlobalTypeDecl`. The focused Spring Boot Hazelcast client/server
+        // pair passes again when only this package is interpreted. Keep the
+        // standard-library parser package out of JIT until that compiler bug is
+        // root-caused; explicit package allowance remains available for
+        // diagnosis.
+        if let Some(prefix) = xerces_schema_jit_deny_prefix(class_name) {
+            if !package_allowed(prefix, allow_packages) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
+
         // ES-JIT-DEOPT-GC.1 (2026-07-08) - Elasticsearch interval-provider
         // tests crash under JIT while serializing through Jackson YAML. Package
         // bisection narrowed the producer from org/yaml/snakeyaml/emitter/ to
@@ -1700,6 +1715,16 @@ fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static 
 fn jaxb_mapping_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
     const DOT_PREFIX: &str = "org.glassfish.jaxb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
+fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
+    const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
     if class_name.starts_with(SLASH_PREFIX) {
         Some(SLASH_PREFIX)
     } else {
@@ -3278,6 +3303,31 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
                 &["org/glassfish/jaxb/"],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn xerces_schema_package_skipped_conservatively_and_lifts_for_bisection() {
+        for cls in [
+            "com/sun/org/apache/xerces/internal/util/SymbolHash",
+            "com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar",
+        ] {
+            assert_eq!(
+                check(cls, "get", false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls} should stay interpreted under the Xerces schema guard"
+            );
+        }
+        assert_eq!(
+            check_with(
+                "com/sun/org/apache/xerces/internal/util/SymbolHash",
+                "get",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["com/sun/org/apache/xerces/internal/"],
             ),
             None
         );
