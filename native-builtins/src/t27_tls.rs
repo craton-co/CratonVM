@@ -289,6 +289,21 @@ pub(crate) fn selected_context_trust_root_ders() -> Vec<Vec<u8>> {
         .unwrap_or_default()
 }
 
+/// Return anchors attached to a specific SSLContext.  Unlike the selected
+/// context slot, this remains available after an SSL factory crosses into a
+/// different Java thread.
+pub(crate) fn context_trust_root_ders(
+    ctx: &mut dyn NativeContext,
+    context: ObjectRef,
+) -> Vec<Vec<u8>> {
+    let key = ctx_obj_key(ctx, context);
+    ctx_trust_roots_table()
+        .lock()
+        .get(&key)
+        .map(|roots| roots.root_ders.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
 pub(crate) fn is_dsa_private_key_pem(key_pem: &str) -> bool {
     openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).is_ok_and(|key| key.dsa().is_ok())

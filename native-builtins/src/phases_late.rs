@@ -42606,15 +42606,24 @@ fn p68_extract_trust_manager_roots(
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
+fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Vec<u8>> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
-            p68_ctx_trust_roots_table()
+            let direct = p68_ctx_trust_roots_table()
                 .lock()
                 .get(&key)
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if !direct.is_empty() {
+                return direct;
+            }
+            if ctx.object_num_fields(*this) > 0 {
+                if let Value::Object(Some(sslctx)) = ctx.get_field(*this, 0) {
+                    return crate::t27_tls::context_trust_root_ders(ctx, sslctx);
+                }
+            }
+            Vec::new()
         }
         _ => Vec::new(),
     }
@@ -42720,7 +42729,7 @@ fn p68_create_socket_inet_address(
         }
         .into());
     }
-    let extra_roots = p68_factory_trust_roots(args);
+    let extra_roots = p68_factory_trust_roots(ctx, args);
     let java_tm_key = p68_factory_java_tm_key(ctx, args);
     new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
 }
@@ -43144,7 +43153,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
@@ -43187,7 +43196,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
         },
@@ -43229,7 +43238,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
