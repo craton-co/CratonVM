@@ -1284,6 +1284,26 @@ fn sc_connect_bound(
             verdict.map_err(|e| map_err(&target, e))?;
             (stream, true)
         }
+        crate::nb_connect::StartConnect::DeferredFailure(stream, error) => {
+            // A non-blocking channel must retain the live descriptor until the
+            // selector drives finishConnect(), just like the unbound channel
+            // path below. Throwing here would violate SocketChannel's async
+            // contract and can strand a caller waiting for OP_CONNECT.
+            if allow_block {
+                return Err(map_err(&target, error));
+            }
+            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+            tcp_registry()
+                .write()
+                .insert(id, TcpHandle::ConnectFailed(stream, error));
+            tcp_blocking_state().write().insert(id, false);
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+            let host_str = ctx.create_string(host);
+            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            return Ok(true);
+        }
     };
     if connected && blocking {
         stream
