@@ -19817,6 +19817,7 @@ fn execute_invoke_kind(
         &method_descriptor,
         &args,
         false,
+        is_special,
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
@@ -24117,6 +24118,28 @@ fn force_native_over_real_jdk_bytecode(
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
+    // allow-list. JarFile inherits these operations from ZipFile, so a
+    // subclass `super.close()` resolves to the real ZipFile bytecode after
+    // cache population unless its registered bridge is forced here too. The
+    // real body dereferences constructor state which native-backed JarFiles do
+    // not have.
+    if class_name == "java/util/zip/ZipFile"
+        && matches!(
+            method_name,
+            "<init>"
+                | "getEntry"
+                | "getInputStream"
+                | "entries"
+                | "stream"
+                | "getComment"
+                | "close"
+                | "getName"
+                | "size"
+        )
+    {
+        return true;
+    }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -26783,6 +26806,7 @@ fn try_stackless_invoke(
     descriptor: &str,
     args: &[Value],
     walk_native_hierarchy: bool,
+    is_special: bool,
     // Loader-isolation dispatch override: when `Some`, the bytecode-method
     // lookup uses THIS class_id instead of re-resolving `class_name` (which can
     // pick the wrong same-named per-loader copy). Only the divergent
@@ -26813,6 +26837,32 @@ fn try_stackless_invoke(
     // the caller's operand stack — otherwise the next `pop_int` blows up
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
+
+    // A subclass `super.close()` is an invokespecial whose constant-pool
+    // owner is JarFile even though the concrete implementation is inherited
+    // from ZipFile. Mockito can redefine JarFile for ordinary mock calls; the
+    // general redefine guard correctly yields to that advice, but must not
+    // make this statically-bound superclass call fall into ZipFile's real
+    // bytecode (its `res` field is absent on CratonVM-native JarFiles).
+    // Limit this bypass to the exact invokespecial close shape. Virtual mock
+    // calls still take the normal redefine-aware dispatch path.
+    if is_special
+        && matches!(
+            class_name,
+            "java/util/jar/JarFile" | "java/util/zip/ZipFile"
+        )
+        && method_name == "close"
+        && descriptor == "()V"
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/util/zip/ZipFile", method_name, descriptor)
+        {
+            safe_native_call(shared, thread, callback, args)?;
+            return Ok(CachedCallResult::Handled);
+        }
+    }
 
     // Registered natives that must beat real-JDK bytecode on the declaring
     // class (URL.getHost DNS loop, ClassLoader assertion lock NPE, etc.).
@@ -27906,6 +27956,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
+        false,
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
