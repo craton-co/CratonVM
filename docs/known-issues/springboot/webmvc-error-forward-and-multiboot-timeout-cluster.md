@@ -68,7 +68,7 @@ Both classes HANG at exactly the suite's 300s timeout (`results.tsv`:
 300.191s — both `TIMEOUT`/`HANG`, not a silent process death). Unlike the
 [`modifiedclasspath-aether-network-hang-cluster.md`](modifiedclasspath-aether-network-hang-cluster.md)
 and
-[`graphql-security-autoconfiguration-early-hang.md`](graphql-security-autoconfiguration-early-hang.md)
+[`graphql-security-autoconfiguration-early-hang-FIXED.md`](../../internal/springboot/graphql-security-autoconfiguration-early-hang-FIXED.md)
 HANG shapes, both classes show substantial, continuing real application
 activity throughout their `.err.log`s — not silence, not a single benign
 warning on repeat:
