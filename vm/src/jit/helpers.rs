@@ -5583,23 +5583,40 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 } else {
                     None
                 };
-                let object = match tlab_object {
-                    Some(object) => object,
-                    None => {
-                        use cratonvm_native_api::NativeContext as _;
-                        // Reborrow: `thread` is used again after this arm for
-                        // the pending-return publication.
-                        let mut ctx = crate::vm::NativeContextImpl {
-                            shared: vm,
-                            thread: &mut *thread,
-                        };
-                        ctx.alloc_object(class_id, 1)
+                if let Some(object) = tlab_object {
+                    // Raw primitive-cell write: this arm JUST allocated
+                    // `object` through the legacy TLAB path
+                    // (`init_object_header`, zeroed 16-byte Value cells), so
+                    // field 0 is the Value cell at HEADER_SIZE — the exact
+                    // bytes `set_field_as(.., b'I')` would store, minus that
+                    // path's per-call header read + layout dispatch. A
+                    // primitive store takes no write barrier.
+                    // SAFETY: `object` is a live legacy-layout allocation
+                    // with >= 1 slot (`slots.max(1)` above); the cell is
+                    // exclusively ours until published below.
+                    unsafe {
+                        std::ptr::write(
+                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                            Value::Int(value),
+                        );
                     }
+                    // Object-return handoff root (see `call_integer_native_raw`).
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                use cratonvm_native_api::NativeContext as _;
+                let object = {
+                    // Reborrow: `thread` is used again after this arm for
+                    // the pending-return publication.
+                    let mut ctx = crate::vm::NativeContextImpl {
+                        shared: vm,
+                        thread: &mut *thread,
+                    };
+                    ctx.alloc_object(class_id, 1)
                 };
-                // Direct descriptor-typed write: `Integer.value` is declared
-                // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
-                // per-call `class_id_of` + descriptor resolution and hand the
-                // heap the same normalized store it would have produced.
+                // Descriptor-typed write (`Integer.value`, field 0, `I`) —
+                // this cold arm's allocator may pick a non-legacy layout, so
+                // keep the layout-aware store.
                 vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
                 thread.native_pending_return = Some(object);
