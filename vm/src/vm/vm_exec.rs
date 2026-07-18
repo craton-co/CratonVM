@@ -8339,26 +8339,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             full_args.push(Value::Object(Some(receiver)));
             full_args.extend_from_slice(args);
 
-            // Per-loader identity (JVMS §5.3): when the receiver's class name
-            // resolves (globally, by name) to a DIFFERENT class id than the
-            // receiver actually has — i.e. another loader defined a same-named
-            // class first — dispatch on the receiver's EXACT class id so a
-            // reflective `Method.invoke` on a loader-private (e.g. load-time
-            // weaved) instance runs ITS body, not the global one.
-            // `invoke_on_class_shared` resolves via
-            // `find_method_recursive(receiver_class_id, ...)` and keeps
-            // native-override precedence, matching `invoke_or_native`'s
-            // semantics minus the name→global-id collapse. The common
-            // single-loader case (name resolves back to `receiver_class_id`)
-            // keeps the original `invoke_or_native` path byte-for-byte.
-            let diverges = resolved_from_receiver
-                && self
-                    .shared
-                    .class_manager
-                    .read()
-                    .get_loaded_class_id(&class_name)
-                    != Some(receiver_class_id);
-            if diverges {
+            // Dispatch ordinary object calls through the receiver's exact
+            // loaded class. Re-resolving its name through the global class map
+            // can select an inherited Object member even when the receiver has
+            // a concrete override (notably a method-local anonymous class
+            // reached from a native call such as String.format's `%s`).
+            // `invoke_on_class_shared` preserves native-override precedence
+            // while resolving the actual receiver hierarchy.
+            if resolved_from_receiver {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,

@@ -183,7 +183,6 @@ open each doc for the full picture):
 | [`web-server-mockito-restub-no-op-cluster.md`](web-server-mockito-restub-no-op-cluster.md) | OPEN — found 2026-07-17 |
 | [`webclient-loopback-self-connect-timeout-os10060-cluster.md`](webclient-loopback-self-connect-timeout-os10060-cluster.md) | OPEN — found 2026-07-17, residual of the contextrunner-resource-cycle re-triage below |
 | [`webmvc-error-forward-and-multiboot-timeout-cluster.md`](webmvc-error-forward-and-multiboot-timeout-cluster.md) | OPEN — found 2026-07-17 |
-| [`webmvc-test-anonymous-tostring-override-not-dispatched.md`](webmvc-test-anonymous-tostring-override-not-dispatched.md) | OPEN — found 2026-07-17 (hypothesis for the dispatch gap; the format |
 | [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) | OPEN — found 2026-07-17 |
 | [`zipkin-realsocket-retry-spin-hang.md`](zipkin-realsocket-retry-spin-hang.md) | OPEN — found 2026-07-17. Hypothesis only, not root-caused. |
 ## 2026-07-16 rerun of non-passed classes (post-dev-sync, 764 classes, 8 shards)
