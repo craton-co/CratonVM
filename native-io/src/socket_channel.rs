@@ -1234,26 +1234,6 @@ fn sc_connect_bound(
         crate::nb_connect::start_bound(stream, &remote).map_err(|e| map_err(&target, e))?;
     let (mut stream, connected) = match started {
         crate::nb_connect::StartConnect::Connected(stream) => (stream, true),
-        crate::nb_connect::StartConnect::DeferredFailure(stream, error) => {
-            if allow_block {
-                return Err(map_err(&target, error));
-            }
-            // Mirror the unbound path's deferred-failure arm: keep the
-            // locally-classified terminal failure in the registry under the
-            // SAME bound id so finishConnect()/the first write surfaces it
-            // (async SocketChannel contract), and report this narrow terminal
-            // state as connected so the reactor reaches that write instead of
-            // stranding the request in a never-observable pending state.
-            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-            tcp_registry().write().insert(id, TcpHandle::ConnectFailed(stream, error));
-            tcp_blocking_state().write().insert(id, blocking);
-            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
-            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
-            let host_str = ctx.create_string(host);
-            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
-            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-            return Ok(true);
-        }
         crate::nb_connect::StartConnect::InProgress(stream) if !allow_block => (stream, false),
         crate::nb_connect::StartConnect::DeferredFailure(stream, error) if !allow_block => {
             // Keep the terminal error on the retained OS descriptor. This
