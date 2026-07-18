@@ -2223,9 +2223,12 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     // hostname verification unless the caller sets an endpoint-identification
     // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
     // server via 127.0.0.1 while the test certificate has no matching IP SAN.
-    builder.set_verify_hostname(false);
-    let stream = builder
-        .build()
+    let connector = builder.build();
+    let mut connection = connector
+        .configure()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    connection.set_verify_hostname(false);
+    let stream = connection
         .connect(host, tcp)
         .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
     let mut peer_cert_chain_der = Vec::new();
