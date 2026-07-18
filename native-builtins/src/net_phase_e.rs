@@ -9045,6 +9045,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 _ => None,
             }
             .or_else(crate::t27_tls::huc_default_client_identity);
+            #[cfg(unix)]
+            let legacy_dsa_client = client_ident
+                .as_ref()
+                .is_some_and(|(_, key_pem)| crate::t27_tls::is_dsa_private_key_pem(key_pem));
+            #[cfg(unix)]
+            let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot
@@ -9074,10 +9080,18 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // forever for this thread to reach a safepoint it can't reach until
             // the (now-deadlocked-behind-the-GC) network call returns.
             ctx.begin_blocking_region();
-            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16);
+            #[cfg(unix)]
+            let connect_result = if legacy_dsa_client {
+                crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+            } else {
+                crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                    .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+            };
+            #[cfg(not(unix))]
+            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
-            let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);

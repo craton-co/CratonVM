@@ -2191,8 +2191,13 @@ pub(crate) fn s2_tls_connect(
 /// certificate validation still happens immediately afterward through the
 /// Java TrustManager captured from the owning SSLContext.
 #[cfg(unix)]
-pub(crate) fn s2_legacy_dsa_tls_connect(host: &str, port: u16) -> std::io::Result<i32> {
+pub(crate) fn s2_legacy_dsa_tls_connect(
+    host: &str,
+    port: u16,
+    trust_root_ders: &[Vec<u8>],
+) -> std::io::Result<i32> {
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use openssl::x509::{store::X509StoreBuilder, X509};
     let addr = format!("{host}:{port}");
     let tcp = TcpStream::connect(&addr)?;
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
@@ -2203,7 +2208,17 @@ pub(crate) fn s2_legacy_dsa_tls_connect(host: &str, port: u16) -> std::io::Resul
     builder
         .set_cipher_list("ALL:@SECLEVEL=0")
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    builder.set_verify(SslVerifyMode::NONE);
+    let mut roots = X509StoreBuilder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    for der in trust_root_ders {
+        let cert = X509::from_der(der).map_err(|e| std::io::Error::other(e.to_string()))?;
+        roots
+            .add_cert(cert)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+    builder
+        .set_verify_cert_store(roots.build())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    builder.set_verify(SslVerifyMode::PEER);
     let stream = builder
         .build()
         .connect(host, tcp)

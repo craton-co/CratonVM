@@ -282,6 +282,18 @@ fn selected_context_trust_roots() -> Option<TlsTrustRoots> {
     SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow().clone())
 }
 
+#[cfg(unix)]
+pub(crate) fn selected_context_trust_root_ders() -> Vec<Vec<u8>> {
+    selected_context_trust_roots()
+        .map(|roots| roots.root_ders)
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+pub(crate) fn is_dsa_private_key_pem(key_pem: &str) -> bool {
+    openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).is_ok_and(|key| key.dsa().is_ok())
+}
+
 fn take_selected_context_trust_roots() -> Option<TlsTrustRoots> {
     SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow_mut().take())
 }
