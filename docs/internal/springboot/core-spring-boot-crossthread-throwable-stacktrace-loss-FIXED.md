@@ -1,4 +1,15 @@
-# `Throwable.getStackTrace()` returns empty when queried from a thread other than the one that filled it in
+# FIXED: `Throwable.getStackTrace()` returns empty when queried from a thread other than the one that filled it in
+
+**Resolved 2026-07-18.** Captured Throwable frames now live in a VM-wide,
+non-owning registry, so they survive producer-thread termination and can be
+read from any Java thread. GC forwards live registry handles and sweeps dead
+ones. `Throwable.printStackTrace` was completed as the associated residual:
+it now renders suppressed throwables and common-frame elision like HotSpot.
+
+Validated with the unique `cratonvm-crossthread-throwable-stacktrace-20260718.exe`:
+
+- `StandardStackTracePrinterTests`: 23/23 PASS with JIT and `--nojit`.
+- `StructuredLoggingJsonPropertiesTests`: 19/19 PASS with JIT and `--nojit`.
 
 **Status: OPEN — found 2026-07-17 (root cause confirmed at file:line precision)**
 

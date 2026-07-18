@@ -156,14 +156,22 @@ impl MockCtx {
 
     pub fn set_class_interfaces(&self, class_id: ClassId, interfaces: Vec<ClassId>) {
         // SAFETY: single-threaded test code.
-        unsafe { (*self.class_interfaces.get()).insert(class_id.as_u32(), interfaces); }
+        unsafe {
+            (*self.class_interfaces.get()).insert(class_id.as_u32(), interfaces);
+        }
     }
 
     /// Registers hidden-lambda metadata without adding it to the class table.
-    pub fn set_lambda_proxy_metadata(&self, class_id: ClassId, functional_interface: &str, host: &str) {
+    pub fn set_lambda_proxy_metadata(
+        &self,
+        class_id: ClassId,
+        functional_interface: &str,
+        host: &str,
+    ) {
         // SAFETY: single-threaded test code.
         unsafe {
-            (*self.lambda_functional_interfaces.get()).insert(class_id.as_u32(), functional_interface.to_string());
+            (*self.lambda_functional_interfaces.get())
+                .insert(class_id.as_u32(), functional_interface.to_string());
             (*self.lambda_proxy_hosts.get()).insert(class_id.as_u32(), host.to_string());
         }
     }
@@ -414,7 +422,7 @@ impl NativeContext for MockCtx {
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+    fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
         None
     }
 
@@ -738,15 +746,28 @@ impl NativeContext for MockCtx {
     }
     fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
         // SAFETY: single-threaded test code.
-        unsafe { (*self.class_interfaces.get()).get(&class_id.as_u32()).cloned().unwrap_or_default() }
+        unsafe {
+            (*self.class_interfaces.get())
+                .get(&class_id.as_u32())
+                .cloned()
+                .unwrap_or_default()
+        }
     }
     fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
         // SAFETY: single-threaded test code.
-        unsafe { (*self.lambda_functional_interfaces.get()).get(&class_id.as_u32()).cloned() }
+        unsafe {
+            (*self.lambda_functional_interfaces.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
     }
     fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
         // SAFETY: single-threaded test code.
-        unsafe { (*self.lambda_proxy_hosts.get()).get(&class_id.as_u32()).cloned() }
+        unsafe {
+            (*self.lambda_proxy_hosts.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
     }
     fn class_access_flags(&self, _c: ClassId) -> u16 {
         0

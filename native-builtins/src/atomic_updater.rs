@@ -1409,7 +1409,7 @@ mod tests {
         fn get_stack_trace(
             &self,
             throwable_hash: i32,
-        ) -> Option<&[cratonvm_native_api::StackTraceEntry]> {
+        ) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
             self.inner.get_stack_trace(throwable_hash)
         }
         fn get_field(&self, obj: ObjectRef, index: usize) -> Value {

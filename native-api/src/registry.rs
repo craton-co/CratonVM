@@ -832,12 +832,24 @@ pub trait NativeContext {
         false
     }
 
-    /// Capture the current Java call stack for a throwable's `fillInStackTrace`.
-    /// Returns a unique key for later retrieval.
+    /// Capture the current Java call stack without retaining it. Used by
+    /// StackWalker and caller-sensitive helpers.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
 
-    /// Retrieve a previously captured stack trace.
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]>;
+    /// Capture and retain a stack trace for `Throwable.fillInStackTrace`.
+    ///
+    /// The default keeps lightweight/mock contexts source-compatible. The VM
+    /// implementation overrides it so retained frames are owned by the VM,
+    /// rather than by the Java thread that happened to construct the throwable.
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        self.capture_stack_trace(self.identity_hash_code(throwable))
+    }
+
+    /// Retrieve a previously captured stack trace as an owned snapshot.
+    ///
+    /// An owned value deliberately avoids lending a reference through a
+    /// VM-shared lock while another Java thread may replace or discard a trace.
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>>;
 
     /// The exact `ClassId` each live frame is currently executing in,
     /// innermost (most recent call) first.
@@ -926,7 +938,8 @@ pub trait NativeContext {
     /// third-party object whose class gets redefined under a fresh loader
     /// each time, such as ByteBuddy classes under
     /// `@CompileWithForkedClassLoader`).
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize>;
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str)
+        -> Option<usize>;
 
     /// Read `out.len()` bytes of native memory at `addr` into `out`.
     ///
