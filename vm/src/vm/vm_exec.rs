@@ -13680,55 +13680,6 @@ fn invoke_on_class_shared_inner(
     {
         return Ok(None);
     }
-    // Real JDK Socket instances retain an implementation object in a field
-    // layout that differs from CratonVM's synthetic/network objects.  Let
-    // the registered option bridges win before `Socket.setKeepAlive` reaches
-    // the host bytecode and dispatches `setOption` on that mis-slotted field.
-    if class_name == "java/net/Socket"
-        && matches!(
-            (method_name, descriptor),
-            ("setKeepAlive", "(Z)V")
-                | ("setTcpNoDelay", "(Z)V")
-                | ("setSoTimeout", "(I)V")
-        )
-    {
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name, method_name, descriptor)
-        {
-            return safe_native_call(shared, thread, callback, args)
-                .map(|value| coerce_native_return(value, descriptor));
-        }
-    }
-    // A registry-backed TLS client is represented as a synthetic
-    // `javax/net/ssl/SSLSocket`, but callers invoke these inherited methods
-    // through the concrete JDK Socket body.  Check the receiver itself as
-    // well so that body cannot read its incompatible `impl` slot.
-    if matches!(
-        (method_name, descriptor),
-        ("setKeepAlive", "(Z)V")
-            | ("setTcpNoDelay", "(Z)V")
-            | ("setSoTimeout", "(I)V")
-    ) {
-        if let Some(Value::Object(Some(receiver))) = args.first() {
-            let receiver_class = shared.heap.class_id_of(*receiver);
-            let receiver_name = shared
-                .class_manager
-                .read()
-                .get_class(receiver_class)
-                .map(|class| class.name.to_string())
-                .unwrap_or_default();
-            if receiver_name == "javax/net/ssl/SSLSocket" {
-                if let Some(callback) = shared
-                    .native_methods
-                    .find("java/net/Socket", method_name, descriptor)
-                {
-                    return safe_native_call(shared, thread, callback, args)
-                        .map(|value| coerce_native_return(value, descriptor));
-                }
-            }
-        }
-    }
     // `ServerSocket.accept()` has a native parent implementation, so the
     // later abstract-method rescue cannot displace it. A synthetic
     // SSLServerSocket owns a separate TLS listener registry and must always
@@ -13751,36 +13702,6 @@ fn invoke_on_class_shared_inner(
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
                 }
-            }
-        }
-    }
-    // The JDK's concrete SSLSocketFactory implementation can construct an
-    // unconnected host-backed SSLSocket.  CratonVM's native TLS registry is
-    // intentionally connection-oriented, so returning that host object here
-    // would let a later `Socket.connect` establish plaintext TCP and leave
-    // the peer waiting for a TLS ClientHello.  UnboundID (the LDAPS caller)
-    // explicitly falls back from this optional no-arg form to the
-    // InetAddress overload, which is the fully TLS-aware bridge below.
-    if method_name == "createSocket" && descriptor == "()Ljava/net/Socket;" {
-        if let Some(Value::Object(Some(receiver))) = args.first() {
-            let receiver_class = shared.heap.class_id_of(*receiver);
-            let receiver_name = shared
-                .class_manager
-                .read()
-                .get_class(receiver_class)
-                .map(|class| class.name.to_string())
-                .unwrap_or_default();
-            if std::env::var_os("CRATONVM_DBG_SSL_FACTORY").is_some() {
-                eprintln!(
-                    "[dbg-ssl-factory] declared={class_name} receiver={receiver_name}"
-                );
-            }
-            if receiver_name == "sun/security/ssl/SSLSocketFactoryImpl" {
-                return Err(RuntimeError::IOException {
-                    message: "unconnected JDK SSLSocket requires a TLS-aware createSocket overload"
-                        .into(),
-                }
-                .into());
             }
         }
     }
