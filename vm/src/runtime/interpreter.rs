@@ -26801,6 +26801,30 @@ fn try_stackless_invoke(
             Some(Value::Object(Some(adapter))) => *adapter,
             _ => return None,
         };
+        // This is a narrow adaptation for a real-JDK MethodHandle wrapper
+        // around our synthetic DowncallHandle. `invoke` is an ordinary method
+        // name too (notably JUnit's InterceptingExecutableInvoker.invoke), so
+        // probing field 0 before establishing that the receiver is actually a
+        // MethodHandle subclass turns every unrelated zero-field receiver into
+        // an OOB heap-field read. Apart from the diagnostic flood, returning a
+        // benign null from that probe can strand the caller in a retry loop.
+        //
+        // Use the runtime receiver hierarchy rather than `class_name`: the
+        // invoked method can be resolved on an inherited MethodHandle owner
+        // while the adapter itself is a concrete JDK subclass.
+        let is_method_handle_adapter = {
+            let cm = shared.class_manager.read();
+            let adapter_class = shared.heap.class_id_of(adapter);
+            cm.get_loaded_class_id("java/lang/invoke/MethodHandle")
+                .map(|method_handle_class| {
+                    adapter_class == method_handle_class
+                        || cm.is_subclass_of(adapter_class, method_handle_class)
+                })
+                .unwrap_or(false)
+        };
+        if !is_method_handle_adapter {
+            return None;
+        }
         let target = match shared.heap.get_field(adapter, 0) {
             Value::Object(Some(target)) => target,
             _ => return None,

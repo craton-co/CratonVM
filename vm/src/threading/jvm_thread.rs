@@ -19,7 +19,7 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
@@ -83,6 +83,11 @@ pub struct GcBlockState {
     /// True from `deposit_root_snapshot` (just before the thread blocks)
     /// until the end of `check_post_block_gc` (after the fixup is applied).
     pub in_blocked_region: AtomicBool,
+    /// Java-visible blocking kind while `in_blocked_region` is true:
+    /// 1 = WAITING (wait/park/join), 2 = BLOCKED (monitor acquisition).
+    /// The GC protocol only needs the boolean above; preserving this small
+    /// distinction lets `Thread.getState()` report the JDK state correctly.
+    pub java_state: AtomicU8,
     /// Composed `frame-held address → current address` map accumulated by GC
     /// initiators for every collection that completed while the thread was
     /// in a blocked region. Applied + cleared on wake.
@@ -103,6 +108,7 @@ impl GcBlockState {
     pub fn new() -> Self {
         Self {
             in_blocked_region: AtomicBool::new(false),
+            java_state: AtomicU8::new(0),
             fixup: PLMutex::new(std::collections::HashMap::new()),
             slot_origins: PLMutex::new(Vec::new()),
         }

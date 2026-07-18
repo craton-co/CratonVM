@@ -655,6 +655,8 @@ pub(crate) fn native_thread_get_state(
     let name = match ctx.thread_run_state(this) {
         1 => "RUNNABLE",
         2 => "TERMINATED",
+        3 => "WAITING",
+        4 => "BLOCKED",
         _ => "NEW",
     };
     let cid = match ctx.ensure_class_initialized("java/lang/Thread$State") {
