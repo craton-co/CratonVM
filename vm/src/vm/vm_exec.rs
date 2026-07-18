@@ -3429,11 +3429,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             }
         }
-        self.thread
+        let entry = self
+            .thread
             .native_pin_roots
             .get(handle)
             .copied()
-            .unwrap_or(fallback)
+            .unwrap_or(fallback);
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): the PIN-STALE canary
+        // covers pin TIME; this covers READ time — a forwarded address
+        // sitting in the pin table means a GC between pin and read failed
+        // to remap THIS entry (initiator/arrive/fold writeback gap), which
+        // no other canary distinguishes from caller-side misuse.
+        if handle != usize::MAX && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(entry.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-TABLE-STALE tid={} handle={} len={} 0x{:x}->0x{new:x} \
+                         (pin-table entry missed a remap) reader:\n{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        entry.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        entry
     }
 
     fn unpin_native_roots(&mut self, base: usize) {
