@@ -2189,6 +2189,41 @@ static TLAB_GATE_CONSECUTIVE_FAILS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static TLAB_LAST_BREAK_ALLOC_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Slow-path entries since the last refill-time `needs_gc()` fire (the
+/// crumb-treadmill fix in `tlab_alloc_object_inner`). Entry-counted, not
+/// byte-counted: the degraded modes this guards (per-object allocation,
+/// crumb-sized mini-TLABs) enter the slow path orders of magnitude more
+/// often than healthy TLAB flow, so the counter accelerates exactly when
+/// the wedge deepens, and a bytes-based stamp would freeze (the per-object
+/// path doesn't bump `bytes_allocated_total`).
+static TLAB_SLOWPATH_ENTRIES_SINCE_GC: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Gate for the two refill-time GC triggers (the wedge-breaker and the
+/// `needs_gc()` consult). **Default OFF** (opt in with
+/// `CRATONVM_TLAB_GC_TRIGGER=1`): with the triggers on, BinTreesClassic
+/// d=18 reproducibly under-counts (5/5 runs wrong checksum, e.g. 67644084
+/// vs 68332206) with "young walk: cursor overshot into free block" and
+/// "non-moving sweep: implausible object size (class_id=0, live
+/// hash/num_slots)" warnings — the extra mid-drain collections expose a
+/// LATENT young-sweep/walk defect when the free list holds split remnants
+/// and mini-TLAB fillers (see
+/// docs/known-issues/tlab-trigger-gc-young-walk-corruption.md). The
+/// triggers themselves are the intended cure for the crumb-treadmill wedge
+/// (10.5M consecutive refill failures, one GC per run); re-enable by
+/// default once the walk defect is fixed.
+fn tlab_gc_trigger_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_TLAB_GC_TRIGGER")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
 
 fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
     use std::sync::atomic::Ordering;
@@ -2256,6 +2291,39 @@ fn tlab_alloc_object_inner(
         return Some(unsafe { ObjectRef::from_raw(ptr) });
     }
 
+    // Crumb-treadmill fix (perf/halfgap-20260717): the JIT allocation path
+    // never consulted `needs_gc()` — it only reacted to HARD allocation
+    // failure (probe/alloc returning None). With the fragmentation-floor
+    // refill serving ever-smaller free-list crumbs, allocation can succeed
+    // indefinitely off a degrading free list (and spill to old gen) without
+    // any failure ever occurring, so the young collection whose
+    // sweep+coalesce would restore full-size TLAB flow never triggers —
+    // observed live as ONE young GC in a 23-second BinTreesClassic d=18 run
+    // at -Xmx8g. Consult the same live-occupancy trigger the interpreter
+    // path uses, once per refill (never per object), rate-limited by
+    // allocation progress so a genuinely-full-of-live-data young gen cannot
+    // thrash back-to-back collections (the "150 no-progress sweeps" failure
+    // mode documented on `needs_gc` itself).
+    // Rate limit: needs_gc() is naturally self-limiting (the collection
+    // tenures survivors via selective promotion and rebuilds the free list,
+    // so `live = used - free_list` collapses immediately after), but keep a
+    // slow-path-entries-since-last-fire backstop against a pathological
+    // live-set-≥-threshold loop. NOTE: the re-arm metric deliberately is
+    // NOT `bytes_allocated_total` — the per-object slow path this guard
+    // exists for never bumps that counter, so a bytes-based re-arm freezes
+    // in exactly the wedge it guards (measured: 11.5M refill failures, one
+    // GC, counter parked).
+    if refill_needs_young_room && tlab_gc_trigger_enabled() {
+        use std::sync::atomic::Ordering;
+        const NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES: u64 = 65_536;
+        let entries = TLAB_SLOWPATH_ENTRIES_SINCE_GC.fetch_add(1, Ordering::Relaxed) + 1;
+        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc() {
+            TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
+            thread.tlab.retire();
+            maybe_gc_forced(shared, thread);
+        }
+    }
+
     // Slow path: the current TLAB is exhausted. Ask the adaptive sizer
     // for the next refill size, request it from the shared arena, and
     // install a fresh TLAB. The sizer looks at the just-retired TLAB's
@@ -2306,15 +2374,19 @@ fn tlab_alloc_object_inner(
         // Sustained gate failure = the wedge: per-object allocations keep
         // succeeding so nothing else will ever trigger the collection that
         // coalesces the free list. Force one (rate-limited) and re-probe.
-        if !tlab_refill_wedge_break(thread, shared)
+        if !tlab_gc_trigger_enabled()
+            || !tlab_refill_wedge_break(thread, shared)
             || (!shared.heap.young_bump_headroom(requested)
                 && !shared.heap.young_has_free_block(free_block_floor))
         {
             return None;
         }
-    } else if refill_needs_young_room {
-        TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
+    // NOTE: the wedge-breaker's consecutive-failure counter is reset ONLY on
+    // a successful refill below — NOT on a gate pass. The gate can pass on
+    // every attempt (a ≥floor block exists, or its cached bound is stale)
+    // while `refill_tlab` itself fails every time; resetting here parked the
+    // counter at 1 through an 11.5M-failure wedge (measured).
 
     // Bug-D fix (TLAB tail-filler on refill, 2026-06-12): retire the OUTGOING
     // TLAB *before* replacing it. The fast path above returned `None` because
@@ -2348,7 +2420,10 @@ fn tlab_alloc_object_inner(
         // 9.4M consecutive stage-1 failures with ZERO stage-0 gate
         // failures). Count these toward the same breaker; on a sustained
         // run force one coalescing collection and retry the refill once.
-        if refill_needs_young_room && tlab_refill_wedge_break(thread, shared) {
+        if refill_needs_young_room
+            && tlab_gc_trigger_enabled()
+            && tlab_refill_wedge_break(thread, shared)
+        {
             refill = shared.heap.refill_tlab(requested);
         }
     } else {
@@ -29067,8 +29142,17 @@ fn compile_osr_artifact(
                 invoke_info.push((pc, info_ptr));
             }
 
-            // Resolve ldc/ldc_w constants
+            // Resolve ldc/ldc_w constants. String constants are wired the
+            // same way as `jit::try_compile`'s cp_ldc_resolver (boxed text
+            // retained via `owned_jit_strings2` → `cm._jit_strings`, codegen
+            // materializes through `helpers.ldc_string`). Before this
+            // (perf/halfgap-20260717), ANY method containing `ldc "str"`
+            // silently failed its OSR-artifact compile and got permanently
+            // OSR-denied — a once-invoked method with a hot loop after a
+            // string constant (StringRegexOnly.run: `Pattern.compile("(\\d+)")`)
+            // then interpreted its entire workload.
             let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
+            let mut ldc_string_info2: Vec<(usize, *const u8, usize)> = Vec::new();
             if !scan.ldc_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
@@ -29076,7 +29160,22 @@ fn compile_osr_artifact(
                     let val = match class.constant_pool.get(cp_idx) {
                         Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
                         Some(ConstantPoolEntry::Float(v)) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
-                        _ => return None, // String/other ldc — bail out of OSR
+                        Some(ConstantPoolEntry::StringReference { string_index })
+                            if class.constant_pool.get_utf8_wide(*string_index).is_none() =>
+                        {
+                            match class.constant_pool.get_utf8(*string_index) {
+                                Some(s) => {
+                                    let boxed: Box<str> = s.to_string().into_boxed_str();
+                                    let ptr = boxed.as_ptr();
+                                    let len = boxed.len();
+                                    owned_jit_strings2.push(boxed);
+                                    ldc_string_info2.push((pc, ptr, len));
+                                    continue;
+                                }
+                                None => return None,
+                            }
+                        }
+                        _ => return None, // wide-string/Class/other ldc — bail out of OSR
                     };
                     ldc_info2.push((pc, val));
                 }
@@ -29265,9 +29364,9 @@ fn compile_osr_artifact(
                 // this codepath emits the slow-path helper for
                 // every invokevirtual/invokeinterface.
                 ldc_info2,
-                Vec::new(), // ldc_string_info — not yet wired for this
-                // OSR-recompile path (mirrors the mic_slots/pic_slots
-                // "not yet allocated here" placeholders above).
+                ldc_string_info2, // wired (perf/halfgap-20260717) — see the
+                // resolve block above; bytes owned by owned_jit_strings2 →
+                // cm._jit_strings, same retention as the invoke-info strs.
                 ldc2w_info2,
                 std::collections::HashMap::new(), // branch_hints
                 std::collections::HashMap::new(), // loop_unroll_hints

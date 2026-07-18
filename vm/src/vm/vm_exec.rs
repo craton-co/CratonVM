@@ -626,6 +626,21 @@ fn youngscan_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
 }
 
+/// Cached `CRATONVM_DBG_BLOCKGC` gate — blocked-GC/pin canaries on the
+/// native-call funnel and the pin/unpin paths. PERF (perf/halfgap-20260717):
+/// the uncached `std::env::var_os` probes of this flag ran on EVERY native
+/// call (the PIN-UNDERFLOW guard) and on pin-table operations; `getenv`
+/// linear-scans `environ`, and the probes measured ~7% of a HashMapOnly-4M
+/// run. Same read-once semantics every other debug flag in this codebase
+/// uses (see `dbg_jit_alloc_filter`'s identical history: a per-call getenv
+/// was once ~13% of binarytrees-18).
+#[inline]
+fn blockgc_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some())
+}
+
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
 thread_local! {
@@ -727,7 +742,7 @@ fn safe_native_call_impl(
             }
         }
     }
-    let _pin_floor_guard = if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+    let _pin_floor_guard = if blockgc_dbg() {
         Some(PinFloorGuard {
             floor: thread.native_pin_roots.len(),
             thread: thread as *const JvmThread,
@@ -2160,7 +2175,7 @@ impl<'a> NativeContextImpl<'a> {
         // (`fold_pointer_map_into_blocked` seeds only from snapshot
         // addresses), so the wake-time fixup misses it forever. Needs both
         // CRATONVM_DBG_BLOCKGC and the CRATONVM_DBG_STALE_OBJREF ring.
-        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        if blockgc_dbg() {
             let mut stale_n = 0usize;
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
@@ -2301,7 +2316,7 @@ impl<'a> NativeContextImpl<'a> {
                     self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
                 );
             }
-            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if blockgc_dbg() {
                 eprintln!(
                     "[blockgc] wake tid={} applying {} composed fixups ({} frames)",
                     self.thread.thread_id.0,
@@ -2388,7 +2403,7 @@ impl<'a> NativeContextImpl<'a> {
                 std::mem::take(&mut *o)
             };
             if !origins.is_empty() {
-                let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
+                let dbg = blockgc_dbg();
                 for so in &origins {
                     if so.cur == so.orig {
                         continue;
@@ -2437,7 +2452,7 @@ impl<'a> NativeContextImpl<'a> {
         // the wake-time fixup application — catches both "chain key missing"
         // (was_key=false) and "frame held an intermediate address" desyncs at
         // the exact wake where they surface.
-        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        if blockgc_dbg() {
             for (fi, fr) in self.thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
@@ -3376,7 +3391,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // GC only remaps pins through per-cycle pointer maps, which never
         // contain long-dead addresses). A hit here means the CALLER received
         // a stale value from upstream; the backtrace names it.
-        if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        if blockgc_dbg() {
             if let Some(new) = self
                 .shared
                 .heap
@@ -3434,7 +3449,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // which is stale if a GC ran since the pin. Name the reader loudly
         // under the flag; the culprit truncator is inside its call subtree.
         if handle != usize::MAX && handle >= self.thread.native_pin_roots.len() {
-            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if blockgc_dbg() {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     let ring = if unpin_ring_enabled() {
@@ -3471,7 +3486,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // sitting in the pin table means a GC between pin and read failed
         // to remap THIS entry (initiator/arrive/fold writeback gap), which
         // no other canary distinguishes from caller-side misuse.
-        if handle != usize::MAX && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        if handle != usize::MAX && blockgc_dbg() {
             if let Some(new) = self
                 .shared
                 .heap
@@ -4186,7 +4201,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // the minor-GC epoch at entry and compare at exit. A delta proves a
         // GC completed INSIDE a plain ref store (and names the stack);
         // zero deltas across a firing run pins all staleness on producers.
-        let epoch_entry = if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+        let epoch_entry = if blockgc_dbg() {
             Some(self.shared.heap.debug_minor_gc_count())
         } else {
             None

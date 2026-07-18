@@ -13856,30 +13856,43 @@ impl Compiler {
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
         // — no helper call, no per-alloc layout lookup. `class_layout` here runs
         // once at JIT-compile time, not per allocation.
-        // GROOVY-CLUSTER-20260717: class_layout(class_id_raw) is snapshotted
-        // ONCE here at JIT-compile time and its body_size/offsets get baked
-        // as immediate constants into the machine code below (bump-allocation
-        // size, array_length header write). Unlike the interpreter
-        // (vm/src/vm/vm_exec.rs) and the GC scan (gc/src/gen_heap.rs,
-        // gc/src/heap.rs), which both validate their own cached layout
-        // against layout_generation() before trusting it, this compile-time
-        // snapshot has no such check. When a class's registered compact
-        // layout is later replaced -- class_manager.rs's
-        // recompute_subclass_layouts / register_compact_layout_if_enabled,
-        // exercised whenever a synthetic-stub class gets upgraded to real
-        // bytecode with a different field count (the exact shape of ANTLR/
-        // Groovy-generated parser classes) -- any already-JIT-compiled new
-        // site keeps allocating objects at the OLD, now-wrong size while
-        // field-access code (correctly, dynamically, per-object) uses the
-        // CURRENT layout, corrupting the heap (confirmed via bisect +
-        // core-dump: SIGSEGV in JIT-generated code, RAX holding a garbage
-        // sign-extended int value used as a pointer). Disabling the fast
-        // inline-compact path here (falling back to the always-correct
-        // legacy-sized bump allocation, still avoiding the helper call) is
-        // the minimal safe fix; a full fix would thread layout_generation()
-        // through the JIT's compact-object fast paths the same way the
-        // interpreter/GC already do. See known-issues doc for detail.
-        let compact_body: Option<usize> = None;
+        // GROOVY-CLUSTER-20260717 → GUARDED RESTORE (perf/halfgap-20260717):
+        // class_layout(class_id_raw) is snapshotted ONCE at JIT-compile time
+        // and its body_size gets baked as immediate constants below
+        // (bump-allocation size, array_length header write). When a class's
+        // registered compact layout is later REPLACED (class_manager.rs's
+        // recompute_subclass_layouts — the synthetic-stub→real-bytecode
+        // upgrade, the exact shape of ANTLR/Groovy-generated parser
+        // classes), an already-compiled site would keep allocating at the
+        // OLD size while field access (correctly, per-object) uses the
+        // CURRENT layout — confirmed heap corruption; the interim fix
+        // disabled this path entirely (compact_body = None).
+        //
+        // The restore bakes the ADDRESS + compile-time VALUE of the class's
+        // layout-REPLACE counter (`types::field_layout::layout_replace_guard`
+        // — fixed-capacity table, addresses stable for process life; new
+        // class REGISTRATIONS don't bump it, only replacements do) and
+        // emits a 3-instruction guard at the top of the inline path:
+        //     mov r11, imm64(count_addr)
+        //     mov eax, [r11]
+        //     cmp eax, imm32(count_at_compile_time)  ;  jne slow_path
+        // A replaced layout therefore permanently routes this site to the
+        // always-correct `new_object` helper — for classes that never get
+        // replaced (every benchmark and the overwhelming majority of real
+        // classes), the full compact inline path is back.
+        let compact_snapshot: Option<(usize, *const u32, u32)> =
+            if cratonvm_types::compact_ref_fields_enabled() {
+                cratonvm_types::class_layout(class_id_raw)
+                    .filter(|l| l.field_count() == num_fields)
+                    .map(|l| {
+                        let (addr, expected) =
+                            cratonvm_types::layout_replace_guard(class_id_raw);
+                        (l.body_size as usize, addr, expected)
+                    })
+            } else {
+                None
+            };
+        let compact_body: Option<usize> = compact_snapshot.map(|(body, _, _)| body);
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)
@@ -13888,6 +13901,18 @@ impl Compiler {
         let end_off = self.helpers.tlab_end_offset_in_thread as i32;
         // Cast: value to i32 (encoding immediate/displacement)
         let class_id_off = self.helpers.class_id_offset_in_obj as i32;
+
+        // Step 0: layout-replace guard (see the GUARDED RESTORE note above).
+        // Runs before anything else so a stale-layout site diverts to the
+        // helper with zero state to unwind. R11/RAX are scratch here.
+        let layout_guard_patch = compact_snapshot.map(|(_, count_addr, expected)| {
+            self.emit_mov_imm64_full(R11, count_addr as i64);
+            self.emit_mov_r32_mem_disp32(RAX, R11, 0);
+            // CMP EAX, imm32 (EAX-only short form 0x3D).
+            self.buf.emit_byte(0x3D);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+            self.emit_jcc_rel32_patch(0x85) // JNE slow_path
+        });
 
         // Step 1: fetch the JvmThread*. Allocation-heavy methods cache it in
         // the prologue/OSR trampoline; otherwise use the small TLS helper.
@@ -14095,6 +14120,11 @@ impl Compiler {
         // ----- slow_path -----
         self.patch_rel32_to_here(null_thread_patch);
         self.patch_rel32_to_here(tlab_full_patch);
+        if let Some(patch) = layout_guard_patch {
+            // Layout-replace guard mismatch: the baked compact size is stale;
+            // the helper allocates per the CURRENT layout.
+            self.patch_rel32_to_here(patch);
+        }
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: ClassId fits in 32 bits
         self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding

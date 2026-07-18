@@ -26,6 +26,7 @@ pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 pub use field_layout::clear_class_layouts;
 pub use field_layout::{
     class_layout, compact_field_slot, compact_ref_fields_enabled, is_compact_object,
+    layout_replace_guard,
     layout_generation, object_body_size, register_class_layout, set_compact_ref_fields_enabled,
     CompactLayout,
 };

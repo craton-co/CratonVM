@@ -120,6 +120,47 @@ const MAX_DENSE_CLASS_LAYOUTS: usize = 1 << 20;
 /// `RwLock` per scanned object. A redefine bumps this, invalidating caches.
 static LAYOUT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Per-class layout REPLACEMENT counters (perf/halfgap-20260717).
+///
+/// `LAYOUT_GENERATION` bumps on every registration — including brand-new
+/// classes — so JIT code that baked a layout at compile time cannot use it
+/// as a staleness guard without degrading on every subsequent class load.
+/// This table counts only REPLACEMENTS (an existing `class_id`'s layout
+/// swapped for a different one — the synthetic-stub→real-bytecode upgrade
+/// that made baked compact sizes corrupt the heap, see the
+/// GROOVY-CLUSTER-20260717 note in `jit/src/x64.rs`). JIT code bakes the
+/// slot's ADDRESS and its value at compile time and emits a 2-instruction
+/// guard (load + compare); a mismatch routes to the always-correct helper.
+///
+/// Fixed-capacity so the slot addresses baked into machine code can never
+/// dangle: 4 bytes × `MAX_DENSE_CLASS_LAYOUTS` = 4 MiB, virtually allocated
+/// once and touched lazily per 1024-class page.
+static LAYOUT_REPLACE_COUNTS: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU32]>> =
+    std::sync::OnceLock::new();
+
+fn layout_replace_counts() -> &'static [std::sync::atomic::AtomicU32] {
+    LAYOUT_REPLACE_COUNTS.get_or_init(|| {
+        let mut v = Vec::with_capacity(MAX_DENSE_CLASS_LAYOUTS);
+        v.resize_with(MAX_DENSE_CLASS_LAYOUTS, || {
+            std::sync::atomic::AtomicU32::new(0)
+        });
+        v.into_boxed_slice()
+    })
+}
+
+/// Stable address of `class_id`'s replace counter (for baking into JIT
+/// code) plus its current value. The address is valid for the process
+/// lifetime — the table is fixed-capacity and never reallocates.
+pub fn layout_replace_guard(class_id: u32) -> (*const u32, u32) {
+    let counts = layout_replace_counts();
+    let idx = (class_id as usize).min(counts.len() - 1);
+    let slot = &counts[idx];
+    (
+        slot as *const std::sync::atomic::AtomicU32 as *const u32,
+        slot.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
 /// Current layout-registry generation (see [`LAYOUT_GENERATION`]).
 #[inline]
 pub fn layout_generation() -> u64 {
@@ -138,6 +179,14 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
         v.resize(idx + 1, None);
+    }
+    // REPLACEMENT (not first registration) invalidates any JIT code that
+    // baked this class's layout — bump the per-class replace counter BEFORE
+    // publishing the new layout, still under the write lock, so a baked
+    // guard that passes (sees the old count) can only have raced an
+    // already-correct old layout, never observe new-count + old-layout.
+    if v[idx].is_some() {
+        layout_replace_counts()[idx].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
     v[idx] = Some(layout);
     // Bump after the store so a reader that observes the new generation also
