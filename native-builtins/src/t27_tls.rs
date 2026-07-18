@@ -456,15 +456,16 @@ pub(crate) fn ctx_identity(
     ctx_identity_table().lock().get(&key).cloned()
 }
 
-/// Convert a PKCS#8 key DER + DER cert chain (leaf first) to the (cert_pem,
-/// key_pem) pair the rustls config builders consume. Shared by the keystore
-/// load path so it can record a per-keystore identity for the per-context flow.
+/// Convert a private-key DER (PKCS#8, PKCS#1, or SEC1) + DER cert chain (leaf
+/// first) to the (cert_pem, key_pem) pair the rustls config builders consume.
+/// Shared by the keystore load path so it can record a per-context identity
+/// without changing the key's encoding label.
 pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (String, String) {
     let mut cert_pem = String::new();
     for c in chain_der {
         cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
     }
-    let key_pem = der_to_pem("PRIVATE KEY", key_pkcs8_der);
+    let key_pem = der_to_pem(sniff_private_key_pem_header(key_pkcs8_der), key_pkcs8_der);
     (cert_pem, key_pem)
 }
 
@@ -3285,6 +3286,25 @@ mod tests {
     /// don't race with each other. Each test acquires the lock for its
     /// duration; the previous slot value is restored on drop.
     static IDENTITY_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn der_identity_to_pem_preserves_private_key_encoding() {
+        // Minimal DER envelopes are sufficient for the label sniffer: its
+        // decision only depends on the outer sequence, version, and next tag.
+        let pkcs8 = [0x30, 0x07, 0x02, 0x01, 0x00, 0x30, 0x02, 0x06, 0x00];
+        let pkcs1_rsa = [0x30, 0x08, 0x02, 0x01, 0x00, 0x02, 0x03, 0x01, 0x02, 0x03];
+        let sec1_ec = [0x30, 0x05, 0x02, 0x01, 0x00, 0x04, 0x00];
+
+        assert!(der_identity_to_pem(&pkcs8, &[])
+            .1
+            .starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(der_identity_to_pem(&pkcs1_rsa, &[])
+            .1
+            .starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(der_identity_to_pem(&sec1_ec, &[])
+            .1
+            .starts_with("-----BEGIN EC PRIVATE KEY-----"));
+    }
 
     /// RAII helper: stash a runtime TLS identity for the lifetime of a
     /// test, then restore whatever was there before. Acquires the
