@@ -305,3 +305,13 @@ After the C29 matrix finished, the explicit DoHead process sweep found no
 matching runner or VM process. Do not move this record to docs/internal until
 a newly built binary completes the 64-class matrix with zero residuals,
 followed by a relevant --nojit control.
+
+## 2026-07-18 C32 system-environment map node residual
+
+C32 closes the remaining zero-slot HashMap node producer in
+native-builtins/lang_system. System.getenv() could receive an apparent
+HashMap$Node initialization success carrying Object class ID 0; its field
+writes were silently dropped. The path now unconditionally obtains the named
+synthetic HashMap$Node layout. C32 mixed transport pressure
+(511->1023, 512->0, 513->511; two processes, eight passes) completed 24/24
+PASS with ALL_DONE and no matching DoHead process remaining.
