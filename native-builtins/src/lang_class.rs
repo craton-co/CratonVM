@@ -3006,13 +3006,13 @@ pub(crate) fn native_class_new_instance(
 /// "mapped with targetEntity=`X`, but the attribute is declared as `X`" error
 /// (same name, divergent loader identity).
 ///
-/// Uses an exact `(loader, name)` namespace probe (no Java `loadClass`, no global
-/// fallback inside the probe) so it is GC-safe to call mid-reflection-object
-/// build. Falls back to the global [`descriptor_to_class_mirror`] for
-/// primitives/arrays, gate-off, a built-in declaring loader, or a type the
-/// declaring loader did not itself define (e.g. a parent-delegated JDK type),
-/// preserving the legacy answer in every case the enhancing loader is not the
-/// type's definer.
+/// It first uses an exact `(loader, name)` namespace probe. If a recorded
+/// user-defined loader has not resolved the reference yet, it drives that
+/// loader's `loadClass` before falling back to the global
+/// [`descriptor_to_class_mirror`] path. This is required because reflection
+/// resolves a method descriptor just as bytecode does: returning the global
+/// same-named class makes `Method.getReturnType()` disagree with the method's
+/// own `new` and `ldc` instructions.
 pub(crate) fn descriptor_to_class_mirror_via_loader(
     ctx: &mut dyn NativeContext,
     desc: &str,
@@ -3027,6 +3027,40 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             if loader_id >= 3 {
                 if let Some(cid) = ctx.class_id_defined_by_loader_exact(inner, loader_id as u32) {
                     return ctx.get_class_mirror(cid);
+                }
+            }
+            // A real-JDK ClassLoader can define a class whose manager entry
+            // still reports the pre-existing application namespace. The
+            // defining-loader side table is authoritative for that case. Use
+            // it for an exact already-loaded lookup first, then initiate the
+            // descriptor through that loader if necessary.
+            if let Some(loader) =
+                crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+            {
+                if let Some(mirror) =
+                    crate::classloader::find_loaded_class_for_loader(ctx, loader, inner)
+                {
+                    return mirror;
+                }
+                // Native calls are not represented by an interpreter frame,
+                // so pin both objects across the potentially allocating /
+                // re-entrant loader call. A failure deliberately retains the
+                // historical global fallback below.
+                let loader_pin = ctx.pin_native_root(loader);
+                let name = ctx.create_string(&inner.replace('/', "."));
+                let name_pin = ctx.pin_native_root(name);
+                let loader = ctx.read_native_pin(loader_pin, loader);
+                let name = ctx.read_native_pin(name_pin, name);
+                let loaded = ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name))],
+                );
+                ctx.unpin_native_roots(name_pin);
+                ctx.unpin_native_roots(loader_pin);
+                if let Ok(Some(Value::Object(Some(mirror)))) = loaded {
+                    return mirror;
                 }
             }
         }
