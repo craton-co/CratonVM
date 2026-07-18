@@ -1613,6 +1613,30 @@ thread_local! {
     static FIELD_DESCRIPTOR_LAST:
         std::cell::Cell<Option<(usize, u32, usize, u8)>> =
         const { std::cell::Cell::new(None) };
+
+    /// PERF (perf/halfgap-20260717): the single-entry cache above thrashes
+    /// on the alternating-(class,slot) pattern of hot native fast paths
+    /// (real-JDK Matcher: String.value/coder + Matcher scalars +
+    /// StringBuilder value/count in rotation — measured 8.7% of a
+    /// StringRegexOnly run falling through to the RwLock probe). Small
+    /// round-robin working set behind it, same shape as
+    /// `gen_heap::compact_field_slot`'s cache. Entries: (vm_key, class_id,
+    /// slot, byte); vacant slots have vm_key == 0 (never a real address).
+    static FIELD_DESCRIPTOR_RING:
+        std::cell::RefCell<([(usize, u32, usize, u8); 8], usize)> =
+        const { std::cell::RefCell::new(([(0, 0, 0, 0); 8], 0)) };
+}
+
+/// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
+/// in both thread-local tiers.
+fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, byte: u8) {
+    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
+    FIELD_DESCRIPTOR_RING.with(|cell| {
+        let mut ring = cell.borrow_mut();
+        let next = ring.1;
+        ring.0[next] = (vm_key, class_id, slot_index, byte);
+        ring.1 = (next + 1) % ring.0.len();
+    });
 }
 
 fn resolve_field_descriptor_byte_cached(
@@ -1631,6 +1655,21 @@ fn resolve_field_descriptor_byte_cached(
     }) {
         return if cached == 0 { None } else { Some(cached) };
     }
+    // Second tier: the round-robin ring (see FIELD_DESCRIPTOR_RING's doc).
+    let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
+        let ring = cell.borrow();
+        ring.0
+            .iter()
+            .find(|(vm, cid, slot, _)| {
+                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
+            })
+            .map(|&(_, _, _, byte)| byte)
+    });
+    if let Some(byte) = ring_hit {
+        FIELD_DESCRIPTOR_LAST
+            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte))));
+        return if byte == 0 { None } else { Some(byte) };
+    }
     // Fast path: read lock, hash lookup, early return on hit.
     //
     // PERF (negative-result memoization): the cache value `0u8` (NUL) is a
@@ -1646,8 +1685,7 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1781,16 +1819,14 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8);
         }
         None => {}
     }

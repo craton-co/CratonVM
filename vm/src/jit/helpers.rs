@@ -5678,6 +5678,220 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site infos for the exact-HashMap thin direct-call helpers'
+/// fallback/dispatch paths (perf/halfgap-20260717).
+static HASHMAP_PUT_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/util/HashMap",
+    method_name: "put",
+    descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    num_jit_args: 3,
+    return_type: b'L',
+    invoke_kind: 0,
+};
+static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/util/HashMap",
+    method_name: "get",
+    descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+    num_jit_args: 2,
+    return_type: b'L',
+    invoke_kind: 0,
+};
+
+thread_local! {
+    /// `(vm_key, class_id)` of the EXACT `java/util/HashMap` class, learned
+    /// on the first direct-call fallback resolution — same pattern as
+    /// `MATCHER_CLASS_CACHE`/`INTEGER_WRAPPER_CLASS_CACHE`.
+    static HASHMAP_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shared receiver/key screening for the two HashMap thin helpers. Returns
+/// the validated `(thread-independent)` pieces or `None` → caller falls back
+/// to the full dispatcher. The receiver must be EXACTLY `java/util/HashMap`
+/// (a LinkedHashMap receiver at a HashMap-declared site takes the fallback,
+/// which performs real virtual dispatch), and no class redefine may be in
+/// flight (the overlay + class-id cache assume stable identity).
+///
+/// SAFETY: `receiver` must be non-null and 8-aligned below 2^48 (checked by
+/// callers before the raw header read).
+unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
+    let cid = std::ptr::read(receiver as usize as *const u32);
+    let vm_key = vm as *const SharedVm as usize;
+    if HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
+        return !crate::classloading::any_class_redefined();
+    }
+    let is_exact = vm
+        .class_manager
+        .read()
+        .get_class(ClassId::new(cid))
+        .map(|class| class.name.as_ref() == "java/util/HashMap")
+        .unwrap_or(false);
+    if is_exact {
+        HASHMAP_CLASS_CACHE.with(|c| c.set(Some((vm_key, cid))));
+        return !crate::classloading::any_class_redefined();
+    }
+    false
+}
+
+/// Thin direct-call target for JIT `invokevirtual HashMap.get(Object)` sites
+/// whose constant-pool class is exactly `java/util/HashMap` (recognition in
+/// `jit::try_compile`; registered via `set_hashmap_get_direct_fn`).
+///
+/// Fast path: the Integer-keyed overlay probe (`jit_overlay_hashmap_get`) —
+/// no Java-heap allocation, no Java dispatch, no `safe_native_call` wrapper
+/// (same contract as `jit_integer_int_value_direct`). Everything else —
+/// subclass receiver, non-Integer key, materialized map, redefine window —
+/// falls back to the full generic dispatcher, byte-for-byte the semantics
+/// the non-direct site had.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    'fast: {
+        let rraw = receiver as u64;
+        if (rraw & 0x7) != 0 || rraw >= (1u64 << 48) {
+            break 'fast;
+        }
+        if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        let key_val = if key == 0 {
+            Value::Object(None)
+        } else {
+            let kraw = key as u64;
+            if (kraw & 0x7) != 0 || kraw >= (1u64 << 48) {
+                break 'fast;
+            }
+            match vm.heap.is_object_address(key as usize) {
+                Some(object) => Value::Object(Some(object)),
+                None => break 'fast,
+            }
+        };
+        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let probe = {
+            let ctx = crate::vm::NativeContextImpl {
+                shared: vm,
+                thread: &mut *thread,
+            };
+            cratonvm_native_collections::jit_overlay_hashmap_get(&ctx, recv_obj, key_val)
+        };
+        match probe {
+            Some(Ok(Some(Value::Object(Some(object))))) => {
+                // Object-return handoff root (see `jit_integer_value_of_direct`).
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
+            // The overlay stores whatever Value was put; an object-typed map
+            // returning a non-object Value is out-of-contract — take the
+            // full dispatcher rather than guessing an encoding.
+            Some(Ok(Some(_))) => break 'fast,
+            Some(Err(error)) => {
+                return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_GET_DIRECT_INFO)
+            }
+            None => break 'fast,
+        }
+    }
+    let args = [receiver, key];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
+}
+
+/// PUT sibling of [`jit_hashmap_get_direct`] — see its doc for the contract.
+/// The overlay insert writes only the Rust-side table (GC-scanned as roots),
+/// so the wrapper-free path holds; any non-overlay case (materialization,
+/// resize, non-Integer key) falls back to full dispatch.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_hashmap_put_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    key: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    'fast: {
+        let rraw = receiver as u64;
+        if (rraw & 0x7) != 0 || rraw >= (1u64 << 48) {
+            break 'fast;
+        }
+        if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        let mut vals = [Value::Object(None); 2];
+        for (slot, raw) in [(0usize, key), (1usize, value)] {
+            if raw == 0 {
+                continue;
+            }
+            let bits = raw as u64;
+            if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+                break 'fast;
+            }
+            match vm.heap.is_object_address(raw as usize) {
+                Some(object) => vals[slot] = Value::Object(Some(object)),
+                None => break 'fast,
+            }
+        }
+        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let probe = {
+            let mut ctx = crate::vm::NativeContextImpl {
+                shared: vm,
+                thread: &mut *thread,
+            };
+            cratonvm_native_collections::jit_overlay_hashmap_put(
+                &mut ctx, recv_obj, vals[0], vals[1],
+            )
+        };
+        match probe {
+            Some(Ok(Some(Value::Object(Some(object))))) => {
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
+            Some(Ok(Some(_))) => break 'fast,
+            Some(Err(error)) => {
+                return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_PUT_DIRECT_INFO)
+            }
+            None => break 'fast,
+        }
+    }
+    let args = [receiver, key, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
 #[inline]
 fn call_integer_native_raw(
     vm: &SharedVm,
@@ -8528,6 +8742,8 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::set_integer_int_value_direct_fn(
         jit_integer_int_value_direct as *const () as usize,
     );
+    cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
+    cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
 
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,

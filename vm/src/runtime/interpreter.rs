@@ -28954,6 +28954,44 @@ fn compile_osr_artifact(
                         ));
                         continue;
                     }
+                    // Exact-HashMap `put`/`get` thin direct calls — parity
+                    // with `jit::try_compile`'s recognition (guard-free: the
+                    // helper verifies the receiver's EXACT class and routes
+                    // subclasses / non-overlay cases to the full generic
+                    // dispatcher). As with `Integer.valueOf` above, this
+                    // OSR-tier site is the load-bearing one: a once-invoked
+                    // benchmark-style method runs its whole life inside the
+                    // OSR body and never passes through `jit::try_compile`.
+                    if invoke_kind == 0 && target_class == "java/util/HashMap" {
+                        let recognized = if mn == "put"
+                            && desc == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                        {
+                            Some((
+                                crate::jit::helpers::jit_hashmap_put_direct as *const () as usize,
+                                2usize,
+                            ))
+                        } else if mn == "get" && desc == "(Ljava/lang/Object;)Ljava/lang/Object;" {
+                            Some((
+                                crate::jit::helpers::jit_hashmap_get_direct as *const () as usize,
+                                1usize,
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some((entry, num_params)) = recognized {
+                            direct_calls2.push((
+                                pc,
+                                crate::jit::JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
 
                     // For invokestatic, schedule eager callee compilation (after lock release)
                     if invoke_kind == 3 && !is_recursive_call {

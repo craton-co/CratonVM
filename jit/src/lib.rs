@@ -3127,6 +3127,28 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
 pub static INTEGER_INT_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Exact-HashMap `put`/`get` thin direct-call helpers
+/// (perf/halfgap-20260717). `java/util/HashMap` is NOT final, so these
+/// register guard-free (`guard_class_id: 0`) and the helpers themselves
+/// verify the receiver's EXACT class, falling back to the full generic
+/// dispatcher for subclasses (LinkedHashMap at a HashMap-declared site),
+/// non-Integer keys, materialized maps, and redefine windows. The fast
+/// path is the Integer-overlay probe with no `safe_native_call` wrapper —
+/// the same wrapper-free contract as `INTEGER_INT_VALUE_DIRECT_FN`.
+pub static HASHMAP_PUT_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the exact-HashMap thin direct-call helpers (called once from the
+/// VM's `build_helpers`).
+pub fn set_hashmap_put_direct_fn(addr: usize) {
+    HASHMAP_PUT_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_hashmap_get_direct_fn(addr: usize) {
+    HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register the `Integer.intValue` thin direct-call helper (called once from
 /// the VM's `build_helpers`).
 pub fn set_integer_int_value_direct_fn(addr: usize) {
@@ -6759,6 +6781,47 @@ fn try_compile_inner(
                             },
                         ));
                         continue;
+                    }
+                }
+                // Exact-HashMap `put`/`get` thin direct calls (see
+                // `HASHMAP_PUT_DIRECT_FN`): guard-free registration — the
+                // helper verifies the receiver's exact class at runtime and
+                // routes everything non-exact/non-overlay to the generic
+                // dispatcher, so a subclass receiver keeps full virtual
+                // semantics.
+                if invoke_kind == 0 && class_name == "java/util/HashMap" {
+                    let recognized = if method_name == "put"
+                        && descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                    {
+                        Some((
+                            HASHMAP_PUT_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            2usize,
+                        ))
+                    } else if method_name == "get"
+                        && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+                    {
+                        Some((
+                            HASHMAP_GET_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            1usize,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((entry, num_params)) = recognized {
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
                     }
                 }
                 // First the layout-independent instance intrinsics.

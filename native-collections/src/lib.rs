@@ -627,6 +627,36 @@ fn materialize_hm_int_fast(
     Ok(current)
 }
 
+/// JIT direct-call probe for the exact-HashMap integer-overlay GET fast path
+/// (perf/halfgap-20260717). `None` = not servable by the overlay (non-Integer
+/// key, or the map has materialized real nodes) — the caller must fall back
+/// to the full dispatch path. Never allocates on the Java heap and never
+/// dispatches Java code, so the VM-side thin helper may call it without the
+/// full `safe_native_call` wrapper (same contract as the wrapper-free
+/// `Integer.intValue` direct helper).
+pub fn jit_overlay_hashmap_get(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Value,
+) -> Option<MethodCallResult> {
+    try_hm_int_fast_get(ctx, this, key)
+}
+
+/// PUT sibling of [`jit_overlay_hashmap_get`]. The overlay insert only
+/// touches the Rust-side table (whose entries the GC scans as roots via
+/// `gc_overlay_roots_for_collection`), so the no-Java-heap-allocation /
+/// no-Java-dispatch contract holds here too; a `None` (first put on a map
+/// with existing real nodes, non-Integer key, serialization put, ...) must
+/// fall back to full dispatch, which handles materialization.
+pub fn jit_overlay_hashmap_put(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: Value,
+    value: Value,
+) -> Option<MethodCallResult> {
+    try_hm_int_fast_put(ctx, this, key, value)
+}
+
 // ---------------------------------------------------------------------------
 // Cached debug-flag probes.
 //
