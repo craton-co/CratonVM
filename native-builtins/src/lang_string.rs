@@ -4,7 +4,7 @@
 //! String, StringBuilder, and StringBuffer native method implementations.
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::intern_arc;
 use cratonvm_types::Value;
 
@@ -2090,7 +2090,9 @@ fn invoke_to_string_opt(
         }
     }
 
-    // Call obj.toString() via virtual dispatch; fall back on dispatch errors
+    // Call obj.toString() via virtual dispatch. A Java exception from the
+    // override is observable and must reach the caller; only an absent or
+    // malformed return value uses the historical identity fallback.
     let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
     match result {
         Ok(Some(Value::Object(Some(str_ref)))) => Ok(Some(
@@ -2101,7 +2103,7 @@ fn invoke_to_string_opt(
         // null;`) — this is NOT a dispatch failure, don't fall through to the
         // ClassName@hash fallback below.
         Ok(Some(Value::Object(None))) => Ok(None),
-        Ok(_) | Err(_) => {
+        Ok(_) => {
             // Honest fallback name: arrays render their JVMS array-class name
             // like HotSpot ([Ljava.lang.Class; / [I), not "Object".
             let name = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
@@ -2111,6 +2113,7 @@ fn invoke_to_string_opt(
             };
             Ok(Some(format!("{}@{:x}", name, ctx.identity_hash_code(obj))))
         }
+        Err(err) => Err(err),
     }
 }
 
@@ -4649,7 +4652,7 @@ pub(crate) fn native_string_format(
                             if let Some(a) = arr_ref {
                                 let elem = ctx.get_array_element(a, use_idx);
                                 let text =
-                                    format_arg_full(ctx, &elem, spec, &flags, width, precision);
+                                    format_arg_full(ctx, &elem, spec, &flags, width, precision)?;
                                 result.push_str(&text);
                             }
                         }
@@ -4696,7 +4699,7 @@ pub(crate) fn format_arg_full(
     flags: &str,
     width: Option<usize>,
     precision: Option<usize>,
-) -> String {
+) -> Result<String, MethodCallFailed> {
     // Uppercase string-family conversions ('S'/'B'/'C') format identically to
     // their lowercase form, then the whole result is upper-cased — per
     // java.util.Formatter's "If the conversion is 'S', 'B' or 'C' … the result is
@@ -4713,7 +4716,7 @@ pub(crate) fn format_arg_full(
     };
 
     // Get the raw formatted value first
-    let raw = format_arg(ctx, val, spec);
+    let raw = format_arg(ctx, val, spec)?;
 
     // Apply precision for %f/%e/%g — override default
     let raw = match spec {
@@ -4780,7 +4783,7 @@ pub(crate) fn format_arg_full(
     if uppercase_result {
         formatted = formatted.to_uppercase();
     }
-    formatted
+    Ok(formatted)
 }
 
 /// Insert ',' thousands separators into the integer part of a numeric string
@@ -4831,7 +4834,11 @@ fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
 }
 
 /// Format a single argument for String.format.
-pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -> String {
+pub(crate) fn format_arg(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    spec: char,
+) -> Result<String, MethodCallFailed> {
     // Helper: unbox wrapper object to primitive. Arrays are NEVER wrappers —
     // num_slots is the array LENGTH and get_field(0) on packed primitive
     // arrays reads garbage (String.format("%s", int[]) printed a bogus
@@ -4874,7 +4881,7 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
         Value::Object(Some(obj))
     }
 
-    match val {
+    let formatted = match val {
         Value::Object(None) => match spec {
             'b' => "false".to_string(),
             _ => "null".to_string(),
@@ -4883,10 +4890,10 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             // For %b: check if it's a Boolean wrapper, else non-null = true
             if spec == 'b' {
                 let inner = unbox_obj(ctx, *obj);
-                return match inner {
+                return Ok(match inner {
                     Value::Int(v) => if v != 0 { "true" } else { "false" }.to_string(),
                     _ => "true".to_string(),
-                };
+                });
             }
             // For %s: real OpenJDK does `String.valueOf(arg)` == `arg.toString()`.
             // A String formats as its characters; a boxed primitive wrapper
@@ -4906,19 +4913,20 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
                     ctx.class_id_by_name("java/lang/String") == Some(ctx.class_id_of_object(*obj));
                 if is_string {
                     if let Some(s) = ctx.read_string(*obj) {
-                        return s;
+                        return Ok(s);
                     }
                 }
-                match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                return match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(s)))) => {
-                        return ctx.read_string(s).unwrap_or_else(|| "null".to_string());
+                        Ok(ctx.read_string(s).unwrap_or_else(|| "null".to_string()))
                     }
-                    _ => return "null".to_string(),
-                }
+                    Ok(_) => Ok("null".to_string()),
+                    Err(err) => Err(err),
+                };
             }
             // %h / %H: hashcode hex (left as-is — String fast path or "null").
             if spec == 'h' || spec == 'H' {
-                return ctx.read_string(*obj).unwrap_or_else(|| "null".to_string());
+                return Ok(ctx.read_string(*obj).unwrap_or_else(|| "null".to_string()));
             }
             // BigInteger numeric conversions: its slot-0 field is `signum`, not the
             // value, so it must NOT be unboxed. Java's Formatter formats a
@@ -4935,14 +4943,18 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
                         'd' => 10,
                         _ => 16,
                     };
-                    if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                    match ctx.invoke_virtual(
                         *obj,
                         "toString",
                         "(I)Ljava/lang/String;",
                         &[Value::Int(radix)],
                     ) {
-                        let str = ctx.read_string(s).unwrap_or_default();
-                        return if spec == 'X' { str.to_uppercase() } else { str };
+                        Ok(Some(Value::Object(Some(s)))) => {
+                            let str = ctx.read_string(s).unwrap_or_default();
+                            return Ok(if spec == 'X' { str.to_uppercase() } else { str });
+                        }
+                        Ok(_) => {}
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -4968,9 +4980,9 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
                         "java/lang/Short" => v & 0xFFFF,
                         _ => v,
                     };
-                    format_arg(ctx, &Value::Int(masked), spec)
+                    return format_arg(ctx, &Value::Int(masked), spec);
                 }
-                _ => format_arg(ctx, &inner, spec),
+                _ => return format_arg(ctx, &inner, spec),
             }
         }
         Value::Int(v) => match spec {
@@ -5010,7 +5022,8 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             _ => format_double(*v),
         },
         _ => "?".to_string(),
-    }
+    };
+    Ok(formatted)
 }
 
 // ---------------------------------------------------------------------------

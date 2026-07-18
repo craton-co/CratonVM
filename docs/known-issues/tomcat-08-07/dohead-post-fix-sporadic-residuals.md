@@ -337,3 +337,24 @@ the entire DoHead family. The document remains under `docs/known-issues`.
   producer and from the C32 focused transport cases.
 - Completion cleanup found no matching DoHead VM or runner process. No
   `--nojit` control was run because the JIT full matrix remains non-zero.
+
+## 2026-07-18 C34 System.getenv fallback-layout closure
+
+**Status: OPEN.** The C34 fallback allocation repair closes C33's `1023 -> 0`
+header-map loss, but the independent partial-write/transport family remains.
+
+- The `System.getenv()` legacy fallback allocated a three-slot HashMap and
+  four-slot HashMap$Node with `ClassId(0)` after real layout resolution failed.
+  C34 now uses named synthetic layouts for both objects.
+- Exact JIT stress for the former residual:
+  `/data/data/dohead-c34-systemenvfallback-1023to0-n2x8-20260718`, two
+  processes and eight passes, completed **8/8 PASS** with `ALL_DONE`.
+- C34 full JIT matrix:
+  `/data/data/dohead-c34-systemenvfallback-full64-n2x1-20260718`, completed
+  **60 PASS, 4 FAIL**. `1023 -> 0` now passes. Current residuals are
+  `1023 -> 511`, `1024 -> 1023`, and `1 -> 1025` (each EOF with nine bytes
+  left), plus `512 -> 1` (expected HTTP 200, got -1). Two residual logs retain
+  guarded zero-slot accesses at field indices 4 or 5; their producer remains
+  to be identified before changing selector behavior.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.

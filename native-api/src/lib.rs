@@ -32,5 +32,5 @@ pub use registry::{
     dispatch_baos_event, install_baos_event_hook, AnnotationData, AnnotationElementValue,
     BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata, MethodMetadata,
     NativeCallback, NativeContext, NativeKind, NativeMethodRegistry, NativeThreadBlocker,
-    StackTraceEntry, TypeArgAnnotations,
+    StackTraceEntry, ThreadJmxSnapshot, TypeArgAnnotations,
 };

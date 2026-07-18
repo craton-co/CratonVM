@@ -57,6 +57,30 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+/// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
+///
+/// The object references are strong, GC-remapped registry roots for the short
+/// interval in which a thread owns, waits on, or contends for a lock.  Native
+/// JMX code pins them before doing any allocating work.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadJmxSnapshot {
+    pub thread_object: Option<ObjectRef>,
+    pub thread_id: i64,
+    pub thread_name: String,
+    /// JMM/JVMTI thread-status bits reserved for consumers that use the
+    /// encoded state rather than the JDK 25 `Thread.State` field.
+    pub thread_status: i32,
+    pub stack_trace: Vec<StackTraceEntry>,
+    pub lock: Option<ObjectRef>,
+    /// Logical JMM class name for `lock` when a VM shim deliberately models
+    /// the backing synchronizer without materializing its private JDK object.
+    pub lock_class_name: Option<String>,
+    pub lock_owner_id: i64,
+    pub lock_owner_name: Option<String>,
+    pub locked_monitors: Vec<ObjectRef>,
+    pub locked_synchronizers: Vec<ObjectRef>,
+}
+
 fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
     match element_type {
         ArrayElementType::Boolean
@@ -1754,6 +1778,23 @@ pub trait NativeContext {
     /// / `Thread.dumpThreads()`. The default returns empty.
     fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
         Vec::new()
+    }
+
+    /// Atomically snapshot the thread state and lock relationships needed by
+    /// `ThreadMXBean`. The default leaves lightweight/mock contexts source
+    /// compatible; production VMs must return GC-safe registry-backed refs.
+    fn thread_jmx_snapshot(&self, _thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        None
+    }
+
+    /// Record the current ownership of an `AbstractOwnableSynchronizer`.
+    /// Implementations retain/remap the synchronizer while it is owned so a
+    /// later JMX dump can report `lockedSynchronizers` without heap walking.
+    fn record_jmx_owned_synchronizer(
+        &mut self,
+        _synchronizer: ObjectRef,
+        _owner: Option<ObjectRef>,
+    ) {
     }
 
     /// Get the Java Thread object for the current thread.
