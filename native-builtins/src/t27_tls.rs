@@ -49,6 +49,10 @@ use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(unix)]
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+#[cfg(unix)]
+use openssl::{pkey::PKey, x509::X509};
 use parking_lot::Mutex;
 use rustls::client::{ClientConnection, ResolvesClientCert};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -278,6 +282,41 @@ fn selected_context_trust_roots() -> Option<TlsTrustRoots> {
     SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow().clone())
 }
 
+#[cfg(unix)]
+pub(crate) fn selected_context_trust_root_ders() -> Vec<Vec<u8>> {
+    selected_context_trust_roots()
+        .map(|roots| roots.root_ders)
+        .unwrap_or_default()
+}
+
+/// Return anchors attached to a specific SSLContext.  Unlike the selected
+/// context slot, this remains available after an SSL factory crosses into a
+/// different Java thread.
+pub(crate) fn context_trust_root_ders(
+    ctx: &mut dyn NativeContext,
+    context: ObjectRef,
+) -> Vec<Vec<u8>> {
+    let key = ctx_obj_key(ctx, context);
+    ctx_trust_roots_table()
+        .lock()
+        .get(&key)
+        .map(|roots| roots.root_ders.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+pub(crate) fn is_dsa_private_key_pem(key_pem: &str) -> bool {
+    openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).is_ok_and(|key| key.dsa().is_ok())
+}
+
+#[cfg(unix)]
+pub(crate) fn is_dsa_certificate_der(der: &[u8]) -> bool {
+    openssl::x509::X509::from_der(der)
+        .ok()
+        .and_then(|cert| cert.public_key().ok())
+        .is_some_and(|key| key.dsa().is_ok())
+}
+
 fn take_selected_context_trust_roots() -> Option<TlsTrustRoots> {
     SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow_mut().take())
 }
@@ -456,15 +495,16 @@ pub(crate) fn ctx_identity(
     ctx_identity_table().lock().get(&key).cloned()
 }
 
-/// Convert a PKCS#8 key DER + DER cert chain (leaf first) to the (cert_pem,
-/// key_pem) pair the rustls config builders consume. Shared by the keystore
-/// load path so it can record a per-keystore identity for the per-context flow.
+/// Convert a private-key DER (PKCS#8, PKCS#1, or SEC1) + DER cert chain (leaf
+/// first) to the (cert_pem, key_pem) pair the rustls config builders consume.
+/// Shared by the keystore load path so it can record a per-context identity
+/// without changing the key's encoding label.
 pub fn der_identity_to_pem(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) -> (String, String) {
     let mut cert_pem = String::new();
     for c in chain_der {
         cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
     }
-    let key_pem = der_to_pem("PRIVATE KEY", key_pkcs8_der);
+    let key_pem = der_to_pem(sniff_private_key_pem_header(key_pkcs8_der), key_pkcs8_der);
     (cert_pem, key_pem)
 }
 
@@ -930,30 +970,38 @@ fn trust_roots_pem(trust_roots: Option<&TlsTrustRoots>) -> String {
 /// hardcoded assumption) if the DER doesn't parse as expected, so this is
 /// strictly additive -- it can only recognize MORE valid keys, never fewer.
 fn sniff_private_key_pem_header(der: &[u8]) -> &'static str {
-    fn tlv_value_offset(buf: &[u8], tag_pos: usize) -> Option<usize> {
+    fn tlv_bounds(buf: &[u8], tag_pos: usize) -> Option<(usize, usize)> {
         if tag_pos + 1 >= buf.len() {
             return None;
         }
         let len_byte = buf[tag_pos + 1];
         let mut p = tag_pos + 2;
-        if len_byte & 0x80 != 0 {
+        let len = if len_byte & 0x80 != 0 {
             let n = (len_byte & 0x7f) as usize;
             if n > 4 || p + n > buf.len() {
                 return None;
             }
+            let mut len = 0usize;
+            for byte in &buf[p..p + n] {
+                len = len.checked_mul(256)?.checked_add(*byte as usize)?;
+            }
             p += n;
-        }
-        Some(p)
+            len
+        } else {
+            len_byte as usize
+        };
+        let end = p.checked_add(len)?;
+        (end <= buf.len()).then_some((p, end))
     }
     (|| -> Option<&'static str> {
         if *der.first()? != 0x30 {
             return None; // must be a top-level SEQUENCE
         }
-        let after_outer = tlv_value_offset(der, 0)?;
+        let (after_outer, _) = tlv_bounds(der, 0)?;
         if *der.get(after_outer)? != 0x02 {
             return None; // version INTEGER
         }
-        let after_version = tlv_value_offset(der, after_outer)?;
+        let (_, after_version) = tlv_bounds(der, after_outer)?;
         match der.get(after_version) {
             Some(0x30) => Some("PRIVATE KEY"),    // PKCS#8 AlgorithmIdentifier
             Some(0x04) => Some("EC PRIVATE KEY"), // SEC1 privateKey OCTET STRING
@@ -1134,8 +1182,16 @@ impl SniCertResolver {
 /// `config` before the caller sees it.
 pub(crate) struct TlsServerListenerEntry {
     pub(crate) listener: TcpListener,
-    pub(crate) config: Arc<ServerConfig>,
+    pub(crate) config: TlsServerConfig,
     pub(crate) local_port: u16,
+}
+
+#[derive(Clone)]
+pub(crate) enum TlsServerConfig {
+    Rustls(Arc<ServerConfig>),
+    Native(native_tls::TlsAcceptor),
+    #[cfg(unix)]
+    LegacyDsa(SslAcceptor),
 }
 
 pub(crate) struct ServerRegistry {
@@ -1164,11 +1220,18 @@ pub(crate) struct TlsClientStreamEntry {
 }
 
 pub(crate) struct TlsServerStreamEntry {
-    pub(crate) stream: StreamOwned<ServerConnection, TcpStream>,
+    pub(crate) stream: TlsServerStream,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
     pub(crate) negotiated_alpn: Option<String>,
+}
+
+pub(crate) enum TlsServerStream {
+    Rustls(StreamOwned<ServerConnection, TcpStream>),
+    Native(native_tls::TlsStream<TcpStream>),
+    #[cfg(unix)]
+    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
 }
 
 impl Default for ServerRegistry {
@@ -2466,45 +2529,74 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
-    let conn = ServerConnection::new(config)
-        .map_err(|e| format!("ServerConnection::new failed: {}", e))?;
-    let mut stream = StreamOwned::new(conn, tcp);
-
-    while stream.conn.is_handshaking() {
-        if stream.conn.wants_read() {
-            stream
-                .conn
-                .read_tls(&mut stream.sock)
-                .map_err(|e| format!("server handshake read: {}", e))?;
-            stream
-                .conn
-                .process_new_packets()
-                .map_err(|e| format!("server handshake process: {}", e))?;
-        }
-        if stream.conn.wants_write() {
-            stream
-                .conn
-                .write_tls(&mut stream.sock)
-                .map_err(|e| format!("server handshake write: {}", e))?;
-        }
-    }
-
-    let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
-    let negotiated_protocol = match stream.conn.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-        _ => "TLS",
-    }
-    .to_string();
-    let negotiated_cipher = stream
-        .conn
-        .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or_else(|| "UNKNOWN".to_string());
-    let negotiated_alpn = stream
-        .conn
-        .alpn_protocol()
-        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    let (stream, sni_hostname, negotiated_protocol, negotiated_cipher, negotiated_alpn) =
+        match config {
+            TlsServerConfig::Rustls(config) => {
+                let conn = ServerConnection::new(config)
+                    .map_err(|e| format!("ServerConnection::new failed: {e}"))?;
+                let mut stream = StreamOwned::new(conn, tcp);
+                while stream.conn.is_handshaking() {
+                    if stream.conn.wants_read() {
+                        stream
+                            .conn
+                            .read_tls(&mut stream.sock)
+                            .map_err(|e| format!("server handshake read: {e}"))?;
+                        stream
+                            .conn
+                            .process_new_packets()
+                            .map_err(|e| format!("server handshake process: {e}"))?;
+                    }
+                    if stream.conn.wants_write() {
+                        stream
+                            .conn
+                            .write_tls(&mut stream.sock)
+                            .map_err(|e| format!("server handshake write: {e}"))?;
+                    }
+                }
+                let sni = stream.conn.server_name().map(|s| s.to_string());
+                let protocol = match stream.conn.protocol_version() {
+                    Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+                    _ => "TLS",
+                }
+                .to_string();
+                let cipher = stream
+                    .conn
+                    .negotiated_cipher_suite()
+                    .map(|cs| format!("{:?}", cs.suite()))
+                    .unwrap_or_else(|| "UNKNOWN".to_string());
+                let alpn = stream
+                    .conn
+                    .alpn_protocol()
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok());
+                (TlsServerStream::Rustls(stream), sni, protocol, cipher, alpn)
+            }
+            TlsServerConfig::Native(acceptor) => {
+                let stream = acceptor
+                    .accept(tcp)
+                    .map_err(|e| format!("legacy TLS server handshake: {e}"))?;
+                (
+                    TlsServerStream::Native(stream),
+                    None,
+                    "TLSv1.2".to_string(),
+                    "UNKNOWN".to_string(),
+                    None,
+                )
+            }
+            #[cfg(unix)]
+            TlsServerConfig::LegacyDsa(acceptor) => {
+                let stream = acceptor
+                    .accept(tcp)
+                    .map_err(|e| format!("legacy DSA TLS server handshake: {e}"))?;
+                (
+                    TlsServerStream::LegacyDsa(stream),
+                    None,
+                    "TLSv1.2".to_string(),
+                    "UNKNOWN".to_string(),
+                    None,
+                )
+            }
+        };
 
     let entry = TlsServerStreamEntry {
         stream,
@@ -2526,7 +2618,12 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         return e.stream.read(buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        return match &mut e.stream {
+            TlsServerStream::Rustls(s) => s.read(buf),
+            TlsServerStream::Native(s) => s.read(buf),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.read(buf),
+        };
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2541,7 +2638,12 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
         return e.stream.write(data);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return e.stream.write(data);
+        return match &mut e.stream {
+            TlsServerStream::Rustls(s) => s.write(data),
+            TlsServerStream::Native(s) => s.write(data),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.write(data),
+        };
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2557,8 +2659,19 @@ pub(crate) fn rustls_stream_close(id: i32) {
         let _ = e.stream.flush();
     }
     if let Some(mut e) = reg.server_streams.remove(&id) {
-        e.stream.conn.send_close_notify();
-        let _ = e.stream.flush();
+        match &mut e.stream {
+            TlsServerStream::Rustls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+            }
+            TlsServerStream::Native(s) => {
+                let _ = s.shutdown();
+            }
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => {
+                let _ = s.shutdown();
+            }
+        }
     }
 }
 
@@ -2605,6 +2718,31 @@ const SSS_LISTENER_ID: usize = 0;
 const SSS_LOCAL_PORT: usize = 1;
 const SSS_CLOSED: usize = 2;
 const SSS_FIELDS: usize = 4;
+
+/// `SSLServerSocket` is a real JDK class, so its loaded instance layout is
+/// not the compact synthetic layout expected by the TLS listener bridge.
+/// Keep the authoritative lifecycle data outside the object: raw field writes
+/// can be dropped or collide with reference-typed JDK fields, which otherwise
+/// makes a newly-bound listener appear closed before its first accept.
+#[derive(Clone, Copy)]
+struct SslServerSocketState {
+    listener_id: i32,
+    local_port: i32,
+    closed: i32,
+}
+
+fn ssl_server_socket_states() -> &'static Mutex<HashMap<u64, SslServerSocketState>> {
+    static STATES: OnceLock<Mutex<HashMap<u64, SslServerSocketState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ssl_server_socket_state(socket: ObjectRef) -> Option<SslServerSocketState> {
+    ssl_server_socket_states().lock().get(&objref_key(socket)).copied()
+}
+
+fn set_ssl_server_socket_state(socket: ObjectRef, state: SslServerSocketState) {
+    ssl_server_socket_states().lock().insert(objref_key(socket), state);
+}
 
 // Server-side SSLSocket returned from accept(): reuses the existing
 // SSLSocket 6-field layout but field 2 (tls_id) references the rustls
@@ -2667,6 +2805,156 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Build a real TLS listener and its Java `SSLServerSocket` wrapper.  Keep
+/// every `SSLServerSocketFactory.createServerSocket` overload on this one
+/// path so callers cannot accidentally fall through to `ServerSocketFactory`'s
+/// plaintext implementation.
+#[cfg(unix)]
+fn legacy_dsa_acceptor(cert_pem: &str, key_pem: &str) -> Result<SslAcceptor, String> {
+    let key = PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| e.to_string())?;
+    if !key.dsa().is_ok() {
+        return Err("key is not DSA".to_string());
+    }
+    let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| e.to_string())?;
+    let mut builder =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).map_err(|e| e.to_string())?;
+    builder.set_security_level(0);
+    builder
+        .set_cipher_list("ALL:@SECLEVEL=0")
+        .map_err(|e| e.to_string())?;
+    builder.set_private_key(&key).map_err(|e| e.to_string())?;
+    builder.set_certificate(&cert).map_err(|e| e.to_string())?;
+    builder.check_private_key().map_err(|e| e.to_string())?;
+    Ok(builder.build())
+}
+
+fn create_ssl_server_socket(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    port: i32,
+    bind_address: &str,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+    if !(0..=65535).contains(&port) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("port out of range: {port}"),
+        }
+        .into());
+    }
+    // SSLContext.getServerSocketFactory() retains its context in field zero.
+    // Prefer that per-context identity: Spring SSL bundles commonly build
+    // multiple contexts in one process, so the process-wide keystore slot may
+    // have been replaced by an unrelated client context by the time LDAPS
+    // starts its listener. getDefault() returns an unbound factory and keeps
+    // the established runtime-identity fallback for that case.
+    let identity = args
+        .first()
+        .and_then(|value| match value {
+            Value::Object(Some(factory)) if ctx.object_num_fields(*factory) > 0 => {
+                match ctx.get_field(*factory, 0) {
+                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .map(|(cert_pem, key_pem)| RuntimeTlsIdentity {
+            cert_pem,
+            key_pem,
+            client_ca_pem: None,
+        })
+        .unwrap_or(require_runtime_tls_identity()?);
+    let config = build_server_config_single_cert(
+        &identity.cert_pem,
+        &identity.key_pem,
+        &["h2", "http/1.1"],
+        false,
+        None,
+    )
+    .map(TlsServerConfig::Rustls)
+    .or_else(|rustls_error| {
+        #[cfg(unix)]
+        {
+            legacy_dsa_acceptor(&identity.cert_pem, &identity.key_pem)
+                .map(TlsServerConfig::LegacyDsa)
+                .map_err(|legacy_error| {
+                    format!("{rustls_error}; legacy DSA TLS fallback: {legacy_error}")
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            native_tls::Identity::from_pkcs8(
+                identity.cert_pem.as_bytes(),
+                identity.key_pem.as_bytes(),
+            )
+            .and_then(native_tls::TlsAcceptor::new)
+            .map(TlsServerConfig::Native)
+            .map_err(|native_error| {
+                format!("{rustls_error}; platform TLS fallback: {native_error}")
+            })
+        }
+    })
+    .map_err(|message| RuntimeError::IOException { message })?;
+
+    let listener = TcpListener::bind((bind_address, port as u16)).map_err(|error| {
+        RuntimeError::IOException {
+            message: format!("bind {bind_address}:{port}: {error}"),
+        }
+    })?;
+    let local_port = listener
+        .local_addr()
+        .map(|address| address.port())
+        .unwrap_or(port as u16);
+
+    let entry = TlsServerListenerEntry {
+        listener,
+        config,
+        local_port,
+    };
+    let id = {
+        let mut reg = sreg().lock();
+        let id = alloc_server_id(&mut reg);
+        reg.listeners.insert(id, entry);
+        id
+    };
+
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
+    set_ssl_server_socket_state(
+        obj,
+        SslServerSocketState {
+            listener_id: id,
+            local_port: local_port as i32,
+            closed: 0,
+        },
+    );
+    ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
+    ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
+    ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
+    ctx.set_field(obj, 3, Value::Object(None));
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn ssl_server_bind_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    index: usize,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    let address = obj_arg(args, index)?;
+    let pin_base = ctx.pin_native_root(address);
+    let resolved = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin_base);
+    let host = match resolved? {
+        Some(Value::Object(Some(value))) => ctx.read_string(value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "InetAddress has no host address".into(),
+        }
+        .into());
+    }
+    Ok(host)
+}
+
 fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2692,50 +2980,30 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            if !(0..=65535).contains(&port) {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("port out of range: {}", port),
-                }
-                .into());
-            }
-            let identity = require_runtime_tls_identity()?;
-            let config = build_server_config_single_cert(
-                &identity.cert_pem,
-                &identity.key_pem,
-                &["h2", "http/1.1"],
-                false,
-                None,
-            )
-            .map_err(|e| RuntimeError::IOException { message: e })?;
-
-            let listener = TcpListener::bind(("0.0.0.0", port as u16)).map_err(|e| {
-                RuntimeError::IOException {
-                    message: format!("bind 0.0.0.0:{}: {}", port, e),
-                }
-            })?;
-            let local_port = match listener.local_addr() {
-                Ok(a) => a.port(),
-                Err(_) => port as u16,
-            };
-
-            let entry = TlsServerListenerEntry {
-                listener,
-                config,
-                local_port,
-            };
-            let id = {
-                let mut reg = sreg().lock();
-                let id = alloc_server_id(&mut reg);
-                reg.listeners.insert(id, entry);
-                id
-            };
-
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
-            ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
-            ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
-            ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
-            ctx.set_field(obj, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
+            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
+        },
+    );
+    // UnboundID's LDAP listener calls these overloads (with backlog 128).
+    // Without explicit bridges here, dispatch reaches `ServerSocketFactory`'s
+    // plaintext implementation and an LDAPS client gets "wrong version
+    // number" after the SocketFactory client-side fix succeeds.
+    r.register(
+        sssf,
+        "createServerSocket",
+        "(II)Ljava/net/ServerSocket;",
+        |ctx, args| {
+            let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
+            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
+        },
+    );
+    r.register(
+        sssf,
+        "createServerSocket",
+        "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
+        |ctx, args| {
+            let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
+            let bind_address = ssl_server_bind_address(ctx, args, 3)?;
+            create_ssl_server_socket(ctx, args, port, &bind_address)
         },
     );
     r.register(
@@ -2770,25 +3038,48 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     let sss = "javax/net/ssl/SSLServerSocket";
     r.register(sss, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SSS_LOCAL_PORT)))
+        Ok(Some(Value::Int(
+            ssl_server_socket_state(this)
+                .map(|state| state.local_port)
+                .unwrap_or_else(|| ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0)),
+        )))
     });
     r.register(sss, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SSS_CLOSED)))
+        Ok(Some(Value::Int(
+            ssl_server_socket_state(this)
+                .map(|state| state.closed)
+                .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1)),
+        )))
     });
     r.register(sss, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1);
+        let state = ssl_server_socket_state(this).unwrap_or(SslServerSocketState {
+            listener_id: ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1),
+            local_port: ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0),
+            closed: 1,
+        });
+        let id = state.listener_id;
         if id >= 0 {
             rustls_listener_close(id);
             ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
+        set_ssl_server_socket_state(
+            this,
+            SslServerSocketState {
+                listener_id: -1,
+                local_port: state.local_port,
+                closed: 1,
+            },
+        );
         ctx.set_field(this, SSS_CLOSED, Value::Int(1));
         Ok(None)
     });
     r.register(sss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1);
+        let id = ssl_server_socket_state(this)
+            .map(|state| state.listener_id)
+            .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
         if id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLServerSocket is closed".into(),
@@ -3305,6 +3596,25 @@ mod tests {
     /// don't race with each other. Each test acquires the lock for its
     /// duration; the previous slot value is restored on drop.
     static IDENTITY_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    #[test]
+    fn der_identity_to_pem_preserves_private_key_encoding() {
+        // Minimal DER envelopes are sufficient for the label sniffer: its
+        // decision only depends on the outer sequence, version, and next tag.
+        let pkcs8 = [0x30, 0x07, 0x02, 0x01, 0x00, 0x30, 0x02, 0x06, 0x00];
+        let pkcs1_rsa = [0x30, 0x08, 0x02, 0x01, 0x00, 0x02, 0x03, 0x01, 0x02, 0x03];
+        let sec1_ec = [0x30, 0x05, 0x02, 0x01, 0x00, 0x04, 0x00];
+
+        assert!(der_identity_to_pem(&pkcs8, &[])
+            .1
+            .starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(der_identity_to_pem(&pkcs1_rsa, &[])
+            .1
+            .starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(der_identity_to_pem(&sec1_ec, &[])
+            .1
+            .starts_with("-----BEGIN EC PRIVATE KEY-----"));
+    }
 
     /// RAII helper: stash a runtime TLS identity for the lifetime of a
     /// test, then restore whatever was there before. Acquires the

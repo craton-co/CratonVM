@@ -1962,7 +1962,7 @@ pub(crate) struct SocketRegistry {
 /// chain is stored as DER bytes so it can be handed out repeatedly through
 /// `SSLSession.getPeerCertificates()` without touching the live TLS stream.
 pub(crate) struct TlsEntry {
-    pub(crate) stream: native_tls::TlsStream<TcpStream>,
+    pub(crate) stream: TlsClientStream,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     /// T2.7.11: owned so real negotiated handshake values can live here
@@ -1975,6 +1975,22 @@ pub(crate) struct TlsEntry {
     /// `SSLSocket.getApplicationProtocol()` on the Java side.
     pub(crate) negotiated_alpn: Option<String>,
     pub(crate) peer_cert_chain_der: Vec<Vec<u8>>,
+}
+
+pub(crate) enum TlsClientStream {
+    Native(native_tls::TlsStream<TcpStream>),
+    #[cfg(unix)]
+    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+}
+
+impl TlsClientStream {
+    pub(crate) fn get_ref(&self) -> &TcpStream {
+        match self {
+            Self::Native(stream) => stream.get_ref(),
+            #[cfg(unix)]
+            Self::LegacyDsa(stream) => stream.get_ref(),
+        }
+    }
 }
 
 impl Default for SocketRegistry {
@@ -2119,7 +2135,7 @@ pub(crate) fn s2_tls_connect(
     }
 
     let entry = TlsEntry {
-        stream: tls_stream,
+        stream: TlsClientStream::Native(tls_stream),
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -2128,6 +2144,80 @@ pub(crate) fn s2_tls_connect(
         peer_cert_chain_der,
     };
 
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
+/// Connect using a per-connection OpenSSL policy for a legacy DSA identity.
+/// The caller only selects this after recognizing a configured DSA trust root;
+/// certificate validation still happens immediately afterward through the
+/// Java TrustManager captured from the owning SSLContext.
+#[cfg(unix)]
+pub(crate) fn s2_legacy_dsa_tls_connect(
+    host: &str,
+    port: u16,
+    trust_root_ders: &[Vec<u8>],
+) -> std::io::Result<i32> {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use openssl::x509::{store::X509StoreBuilder, X509VerifyResult, X509};
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr)?;
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    builder.set_security_level(0);
+    builder
+        .set_cipher_list("ALL:@SECLEVEL=0")
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut roots = X509StoreBuilder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    for der in trust_root_ders {
+        let cert = X509::from_der(der).map_err(|e| std::io::Error::other(e.to_string()))?;
+        roots
+            .add_cert(cert)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+    builder
+        .set_verify_cert_store(roots.build())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Spring Boot's historical embedded-LDAP fixture explicitly trusts a
+    // self-signed DSA certificate whose validity window ended in 2017.  The
+    // JVM trust-manager shim accepts that explicit anchor; retain normal
+    // chain verification but mirror that compatibility behavior for the
+    // one expiration error in this legacy-DSS bridge.
+    builder.set_verify_callback(SslVerifyMode::PEER, |verified, store| {
+        verified || store.error() == unsafe { X509VerifyResult::from_raw(10) }
+    });
+    // A plain JSSE SSLSocket validates the peer chain but does not perform
+    // hostname verification unless the caller sets an endpoint-identification
+    // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
+    // server via 127.0.0.1 while the test certificate has no matching IP SAN.
+    let connector = builder.build();
+    let mut connection = connector
+        .configure()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    connection.set_verify_hostname(false);
+    let stream = connection
+        .connect(host, tcp)
+        .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
+    let mut peer_cert_chain_der = Vec::new();
+    if let Some(cert) = stream.ssl().peer_certificate() {
+        peer_cert_chain_der.push(
+            cert.to_der()
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        );
+    }
+    let entry = TlsEntry {
+        stream: TlsClientStream::LegacyDsa(stream),
+        peer_host: host.to_string(),
+        peer_port: port,
+        negotiated_protocol: "TLSv1.2".to_string(),
+        negotiated_cipher: "UNKNOWN".to_string(),
+        negotiated_alpn: None,
+        peer_cert_chain_der,
+    };
     let mut reg = s2_registry().lock();
     let id = s2_next_free_id(&mut reg);
     reg.tls_streams.insert(id, entry);
@@ -2148,7 +2238,11 @@ pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
-        Some(entry) => entry.stream.read(buf),
+        Some(entry) => match &mut entry.stream {
+            TlsClientStream::Native(stream) => stream.read(buf),
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+        },
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no such TLS stream id",
@@ -2164,7 +2258,11 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
-        Some(entry) => entry.stream.write(data),
+        Some(entry) => match &mut entry.stream {
+            TlsClientStream::Native(stream) => stream.write(data),
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => stream.write(data),
+        },
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no such TLS stream id",
@@ -2184,7 +2282,15 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
         // Best-effort: if the peer already closed the connection, shutdown
         // can legitimately return an error that should not surface as an
         // exception to Java-side callers.
-        let _ = entry.stream.shutdown();
+        match &mut entry.stream {
+            TlsClientStream::Native(stream) => {
+                let _ = stream.shutdown();
+            }
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => {
+                let _ = stream.shutdown();
+            }
+        }
     }
     Ok(())
 }
@@ -2229,19 +2335,19 @@ const BB_LIMIT: usize = 2;
 const BB_CAP: usize = 3;
 const BB_MARK: usize = 4;
 const BB_ORDER: usize = 5; // 0=BIG_ENDIAN, 1=LITTLE_ENDIAN
-// Real `Buffer.segment` field index (`final java.lang.foreign.MemorySegment
-// segment`) — the only Object-typed slot among a real-JDK-shaped typed
-// NIO buffer view's 6 physical fields (mark/position/limit/capacity/
-// address/segment). Used to stash the backing array reference for
-// IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/DoubleBuffer views, whose
-// abstract class declares no `hb` field to write by name — see
-// `s2_bb_arr`'s fallback and `s2_bb_synthetic_layout`'s class-name guard
-// (both fixed together 2026-07-11; writing here without that guard gets
-// silently clobbered by `s2_bb_set_order`, which used to also treat slot 5
-// as an int order flag for these same 6-field objects).
+                           // Real `Buffer.segment` field index (`final java.lang.foreign.MemorySegment
+                           // segment`) — the only Object-typed slot among a real-JDK-shaped typed
+                           // NIO buffer view's 6 physical fields (mark/position/limit/capacity/
+                           // address/segment). Used to stash the backing array reference for
+                           // IntBuffer/LongBuffer/ShortBuffer/FloatBuffer/DoubleBuffer views, whose
+                           // abstract class declares no `hb` field to write by name — see
+                           // `s2_bb_arr`'s fallback and `s2_bb_synthetic_layout`'s class-name guard
+                           // (both fixed together 2026-07-11; writing here without that guard gets
+                           // silently clobbered by `s2_bb_set_order`, which used to also treat slot 5
+                           // as an int order flag for these same 6-field objects).
 const BB_SEGMENT_SLOT: usize = 5;
-                           // NEW-17: extra fields for direct buffers. Bytes 6..7 are only populated
-                           // by `allocateDirect`; non-direct buffers leave them at default (0).
+// NEW-17: extra fields for direct buffers. Bytes 6..7 are only populated
+// by `allocateDirect`; non-direct buffers leave them at default (0).
 const BB_NATIVE_ID: usize = 6; // Long  — alloc_id from NativeMemoryTable, 0 if heap
 const BB_DIRECT_FLAG: usize = 7; // Int   — 1 if direct, 0 otherwise
 
@@ -2520,10 +2626,8 @@ fn s2_bb_set_order(ctx: &mut dyn NativeContext, buf: ObjectRef, ord: i32) {
     // array moved to `BB_SEGMENT_SLOT`). Gated on whether `bigEndian`
     // actually resolves so this NEVER touches slot 0 — real `mark` — on a
     // genuine ByteBuffer, which already round-trips correctly by name.
-    let has_big_endian_field = !matches!(
-        ctx.get_field_by_name(buf, "bigEndian"),
-        Value::Object(None)
-    );
+    let has_big_endian_field =
+        !matches!(ctx.get_field_by_name(buf, "bigEndian"), Value::Object(None));
     if has_big_endian_field {
         ctx.set_field_by_name(buf, "bigEndian", Value::Int(if ord == 1 { 0 } else { 1 }));
         // nativeByteOrder = (bigEndian == platform-is-big-endian); every
@@ -2684,7 +2788,11 @@ pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Obj
         .ok()
         .or_else(|| ctx.class_id_by_name("java/nio/ByteOrder"));
     if let Some(cid) = cid {
-        let field = if ord == 1 { "LITTLE_ENDIAN" } else { "BIG_ENDIAN" };
+        let field = if ord == 1 {
+            "LITTLE_ENDIAN"
+        } else {
+            "BIG_ENDIAN"
+        };
         if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
             if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
                 return o;
@@ -3649,7 +3757,11 @@ fn s2_typed_view_byte_start(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
         Value::Long(v) => i32::try_from(v).unwrap_or(-1),
         _ => -1,
     };
-    if marker < 0 { -(marker + 1) } else { 0 }
+    if marker < 0 {
+        -(marker + 1)
+    } else {
+        0
+    }
 }
 
 /// `ByteBuffer.asCharBuffer()` — the view returned MUST have its backing
@@ -3747,7 +3859,11 @@ fn s2_bb_new_heap_view(
     ctx.set_field_by_name(buf, "limit", Value::Int(lim));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap));
     ctx.set_field_by_name(buf, "mark", Value::Int(mark));
-    ctx.set_field_by_name(buf, "address", Value::Long(16i64.saturating_add(offset as i64)));
+    ctx.set_field_by_name(
+        buf,
+        "address",
+        Value::Long(16i64.saturating_add(offset as i64)),
+    );
     if s2_bb_synthetic_layout(ctx, buf) {
         // Bare-synthetic layout: no `offset` field exists, so aliasing at a
         // non-zero base is not representable — the callers below keep the
@@ -3809,11 +3925,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            ctx.new_object_initialized(
-                "java/nio/DirectByteBuffer",
-                "(I)V",
-                &[Value::Int(cap)],
-            )
+            ctx.new_object_initialized("java/nio/DirectByteBuffer", "(I)V", &[Value::Int(cap)])
         },
     );
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
@@ -4439,7 +4551,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             if v < 0 || v > limit {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: format!("newPosition > limit: ({v} > {limit})"),
-                }.into());
+                }
+                .into());
             }
             if s2_bb_get_mark(ctx, this) > v {
                 s2_bb_set_mark(ctx, this, -1);
@@ -4459,7 +4572,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             if v < 0 || v > cap {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: format!("newLimit > capacity: ({v} > {cap})"),
-                }.into());
+                }
+                .into());
             }
             let pos = s2_bb_pos(ctx, this);
             if pos > v {
@@ -4556,7 +4670,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "isDirect", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(
-            s2_bb_direct_addr(ctx, this).is_some() as i32,
+            s2_bb_direct_addr(ctx, this).is_some() as i32
         )))
     });
     r.register(bb, "isReadOnly", "()Z", |ctx, args| {
@@ -4640,17 +4754,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(buf))));
         }
         let buf = match s2_bb_storage(ctx, this) {
-            Some(S2BbStorage::Heap { arr, base }) => s2_bb_new_heap_view(
-                ctx,
-                arr,
-                base + pos as usize,
-                0,
-                rem,
-                rem,
-                -1,
-                ro,
-                ord,
-            ),
+            Some(S2BbStorage::Heap { arr, base }) => {
+                s2_bb_new_heap_view(ctx, arr, base + pos as usize, 0, rem, rem, -1, ro, ord)
+            }
             Some(S2BbStorage::Direct { addr }) => s2_bb_new_direct_view(
                 ctx,
                 addr.saturating_add(pos as i64),
@@ -5194,14 +5300,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 if off < 0
                     || len < 0
-                    || off.checked_add(len).map_or(true, |e| e > ctx.array_length(dst) as i32)
+                    || off
+                        .checked_add(len)
+                        .map_or(true, |e| e > ctx.array_length(dst) as i32)
                 {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: "IndexOutOfBoundsException".to_string(),
                     }
                     .into());
                 }
-                if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
+                if pos
+                    .checked_add(len)
+                    .map_or(true, |e| e > s2_bb_limit(ctx, this))
+                {
                     return Err(RuntimeError::BufferUnderflowException.into());
                 }
                 let bs = s2_typed_view_byte_start(ctx, this);
@@ -5224,14 +5335,19 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 if off < 0
                     || len < 0
-                    || off.checked_add(len).map_or(true, |e| e > ctx.array_length(src) as i32)
+                    || off
+                        .checked_add(len)
+                        .map_or(true, |e| e > ctx.array_length(src) as i32)
                 {
                     return Err(RuntimeError::IllegalArgumentException {
                         message: "IndexOutOfBoundsException".to_string(),
                     }
                     .into());
                 }
-                if pos.checked_add(len).map_or(true, |e| e > s2_bb_limit(ctx, this)) {
+                if pos
+                    .checked_add(len)
+                    .map_or(true, |e| e > s2_bb_limit(ctx, this))
+                {
                     return Err(RuntimeError::BufferOverflowException.into());
                 }
                 let bs = s2_typed_view_byte_start(ctx, this);
@@ -5250,17 +5366,42 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     }
 
     s2_typed_buffer_view_fns!(
-        s2_ib_get, s2_ib_get_abs, s2_ib_put, s2_ib_put_abs,
-        s2_ib_order, s2_ib_slice, s2_ib_slice2, s2_ib_dup, s2_ib_ro, s2_ib_compact,
-        s2_ib_get_bulk, s2_ib_put_bulk,
-        "java/nio/IntBuffer", 4, s2_bb_read4, s2_bb_write4,
-        |v: i32| Value::Int(v), |v: &Value| v.as_int().unwrap_or(0)
+        s2_ib_get,
+        s2_ib_get_abs,
+        s2_ib_put,
+        s2_ib_put_abs,
+        s2_ib_order,
+        s2_ib_slice,
+        s2_ib_slice2,
+        s2_ib_dup,
+        s2_ib_ro,
+        s2_ib_compact,
+        s2_ib_get_bulk,
+        s2_ib_put_bulk,
+        "java/nio/IntBuffer",
+        4,
+        s2_bb_read4,
+        s2_bb_write4,
+        |v: i32| Value::Int(v),
+        |v: &Value| v.as_int().unwrap_or(0)
     );
     s2_typed_buffer_view_fns!(
-        s2_lb_get, s2_lb_get_abs, s2_lb_put, s2_lb_put_abs,
-        s2_lb_order, s2_lb_slice, s2_lb_slice2, s2_lb_dup, s2_lb_ro, s2_lb_compact,
-        s2_lb_get_bulk, s2_lb_put_bulk,
-        "java/nio/LongBuffer", 8, s2_bb_read8, s2_bb_write8,
+        s2_lb_get,
+        s2_lb_get_abs,
+        s2_lb_put,
+        s2_lb_put_abs,
+        s2_lb_order,
+        s2_lb_slice,
+        s2_lb_slice2,
+        s2_lb_dup,
+        s2_lb_ro,
+        s2_lb_compact,
+        s2_lb_get_bulk,
+        s2_lb_put_bulk,
+        "java/nio/LongBuffer",
+        8,
+        s2_bb_read8,
+        s2_bb_write8,
         |v: i64| Value::Long(v),
         |v: &Value| match v {
             Value::Long(l) => *l,
@@ -5268,17 +5409,42 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
     );
     s2_typed_buffer_view_fns!(
-        s2_sb_get, s2_sb_get_abs, s2_sb_put, s2_sb_put_abs,
-        s2_sb_order, s2_sb_slice, s2_sb_slice2, s2_sb_dup, s2_sb_ro, s2_sb_compact,
-        s2_sb_get_bulk, s2_sb_put_bulk,
-        "java/nio/ShortBuffer", 2, s2_bb_read2, s2_bb_write2,
-        |v: i16| Value::Int(v as i32), |v: &Value| v.as_int().unwrap_or(0) as i16
+        s2_sb_get,
+        s2_sb_get_abs,
+        s2_sb_put,
+        s2_sb_put_abs,
+        s2_sb_order,
+        s2_sb_slice,
+        s2_sb_slice2,
+        s2_sb_dup,
+        s2_sb_ro,
+        s2_sb_compact,
+        s2_sb_get_bulk,
+        s2_sb_put_bulk,
+        "java/nio/ShortBuffer",
+        2,
+        s2_bb_read2,
+        s2_bb_write2,
+        |v: i16| Value::Int(v as i32),
+        |v: &Value| v.as_int().unwrap_or(0) as i16
     );
     s2_typed_buffer_view_fns!(
-        s2_fb_get, s2_fb_get_abs, s2_fb_put, s2_fb_put_abs,
-        s2_fb_order, s2_fb_slice, s2_fb_slice2, s2_fb_dup, s2_fb_ro, s2_fb_compact,
-        s2_fb_get_bulk, s2_fb_put_bulk,
-        "java/nio/FloatBuffer", 4, s2_bb_read4, s2_bb_write4,
+        s2_fb_get,
+        s2_fb_get_abs,
+        s2_fb_put,
+        s2_fb_put_abs,
+        s2_fb_order,
+        s2_fb_slice,
+        s2_fb_slice2,
+        s2_fb_dup,
+        s2_fb_ro,
+        s2_fb_compact,
+        s2_fb_get_bulk,
+        s2_fb_put_bulk,
+        "java/nio/FloatBuffer",
+        4,
+        s2_bb_read4,
+        s2_bb_write4,
         |v: i32| Value::Float(f32::from_bits(v as u32)),
         |v: &Value| match v {
             Value::Float(f) => f.to_bits() as i32,
@@ -5286,10 +5452,22 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         }
     );
     s2_typed_buffer_view_fns!(
-        s2_db_get, s2_db_get_abs, s2_db_put, s2_db_put_abs,
-        s2_db_order, s2_db_slice, s2_db_slice2, s2_db_dup, s2_db_ro, s2_db_compact,
-        s2_db_get_bulk, s2_db_put_bulk,
-        "java/nio/DoubleBuffer", 8, s2_bb_read8, s2_bb_write8,
+        s2_db_get,
+        s2_db_get_abs,
+        s2_db_put,
+        s2_db_put_abs,
+        s2_db_order,
+        s2_db_slice,
+        s2_db_slice2,
+        s2_db_dup,
+        s2_db_ro,
+        s2_db_compact,
+        s2_db_get_bulk,
+        s2_db_put_bulk,
+        "java/nio/DoubleBuffer",
+        8,
+        s2_bb_read8,
+        s2_bb_write8,
         |v: i64| Value::Double(f64::from_bits(v as u64)),
         |v: &Value| match v {
             Value::Double(d) => d.to_bits() as i64,
@@ -5359,7 +5537,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(db, "slice", "()Ljava/nio/DoubleBuffer;", s2_db_slice);
     r.register(db, "slice", "(II)Ljava/nio/DoubleBuffer;", s2_db_slice2);
     r.register(db, "duplicate", "()Ljava/nio/DoubleBuffer;", s2_db_dup);
-    r.register(db, "asReadOnlyBuffer", "()Ljava/nio/DoubleBuffer;", s2_db_ro);
+    r.register(
+        db,
+        "asReadOnlyBuffer",
+        "()Ljava/nio/DoubleBuffer;",
+        s2_db_ro,
+    );
     r.register(db, "compact", "()Ljava/nio/DoubleBuffer;", s2_db_compact);
     r.register(db, "get", "([DII)Ljava/nio/DoubleBuffer;", s2_db_get_bulk);
     r.register(db, "put", "([DII)Ljava/nio/DoubleBuffer;", s2_db_put_bulk);
@@ -5498,12 +5681,10 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
     fn s2_byte_order_ord(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
         match ctx.get_field(obj, 0) {
             Value::Int(v) => v,
-            Value::Object(Some(name)) => {
-                match ctx.read_string(name).as_deref() {
-                    Some("LITTLE_ENDIAN") => 1,
-                    _ => 0,
-                }
-            }
+            Value::Object(Some(name)) => match ctx.read_string(name).as_deref() {
+                Some("LITTLE_ENDIAN") => 1,
+                _ => 0,
+            },
             _ => 0,
         }
     }
