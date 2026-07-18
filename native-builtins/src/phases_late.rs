@@ -23819,21 +23819,18 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         }
         Err(_) => return Value::Object(None),
     };
-    // Parse the main section (terminated by a blank line) into key/value pairs,
-    // then build a REAL Manifest whose Attributes is backed by a real map —
+    // Parse the main section, including folded continuation lines, through the
+    // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
+    // one parser prevents JarFile.getManifest() from drifting from the normal
+    // constructor path on long attributes such as Spring Boot's Class-Path.
+    let pairs = match p59_parse_manifest_bytes(manifest_content.as_bytes()) {
+        Ok(parsed) => parsed.main,
+        Err(_) => return Value::Object(None),
+    };
+    // Build a REAL Manifest whose Attributes is backed by a real map —
     // consistent with getValue/putValue/size/write (see
     // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
     // was wrong for the 1-field real layout and read back null/empty.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for line in manifest_content.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            break; // end of the main (manifest-wide) section
-        }
-        if let Some((key, value)) = line.split_once(": ") {
-            pairs.push((key.trim().to_string(), value.trim().to_string()));
-        }
-    }
     // A real Manifest (its <init> native installs a real empty Attributes at
     // slot 0 and a real entries map at slot 1); populate the main Attributes
     // through real putValue. Pin across the allocating calls.
@@ -24165,14 +24162,45 @@ fn p59_manifest_init_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             },
         };
 
+    // `Manifest(Manifest)` is a copy constructor, not a view constructor.
+    // Spring Boot removes launcher-only keys from a copy before reading the
+    // original `Start-Class`, so sharing Attributes loses that source value.
     let this_pin = ctx.pin_native_root(this);
-    let attrs = source
-        .and_then(|src| source_field(ctx, src, "attr", 0))
-        .unwrap_or_else(|| p59_manifest_new_attributes(ctx));
+    let attrs = match source.and_then(|src| source_field(ctx, src, "attr", 0)) {
+        Some(source_attrs) => {
+            let source_pin = ctx.pin_native_root(source_attrs);
+            let source_attrs = ctx.read_native_pin(source_pin, source_attrs);
+            let copied = ctx.new_object_initialized(
+                "java/util/jar/Attributes",
+                "(Ljava/util/jar/Attributes;)V",
+                &[Value::Object(Some(source_attrs))],
+            )?;
+            ctx.unpin_native_roots(source_pin);
+            match copied {
+                Some(Value::Object(Some(attrs))) => attrs,
+                _ => p59_manifest_new_attributes(ctx),
+            }
+        }
+        None => p59_manifest_new_attributes(ctx),
+    };
     let attrs_pin = ctx.pin_native_root(attrs);
-    let entries = source
-        .and_then(|src| source_field(ctx, src, "entries", 1))
-        .unwrap_or_else(|| p59_manifest_new_entries_map(ctx));
+    let entries = match source.and_then(|src| source_field(ctx, src, "entries", 1)) {
+        Some(source_entries) => {
+            let source_pin = ctx.pin_native_root(source_entries);
+            let source_entries = ctx.read_native_pin(source_pin, source_entries);
+            let copied = ctx.new_object_initialized(
+                "java/util/LinkedHashMap",
+                "(Ljava/util/Map;)V",
+                &[Value::Object(Some(source_entries))],
+            )?;
+            ctx.unpin_native_roots(source_pin);
+            match copied {
+                Some(Value::Object(Some(entries))) => entries,
+                _ => p59_manifest_new_entries_map(ctx),
+            }
+        }
+        None => p59_manifest_new_entries_map(ctx),
+    };
     let entries_pin = ctx.pin_native_root(entries);
 
     let this = ctx.read_native_pin(this_pin, this);
@@ -72617,6 +72645,27 @@ mod t10_manifest_input_stream_tests {
             Some(Value::Object(Some(s))) => ctx.read_string(s),
             _ => None,
         }
+    }
+
+    #[test]
+    fn t10_manifest_parser_preserves_folded_main_attribute() {
+        // `JarFile.getManifest()` and `Manifest(InputStream)` deliberately
+        // share this parser. This is the long-Class-Path shape Spring Boot
+        // writes when it emits a launcher manifest.
+        let parsed = p59_parse_manifest_bytes(
+            b"Manifest-Version: 1.0\r\nClass-Path: lib/one.jar lib/two.jar \r\n lib/three.jar\r\n\r\n",
+        )
+        .expect("valid folded manifest");
+        assert_eq!(
+            parsed.main,
+            vec![
+                ("Manifest-Version".to_string(), "1.0".to_string()),
+                (
+                    "Class-Path".to_string(),
+                    "lib/one.jar lib/two.jar lib/three.jar".to_string(),
+                ),
+            ]
+        );
     }
 
     // STALE (unit-test mock cannot exercise this path): the Manifest parser now
