@@ -13689,6 +13689,35 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // A registry-backed TLS client is represented as a synthetic
+    // `javax/net/ssl/SSLSocket`, but callers invoke these inherited methods
+    // through the concrete JDK Socket body.  Check the receiver itself as
+    // well so that body cannot read its incompatible `impl` slot.
+    if matches!(
+        (method_name, descriptor),
+        ("setKeepAlive", "(Z)V")
+            | ("setTcpNoDelay", "(Z)V")
+            | ("setSoTimeout", "(I)V")
+    ) {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLSocket" {
+                if let Some(callback) = shared
+                    .native_methods
+                    .find("java/net/Socket", method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // `ServerSocket.accept()` has a native parent implementation, so the
     // later abstract-method rescue cannot displace it. A synthetic
     // SSLServerSocket owns a separate TLS listener registry and must always
