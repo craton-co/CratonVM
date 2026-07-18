@@ -2624,8 +2624,9 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // Option setters on the `java.net.Socket` adapter returned by
     // SocketChannel.socket(). These are the methods Tomcat's
     // SocketProperties.setProperties invokes; the adapter has no real
-    // SocketImpl so the real bytecode would NPE in getImpl(). No-op them
-    // (gate-aware: dropped under CRATONVM_REAL_NET_SOCKETS).
+    // SocketImpl so the real bytecode would NPE in getImpl(). The adaptor
+    // owns its own setSoTimeout implementation, so do not shadow the base
+    // Socket setter: ordinary sockets must apply SO_RCVTIMEO to their stream.
     let client_socket = "java/net/Socket";
     for (m, d) in [
         ("setReceiveBufferSize", "(I)V"),
@@ -2635,7 +2636,6 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         ("setTcpNoDelay", "(Z)V"),
         ("setOOBInline", "(Z)V"),
         ("setSoLinger", "(ZI)V"),
-        ("setSoTimeout", "(I)V"),
         ("setPerformancePreferences", "(III)V"),
     ] {
         r.register(client_socket, m, d, socket_opt_noop);
