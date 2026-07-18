@@ -13669,6 +13669,26 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // Real JDK Socket instances retain an implementation object in a field
+    // layout that differs from CratonVM's synthetic/network objects.  Let
+    // the registered option bridges win before `Socket.setKeepAlive` reaches
+    // the host bytecode and dispatches `setOption` on that mis-slotted field.
+    if class_name == "java/net/Socket"
+        && matches!(
+            (method_name, descriptor),
+            ("setKeepAlive", "(Z)V")
+                | ("setTcpNoDelay", "(Z)V")
+                | ("setSoTimeout", "(I)V")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
     // `ServerSocket.accept()` has a native parent implementation, so the
     // later abstract-method rescue cannot displace it. A synthetic
     // SSLServerSocket owns a separate TLS listener registry and must always
