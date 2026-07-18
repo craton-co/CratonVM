@@ -294,6 +294,14 @@ pub(crate) fn is_dsa_private_key_pem(key_pem: &str) -> bool {
     openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).is_ok_and(|key| key.dsa().is_ok())
 }
 
+#[cfg(unix)]
+pub(crate) fn is_dsa_certificate_der(der: &[u8]) -> bool {
+    openssl::x509::X509::from_der(der)
+        .ok()
+        .and_then(|cert| cert.public_key().ok())
+        .is_some_and(|key| key.dsa().is_ok())
+}
+
 fn take_selected_context_trust_roots() -> Option<TlsTrustRoots> {
     SELECTED_CONTEXT_TRUST_ROOTS.with(|c| c.borrow_mut().take())
 }

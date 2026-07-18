@@ -9046,11 +9046,14 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
             .or_else(crate::t27_tls::huc_default_client_identity);
             #[cfg(unix)]
+            let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
+            #[cfg(unix)]
             let legacy_dsa_client = client_ident
                 .as_ref()
-                .is_some_and(|(_, key_pem)| crate::t27_tls::is_dsa_private_key_pem(key_pem));
-            #[cfg(unix)]
-            let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
+                .is_some_and(|(_, key_pem)| crate::t27_tls::is_dsa_private_key_pem(key_pem))
+                || legacy_dsa_roots
+                    .iter()
+                    .any(|der| crate::t27_tls::is_dsa_certificate_der(der));
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot
