@@ -15328,7 +15328,21 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             match read_retry_eintr(&mut stream_ref, &mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
+                // A blocking TcpStream only yields WouldBlock here when the
+                // configured SO_RCVTIMEO expires. InputStream.read must throw
+                // the typed Java timeout instead of returning the forbidden
+                // zero-byte read (or pretending the peer closed).
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Err(RuntimeError::SocketTimeoutException {
+                        message: format!("Socket read timed out: {e}"),
+                    }
+                    .into())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
@@ -15359,7 +15373,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(RuntimeError::SocketTimeoutException {
+                            message: format!("Socket read timed out: {e}"),
+                        }
+                        .into());
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
@@ -15396,7 +15420,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(RuntimeError::SocketTimeoutException {
+                            message: format!("Socket read timed out: {e}"),
+                        }
+                        .into());
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
