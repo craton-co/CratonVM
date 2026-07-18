@@ -1,6 +1,7 @@
 package cratonvm;
 
 import java.io.InputStream;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 
@@ -21,15 +22,23 @@ public final class SocketInputStreamTimeout {
             throw new IllegalArgumentException("expected the externally hosted peer port");
         }
         int port = Integer.parseInt(args[0]);
-        expectTimeout(port, "read()");
-        expectTimeout(port, "read(byte[], off, len)");
-        expectTimeout(port, "read(byte[])");
+        for (boolean setBeforeConnect : new boolean[] {false, true}) {
+            expectTimeout(port, "read()", setBeforeConnect);
+            expectTimeout(port, "read(byte[], off, len)", setBeforeConnect);
+            expectTimeout(port, "read(byte[])", setBeforeConnect);
+        }
         System.out.println("SOCKET_INPUT_STREAM_TIMEOUT_OK");
     }
 
-    private static void expectTimeout(int port, String overload) throws Exception {
-        try (Socket socket = new Socket("127.0.0.1", port)) {
-            socket.setSoTimeout(READ_TIMEOUT_MILLIS);
+    private static void expectTimeout(int port, String overload, boolean setBeforeConnect) throws Exception {
+        try (Socket socket = setBeforeConnect ? new Socket() : new Socket("127.0.0.1", port)) {
+            if (setBeforeConnect) {
+                socket.setSoTimeout(READ_TIMEOUT_MILLIS);
+                socket.connect(new InetSocketAddress("127.0.0.1", port));
+            }
+            else {
+                socket.setSoTimeout(READ_TIMEOUT_MILLIS);
+            }
             InputStream input = socket.getInputStream();
             try {
                 int actual;
@@ -42,7 +51,8 @@ public final class SocketInputStreamTimeout {
                 else {
                     actual = input.read(new byte[4]);
                 }
-                throw new AssertionError(overload + " returned " + actual + " instead of timing out");
+                throw new AssertionError(overload + " (setBeforeConnect=" + setBeforeConnect
+                        + ") returned " + actual + " instead of timing out");
             }
             catch (SocketTimeoutException expected) {
                 // This is the Java InputStream contract for SO_TIMEOUT.

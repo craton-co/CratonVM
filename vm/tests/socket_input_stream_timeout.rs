@@ -51,7 +51,7 @@ fn run_probe(binary: &Path, nojit: bool, real_net_sockets: bool) {
             .expect("failed to make timeout probe peer nonblocking");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut connections = 0;
-        while connections < 3 && Instant::now() < deadline {
+        while connections < 6 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((_socket, _peer)) => {
                     connections += 1;
@@ -91,8 +91,8 @@ fn run_probe(binary: &Path, nojit: bool, real_net_sockets: bool) {
         "{FIXTURE} failed (nojit={nojit}, real_net_sockets={real_net_sockets}). stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(
-        connections, 3,
-        "{FIXTURE} did not exercise every read overload"
+        connections, 6,
+        "{FIXTURE} did not exercise every read overload before and after connect"
     );
 }
 
