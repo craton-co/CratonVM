@@ -1234,7 +1234,16 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ctx.find_resource(&resource_name) {
+    // A package-directory resource has a URL but no byte content to read.
+    // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
+    // `SomeClass`'s package directory and HotSpot returns a non-null stream.
+    // `find_resource` correctly declines to open a directory as a file, so use
+    // the URL lookup solely to distinguish that existing directory from a
+    // missing resource and serve an empty stream for the former.
+    let bytes = ctx
+        .find_resource(&resource_name)
+        .or_else(|| (!ctx.find_all_resource_urls(&resource_name).is_empty()).then(Vec::new));
+    match bytes {
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
             let len = bytes.len();
