@@ -44075,6 +44075,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // (matches original behavior for `init((KeyStore) null)` / a
             // `getTrustManagers()` call with no preceding `init`).
             let this = obj_arg(args, 0)?;
+            let runtime_class = ctx
+                .class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_default();
+            // This bridge owns only the synthetic default factory made by
+            // TrustManagerFactory.getInstance(). A concrete provider factory
+            // (notably Netty's InsecureTrustManagerFactory) implements its
+            // policy through the real TrustManagerFactory bytecode and SPI.
+            // Treating every subclass as our synthetic default silently
+            // replaces that provider's manager with a PKIX manager. Execute
+            // the base bytecode without re-entering this native so virtual
+            // SPI dispatch returns the provider's configured manager.
+            if runtime_class != "javax/net/ssl/TrustManagerFactory" {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getTrustManagers",
+                    "()[Ljavax/net/ssl/TrustManager;",
+                    &[],
+                );
+            }
             let ih = ctx.identity_hash_code(this);
             let tm_id = if ih != 0 {
                 tmf_tm_id_by_identity()

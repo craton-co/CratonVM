@@ -9351,13 +9351,29 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     );
     // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
     // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
-    // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
+    // keyed by ObjectRef via engine_id_or_alloc).  It is intentionally a
+    // synthetic allocation, but it still participates in real JDK bytecode:
+    // Netty configures ALPN through SSLEngineImpl's
+    // setHandshakeApplicationProtocolSelector(), which takes engineLock.  A
+    // bare allocation leaves that final constructor field null and turns a
+    // normal TLS setup into an NPE.  Supply the one JDK-visible invariant that
+    // method needs without running SSLEngineImpl's full JSSE constructor (the
+    // rustls-backed native state owns the rest of the engine lifecycle).
     for desc in [
         "()Ljavax/net/ssl/SSLEngine;",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
             let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            let lock = match ctx.new_object_initialized(
+                "java/util/concurrent/locks/ReentrantLock",
+                "()V",
+                &[],
+            )? {
+                Some(Value::Object(Some(lock))) => lock,
+                _ => return Err(npe("ReentrantLock <init> failed")),
+            };
+            ctx.set_field_by_name(eng, "engineLock", Value::Object(Some(lock)));
             // Copy this SSLContext's per-context identity (its keystore cert+key)
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
