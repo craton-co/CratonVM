@@ -1101,6 +1101,23 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// Used by allocation helpers when the fast-path allocation fails.
 /// Public wrapper so sibling modules (exceptions, invokedynamic) can force a
 /// GC cycle when a direct allocation fails.
+/// Self-call identity proof for the raw direct self-recursive CALL routing
+/// (see `cratonvm_jit::set_self_call_identity_stable`): true iff `class_id`
+/// was defined by a BUILTIN loader (bootstrap/extension/application) AND the
+/// loader-blind global name lookup maps the class's name back to this exact
+/// `ClassId`. Builtin loader registries hold one class per name and resolve a
+/// self-reference to the already-defined class, so a same-named shadow can
+/// never rebind the target; `UserDefined` loaders (enhancement/duplicating
+/// loaders) return false and keep the dispatch route.
+fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    !matches!(class.loader_id, cratonvm_types::ClassLoaderId::UserDefined(_))
+        && cm.find_class_by_name(&class.name) == Some(class_id)
+}
+
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
 }
@@ -31119,6 +31136,10 @@ fn try_jit_upgrade_with_gate(
             };
             let c_helpers = crate::jit::helpers::build_helpers();
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
+            crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+                shared,
+                callee_cached.declaring_class_id,
+            ));
             let mut compiled = crate::jit::try_compile(
                 &callee_cached,
                 Some(&c_resolver),
@@ -31259,6 +31280,10 @@ fn try_jit_upgrade_with_gate(
     // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
     let main_inline_on = crate::runtime::env_cache::jit_main_inline();
     let string_layout_resolver = || resolve_string_field_layout(shared);
+    crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+        shared,
+        cached.declaring_class_id,
+    ));
     let mut compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -31950,6 +31975,10 @@ fn try_jit_compile_callee_slow(
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
     let compile_start = std::time::Instant::now();
+    crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+        shared,
+        cached.declaring_class_id,
+    ));
     let mut compiled = crate::jit::try_compile(
         &cached,
         Some(&resolver),

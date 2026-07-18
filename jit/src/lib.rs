@@ -5286,6 +5286,40 @@ fn note_jit_recursive_compile_cycle(class_name: &str, method_name: &str, descrip
     }
 }
 
+thread_local! {
+    /// Per-compile request flag (same consume-once pattern as
+    /// `x64::set_kernel_reg_homes_request`): the VM caller sets it right
+    /// before `try_compile` when it has PROVEN that the compiling class's
+    /// self-references resolve to the class itself — the class was defined
+    /// by a BUILTIN (bootstrap/extension/application) loader and the
+    /// loader-blind global name lookup maps its name back to its own
+    /// `ClassId`. Under that proof a NON-tail static self-recursive
+    /// invokestatic may be raw-routed to the guarded direct self-CALL
+    /// (`x64.rs` 0xb8 else-arm) instead of carrying dispatch metadata: the
+    /// loader-identity hazard that historically forced the dispatch route
+    /// ("a raw direct entry call ... can invoke a different same-named
+    /// method") cannot arise for a builtin-loaded class, whose registry
+    /// holds exactly one class per name and always resolves a
+    /// self-reference to the already-defined class. Custom (`UserDefined`)
+    /// loaders keep the dispatch route unconditionally.
+    ///
+    /// Motivation (bt18 regression): dispatch-mediated self-recursion pays
+    /// the full helper round trip per level — `jit_invoke_dispatch` +
+    /// `push_entry_full`/`pop_jit_entry` + the `lookup_jit_code_range`
+    /// mutex scan — measured at >60% of the whole BinTreesClassic d=18 run
+    /// (~90M chain pushes; the recursive `bottomUpTree`/`itemCheck` pair
+    /// dispatched once per NODE).
+    static SELF_CALL_IDENTITY_STABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Set the per-compile self-call identity proof — see
+/// [`SELF_CALL_IDENTITY_STABLE`]. Consumed (reset to `false`) by the next
+/// `try_compile` on this thread, including on its early-bail paths.
+pub fn set_self_call_identity_stable(v: bool) {
+    SELF_CALL_IDENTITY_STABLE.with(|c| c.set(v));
+}
+
 /// Direct JIT-to-JIT calls into recursive compile-cycle participants bypass the
 /// dispatch depth guard. Such targets must stay on the dispatch path.
 #[doc(hidden)]
@@ -5535,6 +5569,9 @@ pub fn try_compile(
         return None;
     }
 
+    // Consume the per-compile self-call identity proof FIRST — even an
+    // early bail below must not leak a stale `true` into a later compile.
+    let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
@@ -5567,6 +5604,7 @@ pub fn try_compile(
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
         &mut backend_attempted,
+        self_call_identity_stable,
     );
 
     if result.is_none() && backend_attempted {
@@ -5719,6 +5757,7 @@ fn try_compile_inner(
     // transient miss (e.g. resolver returned None, profile not yet
     // present — worth retrying later).
     backend_attempted: &mut bool,
+    self_call_identity_stable: bool,
 ) -> Option<CompiledMethod> {
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
@@ -6926,6 +6965,26 @@ fn try_compile_inner(
                 continue;
             }
 
+            // bt18-regression fix (2026-07-18): NON-tail static self-recursion
+            // may ALSO take the raw direct-CALL path — but only under the
+            // caller-supplied identity proof (see `SELF_CALL_IDENTITY_STABLE`:
+            // builtin-loaded class whose name maps back to its own ClassId,
+            // so the historical loader-identity hazard cannot arise) and
+            // never for mutual-recursion cycle targets (the dispatch depth
+            // guard is still their only stack protection). The x64 else-arm
+            // emits the inline stack-floor check + `self_call_stack_guard`
+            // helper before the direct CALL, so runaway recursion still
+            // surfaces as a catchable StackOverflowError. `needs_heap` is
+            // required: the guard is called with the vm_ptr frame slot.
+            if invoke_kind == 3
+                && is_same_method_recursive_call
+                && !recursive_cycle_target
+                && self_call_identity_stable
+            {
+                needs_heap = true;
+                continue;
+            }
+
             // BUG-1 companion — when the dedicated self-call stack guard is
             // Earlier revisions routed NON-tail static self-recursive sites
             // through a raw direct-CALL path with a self-call guard. It avoids
@@ -8110,8 +8169,13 @@ mod tests {
 
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
     ///
-    /// The site must retain `invoke_dispatch` even when a self-call guard is
-    /// available, so class-loader identity is resolved at dispatch time.
+    /// WITHOUT the caller-supplied identity proof the site must retain
+    /// `invoke_dispatch`, so class-loader identity is resolved at dispatch
+    /// time (dee2e26f hardening). WITH the proof
+    /// (`set_self_call_identity_stable(true)` — builtin-loaded class whose
+    /// name maps back to its own ClassId) the site takes the raw guarded
+    /// direct self-CALL (bt18-regression fix, 2026-07-18); the flag is
+    /// consume-once so the NEXT compile reverts to dispatch.
     /// Proven from the emitted machine code: `emit_call_absolute` bakes the
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
@@ -8233,6 +8297,78 @@ mod tests {
         assert!(
             contains(&bytes_off, DISPATCH_ADDR),
             "unwired guard must keep the historical invoke_dispatch routing"
+        );
+
+        // (c) bt18-regression fix: with the caller-supplied identity proof,
+        // the non-tail site takes the raw guarded direct self-CALL — the
+        // stack-guard helper is baked and no invoke_dispatch round trip
+        // remains for the recursion.
+        set_self_call_identity_stable(true);
+        let compiled_direct = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("identity-proven self-recursive method must compile");
+        let bytes_direct = compiled_direct.code_bytes().to_vec();
+        assert!(
+            contains(&bytes_direct, GUARD_ADDR),
+            "identity-proven non-tail self-call must bake the self-call stack guard"
+        );
+        assert!(
+            !contains(&bytes_direct, DISPATCH_ADDR),
+            "identity-proven non-tail self-call must not round-trip through invoke_dispatch"
+        );
+
+        // (d) The proof is consume-once: the very next compile reverts to
+        // loader-correct dispatch routing.
+        let compiled_after = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("post-proof compile must fall back to dispatch");
+        assert!(
+            contains(&compiled_after.code_bytes().to_vec(), DISPATCH_ADDR),
+            "identity proof must not leak into the next compile"
         );
     }
 
