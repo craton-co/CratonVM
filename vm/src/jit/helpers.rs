@@ -6416,6 +6416,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_ref,
             receiver_class_id,
             info.method_name,
+            info.descriptor,
             &rest,
         ) {
             Ok(Some(result)) => {

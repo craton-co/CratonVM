@@ -59,6 +59,7 @@ runnable on its own: `cratonvm -cp build RJitGc`.
 | `RReflect` | methods/fields/invoke, **runtime annotations (dynamic proxy)**, records + `getRecordComponents`, enums, array reflection |
 | `ROptionalClassForName` | `Class.forName` and `ClassLoader.loadClass` throw `ClassNotFoundException` for an optional dependency absent from the classpath |
 | `RPrivateLambdaOwner` | private lambda bodies remain bound to their resolved declaring class when a child has the same synthetic lambda name |
+| `RLambdaDefaultOverload` | lambda SAM dispatch preserves same-named default overloads, including null arguments |
 | `RJitGc` | hot int/long/float/double loops (JIT+OSR), **binary-tree alloc + GC churn**, megamorphic dispatch, array bounds — all checksum-diffed vs HotSpot |
 | `RConcurrent` | threads, atomics, locks, `ConcurrentHashMap`, executors, futures, latches — **not in the default set** (see Known gaps) |
 
