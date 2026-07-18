@@ -21310,7 +21310,38 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let cached_result = if private_impl_class.is_none() {
+            // A private instance lambda body is encoded by javac as an
+            // InvokeVirtual handle, but it retains invokespecial semantics:
+            // resolve it on the handle's declaring class, not by walking the
+            // captured receiver's hierarchy. Synthetic lambda names are not
+            // unique across a hierarchy (for example both Spring Data's
+            // AnnotationBasedPersistentProperty and AbstractPersistentProperty
+            // have lambda$new$2), so receiver-based lookup can execute a
+            // different private body with the same name and descriptor.
+            let impl_owner_id = lambda_impl_dispatch_override(shared, &call_site).or_else(|| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&call_site.impl_handle.class_name)
+            });
+            let private_impl_owner = impl_owner_id.filter(|owner_id| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(*owner_id)
+                    .and_then(|class| {
+                        class.find_method(
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                        )
+                    })
+                    .is_some_and(|method| method.access_flags.contains(MethodAccessFlags::PRIVATE))
+            });
+            // Keep the existing loader-faithful private implementation owner
+            // when it is available; otherwise use the declaring owner found
+            // above for private synthetic lambda methods.
+            let exact_impl_owner = private_impl_class.or(private_impl_owner);
+            let cached_result = if exact_impl_owner.is_none() {
                 recv_class_id_opt
                     .filter(|rcv| *rcv != ClassId::new(0))
                     .map(|rcv| {
@@ -21329,17 +21360,17 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let result = if let Some(result) = cached_result {
-                Ok(result)
-            } else if let Some(impl_cid) = private_impl_class {
+            let result = if let Some(owner_id) = exact_impl_owner {
                 crate::vm::invoke_on_class_shared_no_retarget(
                     shared,
                     thread,
-                    impl_cid,
+                    owner_id,
                     &call_site.impl_handle.member_name,
                     &call_site.impl_handle.descriptor,
                     &full_args,
                 )
+            } else if let Some(result) = cached_result {
+                Ok(result)
             } else if let Some(rcv_cid) = virtual_override {
                 invoke_on_class_shared(
                     shared,
