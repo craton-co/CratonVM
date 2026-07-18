@@ -1027,8 +1027,8 @@ fn safe_native_call_impl(
     let mut out: MethodCallResult = match result {
         Ok(method_result) => {
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
-                thread.native_pending_return = None;
                 if exc_handle == u64::MAX {
+                    thread.native_pending_return = None;
                     thread.native_pin_roots.truncate(pin_base);
                     return Err(crate::runtime::exceptions::throw_runtime_error(
                         shared,
@@ -1040,7 +1040,14 @@ fn safe_native_call_impl(
                 }
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
-                    let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
+                    // JNI `Throw`/`ThrowNew` publish the throwable through
+                    // `native_pending_return` before returning to native code.
+                    // That slot is a GC root and is remapped in place, unlike
+                    // the JNI ABI's raw handle.  Fall back to the raw handle
+                    // for legacy/no-context producers.
+                    let exc_ref = thread
+                        .native_pending_return
+                        .unwrap_or_else(|| unsafe { crate::types::ObjectRef::from_raw(ptr) });
                     thread.native_pending_return = Some(exc_ref);
                     thread.native_pin_roots.truncate(pin_base);
                     crate::runtime::interpreter::update_root_snapshot(shared, thread);
