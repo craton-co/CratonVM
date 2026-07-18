@@ -1273,8 +1273,20 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             ctx.begin_blocking_region();
             let res = r.read(buf);
             ctx.end_blocking_region();
-            res.map_err(|e| net_err("read0", e))?
+            match res {
+                // `NioSocketImpl.timedRead` puts the fd into non-blocking
+                // mode, then expects the native dispatcher to return the JDK
+                // IOStatus.UNAVAILABLE sentinel (-2). It parks until data is
+                // available or its Java-level deadline expires. Blocking here
+                // instead delays the timeout until the peer closes, which
+                // turns an idle socket into a false EOF.
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => -2,
+                result => result.map_err(|error| net_err("read0", error))?,
+            }
         };
+        if n == -2 {
+            return Ok(Some(Value::Int(-2)));
+        }
         if n == 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -1291,6 +1303,51 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         }
         Ok(Some(Value::Int(n as i32)))
     })
+}
+
+/// `Net.poll(FileDescriptor fd, int events, long timeoutMillis) -> int`.
+///
+/// JDK 25's `NioSocketImpl` uses this after a non-blocking read reports
+/// `IOStatus.UNAVAILABLE`. A readiness loop based on `peek` works for the
+/// TCP streams behind the CratonVM Net registry and, unlike a blind sleep,
+/// wakes promptly for either bytes or peer EOF.
+fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = obj_arg(args, 0)?;
+    let timeout_millis = match args.get(2) {
+        Some(Value::Long(value)) => *value,
+        Some(Value::Int(value)) => *value as i64,
+        _ => 0,
+    };
+    let fd = net_fd_from_descriptor(ctx, fd_obj)
+        .ok_or_else(|| ioex("poll: FileDescriptor has no fd id"))?;
+    let stream = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(stream)) => Arc::clone(stream),
+            _ => return Ok(Some(Value::Int(0))),
+        }
+    };
+    let deadline = if timeout_millis < 0 {
+        None
+    } else {
+        Some(std::time::Instant::now() + Duration::from_millis(timeout_millis as u64))
+    };
+    ctx.begin_blocking_region();
+    let result = loop {
+        let mut probe = [0u8; 1];
+        match stream.peek(&mut probe) {
+            Ok(_) => break Ok(Some(Value::Int(1))),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                    break Ok(Some(Value::Int(0)));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => break Err(net_err("poll", error)),
+        }
+    };
+    ctx.end_blocking_region();
+    result
 }
 
 /// `write0(FileDescriptor fd, long address, int len) -> int`
@@ -1844,23 +1901,35 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // offsets; for us it's a no-op since we use name-based field lookup.
     r.register(net, "initIDs", "()V", |_c, _a| Ok(None));
 
-    // NIO-SERVER-SOCKET (2026-06-03): `IOUtil.configureBlocking(fd, blocking)`.
-    // The real JDK `NioSocketImpl` flips the OS fd to non-blocking when an
-    // operation has a timeout (or runs on a virtual thread), then parks on the
-    // `Poller`. Our `Net` natives back each fd with a `std::net` socket that is
-    // always OS-blocking and whose `accept`/`read0`/`write0` block until they
-    // complete, so `Net.accept`/`read0` never return `IOStatus.UNAVAILABLE` and
-    // the park/Poller path is never taken. A no-op here keeps the fd blocking,
-    // which is exactly what we want — implementing it for real (set the
-    // synthetic fd non-blocking) would force us to also implement the Windows
-    // `Poller`, which we deliberately avoid. Registered on `IOUtil` (where the
-    // JDK declares it).
+    // `NioSocketImpl` flips the OS fd to non-blocking when it enforces a
+    // Java-level SO_TIMEOUT. `net_read0` then returns IOStatus.UNAVAILABLE and
+    // `Net.poll` handles the timed wait. This must alter the real stream; a
+    // no-op makes read0 block until peer close and incorrectly report EOF.
     r.register(
         "sun/nio/ch/IOUtil",
         "configureBlocking",
         "(Ljava/io/FileDescriptor;Z)V",
-        |_c, _a| Ok(None),
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 0)?;
+            let blocking = args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0;
+            let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
+                return Ok(None);
+            };
+            let map = net_sockets().read();
+            match map.get(&fd) {
+                Some(NetSocketHandle::Stream(stream)) => stream
+                    .set_nonblocking(!blocking)
+                    .map_err(|error| net_err("configureBlocking", error))?,
+                Some(NetSocketHandle::Listener(listener)) => listener
+                    .lock()
+                    .set_nonblocking(!blocking)
+                    .map_err(|error| net_err("configureBlocking", error))?,
+                None => {}
+            }
+            Ok(None)
+        },
     );
+    r.register(net, "poll", "(Ljava/io/FileDescriptor;IJ)I", net_poll);
 
     // NIO-SERVER-SOCKET: `jdk/net/WindowsSocketOptions` natives. Without these,
     // `jdk.net.ExtendedSocketOptions.<clinit>` throws UnsatisfiedLinkError on
