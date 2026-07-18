@@ -4,6 +4,8 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import javax.net.ServerSocketFactory;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 
 /**
@@ -45,6 +47,19 @@ public final class SslSocketFactoryInetAddress {
         expectIOException("inet", () -> factory.createSocket(loopback, closedPort));
         expectIOException("string-local", () -> factory.createSocket("127.0.0.1", closedPort, loopback, 0));
         expectIOException("inet-local", () -> factory.createSocket(loopback, closedPort, loopback, 0));
+        ServerSocketFactory serverFactory = SSLContext.getDefault().getServerSocketFactory();
+        try (ServerSocket ignored = serverFactory.createServerSocket(0, 1)) {
+            throw new AssertionError("SSL server factory unexpectedly used a plaintext listener");
+        }
+        catch (AbstractMethodError error) {
+            throw new AssertionError("server factory resolved to an abstract method", error);
+        }
+        catch (IllegalStateException expected) {
+            // The default context has no configured key material. Reaching this
+            // TLS-specific error proves the SSL factory bridge won over the
+            // generic ServerSocketFactory native.
+            System.out.println("r:server-factory=tls-bridge");
+        }
         System.out.println("SSL_SOCKET_FACTORY_INET_ADDRESS_OK");
     }
 }

@@ -16125,7 +16125,15 @@ fn invoke_on_class_shared_inner(
                     // the interface-exclusion above retargeted `class_id`) and check
                     // its native registry too -- this generalises the rescue to any
                     // interface-stamped synthetic receiver, not just concrete ones.
-                    if !native && method.is_abstract() {
+                    // The static method reference can already have selected a
+                    // generic native on the abstract parent (for example
+                    // `ServerSocketFactory.createServerSocket(II)`), which
+                    // used to suppress this receiver-specific rescue.  The
+                    // concrete synthetic receiver's bridge is more specific
+                    // and must win even in that case: otherwise an
+                    // `SSLServerSocketFactory` silently constructs a
+                    // plaintext listener through its parent factory.
+                    if method.is_abstract() {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
                                 let rc = shared.heap.class_id_of(*o);
