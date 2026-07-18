@@ -559,6 +559,28 @@ function Get-EffectiveClassTimeoutSec {
       $ClassRow.class -eq 'org.springframework.boot.session.jdbc.autoconfigure.JdbcSessionAutoConfigurationTests') {
     return [Math]::Max($BaseTimeoutSec, 900)
   }
+  # 2026-07-17 contextrunner-resource-cycle-then-silent-stall-cluster investigation:
+  # these 5 classes were originally misclassified as HANG at the standard 300s
+  # shard timeout. A live CPU-sampled repro (single OS thread pegged near 100%
+  # continuously, no thread ever genuinely parked) proved none of them are
+  # deadlocked -- they are just slow (heavy reflection/annotation-scanning plus,
+  # pre-fix, extra work from the since-fixed Class.getMethods() override-shadowing
+  # bug). Each was run standalone to natural completion (FAIL, with real residual
+  # test failures unrelated to hanging -- see
+  # docs/known-issues/springboot/ for the specific residual docs) and the
+  # validated wall-clock times below include headroom over the observed time.
+  # See docs/internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
+  $slowClasses = @{
+    'module/spring-boot-cache|org.springframework.boot.cache.autoconfigure.CacheAutoConfigurationTests' = 600
+    'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.JerseyEndpointRequestIntegrationTests' = 600
+    'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.MvcEndpointRequestIntegrationTests' = 700
+    'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.reactive.EndpointRequestIntegrationTests' = 1000
+    'module/spring-boot-micrometer-tracing-opentelemetry|org.springframework.boot.micrometer.tracing.opentelemetry.autoconfigure.OpenTelemetryTracingAutoConfigurationTests' = 1400
+  }
+  $key = "$($ClassRow.module)|$($ClassRow.class)"
+  if ($slowClasses.ContainsKey($key)) {
+    return [Math]::Max($BaseTimeoutSec, $slowClasses[$key])
+  }
   return $BaseTimeoutSec
 }
 
