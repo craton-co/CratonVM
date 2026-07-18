@@ -15371,6 +15371,57 @@ fn execute_instruction(
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
                             .unwrap_or_else(|| "?".to_string());
+                        // Spring's ConfigurationClassParser reaches this cast
+                        // only after requesting annotation attributes with
+                        // `classValuesAsString=true`. Under its forked
+                        // class-path loader the normal annotation adapter can
+                        // leave a VM-owned Class[] at that boundary. Convert
+                        // that exact representation to the requested String[]
+                        // rather than weakening general array assignability.
+                        let source_class_parser_boundary = target_class_name == "[Ljava/lang/String;"
+                            && thread.frames[frame_idx].class_name()
+                                == "org/springframework/context/annotation/ConfigurationClassParser$SourceClass"
+                            && thread.frames[frame_idx].method_name()
+                                == "getAnnotationAttributes"
+                            && obj_class_name == "java/lang/Class"
+                            && shared.heap.kind_of(obj_ref)
+                                == cratonvm_types::ObjectKind::Array;
+                        if source_class_parser_boundary {
+                            if let Value::Object(Some(strings)) =
+                                crate::vm::convert_class_values_to_strings(
+                                    shared,
+                                    Value::Object(Some(obj_ref)),
+                                )
+                            {
+                                thread.frames[frame_idx]
+                                    .stack
+                                    .push(Value::Object(Some(strings)))?;
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
+                        // `ServletComponentHandler` asks Spring metadata for
+                        // a nested `WebInitParam[]`. The forked class-path
+                        // reader can surface a lone annotation proxy instead
+                        // of that array; materialize the one element through
+                        // the same AnnotationAttributes map contract Spring
+                        // uses for regular annotation arrays.
+                        let servlet_init_params_boundary = target_class_name
+                            == "[Lorg/springframework/core/annotation/AnnotationAttributes;"
+                            && thread.frames[frame_idx].class_name()
+                                == "org/springframework/boot/web/server/servlet/context/ServletComponentHandler"
+                            && thread.frames[frame_idx].method_name() == "extractInitParameters";
+                        if servlet_init_params_boundary {
+                            if let Some(attributes) =
+                                crate::vm::annotation_proxy_to_annotation_attributes_array(
+                                    shared, thread, obj_ref,
+                                )?
+                            {
+                                thread.frames[frame_idx]
+                                    .stack
+                                    .push(Value::Object(Some(attributes)))?;
+                                return Ok(InstructionResult::Continue);
+                            }
+                        }
                         if crate::runtime::env_cache::cce_dbg() {
                             eprintln!(
                                 "[CCE_DBG] checkcast fail: obj_cid={} obj_class={} target={} caller={}.{}{}",

@@ -264,6 +264,10 @@ interceptor chain executes relative to some CratonVM-internal timing/state
 lifecycle paths these classes share) than anything specific to the classes'
 own test bodies.
 
+Follow-on classloader, annotation-adapter, and reflection-identity residuals
+found while retesting the named web-server class were fixed on 2026-07-18;
+see [`mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md`](mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md).
+
 ## Merged 2026-07-17: absorbed `mockwebenvironmentservletcomponentscanintegrationtests-hang.md`
 
 That doc was filed independently for the identical signature (retitled
