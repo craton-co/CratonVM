@@ -20,7 +20,7 @@ use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::ClassId;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Cipher and protocol constants
@@ -2459,6 +2459,39 @@ pub fn engine_negotiated_alpn(engine_id: i32) -> Option<String> {
     crate::t27_tls::engine_negotiated_alpn_internal(engine_id)
 }
 
+pub(crate) fn register_conscrypt_native_bridges(r: &mut NativeMethodRegistry) {
+    let prev = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register("org/conscrypt/NativeCrypto", "clinit", "()V", native_conscrypt_clinit);
+    r.register("org/conscrypt/NativeCrypto", "get_cipher_names", "(Ljava/lang/String;)[Ljava/lang/String;", native_conscrypt_get_cipher_names);
+    r.register("org/conscrypt/NativeCrypto", "EVP_has_aes_hardware", "()I", native_conscrypt_has_aes_hardware);
+    r.set_category(prev);
+}
+
+// Conscrypt's JNI_OnLoad registration is not ABI-safe on CratonVM/Windows.
+// Jetty only needs a provider that can advertise its ALPN processor while it
+// builds a connector; the actual TLS engine remains CratonVM's TLS surface.
+fn native_conscrypt_clinit(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+fn native_conscrypt_get_cipher_names(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(ctx.new_array(
+        ArrayElementType::Reference,
+        0,
+    )))))
+}
+
+fn native_conscrypt_has_aes_hardware(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
 pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
     // Dispatcher: each sub-fn sets its own NativeKind (mostly SyntheticStub —
     // this is the emulated TLS layer; the real rustls engine is t27_tls.rs).
@@ -2475,6 +2508,7 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
     register_x509_trust_manager(r);
     register_ssl_context_impl(r);
     register_ssl_engine_result(r);
+    register_conscrypt_native_bridges(r);
     // T19.9: Keycloak-specific natives for sun.security.ssl.SSLSessionImpl,
     // sun.security.ssl.SSLContextImpl.engineInit, and the hardened
     // SSLEngine.setEnabledCipherSuitesStrict allowlist. These entries are
