@@ -58138,7 +58138,16 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sem, "acquire", "()V", native_sem_acquire);
     registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
     registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
-    registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
+    // HikariCP's SuspendResumeLock suspends a pool by acquiring all 10,000
+    // permits at once. Without this overload that call falls through to the
+    // real AQS bytecode, whose abstract tryAcquireShared base is reached on
+    // the current bridge path and throws UnsupportedOperationException.
+    registry.register(
+        sem,
+        "acquireUninterruptibly",
+        "(I)V",
+        native_sem_acquire_n,
+    );
     registry.register(sem, "release", "()V", native_sem_release);
     registry.register(sem, "release", "(I)V", native_sem_release_n);
     registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
@@ -84438,6 +84447,16 @@ mod concurrency_tests {
 
         native_sem_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
         assert_eq!(sem_permits(&mut ctx, sem), 2);
+    }
+
+    #[test]
+    fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
+        let mut ctx = make_ctx();
+        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+
+        native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+        assert_eq!(sem_permits(&mut ctx, sem), 0);
     }
 
     #[test]
