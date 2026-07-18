@@ -1723,58 +1723,22 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // URLClassLoader.getResource(String) → URL  (delegate to find_resource)
+    // This exact URLClassLoader registration is installed after the generic
+    // ClassLoader one. Keep it on the same parent-first implementation so a
+    // URLClassLoader child can see @WithResource files supplied by its parent.
     r.register(
         ucl,
         "getResource",
         "(Ljava/lang/String;)Ljava/net/URL;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            match ctx.find_resource(name.trim_start_matches('/')) {
-                Some(_) => {
-                    // Build a minimal URL object pointing to this resource
-                    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-                    let full_str = ctx.create_string(&format!("classpath:{name}"));
-                    ctx.set_field(url, 5, Value::Object(Some(full_str)));
-                    Ok(Some(Value::Object(Some(url))))
-                }
-                None => Ok(Some(Value::Object(None))),
-            }
-        },
+        crate::classloader::cl_get_resource_essential,
     );
 
-    // URLClassLoader.getResourceAsStream(String) → InputStream
+    // Use the same delegation path for stream lookup.
     r.register(
         ucl,
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            let resource_name = name.trim_start_matches('/');
-            match ctx.find_resource(resource_name) {
-                None => Ok(Some(Value::Object(None))),
-                Some(bytes) => {
-                    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-                    for (i, &b) in bytes.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
-                    ctx.set_field(stream, 1, Value::Int(0)); // pos
-                    ctx.set_field(stream, 2, Value::Int(0)); // mark
-                    ctx.set_field(stream, 3, Value::Int(bytes.len() as i32)); // count
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-            }
-        },
+        crate::classloader::cl_get_resource_as_stream_essential,
     );
 
     // URLClassLoader.close() — no-op

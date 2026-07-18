@@ -55,8 +55,8 @@ Spring Boot 4.1.0-SNAPSHOT, JDK 25.0.3:
 | `ModifiedClassPathExtensionForkParameterizedTests` | 3/3 | 3/3 |
 
 The one remaining failure in each autoconfiguration class is the already
-separate virtual-thread configuration defect documented in
-`docs/known-issues/springboot/jdk-httpclient-builder-config-loss-cluster.md`.
+separate virtual-thread configuration defect, now fixed in
+`docs/internal/springboot/jdk-httpclient-builder-config-loss-cluster-FIXED.md`.
 It does not involve classpath presence or `ModifiedClassPathClassLoader`.
 
 The `ModifiedClassPathExtensionOverrides*` failures are a distinct

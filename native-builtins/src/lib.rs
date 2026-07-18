@@ -28448,46 +28448,62 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_cdl_await_timeout,
     );
     registry.register(surefire_cdl, "getCount", "()J", native_cdl_get_count);
-    let surefire_sem = "java/util/concurrent/Semaphore";
-    registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
-    registry.register(surefire_sem, "<init>", "(IZ)V", native_sem_init_fair);
-    registry.register(surefire_sem, "acquire", "()V", native_sem_acquire);
-    registry.register(surefire_sem, "acquire", "(I)V", native_sem_acquire_n);
-    registry.register(
-        surefire_sem,
-        "acquireUninterruptibly",
-        "()V",
-        native_sem_acquire,
-    );
-    registry.register(surefire_sem, "release", "()V", native_sem_release);
-    registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
-    registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
-    registry.register(surefire_sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-    registry.register(
-        surefire_sem,
-        "tryAcquire",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        native_sem_try_acquire_timeout,
-    );
-    registry.register(
-        surefire_sem,
-        "availablePermits",
-        "()I",
-        native_sem_available_permits,
-    );
-    registry.register(
-        surefire_sem,
-        "drainPermits",
-        "()I",
-        native_sem_drain_permits,
-    );
-    registry.register(surefire_sem, "isFair", "()Z", native_sem_is_fair);
-    registry.register(
-        surefire_sem,
-        "toString",
-        "()Ljava/lang/String;",
-        native_sem_to_string,
-    );
+    // Keep Semaphore's real JDK constructor and methods when real AQS is in
+    // use.  The synthetic representation stores its permit state in an int[]
+    // in Semaphore.sync, which is safe only while every Semaphore operation is
+    // intercepted.  Libraries such as Oracle UCP call the inherited protected
+    // Sync.reducePermits() directly; with a synthetic holder that method sees
+    // an int[] instead of Semaphore$Sync and retries its CAS forever.
+    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
+        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
+    if synthetic_aqs {
+        let surefire_sem = "java/util/concurrent/Semaphore";
+        registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
+        registry.register(surefire_sem, "<init>", "(IZ)V", native_sem_init_fair);
+        registry.register(surefire_sem, "acquire", "()V", native_sem_acquire);
+        registry.register(surefire_sem, "acquire", "(I)V", native_sem_acquire_n);
+        registry.register(
+            surefire_sem,
+            "acquireUninterruptibly",
+            "()V",
+            native_sem_acquire,
+        );
+        registry.register(
+            surefire_sem,
+            "acquireUninterruptibly",
+            "(I)V",
+            native_sem_acquire_n,
+        );
+        registry.register(surefire_sem, "release", "()V", native_sem_release);
+        registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
+        registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
+        registry.register(surefire_sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+        registry.register(
+            surefire_sem,
+            "tryAcquire",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_sem_try_acquire_timeout,
+        );
+        registry.register(
+            surefire_sem,
+            "availablePermits",
+            "()I",
+            native_sem_available_permits,
+        );
+        registry.register(
+            surefire_sem,
+            "drainPermits",
+            "()I",
+            native_sem_drain_permits,
+        );
+        registry.register(surefire_sem, "isFair", "()Z", native_sem_is_fair);
+        registry.register(
+            surefire_sem,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sem_to_string,
+        );
+    }
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
     let surefire_cb = "java/util/concurrent/CyclicBarrier";
@@ -58038,7 +58054,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // unpark, all of which CratonVM implements; with it the full
     // ByteSizeValueTests suite reaches HotSpot parity (42/42, clean exit).
     // Opt OUT with CRATONVM_SYNTHETIC_AQS=1 (legacy synthetic lock/condition).
-    // CountDownLatch/CyclicBarrier/Semaphore natives below are unaffected.
+    // CountDownLatch/CyclicBarrier synthetic natives below are unaffected.
     let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
         || std::env::var_os("CRATONVM_REAL_AQS").is_some();
     if !real_aqs {
@@ -58126,31 +58142,39 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- Semaphore ---
-    let sem = "java/util/concurrent/Semaphore";
-    registry.register(sem, "<init>", "(I)V", native_sem_init);
-    registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
-    registry.register(sem, "acquire", "()V", native_sem_acquire);
-    registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
-    registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
-    registry.register(sem, "release", "()V", native_sem_release);
-    registry.register(sem, "release", "(I)V", native_sem_release_n);
-    registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
-    registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-    registry.register(
-        sem,
-        "tryAcquire",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        native_sem_try_acquire_timeout,
-    );
-    registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
-    registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
-    registry.register(sem, "isFair", "()Z", native_sem_is_fair);
-    registry.register(
-        sem,
-        "toString",
-        "()Ljava/lang/String;",
-        native_sem_to_string,
-    );
+    // See the matching early-registration guard above.  In the default real
+    // AQS mode, Semaphore must keep its real `sync: Semaphore$Sync` field so
+    // protected AQS operations invoked by third-party subclasses remain sound.
+    if !real_aqs {
+        let sem = "java/util/concurrent/Semaphore";
+        registry.register(sem, "<init>", "(I)V", native_sem_init);
+        registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
+        registry.register(sem, "acquire", "()V", native_sem_acquire);
+        registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
+        // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
+        // once; retain this synthetic-mode overload.
+        registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "release", "()V", native_sem_release);
+        registry.register(sem, "release", "(I)V", native_sem_release_n);
+        registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
+        registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+        registry.register(
+            sem,
+            "tryAcquire",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_sem_try_acquire_timeout,
+        );
+        registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
+        registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
+        registry.register(sem, "isFair", "()Z", native_sem_is_fair);
+        registry.register(
+            sem,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sem_to_string,
+        );
+    }
 
     // --- CyclicBarrier ---
     let cb = "java/util/concurrent/CyclicBarrier";
@@ -74451,6 +74475,25 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // ===========================================================================
 
 fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
+    // Real AQS is the default (and is explicitly enabled by the Spring Boot
+    // runner).  Its `ReentrantReadWriteLock` constructor creates real
+    // ReadLock/WriteLock views whose `sync` field points at the real nested
+    // `Sync`.  The legacy callbacks below instead manufacture a one-field
+    // synthetic view with its parent RWL in slot zero.  That happens to work
+    // for the callbacks they replace, but not for any unoverridden real-JDK
+    // method: `WriteLock.newCondition()` reads that slot as `Sync` and then
+    // tries to invoke `Sync.newCondition()` on the outer RWL, yielding the
+    // misleading `ReentrantReadWriteLock.newCondition` NoSuchMethodError.
+    // Keep the complete RWL family on real bytecode in this mode; the JIT
+    // skip list already protects the AQS family.  StampedLock remains an
+    // independent native implementation and must stay registered.
+    let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
+        || std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    if real_aqs {
+        register_stamped_lock_natives(registry);
+        return;
+    }
+
     let rwl = "java/util/concurrent/locks/ReentrantReadWriteLock";
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
@@ -84238,6 +84281,35 @@ mod concurrency_tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[test]
+    fn default_real_aqs_does_not_override_semaphore() {
+        // This test deliberately leaves the process environment untouched:
+        // production's default is real AQS. Synthetic-AQS test runs exercise
+        // the legacy registration surface instead.
+        if std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
+            && std::env::var_os("CRATONVM_REAL_AQS").is_none()
+        {
+            return;
+        }
+
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        register_concurrent_natives(&mut registry);
+        let sem = "java/util/concurrent/Semaphore";
+        for (name, descriptor) in [
+            ("<init>", "(I)V"),
+            ("<init>", "(IZ)V"),
+            ("acquire", "()V"),
+            ("release", "()V"),
+            ("availablePermits", "()I"),
+        ] {
+            assert!(
+                registry.find(sem, name, descriptor).is_none(),
+                "real AQS must execute Semaphore.{name}{descriptor} bytecode"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ReentrantLock
     // -----------------------------------------------------------------------
@@ -84431,6 +84503,16 @@ mod concurrency_tests {
 
         native_sem_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
         assert_eq!(sem_permits(&mut ctx, sem), 2);
+    }
+
+    #[test]
+    fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
+        let mut ctx = make_ctx();
+        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+
+        native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+        assert_eq!(sem_permits(&mut ctx, sem), 0);
     }
 
     #[test]

@@ -119,6 +119,7 @@ socket2 = { version = "0.5", features = ["all"] }
 # exposes `poll(2)`, on Windows it exposes `WSAPoll` through the same API
 # surface, so a single call site handles both platforms (NEW-3).
 libc = "0.2"
+filetime = "0.2"
 # NEW-18: libffi for portable, ABI-correct dynamic FFI dispatch.
 # Handles arbitrary arities, mixed int/float register classification,
 # variadic calls, struct-by-value, and closure (upcall) stubs across

@@ -15872,6 +15872,21 @@ pub(crate) fn proxy_instance_satisfies_target(
         return true;
     }
 
+    // A real-super generated `$ProxyN` has just the inherited handler field
+    // at slot 0; its interfaces are declared on the class. Do not probe the
+    // synthetic interfaces slot on it: that is out of bounds and this helper
+    // is hot in Spring's conversion/binding path.
+    let proxy_cid = shared.heap.class_id_of(obj_ref);
+    let has_iface_slot = shared
+        .class_manager
+        .read()
+        .get_class(proxy_cid)
+        .map(|c| c.num_total_fields >= 2)
+        .unwrap_or(false);
+    if !has_iface_slot {
+        return obj_name == "java/lang/reflect/Proxy$Instance";
+    }
+
     let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
         cratonvm_types::Value::Object(Some(a)) => a,
         _ => {
@@ -15905,14 +15920,6 @@ pub(crate) fn proxy_instance_satisfies_target(
     // round-trips (proxy-real-classfile Increment 4 soak). Mirrors the same
     // slot-1→declared-interfaces fix applied to
     // `proxy_resolve_declaring_class_mirror`.
-    let proxy_cid = shared.heap.class_id_of(obj_ref);
-    let has_iface_slot = shared
-        .class_manager
-        .read()
-        .get_class(proxy_cid)
-        .map(|c| c.num_total_fields >= 2)
-        .unwrap_or(false);
-
     let mut iface_cids: Vec<ClassId> = Vec::new();
     if has_iface_slot {
         match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
@@ -21702,7 +21709,13 @@ pub(crate) fn try_lambda_dispatch(
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
-            let result = invoke_on_class_shared(
+            // A REF_invokeSpecial lambda target is statically bound to its
+            // implementation owner.  In particular, an Interface.super::m
+            // method reference must reach that interface default method even
+            // when the receiver overrides m.  Retargeting here can resolve a
+            // same-named synthetic lambda helper on the receiver instead and
+            // recurse through the default method indefinitely.
+            let result = crate::vm::invoke_on_class_shared_no_retarget(
                 shared,
                 thread,
                 class_id,
@@ -26774,7 +26787,14 @@ fn try_stackless_invoke(
     // the call-site arguments but substitute that target for native dispatch.
     let mut downcall_adapter_args: Option<Vec<Value>> = None;
     let native_cb = native_cb.or_else(|| {
-        if !matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
+        // This is an adapter for MethodHandle itself, not a general fallback
+        // for any method named invoke*.  In particular, JUnit's executable
+        // invocation path reaches methods with those names on ordinary
+        // zero-field objects; treating those objects as Linker adapters reads
+        // a non-existent slot 0 and leaves the interpreter retrying the call.
+        if class_name != "java/lang/invoke/MethodHandle"
+            || !matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
+        {
             return None;
         }
         let adapter = match args.first() {

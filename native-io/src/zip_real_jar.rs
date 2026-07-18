@@ -26,12 +26,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
+use zip::extra_fields::ExtraField;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
@@ -453,6 +454,8 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // compression scheme. Unknown methods get -1 (not a valid ZIP code)
     // so they fail loudly rather than being misinterpreted.
     let method: i64 = compression_method_code(&entry.compression());
+    let mut times = zip_entry_times(&entry);
+    merge_zip_entry_times(&mut times, zip_local_entry_times(&state.path, &entry));
     drop(entry);
     drop(table);
 
@@ -463,7 +466,8 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         size,
         csize,
         crc,
-    )))))
+        times,
+    )?))))
 }
 
 /// Map a `zip::CompressionMethod` to the standard ZIP method code (per
@@ -506,7 +510,23 @@ fn alloc_zip_entry(
     size: i64,
     csize: i64,
     crc: i64,
-) -> ObjectRef {
+    times: ZipEntryTimes,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Materialize FileTime objects before allocating the ZipEntry: each Java
+    // allocation is a GC point, so this avoids retaining an unpinned entry
+    // reference across an allocation.
+    let mtime = times
+        .modified
+        .map(|time| zip_filetime(ctx, time))
+        .transpose()?;
+    let atime = times
+        .access
+        .map(|time| zip_filetime(ctx, time))
+        .transpose()?;
+    let ctime = times
+        .creation
+        .map(|time| zip_filetime(ctx, time))
+        .transpose()?;
     let entry = match ctx.ensure_class_initialized("java/util/zip/ZipEntry") {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
@@ -527,7 +547,150 @@ fn alloc_zip_entry(
     ctx.set_field_by_name(entry, "size", Value::Long(size));
     ctx.set_field_by_name(entry, "csize", Value::Long(csize));
     ctx.set_field_by_name(entry, "crc", Value::Long(crc));
-    entry
+    if let Some(time) = mtime {
+        ctx.set_field_by_name(entry, "mtime", Value::Object(Some(time)));
+    }
+    if let Some(time) = atime {
+        ctx.set_field_by_name(entry, "atime", Value::Object(Some(time)));
+    }
+    if let Some(time) = ctime {
+        ctx.set_field_by_name(entry, "ctime", Value::Object(Some(time)));
+    }
+    Ok(entry)
+}
+
+#[derive(Clone, Copy, Default)]
+struct ZipEntryTimes {
+    modified: Option<i64>,
+    access: Option<i64>,
+    creation: Option<i64>,
+}
+
+/// Pull high-fidelity times out of ZIP extra fields. The DOS header is only
+/// two-second resolution and, for entries written by the JDK with FileTime
+/// metadata, may be the 1980 fallback while the real values live in 0x5455.
+fn zip_entry_times(entry: &zip::read::ZipFile<'_>) -> ZipEntryTimes {
+    let mut times = ZipEntryTimes::default();
+    for field in entry.extra_data_fields() {
+        merge_zip_entry_times(&mut times, zip_extra_field_times(field));
+    }
+    times
+}
+
+fn zip_extra_field_times(field: &ExtraField) -> ZipEntryTimes {
+    match field {
+        ExtraField::ExtendedTimestamp(timestamp) => ZipEntryTimes {
+            modified: timestamp.mod_time().map(|time| i64::from(time) * 1_000),
+            access: timestamp.ac_time().map(|time| i64::from(time) * 1_000),
+            creation: timestamp.cr_time().map(|time| i64::from(time) * 1_000),
+        },
+        ExtraField::Ntfs(timestamp) => ZipEntryTimes {
+            modified: Some(windows_filetime_to_unix_millis(timestamp.mtime())),
+            access: Some(windows_filetime_to_unix_millis(timestamp.atime())),
+            creation: Some(windows_filetime_to_unix_millis(timestamp.ctime())),
+        },
+    }
+}
+
+fn windows_filetime_to_unix_millis(time: u64) -> i64 {
+    (i128::from(time) / 10_000 - 11_644_473_600_000i128) as i64
+}
+
+fn merge_zip_entry_times(target: &mut ZipEntryTimes, source: ZipEntryTimes) {
+    if source.modified.is_some() {
+        target.modified = source.modified;
+    }
+    if source.access.is_some() {
+        target.access = source.access;
+    }
+    if source.creation.is_some() {
+        target.creation = source.creation;
+    }
+}
+
+/// The JDK writes access and creation times to the local-header 0x5455 field,
+/// while its central-directory record commonly carries only modified time.
+/// `zip` exposes parsed central extras, so read the small local extra block as
+/// well to preserve all three `ZipEntry` time attributes.
+fn zip_local_entry_times(path: &PathBuf, entry: &zip::read::ZipFile<'_>) -> ZipEntryTimes {
+    let Ok(mut file) = File::open(path) else {
+        return ZipEntryTimes::default();
+    };
+    if file.seek(SeekFrom::Start(entry.header_start())).is_err() {
+        return ZipEntryTimes::default();
+    }
+    let mut header = [0u8; 30];
+    if file.read_exact(&mut header).is_err() || header[0..4] != *b"PK\x03\x04" {
+        return ZipEntryTimes::default();
+    }
+    let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+    let extra_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
+    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
+        return ZipEntryTimes::default();
+    }
+    let mut extra = vec![0u8; extra_len];
+    if file.read_exact(&mut extra).is_err() {
+        return ZipEntryTimes::default();
+    }
+    zip_extra_bytes_times(&extra)
+}
+
+fn zip_extra_bytes_times(extra: &[u8]) -> ZipEntryTimes {
+    let mut times = ZipEntryTimes::default();
+    let mut offset = 0;
+    while offset + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
+        let len = usize::from(u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]));
+        offset += 4;
+        let Some(data) = extra.get(offset..offset + len) else {
+            break;
+        };
+        match tag {
+            0x5455 if !data.is_empty() => {
+                let flags = data[0];
+                let mut cursor = 1;
+                let mut read_time = |enabled: bool| {
+                    if !enabled || cursor + 4 > data.len() {
+                        return None;
+                    }
+                    let time = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?);
+                    cursor += 4;
+                    Some(i64::from(time) * 1_000)
+                };
+                times.modified = read_time(flags & 0x01 != 0 || data.len() == 5);
+                times.access = read_time(flags & 0x02 != 0);
+                times.creation = read_time(flags & 0x04 != 0);
+            }
+            0x000a if data.len() >= 32 && data[4..6] == [0x01, 0x00] && data[6..8] == [24, 0] => {
+                times.modified = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[8..16].try_into().unwrap(),
+                )));
+                times.access = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[16..24].try_into().unwrap(),
+                )));
+                times.creation = Some(windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[24..32].try_into().unwrap(),
+                )));
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+    times
+}
+
+fn zip_filetime(ctx: &mut dyn NativeContext, millis: i64) -> Result<ObjectRef, MethodCallFailed> {
+    match ctx.invoke(
+        "java/nio/file/attribute/FileTime",
+        "fromMillis",
+        "(J)Ljava/nio/file/attribute/FileTime;",
+        &[Value::Long(millis)],
+    )? {
+        Some(Value::Object(Some(time))) => Ok(time),
+        _ => Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: "FileTime.fromMillis returned no FileTime".to_string(),
+        })),
+    }
 }
 
 fn read_zip_entry_name(ctx: &dyn NativeContext, entry: ObjectRef) -> Option<String> {
@@ -651,7 +814,7 @@ fn build_byte_array_input_stream(
 /// native rather than falling through to real bytecode.
 fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let handle = get_jar_handle(ctx, this);
-    let entries: Vec<(String, i64, i64, i64, i64)> = {
+    let entries: Vec<(String, i64, i64, i64, i64, ZipEntryTimes)> = {
         let mut table = jar_table().lock();
         let state = match table.get_mut(&handle) {
             Some(s) => s,
@@ -688,12 +851,15 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 // Round-9 HIGH: real ZIP method code, not a DEFLATED stand-in.
                 // See `compression_method_code` for the mapping rationale.
                 let method: i64 = compression_method_code(&f.compression());
+                let mut times = zip_entry_times(&f);
+                merge_zip_entry_times(&mut times, zip_local_entry_times(&state.path, &f));
                 v.push((
                     f.name().to_string(),
                     method,
                     f.size() as i64,
                     f.compressed_size() as i64,
                     f.crc32() as i64 & 0xFFFF_FFFFi64,
+                    times,
                 ));
             }
         }
@@ -710,8 +876,8 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
-    for (name, method, size, csize, crc) in entries {
-        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc);
+    for (name, method, size, csize, crc, times) in entries {
+        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc, times)?;
         ctx.invoke(
             al_class,
             "add",
@@ -1078,6 +1244,19 @@ mod tests {
         let mut out = Vec::new();
         c.read_to_end(&mut out).unwrap();
         assert_eq!(&out, data);
+    }
+
+    #[test]
+    fn local_extended_timestamp_preserves_all_three_times() {
+        // Header 0x5455, payload: flags + modified/access/creation Unix seconds.
+        let mut extra = vec![0x55, 0x54, 13, 0, 0x07];
+        for seconds in [1_700_000_001u32, 1_700_000_002, 1_700_000_003] {
+            extra.extend_from_slice(&seconds.to_le_bytes());
+        }
+        let times = zip_extra_bytes_times(&extra);
+        assert_eq!(times.modified, Some(1_700_000_001_000));
+        assert_eq!(times.access, Some(1_700_000_002_000));
+        assert_eq!(times.creation, Some(1_700_000_003_000));
     }
 
     /// Regression coverage for `native_jarfile_get_comment`'s data source.

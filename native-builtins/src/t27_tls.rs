@@ -550,6 +550,41 @@ pub(crate) fn build_engine_client_config_with_identity(
     )
 }
 
+/// Build a rustls client configuration for one explicit Java `SSLContext`.
+/// This is intentionally per-call rather than using the HttpsURLConnection
+/// process-wide selected-context slot: separate `HttpClient` instances are
+/// allowed to carry different trust managers simultaneously.
+pub(crate) fn client_config_for_ssl_context(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+) -> Result<Arc<ClientConfig>, String> {
+    client_config_for_ssl_context_with_ciphers(ctx, ctx_obj, &[])
+}
+
+/// As `client_config_for_ssl_context`, but applies the Java cipher-suite
+/// restriction carried by a caller's `SSLParameters`.  The JDK HttpClient
+/// path creates its own rustls connection rather than an `SSLSocket`, so this
+/// must be applied while building that connection's `ClientConfig`; merely
+/// retaining the `SSLParameters` object on the client would not constrain the
+/// TLS ClientHello.
+pub(crate) fn client_config_for_ssl_context_with_ciphers(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+    enabled_ciphers: &[String],
+) -> Result<Arc<ClientConfig>, String> {
+    let key = ctx_obj_key(ctx, ctx_obj);
+    let identity = ctx_identity(ctx, ctx_obj);
+    build_engine_client_config_with_identity_ciphers(
+        &["http/1.1"],
+        identity
+            .as_ref()
+            .map(|(cert, key)| (cert.as_str(), key.as_str())),
+        Some(key),
+        Some(key),
+        enabled_ciphers,
+    )
+}
+
 /// As `build_engine_client_config_with_identity`, but additionally restricts
 /// the negotiable cipher suites to `enabled_ciphers` when non-empty. Used by
 /// `SSLSocket.setEnabledCipherSuites` (net_phase_e.rs) to reconnect a socket
@@ -560,11 +595,51 @@ pub(crate) fn build_engine_client_config_with_identity(
 pub(crate) fn build_engine_client_config_with_identity_ciphers(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
+    km_ctx_key: Option<u64>,
+    trust_managers_ctx_key: Option<u64>,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
     let trust_roots = active_client_trust_roots();
+    let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
     let roots = root_store_for_trust_roots(trust_roots.as_ref());
-    build_client_config_ciphers(roots, alpn, client_identity, enabled_ciphers)
+    let use_java_trust_manager = trust_managers_ctx_key
+        .and_then(|key| {
+            ctx_trust_managers_table()
+                .lock()
+                .get(&key)
+                .map(|managers| (!managers.is_empty()).then_some(key))
+        })
+        .is_some();
+    let provider = cipher_provider_for(enabled_ciphers);
+    if let Some(key) = km_ctx_key {
+        let has_kms = ctx_key_managers_table()
+            .lock()
+            .get(&key)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if has_kms {
+            let resolver: Arc<dyn ResolvesClientCert> = Arc::new(JavaKeyManagerResolver {
+                km_ctx_key: key,
+                provider: provider.clone(),
+            });
+            return build_client_config_ex_with_provider(
+                roots,
+                alpn,
+                ClientAuthMode::Resolver(resolver),
+                revocation,
+                use_java_trust_manager,
+                provider,
+            );
+        }
+    }
+    build_client_config_ex_with_provider(
+        roots,
+        alpn,
+        ClientAuthMode::Fixed(client_identity),
+        revocation,
+        use_java_trust_manager,
+        provider,
+    )
 }
 
 // The client identity (cert_pem, key_pem) installed via
@@ -1544,13 +1619,33 @@ fn build_client_config_ex(
     revocation: Option<crate::x509_manager::RevocationConfig>,
     use_java_trust_manager: bool,
 ) -> Result<Arc<ClientConfig>, String> {
+    build_client_config_ex_with_provider(
+        roots,
+        alpn_protocols,
+        client_auth,
+        revocation,
+        use_java_trust_manager,
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+}
+
+/// Provider-aware implementation of `build_client_config_ex`.  A distinct
+/// provider is required when Java `SSLParameters` narrows the allowed cipher
+/// suites, including for the custom-verifier and Java-KeyManager branches.
+fn build_client_config_ex_with_provider(
+    roots: RootCertStore,
+    alpn_protocols: &[&str],
+    client_auth: ClientAuthMode<'_>,
+    revocation: Option<crate::x509_manager::RevocationConfig>,
+    use_java_trust_manager: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<ClientConfig>, String> {
     let builder = if use_java_trust_manager {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PassthroughServerCertVerifier {
                 algorithms: provider.signature_verification_algorithms.clone(),
             });
-        ClientConfig::builder_with_provider(provider)
+        ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
             .dangerous()
@@ -1564,11 +1659,16 @@ fn build_client_config_ex(
                     .map_err(|e| format!("WebPkiServerVerifier::builder failed: {e}"))?;
                 let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
                     Arc::new(OcspAwareServerCertVerifier { inner, revocation });
-                ClientConfig::builder()
+                ClientConfig::builder_with_provider(provider.clone())
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
             }
-            None => ClientConfig::builder().with_root_certificates(roots),
+            None => ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+                .with_root_certificates(roots),
         }
     };
     let mut config = match client_auth {

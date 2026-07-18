@@ -434,6 +434,36 @@ fn check_access(
     )
 }
 
+/// Check a reflective field access using the caller-sensitive part of the
+/// ordinary Java member-access rules.
+///
+/// `Field.get` is not intrinsically a deep-reflection operation.  In
+/// particular, code may reflectively read a private field it declares itself
+/// without first calling `setAccessible(true)`.  HikariConfig relies on this
+/// for its private-final `AtomicReference<Credentials>` while copying config
+/// state.  The old blanket non-public rejection incorrectly treated that
+/// legal same-class read as an access violation.
+///
+/// Keep the existing conservative rule for callers outside the declaring
+/// class: those still need a public member or the explicit accessible
+/// override.  JPMS/open-package validation remains in the caller after this
+/// check and continues to govern cross-class deep reflection.
+fn check_field_access(
+    ctx: &mut dyn NativeContext,
+    modifiers: i32,
+    accessible: bool,
+    declaring_class_id: ClassId,
+    member_desc: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if accessible || (modifiers & ACC_PUBLIC) != 0 {
+        return Ok(());
+    }
+    if resolve_caller_class_id(ctx) == Some(declaring_class_id) {
+        return Ok(());
+    }
+    check_access(modifiers, false, member_desc)
+}
+
 // ---------------------------------------------------------------------------
 // NEW-19: JPMS `opens` / `exports` enforcement for reflection (JEP 403)
 // ---------------------------------------------------------------------------
@@ -485,10 +515,11 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// `StackFrameBuffer` frame (allowed by `caller_is_jdk_internal`) instead of
 /// the user `main` further out, which previously produced a spurious
 /// `IllegalAccessException` (Spring Boot `deduceMainApplicationClass`).
+// Use exact frame ClassIds rather than resolving stack-trace display names:
+// two classes from different loaders can share a binary name.
 fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
-    let trace = ctx.capture_stack_trace(0);
-    for entry in trace.iter().rev() {
-        let name: &str = &entry.class_name;
+    for cid in ctx.frame_class_ids() {
+        let name = ctx.class_name_of_id(cid)?;
         let is_internal = REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
             if prefix.ends_with('/') {
                 name.starts_with(prefix)
@@ -499,9 +530,7 @@ fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
         if is_internal {
             continue;
         }
-        if let Some(cid) = ctx.class_id_by_name(name) {
-            return Some(cid);
-        }
+        return Some(cid);
     }
     None
 }
@@ -1208,7 +1237,16 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ctx.find_resource(&resource_name) {
+    // A package-directory resource has a URL but no byte content to read.
+    // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
+    // `SomeClass`'s package directory and HotSpot returns a non-null stream.
+    // `find_resource` correctly declines to open a directory as a file, so use
+    // the URL lookup solely to distinguish that existing directory from a
+    // missing resource and serve an empty stream for the former.
+    let bytes = ctx
+        .find_resource(&resource_name)
+        .or_else(|| (!ctx.find_all_resource_urls(&resource_name).is_empty()).then(Vec::new));
+    match bytes {
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
             let len = bytes.len();
@@ -4415,7 +4453,13 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, &format!("Field.get({})", descriptor))?;
+    check_field_access(
+        ctx,
+        modifiers,
+        accessible,
+        class_id,
+        &format!("Field.get({})", descriptor),
+    )?;
     // NEW-19: module-level opens check (JPMS)
     enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
 
@@ -4516,7 +4560,13 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, &format!("Field.set({})", descriptor))?;
+    check_field_access(
+        ctx,
+        modifiers,
+        accessible,
+        class_id,
+        &format!("Field.set({})", descriptor),
+    )?;
     // WP2.1-field вЂ” final-field write check (must run AFTER access check
     // so the more specific error message wins on a public-final field).
     check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
@@ -4623,7 +4673,7 @@ fn field_get_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, "Field typed getter")?;
+    check_field_access(ctx, modifiers, accessible, class_id, "Field typed getter")?;
     // NEW-19: module-level opens check (JPMS).
     // `enforce_module_check_from_mirror` takes the slot index of the
     // declaring-class mirror on the Field object; still 0 historically,
@@ -4841,7 +4891,7 @@ fn field_set_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_access(modifiers, accessible, "Field typed setter")?;
+    check_field_access(ctx, modifiers, accessible, class_id, "Field typed setter")?;
     // WP2.1-field вЂ” final-field write check (matches Field.set on the
     // generic `set(Object,Object)` path).
     check_final_for_set(modifiers, accessible, "Field typed setter")?;
@@ -17396,6 +17446,45 @@ mod tests {
             )) => assert_eq!(message, "bad"),
             other => panic!("expected IllegalArgumentException, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn field_access_allows_private_field_from_its_declaring_class() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(vec![declaring]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn field_access_rejects_private_field_from_another_class_without_override() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/OtherCaller")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
     }
 
     // -----------------------------------------------------------------------
