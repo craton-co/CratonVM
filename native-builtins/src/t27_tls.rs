@@ -856,30 +856,38 @@ fn trust_roots_pem(trust_roots: Option<&TlsTrustRoots>) -> String {
 /// hardcoded assumption) if the DER doesn't parse as expected, so this is
 /// strictly additive -- it can only recognize MORE valid keys, never fewer.
 fn sniff_private_key_pem_header(der: &[u8]) -> &'static str {
-    fn tlv_value_offset(buf: &[u8], tag_pos: usize) -> Option<usize> {
+    fn tlv_bounds(buf: &[u8], tag_pos: usize) -> Option<(usize, usize)> {
         if tag_pos + 1 >= buf.len() {
             return None;
         }
         let len_byte = buf[tag_pos + 1];
         let mut p = tag_pos + 2;
-        if len_byte & 0x80 != 0 {
+        let len = if len_byte & 0x80 != 0 {
             let n = (len_byte & 0x7f) as usize;
             if n > 4 || p + n > buf.len() {
                 return None;
             }
+            let mut len = 0usize;
+            for byte in &buf[p..p + n] {
+                len = len.checked_mul(256)?.checked_add(*byte as usize)?;
+            }
             p += n;
-        }
-        Some(p)
+            len
+        } else {
+            len_byte as usize
+        };
+        let end = p.checked_add(len)?;
+        (end <= buf.len()).then_some((p, end))
     }
     (|| -> Option<&'static str> {
         if *der.first()? != 0x30 {
             return None; // must be a top-level SEQUENCE
         }
-        let after_outer = tlv_value_offset(der, 0)?;
+        let (after_outer, _) = tlv_bounds(der, 0)?;
         if *der.get(after_outer)? != 0x02 {
             return None; // version INTEGER
         }
-        let after_version = tlv_value_offset(der, after_outer)?;
+        let (_, after_version) = tlv_bounds(der, after_outer)?;
         match der.get(after_version) {
             Some(0x30) => Some("PRIVATE KEY"),    // PKCS#8 AlgorithmIdentifier
             Some(0x04) => Some("EC PRIVATE KEY"), // SEC1 privateKey OCTET STRING
