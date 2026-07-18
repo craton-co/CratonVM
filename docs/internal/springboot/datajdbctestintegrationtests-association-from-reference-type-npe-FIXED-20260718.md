@@ -4,18 +4,23 @@
 
 ## Resolution (2026-07-18)
 
-**Status: FIXED / record retired.** This report is a downstream manifestation
-of the optional jMolecules association gate documented in
-`data-jdbc-id-field-misclassified-as-association-FIXED-20260718.md`, not an
-independent private-final-field reflection issue. With the absent
-`org.jmolecules.ddd.types.Association` name correctly throwing
-`ClassNotFoundException`, Spring Data never walks `ExampleEntity.name` as an
-association.
+**Status: FIXED / record retired.** The optional jMolecules lookup was already
+correct and is retained as an independent class-loading regression. The actual
+failure was lambda dispatch: `LambdaMetafactory` supplied a private synthetic
+body as an `InvokeVirtual` handle, and CratonVM re-resolved that handle against
+the captured property's concrete subclass. Spring Data subclasses contain
+same-named `lambda$new$N` methods, so the VM executed the subclass supplier
+instead of `AbstractPersistentProperty.lambda$new$2`.
 
-The shared `ROptionalClassForName` regression verifies both
-`Class.forName(name, false, loader)` and `ClassLoader.loadClass(name)` on JIT
-and `--nojit`; each must report the dependency absent. The original failure
-record remains below for history.
+Private lambda implementation handles now dispatch to their resolved declaring
+class in both the interpreter and native-context lambda paths. Ordinary virtual
+method references keep receiver-based dispatch. `RPrivateLambdaOwner` covers a
+parent/child synthetic-lambda-name collision; `ROptionalClassForName` continues
+to verify absent optional dependencies.
+
+Validation: the real Spring Data JDBC metamodel reports `association=false`
+for `Long` and `String` fields with JIT enabled and with `--nojit`, followed by
+the real `DataJdbcTestIntegrationTests` runner class in both modes.
 
 ## Original report
 
@@ -63,7 +68,12 @@ public class ExampleEntity {
 what's on the class — nothing that should make Spring Data JDBC treat it
 as a reference to another aggregate root.
 
-## Root cause (unconfirmed hypothesis)
+## Historical hypothesis (superseded)
+
+The private-final-field/reflection hypothesis below was disproved. Direct
+`Field.getType()` and `Field.getGenericType()` checks were correct in both
+execution modes; the residual was the private-lambda owner dispatch described
+above.
 
 Spring Data JDBC's `BasicPersistentEntity.doWithAssociations` walks every
 persistent property Spring Data's metamodel does **not** classify as a

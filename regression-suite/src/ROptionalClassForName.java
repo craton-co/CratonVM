@@ -1,9 +1,8 @@
 /**
  * Regression: optional dependencies must remain absent when they are not on
  * the class path. Spring Data uses this exact Class.forName form for
- * org.jmolecules.ddd.types.Association; treating the missing type as a Class
- * (or returning null from ClassLoader.loadClass) makes every persistent
- * property look like an association.
+ * org.jmolecules.ddd.types.Association. Keep the lookup contract covered as
+ * an independent class-loading boundary.
  */
 public class ROptionalClassForName {
     private static final String MISSING = "org.jmolecules.ddd.types.Association";
