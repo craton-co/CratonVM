@@ -1,5 +1,13 @@
 # MockWebEnvironmentServletComponentScanIntegrationTests — fixed closure
 
+> **UPDATE 2026-07-18 (later same day):** this class regressed again on
+> later `dev` tip (a genuine `URLClassLoader.getResourceAsStream`
+> real-JDK-mode gap, unrelated to the livelock/loader-URL findings below)
+> and was root-caused and fixed — see
+> [`urlclassloader-getresourceasstream-real-jdk-mode-dead-FIXED.md`](urlclassloader-getresourceasstream-real-jdk-mode-dead-FIXED.md).
+> The findings below are retained for their own evidence trail but are no
+> longer the current closure for this class.
+
 The original hang report was consolidated into
 [`junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md)
 on 2026-07-18. Its `InterceptingExecutableInvoker` retry-storm root cause is
