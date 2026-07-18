@@ -13832,19 +13832,18 @@ fn invoke_on_class_shared_inner(
                 "javax/net/ssl/SSLServerSocketFactory"
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
-                if let Some(callback) =
-                    shared
-                        .native_methods
-                        // The real JDK factory carries its SSLContext in the
-                        // same first instance slot consumed by the bridge.
-                        // Reuse the bridge registered on its public API type
-                        // rather than interpreting `SSLServerSocketImpl`,
-                        // whose host socket path bypasses the TLS registry.
-                        .find(
-                            "javax/net/ssl/SSLServerSocketFactory",
-                            method_name,
-                            descriptor,
-                        )
+                if let Some(callback) = shared
+                    .native_methods
+                    // The real JDK factory carries its SSLContext in the
+                    // same first instance slot consumed by the bridge.
+                    // Reuse the bridge registered on its public API type
+                    // rather than interpreting `SSLServerSocketImpl`,
+                    // whose host socket path bypasses the TLS registry.
+                    .find(
+                        "javax/net/ssl/SSLServerSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
                 {
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
@@ -14839,6 +14838,29 @@ fn invoke_on_class_shared_inner(
                                 | "size"
                                 | "close"
                                 | "getName"
+                            ))
+                        // `JarFile` inherits its ZipFile operations.  A
+                        // subclass `super.close()` (or another inherited
+                        // super call) resolves from the JarFile constant-pool
+                        // reference to ZipFile, where the real JDK body reads
+                        // fields that the native-backed constructor does not
+                        // populate.  Keep the ZipFile side of the bridge
+                        // allow-list in sync with the methods registered in
+                        // `register_jar_natives` so those inherited special
+                        // calls use the same Rust-backed state as direct
+                        // JarFile calls.
+                        || (class_name == "java/util/zip/ZipFile"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEntry"
+                                | "getInputStream"
+                                | "entries"
+                                | "stream"
+                                | "getComment"
+                                | "close"
+                                | "getName"
+                                | "size"
                             ))
                         || (class_name == "java/util/jar/Manifest"
                             && matches!(

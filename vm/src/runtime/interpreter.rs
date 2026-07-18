@@ -1114,8 +1114,10 @@ fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
-    !matches!(class.loader_id, cratonvm_types::ClassLoaderId::UserDefined(_))
-        && cm.find_class_by_name(&class.name) == Some(class_id)
+    !matches!(
+        class.loader_id,
+        cratonvm_types::ClassLoaderId::UserDefined(_)
+    ) && cm.find_class_by_name(&class.name) == Some(class_id)
 }
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
@@ -2265,7 +2267,12 @@ fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
         return false;
     }
     if TLAB_LAST_BREAK_ALLOC_TOTAL
-        .compare_exchange(last, alloc_total.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .compare_exchange(
+            last,
+            alloc_total.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
         .is_err()
     {
         // Another thread is breaking the same wedge; let it.
@@ -6686,7 +6693,9 @@ pub fn execute(
                     }
                     for (pi, p) in thread.native_pin_roots.iter().enumerate() {
                         if p.as_ptr() as usize == stale {
-                            eprintln!("[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}");
+                            eprintln!(
+                                "[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}"
+                            );
                             found += 1;
                         }
                     }
@@ -6694,7 +6703,9 @@ pub fn execute(
                         let snap = thread.root_snapshot.lock();
                         for (si, r) in snap.iter().enumerate() {
                             if r.as_ptr() as usize == stale {
-                                eprintln!("[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}");
+                                eprintln!(
+                                    "[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}"
+                                );
                                 found += 1;
                             }
                         }
@@ -19030,11 +19041,16 @@ fn execute_invoke_kind(
                                 if std::env::var_os("CRATONVM_DBG_A2").is_some() {
                                     let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
                                     if hist.is_empty() {
-                                        eprintln!("[stale-recv] [A2] NO event touches {stale_addr:#x}");
+                                        eprintln!(
+                                            "[stale-recv] [A2] NO event touches {stale_addr:#x}"
+                                        );
                                     } else {
                                         for r in hist {
                                             if r.kind == 0xFF {
-                                                eprintln!("[stale-recv] [A2] seq={} FREE @{:#x}", r.seq, r.addr);
+                                                eprintln!(
+                                                    "[stale-recv] [A2] seq={} FREE @{:#x}",
+                                                    r.seq, r.addr
+                                                );
                                             } else {
                                                 eprintln!("[stale-recv] [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}", r.seq, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size);
                                             }
@@ -19791,6 +19807,7 @@ fn execute_invoke_kind(
         &method_descriptor,
         &args,
         false,
+        is_special,
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
@@ -19973,9 +19990,7 @@ fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
 /// Returns the original value unchanged if it's not a recognized wrapper.
 fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
     match (prim_char, v) {
-        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => {
-            shared.heap.get_field(b, 0)
-        }
+        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
         // Lambda metafactory adaptation permits unboxing followed by primitive
         // widening.  An Integer supplied to a `long` implementation method
         // must therefore become Value::Long, rather than carrying the raw
@@ -21109,8 +21124,7 @@ pub(crate) fn try_lambda_dispatch(
     // The bytecode call-site descriptor is the authoritative identity. Only the
     // exact SAM descriptor may enter the lambda body; any other descriptor must
     // fall through to ordinary interface/default-method dispatch.
-    if method_name == &*call_site.sam_method_name
-        && method_descriptor != &*call_site.sam_descriptor
+    if method_name == &*call_site.sam_method_name && method_descriptor != &*call_site.sam_descriptor
     {
         return Ok(None);
     }
@@ -22220,10 +22234,7 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
-                | (
-                    "forPrimitiveName",
-                    "(Ljava/lang/String;)Ljava/lang/Class;"
-                )
+                | ("forPrimitiveName", "(Ljava/lang/String;)Ljava/lang/Class;")
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24097,6 +24108,28 @@ fn force_native_over_real_jdk_bytecode(
     method_descriptor: &str,
 ) -> bool {
     hotpath_counts::bump(&hotpath_counts::FORCE_NATIVE_CALLS);
+    // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
+    // allow-list. JarFile inherits these operations from ZipFile, so a
+    // subclass `super.close()` resolves to the real ZipFile bytecode after
+    // cache population unless its registered bridge is forced here too. The
+    // real body dereferences constructor state which native-backed JarFiles do
+    // not have.
+    if class_name == "java/util/zip/ZipFile"
+        && matches!(
+            method_name,
+            "<init>"
+                | "getEntry"
+                | "getInputStream"
+                | "entries"
+                | "stream"
+                | "getComment"
+                | "close"
+                | "getName"
+                | "size"
+        )
+    {
+        return true;
+    }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -24708,27 +24741,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-        // ClassLoader resource methods have the same issue: real JDK bytecode
-        // walks URLClassPath state which CratonVM intentionally replaces with
-        // native per-loader lookups.  Keep the singular, stream, and bulk
-        // methods together so URLClassLoader instances do not fall back to the
-        // process-wide dynamic classpath (which leaks resources between test
-        // loaders) and null arguments retain their specified NPE contract.
-        if class_name == "java/lang/ClassLoader"
-            && matches!(
-                method_name,
-                "getResource"
-                    | "getSystemResource"
-                    | "getResources"
-                    | "getSystemResources"
-                    | "getResourceAsStream"
-                    | "getSystemResourceAsStream"
-            )
-        {
-            return true;
-        }
+    // ClassLoader resource methods have the same issue: real JDK bytecode
+    // walks URLClassPath state which CratonVM intentionally replaces with
+    // native per-loader lookups.  Keep the singular, stream, and bulk
+    // methods together so URLClassLoader instances do not fall back to the
+    // process-wide dynamic classpath (which leaks resources between test
+    // loaders) and null arguments retain their specified NPE contract.
+    if class_name == "java/lang/ClassLoader"
+        && matches!(
+            method_name,
+            "getResource"
+                | "getSystemResource"
+                | "getResources"
+                | "getSystemResources"
+                | "getResourceAsStream"
+                | "getSystemResourceAsStream"
+        )
+    {
+        return true;
+    }
 
-        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25984,8 +26017,7 @@ pub(crate) fn is_netty_event_executor_group_shutdown_native_override(
         "io/netty/util/concurrent/EventExecutorGroup"
             | "io/netty/util/concurrent/AbstractEventExecutorGroup"
             | "io/netty/channel/MultiThreadIoEventLoopGroup"
-    )
-        && method_name == "shutdownGracefully"
+    ) && method_name == "shutdownGracefully"
         && method_descriptor == "()Lio/netty/util/concurrent/Future;"
 }
 
@@ -26026,8 +26058,7 @@ pub(crate) fn is_datagram_channel_open_native_override(
     if matches!(
         class_name,
         "java/nio/channels/DatagramChannel" | "java/nio/channels/NetworkChannel"
-    )
-        && method_name == "getLocalAddress"
+    ) && method_name == "getLocalAddress"
         && method_descriptor == "()Ljava/net/SocketAddress;"
     {
         return true;
@@ -26136,13 +26167,20 @@ fn intercept_force_registered_native(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
             if let Some(value) = result {
@@ -26279,13 +26317,20 @@ fn intercept_force_registered_native_cached(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         let ret_type = crate::jit::return_type(method_descriptor);
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -26540,8 +26585,14 @@ fn intercept_classloader_subclass_resource_native(
         || !matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         return None;
@@ -26734,6 +26785,7 @@ fn try_stackless_invoke(
     descriptor: &str,
     args: &[Value],
     walk_native_hierarchy: bool,
+    is_special: bool,
     // Loader-isolation dispatch override: when `Some`, the bytecode-method
     // lookup uses THIS class_id instead of re-resolving `class_name` (which can
     // pick the wrong same-named per-loader copy). Only the divergent
@@ -26764,6 +26816,32 @@ fn try_stackless_invoke(
     // the caller's operand stack — otherwise the next `pop_int` blows up
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
+
+    // A subclass `super.close()` is an invokespecial whose constant-pool
+    // owner is JarFile even though the concrete implementation is inherited
+    // from ZipFile. Mockito can redefine JarFile for ordinary mock calls; the
+    // general redefine guard correctly yields to that advice, but must not
+    // make this statically-bound superclass call fall into ZipFile's real
+    // bytecode (its `res` field is absent on CratonVM-native JarFiles).
+    // Limit this bypass to the exact invokespecial close shape. Virtual mock
+    // calls still take the normal redefine-aware dispatch path.
+    if is_special
+        && matches!(
+            class_name,
+            "java/util/jar/JarFile" | "java/util/zip/ZipFile"
+        )
+        && method_name == "close"
+        && descriptor == "()V"
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/util/zip/ZipFile", method_name, descriptor)
+        {
+            safe_native_call(shared, thread, callback, args)?;
+            return Ok(CachedCallResult::Handled);
+        }
+    }
 
     // Registered natives that must beat real-JDK bytecode on the declaring
     // class (URL.getHost DNS loop, ClassLoader assertion lock NPE, etc.).
@@ -27857,6 +27935,7 @@ fn execute_invokestatic(
         &method_descriptor,
         &args,
         true,
+        false,
         static_dispatch_class_id,
     )? {
         CachedCallResult::FramePushed => {
@@ -29640,7 +29719,10 @@ fn compile_osr_artifact(
                                 let cm_lock = shared.class_manager.read();
                                 match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
                                     (Some(accessor), Some(target)) => {
-                                        crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                        crate::classloading::access_control::check_class_access(
+                                            accessor, target,
+                                        )
+                                        .is_ok()
                                     }
                                     _ => true,
                                 }
@@ -29652,7 +29734,13 @@ fn compile_osr_artifact(
                                     .get_class(target_id)
                                     .map(|c| c.num_total_fields)
                                     .unwrap_or(0);
-                                new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                                new_info2.push((
+                                    pc_new,
+                                    target_id.as_u32(),
+                                    num_fields,
+                                    true,
+                                    true,
+                                ));
                             } else {
                                 new_info2.push((pc_new, 0, 0, true, true));
                             }
@@ -34285,20 +34373,24 @@ fn execute_invokevirtual_vtable_fast(
         && matches!(
             (method_name.as_ref(), method_descriptor.as_ref()),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
                 | ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
                 | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
         )
-        && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None))
+        && matches!(
+            thread.frames[frame_idx].stack.peek_at(0),
+            Value::Object(None)
+        )
     {
-        let (args, _) = pop_coerced_invoke_args_virtual(
-            shared,
-            caller_class_id,
-            cp_index,
-            frame_idx,
-            thread,
-        )?;
+        let (args, _) =
+            pop_coerced_invoke_args_virtual(shared, caller_class_id, cp_index, frame_idx, thread)?;
         let callback = match method_name.as_ref() {
             "getResource" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
             "getResources" => cratonvm_native_builtins::classloader::cl_get_resources_essential,
@@ -35026,7 +35118,12 @@ fn execute_invokevirtual_cached(
     // whereas the registered ClassLoader natives do.  Do this before reading
     // the inline cache: otherwise `resources("...")` poisons the same CP
     // entry and a later `resources(null)` silently returns a Stream.
-    if !is_special && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None)) {
+    if !is_special
+        && matches!(
+            thread.frames[frame_idx].stack.peek_at(0),
+            Value::Object(None)
+        )
+    {
         if let Ok((method_class_name, method_name, method_descriptor, _)) =
             resolve_method_ref(shared, caller_class_id, cp_index)
         {
@@ -35035,8 +35132,14 @@ fn execute_invokevirtual_cached(
                     (method_name.as_ref(), method_descriptor.as_ref()),
                     ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
                         | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                        | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                        | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                        | (
+                            "getResources",
+                            "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                        )
+                        | (
+                            "getResourceAsStream",
+                            "(Ljava/lang/String;)Ljava/io/InputStream;"
+                        )
                         | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
                 )
             {
@@ -38911,26 +39014,28 @@ mod tests {
     #[test]
     fn springboot_mongo_reactive_destroy_wait_is_replaced_only_for_its_lifecycle_bean() {
         let class_name = "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer";
-        assert!(is_springboot_mongo_reactive_customizer_destroy_native_override(
-            class_name,
-            "destroy",
-            "()V"
-        ));
+        assert!(
+            is_springboot_mongo_reactive_customizer_destroy_native_override(
+                class_name, "destroy", "()V"
+            )
+        );
         assert!(force_native_over_real_jdk_bytecode(
-            class_name,
-            "destroy",
-            "()V"
+            class_name, "destroy", "()V"
         ));
-        assert!(!is_springboot_mongo_reactive_customizer_destroy_native_override(
-            class_name,
-            "customize",
-            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
-        ));
-        assert!(is_springboot_mongo_reactive_customizer_customize_native_override(
-            class_name,
-            "customize",
-            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
-        ));
+        assert!(
+            !is_springboot_mongo_reactive_customizer_destroy_native_override(
+                class_name,
+                "customize",
+                "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+            )
+        );
+        assert!(
+            is_springboot_mongo_reactive_customizer_customize_native_override(
+                class_name,
+                "customize",
+                "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+            )
+        );
         assert!(force_native_over_real_jdk_bytecode(
             class_name,
             "customize",
@@ -40290,10 +40395,7 @@ mod tests {
             widen_unboxed_primitive('J', Value::Int(i32::MIN)),
             Value::Long(i64::from(i32::MIN))
         );
-        assert_eq!(
-            widen_unboxed_primitive('J', Value::Int(1)),
-            Value::Long(1)
-        );
+        assert_eq!(widen_unboxed_primitive('J', Value::Int(1)), Value::Long(1));
     }
 
     #[test]
