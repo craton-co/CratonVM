@@ -1,6 +1,31 @@
 # `spring-boot-data-elasticsearch`: loopback connect-refused surfaces as timeout; Spring Data association-mapping always throws for a City field
 
-**Status: OPEN — found 2026-07-17. Two unrelated failures, one per class.**
+**Status: RESOLVED 2026-07-18. Two unrelated failures, one per class.**
+
+## Resolution
+
+The association failure was not an optional-class-loading error. The
+interpreter's virtual lambda dispatch resolved a private synthetic
+`lambda$new$2` against a subclass with the same generated name and
+descriptor, rather than against its declaring class. Private lambda targets
+now retain their exact implementation owner; Spring Data's absent jMolecules
+association type is consequently observed as null and ordinary Elasticsearch
+document fields are no longer treated as associations.
+
+The health timeout combined two Windows NIO defects: a closed loopback port
+could remain pending after a raw non-blocking connect, and the resulting
+failure did not reach the Apache reactor. A pre-connect loopback probe now
+classifies a refused connection, preserves it as a native terminal state, and
+surfaces it at the reactor's first I/O boundary. Socket-channel and plain
+socket bridges preserve `ConnectException`/`SocketTimeoutException`; refused
+connect messages are canonicalized as `Connection refused` rather than using
+localized Winsock text.
+
+Validation with the isolated `cratonvm-sb-data-es-connectassoc-20260718.exe`:
+
+* `DataElasticsearchReactiveHealthIndicatorTests` PASS with JIT on and off.
+* `DataElasticsearchAutoConfigurationTests` PASS with JIT on and off.
+* `nb_connect::imp_windows::tests::closed_loopback_port_reports_connection_refused` PASS.
 
 ## Case 1 — `DataElasticsearchReactiveHealthIndicatorTests.elasticsearchIsDown()`: closed-port connect surfaces as `ConnectTimeoutException`, not "Connection refused"
 
