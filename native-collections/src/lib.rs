@@ -14121,6 +14121,17 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
         native_stream_reduce_identity,
     );
+    // `Stream.reduce(U, BiFunction<U, ? super T, U>, BinaryOperator<U>)` is
+    // distinct from the same-typed identity overload above.  Spring HATEOAS
+    // uses it to fold stream elements into a HAL Forms builder, so omitting
+    // this descriptor resolves the abstract Stream declaration and produces
+    // `AbstractMethodError: ... has no Code attribute`.
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+        native_stream_reduce_general,
+    );
     r.register(
         c,
         "reduce",
@@ -16005,6 +16016,63 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
     let acc = read_pinned_elem(ctx, acc_handle, acc);
     ctx.unpin_native_roots(op_pin);
+    Ok(Some(acc))
+}
+
+/// Sequential implementation of `Stream.reduce(U, BiFunction, BinaryOperator)`.
+///
+/// CratonVM executes object streams sequentially, so the combiner is required
+/// by the Java API but is not invoked.  Every object that remains live across a
+/// user-supplied `BiFunction.apply` is pinned: the callback can allocate and
+/// therefore move the young generation.
+fn native_stream_reduce_general(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(args.get(1).copied()),
+    };
+    let mut acc = args.get(1).copied().unwrap_or(Value::Object(None));
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(acc)),
+    };
+
+    // Keep one batch of pins and release it as a unit.  Each accumulator result
+    // gets a new pin before the next callback, so it cannot go stale even when
+    // the callback triggers a moving collection.
+    let pin_base = ctx.pin_native_root(this);
+    let mut acc_pin = pin_value(ctx, acc);
+    let accumulator_pin = ctx.pin_native_root(accumulator);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(e);
+        }
+    };
+    let (_, elem_pins) = pin_value_slice(ctx, &elements);
+
+    for (index, element) in elements.iter().enumerate() {
+        let accumulator = ctx.read_native_pin(accumulator_pin, accumulator);
+        let acc_arg = read_pinned_elem(ctx, acc_pin, acc);
+        let element = read_pinned_elem(ctx, elem_pins[index], *element);
+        let result = match ctx.invoke_virtual(
+            accumulator,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[acc_arg, element],
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
+        acc = result.unwrap_or(Value::Object(None));
+        acc_pin = pin_value(ctx, acc);
+    }
+
+    let acc = read_pinned_elem(ctx, acc_pin, acc);
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(acc))
 }
 
@@ -44130,6 +44198,21 @@ mod tests {
         assert_eq!(dbg_hmput(), expected);
         // Cached: second call returns the same value.
         assert_eq!(dbg_hmput(), expected);
+    }
+
+    #[test]
+    fn stream_reduce_generic_accumulator_is_registered() {
+        let registry = build_registry();
+        assert!(
+            registry
+                .find(
+                    "java/util/stream/Stream",
+                    "reduce",
+                    "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+                )
+                .is_some(),
+            "generic Stream.reduce must not fall through to the abstract interface declaration"
+        );
     }
 
     // Fix item 4: Java shortest-round-trip Float/Double formatting helpers.
