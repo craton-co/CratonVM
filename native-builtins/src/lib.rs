@@ -74475,6 +74475,25 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // ===========================================================================
 
 fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
+    // Real AQS is the default (and is explicitly enabled by the Spring Boot
+    // runner).  Its `ReentrantReadWriteLock` constructor creates real
+    // ReadLock/WriteLock views whose `sync` field points at the real nested
+    // `Sync`.  The legacy callbacks below instead manufacture a one-field
+    // synthetic view with its parent RWL in slot zero.  That happens to work
+    // for the callbacks they replace, but not for any unoverridden real-JDK
+    // method: `WriteLock.newCondition()` reads that slot as `Sync` and then
+    // tries to invoke `Sync.newCondition()` on the outer RWL, yielding the
+    // misleading `ReentrantReadWriteLock.newCondition` NoSuchMethodError.
+    // Keep the complete RWL family on real bytecode in this mode; the JIT
+    // skip list already protects the AQS family.  StampedLock remains an
+    // independent native implementation and must stay registered.
+    let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
+        || std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    if real_aqs {
+        register_stamped_lock_natives(registry);
+        return;
+    }
+
     let rwl = "java/util/concurrent/locks/ReentrantReadWriteLock";
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
