@@ -6031,6 +6031,44 @@ fn find_fp_strength_reductions(
 /// `CRATONVM_JIT_NO_SPEC_BCE`. Cached in a `OnceLock` like the other env gates
 /// in this file (e.g. `precise_jit_maps_enabled`) so the lookup is paid once
 /// rather than per loop header on every compile.
+thread_local! {
+    static INCLUSIVE_SPEC_BCE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only override for [`inclusive_spec_bce_enabled`].
+pub fn __set_inclusive_spec_bce_override(v: Option<bool>) {
+    INCLUSIVE_SPEC_BCE_TEST_OVERRIDE.with(|c| c.set(v));
+}
+
+/// Whether inclusive (`iv <= bound`) counted loops may take the SOUND
+/// speculative BCE guard (`array.length > bound` via JBE + the
+/// `bound != Integer.MAX_VALUE` entry check). **Default OFF**
+/// (`CRATONVM_JIT_INCLUSIVE_BCE=1` opts in): the machinery is correct
+/// (probe-verified against HotSpot incl. the `iv == bound == length`
+/// boundary), but on the memory-homed template bodies the elision is a
+/// measured NET LOSS for the Sieve OSR artifact (6.4s -> 12.7s, ~2x) —
+/// the per-element check it removes is a predicted-never-taken branch and
+/// a cache-hit length load (~free), while shrinking every unrolled loop
+/// body reshuffles code layout that this frontend-sensitive kernel is
+/// hostage to. Re-evaluate when the backend gets register-homed loop
+/// bodies or an IR-level BCE.
+fn inclusive_spec_bce_enabled() -> bool {
+    if let Some(v) = INCLUSIVE_SPEC_BCE_TEST_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_INCLUSIVE_BCE")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn jit_no_spec_bce() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -6085,6 +6123,120 @@ struct SpeculativeBCEGuard {
     /// guard is dropped (per-bci de-spec), these PCs MUST be removed from
     /// `bounds_safe_pcs` so their per-element checks are restored.
     covered_pcs: Vec<usize>,
+    /// Whether the loop's exit comparator is inclusive (`iv <= bound`). The
+    /// length guard must then prove `array.length > bound` (JBE deopt) — a
+    /// `>= bound` guard is stale by one at `iv == bound` (SECURITY FIX V17,
+    /// now guarded soundly instead of refusing the whole loop). The preheader
+    /// additionally proves `bound != Integer.MAX_VALUE` for inclusive loops
+    /// (at `iv == bound == MAX` the increment wraps negative while the exit
+    /// test keeps passing — the interpreter throws AIOOBE on the wrapped
+    /// index; elided code must deopt instead of accessing).
+    inclusive: bool,
+    /// For a variable-stride IV (canonical `iv += step` compound assignment):
+    /// the STEP's local index. The preheader proves `step >= 0` and
+    /// `step <= Integer.MAX_VALUE - bound` (deopt reason 2 on failure) so
+    /// every elided index is monotonically non-decreasing from the checked
+    /// non-negative entry value and can never wrap past the exit test —
+    /// without this a runtime-NEGATIVE step walks the elided index below
+    /// zero (an OOB write below the array base). `None` for `iinc iv, 1`.
+    step_local: Option<usize>,
+}
+
+/// How a loop's induction variable advances — the step provenance the
+/// speculative BCE guard needs to bound every elided index from below (no
+/// negative step) and above (no int wrap past the exit test).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvStep {
+    /// Canonical `iinc iv, 1`.
+    UnitInc,
+    /// Canonical compound `iv += step` (`iload iv; iload step; iadd;
+    /// istore iv`); payload = the step's local index. The step's runtime
+    /// SIGN and magnitude are unknown at compile time — the preheader guard
+    /// must prove `0 <= step <= Integer.MAX_VALUE - bound` before any elided
+    /// access runs.
+    VarAdd(usize),
+}
+
+/// Prove how the induction variable `iv` advances inside `[header,
+/// back_edge_end)`. Returns `None` when the step shape is anything but the
+/// two canonical forms — the caller must then refuse every bounds-check
+/// elision for the loop (`find_induction_variable` alone admits `iadd;istore`
+/// IVs without identifying the step operand, which is not enough to reason
+/// about sign or wrap).
+fn find_iv_step_provenance(
+    code: &[u8],
+    header: usize,
+    back_edge_end: usize,
+    iv: usize,
+) -> Option<IvStep> {
+    let mut unit_incs = 0usize;
+    let mut var_adds = 0usize;
+    let mut var_step: Option<usize> = None;
+    // PCs of the previous three instruction starts (linear order).
+    let mut prev: [Option<usize>; 3] = [None, None, None];
+    let mut pc = header;
+    while pc < back_edge_end {
+        let op = code[pc];
+        match op {
+            // iinc
+            0x84 => {
+                if code[pc + 1] as usize == iv {
+                    if code[pc + 2] as i8 == 1 {
+                        unit_incs += 1;
+                    } else {
+                        return None; // non-unit iinc — unsupported stride
+                    }
+                }
+            }
+            // wide istore/iinc aliasing the IV via a 2-byte index — unprovable.
+            0xc4 => {
+                if pc + 3 < back_edge_end {
+                    let real = code[pc + 1];
+                    // Widening: operand bytes -> usize index (value fits)
+                    let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+                    if (real == 0x36 || real == 0x84) && idx == iv {
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                // Widening: u8 operand/opcode-relative index -> usize
+                let istore_target = match op {
+                    0x36 => Some(code[pc + 1] as usize),
+                    0x3b..=0x3e => Some((op - 0x3b) as usize),
+                    _ => None,
+                };
+                if istore_target == Some(iv) {
+                    // Must be the canonical `iload iv; iload step; iadd;
+                    // istore iv` (javac's `iv += step`). Anything else —
+                    // including the commuted `step + iv` — is refused.
+                    let (Some(p1), Some(p2), Some(p3)) = (prev[0], prev[1], prev[2]) else {
+                        return None;
+                    };
+                    if code[p1] != 0x60 {
+                        return None;
+                    }
+                    let step = extract_iload_local(code, p2)?;
+                    let base = extract_iload_local(code, p3)?;
+                    if base != iv || step == iv {
+                        return None;
+                    }
+                    if var_step.is_some_and(|s| s != step) {
+                        return None;
+                    }
+                    var_step = Some(step);
+                    var_adds += 1;
+                }
+            }
+        }
+        prev = [Some(pc), prev[0], prev[1]];
+        pc += bytecode_len_at(code, pc);
+    }
+    match (unit_incs, var_adds, var_step) {
+        (1, 0, None) => Some(IvStep::UnitInc),
+        (0, 1, Some(step)) => Some(IvStep::VarAdd(step)),
+        _ => None,
+    }
 }
 
 /// Find induction variables in a loop body.
@@ -7062,15 +7214,28 @@ fn analyze_bounds_elimination(
             .bound_local
             .and_then(|bl| find_bound_arraylength_provenance(code, code_len, bl));
         let iv_start_nonneg = find_iv_nonneg_start(code, code_len, induction_var);
+        // Step 3d: step provenance. `find_induction_variable` admits
+        // `iadd;istore` IVs (the Sieve `j += i` inner loop) without naming the
+        // step operand; every elision below needs the step's identity (to
+        // guard its sign/magnitude) or the `iinc +1` proof. An unprovable
+        // step refuses the loop entirely.
+        let iv_step = find_iv_step_provenance(code, header, back_edge_end, induction_var);
 
-        // Step 4: Find safe array accesses (statically proven)
-        let loop_safe = find_safe_array_accesses(
-            &bounds,
-            modified,
-            &operands,
-            bound_from_array,
-            iv_start_nonneg,
-        );
+        // Step 4: Find safe array accesses (statically proven). Only the
+        // canonical +1 step qualifies: the static proof has no step-sign /
+        // no-wrap guard, so a variable-stride IV (whose runtime step could be
+        // negative) must go through the guarded speculative path below.
+        let loop_safe = if matches!(iv_step, Some(IvStep::UnitInc)) {
+            find_safe_array_accesses(
+                &bounds,
+                modified,
+                &operands,
+                bound_from_array,
+                iv_start_nonneg,
+            )
+        } else {
+            FxHashSet::default()
+        };
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -7094,13 +7259,31 @@ fn analyze_bounds_elimination(
         // (1) and (2) were already checked; (3) was NOT. Enforce it here so the
         // speculative guard is only installed when `bound_local` is invariant.
         //
-        // SECURITY FIX (V17): an inclusive comparator reaches `index == bound`,
-        // which the single `array.length >= bound` header guard does NOT cover
-        // (it would need `array.length >= bound + 1`). Refuse the speculative
-        // guard for inclusive loops so no per-element check is elided past the
-        // stale-by-one guard. (`find_safe_array_accesses` already refused the
-        // static elisions for the same reason.)
-        let bound_invariant = !bounds.inclusive
+        // SECURITY FIX (V17), sound-guard form (2026-07-18): an inclusive
+        // comparator reaches `index == bound`, which a `array.length >= bound`
+        // header guard does NOT cover. Instead of refusing the loop, the
+        // guard emission now proves `array.length > bound` (JBE deopt) plus
+        // `bound != Integer.MAX_VALUE` for inclusive loops — see
+        // `SpeculativeBCEGuard::inclusive`. (`find_safe_array_accesses` still
+        // refuses the guard-less STATIC elisions for inclusive loops.)
+        //
+        // Step-provenance guard (2026-07-18): a variable-stride IV is only
+        // admitted when the step local is identified, loop-invariant, and
+        // < 64 (representable in `modified`); the preheader then proves
+        // `0 <= step <= Integer.MAX_VALUE - bound` at runtime. `None` (an
+        // unprovable step shape) refuses the speculative path entirely —
+        // `find_induction_variable`'s `iadd;istore` admission alone said
+        // nothing about the step's sign, so a runtime-negative step could
+        // walk an elided index below the array base.
+        let step_guard: Option<Option<usize>> = match iv_step {
+            Some(IvStep::UnitInc) => Some(None),
+            Some(IvStep::VarAdd(sl)) if sl < 64 && (modified & (1u64 << sl)) == 0 => {
+                Some(Some(sl))
+            }
+            _ => None,
+        };
+        let bound_invariant = (!bounds.inclusive || inclusive_spec_bce_enabled())
+            && step_guard.is_some()
             && bounds
                 .bound_local
                 .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
@@ -7139,6 +7322,8 @@ fn analyze_bounds_elimination(
                         bound_local,
                         iv_local: induction_var,
                         covered_pcs,
+                        inclusive: bounds.inclusive,
+                        step_local: step_guard.flatten(),
                     });
                 }
             }
@@ -17794,9 +17979,11 @@ impl Compiler {
                     .unwrap_or_default();
                 let had_guards = !guards.is_empty();
                 if let Some(first) = guards.first() {
-                    // iv >= 0 at entry: with the +1-only step invariant this
-                    // bounds every elided index from below. All guards at one
-                    // header share the loop's IV, so test it once.
+                    // iv >= 0 at entry: combined with the step guards below
+                    // (unit +1, or a proven `0 <= step <= MAX - bound`
+                    // variable stride) this bounds every elided index from
+                    // below. All guards at one header share the loop's IV,
+                    // bound and step, so test them once.
                     if let Some(reg) = self.reg_for_local(first.iv_local) {
                         self.emit_mov_reg_reg(RAX, reg);
                     } else {
@@ -17808,6 +17995,57 @@ impl Compiler {
                     let patch_offset = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    if first.inclusive || first.step_local.is_some() {
+                        // Load the loop bound into ECX for the entry guards.
+                        if let Some(reg) = self.reg_for_local(first.bound_local) {
+                            self.emit_mov_reg_reg(RCX, reg);
+                        } else {
+                            self.emit_load_local(RCX, self.local_offset(first.bound_local));
+                        }
+                    }
+                    if first.inclusive {
+                        // Inclusive wrap hazard: at `iv == bound ==
+                        // Integer.MAX_VALUE` the post-body increment wraps
+                        // negative while `iv <= bound` keeps passing; the
+                        // interpreter then throws AIOOBE on the wrapped index,
+                        // so elided code must deopt up front.
+                        // CMP ECX, imm32 (81 F9 id); JE rel32 (0F 84).
+                        self.buf.emit(&[0x81, 0xF9]);
+                        self.buf.emit(&0x7FFF_FFFFi32.to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x84]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    }
+                    if let Some(step_local) = first.step_local {
+                        // Variable-stride guards: `step >= 0` (a negative
+                        // step walks the elided index below zero) and
+                        // `step <= Integer.MAX_VALUE - bound` (no int wrap
+                        // past the exit test: every reached index satisfies
+                        // `iv <= bound` pre-step, so `iv + step` stays
+                        // representable and the NEXT exit test is honest).
+                        if let Some(reg) = self.reg_for_local(step_local) {
+                            self.emit_mov_reg_reg(RDX, reg);
+                        } else {
+                            self.emit_load_local(RDX, self.local_offset(step_local));
+                        }
+                        // TEST EDX, EDX (85 D2); JS rel32 (0F 88).
+                        self.buf.emit(&[0x85, 0xD2]);
+                        self.buf.emit(&[0x0F, 0x88]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                        // MOV R11D, INT_MAX (41 BB id); SUB R11D, ECX (41 29 CB);
+                        // CMP EDX, R11D (44 39 DA); JG rel32 (0F 8F).
+                        self.buf.emit(&[0x41, 0xBB]);
+                        self.buf.emit(&0x7FFF_FFFFi32.to_le_bytes());
+                        self.buf.emit(&[0x41, 0x29, 0xCB]);
+                        self.buf.emit(&[0x44, 0x39, 0xDA]);
+                        self.buf.emit(&[0x0F, 0x8F]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    }
                 }
                 for guard in guards {
                     // Load array reference into RAX
@@ -17846,8 +18084,16 @@ impl Compiler {
                     // CMP R10D, ECX — compare array.length vs loop_bound
                     // Encoding: 44 3B D1 (REX.R + CMP r32, r/m32 + ModRM(11, R10, ECX))
                     self.buf.emit(&[0x44, 0x3B, 0xD1]);
-                    // JB rel32 — if array.length < loop_bound (unsigned), deopt
-                    self.buf.emit(&[0x0F, 0x82]);
+                    // Exclusive: JB — deopt if length < bound. Inclusive: JBE —
+                    // the loop reaches `iv == bound`, so the guard must prove
+                    // length > bound (SECURITY FIX V17, sound-guard form). A
+                    // runtime-negative bound reads as huge unsigned and deopts
+                    // conservatively (zero-trip loops re-run interpreted).
+                    self.buf.emit(if guard.inclusive {
+                        &[0x0F, 0x86] // JBE rel32
+                    } else {
+                        &[0x0F, 0x82] // JB rel32
+                    });
                     let patch_offset = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
@@ -33874,21 +34120,77 @@ mod tests {
         let bounds = analyze_loop_bound(&code, 0, 12, 15, 0).expect("loop bound recognized");
         assert!(bounds.inclusive, "if_icmpgt exit must be marked inclusive");
 
-        // The iaload at pc=7 must NOT be elided, and no speculative guard emitted.
+        // Default (opt-in flag off): inclusive loops take no guard at all.
+        __set_inclusive_spec_bce_override(Some(false));
+        let (off_safe, off_guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(!off_safe.contains(&7), "default-off must keep the check");
+        assert!(off_guards.is_empty(), "default-off must emit no guard");
+
+        // V17 sound-guard form (opt-in): the access IS elided, but only on
+        // the strength of a speculative guard flagged `inclusive` (emitted
+        // as `length > bound` / JBE + the bound != MAX entry check), never
+        // the guard-less static proof.
+        __set_inclusive_spec_bce_override(Some(true));
         let (safe_pcs, speculative_guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        __set_inclusive_spec_bce_override(None);
         assert!(
-            !safe_pcs.contains(&7),
-            "inclusive-loop iaload at pc=7 must keep its bounds check, got {:?}",
+            safe_pcs.contains(&7),
+            "inclusive-loop iaload at pc=7 should be guard-elided, got {:?}",
             safe_pcs
         );
-        assert!(
-            speculative_guards.is_empty(),
-            "no speculative guard may be installed for an inclusive loop, got {:?}",
-            speculative_guards
-                .iter()
-                .map(|g| (g.loop_header, g.array_local, g.bound_local))
-                .collect::<Vec<_>>()
+        assert_eq!(speculative_guards.len(), 1, "one guarded array expected");
+        let g = &speculative_guards[0];
+        assert!(g.inclusive, "guard must record the inclusive comparator");
+        assert_eq!(g.step_local, None, "iinc +1 loop needs no step guard");
+        assert!(g.covered_pcs.contains(&7));
+    }
+
+    #[test]
+    fn test_bce_varadd_step_guard_and_commuted_refusal() {
+        // Sieve inner-loop shape: `for (j = ..; j < n; j += i) a[j] = ..`.
+        //   locals: 0 = j (IV), 1 = n (bound), 2 = arr, 3 = i (step)
+        //   0: iload_0
+        //   1: iload_1
+        //   2: if_icmpge +16 -> 18
+        //   5: aload_2
+        //   6: iload_0
+        //   7: iconst_1
+        //   8: bastore
+        //   9: iload_0        (canonical j += i)
+        //  10: iload_3
+        //  11: iadd
+        //  12: istore_0
+        //  13: goto -13 -> 0
+        //  16..: return padding
+        let code = [
+            0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1a, 0x1d, 0x60, 0x3b, 0xa7,
+            0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        ];
+        let code_len = 17;
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0].0, 0);
+        assert_eq!(
+            find_iv_step_provenance(&code, 0, 16, 0),
+            Some(IvStep::VarAdd(3)),
+            "canonical j += i must name the step local"
         );
+        let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(safe_pcs.contains(&8), "bastore at pc=8 should be guard-elided");
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].step_local, Some(3), "guard must carry the step local");
+        assert!(!guards[0].inclusive);
+
+        // Commuted form `j = i + j` (iload_3; iload_0; iadd; istore_0) is NOT
+        // the canonical compound shape — the step cannot be proven, so the
+        // whole loop must be refused (no guard, no elision).
+        let commuted = [
+            0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7,
+            0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
+        let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
+        assert!(!safe2.contains(&8), "unproven step must keep the bounds check");
+        assert!(guards2.is_empty());
     }
 
     #[test]
