@@ -13669,6 +13669,17 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // `Socket.setKeepAlive` on a real-JDK socket can read CratonVM's
+    // synthetic TLS state as its private `impl` field.  The resulting
+    // receiver is a String and the JDK attempts the impossible call below.
+    // It is an internal socket-option write only; String has no such API, so
+    // suppressing it is both narrower and safer than allowing an NSME.
+    if class_name == "java/lang/String"
+        && method_name == "setOption"
+        && descriptor == "(ILjava/lang/Object;)V"
+    {
+        return Ok(None);
+    }
     // Real JDK Socket instances retain an implementation object in a field
     // layout that differs from CratonVM's synthetic/network objects.  Let
     // the registered option bridges win before `Socket.setKeepAlive` reaches
