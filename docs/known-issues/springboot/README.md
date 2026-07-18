@@ -94,7 +94,7 @@ open each doc for the full picture):
 | [`core-autoconfigure-singleton-fail-residuals-20260717.md`](core-autoconfigure-singleton-fail-residuals-20260717.md) | OPEN — found 2026-07-17 |
 | [`core-spring-boot-configdata-resource-resolution-empty-cluster.md`](core-spring-boot-configdata-resource-resolution-empty-cluster.md) | OPEN — found 2026-07-17 |
 | [`core-spring-boot-crossthread-throwable-stacktrace-loss.md`](core-spring-boot-crossthread-throwable-stacktrace-loss.md) | OPEN — found 2026-07-17 (root cause confirmed at file:line precision |
-| [`core-spring-boot-jsonwriter-unmodifiablemap-classcast.md`](core-spring-boot-jsonwriter-unmodifiablemap-classcast.md) | OPEN — found 2026-07-17 |
+| `JsonWriterTests` unmodifiable-map lambda `ClassCastException` | **FIXED 2026-07-18** — moved to [`../../internal/springboot/core-spring-boot-jsonwriter-unmodifiablemap-classcast-FIXED.md`](../../internal/springboot/core-spring-boot-jsonwriter-unmodifiablemap-classcast-FIXED.md); VM-generated lambda-bridge cast errors now use the same concrete collection class name as `Object.getClass()`, allowing Spring's `LambdaSafe` generic filter to suppress expected map-vs-`String` mismatches |
 | [`core-spring-boot-test-config-data-and-classpath-scan-cluster.md`](core-spring-boot-test-config-data-and-classpath-scan-cluster.md) | OPEN — found 2026-07-17, none root-caused to a CratonVM file:line ye |
 | [`crashfail-20260717-crash-cluster.md`](crashfail-20260717-crash-cluster.md) | OPEN — found 2026-07-17 |
 | [`data-elasticsearch-connecttimeout-and-association-mapping-gap.md`](data-elasticsearch-connecttimeout-and-association-mapping-gap.md) | OPEN — found 2026-07-17. Two unrelated failures, one per class. |
