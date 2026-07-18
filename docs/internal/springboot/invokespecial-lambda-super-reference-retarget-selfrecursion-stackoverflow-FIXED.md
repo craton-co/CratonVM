@@ -1,6 +1,6 @@
 # `Interface.super::method` lambda references get retargeted onto the receiver's runtime class — infinite self-recursion StackOverflowError
 
-**Status: OPEN — found 2026-07-17 (root cause CONFIRMED at file:line)**
+**Status: FIXED 2026-07-18**
 
 ## Symptom
 
@@ -93,10 +93,20 @@ where one references `Interface.super::method` on the other.
 
 ## What to fix
 
-`interpreter.rs:21429` should call `invoke_on_class_shared_no_retarget`
-instead of `invoke_on_class_shared`, matching the sibling call sites at
-`interpreter.rs:20437`, `20900`, `21140` and the stated intent of its own
-comment at lines 21396-21398.
+`try_lambda_dispatch` now calls `invoke_on_class_shared_no_retarget` for
+`MethodHandleKind::InvokeSpecial`, matching the sibling non-virtual dispatch
+paths and preserving the method handle's implementation owner.
+
+## Regression and validation
+
+- Added `vm/tests/lambda_invokespecial_no_retarget.rs`, an end-to-end Java
+  probe that creates the same synthetic-helper-name collision and verifies an
+  `Interface.super::method` supplier returns the interface default value.
+- The focused probe passed with JIT enabled and with `--nojit`.
+- The real Spring Boot Micrometer classes both passed under the isolated VM:
+  `InfluxPropertiesConfigAdapterTests` (3 tests) and
+  `InfluxMetricsExportAutoConfigurationTests` (4 tests), in both JIT and
+  disabled-JIT modes. The prior `StackOverflowError` marker is absent.
 
 ## Affected classes
 
