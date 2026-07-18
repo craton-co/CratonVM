@@ -545,6 +545,9 @@ mod tests {
 
         let stream = match start_bound(stream, &peer).unwrap() {
             StartConnect::Connected(stream) => stream,
+            StartConnect::DeferredFailure(_, error) => {
+                panic!("bound connect unexpectedly failed: {error}")
+            }
             StartConnect::InProgress(stream) => {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
