@@ -25121,6 +25121,40 @@ fn native_jsp_servlet_handle_missing_resource(
 }
 
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
+    // ModifiedClassPathClassLoader can legitimately materialize a second
+    // Spring-core namespace. Spring's package-private Adapt.isIn helper is
+    // only an option-name membership test, but its bytecode uses reference
+    // identity and can receive option instances crossing that namespace at a
+    // parent/default-interface boundary. Compare the stable enum names here so
+    // CLASS_TO_STRING continues to request Class[] -> String[] adaptation.
+    registry.register(
+        "org/springframework/core/annotation/MergedAnnotation$Adapt",
+        "isIn",
+        "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(object))) => *object,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let this_name = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let options = match args.get(1) {
+                Some(Value::Object(Some(array))) => *array,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            for index in 0..ctx.array_length(options) {
+                let Value::Object(Some(option)) = ctx.get_array_element(options, index) else {
+                    continue;
+                };
+                if matches!(ctx.get_field_by_name(option, "name"), Value::Object(Some(name)) if ctx.read_string(name).as_deref() == Some(this_name.as_str())) {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+            Ok(Some(Value::Int(0)))
+        },
+    );
     let before = registry.len();
     // These are the ACC_NATIVE methods with no bytecode — they ARE the real
     // behavior, so tag the whole block `Bridge` for the census/differential
@@ -30722,6 +30756,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/security/ProtectionDomain;",
         lang_class::native_class_get_protection_domain0,
     );
+    // JDK 25 implements the public method as a direct read of Class's private
+    // `protectionDomain` field. Our synthetic mirrors cannot rely on that
+    // VM-populated field, so route the public surface through the same
+    // class-id-backed CodeSource implementation as the legacy native hook.
+    registry.register(
+        "java/lang/Class",
+        "getProtectionDomain",
+        "()Ljava/security/ProtectionDomain;",
+        lang_class::native_class_get_protection_domain0,
+    );
     registry.register(
         "java/lang/Class",
         "getSigners",
@@ -30886,6 +30930,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
             Ok(Some(Value::Object(Some(pd))))
         },
+    );
+    // The compatibility registration above predates per-loader class
+    // provenance and resolves same-named classes through the global classpath.
+    // Keep it for its historic boot fallback behavior, then make the public
+    // surface class-id-backed so a locally defined class reports its own JAR.
+    registry.register(
+        "java/lang/Class",
+        "getProtectionDomain",
+        "()Ljava/security/ProtectionDomain;",
+        lang_class::native_class_get_protection_domain0,
     );
     // ProtectionDomain.getCodeSource() → return field 0
     registry.register(

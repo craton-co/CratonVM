@@ -996,6 +996,26 @@ fn cl_real_load_class_base(
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
 
+    // The platform loader owns JDK modules, never application entries. The
+    // flat class store is shared by every loader in CratonVM, so allowing its
+    // normal fallback here turns platform-parent delegation into accidental
+    // application-parent delegation. That breaks URLClassLoader children that
+    // intentionally replace or exclude application JARs.
+    if crate::classloader::is_platform_class_loader(ctx, this)
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
+
     // Loader isolation for generated dynamic proxies (JVMS §5.3). A
     // `jdk.proxyN.$ProxyM` lives in its defining loader's per-loader dynamic
     // module, so it must resolve ONLY through a loader that can see it (its
