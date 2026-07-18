@@ -63,8 +63,8 @@ lines) shows normal startup, a ~20s burst of the benign
 `gen_heap::get_field: out-of-bounds field read dropped` warning against many
 *different*, rapidly-changing `org/springframework/core/$Proxy34` object
 addresses (489 occurrences — ordinary bean-creation/proxy churn, same
-"unrelated burst" shape this doc's sibling
-`mockwebenvironmentservletcomponentscanintegrationtests-hang.md` already
+"unrelated burst" shape that the
+[`MockWebEnvironmentServletComponentScanIntegrationTests` fixed closure](../../internal/springboot/mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md) already
 identified as not-the-hang-itself), and then, as the **literal last line in
 the entire log**:
 
