@@ -2573,6 +2573,7 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
 /// plaintext implementation.
 fn create_ssl_server_socket(
     ctx: &mut dyn NativeContext,
+    args: &[Value],
     port: i32,
     bind_address: &str,
 ) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
@@ -2582,7 +2583,29 @@ fn create_ssl_server_socket(
         }
         .into());
     }
-    let identity = require_runtime_tls_identity()?;
+    // SSLContext.getServerSocketFactory() retains its context in field zero.
+    // Prefer that per-context identity: Spring SSL bundles commonly build
+    // multiple contexts in one process, so the process-wide keystore slot may
+    // have been replaced by an unrelated client context by the time LDAPS
+    // starts its listener. getDefault() returns an unbound factory and keeps
+    // the established runtime-identity fallback for that case.
+    let identity = args
+        .first()
+        .and_then(|value| match value {
+            Value::Object(Some(factory)) if ctx.object_num_fields(*factory) > 0 => {
+                match ctx.get_field(*factory, 0) {
+                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .map(|(cert_pem, key_pem)| RuntimeTlsIdentity {
+            cert_pem,
+            key_pem,
+            client_ca_pem: None,
+        })
+        .unwrap_or(require_runtime_tls_identity()?);
     let config = build_server_config_single_cert(
         &identity.cert_pem,
         &identity.key_pem,
@@ -2669,7 +2692,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            create_ssl_server_socket(ctx, port, "0.0.0.0")
+            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
         },
     );
     // UnboundID's LDAP listener calls these overloads (with backlog 128).
@@ -2682,7 +2705,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(II)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
-            create_ssl_server_socket(ctx, port, "0.0.0.0")
+            create_ssl_server_socket(ctx, args, port, "0.0.0.0")
         },
     );
     r.register(
@@ -2692,7 +2715,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
             let bind_address = ssl_server_bind_address(ctx, args, 3)?;
-            create_ssl_server_socket(ctx, port, &bind_address)
+            create_ssl_server_socket(ctx, args, port, &bind_address)
         },
     );
     r.register(
