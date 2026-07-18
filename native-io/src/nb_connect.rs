@@ -58,9 +58,9 @@ pub enum ConnectPoll {
 }
 
 #[cfg(unix)]
-pub use imp_unix::{poll, start};
+pub use imp_unix::{bind, poll, start, start_bound};
 #[cfg(windows)]
-pub use imp_windows::{poll, start};
+pub use imp_windows::{bind, poll, start, start_bound};
 
 // ---------------------------------------------------------------------------
 // Windows — raw Ws2_32 FFI (mirrors net.rs / nio_selector.rs patterns)
@@ -107,6 +107,8 @@ mod imp_windows {
     #[link(name = "Ws2_32")]
     extern "system" {
         fn socket(af: i32, ty: i32, protocol: i32) -> Socket;
+        #[link_name = "bind"]
+        fn ws_bind(s: Socket, name: *const u8, namelen: i32) -> i32;
         fn connect(s: Socket, name: *const u8, namelen: i32) -> i32;
         fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
         fn getsockopt(
@@ -185,6 +187,57 @@ mod imp_windows {
                     }
                     Err(_) => {}
                 }
+            }
+            let sa = build_sockaddr(addr);
+            let rc = connect(s, sa.as_ptr(), sa.len() as i32);
+            if rc == 0 {
+                return Ok(StartConnect::Connected(TcpStream::from_raw_socket(s as _)));
+            }
+            let werr = WSAGetLastError();
+            if werr == WSAEWOULDBLOCK {
+                return Ok(StartConnect::InProgress(TcpStream::from_raw_socket(s as _)));
+            }
+            closesocket(s);
+            Err(std::io::Error::from_raw_os_error(werr))
+        }
+    }
+
+    /// Create a TCP socket and bind it before it is connected. The returned
+    /// stream owns an unconnected OS socket; `start_bound` consumes it later.
+    pub fn bind(addr: &SocketAddr) -> std::io::Result<TcpStream> {
+        let af = match addr {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6_I,
+        };
+        // SAFETY: standard Winsock socket/bind sequence. TcpStream assumes
+        // ownership only after `bind` succeeds; error paths close the socket.
+        unsafe {
+            let s = socket(af, SOCK_STREAM, IPPROTO_TCP);
+            if s == INVALID_SOCKET {
+                return Err(std::io::Error::from_raw_os_error(WSAGetLastError()));
+            }
+            let sa = build_sockaddr(addr);
+            if ws_bind(s, sa.as_ptr(), sa.len() as i32) != 0 {
+                let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+                closesocket(s);
+                return Err(e);
+            }
+            Ok(TcpStream::from_raw_socket(s as _))
+        }
+    }
+
+    /// Start a non-blocking connect using an already-bound socket.
+    pub fn start_bound(stream: TcpStream, addr: &SocketAddr) -> std::io::Result<StartConnect> {
+        use std::os::windows::io::IntoRawSocket;
+        let s = stream.into_raw_socket() as Socket;
+        // SAFETY: ownership of `s` was transferred out of `stream`; all paths
+        // either wrap it back into TcpStream or close it.
+        unsafe {
+            let mut nb: u32 = 1;
+            if ioctlsocket(s, FIONBIO, &mut nb) != 0 {
+                let e = std::io::Error::from_raw_os_error(WSAGetLastError());
+                closesocket(s);
+                return Err(e);
             }
             let sa = build_sockaddr(addr);
             let rc = connect(s, sa.as_ptr(), sa.len() as i32);
@@ -366,6 +419,67 @@ mod imp_unix {
         }
     }
 
+    /// Create a TCP socket and bind it before it is connected.
+    pub fn bind(addr: &SocketAddr) -> std::io::Result<TcpStream> {
+        let af = match addr {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        // SAFETY: the descriptor becomes a TcpStream only after a successful
+        // bind; every error path closes it exactly once.
+        unsafe {
+            let fd = libc::socket(af, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let sa = build_sockaddr(addr);
+            if libc::bind(
+                fd,
+                sa.as_ptr() as *const libc::sockaddr,
+                sa.len() as libc::socklen_t,
+            ) != 0
+            {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
+            Ok(TcpStream::from_raw_fd(fd))
+        }
+    }
+
+    /// Start a non-blocking connect using an already-bound socket.
+    pub fn start_bound(stream: TcpStream, addr: &SocketAddr) -> std::io::Result<StartConnect> {
+        use std::os::unix::io::IntoRawFd;
+        let fd = stream.into_raw_fd();
+        // SAFETY: ownership of `fd` was transferred out of `stream`; all paths
+        // either wrap it back into TcpStream or close it.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
+            let sa = build_sockaddr(addr);
+            let rc = libc::connect(
+                fd,
+                sa.as_ptr() as *const libc::sockaddr,
+                sa.len() as libc::socklen_t,
+            );
+            if rc == 0 {
+                return Ok(StartConnect::Connected(TcpStream::from_raw_fd(fd)));
+            }
+            let e = std::io::Error::last_os_error();
+            let in_progress = e.raw_os_error() == Some(libc::EINPROGRESS)
+                || e.kind() == std::io::ErrorKind::WouldBlock;
+            if in_progress {
+                return Ok(StartConnect::InProgress(TcpStream::from_raw_fd(fd)));
+            }
+            libc::close(fd);
+            Err(e)
+        }
+    }
+
     pub fn poll(stream: &TcpStream) -> ConnectPoll {
         let fd = stream.as_raw_fd();
         let mut pfd = libc::pollfd {
@@ -409,5 +523,44 @@ mod imp_unix {
             ));
         }
         ConnectPoll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bound_socket_connects_without_losing_its_local_port() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = listener.local_addr().unwrap();
+        let acceptor = std::thread::spawn(move || listener.accept().unwrap());
+
+        let requested = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let stream = bind(&requested).unwrap();
+        let bound_port = stream.local_addr().unwrap().port();
+        assert_ne!(bound_port, 0, "bind(0) must allocate an outbound port");
+
+        let stream = match start_bound(stream, &peer).unwrap() {
+            StartConnect::Connected(stream) => stream,
+            StartConnect::InProgress(stream) => {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match poll(&stream) {
+                        ConnectPoll::Connected => break stream,
+                        ConnectPoll::Failed(e) => panic!("bound connect failed: {e}"),
+                        ConnectPoll::Pending if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        ConnectPoll::Pending => panic!("bound connect timed out"),
+                    }
+                }
+            }
+        };
+        assert_eq!(stream.local_addr().unwrap().port(), bound_port);
+        drop(stream);
+        drop(acceptor.join().unwrap());
     }
 }
