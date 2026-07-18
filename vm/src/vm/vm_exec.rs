@@ -13717,11 +13717,24 @@ fn invoke_on_class_shared_inner(
                 .get_class(receiver_class)
                 .map(|class| class.name.to_string())
                 .unwrap_or_default();
-            if receiver_name == "javax/net/ssl/SSLServerSocketFactory" {
+            if matches!(
+                receiver_name.as_str(),
+                "javax/net/ssl/SSLServerSocketFactory"
+                    | "sun/security/ssl/SSLServerSocketFactoryImpl"
+            ) {
                 if let Some(callback) =
                     shared
                         .native_methods
-                        .find(&receiver_name, method_name, descriptor)
+                        // The real JDK factory carries its SSLContext in the
+                        // same first instance slot consumed by the bridge.
+                        // Reuse the bridge registered on its public API type
+                        // rather than interpreting `SSLServerSocketImpl`,
+                        // whose host socket path bypasses the TLS registry.
+                        .find(
+                            "javax/net/ssl/SSLServerSocketFactory",
+                            method_name,
+                            descriptor,
+                        )
                 {
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
