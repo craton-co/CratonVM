@@ -251,3 +251,57 @@ selector wakeup change for the HTTP/2 partial-write face.
 After this diagnostic attempt completed, every running DoHead VM process was
 terminated; a `/proc` executable-and-command-line sweep confirmed that no DoHead
 VM process remained.
+
+## 2026-07-18 C23-C29 map-layout closure and remaining transport residuals
+
+**Status: OPEN.** This checkpoint closes the sporadic HTTP header-map loss, but
+does not yet close the independent HTTP/2 EOF/timeout family. The document
+therefore remains under docs/known-issues.
+
+### Validated changes
+
+1. The selector phase-3 readiness safety-net now checks each missing interest
+   bit rather than treating any pre-existing ready bit as complete. Together
+   with C20's non-sticky post-epoll_ctl(MOD) self-pipe nudge, the focused
+   selector suite remains clean: cargo test -p cratonvm-native-io --lib
+   nio_selector -- --test-threads=1 reported 20/20.
+2. HttpURLConnection.getHeaderFields() now uses HashMap consistently rather
+   than constructing a LinkedHashMap while invoking HashMap.put.
+3. The decisive header bug was in native collection storage, not the response
+   parser: map_alloc_node() allocated ClassId(0) / java/lang/Object nodes and
+   then wrote HashMap node fields. The heap now correctly gives Object a
+   zero-slot layout, so those writes were guarded/dropped, intermittently
+   removing map entries such as Date. Nodes are now allocated as
+   java/util/HashMap$Node.
+4. Live entry snapshots root key, value, and source-map references across their
+   allocating entry creation, preventing pre-move references from being
+   published after a moving collection.
+
+### Evidence
+
+- C28's two-class pressure run reproduced the old header error once (23/24)
+  and emitted the zero-slot guard records. It established that only rooting the
+  live entry helper was insufficient.
+- C29 binary: /data/data/cvm-dohead-c29-mapnode-20260718.
+- C29 targeted pressure:
+  /data/data/dohead-c29-mapnode-headerpair-n2x4-20260718;
+  1 -> 1025 and 1025 -> 1025, two processes, four passes: **8/8 PASS**,
+  zero failures. The completed attempt left no DoHead process.
+- Focused native validation:
+  cratonvm-native-collections map filter **20/20**, and
+  cratonvm-native-builtins http_url_connection **30/30**.
+- C29 full JIT matrix:
+  /data/data/dohead-c29-mapnode-full64-n2x1-20260718; 64 classes, two
+  processes, -Xmx1g, one pass, 240-second class timeout, ALL_DONE.
+  Result: **61 PASS, 3 residuals**:
+  - 511 -> 1023: HTTP/2 End of input stream with [9] bytes left.
+  - 512 -> 0: timeout.
+  - 513 -> 511: timeout.
+  The first EOF coincided with a guarded zero-slot write at index 4, so the
+  remaining transport diagnosis must identify that distinct raw-object layout
+  producer before assigning the failures to selector or network timing.
+
+After the C29 matrix finished, the explicit DoHead process sweep found no
+matching runner or VM process. Do not move this record to docs/internal until
+a newly built binary completes the 64-class matrix with zero residuals,
+followed by a relevant --nojit control.
