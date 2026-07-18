@@ -1,6 +1,6 @@
-# jOOQ/H2Console autoconfigure — destroy-method ambiguity (residual of a RESOLVED doc) + unconfirmed HANG
+# jOOQ/H2Console autoconfigure destroy-method ambiguity and Jooq test timeout
 
-**Status: PARTIALLY FIXED — 2026-07-17.** Cluster A is fixed by the `Class.getMethods()` hierarchy merge in `native-builtins/src/lang_class.rs`; the unrelated Cluster B hang remains open in this document.
+**Status: FIXED — 2026-07-18.** Cluster A is fixed by the `Class.getMethods()` hierarchy merge in `native-builtins/src/lang_class.rs`; the former Cluster B timeout is closed by the guarded Panama downcall-adapter probe documented below.
 
 ## Cluster A — FIXED 2026-07-17: duplicate 'shutdown' destroy-method candidates (spans `module/spring-boot-jooq`, `module/spring-boot-h2console`, `module/spring-boot-jdbc-test`, `module/spring-boot-flyway`, `module/spring-boot-batch-jdbc`, `module/spring-boot-integration`)
 
@@ -235,4 +235,19 @@ Full logs:
 - `module/spring-boot-flyway` | `FlywayAutoConfigurationTests` (Cluster A, all 61 failures)
 - `module/spring-boot-batch-jdbc` | `BatchJdbcAutoConfigurationTests` (Cluster A, 24 of 26 failures)
 - `module/spring-boot-integration` | `IntegrationAutoConfigurationTests` (Cluster A, 4 of 9 failures)
-- `module/spring-boot-jooq` | `JooqAutoConfigurationTests` (Cluster B, HANG)
+- `module/spring-boot-jooq` | `JooqAutoConfigurationTests` (Cluster B, fixed 2026-07-18)
+
+## Closure — FIXED 2026-07-18
+
+Cluster A is the already-landed `Class.getMethods()` hierarchy merge. For
+Cluster B, a current-fixture repro showed that the apparent JUnit hang came
+from the real-JDK Panama downcall-adapter fallback reading field 0 of every
+invoke-shaped receiver before checking its type. JUnit's zero-field
+`InterceptingExecutableInvoker` therefore repeatedly entered the heap OOB
+guard during generic-type annotation scanning.
+
+The fallback now first requires the resolved invocation class to be
+`java/lang/invoke/MethodHandle` before reading the adapter target.
+`JooqAutoConfigurationTests` then completed
+all 17 tests with zero failures in JIT and `--nojit` modes (about 4m20s each),
+which is within the suite runner's existing 300-second per-class default.

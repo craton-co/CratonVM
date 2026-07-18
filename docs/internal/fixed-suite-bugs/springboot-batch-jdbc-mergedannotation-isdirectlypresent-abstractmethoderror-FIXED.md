@@ -17,7 +17,7 @@ has no Code attribute
 The concurrent `dataSource` destroy-method failures in the same class were
 explicitly separate: they are the existing `Class.getMethods()` duplicate
 method cluster, tracked in
-[`jooq-destroy-method-ambiguity-and-hang.md`](../../known-issues/springboot/jooq-destroy-method-ambiguity-and-hang.md).
+[`jooq-destroy-method-ambiguity-and-hang-FIXED.md`](../springboot/jooq-destroy-method-ambiguity-and-hang-FIXED.md).
 
 ## Root cause and resolution
 
