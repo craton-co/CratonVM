@@ -1522,7 +1522,7 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         let is_lambda = shared.lambda_proxies.read().contains_key(&class_id);
         if is_lambda {
             // Errors are silently swallowed per the Cleaner contract.
-            let _ = try_lambda_dispatch(shared, thread, action, class_id, "run", &[]);
+            let _ = try_lambda_dispatch(shared, thread, action, class_id, "run", "()V", &[]);
             continue;
         }
 
@@ -4628,6 +4628,7 @@ pub fn execute(
                             recv_obj,
                             recv_cid,
                             method_name,
+                            method_descriptor,
                             rest,
                         )? {
                             return Ok(inner);
@@ -18644,6 +18645,7 @@ fn execute_invoke_kind(
                 *obj_ref,
                 obj_class_id,
                 &method_name,
+                &method_descriptor,
                 &args[1..],
             )? {
                 if let Some(value) = result {
@@ -20575,6 +20577,36 @@ pub(crate) fn lambda_impl_dispatch_override(
     })
 }
 
+/// Resolve a lambda implementation that is private in its declaring class.
+///
+/// LambdaMetafactory may encode a private synthetic lambda body as an
+/// `InvokeVirtual` method handle. That handle is nevertheless bound to the
+/// resolved owner method: virtual dispatch on the captured object's concrete
+/// subclass is incorrect when that subclass happens to declare a same-named
+/// synthetic `lambda$...` method. Preserve the declaring class in that case.
+pub(crate) fn lambda_private_impl_dispatch_class(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    let owner_id = lambda_impl_dispatch_override(shared, call_site).or_else(|| {
+        shared
+            .class_manager
+            .read()
+            .get_loaded_class_id(&call_site.impl_handle.class_name)
+    })?;
+    let cm = shared.class_manager.read();
+    let (method, declaring_id) = crate::classloading::find_method_recursive(
+        owner_id,
+        &call_site.impl_handle.member_name,
+        &call_site.impl_handle.descriptor,
+        &cm.class_store,
+    )?;
+    method
+        .access_flags
+        .contains(MethodAccessFlags::PRIVATE)
+        .then_some(declaring_id)
+}
+
 /// Try to run a concrete default method declared by a lambda proxy's
 /// functional interface.
 ///
@@ -20884,6 +20916,7 @@ pub(crate) fn try_lambda_dispatch(
     obj_ref: ObjectRef,
     obj_class_id: ClassId,
     method_name: &str,
+    method_descriptor: &str,
     call_args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
     // S-bytebuddy r4 — independent recursion guard for lambda dispatch.
@@ -20942,76 +20975,18 @@ pub(crate) fn try_lambda_dispatch(
         );
     }
 
-    // A functional interface may declare same-named OVERLOADS of the SAM —
-    // typically `default` methods whose body delegates to the real SAM. JUnit5's
-    // `TestInstancesProvider` has a 2-arg
-    // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)` default
-    // that calls the 3-arg abstract SAM
-    // `getTestInstances(ExtensionRegistry, ExtensionRegistrar, ThrowableCollector)`.
-    // Matching the SAM by name alone would intercept the 2-arg default and route
-    // it to the lambda body one argument short (trailing param left
-    // uninitialised). Only intercept when the supplied arg count matches the
-    // SAM's; otherwise fall through so the real default method runs and then
-    // re-invokes the SAM with the right arity.
+    // A functional interface may declare same-named default overloads of its
+    // SAM. Dispatching a lambda by method name, arity, or runtime argument
+    // assignability is unsound: null is assignable to both `InetAddress` and
+    // `InetSocketAddress`, so the latter default could be skipped entirely.
+    // The bytecode call-site descriptor is the authoritative identity. Only the
+    // exact SAM descriptor may enter the lambda body; any other descriptor must
+    // fall through to ordinary interface/default-method dispatch.
     if method_name == &*call_site.sam_method_name
-        && split_method_descriptor(&call_site.sam_descriptor).0.len() != call_args.len()
+        && method_descriptor != &*call_site.sam_descriptor
     {
         return Ok(None);
     }
-    // Bug B: same name + same arity but mismatched parameter types is an
-    // overloaded interface default (e.g. AnnotationFilter.matches(Class) vs the
-    // SAM matches(String)), not the SAM. Fall through so the real default runs.
-    //
-    // GC-safety: `lambda_args_sam_compatible` can trigger class loading -- a
-    // GC-triggering call -- through its proxy/annotation-satisfies helper
-    // family (`lambda_proxy_satisfies`/`synthetic_implements`/
-    // `proxy_instance_satisfies_target`/`annotation_proxy_satisfies_target`).
-    // This is the exact same predicate whose sibling call site in
-    // `vm_exec.rs`'s `invoke_virtual` was fixed in commit d64fab85 for
-    // identical reasons; this call site was missed by that fix. `obj_ref`
-    // and every object element of `call_args` are plain Rust locals/borrows
-    // at this point, invisible to the collector, so a moving GC landing
-    // inside the predicate leaves them stale for every subsequent heap read
-    // in this function -- starting with the captured-value
-    // `get_field(obj_ref, ...)` reads used to build `full_args` further
-    // down (both in the Scala `apply$mc*$sp` bridge branch and the main
-    // dispatch path below). Pin both before the predicate can run and
-    // re-read through the pins once it returns.
-    let mut obj_ref = obj_ref;
-    let mut call_args_refreshed: Option<Vec<Value>> = None;
-    if method_name == &*call_site.sam_method_name {
-        let sam_compat_pin_base = thread.native_pin_roots.len();
-        thread.native_pin_roots.push(obj_ref);
-        let arg_pins: Vec<Option<usize>> = call_args
-            .iter()
-            .map(|a| match a {
-                Value::Object(Some(o)) => {
-                    let idx = thread.native_pin_roots.len();
-                    thread.native_pin_roots.push(*o);
-                    Some(idx)
-                }
-                _ => None,
-            })
-            .collect();
-        let compatible = lambda_args_sam_compatible(shared, &call_site.sam_descriptor, call_args);
-        // Re-read obj_ref/call_args through the pins -- the compatibility
-        // check above may have triggered a moving GC that relocated either.
-        obj_ref = thread.native_pin_roots[sam_compat_pin_base];
-        let refreshed: Vec<Value> = call_args
-            .iter()
-            .zip(arg_pins.iter())
-            .map(|(orig, pin)| match pin {
-                Some(idx) => Value::Object(Some(thread.native_pin_roots[*idx])),
-                None => *orig,
-            })
-            .collect();
-        thread.native_pin_roots.truncate(sam_compat_pin_base);
-        if !compatible {
-            return Ok(None);
-        }
-        call_args_refreshed = Some(refreshed);
-    }
-    let call_args: &[Value] = call_args_refreshed.as_deref().unwrap_or(call_args);
 
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
@@ -21392,6 +21367,7 @@ pub(crate) fn try_lambda_dispatch(
                 true,
                 num_captures,
             )?;
+            let private_impl_class = lambda_private_impl_dispatch_class(shared, &call_site);
             // Round 7 — if the receiver is itself a lambda proxy whose SAM
             // matches the impl_handle's member name, recurse through
             // try_lambda_dispatch directly. Without this, downstream
@@ -21414,6 +21390,7 @@ pub(crate) fn try_lambda_dispatch(
                         *r,
                         rcv_class_id,
                         &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
                         &full_args[1..],
                     )?;
                     if let Some(inner_v) = inner {
@@ -21498,22 +21475,66 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let cached_result = recv_class_id_opt
-                .filter(|rcv| *rcv != ClassId::new(0))
-                .map(|rcv| {
-                    try_invoke_cached_lambda_impl(
-                        shared,
-                        thread,
-                        obj_class_id,
-                        rcv,
-                        &call_site.impl_handle.member_name,
-                        &call_site.impl_handle.descriptor,
-                        &full_args,
-                    )
-                })
-                .transpose()?
-                .flatten();
-            let result = if let Some(result) = cached_result {
+            // A private instance lambda body is encoded by javac as an
+            // InvokeVirtual handle, but it retains invokespecial semantics:
+            // resolve it on the handle's declaring class, not by walking the
+            // captured receiver's hierarchy. Synthetic lambda names are not
+            // unique across a hierarchy (for example both Spring Data's
+            // AnnotationBasedPersistentProperty and AbstractPersistentProperty
+            // have lambda$new$2), so receiver-based lookup can execute a
+            // different private body with the same name and descriptor.
+            let impl_owner_id = lambda_impl_dispatch_override(shared, &call_site).or_else(|| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&call_site.impl_handle.class_name)
+            });
+            let private_impl_owner = impl_owner_id.filter(|owner_id| {
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(*owner_id)
+                    .and_then(|class| {
+                        class.find_method(
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                        )
+                    })
+                    .is_some_and(|method| method.access_flags.contains(MethodAccessFlags::PRIVATE))
+            });
+            // Keep the existing loader-faithful private implementation owner
+            // when it is available; otherwise use the declaring owner found
+            // above for private synthetic lambda methods.
+            let exact_impl_owner = private_impl_class.or(private_impl_owner);
+            let cached_result = if exact_impl_owner.is_none() {
+                recv_class_id_opt
+                    .filter(|rcv| *rcv != ClassId::new(0))
+                    .map(|rcv| {
+                        try_invoke_cached_lambda_impl(
+                            shared,
+                            thread,
+                            obj_class_id,
+                            rcv,
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
+            let result = if let Some(owner_id) = exact_impl_owner {
+                crate::vm::invoke_on_class_shared_no_retarget(
+                    shared,
+                    thread,
+                    owner_id,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )
+            } else if let Some(result) = cached_result {
                 Ok(result)
             } else if let Some(rcv_cid) = virtual_override {
                 invoke_on_class_shared(
@@ -22992,21 +23013,6 @@ pub(crate) fn is_jython_pymodule_native_override(
     class_name == "org/python/core/PyModule"
         && method_name == "__findattr_ex__"
         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
-}
-
-pub(crate) fn is_time_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/time/Instant"
-        && matches!(
-            (method_name, descriptor),
-            ("now", "()Ljava/time/Instant;")
-                | ("ofEpochSecond", "(J)Ljava/time/Instant;")
-                | ("ofEpochSecond", "(JJ)Ljava/time/Instant;")
-                | ("ofEpochMilli", "(J)Ljava/time/Instant;")
-        )
 }
 
 pub(crate) fn is_jdk_wrapper_math_native_override(
@@ -25257,14 +25263,6 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // H2 calls `Instant.now()` for every SQL statement command swap during
-    // Hibernate schema creation. The registered java.time bridge creates the
-    // same two-field Instant directly and avoids the real-JDK
-    // Clock.currentInstant -> VM.getNanoTimeAdjustment path, which is a hot
-    // interpreted layer under FunctionTests.
-    if is_time_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
     // Tiny JDK wrapper arithmetic helpers are already registered as exact
     // natives in `phases_early`; route real-JDK bytecode through them so hot
     // collection reductions such as Hibernate's JoinedList constructor do not
@@ -26412,6 +26410,11 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 | "java/util/concurrent/LinkedBlockingDeque"
                 | "java/util/concurrent/atomic/AtomicBoolean"
                 | "java/util/EnumSet"
+                // The fallback bridge is needed only if bootstrap had to
+                // synthesize Instant.  With a loaded real JDK Instant, every
+                // factory must run its real bytecode so the result has the
+                // real field layout and ISO-8601 `toString()` semantics.
+                | "java/time/Instant"
                 // NOT "java/util/StringJoiner" (2026-07-10): yielding this
                 // class's SyntheticStub natives to real bytecode here exposes
                 // a deterministic heap-reference-integrity defect (the
@@ -27281,10 +27284,20 @@ fn execute_invokestatic(
     // Walk the superclass chain because the constant pool may reference a subclass
     // while the native is registered on the declaring superclass.
     // Skip hierarchy walk for <init> — constructors are NOT inherited.
-    let direct_native = shared
+    // SyntheticStub registrations on real-protected classes must not suppress
+    // loading the real owner. Otherwise the first call materializes a stub and
+    // seeds a native invoke-cache entry before real bytecode can take over.
+    let direct_native_registered = shared
         .native_methods
         .find(&method_class_name, &method_name, &method_descriptor)
         .is_some();
+    let direct_synthetic_stub_may_yield = direct_native_registered
+        && shared
+            .native_methods
+            .kind_of(&method_class_name, &method_name, &method_descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+        && real_protected_stub_class(&method_class_name);
+    let direct_native = direct_native_registered && !direct_synthetic_stub_may_yield;
     let is_native = direct_native
         || (method_name.as_ref() != "<init>" && {
             let cm = shared.class_manager.read();
@@ -28064,6 +28077,25 @@ fn execute_invokestatic_cached(
     if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
+    }
+    // A call site can first resolve while a bootstrap fallback class is
+    // synthetic, then observe that class upgraded in place to real bytecode.
+    // Cached native entries do not otherwise revisit the SyntheticStub
+    // precedence gate, so evict instead of serving a stale fallback callback.
+    if matches!(&target, CachedInvokeTarget::Native { .. }) {
+        if let Ok((class_name, method_name, descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            ) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
     }
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
@@ -35072,6 +35104,34 @@ fn execute_invokevirtual_cached(
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
+                    // The class may have been upgraded in place after this
+                    // call site cached a SyntheticStub callback. Re-run the
+                    // real-bytecode precedence gate before serving that
+                    // cached callback; otherwise an earlier stub result can
+                    // keep the same receiver ClassId pinned to its fallback
+                    // `toString()` forever.
+                    if let Ok((_owner, method_name, descriptor, _)) =
+                        resolve_method_ref(shared, caller_class_id, cp_index)
+                    {
+                        let receiver_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(actual_class_id)
+                            .map(|class| class.name.clone());
+                        if let Some(receiver_name) = receiver_name {
+                            if synthetic_stub_should_yield_to_real_bytecode(
+                                shared,
+                                &receiver_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
+                                thread
+                                    .invoke_cache
+                                    .evict(caller_class_id, cp_index, is_special);
+                                return Ok(CachedCallResult::CacheMiss);
+                            }
+                        }
+                    }
                     // The callback identity proves this cache entry is one of
                     // the eight real-layout Matcher leaves. The receiver was
                     // just checked against the cache's monomorphic class guard,
@@ -39118,6 +39178,7 @@ mod tests {
             regular_obj,
             ClassId::new(0),
             "accept",
+            "()V",
             &[],
         )
         .unwrap();

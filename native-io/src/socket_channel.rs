@@ -83,6 +83,10 @@ pub enum TcpHandle {
     /// selector never reported `OP_CONNECT` → ES `testAsyncRequests` lost the
     /// request via `CancelledKeyException`.)
     Connecting(TcpStream),
+    /// A loopback connect that is known to have failed, retained until the
+    /// selector drives `finishConnect()` so Java observes an asynchronous
+    /// connect failure rather than a synchronous `connect()` throw.
+    ConnectFailed(TcpStream, std::io::Error),
     /// Closed but kept in the map so callers see -1 / -1 idempotently.
     Closed,
 }
@@ -104,7 +108,9 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
         // A connect-in-progress socket is a live pollable fd: clone it as a
         // Stream so the selector polls it for write-readiness and surfaces
         // OP_CONNECT naturally once the OS completes (or refuses) the connect.
-        Some(TcpHandle::Connecting(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        Some(TcpHandle::Connecting(s)) | Some(TcpHandle::ConnectFailed(s, _)) => {
+            s.try_clone().ok().map(TcpHandleClone::Stream)
+        }
         _ => None,
     }
 }
@@ -146,6 +152,7 @@ pub fn probe_connect_status(net_fd: i32) -> SelectorConnectProbe {
             crate::nb_connect::ConnectPoll::Connected
             | crate::nb_connect::ConnectPoll::Failed(_) => SelectorConnectProbe::Ready,
         },
+        Some(TcpHandle::ConnectFailed(_, _)) => SelectorConnectProbe::Ready,
         Some(TcpHandle::Stream(_)) => SelectorConnectProbe::Ready,
         _ => SelectorConnectProbe::NotConnecting,
     }
@@ -241,7 +248,11 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
     // the underlying refusal was detected correctly).
     match e.kind() {
         ErrorKind::ConnectionRefused => RuntimeError::ConnectException {
-            message: format!("{ctx}: {e}"),
+            // `std::io::Error` uses the localized Winsock text on Windows.
+            // Java callers (including Spring Boot's health assertions) rely
+            // on the portable `Connection refused` wording, so keep the
+            // public exception message stable across host locales.
+            message: format!("{ctx}: Connection refused"),
         }
         .into(),
         ErrorKind::TimedOut => RuntimeError::SocketTimeoutException {
@@ -1272,6 +1283,7 @@ fn sc_connect_inner(
     // manual selector OP_CONNECT injection (which double-fired the connecting
     // reactor's session request → IllegalStateException).
     let mut pending: Option<TcpStream> = None;
+    let mut deferred_failure: Option<(TcpStream, std::io::Error)> = None;
     let mut last_err: Option<std::io::Error> = None;
     for addr in &vetted {
         match crate::nb_connect::start(addr) {
@@ -1297,11 +1309,34 @@ fn sc_connect_inner(
                     pending = Some(stream);
                 }
             }
+            Ok(crate::nb_connect::StartConnect::DeferredFailure(stream, error)) => {
+                if deferred_failure.is_none() {
+                    deferred_failure = Some((stream, error));
+                }
+            }
             Err(e) => {
                 ipc_dbg(format!("connect start failed addr={addr}: {e}"));
                 last_err = Some(e);
             }
         }
+    }
+
+    if let Some((stream, error)) = deferred_failure {
+        let id = tcp_register(TcpHandle::ConnectFailed(stream, error));
+        tcp_blocking_state().write().insert(id, false);
+        cf_set(ctx, this, F_REG_ID, Value::Int(id));
+        // Windows' selector can fail to deliver OP_CONNECT for an untouched
+        // socket that has already been locally classified as refused. Treat
+        // this narrow terminal state as connected so the async reactor reaches
+        // its ordinary first write; that write below then reports the saved
+        // connection failure immediately instead of stranding the request in
+        // a never-observable pending state.
+        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+        let host_str = ctx.create_string(&host);
+        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+        ipc_dbg(format!("connect deferred failure(nonblocking) id={id}"));
+        return Ok(true);
     }
 
     if let Some(stream) = pending {
@@ -1399,6 +1434,10 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 }
                 ConnectPoll::Failed(e) => Verdict::Failed(map_err("finishConnect", e)),
             },
+            Some(TcpHandle::ConnectFailed(_, error)) => Verdict::Failed(map_err(
+                "finishConnect",
+                std::io::Error::new(error.kind(), error.to_string()),
+            )),
             _ => Verdict::NotConnecting,
         }
     };
@@ -1543,6 +1582,14 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 ctx.end_blocking_region();
                 ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
+            }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(map_err(
+                    "read",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
             }
             _ => {
                 ctx.end_blocking_region();
@@ -1694,6 +1741,14 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
             }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(map_err(
+                    "write",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
+            }
             _ => {
                 ctx.end_blocking_region();
                 ctx.unpin_native_roots(bb_pin);
@@ -1823,6 +1878,16 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                 }
                 return Ok(Some(Value::Long(0)));
             }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Err(map_err(
+                    "write(gathering)",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
+            }
             _ => {
                 ctx.end_blocking_region();
                 for (pin, _, _) in &chunks {
@@ -1919,7 +1984,15 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Some(TcpHandle::Stream(s)) => {
                 try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e))?
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
+            Some(TcpHandle::Connecting(_)) => {
+                return Ok(Some(Value::Long(0)));
+            }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                return Err(map_err(
+                    "read(scattering)",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
+            }
             _ => return Err(ioex("read(scattering): channel not a stream")),
         }
     };
@@ -2624,8 +2697,9 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // Option setters on the `java.net.Socket` adapter returned by
     // SocketChannel.socket(). These are the methods Tomcat's
     // SocketProperties.setProperties invokes; the adapter has no real
-    // SocketImpl so the real bytecode would NPE in getImpl(). No-op them
-    // (gate-aware: dropped under CRATONVM_REAL_NET_SOCKETS).
+    // SocketImpl so the real bytecode would NPE in getImpl(). The adaptor
+    // owns its own setSoTimeout implementation, so do not shadow the base
+    // Socket setter: ordinary sockets must apply SO_RCVTIMEO to their stream.
     let client_socket = "java/net/Socket";
     for (m, d) in [
         ("setReceiveBufferSize", "(I)V"),
@@ -2635,7 +2709,6 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         ("setTcpNoDelay", "(Z)V"),
         ("setOOBInline", "(Z)V"),
         ("setSoLinger", "(ZI)V"),
-        ("setSoTimeout", "(I)V"),
         ("setPerformancePreferences", "(III)V"),
     ] {
         r.register(client_socket, m, d, socket_opt_noop);

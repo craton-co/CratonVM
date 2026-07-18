@@ -7340,7 +7340,7 @@ struct Compiler {
     bounds_safe_pcs: FxHashSet<usize>,
     /// Deferred out-of-line bounds-check failure stubs: (branch_patch_offset, bc_pc).
     /// After the main bytecode loop, we emit the slow-path code for each.
-    bounds_check_stubs: Vec<usize>,
+    bounds_check_stubs: Vec<(usize, usize)>,
     /// Round-8 CRIT fix (audit `round8-jit.md`, "false-promise abort" item):
     /// deferred null-check failure stubs for inline array load/store/length
     /// opcodes (iastore / bastore / aastore / lastore / fastore / dastore /
@@ -16214,7 +16214,7 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x83]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.bounds_check_stubs.push(patch_offset);
+        self.bounds_check_stubs.push((patch_offset, bc_pc));
     }
 
     /// Emit the CRC-32 (reflected) inner fold of ONE byte for the
@@ -16428,63 +16428,54 @@ impl Compiler {
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
     ///
-    /// Each stub: loads index (from RCX) and length (0 as placeholder) into
-    /// argument registers, then calls `jit_throw_aioobe` (which diverges).
+    /// Each bytecode array-access site gets its own cold landing pad. Besides
+    /// the index, length, and array pointer already live at the failing check,
+    /// the pad passes the originating bytecode PC to `jit_throw_aioobe`.
     ///
-    /// All stubs share a single landing pad to minimize code size.
+    /// Do not coalesce these pads. A shared landing pad makes a live AIOOBE
+    /// impossible to attribute to one of the method's array accesses: the
+    /// helper return PC identifies only the common pad, while the machine
+    /// instructions preceding the pad are merely the last-emitted main-code
+    /// block and need not be the branch that jumped there.
     fn emit_bounds_check_stubs(&mut self) {
         if self.bounds_check_stubs.is_empty() {
             return;
         }
 
-        // Single shared stub — all JAE branches jump here
-        let stub_offset = self.buf.pos();
+        // Clone the small metadata vector so emitting pads can mutably borrow
+        // `self`. Unrolled copies keep the same bci but have distinct branch
+        // offsets; a separate pad for each remains unambiguous.
+        let sites = self.bounds_check_stubs.clone();
+        for (patch_off, bc_pc) in sites {
+            let stub_offset = self.buf.pos();
 
-        // At this point, RCX = index (from the array access setup)
-        // R10D = array_length (loaded in the bounds check)
-        // We need to pass (index, length) to jit_throw_aioobe
+            // At this point RAX=array pointer, RCX=index, R10D=array length.
+            // Set up jit_throw_aioobe(index, length, array_ptr, bytecode_pc).
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: arg1=RCX, arg2=RDX, arg3=R8, arg4=R9.
+                self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
+                self.buf.emit(&[0x4C, 0x89, 0xD2]); // MOV RDX, R10
+                self.emit_mov_imm32_sx(R9, bc_pc as i32);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // SysV: arg1=RDI, arg2=RSI, arg3=RDX, arg4=RCX.
+                self.rex_w();
+                self.buf.emit_byte(0x8B);
+                self.modrm_reg(RDX, RAX); // MOV RDX, RAX
+                self.rex_w();
+                self.buf.emit_byte(0x8B);
+                self.modrm_reg(RDI, RCX); // MOV RDI, RCX
+                self.buf.emit(&[0x4C, 0x89, 0xD6]); // MOV RSI, R10
+                self.emit_mov_imm32_sx(RCX, bc_pc as i32);
+            }
 
-        // Set up args for jit_throw_aioobe(index: i64, length: i64, array_ptr: i64)
-        //
-        // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
-        // 2026-07-17): RAX still holds the array pointer at this point (the
-        // bounds check only reads through it into R10D; nothing in this
-        // stub clobbers RAX before the CALL), so pass it as a 3rd arg for
-        // `CRATONVM_DBG_AIOOBE3` diagnostics. Behavior-neutral when unset.
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: arg1=RCX, arg2=RDX, arg3=R8
-            // RCX already contains the index
-            // MOV R8, RAX (move array pointer to arg3)
-            self.buf.emit(&[0x49, 0x89, 0xC0]); // REX.WB + MOV r/m64, r64 (R8 <- RAX)
-            // MOV RDX, R10 (move length to arg2)
-            self.buf.emit(&[0x4C, 0x89, 0xD2]); // REX.WR + MOV r/m64, r64
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            // SysV: arg1=RDI, arg2=RSI, arg3=RDX
-            // MOV RDX, RAX (move array pointer to arg3)
-            self.rex_w();
-            self.buf.emit_byte(0x8B);
-            self.modrm_reg(RDX, RAX);
-            // MOV RDI, RCX (move index to arg1)
-            self.rex_w();
-            self.buf.emit_byte(0x8B);
-            self.modrm_reg(RDI, RCX);
-            // MOV RSI, R10 (move length to arg2)
-            self.buf.emit(&[0x4C, 0x89, 0xD6]); // REX.WR + MOV r/m64, r64
-        }
+            // Return the sentinel through this method's epilogue; the
+            // interpreter materializes and routes the Java exception.
+            self.emit_call_absolute(self.helpers.throw_aioobe);
+            self.emit_epilogue();
 
-        // CALL jit_throw_aioobe (absolute) — returns i64::MIN sentinel in RAX
-        self.emit_call_absolute(self.helpers.throw_aioobe);
-
-        // jit_throw_aioobe returns i64::MIN in RAX. Clean up the frame
-        // and return to the interpreter, which will detect the sentinel
-        // and convert it to an ArrayIndexOutOfBoundsException.
-        self.emit_epilogue();
-
-        // Patch all JAE branches to point to the shared stub
-        for &patch_off in &self.bounds_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
@@ -19876,10 +19867,10 @@ impl Compiler {
                                     .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_bounds_stubs: Vec<usize> = self
+                                let orig_bounds_stubs: Vec<(usize, usize)> = self
                                     .bounds_check_stubs
                                     .iter()
-                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
                                 let orig_excn_stubs: Vec<usize> = self
@@ -20086,8 +20077,11 @@ impl Compiler {
                                     // null-check-store, and self-call patch
                                     // sites so the late stub emitters see
                                     // every duplicated branch.
-                                    self.bounds_check_stubs
-                                        .extend(orig_bounds_stubs.iter().map(|&po| po + shift_us));
+                                    self.bounds_check_stubs.extend(
+                                        orig_bounds_stubs
+                                            .iter()
+                                            .map(|&(po, bci)| (po + shift_us, bci)),
+                                    );
                                     self.exception_check_stubs
                                         .extend(orig_excn_stubs.iter().map(|&po| po + shift_us));
                                     self.null_check_store_stubs.extend(
@@ -37870,8 +37864,8 @@ mod tests {
 
     thread_local! {
         /// Set by [`flagging_throw_aioobe`] so an inline out-of-bounds
-        /// access can be observed from a test: records `(index, length)`.
-        static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64)>> =
+        /// access can be observed from a test: `(index, length, bytecode_pc)`.
+        static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64, i64)>> =
             const { std::cell::Cell::new(None) };
         /// Set by [`flagging_npe_with_action`] when an inline null-check deopt
         /// stub fires.
@@ -37882,14 +37876,19 @@ mod tests {
         static TEST_NPE_ACTION: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
     }
 
-    /// Test stand-in for `jit_throw_aioobe`: records `(index, length)`
+    /// Test stand-in for `jit_throw_aioobe`: records the failure payload
     /// and returns the `i64::MIN` deopt sentinel, exactly like the real
     /// helper. The bounds-check stub calls this when `idx >= len`.
     ///
-    /// SAFETY: plain `extern "C"` callback invoked by JIT code with two
+    /// SAFETY: plain `extern "C"` callback invoked by JIT code with four
     /// `i64` arguments; touches only a thread-local.
-    unsafe extern "C" fn flagging_throw_aioobe(index: i64, length: i64) -> i64 {
-        TEST_AIOOBE_HIT.with(|c| c.set(Some((index, length))));
+    unsafe extern "C" fn flagging_throw_aioobe(
+        index: i64,
+        length: i64,
+        _array_ptr: i64,
+        bytecode_pc: i64,
+    ) -> i64 {
+        TEST_AIOOBE_HIT.with(|c| c.set(Some((index, length, bytecode_pc))));
         i64::MIN
     }
 
@@ -38377,8 +38376,8 @@ mod tests {
         assert_eq!(result, i64::MIN, "OOB iaload must deopt with sentinel");
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),
-            Some((3, 3)),
-            "OOB iaload must report (index=3, length=3) to throw_aioobe"
+            Some((3, 3, 2)),
+            "OOB iaload must report index, length, and originating bci"
         );
 
         // Negative index — unsigned compare catches it as huge.

@@ -189,3 +189,65 @@ sequence for the four residual faces from this clean branch. Do not move this
 record back under `docs/internal` or claim the family fixed until a newly built
 clean binary completes the same full 64-class matrix with zero transport,
 header, timeout, selector, loader, or native-stack residuals.
+
+## 2026-07-18 C20/C21 follow-up — interest-change wakeup and narrowed residuals
+
+**Status: OPEN.** C20 adds a Linux selector interest-change nudge: after a
+successful `epoll_ctl(EPOLL_CTL_MOD)`, `selector_set_interest()` writes one byte
+to the selector self-pipe without setting the public sticky `woken` flag. This
+addresses the specific partial-gathering-write interstice in which Tomcat arms
+`OP_WRITE` while its poller is already blocked in `epoll_wait`; `epoll_ctl(MOD)`
+alone does not reliably wake that wait. The earlier retained HTTP/2 close trace
+showed the whole response body followed by only a partial final GOAWAY frame,
+which is consistent with the last readiness transition not being observed before
+the connection is closed.
+
+The change is intentionally limited to an internal readiness re-check: it does
+not make `Selector.wakeup()` sticky and therefore does not alter its Java-visible
+return contract. The focused regression suite passed:
+
+```text
+CARGO_TARGET_DIR=/data/data/target-dohead-c20-test-20260718 \
+  cargo test -p cratonvm-native-io --lib nio_selector -- --test-threads=1
+20 passed; 0 failed
+```
+
+The unique C20 binary was `/data/data/cvm-dohead-c20-writewakeup-20260718`.
+Its focused two-process, four-pass `0 -> {1,1023,1024,1025}` exercise completed
+16/16 class runs clean at
+`/data/data/dohead-c20-writewakeup-0-1-family-n2x4-20260718`, including the
+previously retained HTTP/2 EOF face. This is strong targeted evidence, but not a
+full-family closure.
+
+The first full C20 matrix reached 42 classes and failed at
+`TestHttpServletDoHeadInvalidWrite1ValidWrite513`, parameter
+`testDoHead[39: 0 false true 16 false 1 BUFFER 513 true]`, with the HTTP/1
+header-count assertion `expected:<4> but was:<3>`.
+
+### C21 wire/header diagnostic result
+
+An uncommitted diagnostic-only `HttpURLConnection` header trace was built as
+`/data/data/cvm-dohead-c21-hucdiag-20260718` and removed before this commit.
+The retained run is
+`/data/data/dohead-c21-hucdiag-1-family-n2x6-20260718`. It completed all eight
+`1 -> {0,1,511,512,513,1023,1024,1025}` classes in pass 1 and the same set in
+pass 2 before the harness stopped on its first failed exit. It recorded:
+
+| Pass/class | Exact residual |
+| --- | --- |
+| pass 1, `1 -> 0` | Header-count failure at `testDoHead[60: 0 false true 16384 false 1 NONE 0 false]`: expected 4, got 5. The raw GET and HEAD headers were identical five-entry lists (`Content-Type`, `Content-Length`, `Date`, `Keep-Alive`, `Connection`). |
+| pass 1, `1 -> 512` | `connection closed before response head` on HEAD, parameter 79. |
+| pass 2, `1 -> 0` | `SocketTimeoutException: Read timed out` on HEAD, parameter 15, after 361.828 seconds. |
+
+The raw-header result rules out the HTTP response parser and wire transport as
+the direct cause of the header-count failure. In the interval after the matching
+headers are returned and before the assertion, the VM logged guarded
+out-of-bounds `get_field`/`set_field` accesses on zero-field `java/lang/Object`
+receivers. The next implementation gate is therefore the Java map/collection
+copy path (`HttpURLConnection.getHeaderFields()` -> `CaseInsensitiveKeyMap`),
+including its object-layout/receiver handling, while separately retaining the
+selector wakeup change for the HTTP/2 partial-write face.
+
+After this diagnostic attempt completed, every running DoHead VM process was
+terminated; a `/proc` executable-and-command-line sweep confirmed that no DoHead
+VM process remained.

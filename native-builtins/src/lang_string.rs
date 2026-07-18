@@ -3875,15 +3875,36 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
-    let len = ctx.array_length(arr);
-    let mut parts = Vec::with_capacity(len);
-    for i in 0..len {
-        if let Value::Object(Some(elem)) = ctx.get_array_element(arr, i) {
-            parts.push(ctx.read_string(elem).unwrap_or_default());
-        } else {
-            parts.push("null".to_string());
+    // `String.join` accepts any CharSequence, not only String.  Keep the
+    // array rooted while an element's virtual `toString()` can allocate, then
+    // root that element for the call itself: both references may move in a GC.
+    let arr_pin = ctx.pin_native_root(arr);
+    let parts_result: Result<Vec<String>, cratonvm_types::error::MethodCallFailed> = (|| {
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        let len = ctx.array_length(arr);
+        let mut parts = Vec::with_capacity(len);
+        for i in 0..len {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            if let Value::Object(Some(elem)) = ctx.get_array_element(arr, i) {
+                let elem_pin = ctx.pin_native_root(elem);
+                let elem = ctx.read_native_pin(elem_pin, elem);
+                // Preserve the String fast path, but use real polymorphic
+                // dispatch for StringBuilder, custom CharSequences, and
+                // application classes such as Spring Boot's Regex.
+                let text_result = match ctx.read_string(elem) {
+                    Some(text) => Ok(text),
+                    None => invoke_to_string(ctx, elem),
+                };
+                ctx.unpin_native_roots(elem_pin);
+                parts.push(text_result?);
+            } else {
+                parts.push("null".to_string());
+            }
         }
-    }
+        Ok(parts)
+    })();
+    ctx.unpin_native_roots(arr_pin);
+    let parts = parts_result?;
     let joined = parts.join(&delim);
     Ok(Some(Value::Object(Some(
         ctx.create_string_uninterned(&joined),
@@ -5866,7 +5887,7 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::mock_ctx;
+    use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::ArrayElementType;
 
     // -----------------------------------------------------------------------
@@ -5901,6 +5922,47 @@ mod tests {
     #[test]
     fn format_float_nan() {
         assert_eq!(format_float(f32::NAN), "NaN");
+    }
+
+    fn join_custom_charsequence_to_string(
+        ctx: &mut MockNativeContext,
+        receiver: cratonvm_types::ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name == "toString" && descriptor == "()Ljava/lang/String;" {
+            return Some(Ok(Some(ctx.get_field(receiver, 1))));
+        }
+        None
+    }
+
+    #[test]
+    fn string_join_array_uses_to_string_for_custom_charsequence() {
+        let mut ctx = mock_ctx();
+        let delimiter = ctx.create_string("|");
+        let prefix = ctx.create_string("prefix");
+        let custom = ctx.fresh_object_ref();
+        let custom_text = ctx.create_string("custom");
+        // Leave field 0 non-reference so the mock's String-layout reader
+        // cannot mistake this custom object for a String.
+        ctx.set_field(custom, 1, Value::Object(Some(custom_text)));
+        let sequences = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 3);
+        ctx.set_array_element(sequences, 0, Value::Object(Some(prefix)));
+        ctx.set_array_element(sequences, 1, Value::Object(Some(custom)));
+        ctx.set_array_element(sequences, 2, Value::Object(None));
+        ctx.set_invoke_virtual_hook(join_custom_charsequence_to_string);
+
+        let result = native_string_join(
+            &mut ctx,
+            &[Value::Object(Some(delimiter)), Value::Object(Some(sequences))],
+        )
+        .unwrap();
+        let Some(Value::Object(Some(joined))) = result else {
+            panic!("String.join should return a String");
+        };
+        assert_eq!(ctx.read_string(joined).as_deref(), Some("prefix|custom|null"));
+        assert_eq!(ctx.native_pin_count_for_test(), 0, "String.join must release native roots");
     }
 
     // -----------------------------------------------------------------------

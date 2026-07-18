@@ -1,4 +1,21 @@
-# 2026-07-17 rerun: 5 fatal CRASHes, 2 distinct clusters
+# 2026-07-17 rerun: 5 fatal CRASHes, 2 distinct clusters — FIXED
+
+## Resolution (2026-07-18)
+
+The late `ExceptionUtils` manifestation was already covered by the current
+precise JIT-root and Conscrypt/JUL dispatch regressions on `dev`; the supplied
+Spring Boot checkout has since moved its two tracing tests to `autoconfigure`,
+so the historical class names are no longer runnable. The still-reproducible
+Jetty crash was fixed by preventing Conscrypt's Windows JNI `JNI_OnLoad`
+registration from mutating CratonVM's JNI tables, while registering the small
+real-JDK Conscrypt initialization bridge required by Jetty's ALPN discovery.
+
+`SslServerCustomizerTests` now passes 6/6 in both JIT and `--nojit` modes.
+The separate current-fixture `ModifiedClassPathExtensionOverridesParameterizedTests`
+assertion is an external dependency-version expectation (`spring-context 7.0.7`
+versus 4.1.0.RELEASE), not a VM failure.
+
+---
 
 **Status: OPEN — found 2026-07-17**, `craton-rerun-20260717` (see
 `apps/spring-boot-suite-runner/RESULTS-20260717.md`), against the 510-class

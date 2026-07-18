@@ -8033,59 +8033,21 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    let application_context =
-        match spring_extension_get_application_context(ctx, extension_context)? {
-            Some(Value::Object(Some(application_context))) => application_context,
-            other => return Ok(other),
-        };
-
-    let parameter_type =
-        match ctx.invoke_virtual(parameter, "getType", "()Ljava/lang/Class;", &[])? {
-            Some(Value::Object(Some(parameter_type))) => parameter_type,
-            _ => return Ok(Some(Value::Object(Some(application_context)))),
-        };
-    if spring_java_class_name(ctx, parameter_type).as_deref()
-        == Some("org.springframework.context.ApplicationContext")
-    {
-        return Ok(Some(Value::Object(Some(application_context))));
-    }
-
-    let is_bean_override = ctx
-        .invoke_special(
-            "org/springframework/test/context/junit/jupiter/SpringExtension",
-            "isBeanOverride",
-            "(Ljava/lang/reflect/Parameter;)Z",
-            &[Value::Object(Some(parameter))],
-        )?
-        .and_then(|v| v.as_int())
-        .unwrap_or(0)
-        != 0;
-    if is_bean_override {
-        if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
-            "org/springframework/test/context/bean/override/BeanOverrideUtils",
-            "resolveHandlerForParameter",
-            "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
-            &[Value::Object(Some(parameter)), Value::Object(Some(test_class))],
-        ) {
-            if let Ok(Some(Value::Object(Some(bean_name)))) =
-                ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
-            {
-                return ctx.invoke_virtual(
-                    application_context,
-                    "getBean",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[Value::Object(Some(bean_name))],
-                );
-            }
-        }
-    }
-
-    let bean_factory = match ctx.invoke_virtual(
-        application_context,
-        "getAutowireCapableBeanFactory",
-        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-        &[],
-    )? {
+    // Spring Framework 7.0.7 delegates every parameter shape directly to
+    // ParameterResolutionDelegate. Keep this native mirror deliberately
+    // narrow: the former ApplicationContext / BeanOverride branches drifted
+    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    let application_context = spring_extension_get_application_context(ctx, extension_context)?;
+    let bean_factory_result = match application_context {
+        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
+            application_context,
+            "getAutowireCapableBeanFactory",
+            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+            &[],
+        )?,
+        other => return Ok(other),
+    };
+    let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -25171,6 +25133,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    crate::tls::register_conscrypt_native_bridges(registry);
     register_ecj_problem_overrides(registry);
     registry.register(
         "org/apache/jasper/servlet/JspServlet",
@@ -38535,8 +38498,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     register_synchronized_collection_wrapper_natives(registry);
     register_function_identity_natives(registry);
     // WildFly can load java.time.Instant through a bootstrap synthetic stub even
-    // in real-JDK mode. The interpreter already force-routes the hot Instant
-    // factories to native dispatch; make the bridge available in essentials too.
+    // in real-JDK mode. Keep its SyntheticStub bridge available in essentials;
+    // a loaded real-JDK Instant remains on its own bytecode path.
     register_synthetic_instant_stub_natives(registry);
     // Real-JDK boot can still resolve `java/util/Objects` through a synthetic
     // fallback when java.base stubs are partial. Install the existing spec

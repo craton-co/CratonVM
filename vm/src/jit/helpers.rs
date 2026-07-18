@@ -4211,8 +4211,14 @@ pub unsafe extern "C" fn jit_instanceof(
 /// terminate the process instead of unwinding to the `catch_unwind` in the
 /// interpreter.  Using a thread-local flag sidesteps this platform limitation.
 // SAFETY: Called from JIT-compiled code when an array bounds check fails.
-// Only stores two i64 values in a thread-local; no pointer dereferences.
-pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i64) -> i64 {
+// Only stores two i64 values in a thread-local. The raw pointer is read solely
+// by the explicitly-enabled diagnostic block below.
+pub unsafe extern "C" fn jit_throw_aioobe(
+    index: i64,
+    length: i64,
+    array_ptr: i64,
+    bytecode_pc: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -4240,14 +4246,14 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i6
             let gc_flags = std::ptr::read_unaligned(base.add(22) as *const u8);
             let fwd_ptr = std::ptr::read_unaligned(base.add(24) as *const usize);
             eprintln!(
-                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
+                "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
 header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
 array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags={gc_flags} \
 forwarding_ptr={fwd_ptr:#x}"
             );
         } else {
             eprintln!(
-                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL"
+                "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr=NULL"
             );
         }
     }
@@ -6624,6 +6630,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_ref,
             receiver_class_id,
             info.method_name,
+            info.descriptor,
             &rest,
         ) {
             Ok(Some(result)) => {
@@ -7670,7 +7677,7 @@ mod tests {
         let _ = take_jit_deopt_pending();
         let _ = take_jit_pending_aioobe();
         // SAFETY: only stores into thread-locals; no pointer dereference.
-        let r = unsafe { jit_throw_aioobe(5, 3, 0) };
+        let r = unsafe { jit_throw_aioobe(5, 3, 0, 17) };
         assert_eq!(r, i64::MIN);
         assert!(
             take_jit_deopt_pending(),

@@ -1,4 +1,29 @@
-# Misc non-passed residuals — 2026-07-16 full-suite rerun
+# Hibernate miscellaneous residuals — CLOSED 2026-07-17
+
+> **Final resolution (2026-07-17):** the remaining
+> `BigInteger.smallToString` AIOOBE was a JIT-only corruption residual in
+> real-JDK `java/math/MutableBigInteger` divide/normalization code. It is now
+> fail-closed in all three admission layers: VM static eligibility, tiered
+> background scheduling, and the JIT's final compiler gate. Public
+> `BigInteger` callers and application code remain JIT-eligible.
+>
+> The historical shared bounds-failure stub also obscured the throwing bytecode
+> site. It now emits one cold failure pad per check and threads the originating
+> BCI into the diagnostic, so any future array-bounds regression is attributed
+> to the real bytecode operation rather than the last main-code instruction.
+>
+> Verification on the incident fixture using the uniquely built
+> `cratonvm-hib-biginteger-smalltostring-gated-20260717-001` binary:
+>
+> - `SmallDividendRepro 20000`: `bad=0`; zero MutableBigInteger tier-enqueue
+>   or JIT-disassembly activity.
+> - `DefaultCatalogAndSchemaTest`, normal JIT: `found=132 started=132 ok=132
+>   failed=0`, 826,609 ms.
+> - The same full class with `--nojit`: `found=132 started=132 ok=132
+>   failed=0`, 754,331 ms.
+>
+> This document is retained as the investigation history; all of its residuals
+> are now closed and it belongs under `docs/internal/fixed-suite-bugs/`.
 
 ## `DefaultCatalogAndSchemaTest` — GC-corruption family CLOSED; BigInteger AIOOBE/InvalidMappingException residual CONFIRMED real, reproducibility wildly environment-sensitive (near-unreproducible in some sessions, a reliable ~50% full-harness hit rate in others, same day), root cause STILL OPEN
 

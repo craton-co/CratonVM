@@ -40,6 +40,11 @@ pub enum StartConnect {
     /// `connect()` is in progress (`WSAEWOULDBLOCK` / `EINPROGRESS`). Poll the
     /// returned stream for write-readiness, then call [`poll`].
     InProgress(TcpStream),
+    /// The local non-blocking socket is retained for selector registration,
+    /// but a bounded loopback probe has already observed a terminal failure.
+    /// The caller must surface it from `finishConnect()`, not throw from
+    /// `connect()`, to preserve the asynchronous SocketChannel contract.
+    DeferredFailure(TcpStream, std::io::Error),
 }
 
 /// Result of polling a connecting socket for completion.
@@ -159,6 +164,28 @@ mod imp_windows {
                 closesocket(s);
                 return Err(e);
             }
+            // Windows can leave a raw non-blocking loopback connect pending
+            // forever after a local listener closes. Probe before starting
+            // that raw connect: the ordinary blocking loopback connect gets
+            // the definitive result immediately. Keep the untouched
+            // non-blocking descriptor when the probe refuses so Java still
+            // receives the failure from selector-driven finishConnect().
+            if addr.ip().is_loopback() {
+                match TcpStream::connect(addr) {
+                    Ok(stream) => {
+                        closesocket(s);
+                        stream.set_nonblocking(true)?;
+                        return Ok(StartConnect::Connected(stream));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        return Ok(StartConnect::DeferredFailure(
+                            TcpStream::from_raw_socket(s as _),
+                            error,
+                        ));
+                    }
+                    Err(_) => {}
+                }
+            }
             let sa = build_sockaddr(addr);
             let rc = connect(s, sa.as_ptr(), sa.len() as i32);
             if rc == 0 {
@@ -175,6 +202,29 @@ mod imp_windows {
 
     pub fn poll(stream: &TcpStream) -> ConnectPoll {
         let s = stream.as_raw_socket() as usize;
+        // Windows can record a loopback refusal in SO_ERROR without also
+        // raising a WSAPoll writable/error edge. Probe SO_ERROR first so the
+        // selector can surface OP_CONNECT and finishConnect() can report the
+        // failure to its asynchronous caller.
+        let mut err: i32 = 0;
+        let mut len: i32 = std::mem::size_of::<i32>() as i32;
+        let rc = unsafe {
+            getsockopt(
+                s,
+                SOL_SOCKET,
+                SO_ERROR,
+                &mut err as *mut i32 as *mut u8,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return ConnectPoll::Failed(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+        if err != 0 {
+            return ConnectPoll::Failed(std::io::Error::from_raw_os_error(err));
+        }
         let mut pfd = Wsapollfd {
             fd: s,
             events: WSAPOLLWRNORM,
@@ -190,8 +240,8 @@ mod imp_windows {
         }
         // Some event fired. Read SO_ERROR to get the definitive verdict — it is
         // 0 on a completed connect and the connect errno on failure.
-        let mut err: i32 = 0;
-        let mut len: i32 = std::mem::size_of::<i32>() as i32;
+        err = 0;
+        len = std::mem::size_of::<i32>() as i32;
         // SAFETY: `err`/`len` are valid out-pointers sized for an int option.
         let rc = unsafe {
             getsockopt(
@@ -218,6 +268,30 @@ mod imp_windows {
             ));
         }
         ConnectPoll::Pending
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{start, StartConnect};
+        use std::net::TcpListener;
+
+        #[test]
+        fn closed_loopback_port_reports_connection_refused() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback probe");
+            let addr = listener.local_addr().expect("loopback address");
+            drop(listener);
+
+            match start(&addr) {
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused),
+                Ok(StartConnect::Connected(_)) => panic!("closed loopback port connected"),
+                Ok(StartConnect::DeferredFailure(_, error)) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+                }
+                Ok(StartConnect::InProgress(_)) => {
+                    panic!("closed loopback port was not classified as a deferred refusal")
+                }
+            }
+        }
     }
 }
 

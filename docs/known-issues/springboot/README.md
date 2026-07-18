@@ -11,6 +11,11 @@ produce). Most have since been retired (fixed or found not to reproduce on
 current dev, see table). The rest is an uncharacterized long tail of
 smaller/individual differences not yet clustered.
 
+> Closure update (2026-07-18): the HTTP codec, JDBC, Micrometer tracing, and
+> R2DBC `FilteredClassLoader` cluster is fixed. Canonical records are under
+> [`docs/internal/springboot`](../../internal/springboot/); the legacy index
+> links below are retained as redirects.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -86,7 +91,7 @@ open each doc for the full picture):
 | [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) | OPEN (majority FIXED 2026-07-18) — found 2026-07-17 |
 | [`oncondition-report-window-isolation-residual.md`](oncondition-report-window-isolation-residual.md) | OPEN — found 2026-07-18, residual of the capturedoutput fix above |
 | [`propertiesmigration-logfactory-oom-residual.md`](propertiesmigration-logfactory-oom-residual.md) | OPEN — found 2026-07-18, residual of the capturedoutput fix above |
-| [`cassandra-jni-thrownew-discards-payload-hang.md`](cassandra-jni-thrownew-discards-payload-hang.md) | OPEN — found 2026-07-17 |
+| [Cassandra JNI `ThrowNew` payload-loss hang (fixed)](../../internal/fixed-suite-bugs/cassandra-jni-thrownew-discards-payload-hang-FIXED.md) | FIXED — 2026-07-17 |
 | [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
 | [`Class.getMethods` override-shadowing duplicate-close cluster](../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md) | FIXED — 2026-07-17 |
 | [`Collections.singletonMap` real-wrapper regression](../../internal/springboot/collections-singletonmap-hashmap-backed-not-real-class-FIXED.md) | FIXED — 2026-07-18 |
@@ -94,30 +99,29 @@ open each doc for the full picture):
 | `contextrunner-resource-cycle-then-silent-stall-cluster.md` | **REFUTED/FIXED 2026-07-17** — moved to [`../../internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md`](../../internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md); not a deadlock — live CPU sampling showed 5 of 6 classes just needed more wall time than the 300s shard default (now carved out in the suite runner), and the `Class.getMethods()` override-shadowing fix cut both failures and wall time substantially. The 6th class is a distinct recursion bug, see [`opentelemetry-contextstorage-early-init-recursion-cluster.md`](opentelemetry-contextstorage-early-init-recursion-cluster.md). Real residuals split into 3 new docs (this row, plus the two below) |
 | [`controllerendpointdiscoverertests-hv000203-valueextractor.md`](controllerendpointdiscoverertests-hv000203-valueextractor.md) | OPEN — found 2026-07-17, hypothesis unconfirmed |
 | [`core-autoconfigure-singleton-fail-residuals-20260717.md`](core-autoconfigure-singleton-fail-residuals-20260717.md) | OPEN — found 2026-07-17 |
-| [`core-spring-boot-configdata-resource-resolution-empty-cluster.md`](core-spring-boot-configdata-resource-resolution-empty-cluster.md) | OPEN — found 2026-07-17 |
+| [`ConfigData resource-resolution empty cluster`](../../internal/springboot/core-spring-boot-configdata-resource-resolution-empty-cluster.md) | FIXED — 2026-07-18 |
 | [`core-spring-boot-crossthread-throwable-stacktrace-loss.md`](core-spring-boot-crossthread-throwable-stacktrace-loss.md) | OPEN — found 2026-07-17 (root cause confirmed at file:line precision |
 | `JsonWriterTests` unmodifiable-map lambda `ClassCastException` | **FIXED 2026-07-18** — moved to [`../../internal/springboot/core-spring-boot-jsonwriter-unmodifiablemap-classcast-FIXED.md`](../../internal/springboot/core-spring-boot-jsonwriter-unmodifiablemap-classcast-FIXED.md); VM-generated lambda-bridge cast errors now use the same concrete collection class name as `Object.getClass()`, allowing Spring's `LambdaSafe` generic filter to suppress expected map-vs-`String` mismatches |
 | [`core-spring-boot-test-config-data-and-classpath-scan-cluster.md`](core-spring-boot-test-config-data-and-classpath-scan-cluster.md) | OPEN — found 2026-07-17, none root-caused to a CratonVM file:line ye |
 | [`crashfail-20260717-crash-cluster.md`](crashfail-20260717-crash-cluster.md) | OPEN — found 2026-07-17 |
-| [`data-elasticsearch-connecttimeout-and-association-mapping-gap.md`](data-elasticsearch-connecttimeout-and-association-mapping-gap.md) | OPEN — found 2026-07-17. Two unrelated failures, one per class. |
 | [`data-jdbc-id-field-misclassified-as-association.md`](data-jdbc-id-field-misclassified-as-association.md) | OPEN — found 2026-07-17. Hypothesis 1 below (a `Class`-identity/equa |
 | [`datajdbctestintegrationtests-association-from-reference-type-npe.md`](datajdbctestintegrationtests-association-from-reference-type-npe.md) | OPEN — found 2026-07-17 |
 | [`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`](disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md) | OPEN — found 2026-07-17 |
 | [`docker-compose-lifecycle-capturedoutput-log-gap.md`](../../internal/springboot/docker-compose-lifecycle-capturedoutput-log-gap-FIXED.md) | FIXED — 2026-07-18 |
 | [`docker-compose-regex-string-join-charsequence-truncation-cluster.md`](docker-compose-regex-string-join-charsequence-truncation-cluster.md) | OPEN — found 2026-07-17 |
 | [`docker-compose-socketinputstream-read-timedout-as-eof.md`](docker-compose-socketinputstream-read-timedout-as-eof.md) | OPEN — found 2026-07-17 |
-| [`encodepasswordcommandtests-cli-hang.md`](encodepasswordcommandtests-cli-hang.md) | OPEN — found 2026-07-17, not root-caused |
+| `EncodePasswordCommandTests` BCrypt verifier stall | **FIXED 2026-07-18** — moved to [`../../internal/springboot/encodepasswordcommandtests-cli-hang-FIXED.md`](../../internal/springboot/encodepasswordcommandtests-cli-hang-FIXED.md); Spring Security's BCrypt key schedule now uses the native intrinsic while legacy `$2x$` compatibility retains bytecode semantics |
 | [`file-url-openconnection-getinputstream-unknownserviceexception-FIXED.md`](../../internal/springboot/file-url-openconnection-getinputstream-unknownserviceexception-FIXED.md) | FIXED — 2026-07-17 |
-| [`flyway-resourceprovidercustomizer-aot-substitution-not-applied.md`](flyway-resourceprovidercustomizer-aot-substitution-not-applied.md) | OPEN — found 2026-07-17, not root-caused |
-| [`graphql-datafetcher-getpackage-null-npe-cluster.md`](graphql-datafetcher-getpackage-null-npe-cluster.md) | OPEN — found 2026-07-17 |
-| [`graphql-security-autoconfiguration-early-hang.md`](graphql-security-autoconfiguration-early-hang.md) | OPEN — found 2026-07-17 |
+| `flyway-resourceprovidercustomizer-aot-substitution-not-applied.md` | **FIXED 2026-07-18** — moved to [`../../internal/springboot/flyway-resourceprovidercustomizer-aot-substitution-not-applied-FIXED.md`](../../internal/springboot/flyway-resourceprovidercustomizer-aot-substitution-not-applied-FIXED.md); reflective descriptor resolution now honors the defining `ClassLoader` before any global fallback |
+| [`graphql-security-autoconfiguration-early-hang-FIXED.md`](../../internal/springboot/graphql-security-autoconfiguration-early-hang-FIXED.md) | FIXED — 2026-07-18; generated GraphQL lambda classes now retain defining-host package metadata |
 | [`grpc-test-springextension-isbeanoverride-nosuchmethoderror.md`](grpc-test-springextension-isbeanoverride-nosuchmethoderror.md) | OPEN — found 2026-07-17 |
-| [`hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md`](hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md) | OPEN — found 2026-07-17 |
+| [`hateoas-stream-reduce-triarg-missing-native-abstractmethoderror-FIXED.md`](../../internal/springboot/hateoas-stream-reduce-triarg-missing-native-abstractmethoderror-FIXED.md) | FIXED — 2026-07-18 |
 | [`hazelcast-socketchannel-bind-and-server-hang.md`](hazelcast-socketchannel-bind-and-server-hang.md) | OPEN — found 2026-07-17 |
 | [`hibernatejpaautoconfigurationtests-stall-hang.md`](hibernatejpaautoconfigurationtests-stall-hang.md) | OPEN — found 2026-07-17 |
 | [`http-codec-filteredclassloader-condition-not-honored.md`](http-codec-filteredclassloader-condition-not-honored.md) | OPEN — found 2026-07-17. Same mechanism as 3 already-filed sibling d |
-| [`http-converter-stream-reduce-3arg-no-code-attribute.md`](http-converter-stream-reduce-3arg-no-code-attribute.md) | OPEN — found 2026-07-17 |
-| [`httpclient-autoconfigure-classpath-presence-cluster.md`](httpclient-autoconfigure-classpath-presence-cluster.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed against CratonVM  |
+| [`http-converter-stream-reduce-3arg-no-code-attribute-FIXED.md`](../../internal/springboot/http-converter-stream-reduce-3arg-no-code-attribute-FIXED.md) | FIXED — 2026-07-18 |
+| [`HTTP client autoconfigure classpath-presence cluster`](../../internal/springboot/httpclient-autoconfigure-classpath-presence-cluster-FIXED.md) | FIXED — 2026-07-18 |
+| [`modifiedclasspath-override-artifact-identity-regression.md`](modifiedclasspath-override-artifact-identity-regression.md) | OPEN — confirmed 2026-07-18 |
 | [`inetaddressfilter-null-socketaddress-overload-not-throwing.md`](inetaddressfilter-null-socketaddress-overload-not-throwing.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed to file:line) |
 | [`instant-force-native-factory-synthetic-tostring-cluster.md`](instant-force-native-factory-synthetic-tostring-cluster.md) | OPEN — found 2026-07-17 (confirmed at source level) |
 | [`integration-mbeanserver-getdomains-missing-native-abstractmethoderror.md`](integration-mbeanserver-getdomains-missing-native-abstractmethoderror.md) | OPEN — found 2026-07-17 |

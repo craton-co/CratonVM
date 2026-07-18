@@ -175,6 +175,9 @@ pub(crate) struct SockSide {
     pub local_port: i32,
     pub closed: i32,
     pub stream_id: i32,
+    /// Java's SO_TIMEOUT setting. Unlike the TCP stream id, this is meaningful
+    /// before connect and must survive the stream installation transition.
+    pub read_timeout_ms: i32,
     pub input_shutdown: i32,
     pub output_shutdown: i32,
 }
@@ -224,6 +227,7 @@ fn sock_default() -> SockSide {
         local_port: 0,
         closed: 0,
         stream_id: -1,
+        read_timeout_ms: 0,
         input_shutdown: 0,
         output_shutdown: 0,
     }
@@ -2919,7 +2923,19 @@ fn re1_socket_read_stream(
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read_result.map_err(|e| ioex(format!("Socket read failed: {e}")))?;
+    let n = read_result.map_err(|e| match e.kind() {
+        // SO_RCVTIMEO is reported as TimedOut on Windows and often as
+        // WouldBlock on Unix. Both are Java SocketTimeoutException, not EOF
+        // and not a generic IOException; callers deliberately catch this
+        // concrete type to retry their protocol operation.
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            RuntimeError::SocketTimeoutException {
+                message: format!("Socket read timed out: {e}"),
+            }
+            .into()
+        }
+        _ => ioex(format!("Socket read failed: {e}")),
+    })?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
         if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() && n != 0 {
@@ -3137,6 +3153,16 @@ fn re1_connect_socket(
         _ => ioex(format!("ConnectException: {host}:{port}: {e}")),
     })?;
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+    // `Socket.setSoTimeout` may have been called while this Socket was still
+    // unconnected (Spring Boot's TcpConnectServiceReadinessCheck does exactly
+    // that). The side table is the authoritative socket state for this native
+    // surface, so apply its retained setting before publishing the stream.
+    let read_timeout_ms = sock_get(ctx, this).read_timeout_ms;
+    if read_timeout_ms > 0 {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(read_timeout_ms as u64)))
+            .map_err(|e| ioex(format!("apply preconnect SO_TIMEOUT failed: {e}")))?;
+    }
     let stream_id = s2_alloc_stream(stream);
     let pin_base = ctx.pin_native_root(this);
     let host_str = ctx.create_string(host);
@@ -3416,6 +3442,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                     .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
             }
         }
+        sock_set(ctx, this, |s| s.read_timeout_ms = ms);
         Ok(None)
     });
     // `Socket.getSoTimeout()` had NO native override, so it fell through to
@@ -3434,6 +3461,10 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // already uses.
     r.register(sock, "getSoTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let configured = sock_get(ctx, this).read_timeout_ms;
+        if configured != 0 {
+            return Ok(Some(Value::Int(configured)));
+        }
         let sid = sock_get(ctx, this).stream_id;
         if sid >= 0 {
             let reg = s2_registry().lock();

@@ -704,6 +704,18 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
             let _ =
                 unsafe { libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev) };
         }
+        // epoll_ctl(MOD) does not reliably interrupt an already-blocked
+        // epoll_wait. In particular, Tomcat arms OP_WRITE after a partial
+        // gathering write; without a nudge, the last HTTP/2 frame can remain
+        // queued until shutdown and the peer sees a truncated GOAWAY frame.
+        // Do not set the sticky `woken` bit: this is a readiness re-check, not
+        // a public Selector.wakeup() request.
+        if let Some(wfd) = st.wakeup_pipe_write {
+            let byte: u8 = b'I';
+            let _ = unsafe {
+                libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
+            };
+        }
     }
     Ok(())
 }
@@ -2511,16 +2523,40 @@ fn key_set_interest_ops_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if ctx.object_num_fields(key) > SK_INTEREST_OPS {
         ctx.set_field(key, SK_INTEREST_OPS, Value::Int(ops));
     }
-    let Some(fd) = key_fd(ctx, key) else {
-        return Ok(None);
+    // `interestOps0` is used by the real JDK implementation. A channel can
+    // be registered while still unconnected, in which case its selector key
+    // is currently stored under the placeholder fd (-1), whereas
+    // `channel_net_fd` already observes the later live socket id. Looking up
+    // by that current id loses the update, leaving OP_CONNECT at zero and the
+    // async reactor never receives its deferred connection result. Locate the
+    // key by its stable Java object instead, then keep both native tables in
+    // sync until `refresh_selector_handles` re-keys it to the live fd.
+    sk_state_with_mut(ctx, key, |s| {
+        s.interest_ops = ops;
+    });
+    let target: Option<(i32, i32)> = {
+        let regs = selectors().read();
+        let mut found = None;
+        for (sel_id, sel) in regs.iter() {
+            let mut st = sel.lock();
+            if let Some(fd) = st
+                .keys
+                .values_mut()
+                .find(|k| k.key_obj == Some(key))
+                .map(|k| {
+                    k.interest_ops = ops;
+                    k.net_fd
+                })
+            {
+                found = Some((*sel_id, fd));
+                break;
+            }
+        }
+        found
     };
-    let Some(sel_id) = key_selector_id(ctx, key) else {
-        return Ok(None);
-    };
-    if sel_id == 0 {
-        return Ok(None);
+    if let Some((sel_id, fd)) = target {
+        let _ = selector_set_interest(sel_id, fd, ops);
     }
-    let _ = selector_set_interest(sel_id, fd, ops);
     Ok(None)
 }
 

@@ -53,11 +53,20 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
+use std::collections::VecDeque;
+
 use cratonvm_native_api::charset as engine;
 
 struct SdState {
     name: String,
     carry: Vec<u8>,
+    /// Decoded read-ahead characters.  This deliberately lives beside `carry`
+    /// rather than in a synthetic Java field: the real StreamDecoder layout
+    /// has no collector-visible slot for it.  In particular, `Reader.read()`
+    /// asks StreamDecoder for one or two chars at a time, so retaining a bulk
+    /// refill here prevents resource parsers from turning every input byte into
+    /// a separate native/virtual round trip.
+    pending: VecDeque<u16>,
     /// `Some` when this decoder must implement `sun.util.PropertyResourceBundleCharset`
     /// semantics, used by `PropertyResourceBundle(InputStream)`: decode UTF-8,
     /// but on the first malformed/unmappable byte fall back to ISO-8859-1 for the
@@ -152,6 +161,7 @@ pub(crate) fn alloc_stream_decoder(
         SdState {
             name: charset_name.to_string(),
             carry: Vec::new(),
+            pending: VecDeque::new(),
             prop,
         },
     );
@@ -381,11 +391,75 @@ fn native_sd_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if len == 0 {
         return Ok(Some(Value::Int(0)));
     }
-    // May return 0 when only an incomplete multi-byte tail was read; the
-    // caller (`BufferedReader.fill`'s `do { } while (n == 0)`) retries, and
-    // each call consumes fresh bytes so it converges (or hits EOF → -1).
-    let n = decode_into(ctx, this, out, off, len)?;
-    Ok(Some(Value::Int(n)))
+
+    let key = sd_key(ctx, this);
+    let mut chars = Vec::with_capacity(len);
+    {
+        let mut table = sd_table().lock().unwrap();
+        if let Some(state) = table.get_mut(&key) {
+            while chars.len() < len {
+                match state.pending.pop_front() {
+                    Some(ch) => chars.push(ch),
+                    None => break,
+                }
+            }
+        }
+    }
+    if chars.len() == len {
+        ctx.write_char_array_from(out, off, &chars);
+        return Ok(Some(Value::Int(chars.len() as i32)));
+    }
+
+    // A StreamDecoder `read()` call is implemented by the real JDK bytecode
+    // in terms of `read(char[], 0, 2)`.  Refilling only those two characters
+    // makes a configuration file's comment tokenizer do one full JNI/native
+    // round trip for every byte.  Read a normal chunk and retain the surplus
+    // above, while preserving the existing no-read-ahead Java-field invariant.
+    const READ_AHEAD_CHARS: usize = 4096;
+    let request = (len - chars.len()).max(READ_AHEAD_CHARS);
+    let this_pin = ctx.pin_native_root(this);
+    let out_pin = ctx.pin_native_root(out);
+    let result: MethodCallResult = (|| {
+        let tmp = ctx.new_array(ArrayElementType::Char, request);
+        let tmp_pin = ctx.pin_native_root(tmp);
+        let cur_this = ctx.read_native_pin(this_pin, this);
+        let cur_tmp = ctx.read_native_pin(tmp_pin, tmp);
+        let n = decode_into(ctx, cur_this, cur_tmp, 0, request)?;
+        let tmp = ctx.read_native_pin(tmp_pin, tmp);
+        ctx.unpin_native_roots(tmp_pin);
+
+        if n > 0 {
+            let mut fetched = Vec::with_capacity(n as usize);
+            for index in 0..n as usize {
+                if let Value::Int(ch) = ctx.get_array_element(tmp, index) {
+                    fetched.push((ch & 0xffff) as u16);
+                }
+            }
+            let take = (len - chars.len()).min(fetched.len());
+            chars.extend_from_slice(&fetched[..take]);
+            if take < fetched.len() {
+                let mut table = sd_table().lock().unwrap();
+                let state = table.entry(key).or_insert_with(|| SdState {
+                    name: "UTF-8".to_string(),
+                    carry: Vec::new(),
+                    pending: VecDeque::new(),
+                    prop: None,
+                });
+                state.pending.extend(fetched[take..].iter().copied());
+            }
+        }
+
+        if !chars.is_empty() {
+            let cur_out = ctx.read_native_pin(out_pin, out);
+            ctx.write_char_array_from(cur_out, off, &chars);
+            Ok(Some(Value::Int(chars.len() as i32)))
+        } else {
+            Ok(Some(Value::Int(n)))
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(out_pin);
+    result
 }
 
 /// `close()` — closes the underlying InputStream and drops side-table state.
@@ -574,6 +648,7 @@ fn decode_into(
         let entry = t.entry(key).or_insert_with(|| SdState {
             name: name.clone(),
             carry: Vec::new(),
+            pending: VecDeque::new(),
             prop: None,
         });
         entry.carry = rest;

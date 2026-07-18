@@ -81,18 +81,17 @@ bindings and reflection hints when replayed from AOT-generated source — all
 the generate-compile-execute pipeline for this bean, not a narrow edge
 case.
 
-This sits in the same general territory as
-[`flyway-resourceprovidercustomizer-aot-substitution-not-applied.md`](flyway-resourceprovidercustomizer-aot-substitution-not-applied.md)
+This sits in the same general territory as the now-fixed
+[`Flyway ResourceProviderCustomizer AOT loader-identity issue`](../../internal/springboot/flyway-resourceprovidercustomizer-aot-substitution-not-applied-FIXED.md)
 (a `spring-boot-flyway` class where `TestCompiler`-executed AOT-generated
 substitution code silently doesn't apply) — both are
 `BeanRegistrationAotProcessor` contributions verified via
 `TestCompiler.compile(...)`, and both fail with the AOT-generated behavior
 not taking effect (there: wrong bean instance returned; here: hint/registration
 predicates false when expected true). **Not confirmed to share the exact
-same mechanism** — the Flyway doc's own two candidate explanations
-(generation-side vs. compile/execution-side) apply equally here and are
-equally untested for this class; filing separately rather than merging
-since neither has been root-caused enough to say they're the same bug.
+same mechanism**: Flyway was a `Method` descriptor resolved through the
+wrong class-loader namespace; this Jackson case still needs its own
+generation-versus-execution investigation.
 
 Also adjacent to the already-**FIXED**
 [`../../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md`](../../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md)
