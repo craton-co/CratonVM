@@ -84,7 +84,7 @@ affected classes:
 | `WebFluxObservationAutoConfigurationTests` | PASS |
 | `DefaultErrorWebExceptionHandlerIntegrationTests` | PASS (was HANG at 180s, now completes ~148s) |
 | `PropertiesMigrationListenerTests` | FAIL — new residual, see above |
-| `H2ConsoleAutoConfigurationTests` | the 2 CapturedOutput-specific tests now PASS; class still shows FAIL from the pre-existing, separately-tracked `jooq-destroy-method-ambiguity-and-hang.md` bug (2 other tests, unrelated) |
+| `H2ConsoleAutoConfigurationTests` | PASS (4/4) — the 2 CapturedOutput-specific tests were fixed by this change; the other 2, previously failing from the separately-tracked `jooq-destroy-method-ambiguity-and-hang.md` bug, started passing after merging in `origin/dev`'s concurrent `Class.getMethods` override-shadowing fix (unrelated to this doc) |
 | `HttpClientMetricsAutoConfigurationTests` | PASS |
 | `OpenTelemetryEnvironmentVariableEnvironmentPostProcessorTests` | PASS |
 | `OpenTelemetryEnvironmentVariablesTests` | PASS |
@@ -92,15 +92,18 @@ affected classes:
 | `JerseyAutoConfigurationServletContainerTests` | PASS |
 | `OnFailureConditionReportContextCustomizerFactoryTests` | FAIL — new residual, see above |
 
-11 of 13 classes fully pass (12 of 13 counting `H2Console`'s CapturedOutput
-portion); the 2 remaining failures are newly-exposed, narrower, separately-
-tracked residuals rather than the original empty-capture symptom.
+12 of 13 classes fully pass; the 2 remaining failures (`PropertiesMigrationListenerTests`,
+`OnFailureConditionReportContextCustomizerFactoryTests`) are newly-exposed,
+narrower, separately-tracked residuals rather than the original
+empty-capture symptom.
 
-This same root cause also explains (not independently re-verified against
-every class this session, but the mechanism is identical) the sibling
-docs' symptoms: `capturedoutput-empty-console-cluster.md` and
-`docker-compose-lifecycle-capturedoutput-log-gap.md` — both should be
-re-triaged against a build with this fix.
+This same root cause also explained the sibling docs' symptoms:
+`docker-compose-lifecycle-capturedoutput-log-gap.md` (fully fixed, see
+`docker-compose-lifecycle-capturedoutput-log-gap-FIXED.md`) and
+`capturedoutput-empty-console-cluster.md` (15 of 22 classes fixed; a
+`core/spring-boot`-concentrated residual remains, stays OPEN — see that
+doc for a 2026-07-18 update reconciling this fix against a concurrent
+session's different approach to the same symptom).
 
 ## Symptom
 

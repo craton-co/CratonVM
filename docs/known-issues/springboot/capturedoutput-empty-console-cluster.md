@@ -58,7 +58,7 @@ above) against every class this doc lists:
 `AbstractReactiveHealthIndicatorTests`,
 `LoggingApplicationListenerIntegrationTests`.
 
-**FAIL** (7 classes, all in `core/spring-boot` specifically) — with
+**FAIL** (8 classes, all in `core/spring-boot` specifically) — with
 several genuinely different shapes, not re-investigated at the source
 level this session (out of scope for the fix above, which targeted a
 different doc). Because approach (2) never runs real Logback/log4j2
