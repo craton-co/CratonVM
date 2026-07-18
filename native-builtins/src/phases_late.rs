@@ -42760,7 +42760,7 @@ fn new13_do_create_socket(
     ctx.begin_blocking_region();
     #[cfg(unix)]
     let connect_result = if legacy_dsa_context {
-        crate::servlet::s2_legacy_dsa_tls_connect(host, port)
+        crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders)
     } else {
         crate::servlet::s2_tls_connect(&connector, host, port)
     };

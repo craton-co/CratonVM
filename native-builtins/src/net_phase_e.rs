@@ -9086,6 +9086,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             } else {
                 crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                     .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                    .map_err(std::io::Error::other)
             };
             #[cfg(not(unix))]
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
