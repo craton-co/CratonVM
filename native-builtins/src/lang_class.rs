@@ -3,7 +3,9 @@
 
 //! Class, reflect.Method, reflect.Field, reflect.Constructor native method implementations.
 
-use cratonvm_native_api::{AnnotationData, FieldMetadata, MethodMetadata, NativeContext};
+use cratonvm_native_api::{
+    AnnotationData, FieldMetadata, MethodMetadata, NativeContext, TypeArgAnnotations,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
@@ -14847,22 +14849,23 @@ pub(crate) fn native_class_get_permitted_subclasses(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// JVMS 4.7.20's `CLASS_EXTENDS` target's `supertype_index` value that
+/// selects the superclass (as opposed to `0..n` selecting the n-th entry of
+/// `getInterfaces()`).
+const CLASS_EXTENDS_SUPERCLASS_INDEX: u16 = 0xFFFF;
+
 /// `java/lang/Class.getAnnotatedSuperclass()Ljava/lang/reflect/AnnotatedType;`
 ///
 /// WP2.1-class-modern: returns an `AnnotatedType` for the direct superclass
-/// of this Class. Synthetic best-effort impl: builds a minimal
-/// `AnnotatedType` whose backing `Type` is the superclass `Class` mirror,
-/// with no type-annotations attached. Returns null for `Object`, primitive
+/// of this Class, wrapping the erased superclass `Class` mirror and carrying
+/// any TYPE_USE annotations placed directly on the superclass itself (e.g.
+/// `extends @Foo Bar`) via [`NativeContext::class_extends_type_annotations`]
+/// with `supertype_index == 0xFFFF`. Returns null for `Object`, primitive
 /// types, void, array types, and interfaces вЂ” matching the JDK contract.
-///
-/// The returned object is a synthetic 2-field stand-in:
-///   * slot 0: backing `Type` (the superclass `Class` mirror)
-///   * slot 1: empty `Annotation[]` (placeholder for future RUNTIME
-///     type-annotation wiring)
 ///
 /// Frameworks that probe `Class.getAnnotatedSuperclass()` usually only
 /// need it to be non-null + not throw (Hibernate's
-/// `ReflectionUtil.scanForAnnotatedTypes`); the synthetic backing is
+/// `ReflectionUtil.scanForAnnotatedTypes`); the annotated backing is
 /// sufficient to keep their `<clinit>` chain alive.
 pub(crate) fn native_class_get_annotated_superclass(
     ctx: &mut dyn NativeContext,
@@ -14886,19 +14889,39 @@ pub(crate) fn native_class_get_annotated_superclass(
         None => return Ok(Some(Value::Object(None))),
     };
 
-    Ok(Some(Value::Object(Some(make_annotated_type(
-        ctx,
-        super_mirror,
-    )))))
+    let tree = ctx.class_extends_type_annotations(class_id, CLASS_EXTENDS_SUPERCLASS_INDEX);
+    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns);
+    if !tree.children.is_empty() {
+        stash_annotated_type_argument_anns(at, tree.children);
+    }
+    Ok(Some(Value::Object(Some(at))))
 }
 
 /// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
 ///
 /// WP2.1-class-modern: returns an `AnnotatedType[]` mirroring the
 /// `getGenericInterfaces()` array (residual-2 fix вЂ” see below for why the
-/// erased `getInterfaces()` array is wrong here). Each element is a
-/// synthetic `AnnotatedType` wrapping the corresponding interface Type вЂ” see
-/// [`make_annotated_type`] for the layout.
+/// erased `getInterfaces()` array is wrong here). Each element is an
+/// `AnnotatedType` wrapping the corresponding interface Type, carrying that
+/// interface's TYPE_USE annotations (both directly on the interface itself,
+/// e.g. `implements @Foo Bar`, and -- via the recursive stash consumed by
+/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`]
+/// -- nested in its type arguments to any depth, e.g. `implements
+/// ValueExtractor<ArgumentValue<@ExtractedValue ?>>`) from
+/// [`NativeContext::class_extends_type_annotations`].
+///
+/// HV000203 fix: Hibernate Validator's `ValueExtractorResolver` registers a
+/// custom `jakarta.validation.valueextraction.ValueExtractor<T>` by walking
+/// `getAnnotatedInterfaces()` to find which type parameter is annotated
+/// `@ExtractedValue`. Every element used to come back via [`make_annotated_type`]
+/// with an unconditionally EMPTY `Annotation[]` -- so `@ExtractedValue` was
+/// unreachable regardless of nesting depth, and Validator rejected any
+/// extractor whose annotation sits on a nested type argument (Spring
+/// GraphQL's `ArgumentValueValueExtractor` implements
+/// `ValueExtractor<ArgumentValue<@ExtractedValue ?>>`, two levels deep) with
+/// `HV000203: ... fails to declare the extracted type parameter using
+/// @ExtractedValue`, breaking `ControllerEndpointDiscovererTests` and the
+/// `spring-boot-graphql-test` module's `defaultValidator` bean at startup.
 ///
 /// Always returns a non-null (possibly zero-length) array вЂ” matching the
 /// JDK contract. Frameworks (ByteBuddy, JMX OpenMBean introspector) rely
@@ -14922,6 +14945,7 @@ pub(crate) fn native_class_get_annotated_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let class_id = obj_arg(args, 0).ok().and_then(|this| mirror_class_id(ctx, this));
     let generic_ifaces = match native_class_get_generic_interfaces(ctx, args)? {
         Some(Value::Object(Some(arr))) => arr,
         _ => {
@@ -14933,7 +14957,13 @@ pub(crate) fn native_class_get_annotated_interfaces(
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
     for i in 0..len {
         if let Value::Object(Some(iface_type)) = ctx.get_array_element(generic_ifaces, i) {
-            let at = make_annotated_type(ctx, iface_type);
+            let tree = class_id
+                .map(|cid| ctx.class_extends_type_annotations(cid, i as u16))
+                .unwrap_or_default();
+            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns);
+            if !tree.children.is_empty() {
+                stash_annotated_type_argument_anns(at, tree.children);
+            }
             ctx.set_array_element(arr, i, Value::Object(Some(at)));
         }
     }
@@ -15183,29 +15213,34 @@ fn make_annotated_type_with_anns(
 /// pointer identity -- same pattern/caveats as `constructor_mirror_side_table`:
 /// short-lived objects, not expected to survive a moving GC between
 /// construction and the `getAnnotatedActualTypeArguments()` read that
-/// consumes them), the TYPE_ARGUMENT-level annotations for a *parameterized*
-/// type built from a method parameter, indexed by type-argument position.
+/// consumes them), the TYPE_ARGUMENT-level annotation *subtree* for a
+/// *parameterized* type, indexed by type-argument position. Each
+/// [`TypeArgAnnotations`] node carries both this level's own annotations and
+/// (in `.children`) the next nesting level's subtree, so a chain of
+/// `getAnnotatedActualTypeArguments()` calls (one per generic nesting level,
+/// e.g. `ValueExtractor<ArgumentValue<@ExtractedValue ?>>`) each re-stash
+/// their own remaining subtree for the next call to consume -- see
+/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`].
 ///
 /// Populated by [`native_executable_get_annotated_parameter_types`] (which has
 /// access to the owning method + parameter index needed to look up the
-/// per-type-argument annotations) and consumed by
-/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`].
-/// Not every `AnnotatedType` has an entry here -- only ones backed by a
-/// `ParameterizedType` method-parameter whose type arguments carry TYPE_USE
-/// annotations (e.g. `List<@Valid Person>`); absence means "no per-argument
-/// annotations", not an error.
+/// per-type-argument annotations), by the other `getAnnotatedXxxType`
+/// natives (return type / field type / class supertypes), and recursively by
+/// [`native_annotated_parameterized_type_get_annotated_actual_type_arguments`]
+/// itself. Not every `AnnotatedType` has an entry here -- only ones whose
+/// type arguments carry TYPE_USE annotations (e.g. `List<@Valid Person>`);
+/// absence means "no per-argument annotations", not an error.
 fn annotated_parameterized_type_arg_anns_table(
-) -> &'static Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>> {
-    static TABLE: OnceLock<Mutex<FxHashMap<usize, Vec<Vec<cratonvm_native_api::AnnotationData>>>>> =
-        OnceLock::new();
+) -> &'static Mutex<FxHashMap<usize, Vec<TypeArgAnnotations>>> {
+    static TABLE: OnceLock<Mutex<FxHashMap<usize, Vec<TypeArgAnnotations>>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
-fn stash_annotated_type_argument_anns(
-    at_obj: ObjectRef,
-    per_arg_anns: Vec<Vec<cratonvm_native_api::AnnotationData>>,
-) {
-    if per_arg_anns.iter().all(|v| v.is_empty()) {
+fn stash_annotated_type_argument_anns(at_obj: ObjectRef, per_arg_anns: Vec<TypeArgAnnotations>) {
+    if per_arg_anns
+        .iter()
+        .all(|v| v.anns.is_empty() && v.children.is_empty())
+    {
         return;
     }
     let key = at_obj.as_ptr() as usize;
@@ -15215,9 +15250,7 @@ fn stash_annotated_type_argument_anns(
         .insert(key, per_arg_anns);
 }
 
-fn take_annotated_type_argument_anns(
-    at_obj: ObjectRef,
-) -> Option<Vec<Vec<cratonvm_native_api::AnnotationData>>> {
+fn take_annotated_type_argument_anns(at_obj: ObjectRef) -> Option<Vec<TypeArgAnnotations>> {
     let key = at_obj.as_ptr() as usize;
     annotated_parameterized_type_arg_anns_table()
         .lock()
@@ -15605,10 +15638,18 @@ pub(crate) fn native_annotated_type_get_annotated_owner_type(
 /// `getActualTypeArguments()` (real JDK `ParameterizedTypeImpl`, works fine
 /// since generic signatures are already parsed correctly), and wraps each
 /// argument as a plain `AnnotatedType` -- attaching the TYPE_ARGUMENT-level
-/// annotations stashed by [`native_executable_get_annotated_parameter_types`]
-/// (via [`take_annotated_type_argument_anns`]) when available. AnnotatedTypes
-/// not built from a method parameter (no side-table entry) simply get
-/// argument wrappers with no annotations, matching the prior (gap) behavior.
+/// annotations stashed by the caller (return type / parameter / field /
+/// class-supertype natives, via [`take_annotated_type_argument_anns`]) when
+/// available. Each argument's own `children` subtree (if non-empty) is
+/// re-stashed against the newly built `AnnotatedType`, so calling this same
+/// native AGAIN on that nested result (e.g. HotSpot's
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` applied a
+/// second time, as Hibernate Validator's `ValueExtractorResolver` does for
+/// `ValueExtractor<ArgumentValue<@ExtractedValue ?>>`) finds the next
+/// nesting level's annotations rather than dead-ending after one level.
+/// AnnotatedTypes not built with any per-argument annotations (no side-table
+/// entry) simply get argument wrappers with no annotations, matching the
+/// prior (gap) behavior.
 pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_arguments(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -15645,17 +15686,17 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
         .class_id_by_name("java/lang/reflect/AnnotatedType")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let out = ctx.new_ref_array(comp, n);
-    let empty = Vec::new();
+    let empty = TypeArgAnnotations::default();
     for i in 0..n {
         let tm = match ctx.get_array_element(type_args, i) {
             Value::Object(Some(m)) => m,
             _ => continue,
         };
-        let anns = per_arg_anns
-            .as_ref()
-            .and_then(|v| v.get(i))
-            .unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        let node = per_arg_anns.as_ref().and_then(|v| v.get(i)).unwrap_or(&empty);
+        let at = make_annotated_type_with_anns(ctx, tm, &node.anns);
+        if !node.children.is_empty() {
+            stash_annotated_type_argument_anns(at, node.children.clone());
+        }
         ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
     Ok(Some(Value::Object(Some(out))))
