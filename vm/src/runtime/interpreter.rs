@@ -24049,6 +24049,30 @@ fn force_native_over_real_jdk_bytecode(
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    if is_netty_event_executor_group_shutdown_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_springboot_mongo_reactive_customizer_destroy_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_springboot_mongo_reactive_customizer_customize_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_datagram_channel_open_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     // Tomcat application methods are never registered native overrides apart
     // from the audited bridges below. Reject the large compatibility table
     // early on its hot scanner paths.
@@ -25893,6 +25917,80 @@ fn is_jfr_metadata_native_override(
         ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
             | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
     )
+}
+
+/// Keep MongoDB Reactive Streams' Netty 4.2 group teardown bounded when a
+/// closed monitor callback keeps its default graceful-shutdown quiet period
+/// alive. The native checks the receiver class, so unrelated Netty executors
+/// continue through their original bytecode.
+pub(crate) fn is_netty_event_executor_group_shutdown_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "io/netty/util/concurrent/EventExecutorGroup"
+            | "io/netty/util/concurrent/AbstractEventExecutorGroup"
+            | "io/netty/channel/MultiThreadIoEventLoopGroup"
+    )
+        && method_name == "shutdownGracefully"
+        && method_descriptor == "()Lio/netty/util/concurrent/Future;"
+}
+
+/// Spring Boot's Mongo reactive lifecycle bean waits indefinitely on a Netty
+/// promise that can remain incomplete after its event-loop workers are gone.
+/// The native replacement requests shutdown and returns without that wait.
+pub(crate) fn is_springboot_mongo_reactive_customizer_destroy_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name
+        == "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer"
+        && method_name == "destroy"
+        && method_descriptor == "()V"
+}
+
+pub(crate) fn is_springboot_mongo_reactive_customizer_customize_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name
+        == "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer"
+        && method_name == "customize"
+        && method_descriptor == "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+}
+
+/// JDK 25's JNDI DNS client can use either `DatagramChannel` factory. Its real
+/// `DatagramChannelImpl` path does not share CratonVM's fd-table state, so the
+/// factories and the synthetic channel's local-address accessor must select
+/// the native UDP bridge.
+pub(crate) fn is_datagram_channel_open_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    if matches!(
+        class_name,
+        "java/nio/channels/DatagramChannel" | "java/nio/channels/NetworkChannel"
+    )
+        && method_name == "getLocalAddress"
+        && method_descriptor == "()Ljava/net/SocketAddress;"
+    {
+        return true;
+    }
+    if class_name == "java/nio/channels/DatagramChannel"
+        && method_name == "open"
+        && method_descriptor == "()Ljava/nio/channels/DatagramChannel;"
+    {
+        return true;
+    }
+    method_descriptor == "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;"
+        && ((class_name == "java/nio/channels/DatagramChannel" && method_name == "open")
+            || (class_name == "sun/nio/ch/SelectorProviderImpl"
+                && method_name == "openDatagramChannel"))
 }
 
 fn redefine_immune_forced_native(
@@ -38730,6 +38828,87 @@ mod tests {
             "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
             "include",
             "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z"
+        ));
+    }
+
+    #[test]
+    fn netty_mongodb_event_loop_shutdown_bridge_is_forced_at_each_resolved_owner() {
+        let descriptor = "()Lio/netty/util/concurrent/Future;";
+        for class_name in [
+            "io/netty/util/concurrent/EventExecutorGroup",
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "io/netty/channel/MultiThreadIoEventLoopGroup",
+        ] {
+            assert!(is_netty_event_executor_group_shutdown_native_override(
+                class_name,
+                "shutdownGracefully",
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                class_name,
+                "shutdownGracefully",
+                descriptor
+            ));
+        }
+        assert!(!is_netty_event_executor_group_shutdown_native_override(
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "shutdownGracefully",
+            "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;"
+        ));
+    }
+
+    #[test]
+    fn springboot_mongo_reactive_destroy_wait_is_replaced_only_for_its_lifecycle_bean() {
+        let class_name = "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer";
+        assert!(is_springboot_mongo_reactive_customizer_destroy_native_override(
+            class_name,
+            "destroy",
+            "()V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            class_name,
+            "destroy",
+            "()V"
+        ));
+        assert!(!is_springboot_mongo_reactive_customizer_destroy_native_override(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+        assert!(is_springboot_mongo_reactive_customizer_customize_native_override(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+    }
+
+    #[test]
+    fn datagram_channel_factories_are_forced_to_the_udp_bridge() {
+        let descriptor = "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;";
+        assert!(is_datagram_channel_open_native_override(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            descriptor
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            descriptor
+        ));
+        assert!(is_datagram_channel_open_native_override(
+            "sun/nio/ch/SelectorProviderImpl",
+            "openDatagramChannel",
+            descriptor
+        ));
+        assert!(is_datagram_channel_open_native_override(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;"
         ));
     }
 
