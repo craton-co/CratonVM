@@ -4290,7 +4290,8 @@ fn map_alloc_node(
     let key_pin = ctx.pin_native_root(key);
     let value_pin = pin_value(ctx, value);
     let next_pin = next.map(|n| ctx.pin_native_root(n));
-    let node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    // Use a concrete node class: Object now correctly has zero writable fields.
+    let node = alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS);
     let key = ctx.read_native_pin(key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     let next = next.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
@@ -11252,10 +11253,26 @@ fn alloc_live_entry(
     value: Value,
     source: ObjectRef,
 ) -> ObjectRef {
+    // Entry allocation can trigger a moving collection. The caller often
+    // obtained these values from a source-map snapshot held only in Rust, so
+    // keeping them as bare ObjectRefs here can write pre-move addresses into
+    // the freshly allocated entry. That manifests much later as a dropped
+    // entry while Java walks entrySet() (for example, a sporadically missing
+    // HTTP response header). Root all three inputs and reload after the
+    // allocation before publishing the entry fields.
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let source_pin = ctx.pin_native_root(source);
     let entry = alloc_synthetic(ctx, class, 3);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    let source = ctx.read_native_pin(source_pin, source);
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     ctx.set_field(entry, ENTRY_FIELD_SOURCE, Value::Object(Some(source)));
+    ctx.unpin_native_roots(source_pin);
+    ctx.unpin_native_roots(value_pin);
+    ctx.unpin_native_roots(key_pin);
     entry
 }
 
