@@ -79,6 +79,28 @@ fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usi
     }
 }
 
+#[cfg(test)]
+mod gzip_output_regression_tests {
+    use super::*;
+
+    #[test]
+    fn gzip_output_matches_hotspot_for_a_large_json_string() {
+        let mut body = Vec::with_capacity(10_002);
+        body.push(b'[');
+        body.extend(std::iter::repeat_n(b'a', 10_000));
+        body.push(b']');
+
+        let actual = p58_gzip_compress(&body).expect("gzip compression should succeed");
+        let expected = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xed, 0xc1, 0x31, 0x0d,
+            0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37, 0x51, 0x1f, 0x0d, 0x70,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x52, 0xc0, 0x19,
+            0x7d, 0xe0, 0x12, 0x27, 0x00, 0x00,
+        ];
+        assert_eq!(actual, expected);
+    }
+}
+
 fn read_pinned_object_value(
     ctx: &dyn NativeContext,
     pin: Option<(usize, ObjectRef)>,
@@ -19453,13 +19475,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Finish compression if not already done (count >= 0 means not finished)
         let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
+        // `finish` invokes Java OutputStream methods, which may allocate and move
+        // the receiver. Keep it rooted across that call before using it again.
+        let this_pin = ctx.pin_native_root(this);
         if count >= 0 {
-            p58_gzip_out_finish(ctx, args)?;
+            let this_now = ctx.read_native_pin(this_pin, this);
+            p58_gzip_out_finish(ctx, &[Value::Object(Some(this_now))])?;
         }
         // Close underlying stream
-        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        if let Value::Object(Some(underlying)) = ctx.get_field(this_now, 2) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -19996,10 +20024,15 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
-    ctx.set_field(this, 0, Value::Object(Some(arr)));
-    ctx.set_field(this, 1, Value::Int(0));
+    // Store the pre-existing Java argument before the allocation below; it is
+    // then reachable through `this` if a moving collection occurs.
     ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let this_pin = ctx.pin_native_root(this);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 0, Value::Object(Some(arr)));
+    ctx.set_field(this_now, 1, Value::Int(0));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -20032,22 +20065,34 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
     if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
         let cap = ctx.array_length(arr);
         let new_count = count + bytes.len();
-        // Grow if needed
-        let target = if new_count > cap {
+        if new_count > cap {
+            // The new byte[] can trigger a moving collection. Both `this`
+            // and the old buffer are used after that allocation, so raw
+            // ObjectRefs would write stale memory and corrupt the compressed
+            // payload (Zipkin's 10,002-byte JSON body became 11,034 bytes).
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
             let new_cap = (new_count * 2).max(1024);
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
             for i in 0..count {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+                let arr_now = ctx.read_native_pin(arr_pin, arr);
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr_now, i));
             }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            new_arr
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 0, Value::Object(Some(new_arr)));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(new_arr, count + i, Value::Int(b as i8 as i32));
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 1, Value::Int(new_count as i32));
+            ctx.unpin_native_roots(arr_pin);
+            ctx.unpin_native_roots(this_pin);
         } else {
-            arr
-        };
-        for (i, &b) in bytes.iter().enumerate() {
-            ctx.set_array_element(target, count + i, Value::Int(b as i8 as i32));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, count + i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(this, 1, Value::Int(new_count as i32));
         }
-        ctx.set_field(this, 1, Value::Int(new_count as i32));
     }
 }
 
@@ -20199,57 +20244,22 @@ fn p58_crc32(data: &[u8]) -> u32 {
     !c
 }
 
-#[cfg(unix)]
 fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
-    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    let mut z_len = bound as libz_sys::uLong;
+    let rc =
+        unsafe { libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
     if rc != 0 || z_len < 6 {
         return None;
     }
     z.truncate(z_len as usize);
     // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
     Some(z[2..z.len() - 4].to_vec())
-}
-
-#[cfg(not(unix))]
-fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
-    None
 }
 
 fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -20275,6 +20285,7 @@ fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
 fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
     let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
 
     // Read accumulated uncompressed data
@@ -20293,13 +20304,18 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
     // Write compressed bytes to underlying OutputStream
     if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let underlying_pin = ctx.pin_native_root(underlying);
         for &b in &compressed {
-            let _ = ctx.invoke_virtual(underlying, "write", "(I)V", &[Value::Int(b as i32)]);
+            let underlying_now = ctx.read_native_pin(underlying_pin, underlying);
+            let _ = ctx.invoke_virtual(underlying_now, "write", "(I)V", &[Value::Int(b as i32)]);
         }
+        ctx.unpin_native_roots(underlying_pin);
     }
 
     // Mark as finished (set count to -1)
-    ctx.set_field(this, 1, Value::Int(-1));
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 1, Value::Int(-1));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
