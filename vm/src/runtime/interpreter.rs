@@ -5787,7 +5787,8 @@ pub fn execute(
                     // Skip early compilation for methods with String/Class ldc —
                     // those will be handled by OSR which can wire callees as direct calls.
                     let mut ldc_info_early: Vec<(usize, i64)> = Vec::new();
-                    let mut has_string_ldc = false;
+                    let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
+                    let mut has_unsupported_ldc = false;
                     if !scan.ldc_ops.is_empty() {
                         let cm_lock = shared.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
@@ -5802,18 +5803,45 @@ pub fn execute(
                                         ldc_info_early.push((pc_ldc, v.to_bits() as i64));
                                         // Cast: JIT ABI -- float bits to i64
                                     }
+                                    Some(ConstantPoolEntry::StringReference { string_index })
+                                        if class
+                                            .constant_pool
+                                            .get_utf8_wide(*string_index)
+                                            .is_none() =>
+                                    {
+                                        // Wired 2026-07-18, mirroring the OSR-artifact
+                                        // path: boxed text retained via
+                                        // `owned_jit_strings` -> `cm._jit_strings`;
+                                        // codegen materializes through
+                                        // `helpers.ldc_string`. Before this, ANY
+                                        // method with a string constant went into
+                                        // `jit_skip_set` here, which also blocked the
+                                        // hot-path `jit::try_compile` - OSR artifacts
+                                        // were such methods' ONLY compiled form.
+                                        match class.constant_pool.get_utf8(*string_index) {
+                                            Some(s) => {
+                                                let boxed: Box<str> =
+                                                    s.to_string().into_boxed_str();
+                                                let ptr = boxed.as_ptr();
+                                                let len = boxed.len();
+                                                owned_jit_strings.push(boxed);
+                                                ldc_string_info_early.push((pc_ldc, ptr, len));
+                                            }
+                                            None => has_unsupported_ldc = true,
+                                        }
+                                    }
+                                    // Wide-string / Class / other ldc kinds - still
+                                    // unwired on this path (as on the OSR path).
                                     _ => {
-                                        has_string_ldc = true;
+                                        has_unsupported_ldc = true;
                                     }
                                 }
                             }
                         }
                     }
-                    // Methods with String ldc cannot be early-compiled (no string interning).
-                    // Fall through to interpreted execution; OSR will compile later with
-                    // proper callee wiring and string resolution.
-                    // Use goto to break out of the JIT compilation block.
-                    if has_string_ldc {
+                    // Unsupported ldc kinds (wide-string/Class/...) cannot be
+                    // early-compiled; OSR handles such methods later.
+                    if has_unsupported_ldc {
                         // Mark as skipped so we don't retry
                         shared.jit_skip_set.write().insert(skip_key.clone());
                     }
@@ -5834,8 +5862,8 @@ pub fn execute(
                         }
                     }
 
-                    // Skip compilation for methods with String ldc (fall through to interpreter)
-                    if has_string_ldc {
+                    // Unsupported ldc kind present — fall through to the interpreter.
+                    if has_unsupported_ldc {
                         return None;
                     }
 
@@ -5928,9 +5956,8 @@ pub fn execute(
                         // allocate `Box<JitPICSlot>` per
                         // polymorphic call site in `invoke_info`).
                         ldc_info_early,
-                        Vec::new(), // ldc_string_info — not yet wired for this
-                        // early-compile path (mirrors the mic_slots/pic_slots
-                        // "not yet allocated here" placeholders above).
+                        ldc_string_info_early, // wired 2026-07-18 — see the
+                        // StringReference arm in the ldc resolver above.
                         ldc2w_info_early,
                         std::collections::HashMap::new(), // branch_hints
                         std::collections::HashMap::new(), // loop_unroll_hints
