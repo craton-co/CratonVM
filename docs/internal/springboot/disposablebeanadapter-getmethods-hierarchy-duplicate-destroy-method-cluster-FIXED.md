@@ -1,6 +1,6 @@
 # Spring bean destroy-method resolution: `Class.getMethods()` returns duplicate entries for an overridden 0-arg method across the class/interface hierarchy, so `DisposableBeanAdapter` sees "N candidates" and refuses to pick one
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-17.** Superseded by the corrected `Class.getMethods()` hierarchy merge in `native-builtins/src/lang_class.rs`. The collector now shadows same-signature declarations by specificity while preserving distinct overloads. See [`class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md) for the regression and Spring Boot validation.
 
 **Note — recurrence of a doc previously closed as RESOLVED.** This is the
 same outer symptom (`BeanCreationException: ... Invalid destruction

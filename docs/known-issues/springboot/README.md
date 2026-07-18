@@ -63,7 +63,7 @@ round — read these first if triaging or planning fix work, since they
 explain a large fraction of the 429:
 
 - [`junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster.md`](junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster.md) — the single largest HANG cluster (29 classes across 20 modules), a retry-storm on a speculative collection-layout probe against zero-field JUnit5 internals. Not yet root-caused to a specific CratonVM call site.
-- [`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`](disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md) / [`class-getmethods-override-shadowing-duplicate-close-cluster.md`](class-getmethods-override-shadowing-duplicate-close-cluster.md) / [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) — three independently-filed docs for the **same confirmed root cause**: `native-builtins/src/lang_class.rs::collect_public_methods` (`Class.getMethods()`) doesn't dedupe an overridden method by `(name, descriptor)` across a class hierarchy the way real HotSpot's `privateGetPublicMethods()` does, so Spring's `DisposableBeanAdapter` destroy-method resolution sees N duplicate candidates and refuses to pick one. Confirmed across 15+ modules (jdbc, r2dbc, quartz, hazelcast, micrometer-tracing-brave, data-jpa, jooq, h2console, flyway, batch-jdbc, integration...). **These 3 docs were not consolidated into one this round** (flagged by multiple investigating agents, not yet merged) — treat as one bug when triaging.
+- The `Class.getMethods()` override-shadowing cluster is **FIXED 2026-07-17**: [`../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md) records the implementation and validation. The related disposable-bean, JDBC embedded-data-source, and task-scheduling records moved alongside it. [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) remains listed only for its separate unresolved hang (its destroy-method Cluster A is fixed).
 - [`modifiedclasspath-aether-network-hang-cluster.md`](modifiedclasspath-aether-network-hang-cluster.md) — classes using `@ClassPathExclusions`/`@ClassPathOverrides` hang instead of crashing, likely because a same-day sibling fix (`wrong-receiver-virtual-dispatch-corruption-cluster-FIXED.md`) let a previously-crashing Aether/HTTPS artifact-resolution path actually attempt real (now-blocked) network I/O. Explicitly **not** the whole explanation for the livelock cluster above — the two were confused early in triage and later separated with source evidence.
 - [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) / [`conditionevaluationreport-capturedoutput-empty-cluster.md`](conditionevaluationreport-capturedoutput-empty-cluster.md) — `CapturedOutput`/`OutputCaptureExtension` sees empty or stale output across ~20 classes in a dozen+ modules. Not root-caused to one mechanism.
 - [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) / [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) — PKCS12/PEM keystore parsing fails against demonstrably-correct passwords/keys, confirmed across 5 independent modules/fixture files — strong evidence of a genuine CratonVM JCA-layer defect, not per-fixture corruption.
@@ -76,7 +76,6 @@ open each doc for the full picture):
 | [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) | OPEN — found 2026-07-17 |
 | [`cassandra-jni-thrownew-discards-payload-hang.md`](cassandra-jni-thrownew-discards-payload-hang.md) | OPEN — found 2026-07-17 |
 | [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
-| [`class-getmethods-override-shadowing-duplicate-close-cluster.md`](class-getmethods-override-shadowing-duplicate-close-cluster.md) | OPEN — found 2026-07-17 (refines/reopens a prior RESOLVED conclusion |
 | [`collections-singletonmap-hashmap-backed-not-real-class.md`](collections-singletonmap-hashmap-backed-not-real-class.md) | OPEN — found 2026-07-17 (confirmed at source level) |
 | [`conditionevaluationreport-capturedoutput-empty-cluster.md`](conditionevaluationreport-capturedoutput-empty-cluster.md) | OPEN — found 2026-07-17 |
 | [`contextrunner-resource-cycle-then-silent-stall-cluster.md`](contextrunner-resource-cycle-then-silent-stall-cluster.md) | OPEN — found 2026-07-17 |
@@ -90,7 +89,6 @@ open each doc for the full picture):
 | [`data-elasticsearch-connecttimeout-and-association-mapping-gap.md`](data-elasticsearch-connecttimeout-and-association-mapping-gap.md) | OPEN — found 2026-07-17. Two unrelated failures, one per class. |
 | [`data-jdbc-id-field-misclassified-as-association.md`](data-jdbc-id-field-misclassified-as-association.md) | OPEN — found 2026-07-17. Hypothesis 1 below (a `Class`-identity/equa |
 | [`datajdbctestintegrationtests-association-from-reference-type-npe.md`](datajdbctestintegrationtests-association-from-reference-type-npe.md) | OPEN — found 2026-07-17 |
-| [`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`](disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md) | OPEN — found 2026-07-17 |
 | [`docker-compose-lifecycle-capturedoutput-log-gap.md`](docker-compose-lifecycle-capturedoutput-log-gap.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed against native lo |
 | [`docker-compose-regex-string-join-charsequence-truncation-cluster.md`](docker-compose-regex-string-join-charsequence-truncation-cluster.md) | OPEN — found 2026-07-17 |
 | [`docker-compose-socketinputstream-read-timedout-as-eof.md`](docker-compose-socketinputstream-read-timedout-as-eof.md) | OPEN — found 2026-07-17 |
@@ -115,7 +113,6 @@ open each doc for the full picture):
 | [`jarmode-tools-extractlayers-timestamp-preservation.md`](jarmode-tools-extractlayers-timestamp-preservation.md) | OPEN — found 2026-07-17. Hypothesis only, not confirmed. |
 | [`jarmode-tools-manifest-start-class-lost.md`](jarmode-tools-manifest-start-class-lost.md) | OPEN — found 2026-07-17 |
 | [`jdbc-classloader-hide-override-not-honored-cluster.md`](jdbc-classloader-hide-override-not-honored-cluster.md) | OPEN — found 2026-07-17 |
-| [`jdbc-embeddeddatasource-shutdown-destroy-method-ambiguity-cluster.md`](jdbc-embeddeddatasource-shutdown-destroy-method-ambiguity-cluster.md) | OPEN — found 2026-07-17. Discrepancy against a same-mechanism doc ma |
 | [`jdbc-hikari-mbean-not-registered-cluster.md`](jdbc-hikari-mbean-not-registered-cluster.md) | OPEN — found 2026-07-17 |
 | [`jdbc-hikariconfig-copystateto-field-access-cluster.md`](jdbc-hikariconfig-copystateto-field-access-cluster.md) | OPEN — found 2026-07-17 |
 | [`jdbc-mail-jndi-custom-initialcontextfactory-not-consulted-cluster.md`](jdbc-mail-jndi-custom-initialcontextfactory-not-consulted-cluster.md) | OPEN — found 2026-07-17 (confirms/root-causes an unconfirmed hypothe |
@@ -124,7 +121,7 @@ open each doc for the full picture):
 | [`jdkclienthttpsender-response-timeout-not-enforced.md`](jdkclienthttpsender-response-timeout-not-enforced.md) | OPEN — found 2026-07-17 (hypothesis, not traced into CratonVM's HTTP |
 | [`jetty-loaderhidingresourcetests-empty-jar-listing.md`](jetty-loaderhidingresourcetests-empty-jar-listing.md) | OPEN — found 2026-07-17 |
 | [`jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster.md`](jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster.md) | OPEN — found 2026-07-17 |
-| [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) | OPEN — found 2026-07-17 |
+| [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) | PARTIALLY FIXED — Cluster A fixed 2026-07-17; unrelated hang remains OPEN |
 | [`jsonreadertests-deprecation-reason-string-truncation.md`](jsonreadertests-deprecation-reason-string-truncation.md) | OPEN — found 2026-07-17 |
 | [`junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster.md`](junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster.md) | OPEN — found 2026-07-17 |
 | [`jvmmetrics-virtualthreadmetrics-jfr-recordingstream-unimplemented.md`](jvmmetrics-virtualthreadmetrics-jfr-recordingstream-unimplemented.md) | OPEN — found 2026-07-17 (root cause well-grounded via project roadma |
@@ -163,7 +160,6 @@ open each doc for the full picture):
 | [`springapplicationwebservertests-environment-resolution-cluster.md`](springapplicationwebservertests-environment-resolution-cluster.md) | OPEN — found 2026-07-17 |
 | [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) | OPEN — found 2026-07-17 |
 | [`staticresourcejarstests-jar-url-handling-cluster.md`](staticresourcejarstests-jar-url-handling-cluster.md) | OPEN — found 2026-07-17, not root-caused |
-| [`taskscheduling-invalid-destruction-signature-recurrence.md`](taskscheduling-invalid-destruction-signature-recurrence.md) | OPEN — found 2026-07-17 (discrepancy against a RESOLVED doc) |
 | [`thymeleaf-groovy-layoutdialect-cluster.md`](thymeleaf-groovy-layoutdialect-cluster.md) | OPEN — found 2026-07-17 |
 | [`tls-sslbundle-trust-validation-gap-cluster.md`](tls-sslbundle-trust-validation-gap-cluster.md) | OPEN — found 2026-07-17 |
 | [`web-server-mockito-restub-no-op-cluster.md`](web-server-mockito-restub-no-op-cluster.md) | OPEN — found 2026-07-17 |

@@ -1,6 +1,6 @@
 # `TaskSchedulingAutoConfigurationTests` "Invalid destruction signature" — recurs despite the RESOLVED disposable-bean-adapter doc using this exact class as its "closed" repro
 
-**Status: OPEN — found 2026-07-17 (discrepancy against a RESOLVED doc)**
+**Status: FIXED — 2026-07-17.** This recurrence was the same `Class.getMethods()` override-shadowing defect. Its fix is documented and regression-tested in [`class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md).
 
 ## Symptom
 
@@ -80,7 +80,7 @@ underlying exception CratonVM throws).
 **Cross-reference (2026-07-17, same-day parallel triage):** a sibling
 investigation this session captured the un-wrapped inner exception for 4
 other classes hitting this same outer text
-(`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`)
+(`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster-FIXED.md`)
 — in every one of those, the `.out.log`'s full `Caused by:` chain (not
 visible in `.err.log`) reveals `BeanDefinitionValidationException: Could
 not find unique destroy method ... N candidates`, and that doc pins a

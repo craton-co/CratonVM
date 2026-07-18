@@ -84,7 +84,7 @@ suspected of not reaching the test process's captured output at all
 which may itself frustrate an easy confirmation here.
 
 Note: this is **not** the same bug as
-[`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`](disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md),
+[`../../internal/springboot/disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster-FIXED.md`](../../internal/springboot/disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster-FIXED.md),
 which also affects `module/spring-boot-quartz` (a different class,
 `QuartzEndpointWebIntegrationTests`) — that one is a destroy-method
 reflection-ambiguity bug during bean *disposal*; this one is a
