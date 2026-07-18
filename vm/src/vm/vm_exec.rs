@@ -13682,6 +13682,9 @@ fn invoke_on_class_shared_inner(
                 .get_class(receiver_class)
                 .map(|class| class.name.to_string())
                 .unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
+                eprintln!("[dbg-legacy-dsa] accept receiver={receiver_name}");
+            }
             if receiver_name == "javax/net/ssl/SSLServerSocket" {
                 if let Some(callback) =
                     shared
