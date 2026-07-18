@@ -48,6 +48,8 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Matrix 1280x1280                    | 2,349 ms      | 6,875 ms          | 2.93x         |
 | **QuickBench TOTAL**                | **8,925 ms**  | **23,068 ms**     | **2.58x**     |
 | HashMap (1M put/get, isolated)      | 45 ms         | 201 ms            | 4.47x         |
+| HashMap (10M put/get, isolated)     | 1,471 ms      | 5,488 ms          | 3.73x         |
+| String/Regex (100K, isolated)       | 54 ms         | 193 ms            | 3.57x         |
 | String/Regex (1M, isolated)         | 147 ms        | 1,561 ms          | 10.6x         |
 | Binary Trees (depth=18, isolated)   | 188 ms        | 3,855 ms          | 20.5x²        |
 
@@ -55,8 +57,12 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 host (EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians of
 5 alternating freshly-launched JDK/CratonVM process pairs against Temurin JDK
 25.0.3 C2 and a CratonVM candidate at default settings. Checksums matched on
-every run. The shared host carried load ~7-10 during this sweep (vs ~5 for
-the previous table): both columns inflate together, but CratonVM's
+every run. The 10M-HashMap and 100K-String/Regex size-variant rows are
+single alternating JDK/CratonVM pairs (added 2026-07-18; checksums
+1549999915000000 and 5000050000, exact on both sides — the 10M case
+exercises the materialized-map fallback and GC under the default-ON
+TLAB-refill triggers). The shared host carried load ~7-10 during this
+sweep (vs ~5 for the previous table): both columns inflate together, but CratonVM's
 memory-heavy rows inflate more, so rows unchanged by this round (Fibonacci,
 Sieve, Matrix) moved within the ±10-15% contention noise band — their
 underlying code is identical to the previous measurement. The
