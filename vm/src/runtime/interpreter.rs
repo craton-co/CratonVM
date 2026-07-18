@@ -2200,18 +2200,21 @@ static TLAB_SLOWPATH_ENTRIES_SINCE_GC: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Gate for the two refill-time GC triggers (the wedge-breaker and the
-/// `needs_gc()` consult). **Default OFF** (opt in with
-/// `CRATONVM_TLAB_GC_TRIGGER=1`): with the triggers on, BinTreesClassic
-/// d=18 reproducibly under-counts (5/5 runs wrong checksum, e.g. 67644084
-/// vs 68332206) with "young walk: cursor overshot into free block" and
-/// "non-moving sweep: implausible object size (class_id=0, live
-/// hash/num_slots)" warnings — the extra mid-drain collections expose a
-/// LATENT young-sweep/walk defect when the free list holds split remnants
-/// and mini-TLAB fillers (see
-/// docs/known-issues/tlab-trigger-gc-young-walk-corruption.md). The
-/// triggers themselves are the intended cure for the crumb-treadmill wedge
-/// (10.5M consecutive refill failures, one GC per run); re-enable by
-/// default once the walk defect is fixed.
+/// `needs_gc()` consult) — the crumb-treadmill cure (10.5M consecutive
+/// refill failures, one GC per 23 s run without them). **Default ON**
+/// (opt out with `CRATONVM_TLAB_GC_TRIGGER=0`).
+///
+/// History: the triggers shipped default-OFF (perf/halfgap-20260717)
+/// because the extra mid-drain collections exposed a latent walk-grid
+/// corruption (bt18 5/5 wrong checksums, "cursor overshot into free
+/// block"). Root cause fixed 2026-07-18: an unaligned young-arena capacity
+/// (1 GiB - 4) made `refill_tlab`'s `requested.min(available)` mint
+/// unaligned TLAB sizes whose free-list split remnants sat off the 8-byte
+/// object grid (plus an untracked `Tlab::new` round-down sliver), derailing
+/// the non-moving walk and truncating the mark oracle. See
+/// docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md; the arena
+/// now enforces grid alignment end-to-end and the mark oracle fails safe
+/// above a truncated walk's frontier.
 fn tlab_gc_trigger_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -2219,9 +2222,9 @@ fn tlab_gc_trigger_enabled() -> bool {
         std::env::var("CRATONVM_TLAB_GC_TRIGGER")
             .map(|v| {
                 let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 

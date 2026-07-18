@@ -1,8 +1,62 @@
 # TLAB-trigger GC exposes young-walk/free-list corruption (bt18 under-count)
 
-Status: OPEN. Found 2026-07-18 during the perf/halfgap-20260717 round.
-The exposure vector is quarantined (`CRATONVM_TLAB_GC_TRIGGER` default OFF);
-the underlying defect is latent on dev and pre-dates this round.
+Status: **FIXED 2026-07-18** (perf/halfgap-residuals-20260718).
+`CRATONVM_TLAB_GC_TRIGGER` is now **default ON** (opt out with `=0`).
+
+## Root cause (found via free-list alignment tripwires + backtrace)
+
+The young arena's ergonomics-derived capacity was **not 8-aligned**
+(observed live: 1 GiB - 4). `Arena::remaining()` therefore carried a
+permanent mod-8 dreg, and when young ran nearly full — exactly the regime
+the refill-time triggers create — `refill_tlab`'s
+`actual_size = requested.min(available)` minted **unaligned TLAB sizes**
+(32764, 9772, ... ≡ 4 mod 8). Two independent corruptions follow:
+
+1. `Arena::alloc(actual_size)` served from a free-list block leaves a
+   **split tail remnant at an offset ≡ 4 mod 8** — an off-grid free block.
+   `skip_free_blocks` then resyncs the walk to that block's off-grid end,
+   and every subsequent stride is suspect ("cursor overshot into free
+   block", free blocks at +4 offsets breeding more +4 blocks).
+2. `Tlab::new`'s release-mode safety net rounds an unaligned TLAB end
+   **down**, leaving an untracked zeroed 4-byte sliver between the TLAB's
+   tail filler and the next region — the "[GAP sentinel][unaccounted zero
+   bytes][real object]" hex shape: the walk parses the zero run as a
+   phantom object and desyncs off the grid.
+
+The checksum under-count (676xxxxx family) was amplified by the mark
+oracle: the candidates-only exact-base walk **silently dropped every
+conservative root above an early break**, so whole live subtrees lost
+their roots and were swept.
+
+## Fix (four layers, gc/src/arena.rs + gc/src/gen_heap.rs)
+
+1. `Arena::new`/`Arena::grow` round the capacity down to a multiple of 8
+   (kills the unaligned bump-tail origin).
+2. `Arena::alloc` rounds every allocation size **up** to a multiple of 8 —
+   the free list and bump cursor can never leave the object grid again,
+   regardless of caller. A bounded alignment tripwire
+   (`warn_unaligned_block`) still names any caller that passes an
+   unrounded size.
+3. `refill_tlab` rounds `actual_size`/`take` **down** to a multiple of 8 so
+   a TLAB's end never triggers `Tlab::new`'s round-down sliver.
+4. The mark oracle records its trusted frontier; conservative candidates
+   above a truncated walk fall back to direct plausibility-checked
+   validation (pre-oracle behavior, over-retention-safe) instead of being
+   silently unrooted.
+
+## Validation
+
+- bt18 default heap, triggers ON: **5/5 checksum 68332206** (was 5/5
+  wrong), zero walk warnings.
+- bt18 -Xmx8g triggers ON: 10.64 s stable ×3, correct checksum (the
+  treadmill fix this trigger set was built for).
+- StreamOnlyStressRepro -Xmx32m ×3 + -Xmx512m: `RESULT=OK` (mark-oracle
+  regression face).
+- `cargo test --release -p cratonvm-gc --lib`: 791/791.
+
+Original OPEN report follows for the record.
+
+---
 
 ## Repro (deterministic-ish, ~4/5 runs)
 

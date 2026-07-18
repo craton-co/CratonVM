@@ -5016,6 +5016,15 @@ impl GenerationalHeap {
             }
             exact_cursor += total;
         }
+        // Truncated-oracle fail-safe (2026-07-18): everything the exact-base
+        // walk verified lies BELOW this frontier. A walk that broke early on a
+        // grid anomaly used to silently drop every conservative candidate
+        // above the break (no covering range -> `mark_young` returned -> the
+        // root's whole subtree got swept: the trigger-ON bt18 676xxxxx
+        // under-count family). Candidates above the frontier now fall back to
+        // direct validation of the candidate address (the pre-oracle
+        // behavior) — over-retention-safe, never a header write.
+        let oracle_trusted_abs = from_base + exact_cursor;
 
         // ----- Mark phase -------------------------------------------------
         //
@@ -5056,17 +5065,20 @@ impl GenerationalHeap {
                 return;
             }
             let insertion = young_object_ranges.partition_point(|(start, _)| *start <= addr);
-            let Some(&(base, end)) = insertion
+            let covering = insertion
                 .checked_sub(1)
                 .and_then(|idx| young_object_ranges.get(idx))
-            else {
-                return;
+                .filter(|&&(_, end)| addr < end);
+            let (addr, ptr) = match covering {
+                Some(&(base, _end)) => (base, base as *mut u8),
+                // Below the oracle's trusted frontier the walk was verified:
+                // an uncovered candidate is free/gap space — not an object.
+                None if addr < oracle_trusted_abs => return,
+                // Above the frontier the walk broke early — fall back to
+                // validating the candidate address directly (see the
+                // `oracle_trusted_abs` note above).
+                None => (addr, ptr),
             };
-            if addr >= end {
-                return;
-            }
-            let addr = base;
-            let ptr = base as *mut u8;
             // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
             // address inside the live from-space region, so reading an
             // ObjectHeader there is valid.
@@ -8000,7 +8012,19 @@ impl GenerationalHeap {
         if available < 256 {
             return None; // Not enough for a useful TLAB
         }
-        let actual_size = requested_size.min(available);
+        // Alignment invariant (perf/halfgap residuals, 2026-07-18): a TLAB's
+        // size must be a multiple of 8. `available` can carry a mod-8 dreg
+        // (unaligned free-list dust, or the historical unaligned-capacity bump
+        // tail), and an unaligned TLAB both mints an off-grid free-list split
+        // remnant AND gets its end rounded DOWN by `Tlab::new`'s release
+        // safety net — leaving an untracked zeroed sliver between the TLAB's
+        // filler and the next region that derails the non-moving walk (the
+        // trigger-ON bt18 corruption; see
+        // docs/known-issues/tlab-trigger-gc-young-walk-corruption.md).
+        let actual_size = requested_size.min(available) & !7;
+        if actual_size == 0 {
+            return None;
+        }
         if let Some(ptr) = from.alloc(actual_size, 8) {
             // Zero the TLAB region
             // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
@@ -8037,7 +8061,8 @@ impl GenerationalHeap {
         // condemn every allocation to.
         let floor = crate::tlab::frag_tlab_floor();
         if largest >= floor {
-            let take = largest.min(actual_size);
+            // `& !7`: same TLAB-size alignment invariant as the main path.
+            let take = largest.min(actual_size) & !7;
             if let Some(ptr) = from.alloc(take, 8) {
                 // SAFETY: `ptr` was just allocated from the arena with `take` bytes; zeroing is within bounds.
                 unsafe { std::ptr::write_bytes(ptr, 0, take) };
