@@ -815,6 +815,18 @@ fn cl_real_load_class(
         _ => return Ok(Some(Value::Object(None))),
     };
 
+    // `ClassLoader.loadClass(String)` is virtual too. Honor an override of
+    // that exact public overload before looking for the protected
+    // `(String,boolean)` form: Spring Boot's ModifiedClassPathClassLoader
+    // overrides only this method to reject @ClassPathExclusions packages.
+    // Calling it virtually is safe because a real override is present; base
+    // ClassLoader receivers continue to the native delegation below.
+    if let Some(result) =
+        crate::classloader::invoke_single_load_class_override(ctx, this, class_name_obj)
+    {
+        return result;
+    }
+
     // Honor a `loadClass(String,boolean)` override (override-first loaders).
     // `super.loadClass(name, resolve)` from such an override lands on the base
     // `loadClass(String,boolean)` native (→ `cl_real_load_class_base`), so there
@@ -925,7 +937,10 @@ fn load_class_visible_to(
 /// `cause` is a fresh heap object that must stay rooted across the further
 /// allocations (`create_string`, the outer `new_object_initialized`) needed
 /// to build the final exception.
-pub(crate) fn no_class_def_found_error(ctx: &mut dyn NativeContext, missing_internal: &str) -> ObjectRef {
+pub(crate) fn no_class_def_found_error(
+    ctx: &mut dyn NativeContext,
+    missing_internal: &str,
+) -> ObjectRef {
     let dotted = missing_internal.replace('/', ".");
     let cnfe_msg = ctx.create_string(&dotted);
     let cause = match ctx.new_object_initialized(
@@ -1096,6 +1111,29 @@ fn cl_real_load_class_base(
         && !crate::classloader::is_bootstrap_class_name(&internal)
         && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
         && !crate::classloader::builtin_loader_reachable(ctx, this);
+
+    // A URLClassLoader parented only by bootstrap/platform is intentionally
+    // isolated from application entries. Spring Boot's
+    // ModifiedClassPathClassLoader uses exactly this topology after removing
+    // selected JARs: a process-wide fallback would resurrect the excluded
+    // class and make ClassUtils.isPresent report a false positive. Search its
+    // recorded URLs, then make the miss authoritative.
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this)
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+    {
+        if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+            return result;
+        }
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
 
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
     //    or when the loader's chain cannot reach a built-in loader).

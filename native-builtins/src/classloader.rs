@@ -4,6 +4,7 @@
 //! ClassLoader hierarchy, URLClassLoader, MethodHandles.Lookup, ProtectionDomain,
 //! and CodeSource native method implementations.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -1059,9 +1060,8 @@ pub(crate) fn find_class_is_urlclassloader_native(
     false
 }
 
-/// True iff the receiver's actual class overrides the protected
-/// `ClassLoader.loadClass(String,boolean)` with its own bytecode (a genuine
-/// non-builtin subclass override).
+/// True iff the receiver's actual class overrides a `ClassLoader.loadClass`
+/// overload with its own bytecode (a genuine non-builtin subclass override).
 ///
 /// `ClassLoader.loadClass(String)` is spec'd as `return loadClass(name, false)`
 /// — a virtual self-call. Some loaders (notably Spring's `OverridingClassLoader`
@@ -1079,9 +1079,10 @@ pub(crate) fn find_class_is_urlclassloader_native(
 /// `loadClass(name, false)` so the subclass bytecode actually runs. Returns
 /// false for base / built-in loaders (where the Rust delegation is authoritative
 /// and a virtual dispatch would recurse back into this native).
-pub(crate) fn receiver_overrides_load_class_resolve(
+fn receiver_overrides_load_class(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
+    descriptor: &str,
 ) -> bool {
     let mut cid = Some(ctx.class_id_of_object(this));
     let mut found_override = false;
@@ -1110,15 +1111,83 @@ pub(crate) fn receiver_overrides_load_class_resolve(
             break;
         }
         if !found_override
-            && ctx.declared_methods(id).iter().any(|m| {
-                m.name == "loadClass" && m.descriptor == "(Ljava/lang/String;Z)Ljava/lang/Class;"
-            })
+            && ctx
+                .declared_methods(id)
+                .iter()
+                .any(|m| m.name == "loadClass" && m.descriptor == descriptor)
         {
             found_override = true;
         }
         cid = ctx.superclass_of(id);
     }
     found_override
+}
+
+/// See [`receiver_overrides_load_class`]. The one-argument public overload is
+/// itself virtual and can be overridden independently of the protected
+/// `(String, boolean)` form. `ModifiedClassPathClassLoader` does exactly that
+/// to reject packages excluded by Spring Boot's `@ClassPathExclusions`.
+pub(crate) fn receiver_overrides_load_class_single(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> bool {
+    receiver_overrides_load_class(ctx, this, "(Ljava/lang/String;)Ljava/lang/Class;")
+}
+
+/// See [`receiver_overrides_load_class`].
+pub(crate) fn receiver_overrides_load_class_resolve(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> bool {
+    receiver_overrides_load_class(ctx, this, "(Ljava/lang/String;Z)Ljava/lang/Class;")
+}
+
+// A public `loadClass(String)` override commonly delegates with
+// `super.loadClass(name)`. CratonVM serves that base JDK method natively, so
+// the nested invokespecial reaches the same callback as the outer virtual
+// call. Remember the active loader identity per native thread and let that
+// nested call take base delegation; otherwise ModifiedClassPathClassLoader's
+// `return super.loadClass(name)` recursively re-enters its own override.
+// Identity hashes are stable across moving GC, unlike raw ObjectRef addresses.
+thread_local! {
+    static SINGLE_LOAD_CLASS_OVERRIDE_IN_FLIGHT: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Invoke a genuine public `loadClass(String)` override once, or return
+/// `None` when the receiver has no override or this is its nested
+/// `super.loadClass(name)` delegation.
+pub(crate) fn invoke_single_load_class_override(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_obj: ObjectRef,
+) -> Option<MethodCallResult> {
+    if !receiver_overrides_load_class_single(ctx, this) {
+        return None;
+    }
+    let identity = ctx.identity_hash_code(this);
+    let reentrant = SINGLE_LOAD_CLASS_OVERRIDE_IN_FLIGHT.with(|active| {
+        let mut active = active.borrow_mut();
+        if active.contains(&identity) {
+            true
+        } else {
+            active.push(identity);
+            false
+        }
+    });
+    if reentrant {
+        return None;
+    }
+    let result = ctx.invoke_virtual(
+        this,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    );
+    SINGLE_LOAD_CLASS_OVERRIDE_IN_FLIGHT.with(|active| {
+        let popped = active.borrow_mut().pop();
+        debug_assert_eq!(popped, Some(identity));
+    });
+    Some(result)
 }
 
 /// True if `this` is a USER-DEFINED `ClassLoader` (a non-builtin subclass), as
@@ -1359,12 +1428,14 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 1,
                 "ClassLoader.loadClass name is null",
             );
-            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            ));
         }
     };
 
     // `ClassLoader.loadClass(String)` is spec'd as `return loadClass(name, false)`.
-    // If the receiver's actual class overrides the protected
+    // If the receiver's actual class overrides the public single-argument or protected
     // `loadClass(String,boolean)` with its own bytecode (e.g. Spring's
     // OverridingClassLoader, which redefines eligible classes under itself
     // BEFORE parent delegation, or rejects filtered names), dispatch the virtual
@@ -1376,6 +1447,9 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // `super.loadClass(name, resolve)` from such an override is an invokespecial
     // that lands on the base native `cl_load_class_resolve`
     // (→ `cl_load_class_base_delegation`), so there is no recursion back here.
+    if let Some(result) = invoke_single_load_class_override(ctx, this, name_obj) {
+        return result;
+    }
     if receiver_overrides_load_class_resolve(ctx, this) {
         return ctx.invoke_virtual(
             this,
@@ -1816,7 +1890,9 @@ fn cl_load_class_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 1,
                 "ClassLoader.loadClass name is null",
             );
-            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            ));
         }
     };
     cl_load_class_base_delegation(ctx, this, name_obj)
@@ -3308,7 +3384,9 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             1,
             "ClassLoader.getResource name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let name = {
         let mut found: Option<String> = None;
@@ -3657,7 +3735,9 @@ fn cl_get_resources_impl(
             1,
             "ClassLoader.getResources name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let name = {
         let mut found: Option<String> = None;
@@ -3701,10 +3781,9 @@ fn cl_get_resources_impl(
                 }
                 let this_live = ctx.read_native_pin(p_this, this_ref);
                 let name_for_local = Value::Object(Some(ctx.create_string(&name)));
-                if let Ok(Some(Value::Object(Some(enm)))) = ucl_find_resources(
-                    ctx,
-                    &[Value::Object(Some(this_live)), name_for_local],
-                ) {
+                if let Ok(Some(Value::Object(Some(enm)))) =
+                    ucl_find_resources(ctx, &[Value::Object(Some(this_live)), name_for_local])
+                {
                     collect_url_enumeration_objects(ctx, enm, &mut urls);
                 }
                 ctx.unpin_native_roots(p_this);
@@ -4252,7 +4331,9 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             1,
             "ClassLoader.getResourceAsStream name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let Some(name) = args.iter().rev().find_map(|v| match v {
         Value::Object(Some(o)) => ctx.read_string(*o),
@@ -4756,7 +4837,7 @@ fn probe_resource_exists(ctx: &mut dyn NativeContext, url: ObjectRef) -> bool {
     }
 }
 
-fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &str) -> bool {
+pub(crate) fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &str) -> bool {
     let mut class_id = ctx.class_id_of_object(obj);
     for _ in 0..64 {
         match ctx.class_name_of_id(class_id).as_deref() {
@@ -4770,6 +4851,26 @@ fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &str) -> bool
         }
     }
     false
+}
+
+/// A URLClassLoader whose parent is bootstrap/platform cannot delegate an
+/// application class to the process-wide application loader. Its recorded URL
+/// list is its complete application view (Spring's ModifiedClassPathClassLoader
+/// uses this shape to remove selected JARs from a test's classpath).
+pub(crate) fn url_classloader_isolated_from_app(
+    ctx: &dyn NativeContext,
+    loader: ObjectRef,
+) -> bool {
+    if !object_extends(ctx, loader, "java/net/URLClassLoader") {
+        return false;
+    }
+    match ctx.get_field_by_name(loader, "parent") {
+        Value::Object(None) | Value::Int(0) | Value::Long(0) => true,
+        Value::Object(Some(parent)) => ctx
+            .class_name_of_id(ctx.class_id_of_object(parent))
+            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader"),
+        _ => false,
+    }
 }
 
 fn is_url_class_path_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
@@ -5291,6 +5392,9 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         if let Some(first) = local_urls.first() {
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
             return Ok(Some(Value::Object(Some(url))));
+        }
+        if url_classloader_isolated_from_app(ctx, this) {
+            return Ok(Some(Value::Object(None)));
         }
     }
     // Mirror cl_get_resource's lookup order: structured URL walk FIRST.
@@ -7883,6 +7987,43 @@ mod classloader_tests {
         assert!(
             receiver_overrides_load_class_resolve(&mut ctx, loader),
             "BeanShell-shaped URLClassLoader subclasses must dispatch their loadClass override"
+        );
+    }
+
+    #[test]
+    fn test_loadclass_single_override_survives_urlclassloader_superclass() {
+        let mut ctx = MockNativeContext::new();
+        let url_cid = ctx
+            .ensure_class_initialized("java/net/URLClassLoader")
+            .expect("URLClassLoader class");
+        let modified_cid = ctx
+            .ensure_class_initialized(
+                "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+            )
+            .expect("ModifiedClassPathClassLoader class");
+        ctx.set_superclass(modified_cid, url_cid);
+        ctx.set_declared_methods(
+            modified_cid,
+            vec![cratonvm_native_api::MethodMetadata {
+                name: "loadClass".to_string(),
+                descriptor: "(Ljava/lang/String;)Ljava/lang/Class;".to_string(),
+                access_flags: 0,
+                declaring_class_id: modified_cid,
+                exceptions: Vec::new(),
+            }],
+        );
+        let loader = new_object_ref(
+            &mut ctx,
+            "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+        );
+
+        assert!(
+            receiver_overrides_load_class_single(&mut ctx, loader),
+            "a URLClassLoader subclass's single-argument loadClass override must run"
+        );
+        assert!(
+            !receiver_overrides_load_class_resolve(&mut ctx, loader),
+            "the single-argument override must not be mistaken for the protected overload"
         );
     }
 

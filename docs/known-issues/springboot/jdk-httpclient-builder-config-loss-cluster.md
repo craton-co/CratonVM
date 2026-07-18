@@ -173,8 +173,8 @@ failures in non-JDK-HttpClient backends, documented separately in
 |---|---|
 | `module/spring-boot-http-client` | `org.springframework.boot.http.client.JdkClientHttpRequestFactoryBuilderTests` |
 | `module/spring-boot-http-client` | `org.springframework.boot.http.client.reactive.JdkClientHttpConnectorBuilderTests` |
-| `module/spring-boot-http-client` | `org.springframework.boot.http.client.autoconfigure.imperative.ImperativeHttpClientAutoConfigurationTests` (1 of 4 failures — the other 3 are a separate cluster, see `httpclient-autoconfigure-classpath-presence-cluster.md`) |
-| `module/spring-boot-http-client` | `org.springframework.boot.http.client.autoconfigure.reactive.ReactiveHttpClientAutoConfigurationTests` (1 of 5 failures — the other 4 are the same separate cluster) |
+| `module/spring-boot-http-client` | `org.springframework.boot.http.client.autoconfigure.imperative.ImperativeHttpClientAutoConfigurationTests` (1 failure — the classpath-presence cluster is fixed; see `../../internal/springboot/httpclient-autoconfigure-classpath-presence-cluster-FIXED.md`) |
+| `module/spring-boot-http-client` | `org.springframework.boot.http.client.autoconfigure.reactive.ReactiveHttpClientAutoConfigurationTests` (1 failure — the classpath-presence cluster is fixed; see `../../internal/springboot/httpclient-autoconfigure-classpath-presence-cluster-FIXED.md`) |
 | `module/spring-boot-resttestclient` | `org.springframework.boot.resttestclient.TestRestTemplateTests` (3/38 failures — see Cross-reference below) |
 
 ## Cross-reference (2026-07-17, separate triage batch, same rerun)
