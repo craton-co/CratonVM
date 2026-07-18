@@ -76,6 +76,13 @@ struct ThreadEntry {
     /// fixups while the thread is parked in a blocking native. See
     /// `GcBlockState` and `fold_pointer_map_into_blocked`.
     gc_block_state: Arc<GcBlockState>,
+    /// JMX diagnostic roots. These are deliberately separate from a blocked
+    /// thread's frame snapshot: a lock relationship must remain observable
+    /// while the owner is running, and must be remapped across a moving GC.
+    jmx_contended_monitor: Mutex<Option<ObjectRef>>,
+    jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
+    jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
+    jmx_locked_synchronizers: Mutex<Vec<ObjectRef>>,
     /// T1.5.1 — pending async exception slot. Set by cross-thread
     /// `Thread.stop` / `Thread.stop0` calls; consumed by the target
     /// thread's next `safepoint_check`.
@@ -247,6 +254,10 @@ impl ThreadRegistry {
             frame_trace: Arc::new(Mutex::new(Vec::new())),
             vm_state: Arc::new(Mutex::new(String::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
+            jmx_contended_monitor: Mutex::new(None),
+            jmx_waiting_monitor: Mutex::new(None),
+            jmx_locked_monitors: Mutex::new(Vec::new()),
+            jmx_locked_synchronizers: Mutex::new(Vec::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
             os_tid: std::sync::atomic::AtomicU32::new(0),
@@ -795,6 +806,85 @@ impl ThreadRegistry {
         self.threads.lock().get(&thread_id).map(|e| e.name.clone())
     }
 
+    /// Publish a monitor acquisition attempt before it can block. The object
+    /// is rooted by this registry entry until the acquire completes.
+    pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_contended_monitor.lock() = Some(monitor);
+        }
+    }
+
+    /// Finish an acquisition attempt. Successful acquisitions become owned
+    /// monitor roots; failed/aborted attempts simply lose the contention root.
+    pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_contended_monitor.lock() = None;
+            let mut owned = entry.jmx_locked_monitors.lock();
+            if !owned.iter().any(|o| o.as_ptr() == monitor.as_ptr()) {
+                owned.push(monitor);
+            }
+        }
+    }
+
+    pub fn remove_jmx_locked_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            entry
+                .jmx_locked_monitors
+                .lock()
+                .retain(|o| o.as_ptr() != monitor.as_ptr());
+        }
+    }
+
+    pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_waiting_monitor.lock() = Some(monitor);
+        }
+    }
+
+    pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            return entry.jmx_waiting_monitor.lock().take();
+        }
+        None
+    }
+
+    /// `AbstractOwnableSynchronizer` has one exclusive owner. Remove a
+    /// synchronizer from any former owner before attaching it to the new one.
+    pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
+        let threads = self.threads.lock();
+        for entry in threads.values() {
+            entry
+                .jmx_locked_synchronizers
+                .lock()
+                .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+        }
+        if let Some(owner) = owner {
+            if let Some(entry) = threads.get(&owner) {
+                entry.jmx_locked_synchronizers.lock().push(synchronizer);
+            }
+        }
+    }
+
+    pub fn jmx_lock_snapshot(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<(
+        Option<ObjectRef>,
+        Option<ObjectRef>,
+        Vec<ObjectRef>,
+        Vec<ObjectRef>,
+    )> {
+        let threads = self.threads.lock();
+        let entry = threads.get(&thread_id)?;
+        let snapshot = (
+            *entry.jmx_contended_monitor.lock(),
+            *entry.jmx_waiting_monitor.lock(),
+            entry.jmx_locked_monitors.lock().clone(),
+            entry.jmx_locked_synchronizers.lock().clone(),
+        );
+        Some(snapshot)
+    }
+
     /// Return all (ThreadId, name) pairs for currently registered threads.
     pub fn all_thread_names(&self) -> Vec<(ThreadId, String)> {
         self.threads
@@ -1166,6 +1256,14 @@ impl ThreadRegistry {
                 if let Some(obj) = entry.java_thread_obj {
                     all_roots.push(obj);
                 }
+                if let Some(obj) = *entry.jmx_contended_monitor.lock() {
+                    all_roots.push(obj);
+                }
+                if let Some(obj) = *entry.jmx_waiting_monitor.lock() {
+                    all_roots.push(obj);
+                }
+                all_roots.extend(entry.jmx_locked_monitors.lock().iter().copied());
+                all_roots.extend(entry.jmx_locked_synchronizers.lock().iter().copied());
             }
             // A posted async exception must survive even if the target
             // thread is dead-but-not-yet-reaped: it may still be consumed
@@ -1220,6 +1318,23 @@ impl ThreadRegistry {
                     rekeyed.push((old_addr, new_addr));
                     vacated.push((old_addr, *tid));
                 }
+            }
+            let mut remap_jmx = |obj: &mut ObjectRef| {
+                if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
+                    *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            };
+            if let Some(obj) = entry.jmx_contended_monitor.lock().as_mut() {
+                remap_jmx(obj);
+            }
+            if let Some(obj) = entry.jmx_waiting_monitor.lock().as_mut() {
+                remap_jmx(obj);
+            }
+            for obj in entry.jmx_locked_monitors.lock().iter_mut() {
+                remap_jmx(obj);
+            }
+            for obj in entry.jmx_locked_synchronizers.lock().iter_mut() {
+                remap_jmx(obj);
             }
             // B1 fix — repoint a pending async-exception slot too. It stores
             // the raw address of a posted `Throwable`; a moving collection

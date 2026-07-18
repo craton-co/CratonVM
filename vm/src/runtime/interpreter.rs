@@ -6952,6 +6952,11 @@ pub fn pop_and_recycle_frame_with_reason(
                     "implicit monitorexit on synchronized-method-frame-pop failed"
                 );
             }
+            if !shared.monitors.holds(obj, thread.thread_id) {
+                shared
+                    .thread_registry
+                    .remove_jmx_locked_monitor(thread.thread_id, obj);
+            }
         }
         thread.recycle_frame_with_shared(f, &shared.operand_stack_pool, &shared.tag_pool);
     }
@@ -15798,6 +15803,11 @@ fn execute_instruction(
             // emission site must consult the snapshot itself — there's no
             // value in a dead pre-read here.
             shared.monitors.exit(obj_ref, thread.thread_id)?;
+            if !shared.monitors.holds(obj_ref, thread.thread_id) {
+                shared
+                    .thread_registry
+                    .remove_jmx_locked_monitor(thread.thread_id, obj_ref);
+            }
         }
 
         // -- Unsupported / deprecated --
@@ -24725,6 +24735,17 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_bc_crypto_math_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+
+    // The JDK's final owner setter is the single authoritative transition for
+    // AbstractQueuedSynchronizer-derived locks. Route it through the native
+    // registry so ThreadMXBean can retain an exact, moving-GC-safe index of
+    // ownable synchronizers even after this tiny method has been JIT compiled.
+    if class_name == "java/util/concurrent/locks/AbstractOwnableSynchronizer"
+        && method_name == "setExclusiveOwnerThread"
+        && method_descriptor == "(Ljava/lang/Thread;)V"
+    {
         return true;
     }
 
