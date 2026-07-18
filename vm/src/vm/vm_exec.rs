@@ -7843,7 +7843,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     } else {
                         let private_impl_class =
                             crate::runtime::interpreter::lambda_private_impl_dispatch_class(
-                                self.shared, &lcs,
+                                self.shared,
+                                &lcs,
                             );
                         let rcv_id_opt = match &full_args[0] {
                             Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
@@ -8868,8 +8869,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         #[cfg(windows)]
         // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
         // RegisterNatives-on-load pattern as tcnative on CratonVM.
-        let skip_jni_onload_tcnative = basename_lc.contains("tcnative")
-            || basename_lc.contains("conscrypt_openjdk_jni");
+        let skip_jni_onload_tcnative =
+            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
         #[cfg(not(windows))]
         let skip_jni_onload_tcnative = false;
 
@@ -16133,7 +16134,14 @@ fn invoke_on_class_shared_inner(
                     // and must win even in that case: otherwise an
                     // `SSLServerSocketFactory` silently constructs a
                     // plaintext listener through its parent factory.
-                    if method.is_abstract() {
+                    // `ServerSocket.accept()` is concrete on the parent, but a
+                    // synthetic SSLServerSocket must still route to its own
+                    // TLS-aware native. Without this one concrete exception,
+                    // the parent accept path bypasses the listener registry
+                    // entirely and an LDAPS client waits until timeout.
+                    if method.is_abstract()
+                        || (method_name == "accept" && descriptor == "()Ljava/net/Socket;")
+                    {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
                                 let rc = shared.heap.class_id_of(*o);
