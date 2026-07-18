@@ -3057,24 +3057,26 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Int(-1))),
     };
     let pos = match ctx.get_field(this, BAIS_FIELD_POS) {
-        Value::Int(v) => v as usize,
+        Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let count = match ctx.get_field(this, BAIS_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
+        Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
     }
-    let avail = count - pos;
+    let avail = (count - pos) as usize;
     let to_read = len.min(avail);
     for i in 0..to_read {
-        let byte_val = ctx.get_array_element(data, pos + i);
+        let byte_val = ctx.get_array_element(data, pos as usize + i);
         ctx.set_array_element(buf, off + i, byte_val);
     }
-    let new_pos = pos.checked_add(to_read).unwrap_or(usize::MAX);
-    ctx.set_field(this, BAIS_FIELD_POS, Value::Int(new_pos as i32));
+    ctx.set_field(this, BAIS_FIELD_POS, Value::Int(pos + to_read as i32));
     Ok(Some(Value::Int(to_read as i32)))
 }
 
@@ -18820,6 +18822,48 @@ mod bais_layout_tests {
             }
         }
         assert_eq!(&got, b"hello world");
+    }
+
+    #[test]
+    fn offset_constructor_negative_length_is_immediate_eof_for_bulk_reads() {
+        let mut ctx = MockNativeContext::new();
+        let buf = ctx.new_array(ArrayElementType::Byte, 4);
+        let this = ctx.alloc_object_with_class(4, "java/io/ByteArrayInputStream");
+        native_bais_init_offset(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(buf)),
+                Value::Int(0),
+                Value::Int(-1),
+            ],
+        )
+        .expect("init ok");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+
+        let n = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(8),
+            ],
+        )
+        .expect("read ok");
+        assert_eq!(n, Some(Value::Int(-1)));
+
+        let zero_length = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-length read ok");
+        assert_eq!(zero_length, Some(Value::Int(0)));
     }
 
     fn make_hibernate_lob_stream(ctx: &mut MockNativeContext, count: i64) -> ObjectRef {

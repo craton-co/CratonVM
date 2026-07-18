@@ -1733,6 +1733,10 @@ pub trait NativeContext {
     ///   * `1` — RUNNABLE: started and still alive.
     ///   * `2` — TERMINATED: started and has since finished.
     ///
+    /// Value `3` represents an alive thread parked in a blocking region
+    /// (`WAITING`) and value `4` an alive thread acquiring a contended
+    /// monitor (`BLOCKED`); the default returns `0`.
+    ///
     /// Used to back `Thread.getState()` in real-JDK mode, where the JDK
     /// bytecode reads `holder.threadStatus` — a field the VM does not keep
     /// updated, so `getState()` would otherwise always report `NEW` (even for

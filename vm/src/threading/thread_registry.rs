@@ -998,6 +998,39 @@ impl ThreadRegistry {
         }
     }
 
+    /// Whether a live registered thread is in a GC-safe blocking region.
+    ///
+    /// The same transition is the authoritative source for Java
+    /// `Thread.State.WAITING`: it is published before monitor/AQS/native waits
+    /// and cleared only after the thread wakes and applies post-GC fixups.
+    pub fn is_blocked(&self, thread_id: ThreadId) -> bool {
+        let threads = self.threads.lock();
+        threads.get(&thread_id).is_some_and(|entry| {
+            entry.alive.load(Ordering::Acquire)
+                && entry
+                    .gc_block_state
+                    .in_blocked_region
+                    .load(Ordering::Acquire)
+        })
+    }
+
+    /// The Java blocking state for a currently blocked thread: 1 is WAITING
+    /// and 2 is BLOCKED. Returns 0 for running, dead, and unknown threads.
+    pub fn java_block_state(&self, thread_id: ThreadId) -> u8 {
+        let threads = self.threads.lock();
+        threads
+            .get(&thread_id)
+            .filter(|entry| {
+                entry.alive.load(Ordering::Acquire)
+                    && entry
+                        .gc_block_state
+                        .in_blocked_region
+                        .load(Ordering::Acquire)
+            })
+            .map(|entry| entry.gc_block_state.java_state.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     /// Clear the GC-blocked mark for a VM-registered native carrier thread.
     pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
         let threads = self.threads.lock();
@@ -1666,6 +1699,22 @@ mod tests {
     fn unknown_thread_not_alive() {
         let registry = ThreadRegistry::new();
         assert!(!registry.is_alive(ThreadId(99)));
+    }
+
+    #[test]
+    fn native_blocked_thread_is_reported_as_blocked_until_woken() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "waiter", None);
+
+        assert!(!registry.is_blocked(tid));
+        registry.mark_native_thread_blocked(tid);
+        assert!(registry.is_blocked(tid));
+        registry.mark_native_thread_unblocked(tid);
+        assert!(!registry.is_blocked(tid));
+
+        registry.mark_dead(tid);
+        assert!(!registry.is_blocked(tid));
     }
 
     // -----------------------------------------------------------------

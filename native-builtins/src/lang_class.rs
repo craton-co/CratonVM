@@ -103,7 +103,9 @@ pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
-    let dotted: Arc<str> = if slashed.contains('/') {
+    let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
+        Arc::from(primitive)
+    } else if slashed.contains('/') {
         Arc::from(slashed.replace('/', "."))
     } else {
         Arc::from(slashed)
@@ -848,7 +850,9 @@ pub(crate) fn native_class_get_name(
                     spring_configuration_cglib_display_name(ctx, class_id, &strict_name)
                 })
                 .unwrap_or(strict_name);
-            let dotted = display_name.replace('/', ".");
+            let dotted = primitive_descriptor_name(&display_name)
+                .map(str::to_string)
+                .unwrap_or_else(|| display_name.replace('/', "."));
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -895,7 +899,9 @@ pub(crate) fn native_class_get_name(
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
             let display_name =
                 spring_configuration_cglib_display_name(ctx, class_id, &name).unwrap_or(name);
-            let dotted_name = if display_name.contains('/') {
+            let dotted_name = if let Some(primitive) = primitive_descriptor_name(&display_name) {
+                primitive.to_string()
+            } else if display_name.contains('/') {
                 display_name.replace('/', ".")
             } else {
                 display_name
@@ -926,7 +932,9 @@ pub(crate) fn native_class_get_name(
             // this is rare (only primitive `getName()` calls; user code
             // usually goes through the `Some(class_id)` arm above).
             if let Some(prim_name) = mirror_class_name(ctx, this) {
-                let dotted_name = if prim_name.contains('/') {
+                let dotted_name = if let Some(primitive) = primitive_descriptor_name(&prim_name) {
+                    primitive.to_string()
+                } else if prim_name.contains('/') {
                     prim_name.replace('/', ".")
                 } else {
                     prim_name
@@ -16603,6 +16611,18 @@ mod tests {
         };
         // getName converts / to .
         assert_eq!(ctx.read_string(obj).unwrap(), "java.lang.Object");
+    }
+
+    #[test]
+    fn class_get_name_normalizes_primitive_descriptors() {
+        assert_eq!(
+            dotted_class_name(ClassId::new(0xfff0_0001), "Z").as_ref(),
+            "boolean"
+        );
+        assert_eq!(
+            dotted_class_name(ClassId::new(0xfff0_0002), "I").as_ref(),
+            "int"
+        );
     }
 
     #[test]

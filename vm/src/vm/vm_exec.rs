@@ -1382,6 +1382,10 @@ pub(crate) fn monitor_enter_blocking(
     };
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
+    ctx.thread
+        .gc_block_state
+        .java_state
+        .store(2, std::sync::atomic::Ordering::Release);
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
@@ -5759,6 +5763,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // filler write can happen after a concurrent census has already
         // decided it may proceed without waiting for this thread.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // KC16-watchdog: stash a snapshot of the current frame chain in a
@@ -6539,6 +6547,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
         // grow/realloc the young arena while we are joined.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
@@ -6576,7 +6588,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             None => 0, // NEW — never started
             Some(id) => {
                 if self.shared.thread_registry.is_alive(id) {
-                    1 // RUNNABLE
+                    match self.shared.thread_registry.java_block_state(id) {
+                        1 => 3, // WAITING
+                        2 => 4, // BLOCKED
+                        _ => 1, // RUNNABLE
+                    }
                 } else {
                     2 // TERMINATED
                 }
@@ -7110,6 +7126,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
         // blocked region, while the young arena it points into is still valid.
         // While we are GC-blocked a stop-the-world moving collection can run on
@@ -7537,6 +7557,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // grow/realloc the young arena while this thread is parked, freeing
         // the buffer the TLAB points into.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
 
@@ -7843,7 +7867,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     } else {
                         let private_impl_class =
                             crate::runtime::interpreter::lambda_private_impl_dispatch_class(
-                                self.shared, &lcs,
+                                self.shared,
+                                &lcs,
                             );
                         let rcv_id_opt = match &full_args[0] {
                             Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
@@ -8868,8 +8893,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         #[cfg(windows)]
         // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
         // RegisterNatives-on-load pattern as tcnative on CratonVM.
-        let skip_jni_onload_tcnative = basename_lc.contains("tcnative")
-            || basename_lc.contains("conscrypt_openjdk_jni");
+        let skip_jni_onload_tcnative =
+            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
         #[cfg(not(windows))]
         let skip_jni_onload_tcnative = false;
 
@@ -13668,6 +13693,90 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // `Socket.setKeepAlive` on a real-JDK socket can read CratonVM's
+    // synthetic TLS state as its private `impl` field.  The resulting
+    // receiver is a String and the JDK attempts the impossible call below.
+    // It is an internal socket-option write only; String has no such API, so
+    // suppressing it is both narrower and safer than allowing an NSME.
+    if class_name == "java/lang/String"
+        && method_name == "setOption"
+        && descriptor == "(ILjava/lang/Object;)V"
+    {
+        return Ok(None);
+    }
+    // `ServerSocket.accept()` has a native parent implementation, so the
+    // later abstract-method rescue cannot displace it. A synthetic
+    // SSLServerSocket owns a separate TLS listener registry and must always
+    // prefer its concrete bridge before inherited-native lookup.
+    if method_name == "accept" && descriptor == "()Ljava/net/Socket;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLServerSocket" {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        .find(&receiver_name, method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+    // UnboundID retains an SSLServerSocketFactory in a field whose declared
+    // type is ServerSocketFactory, then invokes its concrete parent overloads
+    // (`createServerSocket(II)` and `(IILjava/net/InetAddress;)`).  The
+    // parent has registered native implementations, so ordinary resolution
+    // never reaches the TLS factory's more-specific bridge.  Prefer that
+    // bridge from the receiver's actual synthetic class before the parent
+    // native can manufacture a plaintext listener.
+    if method_name == "createServerSocket"
+        && matches!(
+            descriptor,
+            "(I)Ljava/net/ServerSocket;"
+                | "(II)Ljava/net/ServerSocket;"
+                | "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;"
+        )
+    {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if matches!(
+                receiver_name.as_str(),
+                "javax/net/ssl/SSLServerSocketFactory"
+                    | "sun/security/ssl/SSLServerSocketFactoryImpl"
+            ) {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        // The real JDK factory carries its SSLContext in the
+                        // same first instance slot consumed by the bridge.
+                        // Reuse the bridge registered on its public API type
+                        // rather than interpreting `SSLServerSocketImpl`,
+                        // whose host socket path bypasses the TLS registry.
+                        .find(
+                            "javax/net/ssl/SSLServerSocketFactory",
+                            method_name,
+                            descriptor,
+                        )
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // The real-JDK Thread methods read the host field layout directly.  A
     // CratonVM Thread can instead carry a stale/mis-slotted value there, which
     // made Mockito plugin discovery dispatch `getResources` on a String.
@@ -16125,7 +16234,22 @@ fn invoke_on_class_shared_inner(
                     // the interface-exclusion above retargeted `class_id`) and check
                     // its native registry too -- this generalises the rescue to any
                     // interface-stamped synthetic receiver, not just concrete ones.
-                    if !native && method.is_abstract() {
+                    // The static method reference can already have selected a
+                    // generic native on the abstract parent (for example
+                    // `ServerSocketFactory.createServerSocket(II)`), which
+                    // used to suppress this receiver-specific rescue.  The
+                    // concrete synthetic receiver's bridge is more specific
+                    // and must win even in that case: otherwise an
+                    // `SSLServerSocketFactory` silently constructs a
+                    // plaintext listener through its parent factory.
+                    // `ServerSocket.accept()` is concrete on the parent, but a
+                    // synthetic SSLServerSocket must still route to its own
+                    // TLS-aware native. Without this one concrete exception,
+                    // the parent accept path bypasses the listener registry
+                    // entirely and an LDAPS client waits until timeout.
+                    if method.is_abstract()
+                        || (method_name == "accept" && descriptor == "()Ljava/net/Socket;")
+                    {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
                                 let rc = shared.heap.class_id_of(*o);

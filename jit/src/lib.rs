@@ -3426,16 +3426,12 @@ pub fn try_resolve_intrinsic(
             _ => {}
         }
     }
+    // Real-JDK CRC32 stores its public (not complemented running) value in
+    // `crc`. Keep archive creation on the proven updateBytes0 native path
+    // until every compiled call shape has one state-representation contract.
+    // CRC32C uses its own running-state contract and remains eligible above.
     if class == "java/util/zip/CRC32" {
-        match (name, descriptor) {
-            ("update", "(I)V") => {
-                return Some((JitIntrinsic::Crc32UpdateByte.as_entry(), 1, b'V'));
-            }
-            ("update", "([BII)V") => {
-                return Some((JitIntrinsic::Crc32UpdateBytes.as_entry(), 3, b'V'));
-            }
-            _ => {}
-        }
+        return None;
     }
     // ===== INTRINSIC REGION END: CRC32 =====
 

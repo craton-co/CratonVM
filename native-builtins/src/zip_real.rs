@@ -777,6 +777,11 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // and any app reading JARs trips `updateBytes0` during entry verification.
     let crc = "java/util/zip/CRC32";
     r.register(crc, "update", "(II)I", crc32_update);
+    // `updateBytes` is concrete real-JDK bytecode that only checks its range
+    // then delegates to updateBytes0. Force its registered implementation in
+    // real-JDK mode so archive writers never compile a second, incompatible
+    // CRC-state transition around the native boundary.
+    r.register(crc, "updateBytes", "(I[BII)I", crc32_update_bytes_0);
     r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
     r.register(
         crc,

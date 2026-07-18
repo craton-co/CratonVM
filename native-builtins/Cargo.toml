@@ -191,3 +191,8 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Only the legacy DSA server fallback needs OpenSSL's per-context security
+# policy API. Keeping it Unix-scoped preserves the Windows dependency graph.
+openssl = "0.10"

@@ -1,10 +1,20 @@
 # WildFly standalone boot hangs forever in CratonVM's STW cross-thread JIT-takeover during parallel-extension-add
 
-Status: **RESOLVED** (2026-07-14) — see "Final resolution" at the bottom. The specific bug this doc
-documents (the `STW cross-thread JIT takeover ... rounds=64 pending=N taken=0` warning followed by a
-permanent hang) is fixed: 0 occurrences across 50+ verification attempts post-fix, versus ~80-90%
-before. Moved to `docs/internal/fixed-suite-bugs/` accordingly; see the bottom section for what remains
-genuinely open (separate, already-tracked bugs, not sub-parts of this one).
+Status: **REOPENED 2026-07-18** — see "Recurrence 2026-07-18" at the bottom. Symptom reproduced again
+("LifecycleException: Could not start container", empty server.log, dominant failure mode across a
+fresh 6-shard full-suite rerun) on a binary built from current dev, which includes every fix commit
+this doc's history references as an ancestor. This is the FOURTH time this exact symptom has recurred
+via a different specific mechanism (see the 2026-07-14 "Final resolution", the 2026-07-14 addendum, and
+the 2026-07-15 follow-up below, each of which closed the doc after fixing a distinct root cause under
+the same diagnostic signature) -- moved back to `docs/known-issues/` accordingly. The historical
+resolution sections below are preserved as-is; none of their conclusions are disputed for the window
+they cover, they just did not hold going forward.
+
+Prior status (preserved for history): **RESOLVED** (2026-07-14) — see "Final resolution" at the bottom.
+The specific bug this doc documents (the `STW cross-thread JIT takeover ... rounds=64 pending=N
+taken=0` warning followed by a permanent hang) is fixed: 0 occurrences across 50+ verification attempts
+post-fix, versus ~80-90% before. Moved to `docs/internal/fixed-suite-bugs/` accordingly; see the bottom
+section for what remains genuinely open (separate, already-tracked bugs, not sub-parts of this one).
 
 Original filing (2026-07-13), preserved for history:
 
@@ -601,3 +611,58 @@ under a bin lock — same semantics, coarser collision domain here). If counted-
 audit the remaining ~65 `NativeContext::monitor_enter` native call sites the same way (the census
 dump + gdb-attach recipe above localizes the population in one wedged boot), or take CHM segmentation
 finer.
+
+
+## Recurrence 2026-07-18 — reopened
+
+Fresh full-suite 6-shard rerun ("round 7", worktree `test/wildfly-full-suite-20260718`, `dev@7a939ec0`
+base + a local fix for an unrelated same-day compile break in `native-io/src/socket_channel.rs`,
+binary `frozen-cratonvm-wildfly-bugbash-v7-20260718`) reproduced this doc's exact symptom as the
+dominant failure mode:
+
+- Isolated sanity check, `org.jboss.as.test.integration.beanvalidation.BeanValidationTestCase`: 76-77s
+  wall time, `LifecycleException: Could not start container`
+  (`CommonManagedDeployableContainer.java:107`), `target/wildfly/standalone/log/server.log` remained
+  0 bytes -- identical signature to the original filing.
+- Broader sample (252/1548 classes completed before this check): 240 FAIL, of which 199 (83%) show
+  "Could not start container" and 18 (7.5%) show "exited unexpectedly with code [1]" (the companion
+  [[wildfly-remoting-classcastexception-parallel-extension-add]] crash path) — the same two-signature
+  split this doc's "Scale" section originally described, on a binary built from `dev` well after every
+  fix commit referenced in this doc's resolution history (`945e4492`, `41b06719`, `6a0eedd8`/
+  `cfd80297`, `7831ce2c`/`b1ac28f3`).
+
+Not yet re-diagnosed to a specific mechanism this time (no fresh live-gdb/CPU-census capture done in this
+pass) -- reopening on the strength of the reproduction alone, consistent with this doc's own established
+pattern of recurring via a new specific trigger each time. Whoever picks this up next should start with
+the same CPU-activity-aware repro loop and `CRATONVM_DBG_STW_CENSUS=1`/gdb-attach recipe the prior three
+resolutions used (see "Final resolution" and the 2026-07-15 follow-up above) rather than assuming it's
+the same exact mechanism as any prior fix.
+
+## New evidence 2026-07-18 (same session) — mechanism looks different this time: recurring stall, not permanent wedge
+
+Follow-up isolated-repro batch (10 attempts, round-7 binary `frozen-cratonvm-wildfly-bugbash-v7-20260718`,
+`org.jboss.as.test.integration.basic` module) to characterize this recurrence more precisely than the
+initial reopening note above:
+
+- **`pending=1`, not `pending=6`.** Every attempt that hit the warning showed exactly one uncooperative
+  mutator, not six — closer to the original, already-fixed `bee86ff0` shape (`main-vm` post-`main()`)
+  than the `pending=6` shape this doc originally filed. Worth checking whether `bee86ff0`'s specific fix
+  has a narrow gap, rather than assuming this is the same `pending=6`/multi-worker mechanism recurring.
+- **Not a permanent wedge this time.** A 30s-timeout batch (5 runs) showed the warning firing once early
+  (~1s into boot) in all 5, then boot **continuing** for thousands of further log lines (deployment
+  scanner `Scan complete`, `read-children-resources` management operations) — clearly past the point
+  where the original bug went permanently silent. A follow-up 90s run showed the warning firing **twice**
+  (12:56:05 and 12:57:14, ~69s apart, both `pending=1`), with substantial real work happening between
+  occurrences, and still had not reached `WFLYSRV0025` (final started banner) by the 90s cutoff.
+- **Net effect: boot is now recurringly-stalling-but-progressing, rather than permanently wedged** — it
+  still never completes within any timeout tried (30s/90s isolated; Arquillian's own internal timeout in
+  the real harness gives up well before that), so the practical symptom (0 OK, "Could not start
+  container") is unchanged, but the underlying mechanism producing it looks different from either the
+  original `pending=6` filing or the `bee86ff0` single-thread-post-main() case. Possibly a partial fix
+  landed between 2026-07-15 and now that narrowed but did not eliminate the wedge duration per
+  occurrence, or a different, lower-severity variant of the same class of bug.
+- **CCE_CRASH did not reproduce** in this same batch (0/10 across two rounds of 5) — see the companion
+  doc's new-evidence section for why this might just be a low-probability-per-attempt event rather than
+  fixed, given round 7's real harness run separately observed it at 18/240 (7.5%).
+
+Raw logs: `/tmp/r7repro1.log` .. `/tmp/r7repro10.log`, `/tmp/r7repro_long.log` on the Azure host.

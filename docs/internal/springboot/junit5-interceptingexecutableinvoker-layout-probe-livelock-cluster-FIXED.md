@@ -1,6 +1,16 @@
 # JUnit5 `InterceptingExecutableInvoker` speculative-layout-probe livelock (HANG cluster)
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED 2026-07-18**
+
+## Resolution
+
+The apparent collection-layout probe was actually the foreign-function downcall adapter fast path in `try_stackless_invoke`. It was selected solely by the method name `invoke`/`invokeExact`/`invokeBasic` and read receiver field zero before proving that the receiver was a `MethodHandle`. JUnit's zero-field `InterceptingExecutableInvoker.invoke` therefore entered that unrelated path, repeatedly generated a guarded out-of-bounds field read, and could make no forward progress.
+
+The adapter fast path now first establishes, from the runtime receiver class hierarchy, that its receiver is `java/lang/invoke/MethodHandle` or a subclass. All other same-named methods return to ordinary invocation without probing a field. This is deliberately a receiver-type check rather than a declaring-method-name check because an inherited MethodHandle method may be resolved on a different owner than the concrete adapter receiver.
+
+The focused 30-class Spring Boot cluster was re-run with the debug guard enabled after the change: there were zero JUnit `InterceptingExecutableInvoker` out-of-bounds probes. The original five representative classes also had zero such probes under `--nojit`. Formerly hung Redis and WebSocket cases now complete with their ordinary, unrelated test outcomes instead of timing out.
+
+`ThreadDumpEndpointTests` exposed a separate liveness residual while making this verification run: real-JDK `Thread.getState()` only reported NEW, RUNNABLE, or TERMINATED, so its setup loop could never observe WAITING or BLOCKED. The VM now publishes WAITING for wait/park/join regions and BLOCKED for contended monitor entry, which makes that test complete in both execution modes. Its remaining JMX lock/monitor-text assertion is a distinct, pre-existing `ThreadInfo` fidelity limitation, recorded in [`../../known-issues/springboot/thread-dump-endpoint-jmx-threadinfo-fidelity.md`](../../known-issues/springboot/thread-dump-endpoint-jmx-threadinfo-fidelity.md).
 
 ## Symptom
 

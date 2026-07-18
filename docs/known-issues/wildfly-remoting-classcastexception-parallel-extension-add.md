@@ -1,6 +1,11 @@
 # WildFly boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.AttributeDefinition` initializing `org.jboss.as.remoting` during parallel-extension-add
 
-Status: FIXED — 2026-07-13
+Status: **REOPENED 2026-07-18** — see "Recurrence 2026-07-18" at the bottom. The exact
+`LifecycleException: ... exited unexpectedly with code [1]` crash signature reproduced again in a fresh
+6-shard full-suite rerun (18 instances / 240 FAIL classes sampled) on a binary built from current dev,
+which includes the `70154861` fix as an ancestor. Moved back to `docs/known-issues/` accordingly.
+
+Prior status (preserved for history): FIXED — 2026-07-13
 
 Date observed: 2026-07-13, Azure worktree `test/wildfly-full-suite-20260707`, dev@e8f36c78 (round-6e binary,
 `frozen-cratonvm-wildfly-bugbash-v6-20260713`).
@@ -191,3 +196,45 @@ for full detail rather than this summary). Headline findings, most-recent-first:
   Whoever picks this up next should start from the `via_pin=true` finding in the `AttributeAccess` doc's
   2026-07-15 section, not re-chase individual unpinned-local sites — that avenue has now been tried
   repeatedly and each time found real-but-non-closing bugs.
+
+## Recurrence 2026-07-18 — reopened
+
+Fresh full-suite 6-shard rerun ("round 7", worktree `test/wildfly-full-suite-20260718`, `dev@7a939ec0`
+base + a local fix for an unrelated same-day compile break in `native-io/src/socket_channel.rs`, binary
+`frozen-cratonvm-wildfly-bugbash-v7-20260718`) reproduced this bug's exact crash signature:
+
+- Broader sample (252/1548 classes completed before this check): of 240 FAIL classes, 18 (7.5%) show
+  `LifecycleException: ... exited unexpectedly with code [1]` — the fast-crash path this doc documents,
+  as opposed to the companion [[wildfly-standalone-boot-stw-jit-takeover-hang]]'s dominant "Could not
+  start container" hang (199/240, 83%).
+
+Not re-diagnosed to a specific extension/call site this pass (no per-class log inspection done yet to
+confirm whether this is `org.jboss.as.remoting` again, `org.wildfly.extension.io.IOExtension` per the
+2026-07-14 addendum's `CCE_CRASH` finding, or a new site) — reopening on the strength of the reproduction
+count alone, consistent with `docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md`'s
+"long-tail" characterization of this bug family (new sites keep surfacing after each fix). Whoever picks
+this up next should pull the specific failing classes' logs from this round's output
+(`/data/data/wt-wildfly-bugbash-20260718-runner/out/round7-s*of6-*/`) and grep for
+`ClassCastException.*AttributeDefinition` to identify which extension is implicated this time before
+assuming it's a reopened instance of the original `org.jboss.as.remoting` site.
+
+## New evidence 2026-07-18 (same session) — did not reproduce in 10 isolated attempts; likely low per-attempt probability, not fixed
+
+Follow-up: ran 10 isolated repro attempts (round-7 binary, `org.jboss.as.test.integration.basic` module,
+20-30s timeout each, same command as the original repro) specifically trying to catch this exception
+live. **0/10 hit it** — every attempt instead showed the companion
+[[wildfly-standalone-boot-stw-jit-takeover-hang]]'s STW warning (see that doc's matching new-evidence
+section for the mechanism details, which also changed shape this pass: `pending=1`, not `pending=6`,
+and no longer a permanent wedge).
+
+This is **not** strong evidence the bug is fixed — round 7's real 6-shard harness run separately observed
+this exact signature at 18/240 (7.5%) in the same time window these isolated attempts were made, so a
+10-attempt isolated sample missing it entirely (expected hits at 7.5%: <1) is unsurprising, not
+contradictory. Isolated single-process reproduction may simply have a lower probability-per-attempt than
+the real harness's 6-concurrent-shard host-load conditions, consistent with this bug's original filing
+describing it as inherently non-deterministic (~1/5 in the first investigation, run under different host
+load than today). Whoever next chases this should pull the actual failing classes directly from round 7's
+output (`/data/data/wt-wildfly-bugbash-20260718-runner/out/round7-s*of6-*/results.tsv`, filter for
+`exited unexpectedly with code \[1\]` in the FAIL rows' logs) rather than relying on fresh isolated
+repro attempts, since those have now twice failed to reproduce it (this session's 10 attempts, plus the
+earlier "did not reproduce" note above) despite the real harness continuing to hit it.

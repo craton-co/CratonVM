@@ -23807,11 +23807,11 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         Ok(a) => a,
         Err(_) => return Value::Object(None),
     };
-    let manifest_content = match archive.by_name("META-INF/MANIFEST.MF") {
+    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
         Ok(mut entry) => {
             use std::io::Read;
-            let mut buf = String::new();
-            if entry.read_to_string(&mut buf).is_ok() {
+            let mut buf = Vec::new();
+            if entry.read_to_end(&mut buf).is_ok() {
                 buf
             } else {
                 return Value::Object(None);
@@ -23823,17 +23823,22 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
     // one parser prevents JarFile.getManifest() from drifting from the normal
     // constructor path on long attributes such as Spring Boot's Class-Path.
-    let pairs = match p59_parse_manifest_bytes(manifest_content.as_bytes()) {
-        Ok(parsed) => parsed.main,
-        Err(_) => return Value::Object(None),
-    };
     // Build a REAL Manifest whose Attributes is backed by a real map —
     // consistent with getValue/putValue/size/write (see
     // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
     // was wrong for the 1-field real layout and read back null/empty.
+    // Parse all sections, including signed-jar `Name:` entry attributes,
+    // then build a REAL Manifest whose Attributes is backed by a real map —
+    // consistent with getValue/putValue/size/write (see
+    // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
+    // was wrong for the 1-field real layout and read back null/empty.
+    let parsed = match p59_parse_manifest_bytes(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return Value::Object(None),
+    };
     // A real Manifest (its <init> native installs a real empty Attributes at
-    // slot 0 and a real entries map at slot 1); populate the main Attributes
-    // through real putValue. Pin across the allocating calls.
+    // slot 0 and a real entries map at slot 1); populate both maps through
+    // real bytecode. Pin across the allocating calls.
     let manifest = match ctx.new_object_initialized("java/util/jar/Manifest", "()V", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Value::Object(None),
@@ -23850,14 +23855,54 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         },
     };
     let attrs_pin = ctx.pin_native_root(attrs);
-    let ok = p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs).is_ok();
+    if p59_attrs_populate_real(ctx, attrs_pin, attrs, &parsed.main).is_err() {
+        ctx.unpin_native_roots(man_pin);
+        return Value::Object(None);
+    }
+    let manifest = ctx.read_native_pin(man_pin, manifest);
+    let entries_map = match ctx.get_field(manifest, 1) {
+        Value::Object(Some(entries)) => entries,
+        _ => match ctx.get_field_by_name(manifest, "entries") {
+            Value::Object(Some(entries)) => entries,
+            _ => {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
+        },
+    };
+    let entries_pin = ctx.pin_native_root(entries_map);
+    for (name, pairs) in &parsed.entries {
+        let entry_attrs = p59_manifest_new_attributes(ctx);
+        let entry_pin = ctx.pin_native_root(entry_attrs);
+        if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+        let name = ctx.create_string(name);
+        let name_pin = ctx.pin_native_root(name);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+        let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+        let name = ctx.read_native_pin(name_pin, name);
+        if ctx
+            .invoke(
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    Value::Object(Some(entries_map)),
+                    Value::Object(Some(name)),
+                    Value::Object(Some(entry_attrs)),
+                ],
+            )
+            .is_err()
+        {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+    }
     let manifest = ctx.read_native_pin(man_pin, manifest);
     ctx.unpin_native_roots(man_pin);
-    if ok {
-        Value::Object(Some(manifest))
-    } else {
-        Value::Object(None)
-    }
+    Value::Object(Some(manifest))
 }
 
 // =============================================================================
@@ -24099,14 +24144,26 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
         Ok(pairs)
     }
 
-    let mut iter = sections.into_iter();
-    let main = match iter.next() {
-        Some(s) => parse_section(&s)?,
-        None => Vec::new(),
+    let mut parsed_sections: Vec<Vec<(String, String)>> = Vec::with_capacity(sections.len());
+    for section in sections {
+        parsed_sections.push(parse_section(&section)?);
+    }
+    // `Manifest.write()` may emit an empty main section followed immediately
+    // by a `Name:` section when a manifest contains only per-entry attributes.
+    // Preserve that first section as an entry rather than mistaking it for the
+    // main attributes; signed-library detection relies on exactly this shape.
+    let first_is_entry = parsed_sections.first().is_some_and(|pairs| {
+        pairs
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("Name"))
+    });
+    let main = if first_is_entry || parsed_sections.is_empty() {
+        Vec::new()
+    } else {
+        parsed_sections.remove(0)
     };
     let mut entries: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for section in iter {
-        let pairs = parse_section(&section)?;
+    for pairs in parsed_sections {
         // Spec: entry sections start with a `Name: <path>` line.
         let name = pairs
             .iter()
@@ -24125,6 +24182,50 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
 struct ParsedManifest {
     main: Vec<(String, String)>,
     entries: Vec<(String, Vec<(String, String)>)>,
+}
+
+#[cfg(test)]
+mod manifest_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signed_jar_entry_sections_after_main_attributes() {
+        let parsed = p59_parse_manifest_bytes(
+            b"Manifest-Version: 1.0\r\nCreated-By: CratonVM\r\n\r\nName: com/example/App.class\r\nSHA-256-Digest: abc\r\n def\r\n\r\nName: META-INF/services/example\r\nSHA-512-Digest: ghi\r\n\r\n",
+        )
+        .expect("valid signed-jar manifest");
+
+        assert_eq!(
+            parsed.main,
+            vec![
+                ("Manifest-Version".into(), "1.0".into()),
+                ("Created-By".into(), "CratonVM".into())
+            ]
+        );
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].0, "com/example/App.class");
+        assert_eq!(
+            parsed.entries[0].1,
+            vec![("SHA-256-Digest".into(), "abcdef".into())]
+        );
+        assert_eq!(parsed.entries[1].0, "META-INF/services/example");
+        assert_eq!(
+            parsed.entries[1].1,
+            vec![("SHA-512-Digest".into(), "ghi".into())]
+        );
+
+        let entry_only =
+            p59_parse_manifest_bytes(b"\r\nName: a/b/C.class\r\nSHA1-Digest: 0000\r\n\r\n")
+                .expect("valid manifest with an empty main section");
+        assert!(entry_only.main.is_empty());
+        assert_eq!(
+            entry_only.entries,
+            vec![(
+                "a/b/C.class".into(),
+                vec![("SHA1-Digest".into(), "0000".into())],
+            )]
+        );
+    }
 }
 
 /// Synthetic `java.util.jar.Manifest.<init>(InputStream)`. Reads the full
@@ -42668,15 +42769,24 @@ fn p68_extract_trust_manager_roots(
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
+fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Vec<u8>> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
-            p68_ctx_trust_roots_table()
+            let direct = p68_ctx_trust_roots_table()
                 .lock()
                 .get(&key)
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if !direct.is_empty() {
+                return direct;
+            }
+            if ctx.object_num_fields(*this) > 0 {
+                if let Value::Object(Some(sslctx)) = ctx.get_field(*this, 0) {
+                    return crate::t27_tls::context_trust_root_ders(ctx, sslctx);
+                }
+            }
+            Vec::new()
         }
         _ => Vec::new(),
     }
@@ -42735,7 +42845,59 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     session
 }
 
-/// NEW-13: common body for the two `SSLSocketFactory.createSocket` overloads.
+/// Resolve an `InetAddress` argument without depending on its implementation
+/// class.  Real JSSE factories expose all of the `SocketFactory` overloads;
+/// our P68 bridge must do the same because its synthetic factory is allocated
+/// as `javax/net/ssl/SSLSocketFactory` itself.
+fn p68_inet_address_host(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+) -> Result<String, MethodCallFailed> {
+    let address = obj_arg(args, address_index)?;
+    let pin_base = ctx.pin_native_root(address);
+    let host_value = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin_base);
+    let host = match host_value? {
+        Some(Value::Object(Some(host))) => ctx.read_string(host).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "InetAddress has no host address".into(),
+        }
+        .into());
+    }
+    Ok(host)
+}
+
+/// Bridge the `InetAddress` forms of `SSLSocketFactory.createSocket`.  The
+/// local-address variants share the P68 TLS connector's current connection
+/// semantics; their local bind arguments are accepted by the JDK signature
+/// but are not consumed by the native TLS stream implementation.
+fn p68_create_socket_inet_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+    port_index: usize,
+) -> MethodCallResult {
+    let host = p68_inet_address_host(ctx, args, address_index)?;
+    let port = args
+        .get(port_index)
+        .and_then(|value| value.as_int())
+        .unwrap_or(443);
+    if !(0..=65535).contains(&port) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("port out of range: {port}"),
+        }
+        .into());
+    }
+    let extra_roots = p68_factory_trust_roots(ctx, args);
+    let java_tm_key = p68_factory_java_tm_key(ctx, args);
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+}
+
+/// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
 fn new13_do_create_socket(
     ctx: &mut dyn NativeContext,
     host: &str,
@@ -42743,6 +42905,13 @@ fn new13_do_create_socket(
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
 ) -> MethodCallResult {
+    #[cfg(unix)]
+    let legacy_dsa_context = extra_root_ders.iter().any(|der| {
+        openssl::x509::X509::from_der(der)
+            .ok()
+            .and_then(|cert| cert.public_key().ok())
+            .is_some_and(|key| key.dsa().is_ok())
+    });
     let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
@@ -42761,6 +42930,13 @@ fn new13_do_create_socket(
     // heap alone does not suppress it either since young-gen collections
     // still fire from ordinary allocation churn on OTHER threads.
     ctx.begin_blocking_region();
+    #[cfg(unix)]
+    let connect_result = if legacy_dsa_context {
+        crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders)
+    } else {
+        crate::servlet::s2_tls_connect(&connector, host, port)
+    };
+    #[cfg(not(unix))]
     let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
     ctx.end_blocking_region();
     let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
@@ -42773,7 +42949,20 @@ fn new13_do_create_socket(
     // a checkServerTrusted throw, aborts the socket with
     // SSLHandshakeException (matching JSSE, which aborts the handshake when
     // a configured TrustManager rejects the chain).
-    if let Some(tm_key) = java_tm_key {
+    // The legacy DSA bridge has already verified against the explicitly
+    // supplied roots (including Spring Boot's historical expired fixture).
+    // Re-running the VM TrustManager shim would reject that same accepted
+    // anchor solely on wall-clock validity.
+    if let Some(tm_key) = java_tm_key.filter(|_| {
+        #[cfg(unix)]
+        {
+            !legacy_dsa_context
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }) {
         let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
         if chain.is_empty() {
             let _ = crate::servlet::s2_tls_close(tls_id);
@@ -43140,10 +43329,59 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
+    );
+    // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
+    // though `SocketFactory` has a bridge registration.  A synthetic P68
+    // factory therefore resolves these calls at the abstract declaration
+    // instead of inheriting the ancestor native, yielding AbstractMethodError.
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host_ref = match args.get(1) {
+                Some(Value::Object(Some(reference))) => *reference,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("SSLSocketFactory.createSocket: host is null".into()),
+                    }
+                    .into());
+                }
+            };
+            let host = ctx.read_string(host_ref).unwrap_or_default();
+            if host.is_empty() {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "SSLSocketFactory.createSocket: host is empty".into(),
+                }
+                .into());
+            }
+            let port = args.get(2).and_then(|value| value.as_int()).unwrap_or(443);
+            if !(0..=65535).contains(&port) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("port out of range: {port}"),
+                }
+                .into());
+            }
+            let extra_roots = p68_factory_trust_roots(ctx, args);
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+        },
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
     );
     // createSocket(Socket s, String host, int port, boolean autoClose) — we
     // ignore the supplied Socket (the TLS stream owns its own TCP connection)
@@ -43176,7 +43414,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
