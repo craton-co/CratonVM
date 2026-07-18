@@ -13710,6 +13710,11 @@ fn invoke_on_class_shared_inner(
                 .get_class(receiver_class)
                 .map(|class| class.name.to_string())
                 .unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_SSL_FACTORY").is_some() {
+                eprintln!(
+                    "[dbg-ssl-factory] declared={class_name} receiver={receiver_name}"
+                );
+            }
             if receiver_name == "sun/security/ssl/SSLSocketFactoryImpl" {
                 return Err(RuntimeError::IOException {
                     message: "unconnected JDK SSLSocket requires a TLS-aware createSocket overload"
