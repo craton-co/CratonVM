@@ -7878,6 +7878,42 @@ mod classloader_tests {
     }
 
     #[test]
+    fn test_loadclass_resolve_override_on_direct_urlclassloader_subclass() {
+        // Spring Boot's FilteredClassLoader directly extends URLClassLoader and
+        // rejects hidden packages from loadClass(String, boolean).  Keep this
+        // one-level shape distinct from the BeanShell hierarchy above: reaching
+        // URLClassLoader must not hide an override already declared by its
+        // immediate child.
+        let mut ctx = MockNativeContext::new();
+        let url_cid = ctx
+            .ensure_class_initialized("java/net/URLClassLoader")
+            .expect("URLClassLoader class");
+        let filtered_cid = ctx
+            .ensure_class_initialized("org/springframework/boot/test/context/FilteredClassLoader")
+            .expect("FilteredClassLoader class");
+        ctx.set_superclass(filtered_cid, url_cid);
+        ctx.set_declared_methods(
+            filtered_cid,
+            vec![cratonvm_native_api::MethodMetadata {
+                name: "loadClass".to_string(),
+                descriptor: "(Ljava/lang/String;Z)Ljava/lang/Class;".to_string(),
+                access_flags: 0,
+                declaring_class_id: filtered_cid,
+                exceptions: Vec::new(),
+            }],
+        );
+        let loader = new_object_ref(
+            &mut ctx,
+            "org/springframework/boot/test/context/FilteredClassLoader",
+        );
+
+        assert!(
+            receiver_overrides_load_class_resolve(&mut ctx, loader),
+            "a direct URLClassLoader subclass must dispatch its loadClass override"
+        );
+    }
+
+    #[test]
     fn test_reset_clears_real_jdk_loader_namespace_ids() {
         let mut ctx = MockNativeContext::new();
         let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
