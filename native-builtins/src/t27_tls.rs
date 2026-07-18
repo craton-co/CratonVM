@@ -2604,6 +2604,31 @@ const SSS_LOCAL_PORT: usize = 1;
 const SSS_CLOSED: usize = 2;
 const SSS_FIELDS: usize = 4;
 
+/// `SSLServerSocket` is a real JDK class, so its loaded instance layout is
+/// not the compact synthetic layout expected by the TLS listener bridge.
+/// Keep the authoritative lifecycle data outside the object: raw field writes
+/// can be dropped or collide with reference-typed JDK fields, which otherwise
+/// makes a newly-bound listener appear closed before its first accept.
+#[derive(Clone, Copy)]
+struct SslServerSocketState {
+    listener_id: i32,
+    local_port: i32,
+    closed: i32,
+}
+
+fn ssl_server_socket_states() -> &'static Mutex<HashMap<u64, SslServerSocketState>> {
+    static STATES: OnceLock<Mutex<HashMap<u64, SslServerSocketState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ssl_server_socket_state(socket: ObjectRef) -> Option<SslServerSocketState> {
+    ssl_server_socket_states().lock().get(&objref_key(socket)).copied()
+}
+
+fn set_ssl_server_socket_state(socket: ObjectRef, state: SslServerSocketState) {
+    ssl_server_socket_states().lock().insert(objref_key(socket), state);
+}
+
 // Server-side SSLSocket returned from accept(): reuses the existing
 // SSLSocket 6-field layout but field 2 (tls_id) references the rustls
 // server-streams table rather than the native-tls client table. The
@@ -2778,6 +2803,14 @@ fn create_ssl_server_socket(
     };
 
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
+    set_ssl_server_socket_state(
+        obj,
+        SslServerSocketState {
+            listener_id: id,
+            local_port: local_port as i32,
+            closed: 0,
+        },
+    );
     ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
     ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
     ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
@@ -2890,25 +2923,48 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     let sss = "javax/net/ssl/SSLServerSocket";
     r.register(sss, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SSS_LOCAL_PORT)))
+        Ok(Some(Value::Int(
+            ssl_server_socket_state(this)
+                .map(|state| state.local_port)
+                .unwrap_or_else(|| ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0)),
+        )))
     });
     r.register(sss, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SSS_CLOSED)))
+        Ok(Some(Value::Int(
+            ssl_server_socket_state(this)
+                .map(|state| state.closed)
+                .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1)),
+        )))
     });
     r.register(sss, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1);
+        let state = ssl_server_socket_state(this).unwrap_or(SslServerSocketState {
+            listener_id: ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1),
+            local_port: ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0),
+            closed: 1,
+        });
+        let id = state.listener_id;
         if id >= 0 {
             rustls_listener_close(id);
             ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
+        set_ssl_server_socket_state(
+            this,
+            SslServerSocketState {
+                listener_id: -1,
+                local_port: state.local_port,
+                closed: 1,
+            },
+        );
         ctx.set_field(this, SSS_CLOSED, Value::Int(1));
         Ok(None)
     });
     r.register(sss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1);
+        let id = ssl_server_socket_state(this)
+            .map(|state| state.listener_id)
+            .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
         if id < 0 {
             return Err(RuntimeError::IOException {
                 message: "SSLServerSocket is closed".into(),
