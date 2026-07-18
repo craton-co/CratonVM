@@ -8519,43 +8519,88 @@ fn collect_public_fields(
 /// underflowing to `-1` and triggering `NegativeArraySizeException`.
 /// Real JDK 25 returns only the 2 declared `Invoker` methods; this fix
 /// matches.
+fn merge_public_method(
+    ctx: &dyn NativeContext,
+    metas: &mut Vec<MethodMetadata>,
+    candidate: MethodMetadata,
+) {
+    // JDK `PublicMethods` groups by name and parameter types, but only merges
+    // declarations with the same return type. A compiler bridge therefore
+    // remains beside its covariant target, while inherited close()/shutdown()
+    // copies with the same full JVM descriptor are shadowed.
+    let candidate_is_interface = ctx.is_interface_class(candidate.declaring_class_id);
+    let mut i = 0;
+    while i < metas.len() {
+        let existing = &metas[i];
+        if existing.name != candidate.name || existing.descriptor != candidate.descriptor {
+            i += 1;
+            continue;
+        }
+
+        let existing_class = existing.declaring_class_id;
+        let candidate_class = candidate.declaring_class_id;
+        let existing_is_interface = ctx.is_interface_class(existing_class);
+        if candidate_class == existing_class
+            || (candidate_is_interface == existing_is_interface
+                && ctx.is_subclass(existing_class, candidate_class))
+            || (candidate_is_interface && !existing_is_interface)
+        {
+            return;
+        }
+        if !candidate_is_interface && existing_is_interface
+            || (candidate_is_interface == existing_is_interface
+                && ctx.is_subclass(candidate_class, existing_class))
+        {
+            metas.remove(i);
+            continue;
+        }
+
+        // Unrelated interfaces with an identical descriptor are both visible.
+        i += 1;
+    }
+    metas.push(candidate);
+}
+
+/// Recursively collect public methods in the JDK's order: local declarations,
+/// superclass, then direct superinterfaces. Interface static methods are local
+/// only and must not be inherited by implementing classes/subinterfaces.
+fn collect_public_methods_from(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    include_static: bool,
+    visited: &mut std::collections::HashSet<cratonvm_types::ClassId>,
+    metas: &mut Vec<MethodMetadata>,
+) {
+    if !visited.insert(class_id) {
+        return;
+    }
+    for meta in declared_methods_with_synthetic(ctx, class_id) {
+        if meta.name == "<init>" || meta.name == "<clinit>" {
+            continue;
+        }
+        let is_public = (meta.access_flags & 0x0001) != 0;
+        let is_static = (meta.access_flags & 0x0008) != 0;
+        if is_public && (include_static || !is_static) {
+            merge_public_method(ctx, metas, meta);
+        }
+    }
+    if !ctx.is_interface_class(class_id) {
+        if let Some(parent) = ctx.superclass_of(class_id) {
+            collect_public_methods_from(ctx, parent, true, visited, metas);
+        }
+    }
+    for iface_id in ctx.class_interfaces(class_id) {
+        collect_public_methods_from(ctx, iface_id, false, visited, metas);
+    }
+}
+
 fn collect_public_methods(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
 ) -> cratonvm_types::ObjectRef {
     let mut metas: Vec<MethodMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    let mut stack = vec![class_id];
-
-    while let Some(cid) = stack.pop() {
-        if !visited.insert(cid) {
-            continue;
-        }
-        // F2: include synthetic JDK declarations so frameworks that
-        // walk the public method table on a synthetic-stub class (e.g.
-        // java/lang/ClassLoader) still see the JDK-contracted methods.
-        let methods = declared_methods_with_synthetic(ctx, cid);
-        for meta in methods {
-            if meta.name == "<init>" || meta.name == "<clinit>" {
-                continue;
-            }
-            if (meta.access_flags & 0x0001) != 0 {
-                // PUBLIC
-                metas.push(meta);
-            }
-        }
-        // G2-fix: only walk the superclass chain for non-interface classes.
-        // Interfaces (and their super-interfaces) intentionally skip the
-        // superclass (which is java/lang/Object) per JDK semantics.
-        if !ctx.is_interface_class(cid) {
-            if let Some(parent) = ctx.superclass_of(cid) {
-                stack.push(parent);
-            }
-        }
-        for iface_id in ctx.class_interfaces(cid) {
-            stack.push(iface_id);
-        }
-    }
+    collect_public_methods_from(ctx, class_id, true, &mut visited, &mut metas);
     // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
     // same fix, same residual-gap doc reference.
     build_mirror_array(ctx, metas.len(), |ctx, i| {
@@ -18970,6 +19015,97 @@ mod tests {
             "G2: collect_public_methods on an interface must skip Object's superclass methods (got {} methods)",
             n,
         );
+    }
+
+    #[test]
+    fn get_methods_shadows_class_and_interface_overrides_without_losing_overloads() {
+        // Regression for Spring DisposableBeanAdapter destroy-method lookup.
+        // A concrete class's close() must hide both its superclass and
+        // interface copies, while two real shutdown overloads remain visible.
+        let mut ctx = mock_ctx();
+        let parent = ctx
+            .ensure_class_initialized("com/example/Parent")
+            .expect("ensure Parent");
+        let child = ctx
+            .ensure_class_initialized("com/example/Child")
+            .expect("ensure Child");
+        let iface = ctx
+            .ensure_class_initialized("com/example/Shutdownable")
+            .expect("ensure Shutdownable");
+        ctx.set_is_interface(iface, true);
+        ctx.set_superclass(child, parent);
+        ctx.set_interfaces(child, vec![iface]);
+
+        let method = |name: &str, descriptor: &str, declaring_class_id| MethodMetadata {
+            name: name.to_string(),
+            descriptor: descriptor.to_string(),
+            access_flags: 0x0001,
+            declaring_class_id,
+            exceptions: Vec::new(),
+        };
+        ctx.set_declared_methods(
+            parent,
+            vec![
+                method("close", "()V", parent),
+                method("shutdown", "()V", parent),
+                method("shutdown", "(J)V", parent),
+            ],
+        );
+        ctx.set_declared_methods(child, vec![method("close", "()V", child)]);
+        ctx.set_declared_methods(
+            iface,
+            vec![
+                method("close", "()V", iface),
+                method("shutdown", "()V", iface),
+                method("shutdown", "(J)V", iface),
+            ],
+        );
+
+        let methods = collect_public_methods(&mut ctx, child);
+        let mut closes = Vec::new();
+        let mut shutdowns = Vec::new();
+        for i in 0..ctx.array_length(methods) {
+            let method_obj = match ctx.get_array_element(methods, i) {
+                Value::Object(Some(obj)) => obj,
+                other => panic!("expected Method object at index {i}, got {other:?}"),
+            };
+            let name = match method_name_value(&ctx, method_obj) {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                other => panic!("Method.name must be a String, got {other:?}"),
+            };
+            if name == "close" {
+                closes.push(method_obj);
+            } else if name == "shutdown" {
+                shutdowns.push(method_obj);
+            }
+        }
+
+        assert_eq!(
+            closes.len(),
+            1,
+            "getMethods must expose one overridden close()"
+        );
+        let declaring_name = |method_obj| match method_clazz_value(&ctx, method_obj) {
+            Value::Object(Some(mirror)) => mirror_class_name(&ctx, mirror).unwrap_or_default(),
+            other => panic!("Method.clazz must be a Class mirror, got {other:?}"),
+        };
+        assert_eq!(
+            declaring_name(closes[0]),
+            "com/example/Child",
+            "the leaf-class close() must win"
+        );
+        assert_eq!(
+            shutdowns.len(),
+            2,
+            "the two real shutdown overloads must remain, without interface duplicates"
+        );
+        for shutdown in shutdowns {
+            assert_eq!(
+                declaring_name(shutdown),
+                "com/example/Parent",
+                "an inherited class method must shadow the same interface method"
+            );
+        }
     }
 
     #[test]

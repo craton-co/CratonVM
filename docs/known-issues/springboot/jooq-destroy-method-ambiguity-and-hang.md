@@ -1,8 +1,10 @@
 # jOOQ/H2Console autoconfigure — destroy-method ambiguity (residual of a RESOLVED doc) + unconfirmed HANG
 
-**Status: OPEN — found 2026-07-17**
+**Status: PARTIALLY FIXED — 2026-07-17.** Cluster A is fixed by the `Class.getMethods()` hierarchy merge in `native-builtins/src/lang_class.rs`; the unrelated Cluster B hang remains open in this document.
 
-## Cluster A — duplicate 'shutdown' destroy-method candidates (spans `module/spring-boot-jooq`, `module/spring-boot-h2console`, `module/spring-boot-jdbc-test`, `module/spring-boot-flyway`, `module/spring-boot-batch-jdbc`, `module/spring-boot-integration`)
+## Cluster A — FIXED 2026-07-17: duplicate 'shutdown' destroy-method candidates (spans `module/spring-boot-jooq`, `module/spring-boot-h2console`, `module/spring-boot-jdbc-test`, `module/spring-boot-flyway`, `module/spring-boot-batch-jdbc`, `module/spring-boot-integration`)
+
+This cluster is fixed. The public-method collector now deduplicates same-name, same-descriptor hierarchy declarations by specificity while retaining genuine overloads. The canonical closure record is [`../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md).
 
 Same exact signature confirmed in **six separate modules** in this rerun —
 folded into one shared cluster per this investigation's clustering
@@ -76,7 +78,7 @@ disambiguation to see a tie. Unconfirmed.
 
 **Cross-reference (2026-07-17, same-day parallel triage):** this hypothesis
 is confirmed at the source level (though not by a live rebuild+repro) in
-[`disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md`](disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster.md),
+[`../../internal/springboot/disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster-FIXED.md`](../../internal/springboot/disposablebeanadapter-getmethods-hierarchy-duplicate-destroy-method-cluster-FIXED.md),
 found independently against `module/spring-boot-quartz`,
 `module/spring-boot-data-r2dbc`, and `module/spring-boot-micrometer-tracing-brave`
 in the same rerun (`Cannot resolve method 'shutdown'/'dispose'/'close' to a
@@ -124,7 +126,7 @@ Same exact signature, confirmed via the `.out.log`'s `Caused by:` chain
   `spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
   doc's module list (`spring-boot-jdbc (EmbeddedDataSourceConfiguration)`)
   — i.e. this is the same discrepancy-with-a-RESOLVED-doc situation as
-  `taskscheduling-invalid-destruction-signature-recurrence.md` describes
+  `../../internal/springboot/taskscheduling-invalid-destruction-signature-recurrence-FIXED.md` documents
   for `TaskSchedulingAutoConfigurationTests`, for the *other* bean type
   that RESOLVED doc named. The 2026-07-12 closure's standalone probe (a
   plain `AutoCloseable` bean) never exercised this specific

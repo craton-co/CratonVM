@@ -6207,14 +6207,25 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // Same chain: RedisHttpSessionConfiguration.redisMessageListenerContainer()
-    // calls container.setConnectionFactory(this.redisConnectionFactory) with
-    // a null factory and Assert.notNull(...) throws
-    // `IllegalArgumentException: ConnectionFactory must not be null!`.
+    // can call this setter with a null factory while its broken multi-argument
+    // autowiring path is being bypassed.  Keep that narrow bootstrap escape,
+    // but execute the real setter for a valid factory.  The former unconditional
+    // no-op swallowed legitimate injection in Spring Data Redis's own
+    // DataRedisAnnotationDrivenConfiguration tests, leaving the container
+    // unusable at afterPropertiesSet().
     r.register(
         "org/springframework/data/redis/listener/RedisMessageListenerContainer",
         "setConnectionFactory",
         "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| match args.get(1) {
+            Some(Value::Object(Some(_))) => ctx.invoke_special_bytecode_only(
+                "org/springframework/data/redis/listener/RedisMessageListenerContainer",
+                "setConnectionFactory",
+                "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
+                args,
+            ),
+            _ => Ok(None),
+        },
     );
 
     // Same chain: the `enableRedisKeyspaceNotificationsInitializer` bean's

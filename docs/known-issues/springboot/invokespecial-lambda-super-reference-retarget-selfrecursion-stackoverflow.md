@@ -103,4 +103,4 @@ comment at lines 21396-21398.
 | Module | Class |
 |---|---|
 | `module/spring-boot-micrometer-metrics` | `org.springframework.boot.micrometer.metrics.autoconfigure.export.influx.InfluxPropertiesConfigAdapterTests` (2 of 3 tests) |
-| `module/spring-boot-micrometer-metrics` | `org.springframework.boot.micrometer.metrics.autoconfigure.export.influx.InfluxMetricsExportAutoConfigurationTests` (3 of 4 tests; the 4th failure in this class is the separate `getMethods()` cluster, see [`class-getmethods-override-shadowing-duplicate-close-cluster.md`](class-getmethods-override-shadowing-duplicate-close-cluster.md)) |
+| `module/spring-boot-micrometer-metrics` | `org.springframework.boot.micrometer.metrics.autoconfigure.export.influx.InfluxMetricsExportAutoConfigurationTests` (3 of 4 tests; the former separate `getMethods()` cluster is fixed, see [`../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md)) |
