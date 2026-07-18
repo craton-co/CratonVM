@@ -49,6 +49,10 @@ use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, OnceLock};
 
+#[cfg(unix)]
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+#[cfg(unix)]
+use openssl::{pkey::PKey, x509::X509};
 use parking_lot::Mutex;
 use rustls::client::{ClientConnection, ResolvesClientCert};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
@@ -1076,6 +1080,8 @@ pub(crate) struct TlsServerListenerEntry {
 pub(crate) enum TlsServerConfig {
     Rustls(Arc<ServerConfig>),
     Native(native_tls::TlsAcceptor),
+    #[cfg(unix)]
+    LegacyDsa(SslAcceptor),
 }
 
 pub(crate) struct ServerRegistry {
@@ -1114,6 +1120,8 @@ pub(crate) struct TlsServerStreamEntry {
 pub(crate) enum TlsServerStream {
     Rustls(StreamOwned<ServerConnection, TcpStream>),
     Native(native_tls::TlsStream<TcpStream>),
+    #[cfg(unix)]
+    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
 }
 
 impl Default for ServerRegistry {
@@ -2440,6 +2448,19 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     None,
                 )
             }
+            #[cfg(unix)]
+            TlsServerConfig::LegacyDsa(acceptor) => {
+                let stream = acceptor
+                    .accept(tcp)
+                    .map_err(|e| format!("legacy DSA TLS server handshake: {e}"))?;
+                (
+                    TlsServerStream::LegacyDsa(stream),
+                    None,
+                    "TLSv1.2".to_string(),
+                    "UNKNOWN".to_string(),
+                    None,
+                )
+            }
         };
 
     let entry = TlsServerStreamEntry {
@@ -2465,6 +2486,8 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         return match &mut e.stream {
             TlsServerStream::Rustls(s) => s.read(buf),
             TlsServerStream::Native(s) => s.read(buf),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.read(buf),
         };
     }
     Err(std::io::Error::new(
@@ -2483,6 +2506,8 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
         return match &mut e.stream {
             TlsServerStream::Rustls(s) => s.write(data),
             TlsServerStream::Native(s) => s.write(data),
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => s.write(data),
         };
     }
     Err(std::io::Error::new(
@@ -2505,6 +2530,10 @@ pub(crate) fn rustls_stream_close(id: i32) {
                 let _ = s.flush();
             }
             TlsServerStream::Native(s) => {
+                let _ = s.shutdown();
+            }
+            #[cfg(unix)]
+            TlsServerStream::LegacyDsa(s) => {
                 let _ = s.shutdown();
             }
         }
@@ -2620,6 +2649,25 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
 /// every `SSLServerSocketFactory.createServerSocket` overload on this one
 /// path so callers cannot accidentally fall through to `ServerSocketFactory`'s
 /// plaintext implementation.
+#[cfg(unix)]
+fn legacy_dsa_acceptor(cert_pem: &str, key_pem: &str) -> Result<SslAcceptor, String> {
+    let key = PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| e.to_string())?;
+    if !key.dsa().is_ok() {
+        return Err("key is not DSA".to_string());
+    }
+    let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| e.to_string())?;
+    let mut builder =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).map_err(|e| e.to_string())?;
+    builder.set_security_level(0);
+    builder
+        .set_cipher_list("ALL:@SECLEVEL=0")
+        .map_err(|e| e.to_string())?;
+    builder.set_private_key(&key).map_err(|e| e.to_string())?;
+    builder.set_certificate(&cert).map_err(|e| e.to_string())?;
+    builder.check_private_key().map_err(|e| e.to_string())?;
+    Ok(builder.build())
+}
+
 fn create_ssl_server_socket(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2664,12 +2712,26 @@ fn create_ssl_server_socket(
     )
     .map(TlsServerConfig::Rustls)
     .or_else(|rustls_error| {
-        native_tls::Identity::from_pkcs8(identity.cert_pem.as_bytes(), identity.key_pem.as_bytes())
+        #[cfg(unix)]
+        {
+            legacy_dsa_acceptor(&identity.cert_pem, &identity.key_pem)
+                .map(TlsServerConfig::LegacyDsa)
+                .map_err(|legacy_error| {
+                    format!("{rustls_error}; legacy DSA TLS fallback: {legacy_error}")
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            native_tls::Identity::from_pkcs8(
+                identity.cert_pem.as_bytes(),
+                identity.key_pem.as_bytes(),
+            )
             .and_then(native_tls::TlsAcceptor::new)
             .map(TlsServerConfig::Native)
             .map_err(|native_error| {
                 format!("{rustls_error}; platform TLS fallback: {native_error}")
             })
+        }
     })
     .map_err(|message| RuntimeError::IOException { message })?;
 
