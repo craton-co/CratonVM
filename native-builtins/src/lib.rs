@@ -70765,20 +70765,34 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Attributes is a Map and therefore accepts null values. In particular,
+    // Spring Boot writes its version attribute from Package metadata, which is
+    // null for an exploded classes directory; HotSpot retains that mapping and
+    // serializes it as the literal text "null". Do not turn that legal put
+    // into a silent no-op.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
     let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
     let result = cratonvm_native_collections::native_map_put_pub(
@@ -70786,12 +70800,14 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         &[
             Value::Object(Some(map)),
             Value::Object(Some(map_key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     ctx.unpin_native_roots(map_key_pin);
     result
@@ -70830,30 +70846,42 @@ fn native_attrs_put_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Map.put(Object, Object) has the same null-value contract as putValue.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let result = cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
             Value::Object(Some(key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     result
 }
