@@ -33281,7 +33281,12 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     });
     r.register(stpe, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let core_pool_size = match ctx.get_field_by_name(this, "corePoolSize") {
+            Value::Int(value) => Value::Int(value),
+            // Synthetic STPE objects have only the historical slot layout.
+            _ => ctx.get_field(this, 0),
+        };
+        Ok(Some(core_pool_size))
     });
 
     // ScheduledExecutorService interface

@@ -3750,8 +3750,23 @@ impl NativeMethodRegistry {
         // ContainerBase then failed in scheduleWithFixedDelay -> delayedExecute.
         // Let the real STPE constructors and scheduling bytecode initialize the
         // inherited executor state coherently.
+        // These two methods are real-layout bridges: the constructor delegates
+        // to ThreadPoolExecutor's real constructor and the getter resolves the
+        // inherited field by name. They are required by Spring's
+        // ThreadPoolTaskScheduler anonymous subclass. Every other STPE native
+        // remains unsafe against real JDK objects and is dropped.
+        let keep_real_scheduled_executor_bridge = self.current_category == NativeKind::Bridge
+            && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
+            && matches!(
+                (method_name, descriptor),
+                (
+                    "<init>",
+                    "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V"
+                ) | ("getCorePoolSize", "()I")
+            );
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
+            && !keep_real_scheduled_executor_bridge
         {
             return;
         }
@@ -4604,6 +4619,21 @@ mod tests {
                 "(ILjava/util/concurrent/ThreadFactory;)V",
             )
             .is_none());
+
+        real_layout.set_category(NativeKind::Bridge);
+        real_layout.register(
+            "java/util/concurrent/ScheduledThreadPoolExecutor",
+            "<init>",
+            "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "<init>",
+                "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+            )
+            .is_some());
 
         real_layout.register(
             "java/util/concurrent/Executors",

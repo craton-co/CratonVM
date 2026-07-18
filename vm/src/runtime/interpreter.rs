@@ -19867,11 +19867,32 @@ fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
 /// Returns the original value unchanged if it's not a recognized wrapper.
 fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
     match (prim_char, v) {
-        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
-        ('J', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
-        ('F', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
-        ('D', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
+        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => {
+            shared.heap.get_field(b, 0)
+        }
+        // Lambda metafactory adaptation permits unboxing followed by primitive
+        // widening.  An Integer supplied to a `long` implementation method
+        // must therefore become Value::Long, rather than carrying the raw
+        // compact Int tag into an lload/putfield J path.
+        ('J' | 'F' | 'D', Value::Object(Some(b))) => {
+            widen_unboxed_primitive(prim_char, shared.heap.get_field(b, 0))
+        }
         (_, other) => other,
+    }
+}
+
+/// Apply the primitive-widening portion of lambda unboxing without changing
+/// the source wrapper's value. This is intentionally limited to conversions
+/// permitted after unboxing by the Java language specification.
+fn widen_unboxed_primitive(target: char, value: Value) -> Value {
+    match (target, value) {
+        ('J', Value::Int(value)) => Value::Long(value as i64),
+        ('F', Value::Int(value)) => Value::Float(value as f32),
+        ('F', Value::Long(value)) => Value::Float(value as f32),
+        ('D', Value::Int(value)) => Value::Double(value as f64),
+        ('D', Value::Long(value)) => Value::Double(value as f64),
+        ('D', Value::Float(value)) => Value::Double(value as f64),
+        (_, value) => value,
     }
 }
 
@@ -39834,6 +39855,18 @@ mod tests {
     #[test]
     fn widen_primitive_int_to_long() {
         assert_eq!(widen_primitive("I", "J", Value::Int(5)), Value::Long(5));
+    }
+
+    #[test]
+    fn unboxed_integer_widens_for_long_lambda_target() {
+        assert_eq!(
+            widen_unboxed_primitive('J', Value::Int(i32::MIN)),
+            Value::Long(i64::from(i32::MIN))
+        );
+        assert_eq!(
+            widen_unboxed_primitive('J', Value::Int(1)),
+            Value::Long(1)
+        );
     }
 
     #[test]

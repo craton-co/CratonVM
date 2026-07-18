@@ -8764,6 +8764,12 @@ pub(crate) fn initialize_real_scheduled_thread_pool_executor(
 
     let this = ctx.read_native_pin(pin_base, this);
     if result.is_ok() {
+        // The real parent constructor is responsible for this assignment, but
+        // the interpreter's constructor fast path can leave the inherited
+        // field at its default value when the receiver is a user subclass.
+        // Preserve the argument supplied to the real STPE constructor so a
+        // ThreadPoolTaskScheduler subclass has the requested pool size.
+        ctx.set_field_by_name(this, "corePoolSize", Value::Int(cores));
         ctx.set_field_by_name(
             this,
             "continueExistingPeriodicTasksAfterShutdown",
@@ -8809,6 +8815,36 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
         },
     );
+    // The real-JDK registration pass drops the synthetic STPE surface because
+    // its historical two-slot layout corrupts real executors. Keep only this
+    // constructor as a Bridge: it initializes the real ThreadPoolExecutor
+    // state and covers Spring's anonymous ThreadPoolTaskScheduler subclass.
+    let __bridge_category = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        ses,
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cores = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            let factory = match args.get(2) {
+                Some(Value::Object(Some(factory))) => Some(*factory),
+                _ => None,
+            };
+            // The shared initializer delegates to ThreadPoolExecutor's real
+            // constructor, which supplies the JDK default abort policy. The
+            // caller-provided rejection handler is only observed by the
+            // scheduled executor's own bytecode; scheduler subclasses such as
+            // Spring's anonymous executor need their core-pool size preserved
+            // here instead of falling through an incomplete constructor path.
+            initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
+        },
+    );
+    r.set_category(__bridge_category);
     r.register(ses, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) > 1 {
@@ -8939,14 +8975,19 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // (register_essential_natives, phase 63) provides delay-aware scheduling.
     // These stubs used to overwrite p63 and return null / block real Surefire
     // fork shutdown sequencing.
+    let __core_getter_category = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(ses, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
-        } else {
-            Ok(Some(Value::Int(1)))
-        }
+        let core_pool_size = match ctx.get_field_by_name(this, "corePoolSize") {
+            Value::Int(value) => Value::Int(value),
+            // Synthetic STPE objects have only the historical slot layout.
+            _ if ctx.object_num_fields(this) > 0 => ctx.get_field(this, 0),
+            _ => Value::Int(1),
+        };
+        Ok(Some(core_pool_size))
     });
+    r.set_category(__core_getter_category);
     r.register(ses, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });

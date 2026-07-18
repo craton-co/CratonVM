@@ -2923,7 +2923,8 @@ pub(crate) fn native_class_get_simple_name(
                 .find(|(inner_class, _, _, _)| inner_class == &name)
             {
                 if !inner_name.is_empty() {
-                    let simple = cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
+                    let simple =
+                        cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
                     let result = ctx.create_string(&simple);
                     return Ok(Some(Value::Object(Some(result))));
                 }
@@ -4448,9 +4449,46 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         ctx.get_field(recv, slot)
     };
 
-    // Box primitive values for the generic Object return
-    let result = box_value(ctx, raw_value, &descriptor);
+    // Box primitive values for the generic Object return. `NativeContext`
+    // field access intentionally exposes the raw slot so synthetic overlays
+    // can manage their own layouts; reflection, however, has the real field
+    // descriptor and must honour it. In particular, a long field whose slot
+    // currently carries an Int must be widened before it is placed in a Long
+    // wrapper. Otherwise Long.longValue() later receives the raw compact-Int
+    // bits (0xfffc...) as a supposed long.
+    let boxed_value = coerce_reflective_field_value(raw_value, &descriptor);
+    let result = box_value(ctx, boxed_value, &descriptor);
     Ok(Some(result))
+}
+
+/// Normalize a raw field slot to the type promised by reflection metadata.
+///
+/// This is deliberately limited to the category-2 primitive shapes that can
+/// otherwise cross `Field.get(Object)` as the wrong `Value` variant. The
+/// ordinary numeric-wrapper paths already handle the one-word primitive
+/// descriptors directly.
+fn coerce_reflective_field_value(value: Value, descriptor: &str) -> Value {
+    match descriptor.as_bytes().first().copied() {
+        Some(b'J') => match value {
+            Value::Long(_) => value,
+            Value::Int(v) => Value::Long(v as i64),
+            Value::Double(v) => Value::Long(v.to_bits() as i64),
+            Value::Float(v) => Value::Long(v.to_bits() as i64),
+            Value::Object(None) | Value::Uninitialized => Value::Long(0),
+            Value::Object(Some(v)) => Value::Long(v.as_ptr() as usize as i64),
+            Value::ReturnAddress(v) => Value::Long(v as i64),
+        },
+        Some(b'D') => match value {
+            Value::Double(_) => value,
+            Value::Long(v) => Value::Double(f64::from_bits(v as u64)),
+            Value::Int(v) => Value::Double(v as f64),
+            Value::Float(v) => Value::Double(v as f64),
+            Value::Object(None) | Value::Uninitialized => Value::Double(0.0),
+            Value::Object(Some(v)) => Value::Double(f64::from_bits(v.as_ptr() as usize as u64)),
+            Value::ReturnAddress(v) => Value::Double(v as f64),
+        },
+        _ => value,
+    }
 }
 
 pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11096,8 +11134,8 @@ fn build_annotation_array_for(
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
-    let container_loader = declaring_class_id
-        .and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
+    let container_loader =
+        declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         create_annotation_proxy(ctx, resolvable[i], container_loader)
@@ -15041,7 +15079,9 @@ pub(crate) fn native_class_get_annotated_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let class_id = obj_arg(args, 0).ok().and_then(|this| mirror_class_id(ctx, this));
+    let class_id = obj_arg(args, 0)
+        .ok()
+        .and_then(|this| mirror_class_id(ctx, this));
     let generic_ifaces = match native_class_get_generic_interfaces(ctx, args)? {
         Some(Value::Object(Some(arr))) => arr,
         _ => {
@@ -15788,7 +15828,10 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
             Value::Object(Some(m)) => m,
             _ => continue,
         };
-        let node = per_arg_anns.as_ref().and_then(|v| v.get(i)).unwrap_or(&empty);
+        let node = per_arg_anns
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .unwrap_or(&empty);
         let at = make_annotated_type_with_anns(ctx, tm, &node.anns);
         if !node.children.is_empty() {
             stash_annotated_type_argument_anns(at, node.children.clone());
