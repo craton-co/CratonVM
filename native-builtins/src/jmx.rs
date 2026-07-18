@@ -189,6 +189,31 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_object_name_get_key_property,
     );
+    // RKC-ObjectName-02: this synthetic ObjectName deliberately stores only
+    // its source text, so all three key-property accessors must stay native.
+    // Their real JDK implementations read `_ca_array` / `_kp_array` (and the
+    // private lazy `_propertyList`) which do not exist in the one-field model.
+    // Keep the public defensive Hashtable, the private Map used by
+    // getKeyProperty, and the source-order list-string accessor together: an
+    // uncovered member otherwise falls through to real bytecode and NPEs.
+    r.register(
+        cls,
+        "_getKeyPropertyList",
+        "()Ljava/util/Map;",
+        native_object_name_get_key_property_map,
+    );
+    r.register(
+        cls,
+        "getKeyPropertyList",
+        "()Ljava/util/Hashtable;",
+        native_object_name_get_key_property_list,
+    );
+    r.register(
+        cls,
+        "getKeyPropertyListString",
+        "()Ljava/lang/String;",
+        native_object_name_get_key_property_list_string,
+    );
     // RKC-ObjectName-01: `getCanonicalKeyPropertyListString` and the
     // `is*Pattern` family are real, un-intercepted-until-now `ObjectName`
     // methods that `com.sun.jmx.mbeanserver.Repository`/`JmxMBeanServer`
@@ -303,21 +328,35 @@ fn object_name_quote_text(input: &str) -> String {
     out
 }
 
-fn object_name_table_get(
-    ctx: &mut dyn NativeContext,
-    table: ObjectRef,
-    key: &str,
-) -> Option<String> {
-    let key_obj = ctx.create_string(key);
-    match ctx.invoke_virtual(
-        table,
-        "get",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[Value::Object(Some(key_obj))],
-    ) {
-        Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v),
-        _ => None,
+/// Snapshot String pairs from either the native HashMap-shaped Hashtable or a
+/// real JDK Hashtable. Both store their buckets in field 0 and chain entries
+/// through field 3; the entry's key/value slots differ only because a real
+/// `Hashtable$Entry` has its hash in slot 0. Reading fields only means this
+/// does not need native GC pins.
+fn object_name_table_pairs(ctx: &dyn NativeContext, table: ObjectRef) -> Vec<(String, String)> {
+    let buckets = match ctx.get_field(table, 0) {
+        Value::Object(Some(buckets)) => buckets,
+        _ => return Vec::new(),
+    };
+    let mut pairs = Vec::new();
+    for index in 0..ctx.array_length(buckets) {
+        let mut entry = ctx.get_array_element(buckets, index);
+        while let Value::Object(Some(node)) = entry {
+            let real_entry = matches!(ctx.get_field(node, 0), Value::Int(_));
+            let (key, value) = if real_entry {
+                (ctx.get_field(node, 1), ctx.get_field(node, 2))
+            } else {
+                (ctx.get_field(node, 0), ctx.get_field(node, 1))
+            };
+            if let (Value::Object(Some(key)), Value::Object(Some(value))) = (key, value) {
+                if let (Some(key), Some(value)) = (ctx.read_string(key), ctx.read_string(value)) {
+                    pairs.push((key, value));
+                }
+            }
+            entry = ctx.get_field(node, 3);
+        }
     }
+    pairs
 }
 
 fn object_name_from_domain_table(
@@ -325,16 +364,18 @@ fn object_name_from_domain_table(
     domain: &str,
     table: Option<ObjectRef>,
 ) -> String {
-    let mut pairs = Vec::new();
-    if let Some(table) = table {
-        for key in ["name", "type"] {
-            if let Some(value) = object_name_table_get(ctx, table, key) {
-                if !value.is_empty() {
-                    pairs.push(format!("{key}={value}"));
-                }
-            }
-        }
-    }
+    // ObjectName(String, Hashtable) accepts every property in the supplied
+    // table. The previous name/type-only shortcut silently dropped arbitrary
+    // Spring properties (including name1/name2, context and identity), which
+    // became visible once getKeyPropertyList stopped falling through to an
+    // NPE. Retain every non-empty String entry instead.
+    let pairs = table
+        .map(|table| object_name_table_pairs(ctx, table))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
     if pairs.is_empty() {
         format!("{domain}:*")
     } else {
@@ -501,21 +542,106 @@ fn native_object_name_get_key_property(
     };
     let key = object_name_string_arg(ctx, args, 1);
     let text = object_name_text(ctx, this);
-    let props = text.split_once(':').map(|(_, p)| p).unwrap_or("");
-    for pair in props.split(',') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                let unquoted = v
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .unwrap_or(v);
-                let s = ctx.create_string(unquoted);
-                return Ok(Some(Value::Object(Some(s))));
-            }
+    for (property_key, value) in object_name_property_pairs(&text) {
+        if property_key == key {
+            // ObjectName returns the original property-value text,
+            // including quote delimiters when the value was quoted.
+            let s = ctx.create_string(value);
+            return Ok(Some(Value::Object(Some(s))));
         }
     }
     // Real JDK semantics: no such key property -> null (not an exception).
     Ok(Some(Value::Object(None)))
+}
+
+/// Construct a fresh Java map from ObjectName's text representation.  The
+/// real implementation memoizes this privately; a fresh map is sufficient for
+/// the synthetic model and prevents callers from observing shared mutable
+/// state.  Every object held across allocating Java calls is pinned so this is
+/// safe with the moving collector.
+fn object_name_key_property_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    map_class: &str,
+) -> MethodCallResult {
+    let map = match ctx.new_object_initialized(map_class, "()V", &[])? {
+        Some(Value::Object(Some(map))) => map,
+        other => return Ok(other),
+    };
+    let pin_base = ctx.pin_native_root(map);
+    let text = object_name_text(ctx, this);
+
+    for (key, value) in object_name_property_pairs(&text) {
+        let key = ctx.create_string(key);
+        let key_pin = ctx.pin_native_root(key);
+        let value = ctx.create_string(value);
+        let value_pin = ctx.pin_native_root(value);
+        let map = ctx.read_native_pin(pin_base, map);
+        let result = ctx.invoke(
+            map_class,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(map)),
+                Value::Object(Some(ctx.read_native_pin(key_pin, key))),
+                Value::Object(Some(ctx.read_native_pin(value_pin, value))),
+            ],
+        );
+        if let Err(error) = result {
+            ctx.unpin_native_roots(pin_base);
+            return Err(error);
+        }
+    }
+
+    let map = ctx.read_native_pin(pin_base, map);
+    ctx.unpin_native_roots(pin_base);
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn native_object_name_get_key_property_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(object_name))) => *object_name,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    object_name_key_property_map(ctx, this, "java/util/HashMap")
+}
+
+fn native_object_name_get_key_property_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(object_name))) => *object_name,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    object_name_key_property_map(ctx, this, "java/util/Hashtable")
+}
+
+/// `ObjectName.getKeyPropertyListString()` returns the source-order property
+/// list (unlike the canonical accessor, it does not sort keys) and omits a
+/// trailing property-list wildcard.
+fn native_object_name_get_key_property_list_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(object_name))) => *object_name,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = object_name_text(ctx, this);
+    let properties = text
+        .split_once(':')
+        .map(|(_, properties)| properties)
+        .unwrap_or("");
+    let list = split_object_name_properties(properties)
+        .into_iter()
+        .filter(|property| *property != "*")
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Some(Value::Object(Some(ctx.create_string(&list)))))
 }
 
 /// Simple JMX-style glob match:  = any run of characters,  = any
@@ -541,17 +667,25 @@ fn object_name_glob_match(pattern: &str, text: &str) -> bool {
 fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
     let (domain, props_str) = text.split_once(':').unwrap_or((text, ""));
     let is_pattern = props_str == "*" || props_str.ends_with(",*");
-    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
-    let props_str = if props_str == "*" { "" } else { props_str };
-    let mut props = Vec::new();
-    if !props_str.is_empty() {
-        for pair in props_str.split(',') {
-            if let Some((k, v)) = pair.split_once('=') {
-                props.push((k.to_string(), v.to_string()));
-            }
-        }
-    }
+    let props = object_name_property_pairs(text)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
     (domain.to_string(), props, is_pattern)
+}
+
+/// Return the non-wildcard key/value pairs while preserving the exact value
+/// text.  In particular, commas in quoted values are data, not separators.
+fn object_name_property_pairs(text: &str) -> Vec<(&str, &str)> {
+    let properties = text
+        .split_once(':')
+        .map(|(_, properties)| properties)
+        .unwrap_or("");
+    split_object_name_properties(properties)
+        .into_iter()
+        .filter(|property| *property != "*")
+        .filter_map(|property| property.split_once('='))
+        .collect()
 }
 
 /// Split a key-property list on commas not protected by ObjectName quoting.
@@ -4684,13 +4818,22 @@ mod jmx_tests {
 
     #[test]
     fn test_object_name_new_natives_are_registered_bridge() {
-        // RKC-ObjectName-01 regression test: getCanonicalKeyPropertyListString
-        // and the is*Pattern family must be registered (previously they fell
-        // through to real bytecode, which NPEs on the synthetic 1-field
-        // ObjectName's never-populated `_ca_array`/`_compressed_storage`).
+        // RKC-ObjectName-01/02 regression: all accessor members that read
+        // real ObjectName cache fields must be registered.  Otherwise they
+        // fall through to real bytecode and NPE on the synthetic one-field
+        // ObjectName's never-populated `_ca_array`/`_kp_array`.
         let mut r = NativeMethodRegistry::new();
         register_jmx_natives(&mut r);
         let cls = "javax/management/ObjectName";
+        assert!(r
+            .find(cls, "_getKeyPropertyList", "()Ljava/util/Map;")
+            .is_some());
+        assert!(r
+            .find(cls, "getKeyPropertyList", "()Ljava/util/Hashtable;")
+            .is_some());
+        assert!(r
+            .find(cls, "getKeyPropertyListString", "()Ljava/lang/String;")
+            .is_some());
         assert!(r
             .find(
                 cls,
@@ -4750,6 +4893,44 @@ mod jmx_tests {
             other => panic!("expected a String, got {other:?}"),
         };
         assert_eq!(s, "k=v");
+    }
+
+    #[test]
+    fn test_object_name_key_property_accessors_preserve_quoted_source_text() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let name = object_name_new(&mut ctx, "d:b=2,a=\"x,y\",c=3,*".to_string());
+        let key = ctx.create_string("a");
+
+        let result = native_object_name_get_key_property(
+            &mut ctx,
+            &[Value::Object(Some(name)), Value::Object(Some(key))],
+        )
+        .unwrap()
+        .unwrap();
+        let property = match result {
+            Value::Object(Some(value)) => ctx.read_string(value).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(property, "\"x,y\"");
+
+        let result =
+            native_object_name_get_key_property_list_string(&mut ctx, &[Value::Object(Some(name))])
+                .unwrap()
+                .unwrap();
+        let list = match result {
+            Value::Object(Some(value)) => ctx.read_string(value).unwrap(),
+            other => panic!("expected a String, got {other:?}"),
+        };
+        assert_eq!(list, "b=2,a=\"x,y\",c=3");
+
+        assert_eq!(
+            object_name_parts(&object_name_text(&ctx, name)).1,
+            vec![
+                ("b".to_string(), "2".to_string()),
+                ("a".to_string(), "\"x,y\"".to_string()),
+                ("c".to_string(), "3".to_string()),
+            ]
+        );
     }
 
     #[test]
