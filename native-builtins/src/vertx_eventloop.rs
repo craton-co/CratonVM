@@ -1349,47 +1349,11 @@ pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(CLS_VERTX_IMPL, "close", "()V", native_vertx_close);
 
-    // Keep the synthetic event-loop shim off real Netty NIO. Registering this
-    // surface on `NioEventLoop` or its `SingleThreadEventExecutor` superclass
-    // intercepts real Netty's Java selector loop and runs connect/register
-    // tasks inline on the caller, leaving no event-loop thread to complete
-    // non-blocking connect/read/write. DefaultEventLoop remains synthetic-only
-    // for the Vert.x/boot paths that need this shim.
-    for cls in [CLS_DEFAULT_EVENT_LOOP] {
-        registry.register(cls, "run", "()V", native_nel_run);
-        registry.register(
-            cls,
-            "execute",
-            "(Ljava/lang/Runnable;)V",
-            native_nel_execute,
-        );
-        registry.register(
-            cls,
-            "schedule",
-            "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;",
-            native_nel_schedule,
-        );
-        registry.register(cls, "inEventLoop", "()Z", native_nel_in_event_loop);
-        registry.register(cls, "isShuttingDown", "()Z", native_nel_is_shutting_down);
-        registry.register(
-            cls,
-            "shutdownGracefully",
-            "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;",
-            native_nel_shutdown_gracefully,
-        );
-        registry.register(
-            cls,
-            "awaitTermination",
-            "(JLjava/util/concurrent/TimeUnit;)Z",
-            native_nel_await_termination,
-        );
-        registry.register(
-            cls,
-            "submit",
-            "(Ljava/lang/Runnable;)Ljava/util/concurrent/Future;",
-            native_nel_submit,
-        );
-    }
+    // A real Netty DefaultEventLoop owns its queue, worker lifecycle and
+    // shutdown state. Its former CratonVM override ran tasks synchronously on
+    // the submitting thread, which can deadlock asynchronous clients such as
+    // the Cassandra driver. Keep these helpers for direct synthetic tests, but
+    // do not register them: production Netty must always execute its bytecode.
     registry.set_category(__prev_cat);
 }
 
@@ -1482,6 +1446,16 @@ mod tests {
     fn reset_shared_globals() {
         // Drop any dead-ids a previous (now-finished) test left behind.
         let _ = drain_native_thread_dead_queue();
+    }
+
+    #[test]
+    fn default_event_loop_has_no_registered_override() {
+        let mut registry = NativeMethodRegistry::new();
+        register_vertx_eventloop_natives(&mut registry);
+        assert_eq!(
+            registry.kind_of(CLS_DEFAULT_EVENT_LOOP, "execute", "(Ljava/lang/Runnable;)V"),
+            None,
+        );
     }
 
     /// FIX(test-isolation): Back-compat alias. The dead-queue tests historically

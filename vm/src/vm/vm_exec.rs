@@ -1027,8 +1027,8 @@ fn safe_native_call_impl(
     let mut out: MethodCallResult = match result {
         Ok(method_result) => {
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
-                thread.native_pending_return = None;
                 if exc_handle == u64::MAX {
+                    thread.native_pending_return = None;
                     thread.native_pin_roots.truncate(pin_base);
                     return Err(crate::runtime::exceptions::throw_runtime_error(
                         shared,
@@ -1040,7 +1040,14 @@ fn safe_native_call_impl(
                 }
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
-                    let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
+                    // JNI `Throw`/`ThrowNew` publish the throwable through
+                    // `native_pending_return` before returning to native code.
+                    // That slot is a GC root and is remapped in place, unlike
+                    // the JNI ABI's raw handle.  Fall back to the raw handle
+                    // for legacy/no-context producers.
+                    let exc_ref = thread
+                        .native_pending_return
+                        .unwrap_or_else(|| unsafe { crate::types::ObjectRef::from_raw(ptr) });
                     thread.native_pending_return = Some(exc_ref);
                     thread.native_pin_roots.truncate(pin_base);
                     crate::runtime::interpreter::update_root_snapshot(shared, thread);
@@ -1116,9 +1123,7 @@ fn safe_native_call_impl(
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
                 let healed = shared.heap.load_and_forward(*o);
-                if healed.as_ptr() != o.as_ptr()
-                    && cratonvm_gc::stale_objref_debug::enabled()
-                {
+                if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                     // The cached-dispatch callback pointer often has no ring
@@ -3361,7 +3366,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // contain long-dead addresses). A hit here means the CALLER received
         // a stale value from upstream; the backtrace names it.
         if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
-            if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(obj.as_ptr() as usize)
+            {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     eprintln!(
@@ -3440,7 +3449,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if base < self.thread.native_pin_roots.len() {
             if unpin_ring_enabled() {
                 let bt = format!("{}", std::backtrace::Backtrace::force_capture());
-                let short: String = bt.lines().skip(8).take(12).map(|l| format!("{l}\n")).collect();
+                let short: String = bt
+                    .lines()
+                    .skip(8)
+                    .take(12)
+                    .map(|l| format!("{l}\n"))
+                    .collect();
                 UNPIN_RING.with(|r| {
                     let mut r = r.borrow_mut();
                     if r.len() >= 6 {
@@ -4249,7 +4263,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
         let cm = self.shared.class_manager.read();
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
@@ -9992,8 +10010,14 @@ pub fn invoke_or_native(
         && matches!(
             (method_name, descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         if let Some(callback) =
@@ -11765,9 +11789,7 @@ fn proxy_method_exception_types(
         .get(&declaring_mirror)
         .copied();
     let declared = declaring_class
-        .map(|class_id| {
-            proxy_method_declared_exceptions(shared, class_id, method_name, descriptor)
-        })
+        .map(|class_id| proxy_method_declared_exceptions(shared, class_id, method_name, descriptor))
         .unwrap_or_default();
     let exception_arr = shared.heap.alloc_array(
         class_component,
