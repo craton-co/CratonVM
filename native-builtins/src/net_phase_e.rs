@@ -2919,7 +2919,19 @@ fn re1_socket_read_stream(
         Value::Object(Some(o)) => o,
         _ => buf,
     };
-    let n = read_result.map_err(|e| ioex(format!("Socket read failed: {e}")))?;
+    let n = read_result.map_err(|e| match e.kind() {
+        // SO_RCVTIMEO is reported as TimedOut on Windows and often as
+        // WouldBlock on Unix. Both are Java SocketTimeoutException, not EOF
+        // and not a generic IOException; callers deliberately catch this
+        // concrete type to retry their protocol operation.
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            RuntimeError::SocketTimeoutException {
+                message: format!("Socket read timed out: {e}"),
+            }
+            .into()
+        }
+        _ => ioex(format!("Socket read failed: {e}")),
+    })?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
         if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() && n != 0 {
