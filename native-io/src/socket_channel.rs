@@ -1234,6 +1234,12 @@ fn sc_connect_bound(
         crate::nb_connect::start_bound(stream, &remote).map_err(|e| map_err(&target, e))?;
     let (mut stream, connected) = match started {
         crate::nb_connect::StartConnect::Connected(stream) => (stream, true),
+        // `start_bound` currently never yields a deferred failure, but the
+        // shared result type permits one on Windows. Keep this exhaustive so
+        // the unrelated socket-channel work does not prevent a clean build.
+        crate::nb_connect::StartConnect::DeferredFailure(_, error) => {
+            return Err(map_err(&target, error));
+        }
         crate::nb_connect::StartConnect::InProgress(stream) if !allow_block => (stream, false),
         crate::nb_connect::StartConnect::DeferredFailure(stream, error) if !allow_block => {
             // Keep the terminal error on the retained OS descriptor. This

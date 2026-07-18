@@ -5897,11 +5897,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
+            let uri_text = p57_uri_full_text(ctx, uri);
+            // `Paths.get(jar:file:...!/entry)` is the resource-facing half of
+            // the jar-FS contract. Jetty's PathResourceFactory mounts the URI
+            // first, then calls this conversion for the root and every
+            // resolved child. Treating the full `jar:` text as an ordinary host
+            // path loses the mounted archive identity, making Files.isDirectory
+            // false and Files.list() empty despite a valid central directory.
+            if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
+                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                return Ok(Some(Value::Object(Some(result))));
+            }
             // Opaque file-scheme URIs (`file:.`, `file:foo`) are not
             // hierarchical: the real JDK throws here rather than yielding a
             // path. Match that so callers like Spring's PathEditor fall back
             // to their resource mechanism.
-            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+            if p57_uri_is_opaque_file(&uri_text) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "URI is not hierarchical".to_string(),
                 }
@@ -11862,6 +11875,15 @@ fn p57_to_os_path(p: &str) -> String {
 }
 
 fn p57_absolute_path_string(path: &str) -> String {
+    // A mounted jar/jrt entry is absolute within its own filesystem. Several
+    // Path.toAbsolutePath registrations share this helper; letting any one of
+    // them anchor the opaque sentinel to the host CWD both leaks the sentinel
+    // through Path.toString() and changes the entry identity. Jetty's
+    // PathResource.getName() exercises exactly that sequence after listing a
+    // `jar:` URI.
+    if vfs_decode(path).is_some() {
+        return path.to_string();
+    }
     #[cfg(windows)]
     {
         return p57_windows_absolute_path_string(path);
@@ -13414,6 +13436,17 @@ fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// Split a file-backed `jar:` URI into its backing archive and its path within
+/// that archive. This is deliberately separate from `p57_jar_uri_to_os_path`:
+/// callers such as `FileSystemProvider.newFileSystem` need only the container,
+/// whereas `Path.of(URI)` must retain the entry portion for `Files.*` calls.
+fn p57_jar_uri_to_entry_path(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("jar:")?;
+    let (container, entry) = rest.split_once("!/")?;
+    let jar = p57_jar_uri_to_os_path(container)?;
+    Some((jar, entry.to_string()))
 }
 
 /// Build a `java.io.IOException` runtime error from a Rust IO error — used so
