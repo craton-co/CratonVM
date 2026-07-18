@@ -2835,6 +2835,8 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_one(),
+        "read",
+        "()I",
     ) {
         return result;
     }
@@ -2869,6 +2871,8 @@ fn maybe_socket_input_stream_read(
     this: ObjectRef,
     args: &[Value],
     hook: Option<cratonvm_native_api::NativeCallback>,
+    method_name: &str,
+    descriptor: &str,
 ) -> Option<MethodCallResult> {
     let cls_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
@@ -2876,10 +2880,11 @@ fn maybe_socket_input_stream_read(
     if cls_name == "java/net/Socket$SocketInputStream" {
         return Some(match hook {
             Some(cb) => cb(ctx, args),
-            None => Err(RuntimeError::IOException {
-                message: "SocketInputStream read hook not installed".into(),
-            }
-            .into()),
+            // In CRATONVM_REAL_NET_SOCKETS mode the legacy synthetic-socket
+            // hook is intentionally absent. Run the real JDK inner stream
+            // bytecode instead; it delegates to NioSocketImpl, whose
+            // non-blocking timeout cycle is owned by native-io::net.
+            None => ctx.invoke_virtual_bytecode_only(this, method_name, descriptor, &args[1..]),
         });
     }
     None
@@ -2947,6 +2952,8 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_bytes(),
+        "read",
+        "([BII)I",
     ) {
         return result;
     }
@@ -3093,6 +3100,8 @@ fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_array(),
+        "read",
+        "([B)I",
     ) {
         return result;
     }
