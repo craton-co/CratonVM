@@ -22618,8 +22618,36 @@ fn spring_class_utils_for_name_impl(
     // BOOT-INF/lib fat-jars) and carries the LaunchedURLClassLoader rescue that
     // routing through `loadClass` would lose; its inner-class retry also covers
     // the Spring-Boot `a.b.Outer.Factory` → `a/b/Outer$Factory` factory names.
-    if let Some(Value::Object(Some(loader))) = args.get(1) {
-        let loader = *loader;
+    // Spring passes `null` to mean its default loader, which is the current
+    // thread context loader when available.  This native replaces the Java
+    // body, so it must materialize that default itself before deciding whether
+    // to use the global scanner.  Treating null as the bootstrap/global path
+    // bypassed FilteredClassLoader in ClassUtils.isPresent(name, null).
+    let effective_loader = match args.get(1) {
+        Some(Value::Object(Some(loader))) => Some(*loader),
+        _ => match ctx.invoke(
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(thread)))) => ctx
+                .invoke_virtual(
+                    thread,
+                    "getContextClassLoader",
+                    "()Ljava/lang/ClassLoader;",
+                    &[],
+                )
+                .ok()
+                .flatten()
+                .and_then(|value| match value {
+                    Value::Object(Some(loader)) => Some(loader),
+                    _ => None,
+                }),
+            _ => None,
+        },
+    };
+    if let Some(loader) = effective_loader {
         if crate::classloader::is_user_defined_loader(ctx, loader) {
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
                 crate::lang_class::native_class_for_name(

@@ -11,6 +11,11 @@ produce). Most have since been retired (fixed or found not to reproduce on
 current dev, see table). The rest is an uncharacterized long tail of
 smaller/individual differences not yet clustered.
 
+> Closure update (2026-07-18): the HTTP codec, JDBC, Micrometer tracing, and
+> R2DBC `FilteredClassLoader` cluster is fixed. Canonical records are under
+> [`docs/internal/springboot`](../../internal/springboot/); the legacy index
+> links below are retained as redirects.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
