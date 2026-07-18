@@ -2199,12 +2199,6 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
     use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
     use openssl::x509::{store::X509StoreBuilder, X509};
     let addr = format!("{host}:{port}");
-    if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
-        eprintln!(
-            "[dbg-legacy-dsa] client connecting {addr} roots={}",
-            trust_root_ders.len()
-        );
-    }
     let tcp = TcpStream::connect(&addr)?;
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
@@ -2229,9 +2223,6 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
         .build()
         .connect(host, tcp)
         .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
-    if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
-        eprintln!("[dbg-legacy-dsa] client handshake complete {addr}");
-    }
     let mut peer_cert_chain_der = Vec::new();
     if let Some(cert) = stream.ssl().peer_certificate() {
         peer_cert_chain_der.push(

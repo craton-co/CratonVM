@@ -9054,15 +9054,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 || legacy_dsa_roots
                     .iter()
                     .any(|der| crate::t27_tls::is_dsa_certificate_der(der));
-            #[cfg(unix)]
-            if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
-                eprintln!(
-                    "[dbg-legacy-dsa] SSL factory createSocket host={host} port={port} selected={} roots={} identity={}",
-                    legacy_dsa_client,
-                    legacy_dsa_roots.len(),
-                    client_ident.is_some()
-                );
-            }
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot

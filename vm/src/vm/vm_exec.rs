@@ -13650,23 +13650,6 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
-    if method_name == "createSocket" && std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
-        let receiver_name = args
-            .first()
-            .and_then(|value| match value {
-                Value::Object(Some(receiver)) => Some(shared.heap.class_id_of(*receiver)),
-                _ => None,
-            })
-            .and_then(|id| {
-                shared
-                    .class_manager
-                    .read()
-                    .get_class(id)
-                    .map(|class| class.name.to_string())
-            })
-            .unwrap_or_else(|| "<static-or-null>".to_string());
-        eprintln!("[dbg-legacy-dsa] createSocket declared={class_name} receiver={receiver_name} descriptor={descriptor}");
-    }
     if class_name == "com/sun/tools/attach/VirtualMachine"
         && matches!(
             (method_name, descriptor),
@@ -13699,10 +13682,42 @@ fn invoke_on_class_shared_inner(
                 .get_class(receiver_class)
                 .map(|class| class.name.to_string())
                 .unwrap_or_default();
-            if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
-                eprintln!("[dbg-legacy-dsa] accept receiver={receiver_name}");
-            }
             if receiver_name == "javax/net/ssl/SSLServerSocket" {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        .find(&receiver_name, method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+    // UnboundID retains an SSLServerSocketFactory in a field whose declared
+    // type is ServerSocketFactory, then invokes its concrete parent overloads
+    // (`createServerSocket(II)` and `(IILjava/net/InetAddress;)`).  The
+    // parent has registered native implementations, so ordinary resolution
+    // never reaches the TLS factory's more-specific bridge.  Prefer that
+    // bridge from the receiver's actual synthetic class before the parent
+    // native can manufacture a plaintext listener.
+    if method_name == "createServerSocket"
+        && matches!(
+            descriptor,
+            "(I)Ljava/net/ServerSocket;"
+                | "(II)Ljava/net/ServerSocket;"
+                | "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;"
+        )
+    {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLServerSocketFactory" {
                 if let Some(callback) =
                     shared
                         .native_methods
