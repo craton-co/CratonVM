@@ -21364,21 +21364,25 @@ pub(crate) fn try_lambda_dispatch(
             } else {
                 None
             };
-            let cached_result = private_impl_class.is_none().then(|| recv_class_id_opt
-                .filter(|rcv| *rcv != ClassId::new(0))
-                .map(|rcv| {
-                    try_invoke_cached_lambda_impl(
-                        shared,
-                        thread,
-                        obj_class_id,
-                        rcv,
-                        &call_site.impl_handle.member_name,
-                        &call_site.impl_handle.descriptor,
-                        &full_args,
-                    )
-                })
-                .transpose()?
-                .flatten()).flatten();
+            let cached_result = if private_impl_class.is_none() {
+                recv_class_id_opt
+                    .filter(|rcv| *rcv != ClassId::new(0))
+                    .map(|rcv| {
+                        try_invoke_cached_lambda_impl(
+                            shared,
+                            thread,
+                            obj_class_id,
+                            rcv,
+                            &call_site.impl_handle.member_name,
+                            &call_site.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+            } else {
+                None
+            };
             let result = if let Some(result) = cached_result {
                 Ok(result)
             } else if let Some(impl_cid) = private_impl_class {
