@@ -24079,6 +24079,8 @@ fn force_native_over_real_jdk_bytecode(
                 | ("componentType", "()Ljava/lang/Class;")
         )
     {
+        return true;
+    }
     if is_netty_event_executor_group_shutdown_native_override(
         class_name,
         method_name,
