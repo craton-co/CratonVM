@@ -2470,9 +2470,15 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
             }
             #[cfg(unix)]
             TlsServerConfig::LegacyDsa(acceptor) => {
+                if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
+                    eprintln!("[dbg-legacy-dsa] server accepting listener={listener_id}");
+                }
                 let stream = acceptor
                     .accept(tcp)
                     .map_err(|e| format!("legacy DSA TLS server handshake: {e}"))?;
+                if std::env::var_os("CRATONVM_DBG_LEGACY_DSA").is_some() {
+                    eprintln!("[dbg-legacy-dsa] server handshake complete listener={listener_id}");
+                }
                 (
                     TlsServerStream::LegacyDsa(stream),
                     None,
