@@ -13694,6 +13694,31 @@ fn invoke_on_class_shared_inner(
             }
         }
     }
+    // The JDK's concrete SSLSocketFactory implementation can construct an
+    // unconnected host-backed SSLSocket.  CratonVM's native TLS registry is
+    // intentionally connection-oriented, so returning that host object here
+    // would let a later `Socket.connect` establish plaintext TCP and leave
+    // the peer waiting for a TLS ClientHello.  UnboundID (the LDAPS caller)
+    // explicitly falls back from this optional no-arg form to the
+    // InetAddress overload, which is the fully TLS-aware bridge below.
+    if method_name == "createSocket" && descriptor == "()Ljava/net/Socket;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "sun/security/ssl/SSLSocketFactoryImpl" {
+                return Err(RuntimeError::IOException {
+                    message: "unconnected JDK SSLSocket requires a TLS-aware createSocket overload"
+                        .into(),
+                }
+                .into());
+            }
+        }
+    }
     // UnboundID retains an SSLServerSocketFactory in a field whose declared
     // type is ServerSocketFactory, then invokes its concrete parent overloads
     // (`createServerSocket(II)` and `(IILjava/net/InetAddress;)`).  The
