@@ -24,6 +24,7 @@ use crate::native::registry::{
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
+use cratonvm_native_api::ThreadJmxSnapshot;
 
 use super::SharedVm;
 use crate::classloading::ClassStore;
@@ -1377,7 +1378,13 @@ pub(crate) fn monitor_enter_blocking(
     thread: &mut JvmThread,
     obj: ObjectRef,
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
     let tid = thread.thread_id;
@@ -1432,6 +1439,9 @@ pub(crate) fn monitor_enter_blocking(
         .copied()
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed);
     fixed
 }
 
@@ -1448,7 +1458,13 @@ pub(crate) fn monitor_enter_synchronized_method(
     obj: ObjectRef,
     args: &mut [Value],
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(monitor) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
 
@@ -1502,6 +1518,9 @@ pub(crate) fn monitor_enter_synchronized_method(
         }
     }
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed_monitor);
     fixed_monitor
 }
 
@@ -5693,7 +5712,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
+        self.shared
+            .thread_registry
+            .set_jmx_contended_monitor(self.thread.thread_id, obj);
         self.shared.monitors.enter(obj, self.thread.thread_id);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, obj);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
         }
@@ -5729,6 +5754,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
         let _ = self.shared.monitors.exit(obj, self.thread.thread_id);
+        if !self.shared.monitors.holds(obj, self.thread.thread_id) {
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+        }
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -5818,6 +5848,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+            self.shared
+                .thread_registry
+                .set_jmx_waiting_monitor(self.thread.thread_id, obj);
             let r = self.shared.monitors.wait(
                 obj,
                 self.thread.thread_id,
@@ -5836,6 +5872,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // every later census permanently excluded the thread and a moving
         // collection could run concurrently with its bytecode.
         self.check_post_block_gc();
+        // `Object.wait` returns only after re-acquiring the monitor, including
+        // the InterruptedException path. Re-establish the ownership snapshot
+        // before propagating that result to Java.
+        let waited_on = self
+            .shared
+            .thread_registry
+            .take_jmx_waiting_monitor(self.thread.thread_id)
+            .unwrap_or(obj);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, waited_on);
         let was_interrupted = was_interrupted?;
         // Emit JFR monitor wait event
         {
@@ -6621,6 +6668,86 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // carry the ClassId/descriptor needed to resolve source lines, but
         // class.method is sufficient to pinpoint where a parked thread is stuck.
         self.shared.thread_registry.frame_trace_of(tid)
+    }
+
+    fn thread_jmx_snapshot(&self, thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        let thread_id = read_java_thread_tid(self.shared, thread_obj)
+            .map(|id| id as i64)
+            .unwrap_or(tid.0 as i64);
+        let thread_name = self
+            .shared
+            .thread_registry
+            .thread_name(tid)
+            .unwrap_or_else(|| format!("Thread-{thread_id}"));
+        let thread_status = if !self.shared.thread_registry.is_alive(tid) {
+            0x0002 // JVMTI_THREAD_STATE_TERMINATED
+        } else {
+            match self.shared.thread_registry.java_block_state(tid) {
+                2 => 0x0401, // ALIVE | BLOCKED_ON_MONITOR_ENTER
+                1 => 0x0011, // ALIVE | WAITING_INDEFINITELY
+                _ => 0x0005, // ALIVE | RUNNABLE
+            }
+        };
+        let stack_trace = if self.thread.java_thread_obj == Some(thread_obj) {
+            let cm = self.shared.class_manager.read();
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames)
+        } else {
+            self.shared.thread_registry.frame_trace_of(tid)
+        };
+        let (contended, waiting, locked_monitors, locked_synchronizers) =
+            self.shared.thread_registry.jmx_lock_snapshot(tid)?;
+        // `LockSupport` records the AQS/Condition blocker in the real JDK
+        // `Thread.parkBlocker` field before it enters Unsafe.park. It is the
+        // authoritative lock object for WAITING threads that are not in
+        // Object.wait(), and it is already rooted by the Thread mirror.
+        let park_blocker = match self.get_field_by_name(thread_obj, "parkBlocker") {
+            Value::Object(Some(blocker)) => Some(blocker),
+            _ => None,
+        };
+        let lock = contended.or(waiting).or(park_blocker);
+        // The compatibility CountDownLatch implementation blocks on the
+        // public latch monitor rather than allocating the JDK-private `Sync`.
+        // Preserve the public JMM contract: ThreadInfo exposes that logical
+        // synchronizer, not the implementation's monitor surrogate.
+        let lock_class_name = waiting.and_then(|monitor| {
+            (self.class_name_of_id(self.class_id_of_object(monitor)).as_deref()
+                == Some("java/util/concurrent/CountDownLatch"))
+                .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
+        });
+        let (lock_owner_id, lock_owner_name) = contended
+            .and_then(|monitor| self.shared.monitors.current_owner(monitor))
+            .map(|owner| {
+                let owner_id = self
+                    .shared
+                    .thread_registry
+                    .java_thread_obj(owner)
+                    .and_then(|obj| read_java_thread_tid(self.shared, obj))
+                    .map(|id| id as i64)
+                    .unwrap_or(owner.0 as i64);
+                (owner_id, self.shared.thread_registry.thread_name(owner))
+            })
+            .unwrap_or((-1, None));
+        Some(ThreadJmxSnapshot {
+            thread_object: Some(thread_obj),
+            thread_id,
+            thread_name,
+            thread_status,
+            stack_trace,
+            lock,
+            lock_class_name,
+            lock_owner_id,
+            lock_owner_name,
+            locked_monitors,
+            locked_synchronizers,
+        })
+    }
+
+    fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        let owner = owner.and_then(|thread| resolve_thread_id_from_thread_obj(self.shared, thread));
+        self.shared
+            .thread_registry
+            .set_jmx_owned_synchronizer(owner, synchronizer);
     }
 
     fn current_thread_object(&mut self) -> ObjectRef {
@@ -13832,19 +13959,18 @@ fn invoke_on_class_shared_inner(
                 "javax/net/ssl/SSLServerSocketFactory"
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
-                if let Some(callback) =
-                    shared
-                        .native_methods
-                        // The real JDK factory carries its SSLContext in the
-                        // same first instance slot consumed by the bridge.
-                        // Reuse the bridge registered on its public API type
-                        // rather than interpreting `SSLServerSocketImpl`,
-                        // whose host socket path bypasses the TLS registry.
-                        .find(
-                            "javax/net/ssl/SSLServerSocketFactory",
-                            method_name,
-                            descriptor,
-                        )
+                if let Some(callback) = shared
+                    .native_methods
+                    // The real JDK factory carries its SSLContext in the
+                    // same first instance slot consumed by the bridge.
+                    // Reuse the bridge registered on its public API type
+                    // rather than interpreting `SSLServerSocketImpl`,
+                    // whose host socket path bypasses the TLS registry.
+                    .find(
+                        "javax/net/ssl/SSLServerSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
                 {
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
