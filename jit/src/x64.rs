@@ -2111,7 +2111,7 @@ pub fn precise_jit_maps_enabled() -> bool {
     })
 }
 
-/// Opt-IN inline reference-`putfield` fast path (`CRATONVM_JIT_INLINE_PUTFIELD`).
+/// Default-on inline reference-`putfield` fast path.
 ///
 /// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
 /// store INSTEAD of the `jit_putfield_object` helper CALL — but ONLY on the
@@ -2123,8 +2123,9 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// existing, validated `jit_putfield_object` helper, which performs the full
 /// SATB pre-barrier + card-marking write-barrier. This is the canonical
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
-/// allocation-heavy code (object binarytrees). DEFAULT-OFF pending GC-stress
-/// validation; opt in with `CRATONVM_JIT_INLINE_PUTFIELD`.
+/// allocation-heavy code (object binarytrees). Opt out with
+/// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
+/// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
 /// INT-6 (GC audit 2026-07-10): the YOUNG test reads `GC_FLAG_OLD_GEN`, which
 /// only the GENERATIONAL backend maintains — under G1/ZGC every object read
@@ -2136,7 +2137,23 @@ pub fn precise_jit_maps_enabled() -> bool {
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_PUTFIELD").is_some())
+    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none())
+}
+
+fn inline_site_is_fresh_ctor_first_store(
+    site: &crate::InlineSite,
+    cpc: usize,
+    field_index: usize,
+) -> bool {
+    site.method_name == "<init>"
+        && !site
+            .field_info
+            .iter()
+            .any(|(prior_pc, prior_index, _)| {
+                *prior_pc < cpc
+                    && *prior_index == field_index
+                    && site.callee_code[*prior_pc] == 0xb5
+            })
 }
 
 /// Opt-IN inline `getfield` fast path (`CRATONVM_JIT_INLINE_GETFIELD`).
@@ -14380,6 +14397,109 @@ impl Compiler {
         vec![self.emit_jcc_rel32_patch(0x84)] // JZ -> checked helper
     }
 
+    /// Emit a compact reference-field store with a barrier-free fast path and
+    /// the validated helper as its slow path.
+    ///
+    /// Small callees such as constructors are emitted by
+    /// `try_emit_inline_body`, not the top-level bytecode loop. Keeping this
+    /// emitter shared inside `Compiler` makes their field stores follow the
+    /// same safety contract as top-level compact `putfield`: only a mapped,
+    /// genuinely compact, young receiver whose old field is null is written
+    /// directly. Every case requiring SATB/card barriers goes through
+    /// `jit_putfield_object`.
+    fn emit_inline_body_compact_ref_putfield(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+        compact_body_offset: u32,
+    ) {
+        let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+        let mut bail: Vec<usize> = Vec::new();
+
+        self.load_slot_to_reg(RAX, obj_slot);
+        bail.extend(self.emit_guarded_getfield_receiver_check(self.helpers.region_bounds_addr));
+
+        // A registered compact class may still have legacy instances when a
+        // synthetic/native allocation used a mismatched slot count.
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
+
+        // Old receiver needs a generational card mark.
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+
+        // A non-null old value needs the SATB pre-barrier.
+        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+        self.emit_test_r64_r64(RCX);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
+
+        // Match the interpreter/helper's silent out-of-bounds drop.
+        self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
+        self.emit_mov_imm64(RDX, field_index as i64);
+        self.emit_cmp_r32_r32(RDX, RCX);
+        let oob = self.emit_jcc_rel32_patch(0x83); // JAE -> drop
+
+        // Compact reference fields are bare 8-byte pointers.
+        self.load_slot_to_reg(RDX, val_slot);
+        self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        let done = self.emit_jmp_rel32_patch();
+
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+
+        self.patch_rel32_to_here(oob);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Constructor-only specialization for the first syntactic write to a
+    /// compact reference field.
+    ///
+    /// JVM verification only permits `<init>` on a non-null uninitialized
+    /// object produced by `new`. The inline resolver additionally admits only
+    /// empty super-constructor chains and forward control flow. Therefore the
+    /// first write to a given field starts from null and its resolved slot is
+    /// in bounds. A young compact receiver needs no barrier; the only runtime
+    /// checks retained are the per-object compact flag (synthetic allocations
+    /// can still use legacy cells) and old-generation bit (allocation spill).
+    fn emit_inline_fresh_ctor_compact_ref_putfield(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+        compact_body_offset: u32,
+    ) {
+        let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+        let mut bail: Vec<usize> = Vec::new();
+
+        self.load_slot_to_reg(RAX, obj_slot);
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+
+        self.load_slot_to_reg(RDX, val_slot);
+        self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        let done = self.emit_jmp_rel32_patch();
+
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+
+        self.patch_rel32_to_here(done);
+    }
+
     fn emit_inline_tlab_new(
         &mut self,
         class_id_raw: u32,
@@ -15858,11 +15978,47 @@ impl Compiler {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
                         if type_tag == b'L' || type_tag == b'[' {
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                            self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                            self.emit_call_absolute(self.helpers.putfield_object);
+                            let compact_offset = site
+                                .compact_field_info
+                                .iter()
+                                .find(|(p, _, is_ref)| *p == cpc && *is_ref)
+                                .map(|(_, offset, _)| *offset);
+                            let fresh_ctor_first_store =
+                                inline_site_is_fresh_ctor_first_store(&site, cpc, field_index);
+                            if inline_putfield_enabled()
+                                && cratonvm_types::compact_ref_fields_enabled()
+                                && self.helpers.region_bounds_addr != 0
+                            {
+                                if let Some(offset) = compact_offset {
+                                    if fresh_ctor_first_store {
+                                        self.emit_inline_fresh_ctor_compact_ref_putfield(
+                                            obj_slot,
+                                            val_slot,
+                                            field_index,
+                                            offset,
+                                        );
+                                    } else {
+                                        self.emit_inline_body_compact_ref_putfield(
+                                            obj_slot,
+                                            val_slot,
+                                            field_index,
+                                            offset,
+                                        );
+                                    }
+                                } else {
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                    self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                    self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                                    self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                    self.emit_call_absolute(self.helpers.putfield_object);
+                                }
+                            } else {
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                self.emit_call_absolute(self.helpers.putfield_object);
+                            }
                         } else {
                             self.load_slot_to_reg(ARG_REGS[0], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
@@ -37866,6 +38022,7 @@ mod tests {
             callee_is_static,
             return_type,
             field_info: Vec::new(),
+            compact_field_info: Vec::new(),
             static_field_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
@@ -37875,6 +38032,31 @@ mod tests {
             descriptor,
             elided_invoke_pcs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inline_ctor_fresh_store_proof_rejects_repeated_and_non_ctor_writes() {
+        let mut site = make_inline_site(
+            &[
+                0xb5, 0x00, 0x01, // pc 0: first write of field 0
+                0xb5, 0x00, 0x01, // pc 3: repeated write of field 0
+                0xb5, 0x00, 0x02, // pc 6: first write of field 1
+                0xb1,
+            ],
+            3,
+            3,
+            false,
+            b'V',
+        );
+        site.method_name = "<init>".to_string();
+        site.field_info = vec![(0, 0, b'L'), (3, 0, b'L'), (6, 1, b'L')];
+
+        assert!(inline_site_is_fresh_ctor_first_store(&site, 0, 0));
+        assert!(!inline_site_is_fresh_ctor_first_store(&site, 3, 0));
+        assert!(inline_site_is_fresh_ctor_first_store(&site, 6, 1));
+
+        site.method_name = "setFields".to_string();
+        assert!(!inline_site_is_fresh_ctor_first_store(&site, 0, 0));
     }
 
     #[test]

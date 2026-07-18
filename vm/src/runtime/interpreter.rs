@@ -1101,6 +1101,23 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// Used by allocation helpers when the fast-path allocation fails.
 /// Public wrapper so sibling modules (exceptions, invokedynamic) can force a
 /// GC cycle when a direct allocation fails.
+/// Self-call identity proof for the raw direct self-recursive CALL routing
+/// (see `cratonvm_jit::set_self_call_identity_stable`): true iff `class_id`
+/// was defined by a BUILTIN loader (bootstrap/extension/application) AND the
+/// loader-blind global name lookup maps the class's name back to this exact
+/// `ClassId`. Builtin loader registries hold one class per name and resolve a
+/// self-reference to the already-defined class, so a same-named shadow can
+/// never rebind the target; `UserDefined` loaders (enhancement/duplicating
+/// loaders) return false and keep the dispatch route.
+fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(class_id) else {
+        return false;
+    };
+    !matches!(class.loader_id, cratonvm_types::ClassLoaderId::UserDefined(_))
+        && cm.find_class_by_name(&class.name) == Some(class_id)
+}
+
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
 }
@@ -2320,7 +2337,8 @@ fn tlab_alloc_object_inner(
         use std::sync::atomic::Ordering;
         const NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES: u64 = 65_536;
         let entries = TLAB_SLOWPATH_ENTRIES_SINCE_GC.fetch_add(1, Ordering::Relaxed) + 1;
-        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc() {
+        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc_for_jit_allocation()
+        {
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
             maybe_gc_forced(shared, thread);
@@ -24061,6 +24079,28 @@ fn force_native_over_real_jdk_bytecode(
                 | ("componentType", "()Ljava/lang/Class;")
         )
     {
+    if is_netty_event_executor_group_shutdown_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_springboot_mongo_reactive_customizer_destroy_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_springboot_mongo_reactive_customizer_customize_native_override(
+        class_name,
+        method_name,
+        method_descriptor,
+    ) {
+        return true;
+    }
+    if is_datagram_channel_open_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Tomcat application methods are never registered native overrides apart
@@ -25907,6 +25947,80 @@ fn is_jfr_metadata_native_override(
         ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
             | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
     )
+}
+
+/// Keep MongoDB Reactive Streams' Netty 4.2 group teardown bounded when a
+/// closed monitor callback keeps its default graceful-shutdown quiet period
+/// alive. The native checks the receiver class, so unrelated Netty executors
+/// continue through their original bytecode.
+pub(crate) fn is_netty_event_executor_group_shutdown_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "io/netty/util/concurrent/EventExecutorGroup"
+            | "io/netty/util/concurrent/AbstractEventExecutorGroup"
+            | "io/netty/channel/MultiThreadIoEventLoopGroup"
+    )
+        && method_name == "shutdownGracefully"
+        && method_descriptor == "()Lio/netty/util/concurrent/Future;"
+}
+
+/// Spring Boot's Mongo reactive lifecycle bean waits indefinitely on a Netty
+/// promise that can remain incomplete after its event-loop workers are gone.
+/// The native replacement requests shutdown and returns without that wait.
+pub(crate) fn is_springboot_mongo_reactive_customizer_destroy_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name
+        == "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer"
+        && method_name == "destroy"
+        && method_descriptor == "()V"
+}
+
+pub(crate) fn is_springboot_mongo_reactive_customizer_customize_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    class_name
+        == "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer"
+        && method_name == "customize"
+        && method_descriptor == "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+}
+
+/// JDK 25's JNDI DNS client can use either `DatagramChannel` factory. Its real
+/// `DatagramChannelImpl` path does not share CratonVM's fd-table state, so the
+/// factories and the synthetic channel's local-address accessor must select
+/// the native UDP bridge.
+pub(crate) fn is_datagram_channel_open_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    if matches!(
+        class_name,
+        "java/nio/channels/DatagramChannel" | "java/nio/channels/NetworkChannel"
+    )
+        && method_name == "getLocalAddress"
+        && method_descriptor == "()Ljava/net/SocketAddress;"
+    {
+        return true;
+    }
+    if class_name == "java/nio/channels/DatagramChannel"
+        && method_name == "open"
+        && method_descriptor == "()Ljava/nio/channels/DatagramChannel;"
+    {
+        return true;
+    }
+    method_descriptor == "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;"
+        && ((class_name == "java/nio/channels/DatagramChannel" && method_name == "open")
+            || (class_name == "sun/nio/ch/SelectorProviderImpl"
+                && method_name == "openDatagramChannel"))
 }
 
 fn redefine_immune_forced_native(
@@ -31292,6 +31406,10 @@ fn try_jit_upgrade_with_gate(
             };
             let c_helpers = crate::jit::helpers::build_helpers();
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
+            crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+                shared,
+                callee_cached.declaring_class_id,
+            ));
             let mut compiled = crate::jit::try_compile(
                 &callee_cached,
                 Some(&c_resolver),
@@ -31432,6 +31550,10 @@ fn try_jit_upgrade_with_gate(
     // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
     let main_inline_on = crate::runtime::env_cache::jit_main_inline();
     let string_layout_resolver = || resolve_string_field_layout(shared);
+    crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+        shared,
+        cached.declaring_class_id,
+    ));
     let mut compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -32123,6 +32245,10 @@ fn try_jit_compile_callee_slow(
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
     let compile_start = std::time::Instant::now();
+    crate::jit::set_self_call_identity_stable(self_call_identity_stable(
+        shared,
+        cached.declaring_class_id,
+    ));
     let mut compiled = crate::jit::try_compile(
         &cached,
         Some(&resolver),
@@ -33034,8 +33160,21 @@ fn resolve_inline_site(
     // Phase 2 — resolve field refs with NO class_manager guard held (see
     // the lock-order comment above).
     let mut field_info = Vec::new();
+    let mut compact_field_info = Vec::new();
     for (fpc, cp_idx, type_tag) in field_sites {
         if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
+            if cratonvm_types::compact_ref_fields_enabled() {
+                if let Some(layout) =
+                    cratonvm_types::class_layout(resolved.declaring_class_id.as_u32())
+                {
+                    if let (Some(off), Some(is_ref)) = (
+                        layout.field_offset(resolved.field_index),
+                        layout.field_is_ref(resolved.field_index),
+                    ) {
+                        compact_field_info.push((fpc, off, is_ref));
+                    }
+                }
+            }
             field_info.push((fpc, resolved.field_index, type_tag));
         }
     }
@@ -33060,6 +33199,7 @@ fn resolve_inline_site(
         callee_is_static: is_static,
         return_type,
         field_info,
+        compact_field_info,
         static_field_info,
         ldc_info,
         ldc2w_info,
@@ -38806,6 +38946,87 @@ mod tests {
             "liquibase/serializer/core/string/StringChangeLogSerializer$FieldFilter",
             "include",
             "(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Object;)Z"
+        ));
+    }
+
+    #[test]
+    fn netty_mongodb_event_loop_shutdown_bridge_is_forced_at_each_resolved_owner() {
+        let descriptor = "()Lio/netty/util/concurrent/Future;";
+        for class_name in [
+            "io/netty/util/concurrent/EventExecutorGroup",
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "io/netty/channel/MultiThreadIoEventLoopGroup",
+        ] {
+            assert!(is_netty_event_executor_group_shutdown_native_override(
+                class_name,
+                "shutdownGracefully",
+                descriptor
+            ));
+            assert!(force_native_over_real_jdk_bytecode(
+                class_name,
+                "shutdownGracefully",
+                descriptor
+            ));
+        }
+        assert!(!is_netty_event_executor_group_shutdown_native_override(
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "shutdownGracefully",
+            "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;"
+        ));
+    }
+
+    #[test]
+    fn springboot_mongo_reactive_destroy_wait_is_replaced_only_for_its_lifecycle_bean() {
+        let class_name = "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer";
+        assert!(is_springboot_mongo_reactive_customizer_destroy_native_override(
+            class_name,
+            "destroy",
+            "()V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            class_name,
+            "destroy",
+            "()V"
+        ));
+        assert!(!is_springboot_mongo_reactive_customizer_destroy_native_override(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+        assert!(is_springboot_mongo_reactive_customizer_customize_native_override(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            class_name,
+            "customize",
+            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+        ));
+    }
+
+    #[test]
+    fn datagram_channel_factories_are_forced_to_the_udp_bridge() {
+        let descriptor = "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;";
+        assert!(is_datagram_channel_open_native_override(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            descriptor
+        ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            descriptor
+        ));
+        assert!(is_datagram_channel_open_native_override(
+            "sun/nio/ch/SelectorProviderImpl",
+            "openDatagramChannel",
+            descriptor
+        ));
+        assert!(is_datagram_channel_open_native_override(
+            "java/nio/channels/DatagramChannel",
+            "open",
+            "()Ljava/nio/channels/DatagramChannel;"
         ));
     }
 

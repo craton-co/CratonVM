@@ -178,6 +178,7 @@ const SK_ATTACHMENT: usize = 4;
 enum SelectableHandle {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
     /// Registered without a live handle — `kernel_select` skips it; useful
     /// for lifecycle tests that want a key in the map without a real socket.
     Dummy,
@@ -189,6 +190,7 @@ enum SelectableHandle {
 pub enum SelectableKind {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
 }
 
 impl SelectableHandle {
@@ -200,6 +202,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_fd() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_fd() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_fd() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -210,6 +213,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_socket() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_socket() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_socket() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -610,6 +614,10 @@ pub fn selector_register(
             let _ = s.set_nonblocking(true);
             SelectableHandle::Stream(s)
         }
+        Some(SelectableKind::Udp(s)) => {
+            let _ = s.set_nonblocking(true);
+            SelectableHandle::Udp(s)
+        }
         None => SelectableHandle::Dummy,
     };
     let regs = selectors().read();
@@ -835,10 +843,10 @@ fn finish_in_flight_linux_select(id: i32) {
 /// interest mask). Drains the wakeup pipe before returning.
 #[cfg(target_os = "linux")]
 fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed> {
-    // Phase 1: snapshot prerequisites under the lock — fd, interest map,
-    // listener-set, connect candidates, current epoll fd. Then release the lock
-    // so wakeup() can hit it during the actual epoll_wait.
-    let (efd, interests, listeners, connect_candidates) = {
+    // Phase 1: snapshot prerequisites under the lock — fd and connect
+    // candidates. Interest bits intentionally remain live for phase 3. Then
+    // release the lock so wakeup() can hit it during the actual epoll_wait.
+    let (efd, connect_candidates) = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
@@ -884,8 +892,6 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             Some(v) => v,
             None => return Err(ioex("Selector.select: epoll init failed")),
         };
-        let mut interests = HashMap::with_capacity(st.keys.len());
-        let mut listeners = HashMap::with_capacity(st.keys.len());
         // net_fds of keys with OP_CONNECT interest backed by a non-blocking
         // connect. epoll usually reports connect-completion as EPOLLOUT, but
         // the selector polls a cloned fd while finishConnect() operates on the
@@ -893,8 +899,6 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         // loopback connect cannot be missed and strand Netty's event loop.
         let mut connect_candidates: Vec<i32> = Vec::new();
         for (net_fd, k) in st.keys.iter() {
-            interests.insert(*net_fd, k.interest_ops);
-            listeners.insert(*net_fd, k.handle.is_listener());
             if !k.handle.is_listener() && k.interest_ops & OP_CONNECT != 0 && k.net_fd > 0 {
                 connect_candidates.push(k.net_fd);
             }
@@ -902,7 +906,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         // From this point until phase 3, selector_close() must retain the
         // wakeup handles because epoll_wait may be asleep without this lock.
         st.in_flight_selects += 1;
-        (efd, interests, listeners, connect_candidates)
+        (efd, connect_candidates)
     };
 
     // Phase 1b: actively probe each OP_CONNECT candidate's original socket for
@@ -998,24 +1002,25 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             continue;
         }
         let net_fd = ev.u64 as i32;
-        let interest = match interests.get(&net_fd) {
-            Some(v) => *v,
-            None => continue, // Race: key was removed/cancelled.
+        // `interest_ops` can change while epoll_wait is blocked (Tomcat arms
+        // OP_WRITE after a partial gathering write). Applying this event with
+        // the phase-1 snapshot can report a stale OP_READ bit, which makes the
+        // phase-3 safety probe skip this key and strands the newly armed write.
+        // Re-read the live key under this lock so the readiness mask and the
+        // later probe observe the same selector state.
+        let Some(k) = st.keys.get_mut(&net_fd) else {
+            continue; // Race: key was removed/cancelled.
         };
-        let is_listener = *listeners.get(&net_fd).unwrap_or(&false);
-        let ready = linux_ready_for(ev.events as i32, interest, is_listener);
-        // Translate _, _ — borrow check juggling: take a non-mut snapshot,
-        // then reapply.
+        let is_listener = k.handle.is_listener();
+        let ready = linux_ready_for(ev.events as i32, k.interest_ops, is_listener);
         if ready != 0 {
-            if let Some(k) = st.keys.get_mut(&net_fd) {
-                k.ready_ops = ready;
-                count += 1;
-                if is_listener && ready & OP_ACCEPT != 0 {
-                    if let SelectableHandle::Listener(listener) = &k.handle {
-                        match listener.accept() {
-                            Ok((stream, _)) => accepted_streams.push((net_fd, stream)),
-                            Err(_) => {}
-                        }
+            k.ready_ops = ready;
+            count += 1;
+            if is_listener && ready & OP_ACCEPT != 0 {
+                if let SelectableHandle::Listener(listener) = &k.handle {
+                    match listener.accept() {
+                        Ok((stream, _)) => accepted_streams.push((net_fd, stream)),
+                        Err(_) => {}
                     }
                 }
             }
@@ -1045,16 +1050,24 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     // the selector may otherwise sleep until a later wakeup and reactor tests
     // observe request timeouts. The nonblocking probe is the same conservative
     // readiness check used by the generic selector fallback, applied only to
-    // keys that epoll/connect-probe have not already marked ready this cycle.
+    // interest bits that epoll/connect-probe have not already marked ready this cycle.
+    // A read event that raced an OP_WRITE arm must not suppress the write probe.
     let mut probed_accepts: Vec<(i32, TcpStream)> = Vec::new();
     for (fd, k) in st.keys.iter_mut() {
-        if k.cancelled || k.ready_ops != 0 || k.interest_ops == 0 {
+        if k.cancelled || k.interest_ops == 0 {
             continue;
         }
-        let (ready, accepted) = probe_handle(&k.handle, k.interest_ops);
+        let missing_interest = k.interest_ops & !k.ready_ops;
+        if missing_interest == 0 {
+            continue;
+        }
+        let (ready, accepted) = probe_handle(&k.handle, missing_interest);
         if ready != 0 {
-            k.ready_ops = ready;
-            count += 1;
+            let was_zero = k.ready_ops == 0;
+            k.ready_ops |= ready;
+            if was_zero {
+                count += 1;
+            }
         }
         if let Some(stream) = accepted {
             probed_accepts.push((*fd, stream));
@@ -1563,6 +1576,20 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                 ready |= OP_WRITE;
             }
         }
+        SelectableHandle::Udp(socket) => {
+            if interest & OP_READ != 0 {
+                let mut buf = [0u8; 1];
+                match socket.peek(&mut buf) {
+                    Ok(n) if n > 0 => ready |= OP_READ,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+            if interest & OP_WRITE != 0 {
+                ready |= OP_WRITE;
+            }
+        }
         SelectableHandle::Dummy => {}
     }
     (ready, accepted)
@@ -1842,6 +1869,7 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // The channel's registry id lives in the socket_channel side-table now
     // (its F_REG_ID object slot collides with a real-JDK reference field).
     crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
@@ -2410,7 +2438,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (its F_REG_ID object slot collides with a real-JDK reference field and
     // would coerce to null). A negative fd means the channel is not bound /
     // connected; selector_register still records the key (interest only).
-    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel).unwrap_or(-1);
+    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+        .unwrap_or(-1);
 
     // If the registered channel is backed by an entry in the WP3.4
     // tcp_registry, hand the selector a clone of the live socket so
@@ -2422,7 +2452,7 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Some(SelectableKind::Listener(l))
         }
         Some(crate::socket_channel::TcpHandleClone::Stream(s)) => Some(SelectableKind::Stream(s)),
-        None => None,
+        None => crate::datagram_channel_udp_clone(ctx, channel).map(SelectableKind::Udp),
     };
 
     let key_obj = ctx
@@ -2493,7 +2523,9 @@ fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     // The channel's net fd (tcp_registry id) is the per-selector key into the
     // registration map — exactly what `channel_register_native` stored under.
-    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel) else {
+    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+    else {
         // Not bound / connected → no live registration to find.
         return Ok(Some(Value::Object(None)));
     };
@@ -3421,6 +3453,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/SocketChannelImpl",
         "java/nio/channels/ServerSocketChannel",
         "sun/nio/ch/ServerSocketChannelImpl",
+        "java/nio/channels/DatagramChannel",
+        "sun/nio/ch/DatagramChannelImpl",
     ] {
         r.register(
             c,

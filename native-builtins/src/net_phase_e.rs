@@ -9351,13 +9351,29 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     );
     // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
     // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
-    // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
+    // keyed by ObjectRef via engine_id_or_alloc).  It is intentionally a
+    // synthetic allocation, but it still participates in real JDK bytecode:
+    // Netty configures ALPN through SSLEngineImpl's
+    // setHandshakeApplicationProtocolSelector(), which takes engineLock.  A
+    // bare allocation leaves that final constructor field null and turns a
+    // normal TLS setup into an NPE.  Supply the one JDK-visible invariant that
+    // method needs without running SSLEngineImpl's full JSSE constructor (the
+    // rustls-backed native state owns the rest of the engine lifecycle).
     for desc in [
         "()Ljavax/net/ssl/SSLEngine;",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
             let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            let lock = match ctx.new_object_initialized(
+                "java/util/concurrent/locks/ReentrantLock",
+                "()V",
+                &[],
+            )? {
+                Some(Value::Object(Some(lock))) => lock,
+                _ => return Err(npe("ReentrantLock <init> failed")),
+            };
+            ctx.set_field_by_name(eng, "engineLock", Value::Object(Some(lock)));
             // Copy this SSLContext's per-context identity (its keystore cert+key)
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
@@ -9453,6 +9469,15 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 _ => None,
             }
             .or_else(crate::t27_tls::huc_default_client_identity);
+            #[cfg(unix)]
+            let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
+            #[cfg(unix)]
+            let legacy_dsa_client = client_ident
+                .as_ref()
+                .is_some_and(|(_, key_pem)| crate::t27_tls::is_dsa_private_key_pem(key_pem))
+                || legacy_dsa_roots
+                    .iter()
+                    .any(|der| crate::t27_tls::is_dsa_certificate_der(der));
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot
@@ -9482,10 +9507,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // forever for this thread to reach a safepoint it can't reach until
             // the (now-deadlocked-behind-the-GC) network call returns.
             ctx.begin_blocking_region();
-            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16);
+            #[cfg(unix)]
+            let connect_result = if legacy_dsa_client {
+                crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+            } else {
+                crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                    .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                    .map_err(std::io::Error::other)
+            };
+            #[cfg(not(unix))]
+            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
-            let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);

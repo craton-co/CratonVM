@@ -952,6 +952,17 @@ impl VmHeap {
         }
     }
 
+    /// GC trigger queried from a JIT allocation/refill helper while the
+    /// compiled caller remains discoverable on the native stack.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.needs_gc_for_jit_allocation(),
+            VmHeap::G1(h) => h.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.needs_gc(),
+        }
+    }
+
     /// Native-wrapper young-exhaustion signal, consumed at the
     /// `safe_native_call` boundary to run the GC the wrappers themselves
     /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the

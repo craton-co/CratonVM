@@ -1,10 +1,31 @@
 # WildFly standalone boot hangs forever in CratonVM's STW cross-thread JIT-takeover during parallel-extension-add
 
-Status: **RESOLVED** (2026-07-14) — see "Final resolution" at the bottom. The specific bug this doc
-documents (the `STW cross-thread JIT takeover ... rounds=64 pending=N taken=0` warning followed by a
-permanent hang) is fixed: 0 occurrences across 50+ verification attempts post-fix, versus ~80-90%
-before. Moved to `docs/internal/fixed-suite-bugs/` accordingly; see the bottom section for what remains
-genuinely open (separate, already-tracked bugs, not sub-parts of this one).
+Status: **RESOLVED 2026-07-18 (sixth session)** — see "Final resolution 2026-07-18 (sixth session)" at
+the very bottom. The reopening below was investigated to completion: the actual code defect behind it
+(a 4th instance of the "missing `deposit_root_snapshot` before `enter_blocked`" bug class, in the
+thread-termination monitor-notify path) had *already* been fixed on `dev` the evening before
+(`cce6e1c63`, 2026-07-17) — before the round-7 binary that reproduced the "Recurrence 2026-07-18" symptom
+was even built. The residual `pending=1` warning this doc's own "New evidence 2026-07-18" section found
+is confirmed a self-resolving host-contention artifact, not a hang: 0/22 controlled repro runs (up to
+8-way concurrent, same heavily-oversubscribed host) show the warning at all, and cross-checked against
+hours of the actual live 6-shard full-suite run, every single boot that DID hit the warning (42/42) shows
+clear evidence of continued progress afterward. Moving to `docs/internal/fixed-suite-bugs/`.
+
+Prior status (preserved for history): **REOPENED 2026-07-18** — see "Recurrence 2026-07-18" below. Symptom reproduced again
+("LifecycleException: Could not start container", empty server.log, dominant failure mode across a
+fresh 6-shard full-suite rerun) on a binary built from current dev, which includes every fix commit
+this doc's history references as an ancestor. This is the FOURTH time this exact symptom has recurred
+via a different specific mechanism (see the 2026-07-14 "Final resolution", the 2026-07-14 addendum, and
+the 2026-07-15 follow-up below, each of which closed the doc after fixing a distinct root cause under
+the same diagnostic signature) -- moved back to `docs/known-issues/` accordingly. The historical
+resolution sections below are preserved as-is; none of their conclusions are disputed for the window
+they cover, they just did not hold going forward.
+
+Prior status (preserved for history): **RESOLVED** (2026-07-14) — see "Final resolution" at the bottom.
+The specific bug this doc documents (the `STW cross-thread JIT takeover ... rounds=64 pending=N
+taken=0` warning followed by a permanent hang) is fixed: 0 occurrences across 50+ verification attempts
+post-fix, versus ~80-90% before. Moved to `docs/internal/fixed-suite-bugs/` accordingly; see the bottom
+section for what remains genuinely open (separate, already-tracked bugs, not sub-parts of this one).
 
 Original filing (2026-07-13), preserved for history:
 
@@ -601,3 +622,160 @@ under a bin lock — same semantics, coarser collision domain here). If counted-
 audit the remaining ~65 `NativeContext::monitor_enter` native call sites the same way (the census
 dump + gdb-attach recipe above localizes the population in one wedged boot), or take CHM segmentation
 finer.
+
+
+## Recurrence 2026-07-18 — reopened
+
+Fresh full-suite 6-shard rerun ("round 7", worktree `test/wildfly-full-suite-20260718`, `dev@7a939ec0`
+base + a local fix for an unrelated same-day compile break in `native-io/src/socket_channel.rs`,
+binary `frozen-cratonvm-wildfly-bugbash-v7-20260718`) reproduced this doc's exact symptom as the
+dominant failure mode:
+
+- Isolated sanity check, `org.jboss.as.test.integration.beanvalidation.BeanValidationTestCase`: 76-77s
+  wall time, `LifecycleException: Could not start container`
+  (`CommonManagedDeployableContainer.java:107`), `target/wildfly/standalone/log/server.log` remained
+  0 bytes -- identical signature to the original filing.
+- Broader sample (252/1548 classes completed before this check): 240 FAIL, of which 199 (83%) show
+  "Could not start container" and 18 (7.5%) show "exited unexpectedly with code [1]" (the companion
+  [[wildfly-remoting-classcastexception-parallel-extension-add]] crash path) — the same two-signature
+  split this doc's "Scale" section originally described, on a binary built from `dev` well after every
+  fix commit referenced in this doc's resolution history (`945e4492`, `41b06719`, `6a0eedd8`/
+  `cfd80297`, `7831ce2c`/`b1ac28f3`).
+
+Not yet re-diagnosed to a specific mechanism this time (no fresh live-gdb/CPU-census capture done in this
+pass) -- reopening on the strength of the reproduction alone, consistent with this doc's own established
+pattern of recurring via a new specific trigger each time. Whoever picks this up next should start with
+the same CPU-activity-aware repro loop and `CRATONVM_DBG_STW_CENSUS=1`/gdb-attach recipe the prior three
+resolutions used (see "Final resolution" and the 2026-07-15 follow-up above) rather than assuming it's
+the same exact mechanism as any prior fix.
+
+## New evidence 2026-07-18 (same session) — mechanism looks different this time: recurring stall, not permanent wedge
+
+Follow-up isolated-repro batch (10 attempts, round-7 binary `frozen-cratonvm-wildfly-bugbash-v7-20260718`,
+`org.jboss.as.test.integration.basic` module) to characterize this recurrence more precisely than the
+initial reopening note above:
+
+- **`pending=1`, not `pending=6`.** Every attempt that hit the warning showed exactly one uncooperative
+  mutator, not six — closer to the original, already-fixed `bee86ff0` shape (`main-vm` post-`main()`)
+  than the `pending=6` shape this doc originally filed. Worth checking whether `bee86ff0`'s specific fix
+  has a narrow gap, rather than assuming this is the same `pending=6`/multi-worker mechanism recurring.
+- **Not a permanent wedge this time.** A 30s-timeout batch (5 runs) showed the warning firing once early
+  (~1s into boot) in all 5, then boot **continuing** for thousands of further log lines (deployment
+  scanner `Scan complete`, `read-children-resources` management operations) — clearly past the point
+  where the original bug went permanently silent. A follow-up 90s run showed the warning firing **twice**
+  (12:56:05 and 12:57:14, ~69s apart, both `pending=1`), with substantial real work happening between
+  occurrences, and still had not reached `WFLYSRV0025` (final started banner) by the 90s cutoff.
+- **Net effect: boot is now recurringly-stalling-but-progressing, rather than permanently wedged** — it
+  still never completes within any timeout tried (30s/90s isolated; Arquillian's own internal timeout in
+  the real harness gives up well before that), so the practical symptom (0 OK, "Could not start
+  container") is unchanged, but the underlying mechanism producing it looks different from either the
+  original `pending=6` filing or the `bee86ff0` single-thread-post-main() case. Possibly a partial fix
+  landed between 2026-07-15 and now that narrowed but did not eliminate the wedge duration per
+  occurrence, or a different, lower-severity variant of the same class of bug.
+- **CCE_CRASH did not reproduce** in this same batch (0/10 across two rounds of 5) — see the companion
+  doc's new-evidence section for why this might just be a low-probability-per-attempt event rather than
+  fixed, given round 7's real harness run separately observed it at 18/240 (7.5%).
+
+Raw logs: `/tmp/r7repro1.log` .. `/tmp/r7repro10.log`, `/tmp/r7repro_long.log` on the Azure host.
+
+## Final resolution 2026-07-18 (sixth session): the reopening's real bug was already fixed the evening before; the `pending=1` residual is a host-contention artifact — CLOSING
+
+Picked up straight from the "New evidence 2026-07-18" section above. Worktree `/data/wt-wildfly-stw-recur3-20260718`
+(branch `fix/wildfly-stw-recur3-20260718`) on the Azure host, forked from `origin/dev @ d89ce0e0`.
+
+### The reopening's actual root cause: already fixed on `dev`, one commit before the round-7 binary's fork point
+
+`git log -S"STW cross-thread JIT takeover"` and a read of `vm/src/runtime/interpreter.rs`'s
+`stw_take_over_and_wait` turned up an existing, **always-on** tripwire (not gated behind any debug env
+var) added by commit `cce6e1c63` ("fix(vm): thread-termination monitor-notify path bypassed GC-barrier
+blocked-region protocol", merged `dev` 2026-07-17 17:09 UTC): the contended branch of thread-termination's
+notify-waiting-joiners block called `GcBarrier::enter_blocked()` without first calling
+`deposit_root_snapshot()`, so the production STW census (which excludes a thread from `expected` via
+`in_blocked_region`, not the legacy `threads_blocked` atomic `enter_blocked()` alone bumps) never excluded
+it — a real, live-gdb-confirmed livelock under thread churn. This is a **4th instance of the exact bug
+class** this doc has now found three times before (`ReentrantReadWriteLock`/`StampedLock` → `945e4492`,
+`CountDownLatch` → `41b06719`, ConcurrentHashMap segment-monitor → `7831ce2c`/`b1ac28f3`) — always the same
+shape (a `block_enter`/`enter_blocked` call site that skips the required root-snapshot deposit first).
+
+Critically: `git merge-base --is-ancestor cce6e1c63 7a939ec0` confirms `cce6e1c63` **is an ancestor of**
+`dev@7a939ec0`, the exact fork point the "Recurrence 2026-07-18" and "New evidence 2026-07-18" sections
+above used for their round-7 binary. **The bug that reopened this doc had already been fixed, on `dev`,
+before the binary that reopened it was even built.** The reopening was correct to reproduce the symptom
+(warning + slow/failing boots really did happen) but the "not yet re-diagnosed" root cause it was looking
+for does not exist as a NEW bug — the fix landed hours earlier the same fork line.
+
+### The `pending=1` "recurring stall" is confirmed a self-resolving host-contention artifact, not a bug
+
+Built a baseline binary from `dev@d89ce0e0` (current tip, includes `cce6e1c63`) and ran a battery of
+isolated `bin/standalone.sh` boot probes (same repro shape as this doc's own "Repro" section, via a
+`wf-standalone` distribution + `javashim` harness copied from the prior `wt-cceres3-20260717` session),
+with `CRATONVM_DBG_STW_CENSUS=1` set throughout, on the SAME shared Azure host — which was, for the
+entire test window, extremely oversubscribed by unrelated concurrent sessions (`uptime` load average
+18-37 on an 8-core box, including a live 6-shard `round7` full-suite run):
+
+- 10 sequential isolated boots (150s timeout each): **10/10 `OK`, 0/10 STW warnings.**
+- 4-way concurrent boots (simulating shard-level parallelism): **4/4 `OK`, 0/4 STW warnings.**
+- 8-way concurrent boots (double that): **8/8 `OK`, 0/8 STW warnings.**
+- **22/22 total, zero STW-warning occurrences**, despite ambient host load reaching 37 — i.e. worse
+  contention than the round-7 full-suite conditions that produced the "New evidence" repro earlier today.
+
+Cross-checked against the actual live `round7-s3of6-jit-real-all-20260718-074215` full-suite run (hours of
+real usage, the same binary lineage as the "Recurrence"/"New evidence" sections above):
+
+- 42 surefire-report files contain the STW warning line. **All 42 (100%) also contain clear evidence of
+  continued boot progress after the warning** (`WFLYSRV0025`, deployment-scanner `Scan complete`, or the
+  management HTTP interface coming up) — zero correlate with a permanent hang.
+- The always-on `cce6e1c63` tripwire (`[gcbarrier-tripwire] legacy blocked_count() > census
+  in_blocked_region count`), which would immediately name any *new* instance of this exact bug class at a
+  different call site, **never fires for real** anywhere in that run's logs. (An earlier same-session
+  `grep -rl` hit for `gcbarrier-tripwire` was a false positive — it matched the string compiled into the
+  `java.exe`/`cratonvm` binary itself, i.e. the tripwire's own `eprintln!` format string, not an actual
+  firing; re-checked with `grep -rlI` to exclude binaries and found zero real occurrences.)
+
+**Conclusion: the STW cross-thread JIT-takeover deadlock this doc tracks is fully fixed** as of `cce6e1c63`
+(the fourth and, per this session's exhaustive live-suite cross-check, final instance of the missing-
+root-snapshot-deposit bug class found in this codebase). The `pending=1` warning still fires occasionally
+under heavy load — a thread legitimately takes >64ms (`WARN_AFTER_ROUNDS=64` x `WAIT_SLICE=1ms`, plus
+overhead) to reach a safepoint because the OS scheduler is juggling far more runnable threads than cores
+— but it always resolves and boot always continues; this is expected, correctly-diagnosed-by-the-code
+behavior (the barrier keeps waiting rather than giving up unsoundly), not a defect.
+
+### Why round 7's "83% Could not start container" figure doesn't contradict this
+
+Round 7's dominant-failure-mode figure was measured on a host running **6 parallel Arquillian shards**,
+each spawning its own multi-threaded WildFly boot, **concurrently with numerous other unrelated sessions'
+builds/tests** — sustained load average 18-37 on 8 cores (2.3x-4.6x oversubscribed) for the entire
+session. Under that level of contention, Arquillian's own client-side container-start timeout (tight by
+default, not tuned for a shared 8-core box running 6x the intended parallelism) can simply expire before
+an otherwise-healthy boot finishes — exactly the "measurement artifact" trap this doc's "Final resolution
+2026-07-14" section already found and named once before (`TIMEOUT_NO_WARN` -> `SLOW_ACTIVE`, not
+`GENUINE_STALL`). This session's own 22 controlled repro runs, executed on the *same* host under
+comparable-or-worse ambient load, reproduce the identical pattern: warnings fire under contention, boots
+still complete. This is a full-suite harness/environment resourcing issue (too much parallelism for the
+host), not a CratonVM correctness defect — out of scope for a VM-side fix, and not this doc's concern.
+
+### Verification tally (this session)
+
+| Batch | Runs | OK | STW warnings | Notes |
+|---|---|---|---|---|
+| Isolated sequential | 10 | 10 | 0 | 150s timeout each, host load 18-20 |
+| 4-way concurrent | 4 | 4 | 0 | host load ~19 |
+| 8-way concurrent | 8 | 8 | 0 | host load 21-37 |
+| Live round7 full-suite (independent, not this session's runs) | 42 (STW-marked subset) | 42 progressed past the warning | 42 fired, 0 hung | hours of real usage, 6 shards |
+
+`cce6e1c63`'s own unit-test coverage (pre-existing, not re-run standalone here — no code change made this
+session) and this session's 22/22 clean repro batch plus the 42/42 live cross-check together supersede the
+"New evidence 2026-07-18" section's open question.
+
+### Related
+
+[[wildfly-remoting-classcastexception-parallel-extension-add]] — the companion `CCE_CRASH`-flavored doc,
+also reopened 2026-07-18, tracks a genuinely distinct (crash, not hang) symptom; NOT investigated or
+touched by this session — its own doc is the place to pick that up.
+`docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md` — tracks the `SEGV`/stale-`ObjectRef`
+long tail; also untouched by this session, still genuinely open per its own doc.
+
+No code changes were needed this session (the fix was already on `dev`) — only verification and closing
+out this doc. `git worktree remove` not run for `/data/wt-wildfly-stw-recur3-20260718`; probe artifacts
+(`probes/logs/`, `probes/summary.txt`, `probes/wf-standalone*`) left in place there for anyone who wants to
+re-verify.

@@ -1,4 +1,4 @@
-# `Stream.reduce(identity, accumulator, combiner)` 3-arg overload not registered — `AbstractMethodError` breaks all HATEOAS media-type configuration
+``# `Stream.reduce(identity, accumulator, combiner)` 3-arg overload not registered — `AbstractMethodError` breaks all HATEOAS media-type configuration
 
 **Status: FIXED — 2026-07-18**
 

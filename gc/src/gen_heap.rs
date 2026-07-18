@@ -74,6 +74,43 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
+/// The default non-moving young collector does not need Cheney-copy headroom:
+/// it reclaims dead spans in place and falls back to allocation-failure GC for
+/// fragmentation.  Let transient allocation fill most of the active semi-space
+/// before paying the O(heap) mark/sweep cost.  The moving-young opt-in retains
+/// the conservative 50% trigger above so the to-space can hold all survivors.
+/// Keeping a 10% reserve also leaves room for TLAB refill granularity and avoids
+/// turning every near-capacity refill into an allocation-failure collection.
+const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
+
+#[inline]
+const fn young_gc_trigger_bytes(
+    capacity: usize,
+    moving_threshold: usize,
+    non_moving_young: bool,
+) -> usize {
+    if non_moving_young {
+        capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100
+    } else {
+        moving_threshold
+    }
+}
+
+#[inline]
+const fn next_young_gc_is_guaranteed_non_moving(
+    jit_active: bool,
+    unregistered_jit_frame: bool,
+    jit_allocation_frame: bool,
+    moving_young_requested: bool,
+    allow_moving_young: bool,
+    force_moving: bool,
+) -> bool {
+    !force_moving
+        && ((jit_active && !allow_moving_young)
+            || ((jit_active || unregistered_jit_frame || jit_allocation_frame)
+                && !moving_young_requested))
+}
+
 /// "Humongous" object threshold as a percentage of the young semi-space
 /// capacity.  Allocations whose total in-memory footprint
 /// (`HEADER_SIZE + array_data_size`) exceeds this fraction of one young
@@ -3041,6 +3078,19 @@ impl GenerationalHeap {
 
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(false)
+    }
+
+    /// The JIT allocation/refill helper calls this while its compiled caller
+    /// is still on the native stack. Even when that caller is the unregistered
+    /// compiled entry point, root gathering will detect it and select the
+    /// non-moving young collector, so that path may safely use its larger
+    /// occupancy trigger.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(true)
+    }
+
+    fn needs_gc_with_jit_allocation_frame(&self, jit_allocation_frame: bool) -> bool {
         let from = self.young_from.lock();
         let used = from.used();
         // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
@@ -3067,7 +3117,26 @@ impl GenerationalHeap {
         // itself, so this is a no-op there. The alloc-failure→GC-and-retry path
         // remains the hard backstop against fragmentation under-collection.
         let live = used.saturating_sub(from.free_list_bytes());
-        live >= *self.young_gc_threshold.lock()
+        // Cheney copying needs the unused half as worst-case survivor
+        // headroom. The default non-moving collector instead sweeps in place,
+        // so it can safely use the active semi-space almost to capacity.
+        // Only select the larger threshold when the next normal young cycle is
+        // guaranteed to take that path. In particular, `--nojit` collections
+        // remain moving even though `CRATONVM_MOVING_YOUNG` is unset.
+        let non_moving_young = next_young_gc_is_guaranteed_non_moving(
+            crate::gc_quiescence::is_active(),
+            crate::gc_quiescence::unregistered_jit_frame_on_stack(),
+            jit_allocation_frame,
+            crate::gc_quiescence::moving_young_enabled(),
+            std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_some(),
+            std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some(),
+        );
+        let threshold = young_gc_trigger_bytes(
+            from.capacity(),
+            *self.young_gc_threshold.lock(),
+            non_moving_young,
+        );
+        live >= threshold
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -10382,6 +10451,41 @@ mod tests {
         assert!(
             h_1k.young_semi_capacity() >= 1024,
             "tiny heap must still produce a non-trivial arena (>= 1 KiB)",
+        );
+    }
+
+    #[test]
+    fn young_gc_trigger_preserves_moving_headroom_but_fills_non_moving_space() {
+        let capacity = 1000;
+        let moving_threshold = 500;
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, false),
+            500,
+            "moving young must retain its configured Cheney-copy headroom",
+        );
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, true),
+            900,
+            "non-moving young should defer the O(heap) sweep until 90% occupancy",
+        );
+        let ordinary_cycle =
+            next_young_gc_is_guaranteed_non_moving(false, false, false, false, false, false);
+        assert!(!ordinary_cycle, "JIT-quiescent collection is moving by default");
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(true, false, false, false, false, false),
+            "live JIT frames require the default non-moving collector",
+        );
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(false, false, true, false, false, false),
+            "a JIT allocation helper has a compiled frame for root scanning",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, true, false),
+            "explicitly allowed moving-young must preserve copy headroom",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, false, false, true),
+            "the diagnostic forced-moving path must preserve copy headroom",
         );
     }
 
