@@ -22151,6 +22151,10 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
+                | (
+                    "forPrimitiveName",
+                    "(Ljava/lang/String;)Ljava/lang/Class;"
+                )
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24087,6 +24091,16 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Real JDK CRC32.updateBytes is a small validation wrapper around the
+    // registered updateBytes0 native. Keep that boundary native in every
+    // dispatch mode: compiled archive writers otherwise risk applying the
+    // public CRC representation as the complemented running state.
+    if class_name == "java/util/zip/CRC32"
+        && method_name == "updateBytes"
+        && method_descriptor == "(I[BII)I"
+    {
+        return true;
+    }
     if class_name == "java/io/File"
         && matches!(
             (method_name, method_descriptor),
@@ -24120,6 +24134,13 @@ fn force_native_over_real_jdk_bytecode(
         return false;
     }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // JFR's Type bootstrap table compares Class mirrors by reference.  A
+    // bootstrap type can reach this point through a separately materialised
+    // mirror, so run the registered bridge which canonicalises through the VM
+    // ClassId before delegating to JFR's String-keyed lookup.
+    if is_jfr_metadata_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // The platform-server bridge returns a synthetic MBeanServer receiver.
@@ -25828,6 +25849,34 @@ fn redefine_immune_path_native(
         && method_descriptor == "()Ljava/lang/String;"
 }
 
+fn redefine_immune_jfr_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    is_jfr_metadata_native_override(class_name, method_name, method_descriptor)
+}
+
+fn is_jfr_metadata_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, method_descriptor),
+        (
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;"
+        ) | (
+            "jdk/jfr/internal/util/Utils",
+            "getValidType",
+            "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;"
+        ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+            | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+    )
+}
+
 fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
@@ -25836,6 +25885,7 @@ fn redefine_immune_forced_native(
     redefine_immune_reflection_native(class_name, method_name)
         || redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || redefine_immune_jfr_native(class_name, method_name, method_descriptor)
         || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
 }
@@ -26801,6 +26851,30 @@ fn try_stackless_invoke(
             Some(Value::Object(Some(adapter))) => *adapter,
             _ => return None,
         };
+        // This is a narrow adaptation for a real-JDK MethodHandle wrapper
+        // around our synthetic DowncallHandle. `invoke` is an ordinary method
+        // name too (notably JUnit's InterceptingExecutableInvoker.invoke), so
+        // probing field 0 before establishing that the receiver is actually a
+        // MethodHandle subclass turns every unrelated zero-field receiver into
+        // an OOB heap-field read. Apart from the diagnostic flood, returning a
+        // benign null from that probe can strand the caller in a retry loop.
+        //
+        // Use the runtime receiver hierarchy rather than `class_name`: the
+        // invoked method can be resolved on an inherited MethodHandle owner
+        // while the adapter itself is a concrete JDK subclass.
+        let is_method_handle_adapter = {
+            let cm = shared.class_manager.read();
+            let adapter_class = shared.heap.class_id_of(adapter);
+            cm.get_loaded_class_id("java/lang/invoke/MethodHandle")
+                .map(|method_handle_class| {
+                    adapter_class == method_handle_class
+                        || cm.is_subclass_of(adapter_class, method_handle_class)
+                })
+                .unwrap_or(false)
+        };
+        if !is_method_handle_adapter {
+            return None;
+        }
         let target = match shared.heap.get_field(adapter, 0) {
             Value::Object(Some(target)) => target,
             _ => return None,
@@ -36956,10 +37030,39 @@ mod tests {
             "read",
             "([BII)I",
         ));
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/util/zip/CRC32",
+            "updateBytes",
+            "(I[BII)I",
+        ));
         assert!(!force_native_over_real_jdk_bytecode(
             "org/apache/tomcat/unittest/TesterRequest",
             "getRequestURI",
             "()Ljava/lang/String;",
+        ));
+    }
+
+    #[test]
+    fn jfr_known_type_class_lookup_uses_the_canonical_native_bridge() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(redefine_immune_forced_native(
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(is_jfr_metadata_native_override(
+            "jdk/jfr/internal/util/Utils",
+            "getValidType",
+            "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(is_class_mirror_native_override(
+            "java/lang/Class",
+            "forPrimitiveName",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
         ));
     }
 

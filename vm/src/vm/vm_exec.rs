@@ -1382,6 +1382,10 @@ pub(crate) fn monitor_enter_blocking(
     };
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
+    ctx.thread
+        .gc_block_state
+        .java_state
+        .store(2, std::sync::atomic::Ordering::Release);
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
@@ -5759,6 +5763,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // filler write can happen after a concurrent census has already
         // decided it may proceed without waiting for this thread.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // KC16-watchdog: stash a snapshot of the current frame chain in a
@@ -6539,6 +6547,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
         // grow/realloc the young arena while we are joined.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
@@ -6576,7 +6588,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             None => 0, // NEW — never started
             Some(id) => {
                 if self.shared.thread_registry.is_alive(id) {
-                    1 // RUNNABLE
+                    match self.shared.thread_registry.java_block_state(id) {
+                        1 => 3, // WAITING
+                        2 => 4, // BLOCKED
+                        _ => 1, // RUNNABLE
+                    }
                 } else {
                     2 // TERMINATED
                 }
@@ -7110,6 +7126,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
         // blocked region, while the young arena it points into is still valid.
         // While we are GC-blocked a stop-the-world moving collection can run on
@@ -7537,6 +7557,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // grow/realloc the young arena while this thread is parked, freeing
         // the buffer the TLAB points into.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
 

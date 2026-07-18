@@ -210,7 +210,7 @@ where HotSpot returns 1. The `spring-boot-actuator` instance
 (`dataSource`/`shutdown`) is the same mechanism against
 `EmbeddedDataSourceConfiguration`'s embedded-H2
 `EmbeddedDatabaseFactory$EmbeddedDataSourceProxy`, matching the
-`jooq-destroy-method-ambiguity-and-hang.md` Cluster A shape exactly.
+`jooq-destroy-method-ambiguity-and-hang-FIXED.md` Cluster A shape exactly.
 
 Full logs:
 - `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260717/shard5/logs/module_spring-boot-r2dbc.org.springframework.boot.r2dbc.autoconfigure.R2dbcInitializationAutoC-8f8fc5f27d9f.out.log`

@@ -8521,6 +8521,7 @@ pub mod charset;
 pub mod classloader_value_sidetable;
 #[cfg(feature = "experimental-jmx")]
 pub mod jmx;
+pub mod jfr;
 pub mod panama;
 pub mod panama_libffi;
 pub mod properties_sidetable;
@@ -25133,6 +25134,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    crate::jfr::register_jfr_natives(registry);
     crate::tls::register_conscrypt_native_bridges(registry);
     register_ecj_problem_overrides(registry);
     registry.register(
@@ -30338,6 +30340,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
     );
+    registry.register(
+        "java/lang/Class",
+        "forPrimitiveName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        lang_class::native_class_get_primitive_class,
+    );
     // Synthetic bootstrap may still stub `java/lang/Class` when no real JDK
     // classfile is available. Keep the public name accessors declared by the
     // stub wired to the same native implementations used elsewhere.
@@ -34796,8 +34804,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let dest_len = ctx.array_length(dest) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
             let pos_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "pos")
                 .unwrap_or(1);
@@ -34807,8 +34822,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let buf_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "buf")
                 .unwrap_or(0);
-            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0) as usize;
-            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0) as usize;
+            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0);
+            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0);
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
             if pos >= count {
                 return Ok(Some(Value::Int(-1)));
             }
@@ -34816,14 +34834,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(arr)) => arr,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let avail = count - pos;
-            let to_read = len.min(avail);
+            let avail = (count - pos) as usize;
+            let to_read = (len as usize).min(avail);
             let mut bytes = vec![0u8; to_read];
-            let copied = ctx.read_byte_array_into(buf, pos, &mut bytes);
+            let copied = ctx.read_byte_array_into(buf, pos as usize, &mut bytes);
             if copied > 0 {
-                ctx.write_byte_array_from(dest, off, &bytes[..copied]);
+                ctx.write_byte_array_from(dest, off as usize, &bytes[..copied]);
             }
-            ctx.set_field(this, pos_idx, Value::Int((pos + copied) as i32));
+            ctx.set_field(this, pos_idx, Value::Int(pos + copied as i32));
             Ok(Some(Value::Int(copied as i32)))
         },
     );
@@ -70773,20 +70791,34 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Attributes is a Map and therefore accepts null values. In particular,
+    // Spring Boot writes its version attribute from Package metadata, which is
+    // null for an exploded classes directory; HotSpot retains that mapping and
+    // serializes it as the literal text "null". Do not turn that legal put
+    // into a silent no-op.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
     let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
     let result = cratonvm_native_collections::native_map_put_pub(
@@ -70794,12 +70826,14 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         &[
             Value::Object(Some(map)),
             Value::Object(Some(map_key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     ctx.unpin_native_roots(map_key_pin);
     result
@@ -70838,30 +70872,42 @@ fn native_attrs_put_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Map.put(Object, Object) has the same null-value contract as putValue.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let result = cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
             Value::Object(Some(key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     result
 }

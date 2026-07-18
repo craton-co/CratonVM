@@ -23807,11 +23807,11 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         Ok(a) => a,
         Err(_) => return Value::Object(None),
     };
-    let manifest_content = match archive.by_name("META-INF/MANIFEST.MF") {
+    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
         Ok(mut entry) => {
             use std::io::Read;
-            let mut buf = String::new();
-            if entry.read_to_string(&mut buf).is_ok() {
+            let mut buf = Vec::new();
+            if entry.read_to_end(&mut buf).is_ok() {
                 buf
             } else {
                 return Value::Object(None);
@@ -23823,17 +23823,22 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
     // one parser prevents JarFile.getManifest() from drifting from the normal
     // constructor path on long attributes such as Spring Boot's Class-Path.
-    let pairs = match p59_parse_manifest_bytes(manifest_content.as_bytes()) {
-        Ok(parsed) => parsed.main,
-        Err(_) => return Value::Object(None),
-    };
     // Build a REAL Manifest whose Attributes is backed by a real map —
     // consistent with getValue/putValue/size/write (see
     // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
     // was wrong for the 1-field real layout and read back null/empty.
+    // Parse all sections, including signed-jar `Name:` entry attributes,
+    // then build a REAL Manifest whose Attributes is backed by a real map —
+    // consistent with getValue/putValue/size/write (see
+    // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
+    // was wrong for the 1-field real layout and read back null/empty.
+    let parsed = match p59_parse_manifest_bytes(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return Value::Object(None),
+    };
     // A real Manifest (its <init> native installs a real empty Attributes at
-    // slot 0 and a real entries map at slot 1); populate the main Attributes
-    // through real putValue. Pin across the allocating calls.
+    // slot 0 and a real entries map at slot 1); populate both maps through
+    // real bytecode. Pin across the allocating calls.
     let manifest = match ctx.new_object_initialized("java/util/jar/Manifest", "()V", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Value::Object(None),
@@ -23850,14 +23855,54 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         },
     };
     let attrs_pin = ctx.pin_native_root(attrs);
-    let ok = p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs).is_ok();
+    if p59_attrs_populate_real(ctx, attrs_pin, attrs, &parsed.main).is_err() {
+        ctx.unpin_native_roots(man_pin);
+        return Value::Object(None);
+    }
+    let manifest = ctx.read_native_pin(man_pin, manifest);
+    let entries_map = match ctx.get_field(manifest, 1) {
+        Value::Object(Some(entries)) => entries,
+        _ => match ctx.get_field_by_name(manifest, "entries") {
+            Value::Object(Some(entries)) => entries,
+            _ => {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
+        },
+    };
+    let entries_pin = ctx.pin_native_root(entries_map);
+    for (name, pairs) in &parsed.entries {
+        let entry_attrs = p59_manifest_new_attributes(ctx);
+        let entry_pin = ctx.pin_native_root(entry_attrs);
+        if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+        let name = ctx.create_string(name);
+        let name_pin = ctx.pin_native_root(name);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+        let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+        let name = ctx.read_native_pin(name_pin, name);
+        if ctx
+            .invoke(
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    Value::Object(Some(entries_map)),
+                    Value::Object(Some(name)),
+                    Value::Object(Some(entry_attrs)),
+                ],
+            )
+            .is_err()
+        {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+    }
     let manifest = ctx.read_native_pin(man_pin, manifest);
     ctx.unpin_native_roots(man_pin);
-    if ok {
-        Value::Object(Some(manifest))
-    } else {
-        Value::Object(None)
-    }
+    Value::Object(Some(manifest))
 }
 
 // =============================================================================
@@ -24099,14 +24144,26 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
         Ok(pairs)
     }
 
-    let mut iter = sections.into_iter();
-    let main = match iter.next() {
-        Some(s) => parse_section(&s)?,
-        None => Vec::new(),
+    let mut parsed_sections: Vec<Vec<(String, String)>> = Vec::with_capacity(sections.len());
+    for section in sections {
+        parsed_sections.push(parse_section(&section)?);
+    }
+    // `Manifest.write()` may emit an empty main section followed immediately
+    // by a `Name:` section when a manifest contains only per-entry attributes.
+    // Preserve that first section as an entry rather than mistaking it for the
+    // main attributes; signed-library detection relies on exactly this shape.
+    let first_is_entry = parsed_sections.first().is_some_and(|pairs| {
+        pairs
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("Name"))
+    });
+    let main = if first_is_entry || parsed_sections.is_empty() {
+        Vec::new()
+    } else {
+        parsed_sections.remove(0)
     };
     let mut entries: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for section in iter {
-        let pairs = parse_section(&section)?;
+    for pairs in parsed_sections {
         // Spec: entry sections start with a `Name: <path>` line.
         let name = pairs
             .iter()
@@ -24125,6 +24182,50 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
 struct ParsedManifest {
     main: Vec<(String, String)>,
     entries: Vec<(String, Vec<(String, String)>)>,
+}
+
+#[cfg(test)]
+mod manifest_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signed_jar_entry_sections_after_main_attributes() {
+        let parsed = p59_parse_manifest_bytes(
+            b"Manifest-Version: 1.0\r\nCreated-By: CratonVM\r\n\r\nName: com/example/App.class\r\nSHA-256-Digest: abc\r\n def\r\n\r\nName: META-INF/services/example\r\nSHA-512-Digest: ghi\r\n\r\n",
+        )
+        .expect("valid signed-jar manifest");
+
+        assert_eq!(
+            parsed.main,
+            vec![
+                ("Manifest-Version".into(), "1.0".into()),
+                ("Created-By".into(), "CratonVM".into())
+            ]
+        );
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].0, "com/example/App.class");
+        assert_eq!(
+            parsed.entries[0].1,
+            vec![("SHA-256-Digest".into(), "abcdef".into())]
+        );
+        assert_eq!(parsed.entries[1].0, "META-INF/services/example");
+        assert_eq!(
+            parsed.entries[1].1,
+            vec![("SHA-512-Digest".into(), "ghi".into())]
+        );
+
+        let entry_only =
+            p59_parse_manifest_bytes(b"\r\nName: a/b/C.class\r\nSHA1-Digest: 0000\r\n\r\n")
+                .expect("valid manifest with an empty main section");
+        assert!(entry_only.main.is_empty());
+        assert_eq!(
+            entry_only.entries,
+            vec![(
+                "a/b/C.class".into(),
+                vec![("SHA1-Digest".into(), "0000".into())],
+            )]
+        );
+    }
 }
 
 /// Synthetic `java.util.jar.Manifest.<init>(InputStream)`. Reads the full
