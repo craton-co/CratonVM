@@ -2219,6 +2219,11 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
         .set_verify_cert_store(roots.build())
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     builder.set_verify(SslVerifyMode::PEER);
+    // A plain JSSE SSLSocket validates the peer chain but does not perform
+    // hostname verification unless the caller sets an endpoint-identification
+    // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
+    // server via 127.0.0.1 while the test certificate has no matching IP SAN.
+    builder.set_verify_hostname(false);
     let stream = builder
         .build()
         .connect(host, tcp)
