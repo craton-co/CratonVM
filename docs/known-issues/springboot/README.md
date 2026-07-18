@@ -57,6 +57,15 @@ this batch is dated 2026-07-17 unless noted otherwise. One runner-adjacent
 bug (`%n` hardcoding `\n` instead of the platform line separator) was fixed
 and verified live during this round; see
 [`../../internal/springboot/printf-percent-n-hardcoded-lf-not-platform-separator-FIXED.md`](../../internal/springboot/printf-percent-n-hardcoded-lf-not-platform-separator-FIXED.md).
+The `HV000203`/`ArgumentValueValueExtractor` pair (`spring-boot-actuator`'s
+`ControllerEndpointDiscovererTests` and `spring-boot-graphql-test`'s
+`GraphQlTest{,Properties}IntegrationTests`) was also fixed and verified
+(11/11 tests pass) on 2026-07-18 — see
+[`../../internal/springboot/controllerendpointdiscoverertests-hv000203-valueextractor-FIXED.md`](../../internal/springboot/controllerendpointdiscoverertests-hv000203-valueextractor-FIXED.md)
+and
+[`../../internal/springboot/graphql-hibernate-validator-valueextractor-annotatedtype-gap-FIXED.md`](../../internal/springboot/graphql-hibernate-validator-valueextractor-annotatedtype-gap-FIXED.md);
+root cause was CratonVM's `Class.getAnnotatedInterfaces()` never modeling
+TYPE_USE annotations nested more than one generic level deep.
 
 Several clusters recur across many modules and are the dominant themes this
 round — read these first if triaging or planning fix work, since they
@@ -76,10 +85,9 @@ open each doc for the full picture):
 | [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) | OPEN — found 2026-07-17 |
 | [`cassandra-jni-thrownew-discards-payload-hang.md`](cassandra-jni-thrownew-discards-payload-hang.md) | OPEN — found 2026-07-17 |
 | [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
-| [`collections-singletonmap-hashmap-backed-not-real-class.md`](collections-singletonmap-hashmap-backed-not-real-class.md) | OPEN — found 2026-07-17 (confirmed at source level) |
+| [`Collections.singletonMap` real-wrapper regression](../../internal/springboot/collections-singletonmap-hashmap-backed-not-real-class-FIXED.md) | FIXED — 2026-07-18 |
 | [`conditionevaluationreport-capturedoutput-empty-cluster.md`](conditionevaluationreport-capturedoutput-empty-cluster.md) | OPEN — found 2026-07-17 |
 | [`contextrunner-resource-cycle-then-silent-stall-cluster.md`](contextrunner-resource-cycle-then-silent-stall-cluster.md) | OPEN — found 2026-07-17 |
-| [`controllerendpointdiscoverertests-hv000203-valueextractor.md`](controllerendpointdiscoverertests-hv000203-valueextractor.md) | OPEN — found 2026-07-17, hypothesis unconfirmed |
 | [`core-autoconfigure-singleton-fail-residuals-20260717.md`](core-autoconfigure-singleton-fail-residuals-20260717.md) | OPEN — found 2026-07-17 |
 | [`core-spring-boot-configdata-resource-resolution-empty-cluster.md`](core-spring-boot-configdata-resource-resolution-empty-cluster.md) | OPEN — found 2026-07-17 |
 | [`core-spring-boot-crossthread-throwable-stacktrace-loss.md`](core-spring-boot-crossthread-throwable-stacktrace-loss.md) | OPEN — found 2026-07-17 (root cause confirmed at file:line precision |
@@ -96,7 +104,6 @@ open each doc for the full picture):
 | [`file-url-openconnection-getinputstream-unknownserviceexception.md`](file-url-openconnection-getinputstream-unknownserviceexception.md) | OPEN — found 2026-07-17 |
 | [`flyway-resourceprovidercustomizer-aot-substitution-not-applied.md`](flyway-resourceprovidercustomizer-aot-substitution-not-applied.md) | OPEN — found 2026-07-17, not root-caused |
 | [`graphql-datafetcher-getpackage-null-npe-cluster.md`](graphql-datafetcher-getpackage-null-npe-cluster.md) | OPEN — found 2026-07-17 |
-| [`graphql-hibernate-validator-valueextractor-annotatedtype-gap.md`](graphql-hibernate-validator-valueextractor-annotatedtype-gap.md) | OPEN — found 2026-07-17. Hypothesis, root mechanism not fully pinned |
 | [`graphql-security-autoconfiguration-early-hang.md`](graphql-security-autoconfiguration-early-hang.md) | OPEN — found 2026-07-17 |
 | [`grpc-test-springextension-isbeanoverride-nosuchmethoderror.md`](grpc-test-springextension-isbeanoverride-nosuchmethoderror.md) | OPEN — found 2026-07-17 |
 | [`hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md`](hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md) | OPEN — found 2026-07-17 |
