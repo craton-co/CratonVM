@@ -4524,7 +4524,11 @@ pub(crate) fn native_string_format(
                 continue;
             }
             if chars[i] == 'n' {
-                result.push('\n');
+                // Formatter's %n conversion emits the platform line separator
+                // (System.lineSeparator(), "\r\n" on Windows), not a literal
+                // '\n' -- see native_system_line_separator in lang_system.rs
+                // for the same platform check.
+                result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
                 i += 1;
                 continue;
             }

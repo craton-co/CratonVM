@@ -1116,9 +1116,7 @@ fn safe_native_call_impl(
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
                 let healed = shared.heap.load_and_forward(*o);
-                if healed.as_ptr() != o.as_ptr()
-                    && cratonvm_gc::stale_objref_debug::enabled()
-                {
+                if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                     // The cached-dispatch callback pointer often has no ring
@@ -1878,6 +1876,24 @@ fn normalize_system_property_key(key: &str) -> &str {
 }
 
 impl<'a> NativeContextImpl<'a> {
+    fn capture_current_stack_trace(&self) -> Vec<StackTraceEntry> {
+        let cm = self.shared.class_manager.read();
+        let trace =
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
+        drop(cm);
+        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_CAP frames={} depth={}",
+                self.thread.frames.len(),
+                trace.len()
+            );
+            for (i, e) in trace.iter().enumerate() {
+                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
+            }
+        }
+        trace
+    }
+
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
@@ -3361,7 +3377,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // contain long-dead addresses). A hit here means the CALLER received
         // a stale value from upstream; the backtrace names it.
         if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
-            if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(obj.as_ptr() as usize)
+            {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
                     // Identify WHAT went stale: read the class off the
@@ -3447,10 +3467,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .copied()
             .unwrap_or(fallback);
         // DIAGNOSTIC-ONLY (cce0079 tree-key tail): the PIN-STALE canary
-        // covers pin TIME; this covers READ time - a forwarded address
+        // covers pin TIME; this covers READ time — a forwarded address
         // sitting in the pin table means a GC between pin and read failed
-        // to remap THIS entry, which no other canary distinguishes from
-        // caller-side misuse.
+        // to remap THIS entry (initiator/arrive/fold writeback gap), which
+        // no other canary distinguishes from caller-side misuse.
         if handle != usize::MAX && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
             if let Some(new) = self
                 .shared
@@ -3478,7 +3498,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if base < self.thread.native_pin_roots.len() {
             if unpin_ring_enabled() {
                 let bt = format!("{}", std::backtrace::Backtrace::force_capture());
-                let short: String = bt.lines().skip(8).take(12).map(|l| format!("{l}\n")).collect();
+                let short: String = bt
+                    .lines()
+                    .skip(8)
+                    .take(12)
+                    .map(|l| format!("{l}\n"))
+                    .collect();
                 UNPIN_RING.with(|r| {
                     let mut r = r.borrow_mut();
                     if r.len() >= 6 {
@@ -4103,50 +4128,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry> {
-        // WP1.9: resolve source file + line number + BCI for each frame via
-        // the method's LineNumberTable attribute (see
-        // `crate::runtime::stackwalker::entry_from_frame`).
-        let cm = self.shared.class_manager.read();
-        let trace =
-            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
-        drop(cm);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
-            eprintln!(
-                "STTRACE_DBG_CAP hash={throwable_hash} frames={} depth={}",
-                self.thread.frames.len(),
-                trace.len()
-            );
-            for (i, e) in trace.iter().enumerate() {
-                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
-            }
-        }
-        // Hash 0 is the VM's ephemeral stack-walk sentinel used by
-        // StackWalker/caller-sensitive helpers. Those callers consume the
-        // returned trace immediately and never retrieve it through
-        // get_stack_trace(), so cloning the full vector into the throwable
-        // trace map on every walk only adds work to hot logging/framework
-        // bootstrap paths.
-        if throwable_hash != 0 {
-            self.thread
-                .throwable_stacks
-                .insert(throwable_hash, trace.clone());
-        }
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        self.capture_current_stack_trace()
+    }
+
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        let trace = self.capture_current_stack_trace();
+        self.shared
+            .store_throwable_stack_trace(throwable, trace.clone());
         trace
     }
 
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]> {
-        let r = self
-            .thread
-            .throwable_stacks
-            .get(&throwable_hash)
-            .map(|v| v.as_slice());
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        let r = self.shared.throwable_stack_trace(throwable_hash);
         if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
-                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={} keys={:?}",
+                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
                 r.is_some(),
-                r.map_or(0, |s| s.len()),
-                self.thread.throwable_stacks.keys().collect::<Vec<_>>()
+                r.as_ref().map_or(0, Vec::len),
             );
         }
         r
@@ -4323,7 +4322,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
         let cm = self.shared.class_manager.read();
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
@@ -8577,7 +8580,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8635,7 +8638,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         &self,
         class_id: ClassId,
         field_name: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8657,7 +8660,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+    ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8672,6 +8675,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// `Class.getAnnotatedSuperclass()` / `Class.getAnnotatedInterfaces()`
+    /// (and their `getAnnotatedActualTypeArguments()` chains) — see
+    /// `extract_class_extends_type_annotations` for why this re-parses the
+    /// cached original bytes rather than reading from `Class`.
+    fn class_extends_type_annotations(
+        &self,
+        class_id: ClassId,
+        supertype_index: u16,
+    ) -> crate::native::registry::TypeArgAnnotations {
+        let bytes = {
+            let cm = self.shared.class_manager.read();
+            match cm.class_bytes_cache.get(&class_id) {
+                Some(b) => b.clone(),
+                None => return Default::default(),
+            }
+        };
+        extract_class_extends_type_annotations(&bytes, supertype_index)
     }
 
     fn method_annotation_default(
@@ -9624,14 +9646,40 @@ pub(super) fn extract_return_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting the method return type's direct
-/// TYPE ARGUMENTS (`target_type` 0x14, METHOD_RETURN) whose `type_path` is a
-/// single TYPE_ARGUMENT entry (`type_path_kind == 3`) -- e.g. an annotation on
-/// `String` in `List<@NotBlank String> getNames()`.
+/// Insert an `AnnotationData` into a `TypeArgAnnotations` forest at the
+/// position described by `path` (a `type_path` restricted to TYPE_ARGUMENT
+/// entries, per JVMS 4.7.20.2 — the caller has already filtered out any
+/// ARRAY/INNER_TYPE/WILDCARD_BOUND entries). `path` must be non-empty; each
+/// entry descends one nesting level (top-level index first), growing `tree`
+/// (and each level's `children`) as needed so arbitrarily deep generics
+/// (`ValueExtractor<ArgumentValue<@ExtractedValue ?>>`, two TYPE_ARGUMENT
+/// steps) land at the right node, not just the single-level case
+/// (`List<@NotBlank String>`) the extraction call sites used to hard-code.
+fn insert_type_arg_annotation(
+    tree: &mut Vec<crate::native::registry::TypeArgAnnotations>,
+    path: &[cratonvm_reader::attribute::TypePathEntry],
+    data: crate::native::registry::AnnotationData,
+) {
+    let idx = path[0].type_argument_index as usize;
+    if tree.len() <= idx {
+        tree.resize(idx + 1, Default::default());
+    }
+    if path.len() == 1 {
+        tree[idx].anns.push(data);
+    } else {
+        insert_type_arg_annotation(&mut tree[idx].children, &path[1..], data);
+    }
+}
+
+/// Extract TYPE_USE annotations targeting the method return type's TYPE
+/// ARGUMENTS, at any nesting depth (`target_type` 0x14, METHOD_RETURN, with a
+/// `type_path` made entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`)
+/// -- e.g. an annotation on `String` in `List<@NotBlank String> getNames()`,
+/// or a nested generic like `ValueExtractor<Wrapper<@Foo ?>>`.
 pub(super) fn extract_return_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_RETURN: u8 = 0x14;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9641,22 +9689,20 @@ pub(super) fn extract_return_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_RETURN {
+                if ta.target_type != TARGET_METHOD_RETURN || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
@@ -9706,24 +9752,23 @@ pub(super) fn extract_parameter_type_annotations(
 }
 
 /// Extract TYPE_USE annotations targeting method formal parameters'
-/// TYPE ARGUMENTS (`target_type` 0x16, METHOD_FORMAL_PARAMETER) whose
-/// `type_path` is a single TYPE_ARGUMENT entry (`type_path_kind == 3`) --
-/// i.e. an annotation on a generic type argument like the `@Valid` in
-/// `List<@Valid Person> persons`, as opposed to
+/// TYPE ARGUMENTS, at any nesting depth (`target_type` 0x16,
+/// METHOD_FORMAL_PARAMETER, with a `type_path` made entirely of
+/// TYPE_ARGUMENT entries, `type_path_kind == 3`) -- i.e. an annotation on a
+/// generic type argument like the `@Valid` in `List<@Valid Person> persons`,
+/// or a nested one like `Map<String, @Valid List<Person>>`, as opposed to
 /// [`extract_parameter_type_annotations`] which only keeps the
 /// empty-`type_path` (top-level parameter type) annotations.
 ///
 /// Outer `Vec` indexed by `formal_parameter_index`; inner `Vec` indexed by
-/// `type_argument_index` (0-based, JVMS 4.7.20.2). Multi-level nesting
-/// (e.g. `Map<String, @Valid List<Person>>`, `type_path` length > 1) is not
-/// modeled -- only a direct, single-level type argument is recognized,
-/// which covers the common `List<@Valid T>` / `Map<K, @Valid V>` cases.
-/// Backs `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
+/// the top-level `type_argument_index` (0-based, JVMS 4.7.20.2), with each
+/// entry's own `children` carrying the next nesting level. Backs
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
 /// for method parameters.
 pub(super) fn extract_parameter_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9733,19 +9778,18 @@ pub(super) fn extract_parameter_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<Vec<crate::native::registry::AnnotationData>>> = Vec::new();
+            let mut out: Vec<Vec<crate::native::registry::TypeArgAnnotations>> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER {
+                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || ta.type_path.is_empty() {
                     continue;
                 }
-                // Only a single-level type-argument path: exactly one
-                // type_path entry, and it must be a TYPE_ARGUMENT.
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 // target_info for METHOD_FORMAL_PARAMETER is a single u1 index.
                 let param_idx = match ta.target_info.first() {
                     Some(&i) => i as usize,
@@ -9755,11 +9799,7 @@ pub(super) fn extract_parameter_type_argument_annotations(
                     if out.len() <= param_idx {
                         out.resize(param_idx + 1, Vec::new());
                     }
-                    let type_args = &mut out[param_idx];
-                    if type_args.len() <= type_arg_idx {
-                        type_args.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    type_args[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out[param_idx], &ta.type_path, data);
                 }
             }
             return out;
@@ -9793,14 +9833,14 @@ pub(super) fn extract_field_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting a field type's direct TYPE ARGUMENTS
-/// (`target_type` 0x13, FIELD) whose `type_path` is a single TYPE_ARGUMENT
-/// entry (`type_path_kind == 3`) -- e.g. an annotation on `String` in
-/// `List<@NotBlank String> names`.
+/// Extract TYPE_USE annotations targeting a field type's TYPE ARGUMENTS, at
+/// any nesting depth (`target_type` 0x13, FIELD, with a `type_path` made
+/// entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`) -- e.g. an
+/// annotation on `String` in `List<@NotBlank String> names`.
 pub(super) fn extract_field_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_FIELD: u8 = 0x13;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9810,28 +9850,100 @@ pub(super) fn extract_field_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_FIELD {
+                if ta.target_type != TARGET_FIELD || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
         }
     }
     Vec::new()
+}
+
+/// Extract the runtime-visible TYPE_USE annotations targeting one of a
+/// class's declared supertypes (`target_type` 0x10, CLASS_EXTENDS) from its
+/// original `.class` bytes, re-parsed on demand.
+///
+/// Unlike methods/fields (whose per-member attribute lists survive on the
+/// loaded [`crate::classloading::class::Class`]), the class-level
+/// `RuntimeVisibleTypeAnnotations` attribute is folded away during class
+/// loading (JVMS §4.7 attributes not recognized by the `Class` struct's
+/// field-by-field fold are dropped) — so there is nowhere to read it from
+/// post-load. Re-parsing the cached original bytes (`class_bytes_cache`,
+/// already retained for JVMTI retransformation) is the least invasive way to
+/// recover it without adding a new field threaded through every `Class`
+/// construction site in the codebase. This runs lazily, only when a
+/// framework actually calls `Class.getAnnotatedSuperclass()` /
+/// `getAnnotatedInterfaces()`, so the cost of a second parse pass is
+/// immaterial. Returns an empty tree (not an error) if the bytes were
+/// evicted from the FIFO-capped cache or fail to re-parse.
+///
+/// `supertype_index` is JVMS `CLASS_EXTENDS`'s `u2 supertype_index`: `0xFFFF`
+/// selects the superclass, `0..n` selects the n-th entry of `interfaces`.
+pub(super) fn extract_class_extends_type_annotations(
+    class_bytes: &[u8],
+    supertype_index: u16,
+) -> crate::native::registry::TypeArgAnnotations {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_CLASS_EXTENDS: u8 = 0x10;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+
+    let class_file = match cratonvm_reader::class_reader::read_class(class_bytes) {
+        Ok(cf) => cf,
+        Err(_) => return Default::default(),
+    };
+    let cp = &class_file.constant_pool;
+    for lazy in &class_file.attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut tree = crate::native::registry::TypeArgAnnotations::default();
+            for ta in tas {
+                if ta.target_type != TARGET_CLASS_EXTENDS {
+                    continue;
+                }
+                let idx = match ta.target_info.as_slice() {
+                    [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+                    _ => continue,
+                };
+                if idx != supertype_index {
+                    continue;
+                }
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
+                let data = match convert_annotation(&ta.annotation, cp) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if ta.type_path.is_empty() {
+                    tree.anns.push(data);
+                } else {
+                    insert_type_arg_annotation(&mut tree.children, &ta.type_path, data);
+                }
+            }
+            return tree;
+        }
+    }
+    Default::default()
 }
 
 /// Convert a reader Annotation to our AnnotationData.
@@ -10066,8 +10178,14 @@ pub fn invoke_or_native(
         && matches!(
             (method_name, descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         if let Some(callback) =
@@ -11839,9 +11957,7 @@ fn proxy_method_exception_types(
         .get(&declaring_mirror)
         .copied();
     let declared = declaring_class
-        .map(|class_id| {
-            proxy_method_declared_exceptions(shared, class_id, method_name, descriptor)
-        })
+        .map(|class_id| proxy_method_declared_exceptions(shared, class_id, method_name, descriptor))
         .unwrap_or_default();
     let exception_arr = shared.heap.alloc_array(
         class_component,
@@ -12432,14 +12548,21 @@ pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) ->
     s.push('@');
     s.push_str(&dotted);
     s.push('(');
+    let omit_single_value_name = elems.len() == 1 && elems[0].0 == "value";
     let mut first = true;
     for (name, val) in &elems {
         if !first {
             s.push_str(", ");
         }
         first = false;
-        s.push_str(name);
-        s.push('=');
+        // The JDK's AnnotationInvocationHandler elides `value=` for a
+        // single-member annotation whose sole element is conventionally named
+        // `value`, e.g. `@Qualifier("alpha")`, while retaining names for every
+        // multi-member annotation.
+        if !omit_single_value_name {
+            s.push_str(name);
+            s.push('=');
+        }
         s.push_str(&format_annotation_value(shared, *val));
     }
     s.push(')');
@@ -18402,16 +18525,26 @@ mod tests {
     }
 
     #[test]
-    fn native_context_capture_stack_trace() {
+    fn native_context_throwable_trace_survives_producer_thread_context() {
         let shared = test_shared();
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mut ctx = NativeContextImpl {
+        let throwable = shared.heap.alloc_object(ClassId::new(0), 0);
+        let hash = shared.heap.identity_hash_code(throwable);
+        {
+            let mut producer = JvmThread::new(ThreadId(1), "producer");
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut producer,
+            };
+            let trace = ctx.capture_throwable_stack_trace(throwable);
+            assert!(trace.is_empty());
+        }
+
+        let mut consumer = JvmThread::new(ThreadId(2), "consumer");
+        let ctx = NativeContextImpl {
             shared: &shared,
-            thread: &mut thread,
+            thread: &mut consumer,
         };
-        let trace = ctx.capture_stack_trace(123);
-        assert!(trace.is_empty());
-        let stored = ctx.get_stack_trace(123);
+        let stored = ctx.get_stack_trace(hash);
         assert!(stored.is_some());
         assert!(stored.unwrap().is_empty());
     }

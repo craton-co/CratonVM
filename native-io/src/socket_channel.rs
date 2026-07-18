@@ -2676,47 +2676,92 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // fix in `native-collections/src/lib.rs`.
 const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
 
-fn ss_back_ref_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, ObjectRef>> {
-    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>> = OnceLock::new();
+/// One row per live ServerSocket wrapper. The hash only chooses a bucket:
+/// Java identity hashes are not unique, so every lookup also matches the
+/// wrapper receiver itself.
+struct SsBackRef {
+    wrapper: ObjectRef,
+    channel: ObjectRef,
+}
+
+fn ss_back_ref_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, Vec<SsBackRef>>> {
+    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, Vec<SsBackRef>>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
 fn ss_record_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef, ssc: ObjectRef) {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table().write().insert(key, ssc);
+    let mut table = ss_back_ref_table().write();
+    let bucket = table.entry(key).or_default();
+    if let Some(row) = bucket.iter_mut().find(|row| row.wrapper == ss) {
+        row.channel = ssc;
+    } else {
+        bucket.push(SsBackRef {
+            wrapper: ss,
+            channel: ssc,
+        });
+    }
 }
 
 fn ss_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) -> Option<ObjectRef> {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table().read().get(&key).copied()
+    ss_back_ref_table()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|row| row.wrapper == ss))
+        .map(|row| row.channel)
 }
 
-/// Post-GC hook — remap the SSC `ObjectRef` values that
-/// `ss_back_ref_table` stores. The KEYS are identity hash codes and are
-/// already GC-stable, so they need no rewrite; only the embedded
-/// ObjectRef values are repointed through `pointer_map`. Mirrors
-/// `gc_update_lambda_callsite_cache_refs` in
-/// `native-builtins/src/lang_invoke.rs`. Until this hook is wired into
-/// `vm/src/memory/gc.rs`'s post-compaction step, the table will return
-/// stale `ObjectRef` values for any SSC that was relocated. The
-/// identity-hash key fix alone eliminates the use-after-free risk that
-/// the previous `from_raw(usize)` resurrection carried — the worst-case
-/// behaviour now is a missed lookup rather than a wild dereference.
-#[allow(dead_code)]
-pub fn ss_back_ref_update_after_gc(pointer_map: &rustc_hash::FxHashMap<usize, usize>) {
+fn ss_remove_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) {
+    let key = ctx.identity_hash_code(ss);
+    let mut table = ss_back_ref_table().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|row| row.wrapper != ss);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
+}
+
+/// Keep both ends of the adapter mapping alive during a collection. The
+/// mapping is dropped promptly by `ServerSocket.close`, so this is not a
+/// lifetime extension for closed endpoints.
+pub fn gc_scan_ss_back_ref_roots(roots: &mut Vec<ObjectRef>) {
+    let table = ss_back_ref_table().read();
+    for bucket in table.values() {
+        for row in bucket {
+            roots.push(row.wrapper);
+            roots.push(row.channel);
+        }
+    }
+}
+
+/// Relocate both receiver and channel references after moving GC. The
+/// identity-hash bucket remains stable while its ObjectRef discriminator must
+/// be updated to preserve collision-safe lookup.
+pub fn ss_back_ref_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
     if pointer_map.is_empty() {
         return;
     }
-    let mut table = ss_back_ref_table().write();
-    for v in table.values_mut() {
-        let old = v.as_ptr() as usize;
+    let remap = |obj: ObjectRef| {
+        let old = obj.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            // SAFETY: `new_addr` is the GC's relocated address for the
-            // same logical SSC object; the GC guarantees the new
-            // address is a valid heap object that satisfies
-            // ObjectRef's non-null/alignment invariants.
-            *v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            unsafe { ObjectRef::from_raw(new_addr as *mut u8) }
+        } else {
+            obj
+        }
+    };
+    let mut table = ss_back_ref_table().write();
+    for bucket in table.values_mut() {
+        for row in bucket {
+            row.wrapper = remap(row.wrapper);
+            row.channel = remap(row.channel);
         }
     }
 }
@@ -2909,8 +2954,8 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // The binding native records the actual OS-assigned port in the shared native-api
     // registry keyed by identity hash (object fields can't carry it — the real layout's
     // low slots are reference-typed, so an int does not round-trip). Read it back.
-    let p =
-        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
+    let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+        .unwrap_or(0);
     Ok(Some(Value::Int(p)))
 }
 
@@ -2938,10 +2983,10 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // native-builtins, while this last-registered wrapper lives in native-io,
         // so the native-api side table is the cross-crate handoff.
         let identity = ctx.identity_hash_code(this);
-        match cratonvm_native_api::server_socket_ports::get_addr(identity) {
+        match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
             Some((host, port)) => (port, host),
             None => (
-                cratonvm_native_api::server_socket_ports::get(identity).unwrap_or(0),
+                cratonvm_native_api::server_socket_ports::get(identity, this).unwrap_or(0),
                 "0.0.0.0".to_string(),
             ),
         }
@@ -2969,7 +3014,8 @@ fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Some(ssc) = ss_back_ref(ctx, this) else {
         // Plain ServerSocket — bound iff the binder recorded a port (BUG-04).
         let bound =
-            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).is_some();
+            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+                .is_some();
         return Ok(Some(Value::Int(if bound { 1 } else { 0 })));
     };
     let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
@@ -2995,9 +3041,8 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     if let Some(ssc) = ss_back_ref(ctx, this) {
         let _ = ssc_close(ctx, &[Value::Object(Some(ssc))])?;
-        // C27: remove the identity-hashed key (was raw pointer before).
-        let key = ctx.identity_hash_code(this);
-        ss_back_ref_table().write().remove(&key);
+        // Remove only this receiver's collision bucket entry.
+        ss_remove_back_ref(ctx, this);
         return Ok(None);
     }
     // Plain ServerSocket (no ServerSocketChannel back-ref). This native is the

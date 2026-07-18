@@ -15241,7 +15241,8 @@ fn execute_instruction(
                         // (`getBean<T>()`, `getProperty<T>()`) failed. Dotted
                         // names contain no `/`, so group 3 captures the full
                         // FQN exactly as on HotSpot.
-                        let obj_binary = obj_class_name.replace('/', ".");
+                        let obj_binary = cce_display_class_name(shared, obj_ref, &obj_class_name)
+                            .replace('/', ".");
                         let target_binary = target_class_name.replace('/', ".");
                         // CRATONVM_DBG_CCE_BT: identify the failing receiver
                         // (address + classes) at the moment a checkcast CCE
@@ -19851,6 +19852,7 @@ fn checkcast_lambda_instantiated_args(
                 .get_class(shared.heap.class_id_of(obj_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
+            let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
             let target_binary = inst_tok
                 .strip_prefix('L')
                 .and_then(|d| d.strip_suffix(';'))
@@ -19865,7 +19867,7 @@ fn checkcast_lambda_instantiated_args(
                 let via_pin = handles.get(idx).copied().flatten().is_some();
                 eprintln!(
                     "CRATONVM_DBG_CCE_BT: site=lambda_instantiated_args obj={} @0x{:x} target={} via_pin={via_pin}",
-                    obj_class_name.replace('/', "."),
+                    obj_display_name.replace('/', "."),
                     obj_ref.as_ptr() as usize,
                     target_binary
                 );
@@ -19875,7 +19877,7 @@ fn checkcast_lambda_instantiated_args(
             return Err(RuntimeError::ClassCastException {
                 message: format!(
                     "{} cannot be cast to {}",
-                    obj_class_name.replace('/', "."),
+                    obj_display_name.replace('/', "."),
                     target_binary
                 ),
             }
@@ -19883,6 +19885,43 @@ fn checkcast_lambda_instantiated_args(
         }
     }
     Ok(())
+}
+
+/// Return the Java-visible class name for a failed cast.
+///
+/// The immutable `Map.of` factories and `Collections.unmodifiableMap` use the
+/// same native storage stamp. `Object.getClass()` deliberately translates that
+/// stamp to the corresponding JDK implementation class, but a VM-generated
+/// `ClassCastException` previously exposed the private stamp instead. Besides
+/// being observably unlike HotSpot, that broke `LambdaSafe`: it identifies an
+/// erased-generic mismatch by comparing the exception prefix with
+/// `argument.getClass().getName()`.
+///
+/// Keep this mapping in lockstep with `native-builtins`' `getClass()` mapping
+/// for maps. The backing map's physical slot layout follows the loaded JDK
+/// class, so resolve its `size` field rather than assuming a fixed slot.
+fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+    if raw_name != "cratonvm/internal/UnmodifiableMap" {
+        return raw_name.to_string();
+    }
+    if !matches!(shared.heap.get_field(obj_ref, 1), Value::Int(1)) {
+        return "java/util/Collections$UnmodifiableMap".to_string();
+    }
+    let backing = match shared.heap.get_field(obj_ref, 0) {
+        Value::Object(Some(backing)) => backing,
+        _ => return "java/util/ImmutableCollections$MapN".to_string(),
+    };
+    let size = {
+        let class_id = shared.heap.class_id_of(backing);
+        let cm = shared.class_manager.read();
+        find_field_recursive(class_id, "size", &cm.class_store)
+            .map(|(field_index, _, _)| shared.heap.get_field(backing, field_index))
+    };
+    if matches!(size, Some(Value::Int(1))) {
+        "java/util/ImmutableCollections$Map1".to_string()
+    } else {
+        "java/util/ImmutableCollections$MapN".to_string()
+    }
 }
 
 /// `true` iff `obj_ref` is *provably* not an instance of the reference
@@ -33613,6 +33652,51 @@ fn execute_invokevirtual_vtable_fast(
 
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
+    // A cold invokevirtual site in a lambda reaches this vtable fast path
+    // before the ordinary invoke interceptor.  ClassLoader's resource native
+    // owns the null-name contract, so invoke it directly for just this case;
+    // normal resource lookup remains eligible for the vtable cache.
+    if method_class_name.as_ref() == "java/lang/ClassLoader"
+        && matches!(
+            (method_name.as_ref(), method_descriptor.as_ref()),
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
+        )
+        && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None))
+    {
+        let (args, _) = pop_coerced_invoke_args_virtual(
+            shared,
+            caller_class_id,
+            cp_index,
+            frame_idx,
+            thread,
+        )?;
+        let callback = match method_name.as_ref() {
+            "getResource" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
+            "getResources" => cratonvm_native_builtins::classloader::cl_get_resources_essential,
+            "getResourceAsStream" => {
+                cratonvm_native_builtins::classloader::cl_get_resource_as_stream_essential
+            }
+            // The callback is reached only with a null name, so it always
+            // throws before producing a URL-typed result. Reuse its canonical
+            // ClassLoader NPE construction for `resources(String)`.
+            "resources" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
+            "loadClass" => cratonvm_native_builtins::classloader::cl_load_class_essential,
+            _ => return Ok(CachedCallResult::CacheMiss),
+        };
+        let value = crate::vm::safe_native_call(shared, thread, callback, &args)?;
+        if let Some(value) = value {
+            push_invoke_return_value(
+                &mut thread.frames[frame_idx].stack,
+                coerce_value_for_return(value, crate::jit::return_type(&method_descriptor)),
+            )?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
+        return Ok(CachedCallResult::Handled);
+    }
     if crate::runtime::env_cache::dbg_jetty2() && &*method_name == "getClasspath" {
         eprintln!(
             "[jetty2-vtfast] {}{} receiver={:?}",
@@ -34310,6 +34394,34 @@ fn execute_invokevirtual_cached(
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+
+    // A previous non-null invocation may have cached the real-JDK bytecode
+    // body of an inherited ClassLoader method.  That body does not reliably
+    // enforce the public null-name contract for a synthetic embedded loader,
+    // whereas the registered ClassLoader natives do.  Do this before reading
+    // the inline cache: otherwise `resources("...")` poisons the same CP
+    // entry and a later `resources(null)` silently returns a Stream.
+    if !is_special && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None)) {
+        if let Ok((method_class_name, method_name, method_descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if method_class_name.as_ref() == "java/lang/ClassLoader"
+                && matches!(
+                    (method_name.as_ref(), method_descriptor.as_ref()),
+                    ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+                        | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+                        | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
+                        | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                        | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
+                )
+            {
+                thread
+                    .invoke_cache
+                    .evict(caller_class_id, cp_index, is_special);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
 
     let target = match thread
         .invoke_cache

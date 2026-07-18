@@ -5,7 +5,6 @@
 //!
 //! Each Java thread has its own `JvmThread` containing:
 //! - Call stack (for stack traces)
-//! - Throwable stack traces captured by `fillInStackTrace`
 //! - Test output buffer (`printed`)
 //! - Thread identity and flags
 //
@@ -26,7 +25,6 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
 use crate::classloading::resolution::InvokeCache;
-use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
 use crate::runtime::fx_collections::FxHashMap;
 use crate::types::{ObjectRef, Value};
@@ -305,9 +303,6 @@ pub struct JvmThread {
     /// Human-readable thread name.
     pub name: String,
 
-    /// Stack traces captured by `fillInStackTrace`, keyed by identity hash.
-    pub throwable_stacks: HashMap<i32, Vec<StackTraceEntry>>,
-
     /// Live execution frames. The last element is the currently executing frame.
     /// Frames are pushed on method entry and popped on method return.
     /// Stack traces are derived from frames on demand (in capture_stack_trace).
@@ -567,7 +562,6 @@ impl JvmThread {
         Self {
             thread_id,
             name: name.to_string(),
-            throwable_stacks: HashMap::new(),
             frames: Vec::new(),
             locals_pool: Vec::new(),
             stacks_pool: Vec::new(),

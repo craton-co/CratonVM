@@ -38945,10 +38945,10 @@ fn native_collections_empty_iterator(
 
 fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().cloned().unwrap_or(Value::Object(None));
-    // Keep Set singleton native-backed. WildFly's PathManagerService iterates
-    // this object during Host Controller bootstrap, and the real
-    // Collections$SingletonSet path currently depends on iterator internals
-    // that are not stable this early in the boot graph.
+    if let Some(set) = alloc_real_jdk(ctx, "java/util/Collections$SingletonSet") {
+        ctx.set_field_by_name(set, "element", elem);
+        return Ok(Some(Value::Object(Some(set))));
+    }
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
@@ -38967,9 +38967,11 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().cloned().unwrap_or(Value::Object(None));
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    // Keep singletonMap native-backed for the same bootstrap reason as
-    // singleton Set: WildFly calls simple Map methods before the real
-    // Collections$SingletonMap wrapper's method surface is fully bridged.
+    if let Some(map) = alloc_real_jdk(ctx, "java/util/Collections$SingletonMap") {
+        ctx.set_field_by_name(map, "k", key);
+        ctx.set_field_by_name(map, "v", val);
+        return Ok(Some(Value::Object(Some(map))));
+    }
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
@@ -45958,7 +45960,7 @@ mod tests {
             fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
                 Vec::new()
             }
-            fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
                 None
             }
             fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {

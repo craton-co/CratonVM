@@ -53,7 +53,7 @@ with `--dump-missing-natives`. See [Debugging & Diagnostics](../user-guide/debug
 
 Not as a full JSSE stack. There is no backed `SSLContext`/`SSLEngine`/
 `HttpsURLConnection`. Terminate TLS in front of the VM (reverse proxy or
-sidecar). The cryptographic primitives (digests, AES-GCM, HMAC, RSA,
+sidecar). The cryptographic primitives (digests, AES-GCM, HMAC, RSA, DSA,
 ECDSA/Ed25519, PBKDF2, ML-KEM/ML-DSA) are available; see
 [Cryptography](../security/cryptography.md).
 

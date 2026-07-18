@@ -3844,6 +3844,7 @@ fn re2_bind_listener(
     // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
     cratonvm_native_api::server_socket_ports::record_addr(
         ctx.identity_hash_code(this),
+        this,
         &actual_host,
         actual_port,
     );
@@ -3895,6 +3896,7 @@ fn re2_server_socket_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         s.closed = 1;
         s.listener_id = -1;
     });
+    cratonvm_native_api::server_socket_ports::remove(ctx.identity_hash_code(this), this);
     Ok(None)
 }
 
@@ -6207,14 +6209,25 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // Same chain: RedisHttpSessionConfiguration.redisMessageListenerContainer()
-    // calls container.setConnectionFactory(this.redisConnectionFactory) with
-    // a null factory and Assert.notNull(...) throws
-    // `IllegalArgumentException: ConnectionFactory must not be null!`.
+    // can call this setter with a null factory while its broken multi-argument
+    // autowiring path is being bypassed.  Keep that narrow bootstrap escape,
+    // but execute the real setter for a valid factory.  The former unconditional
+    // no-op swallowed legitimate injection in Spring Data Redis's own
+    // DataRedisAnnotationDrivenConfiguration tests, leaving the container
+    // unusable at afterPropertiesSet().
     r.register(
         "org/springframework/data/redis/listener/RedisMessageListenerContainer",
         "setConnectionFactory",
         "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| match args.get(1) {
+            Some(Value::Object(Some(_))) => ctx.invoke_special_bytecode_only(
+                "org/springframework/data/redis/listener/RedisMessageListenerContainer",
+                "setConnectionFactory",
+                "(Lorg/springframework/data/redis/connection/RedisConnectionFactory;)V",
+                args,
+            ),
+            _ => Ok(None),
+        },
     );
 
     // Same chain: the `enableRedisKeyspaceNotificationsInitializer` bean's
@@ -6678,7 +6691,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // fields (state / packed altAndOuterContextDepth / context) with subclass
     // fields at slots 3..5. Fixed by 50119adb (fork-aware packed layout +
     // `antlr_groovy_atn_special_slot`), so `groovy.*` presence is now decided
-    // honestly by the classpath probe below and `.groovy` bean scripts load
+    // honestly by Spring's bytecode implementation below and `.groovy` bean scripts load
     // through the real `GenericGroovyXmlContextLoader`. See
     // docs/known-issues/test-context-constructor-param-annotation-offset.md.
     r.register(
@@ -6693,17 +6706,16 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             if name == "jakarta.faces.context.FacesContext" {
                 return Ok(Some(Value::Int(0)));
             }
-            let internal = name.replace('.', "/");
-            // BUG-06 — isPresent is a reflective existence probe: it must NOT be
-            // satisfied by a fabricated enterprise-framework synthetic stub
-            // (org/jboss/, io/smallrye/, …) for a class absent from the
-            // classpath. The probe guard makes the class loader return CNFE in
-            // that case (matching HotSpot) instead of fabricating a stub, so
-            // e.g. Spring's ReactiveAdapterRegistry correctly sees
-            // io.smallrye.mutiny.Multi as absent and skips MutinyRegistrar.
-            let _probe_guard = cratonvm_types::reflective_probe::ProbeGuard::new();
-            let present = ctx.ensure_class_initialized(&internal).is_ok();
-            Ok(Some(Value::Int(if present { 1 } else { 0 })))
+            // Preserve Spring's loader-specific semantics, including its
+            // canonical-inner-name fallback (`Outer.Inner` -> `Outer$Inner`).
+            // A global native lookup incorrectly reported such present classes
+            // absent during auto-configuration exclusion validation.
+            ctx.invoke_special_bytecode_only(
+                "org/springframework/util/ClassUtils",
+                "isPresent",
+                "(Ljava/lang/String;Ljava/lang/ClassLoader;)Z",
+                args,
+            )
         },
     );
 
@@ -7525,7 +7537,10 @@ fn re5_collect_publisher_body(
             break;
         }
         let wait_for = deadline.saturating_duration_since(now);
-        let (next_state, wait) = collector.done.wait_timeout(state, wait_for).unwrap_or_else(|e| e.into_inner());
+        let (next_state, wait) = collector
+            .done
+            .wait_timeout(state, wait_for)
+            .unwrap_or_else(|e| e.into_inner());
         state = next_state;
         if wait.timed_out() {
             break;

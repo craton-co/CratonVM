@@ -1478,7 +1478,7 @@ mod cds_tests {
         fn capture_stack_trace(&mut self, _: i32) -> Vec<cratonvm_native_api::StackTraceEntry> {
             panic!("MockNativeContext: capture_stack_trace not implemented for testing")
         }
-        fn get_stack_trace(&self, _: i32) -> Option<&[cratonvm_native_api::StackTraceEntry]> {
+        fn get_stack_trace(&self, _: i32) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
             panic!("MockNativeContext: get_stack_trace not implemented for testing")
         }
         fn get_field(&self, _: cratonvm_types::ObjectRef, _: usize) -> Value {

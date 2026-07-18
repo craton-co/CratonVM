@@ -832,12 +832,24 @@ pub trait NativeContext {
         false
     }
 
-    /// Capture the current Java call stack for a throwable's `fillInStackTrace`.
-    /// Returns a unique key for later retrieval.
+    /// Capture the current Java call stack without retaining it. Used by
+    /// StackWalker and caller-sensitive helpers.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
 
-    /// Retrieve a previously captured stack trace.
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]>;
+    /// Capture and retain a stack trace for `Throwable.fillInStackTrace`.
+    ///
+    /// The default keeps lightweight/mock contexts source-compatible. The VM
+    /// implementation overrides it so retained frames are owned by the VM,
+    /// rather than by the Java thread that happened to construct the throwable.
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        self.capture_stack_trace(self.identity_hash_code(throwable))
+    }
+
+    /// Retrieve a previously captured stack trace as an owned snapshot.
+    ///
+    /// An owned value deliberately avoids lending a reference through a
+    /// VM-shared lock while another Java thread may replace or discard a trace.
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>>;
 
     /// The exact `ClassId` each live frame is currently executing in,
     /// innermost (most recent call) first.
@@ -926,7 +938,8 @@ pub trait NativeContext {
     /// third-party object whose class gets redefined under a fresh loader
     /// each time, such as ByteBuddy classes under
     /// `@CompileWithForkedClassLoader`).
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize>;
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str)
+        -> Option<usize>;
 
     /// Read `out.len()` bytes of native memory at `addr` into `out`.
     ///
@@ -2251,19 +2264,20 @@ pub trait NativeContext {
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a method return
-    /// type's direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x14,
-    /// METHOD_RETURN, with a single TYPE_ARGUMENT `type_path` entry) -- e.g.
-    /// `List<@NotBlank String> getNames()`.
+    /// type's TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type`
+    /// 0x14, METHOD_RETURN, with a `type_path` made entirely of TYPE_ARGUMENT
+    /// entries) -- e.g. `List<@NotBlank String> getNames()`, or nested generics
+    /// like `ValueExtractor<Wrapper<@Foo ?>>`.
     ///
-    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
-    /// returns an empty `Vec`.
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
     fn method_return_type_argument_annotations(
         &self,
         _class_id: ClassId,
         _method_name: &str,
         _method_desc: &str,
-    ) -> Vec<Vec<AnnotationData>> {
+    ) -> Vec<TypeArgAnnotations> {
         Vec::new()
     }
 
@@ -2293,31 +2307,32 @@ pub trait NativeContext {
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a field type's
-    /// direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x13, FIELD, with a
-    /// single TYPE_ARGUMENT `type_path` entry) -- e.g.
-    /// `List<@NotBlank String> names`.
+    /// TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type` 0x13,
+    /// FIELD, with a `type_path` made entirely of TYPE_ARGUMENT entries) --
+    /// e.g. `List<@NotBlank String> names`.
     ///
-    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
-    /// returns an empty `Vec`.
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
     fn field_type_argument_annotations(
         &self,
         _class_id: ClassId,
         _field_name: &str,
-    ) -> Vec<Vec<AnnotationData>> {
+    ) -> Vec<TypeArgAnnotations> {
         Vec::new()
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a method
-    /// formal parameter's type ARGUMENTS (JVMS 4.7.20 `target_type` 0x16,
-    /// METHOD_FORMAL_PARAMETER, with a `type_path` whose *last* entry has
-    /// `type_path_kind == 3`, TYPE_ARGUMENT) -- e.g. the `@Valid` in
+    /// formal parameter's type ARGUMENTS, at any nesting depth (JVMS 4.7.20
+    /// `target_type` 0x16, METHOD_FORMAL_PARAMETER, with a `type_path` made
+    /// entirely of TYPE_ARGUMENT entries) -- e.g. the `@Valid` in
     /// `List<@Valid Person> persons`, which annotates the type argument
     /// `Person`, not the top-level `List` parameter type.
     ///
     /// The outer `Vec` is indexed by `formal_parameter_index`; the inner
-    /// `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Backs
+    /// `Vec` is indexed by the top-level `type_argument_index` (0-based, per
+    /// JVMS 4.7.20.2), and each entry's own `children` carries the next
+    /// nesting level. Backs
     /// `((AnnotatedParameterizedType) method.getAnnotatedParameterTypes()[i])
     /// .getAnnotatedActualTypeArguments()[j].getDeclaredAnnotations()`, which
     /// Spring's `HandlerMethod.MethodValidationInitializer
@@ -2329,7 +2344,7 @@ pub trait NativeContext {
         _class_id: ClassId,
         _method_name: &str,
         _method_desc: &str,
-    ) -> Vec<Vec<Vec<AnnotationData>>> {
+    ) -> Vec<Vec<TypeArgAnnotations>> {
         Vec::new()
     }
 
@@ -3126,6 +3141,30 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Get the runtime-visible TYPE_USE annotations targeting one of this
+    /// class's declared supertypes (JVMS 4.7.20 `target_type` 0x10,
+    /// CLASS_EXTENDS). `supertype_index` is the JVMS-defined index: `0xFFFF`
+    /// (65535) selects the superclass, `0..n` selects the n-th entry of
+    /// `getInterfaces()`.
+    ///
+    /// Returns a [`TypeArgAnnotations`] tree: `.anns` holds annotations with
+    /// an empty `type_path` (directly on the supertype itself, e.g.
+    /// `implements @Foo Bar`); `.children[i]` holds the subtree for the
+    /// supertype's i-th type argument (recursively, for arbitrarily nested
+    /// generics, e.g. `implements ValueExtractor<ArgumentValue<@ExtractedValue
+    /// ?>>`). Backs `Class.getAnnotatedSuperclass()` /
+    /// `Class.getAnnotatedInterfaces()` and their
+    /// `getAnnotatedActualTypeArguments()` chains. Default impl returns an
+    /// empty tree so mock `NativeContext` implementations don't need to plumb
+    /// the attribute store.
+    fn class_extends_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _supertype_index: u16,
+    ) -> TypeArgAnnotations {
+        TypeArgAnnotations::default()
+    }
+
     /// Get the nest host class name for a class.
     /// Returns None if the class is its own nest host.
     fn nest_host_name(&self, _class_id: ClassId) -> Option<String> {
@@ -3145,6 +3184,25 @@ pub struct AnnotationData {
     pub type_descriptor: String,
     /// Element-value pairs: (name, value_representation)
     pub elements: Vec<(String, AnnotationElementValue)>,
+}
+
+/// A tree of TYPE_USE annotations mirroring the nested-generic shape of a
+/// reified `Type`, keyed by `type_argument_index` at each nesting level
+/// (JVMS 4.7.20.2's `type_path`).
+///
+/// `.anns` holds the annotations whose `type_path` ends exactly at this
+/// node; `.children[i]` is the subtree reached by descending into the i-th
+/// type argument. A plain (non-generic) annotated type has `anns` populated
+/// and `children` empty; a nested generic like
+/// `ValueExtractor<ArgumentValue<@ExtractedValue ?>>` needs two levels:
+/// `children[0]` (the `ArgumentValue<?>` argument) has its own
+/// `children[0]` (the wildcard `?`) carrying `@ExtractedValue` in `anns`.
+#[derive(Debug, Clone, Default)]
+pub struct TypeArgAnnotations {
+    /// Annotations directly on this node (empty remaining `type_path`).
+    pub anns: Vec<AnnotationData>,
+    /// Per-type-argument subtrees, indexed by `type_argument_index`.
+    pub children: Vec<TypeArgAnnotations>,
 }
 
 /// A simplified representation of an annotation element value.

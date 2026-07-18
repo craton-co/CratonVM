@@ -28,6 +28,37 @@ static VM_START: OnceLock<Instant> = OnceLock::new();
 /// Epoch millis corresponding to VM_START (for RuntimeMXBean.getStartTime).
 static VM_START_EPOCH_MS: OnceLock<u64> = OnceLock::new();
 
+/// The platform MBeanServer is a JVM-wide singleton. Keeping it in a native
+/// side table requires explicit GC integration below, just like the built-in
+/// ClassLoader singletons.
+fn platform_mbean_server_store() -> &'static std::sync::Mutex<Option<ObjectRef>> {
+    static INSTANCE: OnceLock<std::sync::Mutex<Option<ObjectRef>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn gc_scan_platform_mbean_server_root(out: &mut Vec<ObjectRef>) {
+    if let Some(server) = *platform_mbean_server_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        out.push(server);
+    }
+}
+
+pub fn gc_update_platform_mbean_server_ref(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut slot = platform_mbean_server_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(server) = slot.as_mut() {
+        if let Some(&new_addr) = pointer_map.get(&(server.as_ptr() as usize)) {
+            *server = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
 fn vm_start() -> &'static Instant {
     VM_START.get_or_init(Instant::now)
 }
@@ -643,7 +674,7 @@ pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegi
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
         "()Ljavax/management/MBeanServer;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_mbean_server(ctx))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(platform_mbean_server(ctx))))),
     );
     r.set_category(__prev_cat);
 }
@@ -3130,23 +3161,53 @@ fn mbs_lookup_bean(ctx: &dyn NativeContext, server: ObjectRef, key: &str) -> Opt
     }
 }
 
-/// `javax.management.InstanceNotFoundException` — modelled as an
-/// IllegalArgumentException carrying the key (CratonVM has no dedicated
-/// JMX-exception variant; callers catch the broader type at boot).
-fn jmx_instance_not_found(key: &str) -> MethodCallFailed {
-    RuntimeError::IllegalArgumentException {
-        message: format!("InstanceNotFoundException: {key}"),
+/// Build a typed JMX exception so callers' declared `throws` contracts and
+/// catch clauses keep working. Falling back to IllegalArgumentException is
+/// only for an unrecoverable class-materialisation failure during bootstrap.
+fn jmx_exception(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    message: String,
+) -> MethodCallFailed {
+    let message_ref = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        class,
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(message_ref))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException { message }.into(),
     }
-    .into()
 }
 
-/// `javax.management.AttributeNotFoundException` — modelled as an
-/// IllegalArgumentException carrying the attribute name.
-fn jmx_attribute_not_found(attr: &str) -> MethodCallFailed {
-    RuntimeError::IllegalArgumentException {
-        message: format!("AttributeNotFoundException: {attr}"),
+fn platform_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let mut slot = platform_mbean_server_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(server) = *slot {
+        return server;
     }
-    .into()
+    let server = alloc_mbean_server(ctx);
+    *slot = Some(server);
+    server
+}
+
+/// `javax.management.InstanceNotFoundException` for an absent MBean.
+fn jmx_instance_not_found(ctx: &mut dyn NativeContext, key: &str) -> MethodCallFailed {
+    jmx_exception(
+        ctx,
+        "javax/management/InstanceNotFoundException",
+        key.to_string(),
+    )
+}
+
+/// `javax.management.AttributeNotFoundException` for an absent attribute.
+fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCallFailed {
+    jmx_exception(
+        ctx,
+        "javax/management/AttributeNotFoundException",
+        attr.to_string(),
+    )
 }
 
 /// Fallback: build a synthetic 2-slot `java.util.HashSet` stand-in. Only used
@@ -3599,7 +3660,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             let key = object_name_key(ctx, name_ref);
             let idx = match mbs_find(ctx, this, &key) {
                 Some(i) => i,
-                None => return Err(jmx_instance_not_found(&key)),
+                None => return Err(jmx_instance_not_found(ctx, &key)),
             };
             let bean = mbs_lookup_bean_at(ctx, this, idx);
             Ok(Some(Value::Object(Some(build_object_instance(
@@ -3672,7 +3733,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             let key = object_name_key(ctx, name_ref);
             let bean = match mbs_lookup_bean(ctx, this, &key) {
                 Some(b) => b,
-                None => return Err(jmx_instance_not_found(&key)),
+                None => return Err(jmx_instance_not_found(ctx, &key)),
             };
             // Attribute.getName() / getValue().
             let attr_name = ctx
@@ -3725,7 +3786,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             let key = object_name_key(ctx, name_ref);
             let bean = match mbs_lookup_bean(ctx, this, &key) {
                 Some(b) => b,
-                None => return Err(jmx_instance_not_found(&key)),
+                None => return Err(jmx_instance_not_found(ctx, &key)),
             };
             // DynamicMBean (e.g. Tomcat modeler's BaseModelMBean, which wraps
             // a real managed resource like HostConfig) exposes operations
@@ -3785,7 +3846,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             };
             let key = object_name_key(ctx, name_ref);
             if mbs_find(ctx, this, &key).is_none() {
-                return Err(jmx_instance_not_found(&key));
+                return Err(jmx_instance_not_found(ctx, &key));
             }
             Ok(Some(Value::Object(None)))
         },
@@ -3839,7 +3900,7 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 }
                 // Registered bean but no accessor matched — JMX says
                 // AttributeNotFound.
-                return Err(jmx_attribute_not_found(&attr_name));
+                return Err(jmx_attribute_not_found(ctx, &attr_name));
             }
 
             // Fall through: the platform `java.lang:type=*` MXBean

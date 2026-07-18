@@ -115,6 +115,10 @@ pub fn update_all_roots(
     // primitive long colliding with the reused address would otherwise pass
     // the rewrite gate).
     crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
+    // Throwable backtraces are VM-wide, non-owning side data. Keep the stored
+    // object handle in sync with a move and prune traces for collected
+    // throwables before any early return for a non-relocating sweep.
+    shared.remap_and_sweep_throwable_stack_traces(pointer_map);
     if pointer_map.is_empty() {
         return;
     }
@@ -536,6 +540,8 @@ pub fn update_all_roots(
     // early-returns when nothing moved (non-moving GC).
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
     cratonvm_native_io::socket_channel::channel_fields_update_after_gc(pointer_map);
+    cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(pointer_map);
+    cratonvm_native_api::server_socket_ports::gc_update_after_gc(pointer_map);
 
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {
@@ -635,6 +641,7 @@ pub fn update_all_roots(
     //     returning the live loader after a moving GC (fixes the intermittent
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
+    cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(pointer_map);
 
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons (companion to roots.rs step 18a). Repoint the cached

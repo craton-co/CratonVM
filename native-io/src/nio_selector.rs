@@ -292,6 +292,10 @@ struct SelectorState {
     pending_accepted: VecDeque<(i32 /*listener fd*/, TcpStream)>,
     /// Woken flag — set by `wakeup()`, cleared on next select entry.
     woken: bool,
+    /// Kernel selects that have released this state lock and may still be
+    /// blocked in epoll_wait. Close keeps its wakeup descriptors alive until
+    /// the last such select has observed the close wakeup.
+    in_flight_selects: usize,
 }
 
 impl SelectorState {
@@ -310,6 +314,7 @@ impl SelectorState {
             wakeup_pipe_write: None,
             pending_accepted: VecDeque::new(),
             woken: false,
+            in_flight_selects: 0,
         }
     }
 
@@ -408,21 +413,36 @@ impl SelectorState {
     }
 }
 
+fn release_closed_selector_handles(st: &mut SelectorState) {
+    debug_assert!(!st.open);
+    if st.in_flight_selects != 0 {
+        return;
+    }
+    st.wakeup_sender.take();
+    st.wakeup_receiver.take();
+    st.wakeup_peer.take();
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(efd) = st.epoll_fd.take() {
+            // SAFETY: efd was a valid fd owned by this selector.
+            unsafe { libc::close(efd) };
+        }
+        if let Some(rfd) = st.wakeup_pipe_read.take() {
+            unsafe { libc::close(rfd) };
+        }
+        if let Some(wfd) = st.wakeup_pipe_write.take() {
+            unsafe { libc::close(wfd) };
+        }
+    }
+}
+
 impl Drop for SelectorState {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(efd) = self.epoll_fd.take() {
-                // SAFETY: efd was a valid fd.
-                unsafe { libc::close(efd) };
-            }
-            if let Some(rfd) = self.wakeup_pipe_read.take() {
-                unsafe { libc::close(rfd) };
-            }
-            if let Some(wfd) = self.wakeup_pipe_write.take() {
-                unsafe { libc::close(wfd) };
-            }
-        }
+        // The registry intentionally retains closed selectors so concurrent
+        // callers can finish safely. Drop is only reached at process teardown.
+        self.open = false;
+        self.in_flight_selects = 0;
+        release_closed_selector_handles(self);
     }
 }
 
@@ -489,25 +509,29 @@ pub fn selector_close(id: i32) {
     let regs = selectors().read();
     if let Some(s) = regs.get(&id) {
         let mut st = s.lock();
-        st.open = false;
-        st.keys.clear();
-        st.wakeup_sender.take();
-        st.wakeup_receiver.take();
-        st.wakeup_peer.take();
-        st.pending_accepted.clear();
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(efd) = st.epoll_fd.take() {
-                // SAFETY: efd was a valid fd; close is idempotent.
-                unsafe { libc::close(efd) };
-            }
-            if let Some(rfd) = st.wakeup_pipe_read.take() {
-                unsafe { libc::close(rfd) };
-            }
-            if let Some(wfd) = st.wakeup_pipe_write.take() {
-                unsafe { libc::close(wfd) };
-            }
+        if !st.open {
+            return;
         }
+        st.open = false;
+        // An in-flight epoll_wait must be woken before its self-pipe and
+        // epoll fd can be released. In particular, closing an epoll fd from a
+        // different thread is not a portable wakeup primitive. Keep those
+        // descriptors alive until the final in-flight select returns.
+        st.woken = true;
+        #[cfg(target_os = "linux")]
+        if let Some(wfd) = st.wakeup_pipe_write {
+            let byte: u8 = b'W';
+            // SAFETY: wfd remains owned by this selector until the last
+            // in-flight select calls release_closed_selector_handles().
+            let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let (Some(sender), Some(peer)) = (st.wakeup_sender.as_ref(), st.wakeup_peer) {
+            let _ = sender.send_to(b"W", peer);
+        }
+        st.keys.clear();
+        st.pending_accepted.clear();
+        release_closed_selector_handles(&mut st);
     }
 }
 
@@ -772,6 +796,24 @@ fn linux_ready_for(events: i32, interest: i32, is_listener: bool) -> i32 {
     r
 }
 
+#[cfg(target_os = "linux")]
+fn finish_in_flight_linux_select_locked(st: &mut SelectorState) {
+    debug_assert!(st.in_flight_selects > 0);
+    st.in_flight_selects -= 1;
+    if !st.open {
+        release_closed_selector_handles(st);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_in_flight_linux_select(id: i32) {
+    let regs = selectors().read();
+    if let Some(s) = regs.get(&id) {
+        let mut st = s.lock();
+        finish_in_flight_linux_select_locked(&mut st);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel-backed select — Linux (epoll)
 // ---------------------------------------------------------------------------
@@ -845,6 +887,9 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
                 connect_candidates.push(k.net_fd);
             }
         }
+        // From this point until phase 3, selector_close() must retain the
+        // wakeup handles because epoll_wait may be asleep without this lock.
+        st.in_flight_selects += 1;
         (efd, interests, listeners, connect_candidates)
     };
 
@@ -895,18 +940,20 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     if n < 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
+            finish_in_flight_linux_select(id);
             return Ok(0);
         }
-        // Closing from another thread may invalidate the epoll fd while this
-        // select is asleep. It is an in-flight close wakeup, not an I/O error.
+        // A close can race the wait. It is a wakeup, not an I/O error.
         if selectors()
             .read()
             .get(&id)
             .map(|s| !s.lock().open)
             .unwrap_or(true)
         {
+            finish_in_flight_linux_select(id);
             return Ok(0);
         }
+        finish_in_flight_linux_select(id);
         return Err(ioex(format!("epoll_wait: {err}")));
     }
 
@@ -921,6 +968,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         // The close raced a select already executing in epoll_wait. The JDK
         // wakes that existing operation; it must not surface as a teardown
         // failure. A later select still fails in the entry check above.
+        finish_in_flight_linux_select_locked(&mut st);
         return Ok(0);
     }
 
@@ -1008,6 +1056,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         st.woken = false;
         st.drain_wakeup_pipe();
     }
+    finish_in_flight_linux_select_locked(&mut st);
     Ok(count)
 }
 
