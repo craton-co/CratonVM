@@ -42673,7 +42673,56 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     session
 }
 
-/// NEW-13: common body for the two `SSLSocketFactory.createSocket` overloads.
+/// Resolve an `InetAddress` argument without depending on its implementation
+/// class.  Real JSSE factories expose all of the `SocketFactory` overloads;
+/// our P68 bridge must do the same because its synthetic factory is allocated
+/// as `javax/net/ssl/SSLSocketFactory` itself.
+fn p68_inet_address_host(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+) -> Result<String, MethodCallFailed> {
+    let address = obj_arg(args, address_index)?;
+    let pin_base = ctx.pin_native_root(address);
+    let host_value = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin_base);
+    let host = match host_value? {
+        Some(Value::Object(Some(host))) => ctx.read_string(host).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "InetAddress has no host address".into(),
+        }
+        .into());
+    }
+    Ok(host)
+}
+
+/// Bridge the `InetAddress` forms of `SSLSocketFactory.createSocket`.  The
+/// local-address variants share the P68 TLS connector's current connection
+/// semantics; their local bind arguments are accepted by the JDK signature
+/// but are not consumed by the native TLS stream implementation.
+fn p68_create_socket_inet_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+    port_index: usize,
+) -> MethodCallResult {
+    let host = p68_inet_address_host(ctx, args, address_index)?;
+    let port = args.get(port_index).and_then(|value| value.as_int()).unwrap_or(443);
+    if !(0..=65535).contains(&port) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("port out of range: {port}"),
+        }
+        .into());
+    }
+    let extra_roots = p68_factory_trust_roots(args);
+    let java_tm_key = p68_factory_java_tm_key(ctx, args);
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+}
+
+/// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
 fn new13_do_create_socket(
     ctx: &mut dyn NativeContext,
     host: &str,
@@ -43082,6 +43131,55 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
+    );
+    // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
+    // though `SocketFactory` has a bridge registration.  A synthetic P68
+    // factory therefore resolves these calls at the abstract declaration
+    // instead of inheriting the ancestor native, yielding AbstractMethodError.
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host_ref = match args.get(1) {
+                Some(Value::Object(Some(reference))) => *reference,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("SSLSocketFactory.createSocket: host is null".into()),
+                    }
+                    .into());
+                }
+            };
+            let host = ctx.read_string(host_ref).unwrap_or_default();
+            if host.is_empty() {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "SSLSocketFactory.createSocket: host is empty".into(),
+                }
+                .into());
+            }
+            let port = args.get(2).and_then(|value| value.as_int()).unwrap_or(443);
+            if !(0..=65535).contains(&port) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("port out of range: {port}"),
+                }
+                .into());
+            }
+            let extra_roots = p68_factory_trust_roots(args);
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+        },
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
     );
     // createSocket(Socket s, String host, int port, boolean autoClose) — we
     // ignore the supplied Socket (the TLS stream owns its own TCP connection)
