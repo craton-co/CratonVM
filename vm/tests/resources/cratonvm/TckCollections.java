@@ -36,4 +36,17 @@ public class TckCollections {
         Map<String,Integer> m = Collections.singletonMap("k", 42);
         return (m.size() == 1 && m.get("k") == 42) ? 1 : 0;
     }
+    public static int singleton_wrappers_are_real_and_immutable() {
+        List<String> list = Collections.singletonList("v");
+        Set<String> set = Collections.singleton("v");
+        Map<String,String> map = Collections.singletonMap("k", "v");
+        try {
+            map.put("other", "value");
+            return 0;
+        } catch (UnsupportedOperationException expected) {
+            return ("java.util.Collections$SingletonList".equals(list.getClass().getName())
+                    && "java.util.Collections$SingletonSet".equals(set.getClass().getName())
+                    && "java.util.Collections$SingletonMap".equals(map.getClass().getName())) ? 1 : 0;
+        }
+    }
 }

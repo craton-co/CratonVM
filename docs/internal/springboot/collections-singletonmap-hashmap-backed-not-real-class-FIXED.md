@@ -1,6 +1,6 @@
 # `Collections.singletonMap(...)` returns a `HashMap`-backed object instead of the real `Collections$SingletonMap` — `EnvironmentEndpointTests`
 
-**Status: OPEN — found 2026-07-17 (confirmed at source level)**
+**Status: FIXED — 2026-07-18**
 
 ## Symptom
 
@@ -88,10 +88,33 @@ simple Map methods before the real `Collections$SingletonMap` wrapper's
 method surface is fully bridged." This reads as an intentional
 WildFly-bootstrap trade-off added on top of the SBR-12 fix that silently
 regressed the exact case that fix's own regression test suite covered — not
-a fresh, unrelated bug. `Collections.singleton(Object)` (the `Set` sibling,
-same comment) likely has the identical `getClass()` mismatch for the same
-reason, though no failing Spring Boot test in this batch exercises it
-directly.
+a fresh, unrelated bug. `Collections.singleton(Object)` (the `Set` sibling)
+had the same mismatch and is fixed alongside `singletonMap`.
+
+## Resolution (2026-07-18)
+
+Both registration paths now allocate the real JDK wrapper whenever it is
+available and initialize its natural fields by name:
+
+- normal native-collections mode returns `Collections$SingletonSet` and
+  `Collections$SingletonMap` with `element` / `k`,`v` populated;
+- early/synthetic registration does the same for the complete singleton family
+  (`List`, `Set`, and `Map`), retaining its old synthetic representation only
+  as an unavailable-class fallback.
+
+This restores the observable runtime type and the immutable contract instead
+of exposing mutable `HashSet`/`HashMap` stand-ins. The conformance corpus now
+checks all three wrapper classes and verifies that `singletonMap.put` throws.
+
+Validation used the isolated Linux worktree
+`/data/wt-class-getmethods-shadowing-closure-20260717-v2`, Java 25, and the
+unique binary
+`/data/cv-target-class-getmethods-shadowing-closure-20260717-v2/release/cratonvm-class-getmethods-shadowing-closure-20260717-v2`.
+`SingletonProbe` printed `SINGLETONS_OK`: all three runtime names matched JDK
+25 and `singletonMap` rejected mutation. The targeted Spring Boot sweep also
+contained no `java.util.HashMap`/`SingletonMap` mismatch signature; this
+fixture's `EnvironmentEndpointTests` could not be loaded because its cached
+classpath contains Windows paths, an unrelated harness artifact.
 
 ## Affected classes
 

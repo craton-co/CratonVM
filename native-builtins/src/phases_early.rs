@@ -357,6 +357,11 @@ fn native_collections_singleton_list(
     args: &[Value],
 ) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonList") {
+        let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(list, "element", elem);
+        return Ok(Some(Value::Object(Some(list))));
+    }
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(arr, 0, elem);
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
@@ -370,6 +375,11 @@ fn native_collections_singleton_set(
     args: &[Value],
 ) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonSet") {
+        let set = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(set, "element", elem);
+        return Ok(Some(Value::Object(Some(set))));
+    }
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
@@ -387,6 +397,12 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().copied().unwrap_or(Value::Object(None));
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonMap") {
+        let map = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(map, "k", key);
+        ctx.set_field_by_name(map, "v", val);
+        return Ok(Some(Value::Object(Some(map))));
+    }
     // Create HashMap with 1 entry
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     let cap = 16;
