@@ -639,6 +639,7 @@ pub fn update_all_roots(
     //     returning the live loader after a moving GC (fixes the intermittent
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
+    cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(pointer_map);
 
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons (companion to roots.rs step 18a). Repoint the cached

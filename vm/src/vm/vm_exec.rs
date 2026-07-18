@@ -12501,14 +12501,21 @@ pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) ->
     s.push('@');
     s.push_str(&dotted);
     s.push('(');
+    let omit_single_value_name = elems.len() == 1 && elems[0].0 == "value";
     let mut first = true;
     for (name, val) in &elems {
         if !first {
             s.push_str(", ");
         }
         first = false;
-        s.push_str(name);
-        s.push('=');
+        // The JDK's AnnotationInvocationHandler elides `value=` for a
+        // single-member annotation whose sole element is conventionally named
+        // `value`, e.g. `@Qualifier("alpha")`, while retaining names for every
+        // multi-member annotation.
+        if !omit_single_value_name {
+            s.push_str(name);
+            s.push('=');
+        }
         s.push_str(&format_annotation_value(shared, *val));
     }
     s.push(')');

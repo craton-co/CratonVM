@@ -854,7 +854,7 @@ fn discover_providers(
     // embedded jar trees like IMPL-JARS/<module>/<ver>.jar/<path>), the
     // flat scan below won't find the descriptor at the top-level path.
     //
-    // Delegate to loader.findResources(resource) → Enumeration<URL>,
+    // Delegate to loader.getResources(resource) → Enumeration<URL>,
     // then for each URL extract the JAR-entry path and read bytes directly,
     // mirroring what the real JDK ServiceLoader does via
     // LazyClassPathLookupIterator → loader.getResources(name).
@@ -920,25 +920,25 @@ fn discover_providers(
     }
 
     if let Some(loader_r) = loader_ref_opt {
-        // Primary path: call loader.findResources(resource) → Enumeration<URL>,
+        // Primary path: call loader.getResources(resource) → Enumeration<URL>,
         // then extract the entry path from each URL and read bytes directly.
         let loader_pin = ctx.pin_native_root(loader_r);
         let res_name_val = Value::Object(Some(ctx.create_string(&resource)));
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         let enum_res = ctx.invoke_virtual(
             loader_r,
-            "findResources",
+            "getResources",
             "(Ljava/lang/String;)Ljava/util/Enumeration;",
             &[res_name_val],
         );
         if diag_sl {
             match &enum_res {
-                Err(e) => eprintln!("[SL-LOADER-DBG] findResources Err: {e:?}"),
-                Ok(None) => eprintln!("[SL-LOADER-DBG] findResources -> Ok(None)"),
+                Err(e) => eprintln!("[SL-LOADER-DBG] getResources Err: {e:?}"),
+                Ok(None) => eprintln!("[SL-LOADER-DBG] getResources -> Ok(None)"),
                 Ok(Some(Value::Object(None))) => {
-                    eprintln!("[SL-LOADER-DBG] findResources -> Ok(null)")
+                    eprintln!("[SL-LOADER-DBG] getResources -> Ok(null)")
                 }
-                Ok(Some(v)) => eprintln!("[SL-LOADER-DBG] findResources -> Ok(Some({v:?}))"),
+                Ok(Some(v)) => eprintln!("[SL-LOADER-DBG] getResources -> Ok(Some({v:?}))"),
             }
         }
         let found_via_enum = if let Ok(Some(Value::Object(Some(mut enum_r)))) = enum_res {
@@ -1013,11 +1013,20 @@ fn discover_providers(
                     // an absolute path like `C:/…/META-INF/services/<spi>` misses
                     // and the provider list comes back empty. Read the file
                     // directly. This is the common case for a custom loader whose
-                    // `findResources` override hands back a descriptor URL from a
+                    // `getResources` override hands back a descriptor URL from a
                     // directory on disk (Hibernate's `ClassLoaderServiceImplTest`
                     // `TestClassLoader`, HHH-8363).
                     if ext_str.starts_with("file:") && !ext_str.contains("!/") {
-                        let fs_path = percent_decode(&entry_path);
+                        // Keep the path component from the URL, not the
+                        // classpath-relative `entry_path`: stripping `file:/`
+                        // from `file:/tmp/...` loses its leading slash and
+                        // changes an absolute dynamic-test resource into a
+                        // relative path. Spring Boot's ResourcesClassLoader
+                        // deliberately exposes method-scoped SPI descriptors
+                        // this way.
+                        let fs_path = percent_decode(
+                            ext_str.strip_prefix("file:").unwrap_or(&entry_path),
+                        );
                         if let Ok(bytes) = std::fs::read(&fs_path) {
                             parse_provider_lines(&bytes, &mut providers);
                             got = true;
@@ -1043,7 +1052,7 @@ fn discover_providers(
             false
         };
 
-        // Fallback: if findResources failed or returned an empty Enumeration,
+        // Fallback: if getResources failed or returned an empty Enumeration,
         // directly read the `jarMetas` field from the loader (an
         // EmbeddedImplClassLoader-like object) and call prefix() on each
         // JarMeta to construct the embedded resource path.  This bypasses the
@@ -1102,10 +1111,10 @@ fn discover_providers(
             }
         }
         // IMPL-JARS fallback: runs whenever providers is still empty after the
-        // findResources / jarMetas attempts.  Covers:
-        //   (a) findResources returned null/empty (found_via_enum=false, the common case
+        // getResources / jarMetas attempts. Covers:
+        //   (a) getResources returned null/empty (found_via_enum=false, the common case
         //       for EmbeddedImplClassLoader when jarMetas is empty), and
-        //   (b) findResources succeeded but the URL chain produced no bytes.
+        //   (b) getResources succeeded but the URL chain produced no bytes.
         //
         // Derive the module name from the service FQN, read LISTING.TXT via flat
         // classpath, then open each inner JAR as ZIP and look for the service

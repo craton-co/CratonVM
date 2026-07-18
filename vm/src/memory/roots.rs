@@ -632,6 +632,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     / heap-size dependent). Remap companion in `gc.rs`
     //     (`gc_update_loader_singleton_refs`).
     cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
+    cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(&mut roots);
 
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons cached in `native-builtins/src/lang_system.rs`. Like the
