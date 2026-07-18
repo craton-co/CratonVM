@@ -38799,12 +38799,34 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(log))))
         },
     );
+    // Spring's lazy LogMessage is frequently passed to Commons Logging. Its
+    // real `toString` path dispatches to a package-private formatter method
+    // that is not consistently reachable from a native re-entry. Keep the
+    // normal cache semantics while dispatching the formatter directly.
+    registry.register(
+        "org/springframework/core/log/LogMessage",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(this))) => *this,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(result)) = ctx.get_field_by_name(this, "result") {
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            let result = ctx.invoke_virtual(this, "buildString", "()Ljava/lang/String;", &[])?;
+            if let Some(Value::Object(Some(result))) = result {
+                ctx.set_field_by_name(this, "result", Value::Object(Some(result)));
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
     let acl_log = "org/apache/commons/logging/Log";
     registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
         if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL] {}", s));
-            }
+            emit_framework_log_object(ctx, "[ACL]", *msg, None);
         }
         Ok(None)
     });
@@ -38816,9 +38838,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     );
     registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
         if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL WARN] {}", s));
-            }
+            emit_framework_log_object(ctx, "[ACL WARN]", *msg, None);
         }
         Ok(None)
     });
@@ -38826,13 +38846,16 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         acl_log,
         "warn",
         "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
+        |ctx, args| {
+            if let Some(Value::Object(Some(msg))) = args.get(1) {
+                emit_framework_log_object(ctx, "[ACL WARN]", *msg, args.get(2));
+            }
+            Ok(None)
+        },
     );
     registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
         if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
-            }
+            emit_framework_log_object(ctx, "[ACL ERROR]", *msg, None);
         }
         Ok(None)
     });
@@ -38871,9 +38894,7 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     );
     registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
         if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL FATAL] {}", s));
-            }
+            emit_framework_log_object(ctx, "[ACL FATAL]", *msg, None);
         }
         Ok(None)
     });
@@ -38881,13 +38902,23 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         acl_log,
         "fatal",
         "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
+        |ctx, args| {
+            if let Some(Value::Object(Some(msg))) = args.get(1) {
+                emit_framework_log_object(ctx, "[ACL FATAL]", *msg, args.get(2));
+            }
+            Ok(None)
+        },
     );
     registry.register(
         acl_log,
         "info",
         "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
+        |ctx, args| {
+            if let Some(Value::Object(Some(msg))) = args.get(1) {
+                emit_framework_log_object(ctx, "[ACL]", *msg, args.get(2));
+            }
+            Ok(None)
+        },
     );
     registry.register(
         acl_log,
@@ -38899,7 +38930,12 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         acl_log,
         "error",
         "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
+        |ctx, args| {
+            if let Some(Value::Object(Some(msg))) = args.get(1) {
+                emit_framework_log_object(ctx, "[ACL ERROR]", *msg, args.get(2));
+            }
+            Ok(None)
+        },
     );
 
     // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
@@ -44165,6 +44201,76 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
             let _ = ctx.fd_table().write_string(fd, &sep);
         }
     });
+}
+
+/// Emit a framework log record through the live Java-level console stream.
+///
+/// Native logging fallbacks must not merely add entries to `printed_lines`:
+/// Spring Boot's `OutputCaptureExtension` observes the `PrintStream` installed
+/// by `System.setOut`, so bypassing that stream loses the record to tests (and
+/// to any other Java-level redirection).  Routing through `stream_writeln`
+/// preserves the canonical fd fast path for the original stream while calling
+/// a capture stream's real `OutputStream.write` override after redirection.
+fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
+    ctx.record_printed_line(text.to_string());
+    // `NativeContext::get_system_stream` is the process's canonical fd-backed
+    // stream. `System.setOut` intentionally leaves that canonical stream in
+    // place and records the Java-level replacement in the override table, so
+    // native-originated logs must prefer the override just as GETSTATIC does.
+    if let Some(out) = system_overridden_stream("out").or_else(|| ctx.get_system_stream("out")) {
+        stream_writeln(ctx, &[Value::Object(Some(out))], text);
+    }
+}
+
+/// Include the Throwable's Java representation for overloads whose contract
+/// carries an exception.  Calling `printStackTrace` here would bypass the
+/// capture stream on some JDK paths; `toString` is sufficient for framework
+/// diagnostics and remains part of the same captured record.
+fn emit_framework_log_with_throwable(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: &str,
+    throwable: Option<&Value>,
+) {
+    let throwable = match throwable {
+        Some(Value::Object(Some(throwable))) => {
+            match native_throwable_to_string(ctx, &[Value::Object(Some(*throwable))]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let text = match throwable {
+        Some(throwable) if !throwable.is_empty() => format!("{level} {message}\n{throwable}"),
+        _ => format!("{level} {message}"),
+    };
+    emit_framework_log(ctx, &text);
+}
+
+/// Commons Logging accepts arbitrary objects. Spring uses `LogMessage` for
+/// lazy formatting, so only reading `String` receivers loses those records.
+fn emit_framework_log_object(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: ObjectRef,
+    throwable: Option<&Value>,
+) {
+    let message = ctx
+        .read_string(message)
+        .or_else(|| {
+            match ctx.invoke_virtual(message, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        })
+        .or_else(|| match ctx.get_field_by_name(message, "format") {
+            Value::Object(Some(format)) => ctx.read_string(format),
+            _ => None,
+        });
+    if let Some(message) = message {
+        emit_framework_log_with_throwable(ctx, level, &message, throwable);
+    }
 }
 
 fn native_println_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -71821,19 +71927,21 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Level checks — return false so log call sites short-circuit. The
-    // synthetic-jdk path overrides these with level-aware versions,
-    // which is fine because the registration order in
-    // `register_slf4j_natives` is binder-LAST and we only get called
-    // there if no level-aware override has been registered yet.
+    // Retain trace/debug suppression, but keep the production log levels
+    // live. Spring's commons-logging and SLF4J adapters guard their warning
+    // paths with these checks; returning false here silently erased records
+    // instead of delivering them to the Java console stream.
     fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(0)))
     }
+    fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(1)))
+    }
     registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
     // Marker-aware variants: SLF4J `Logger` interface declares
     // `is{Trace,Debug,Info,Warn,Error}Enabled(Marker)`. Kafka (kafka.Kafka via
     // Scala) routes log calls through these overloads on first startup; the
@@ -71856,19 +71964,19 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isInfoEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isWarnEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isErrorEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
 
     // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
@@ -71903,12 +72011,10 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // accumulation recurs it must be fixed at its source (the map/collection
     // layer), not by skipping this method.
 
-    // No-op log methods (covers the most common arities that JCL /
-    // commons-logging / direct-SLF4J callers use). The synthetic-jdk
-    // `register_slf4j_natives` overrides several of these with
-    // dispatched-to-stdout versions; that override is harmless because
-    // the binder helper runs last in synthetic mode, but here in
-    // real-JDK mode we want pure no-ops.
+    // Preserve lightweight native fallback logging without discarding its
+    // observable console output. The full Logback pipeline is not available
+    // on every supported classpath, but Spring's OutputCaptureExtension must
+    // see INFO/WARN/ERROR records exactly as it sees direct System.out writes.
     fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
     }
@@ -71922,9 +72028,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(lg, "trace", sig, slf4j_noop);
         registry.register(lg, "debug", sig, slf4j_noop);
-        registry.register(lg, "info", sig, slf4j_noop);
-        registry.register(lg, "warn", sig, slf4j_noop);
-        registry.register(lg, "error", sig, slf4j_noop);
+        registry.register(lg, "info", sig, slf4j_log_msg);
+        registry.register(lg, "warn", sig, slf4j_log_msg);
+        registry.register(lg, "error", sig, slf4j_log_msg);
     }
 
     // Logback LoggerContext bridge — paired with the
@@ -72081,11 +72187,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "()Lch/qos/logback/classic/Level;",
         |_, _| Ok(Some(Value::Object(None))),
     );
-    // Plain (String,...) and Marker-variant overloads. Spring Boot's
-    // LogAdapter and direct logback-typed callers dispatch through any
-    // of these; all are routed to a no-op so we never enter logback's
-    // internal filterAndLog path (where filter/appender lists are null
-    // because we bypass logback's <init>).
+    // Plain (String,...) and Marker-variant overloads. Avoid Logback's
+    // incomplete internal filter/appender path, but preserve INFO/WARN/ERROR
+    // records through the same Java-console bridge as the SLF4J interface.
     for sig in [
         "(Ljava/lang/String;)V",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
@@ -72100,9 +72204,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(lb_lg, "trace", sig, slf4j_noop);
         registry.register(lb_lg, "debug", sig, slf4j_noop);
-        registry.register(lb_lg, "info", sig, slf4j_noop);
-        registry.register(lb_lg, "warn", sig, slf4j_noop);
-        registry.register(lb_lg, "error", sig, slf4j_noop);
+        registry.register(lb_lg, "info", sig, slf4j_log_msg);
+        registry.register(lb_lg, "warn", sig, slf4j_log_msg);
+        registry.register(lb_lg, "error", sig, slf4j_log_msg);
     }
     // LocationAwareLogger.log(Marker, fqcn, level, msg, args, t). Spring
     // Boot's slf4j adapter routes here, which then internally calls
@@ -73163,7 +73267,7 @@ fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Format as: [LEVEL] logger - message
     let short_name = logger_name.rsplit('.').next().unwrap_or(&logger_name);
     let formatted = format!("[LOG] {} - {}", short_name, result);
-    ctx.record_printed_line(formatted);
+    emit_framework_log(ctx, &formatted);
     Ok(None)
 }
 
