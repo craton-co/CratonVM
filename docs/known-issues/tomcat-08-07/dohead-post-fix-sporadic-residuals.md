@@ -305,3 +305,35 @@ After the C29 matrix finished, the explicit DoHead process sweep found no
 matching runner or VM process. Do not move this record to docs/internal until
 a newly built binary completes the 64-class matrix with zero residuals,
 followed by a relevant --nojit control.
+
+## 2026-07-18 C32 system-environment map node residual
+
+C32 closes the remaining zero-slot HashMap node producer in
+native-builtins/lang_system. System.getenv() could receive an apparent
+HashMap$Node initialization success carrying Object class ID 0; its field
+writes were silently dropped. The path now unconditionally obtains the named
+synthetic HashMap$Node layout. C32 mixed transport pressure
+(511->1023, 512->0, 513->511; two processes, eight passes) completed 24/24
+PASS with ALL_DONE and no matching DoHead process remaining.
+
+## 2026-07-18 C33 full-matrix checkpoint
+
+**Status: OPEN.** C32's system-environment map-node fix removes the guarded
+zero-slot node writes seen in the previous matrix, but it does not yet close
+the entire DoHead family. The document remains under `docs/known-issues`.
+
+- C32 focused JIT pressure:
+  `/data/data/dohead-c32-systemnode-transport-n2x8-20260718`, covering
+  `511 -> 1023`, `512 -> 0`, and `513 -> 511` with two processes and eight
+  passes, completed **24/24 PASS** with `ALL_DONE`.
+- C32 full JIT matrix:
+  `/data/data/dohead-c32-systemnode-full64-n2x1-20260718`, 64 boundary
+  classes, two processes, one pass, `-Xmx1g`, and a 240-second class timeout,
+  completed with `ALL_DONE`: **63 PASS, 1 FAIL**.
+- The sole residual is `1023 -> 0`, parameter
+  `testDoHead[29: 0 false false 16,384 false 1,023 FULL 0 true]`, which
+  asserts three headers but receives two (`expected:<3> but was:<2>`). This is
+  an HTTP/1 FULL/keep-alive header-map loss, distinct from C29's zero-slot
+  producer and from the C32 focused transport cases.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.

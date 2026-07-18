@@ -1961,9 +1961,7 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, f_loadfactor, Value::Float(0.75));
         ctx.set_field(map, f_entryset, Value::Object(None));
 
-        let node_class_id = ctx
-            .ensure_class_initialized("java/util/HashMap$Node")
-            .unwrap_or(ClassId::new(0));
+        let node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", node_n_fields);
 
         for (key, value) in std::env::vars() {
             let key_obj = ctx.create_string(&key);
