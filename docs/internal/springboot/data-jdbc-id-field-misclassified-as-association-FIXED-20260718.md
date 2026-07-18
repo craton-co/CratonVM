@@ -1,6 +1,30 @@
 # Spring Data JDBC: a plain `@Id private Long id` field is misclassified as an "association", `Association.from()` throws `IllegalArgumentException`
 
-**Status: OPEN — found 2026-07-17. Hypothesis 1 below (a `Class`-identity/equality gap) is now strongly evidenced — see "Update 2026-07-17 (bin7)".**
+**Status: FIXED — retired 2026-07-18. The original investigation below is retained for diagnostic history.**
+
+## Resolution (2026-07-18)
+
+**Status: FIXED / record retired.** The current VM correctly reports
+`org.jmolecules.ddd.types.Association` as absent when it is not on the
+classpath. In particular, both `Class.forName(name, false, loader)` and the
+underlying `ClassLoader.loadClass(name)` throw `ClassNotFoundException` rather
+than producing a class-like result. Spring Data therefore leaves its optional
+`ASSOCIATION_TYPE` gate null and does not classify ordinary `Long`, `String`,
+or `Name` fields as associations.
+
+This was verified with the exact absent jMolecules name on CratonVM with JIT
+enabled and with `--nojit`, alongside a real JDK 25 control. The focused
+`ROptionalClassForName` regression now protects both API forms. A short
+Windows suite attempt against the historical fixture did not reproduce the
+old `Association.from()` exception before its independent 55-second timeout;
+that timeout is not treated as evidence for this resolved classification bug.
+
+No new VM implementation change was required because `dev` already has the
+correct optional-class contract. The original 2026-07-17 report is retained
+below for diagnostic history; the affected JDBC, Cassandra, and LDAP
+manifestations share the same retired jMolecules gate.
+
+## Original report
 
 ## Symptom
 

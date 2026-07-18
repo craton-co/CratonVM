@@ -1,6 +1,23 @@
 # `DataJdbcTestIntegrationTests`: Spring Data JDBC's metamodel treats a plain `String` field as an unresolvable association
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — retired 2026-07-18. The original investigation below is retained for diagnostic history.**
+
+## Resolution (2026-07-18)
+
+**Status: FIXED / record retired.** This report is a downstream manifestation
+of the optional jMolecules association gate documented in
+`data-jdbc-id-field-misclassified-as-association-FIXED-20260718.md`, not an
+independent private-final-field reflection issue. With the absent
+`org.jmolecules.ddd.types.Association` name correctly throwing
+`ClassNotFoundException`, Spring Data never walks `ExampleEntity.name` as an
+association.
+
+The shared `ROptionalClassForName` regression verifies both
+`Class.forName(name, false, loader)` and `ClassLoader.loadClass(name)` on JIT
+and `--nojit`; each must report the dependency absent. The original failure
+record remains below for history.
+
+## Original report
 
 ## Symptom
 

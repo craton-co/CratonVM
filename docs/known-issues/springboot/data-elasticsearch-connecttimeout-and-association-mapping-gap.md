@@ -146,6 +146,21 @@ check). Likely a different bug sharing the same "Spring Data metamodel
 misjudges class presence/simple-type-ness" symptom family — worth a joint
 follow-up, not proven identical.
 
+## Update 2026-07-18 — Case 2 association classification retired
+
+The association-mapping half of this record is the same optional jMolecules
+class-presence gate as the retired Spring Data JDBC record in
+`docs/internal/springboot/data-jdbc-id-field-misclassified-as-association-FIXED-20260718.md`.
+The focused `ROptionalClassForName` probe confirms that the absent
+`org.jmolecules.ddd.types.Association` name throws `ClassNotFoundException`
+through both `Class.forName(name, false, loader)` and `ClassLoader.loadClass`
+with JIT enabled and disabled. It must therefore leave Spring Data's
+`ASSOCIATION_TYPE` null, so Case 2 is resolved and should not be triaged as a
+remaining Elasticsearch mapping defect.
+
+This document remains open solely for Case 1's separate Windows closed-port
+connect/refusal behavior.
+
 ## Affected classes
 
 | Module | Class |
