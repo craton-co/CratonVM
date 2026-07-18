@@ -139,52 +139,21 @@ fn defl_effective_level(level_raw: i32) -> i32 {
     }
 }
 
-#[cfg(unix)]
 fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
+    let mut z_len = bound as libz_sys::uLong;
     let rc = unsafe {
-        compress2(
+        libz_sys::compress2(
             z.as_mut_ptr(),
             &mut z_len,
             data.as_ptr(),
             source_len,
-            defl_effective_level(level) as c_int,
+            defl_effective_level(level),
         )
     };
     if rc != 0 || z_len < 6 {
@@ -196,11 +165,6 @@ fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<
     } else {
         Some(z[2..z.len() - 4].to_vec())
     }
-}
-
-#[cfg(not(unix))]
-fn defl_zlib_compress(_data: &[u8], _level: i32, _zlib_header: bool) -> Option<Vec<u8>> {
-    None
 }
 
 fn defl_compress_finished(data: &[u8], level: i32, zlib_header: bool) -> std::io::Result<Vec<u8>> {
@@ -777,6 +741,11 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // and any app reading JARs trips `updateBytes0` during entry verification.
     let crc = "java/util/zip/CRC32";
     r.register(crc, "update", "(II)I", crc32_update);
+    // `updateBytes` is concrete real-JDK bytecode that only checks its range
+    // then delegates to updateBytes0. Force its registered implementation in
+    // real-JDK mode so archive writers never compile a second, incompatible
+    // CRC-state transition around the native boundary.
+    r.register(crc, "updateBytes", "(I[BII)I", crc32_update_bytes_0);
     r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
     r.register(
         crc,
@@ -895,5 +864,22 @@ mod tests {
         assert_eq!((p2 >> 31) & 0x7FFF_FFFF, 0x7FFF_FFFF);
         assert_eq!((p2 >> 62) & 1, 0);
         assert_eq!((p2 >> 63) & 1, 1);
+    }
+
+    #[test]
+    fn deflater_matches_hotspot_for_a_large_json_string() {
+        let mut body = Vec::with_capacity(10_002);
+        body.push(b'[');
+        body.extend(std::iter::repeat_n(b'a', 10_000));
+        body.push(b']');
+
+        let actual = defl_compress_finished(&body, 6, false)
+            .expect("raw deflate compression should succeed");
+        let expected = [
+            0xed, 0xc1, 0x31, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37,
+            0x51, 0x1f, 0x0d, 0x70, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x52,
+        ];
+        assert_eq!(actual, expected);
     }
 }

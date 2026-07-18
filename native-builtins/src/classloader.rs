@@ -3426,19 +3426,25 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             let this_pin = ctx.pin_native_root(this_ref);
             let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
             let this_live = ctx.read_native_pin(this_pin, this_ref);
-            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this_live, "parent") {
-                let parent_pin = ctx.pin_native_root(parent);
-                let parent_live = ctx.read_native_pin(parent_pin, parent);
-                let parent_result = ctx.invoke_virtual(
-                    parent_live,
-                    "getResource",
-                    "(Ljava/lang/String;)Ljava/net/URL;",
-                    &[name_for_parent],
-                );
-                ctx.unpin_native_roots(parent_pin);
-                if matches!(parent_result, Ok(Some(Value::Object(Some(_))))) {
-                    ctx.unpin_native_roots(this_pin);
-                    return parent_result;
+            // ModifiedClassPathClassLoader deliberately uses the platform
+            // loader as its parent so its URL set is the complete, isolated
+            // test class path. Parent-first resource lookup would reintroduce
+            // application resources that its exclusions removed.
+            if !url_classloader_isolated_from_app(ctx, this_live) {
+                if let Value::Object(Some(parent)) = ctx.get_field_by_name(this_live, "parent") {
+                    let parent_pin = ctx.pin_native_root(parent);
+                    let parent_live = ctx.read_native_pin(parent_pin, parent);
+                    let parent_result = ctx.invoke_virtual(
+                        parent_live,
+                        "getResource",
+                        "(Ljava/lang/String;)Ljava/net/URL;",
+                        &[name_for_parent],
+                    );
+                    ctx.unpin_native_roots(parent_pin);
+                    if matches!(parent_result, Ok(Some(Value::Object(Some(_))))) {
+                        ctx.unpin_native_roots(this_pin);
+                        return parent_result;
+                    }
                 }
             }
             let this_live = ctx.read_native_pin(this_pin, this_ref);
@@ -3462,7 +3468,13 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         if is_classloader_instance(ctx, this_ref) {
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
+                // URLClassLoader itself is parent-first too.  Its exact
+                // native registration may receive the base-loader identity
+                // even when the live receiver is a subclass, so restricting
+                // this to non-builtin names drops a parent's resource stream.
+                if object_extends(ctx, this_ref, "java/net/URLClassLoader")
+                    || !is_builtin_loader_class(&class_name)
+                {
                     // JDK `ClassLoader.getResource` contract: delegate to the
                     // PARENT's getResource FIRST, then fall back to this loader's
                     // own `findResource` override. The previous code skipped
@@ -4079,7 +4091,39 @@ fn cl_get_resources_impl(
 // the same helper). Idempotent — re-registration is a no-op.
 // ---------------------------------------------------------------------------
 
-/// `URLClassPath.getURLs()[Ljava/net/URL;` — return an empty URL[].
+fn ucp_path_urls(ctx: &mut dyn NativeContext, ucp: ObjectRef) -> Option<ObjectRef> {
+    let path = match ctx.get_field_by_name(ucp, "path") {
+        Value::Object(Some(path)) if is_array_list_object(ctx, path) => path,
+        _ => return None,
+    };
+    let path_pin = ctx.pin_native_root(path);
+    let path = ctx.read_native_pin(path_pin, path);
+    let size = match ctx.get_field_by_name(path, "size") {
+        Value::Int(size) if size > 0 => size as usize,
+        _ => {
+            ctx.unpin_native_roots(path_pin);
+            return None;
+        }
+    };
+    let elements = match ctx.get_field_by_name(path, "elementData") {
+        Value::Object(Some(elements)) => elements,
+        _ => {
+            ctx.unpin_native_roots(path_pin);
+            return None;
+        }
+    };
+    let elements_pin = ctx.pin_native_root(elements);
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+    for index in 0..size {
+        let elements = ctx.read_native_pin(elements_pin, elements);
+        ctx.set_array_element(result, index, ctx.get_array_element(elements, index));
+    }
+    ctx.unpin_native_roots(elements_pin);
+    ctx.unpin_native_roots(path_pin);
+    Some(result)
+}
+
+/// `URLClassPath.getURLs()[Ljava/net/URL;` — return recorded URL paths or an empty URL[].
 ///
 /// Real-JDK bytecode reads `path` (an ArrayList) under a monitor and
 /// builds `URL[path.size()]`.  When `path` is null (because the instance
@@ -4088,18 +4132,10 @@ fn cl_get_resources_impl(
 /// (it just means "this loader contributes no URLs") and lets Spring
 /// Boot's clearCache iteration complete in zero iterations.
 fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // If a `URLClassLoader.<init>` stashed its constructor `URL[]` on this ucp
-    // (see `record_ucl_urls`), return those so a real `getURLs()` →
-    // `ucp.getURLs()` bytecode path reflects the loader's URLs. Otherwise an
-    // empty array is spec-legal ("this loader contributes no URLs").
+    // `record_ucl_urls` retains constructor URLs in the real `path` field.
+    // Returning a copy preserves URLClassLoader's public isolation contract.
     if let Some(Value::Object(Some(ucp))) = args.first() {
-        if let Value::Object(Some(stashed)) = ctx.get_field(*ucp, UCP_STASHED_URLS) {
-            let n = ctx.array_length(stashed);
-            let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
-            for i in 0..n {
-                let url = ctx.get_array_element(stashed, i);
-                ctx.set_array_element(result, i, url);
-            }
+        if let Some(result) = ucp_path_urls(ctx, *ucp) {
             return Ok(Some(Value::Object(Some(result))));
         }
     }
@@ -4382,11 +4418,32 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // ensures a custom loader that doesn't override `findResource` still finds
     // resources its parent serves (SerializationHelperTest/ProxyClassReuseTest).
     // The raw `find_resource` fast-path below is kept for builtin loaders.
+    //
+    // `object_extends(.., "java/net/URLClassLoader")` mirrors the identical
+    // gate `cl_get_resource` already applies just above ("URLClassLoader
+    // itself is parent-first too... restricting this to non-builtin names
+    // drops a parent's resource stream") — `is_builtin_loader_class` treats
+    // the bare `java/net/URLClassLoader` class as builtin (it's in the same
+    // match arm as `SecureClassLoader`/`jdk/internal/loader/*`), so a plain,
+    // user-instantiated `new URLClassLoader(urls, parent)` (e.g. Spring
+    // Boot's `ServletComponentScanIntegrationTests.indexedComponentsAreRegistered`,
+    // which wraps just a `@TempDir` holding a generated `META-INF/spring.components`
+    // index, parented to the real test classloader) fell into the raw
+    // `ctx.find_resource` fallback below instead of this delegation-aware
+    // path. That raw store doesn't see resources reachable only through the
+    // dynamically-registered global URL walk (`ctx.find_all_resource_urls`,
+    // used by both `getResource` and `ucl_find_resource`'s own fallback), so
+    // `getResourceAsStream` returned null for a `.class` file `getResource`
+    // resolved moments earlier — `ClassPathResource.getInputStream()` then
+    // threw `FileNotFoundException` reading an indexed component's class
+    // file that plainly exists on the parent's classpath.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
         if is_classloader_instance(ctx, this_ref) {
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
+                if object_extends(ctx, this_ref, "java/net/URLClassLoader")
+                    || !is_builtin_loader_class(&class_name)
+                {
                     let pin = ctx.pin_native_root(this_ref);
                     let name_arg = Value::Object(Some(ctx.create_string(&name)));
                     let this_ref = ctx.read_native_pin(pin, this_ref);
@@ -4650,11 +4707,9 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
     }
 }
 
-/// Slot of the `URLClassPath` placeholder (`ucp`) used to stash a real-JDK-mode
-/// `URLClassLoader`'s constructor `URL[]` so `getURLs()` can return it. The ucp
-/// is a placeholder our `<init>` natives create (see `init_urlclassloader_fields`)
-/// whose real methods are all shimmed, so this slot is ours to use; storing the
-/// array here also keeps it GC-reachable via loader→ucp→array.
+/// Legacy compatibility slot for URLClassPath instances created by older
+/// synthetic paths. Real-JDK URLClassLoader constructor URLs are retained in
+/// the named `path` ArrayList instead, because raw slot zero aliases that field.
 const UCP_STASHED_URLS: usize = 0;
 
 /// Record a real-JDK-mode `URLClassLoader`'s constructor `URL[]` so that
@@ -4681,14 +4736,10 @@ pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls
         _ => return,
     };
     if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
-        ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(url_arr)));
-
-        // The real-mode URLClassLoader constructors call this helper directly,
-        // bypassing URLClassPath.addURL.  Stashing the array is enough for
-        // getURLs(), but findResource(s) resolves application-provided schemes
-        // (notably ShrinkWrap's in-memory `archive:`) from `ucp.path`.  Mirror
-        // addURL's recording here so constructor-supplied custom URLs remain
-        // discoverable as well as inspectable.
+        // The real-mode URLClassLoader constructors call this helper directly.
+        // Retain URLs in `ucp.path`, which backs both getURLs and receiver-local
+        // class/resource lookup. Do not use raw slot zero: on real JDKs it is
+        // the `path` field itself, so writing the URL[] there corrupts the list.
         //
         // `record_url_on_path` can allocate and move both the array and the
         // placeholder, so keep both rooted and reload them on every iteration.
@@ -4709,11 +4760,7 @@ pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls
 fn ucl_init_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-    ucl_setup(ctx, this, urls, Value::Object(None));
-    // The real-JDK layout cannot use ucl_setup's synthetic slots as its
-    // authoritative URL store. Publish the constructor array on the shimmed
-    // URLClassPath as well, which backs getURLs and custom-handler lookup.
-    record_ucl_urls(ctx, this, urls);
+    crate::classloader_real::init_urlclassloader_constructor_with_default_parent(ctx, this, urls);
     Ok(None)
 }
 
@@ -4721,8 +4768,7 @@ fn ucl_init_urls_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
     let parent = args.get(2).copied().unwrap_or(Value::Object(None));
-    ucl_setup(ctx, this, urls, parent);
-    record_ucl_urls(ctx, this, urls);
+    crate::classloader_real::init_urlclassloader_constructor_with_parent(ctx, this, urls, parent);
     Ok(None)
 }
 
@@ -5283,12 +5329,22 @@ pub(crate) fn ucl_try_define_local_class(
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
-    let bytes = if !paths.is_empty() {
-        cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)
-    } else {
-        None
+    // Keep the source metadata coupled to the exact classpath that supplied
+    // the bytes. Falling back to ClassManager's process-wide lookup after a
+    // successful local definition can attach a same-named application JAR as
+    // this class's CodeSource (for example, a URLClassLoader override JAR).
+    let local_class_path =
+        (!paths.is_empty()).then(|| cratonvm_classloading::ClassPath::new(&paths));
+    let (bytes, local_code_source) = match local_class_path.as_ref() {
+        Some(class_path) => match class_path.find_resource(&resource_name) {
+            Some(bytes) => (
+                Some(bytes),
+                class_path.find_class_code_source_info(internal_name),
+            ),
+            None => (None, None),
+        },
+        None => (None, None),
     };
-
     let http_bases = loader_constructor_http_bases(ctx, loader);
     let bytes = match bytes {
         Some(b) => Some(b),
@@ -5315,7 +5371,14 @@ pub(crate) fn ucl_try_define_local_class(
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);
     let loader_id = loader_namespace_id(ctx, loader_live);
-    let opts = cratonvm_native_api::DefineClassFull::default();
+    let opts = match local_code_source {
+        Some((code_source_url, code_source_certificates)) => cratonvm_native_api::DefineClassFull {
+            code_source_url: Some(code_source_url),
+            code_source_certificates,
+            ..Default::default()
+        },
+        None => cratonvm_native_api::DefineClassFull::default(),
+    };
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(internal_name, &bytes, loader_id, opts)
     }));
@@ -5608,14 +5671,17 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
+        if let Some(result) = ucp_path_urls(ctx, ucp) {
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
     let count = match ctx.get_field(this, UCL_URL_COUNT) {
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
     // Synthetic-JDK path: URLs live in the per-instance slots (`ucl_setup`/
-    // `ucl_add_url`). Real-JDK URLClassLoaders use the real field layout, so
-    // those slots are empty/garbage and the URLs were stashed on the `ucp`
-    // placeholder by `record_ucl_urls` instead — fall back to that.
+    // `ucl_add_url`). Keep the legacy raw-slot fallback for old placeholders.
     if count == 0 {
         if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
             if let Value::Object(Some(stashed)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
@@ -6929,6 +6995,28 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         cl,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        cl_get_resource_as_stream,
+    );
+    // Install the exact URLClassLoader declarations here as well. This
+    // registrar runs after the early servlet/S1 setup in real-JDK mode, so it
+    // is the authoritative callback for concrete URLClassLoader resource
+    // methods and their subclasses.
+    r.register(
+        UCL_CLASS,
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        cl_get_resource,
+    );
+    r.register(
+        UCL_CLASS,
+        "getResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        cl_get_resources,
+    );
+    r.register(
+        UCL_CLASS,
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         cl_get_resource_as_stream,

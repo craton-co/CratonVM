@@ -220,6 +220,12 @@ const CORPUS: &[TckTest] = &[
     tck(LANG, "cratonvm/TckStringBuilder", "sb_replace"),
     tck(LANG, "cratonvm/TckStringBuilder", "sb_substring"),
     tck(LANG, "cratonvm/TckStringBuilder", "sb_indexOf"),
+    // JsonReader's deprecation short reason uses BreakIterator sentence boundaries.
+    tck(
+        LANG,
+        "cratonvm/JsonReaderSubstringProbe",
+        "preservesSentenceAfterDottedIdentifier",
+    ),
     // T4.2.18 — TckThread (dedicated)
     tck(LANG, "cratonvm/TckThread", "thread_currentThread"),
     tck(LANG, "cratonvm/TckThread", "thread_getName"),

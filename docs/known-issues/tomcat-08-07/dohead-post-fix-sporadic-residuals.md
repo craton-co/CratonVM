@@ -251,3 +251,110 @@ selector wakeup change for the HTTP/2 partial-write face.
 After this diagnostic attempt completed, every running DoHead VM process was
 terminated; a `/proc` executable-and-command-line sweep confirmed that no DoHead
 VM process remained.
+
+## 2026-07-18 C23-C29 map-layout closure and remaining transport residuals
+
+**Status: OPEN.** This checkpoint closes the sporadic HTTP header-map loss, but
+does not yet close the independent HTTP/2 EOF/timeout family. The document
+therefore remains under docs/known-issues.
+
+### Validated changes
+
+1. The selector phase-3 readiness safety-net now checks each missing interest
+   bit rather than treating any pre-existing ready bit as complete. Together
+   with C20's non-sticky post-epoll_ctl(MOD) self-pipe nudge, the focused
+   selector suite remains clean: cargo test -p cratonvm-native-io --lib
+   nio_selector -- --test-threads=1 reported 20/20.
+2. HttpURLConnection.getHeaderFields() now uses HashMap consistently rather
+   than constructing a LinkedHashMap while invoking HashMap.put.
+3. The decisive header bug was in native collection storage, not the response
+   parser: map_alloc_node() allocated ClassId(0) / java/lang/Object nodes and
+   then wrote HashMap node fields. The heap now correctly gives Object a
+   zero-slot layout, so those writes were guarded/dropped, intermittently
+   removing map entries such as Date. Nodes are now allocated as
+   java/util/HashMap$Node.
+4. Live entry snapshots root key, value, and source-map references across their
+   allocating entry creation, preventing pre-move references from being
+   published after a moving collection.
+
+### Evidence
+
+- C28's two-class pressure run reproduced the old header error once (23/24)
+  and emitted the zero-slot guard records. It established that only rooting the
+  live entry helper was insufficient.
+- C29 binary: /data/data/cvm-dohead-c29-mapnode-20260718.
+- C29 targeted pressure:
+  /data/data/dohead-c29-mapnode-headerpair-n2x4-20260718;
+  1 -> 1025 and 1025 -> 1025, two processes, four passes: **8/8 PASS**,
+  zero failures. The completed attempt left no DoHead process.
+- Focused native validation:
+  cratonvm-native-collections map filter **20/20**, and
+  cratonvm-native-builtins http_url_connection **30/30**.
+- C29 full JIT matrix:
+  /data/data/dohead-c29-mapnode-full64-n2x1-20260718; 64 classes, two
+  processes, -Xmx1g, one pass, 240-second class timeout, ALL_DONE.
+  Result: **61 PASS, 3 residuals**:
+  - 511 -> 1023: HTTP/2 End of input stream with [9] bytes left.
+  - 512 -> 0: timeout.
+  - 513 -> 511: timeout.
+  The first EOF coincided with a guarded zero-slot write at index 4, so the
+  remaining transport diagnosis must identify that distinct raw-object layout
+  producer before assigning the failures to selector or network timing.
+
+After the C29 matrix finished, the explicit DoHead process sweep found no
+matching runner or VM process. Do not move this record to docs/internal until
+a newly built binary completes the 64-class matrix with zero residuals,
+followed by a relevant --nojit control.
+
+## 2026-07-18 C32 system-environment map node residual
+
+C32 closes the remaining zero-slot HashMap node producer in
+native-builtins/lang_system. System.getenv() could receive an apparent
+HashMap$Node initialization success carrying Object class ID 0; its field
+writes were silently dropped. The path now unconditionally obtains the named
+synthetic HashMap$Node layout. C32 mixed transport pressure
+(511->1023, 512->0, 513->511; two processes, eight passes) completed 24/24
+PASS with ALL_DONE and no matching DoHead process remaining.
+
+## 2026-07-18 C33 full-matrix checkpoint
+
+**Status: OPEN.** C32's system-environment map-node fix removes the guarded
+zero-slot node writes seen in the previous matrix, but it does not yet close
+the entire DoHead family. The document remains under `docs/known-issues`.
+
+- C32 focused JIT pressure:
+  `/data/data/dohead-c32-systemnode-transport-n2x8-20260718`, covering
+  `511 -> 1023`, `512 -> 0`, and `513 -> 511` with two processes and eight
+  passes, completed **24/24 PASS** with `ALL_DONE`.
+- C32 full JIT matrix:
+  `/data/data/dohead-c32-systemnode-full64-n2x1-20260718`, 64 boundary
+  classes, two processes, one pass, `-Xmx1g`, and a 240-second class timeout,
+  completed with `ALL_DONE`: **63 PASS, 1 FAIL**.
+- The sole residual is `1023 -> 0`, parameter
+  `testDoHead[29: 0 false false 16,384 false 1,023 FULL 0 true]`, which
+  asserts three headers but receives two (`expected:<3> but was:<2>`). This is
+  an HTTP/1 FULL/keep-alive header-map loss, distinct from C29's zero-slot
+  producer and from the C32 focused transport cases.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.
+
+## 2026-07-18 C34 System.getenv fallback-layout closure
+
+**Status: OPEN.** The C34 fallback allocation repair closes C33's `1023 -> 0`
+header-map loss, but the independent partial-write/transport family remains.
+
+- The `System.getenv()` legacy fallback allocated a three-slot HashMap and
+  four-slot HashMap$Node with `ClassId(0)` after real layout resolution failed.
+  C34 now uses named synthetic layouts for both objects.
+- Exact JIT stress for the former residual:
+  `/data/data/dohead-c34-systemenvfallback-1023to0-n2x8-20260718`, two
+  processes and eight passes, completed **8/8 PASS** with `ALL_DONE`.
+- C34 full JIT matrix:
+  `/data/data/dohead-c34-systemenvfallback-full64-n2x1-20260718`, completed
+  **60 PASS, 4 FAIL**. `1023 -> 0` now passes. Current residuals are
+  `1023 -> 511`, `1024 -> 1023`, and `1 -> 1025` (each EOF with nine bytes
+  left), plus `512 -> 1` (expected HTTP 200, got -1). Two residual logs retain
+  guarded zero-slot accesses at field indices 4 or 5; their producer remains
+  to be identified before changing selector behavior.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.

@@ -101,9 +101,40 @@ pub struct Arena {
     free_bytes_cache: std::cell::Cell<(u64, usize)>,
 }
 
+/// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
+/// block must sit on the 8-aligned object grid — the non-moving sweep's walk
+/// and the mark oracle both assume it. An unaligned block is upstream-bug
+/// evidence (an alloc with an unrounded size minted an unaligned split
+/// remainder, or a walk desync published an off-grid span); it later derails
+/// the linear walk ("cursor overshot into free block" at +4 offsets). Warn
+/// loudly (bounded) at the birth site so the producer is identifiable.
+static FL_ALIGN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cold]
+fn warn_unaligned_block(site: &str, offset: usize, size: usize) {
+    use std::sync::atomic::Ordering;
+    let n = FL_ALIGN_HITS.fetch_add(1, Ordering::Relaxed);
+    if n < 16 {
+        tracing::warn!(
+            "free-list ALIGNMENT tripwire [{site}]: unaligned block off={offset}              (mod8={}) size={size} (mod8={}) — walk-grid hazard",
+            offset & 7,
+            size & 7,
+        );
+    }
+}
+
 impl Arena {
     /// Create a new arena with the given capacity in bytes.
     pub fn new(capacity: usize) -> Self {
+        // Alignment invariant (perf/halfgap residuals, 2026-07-18): the
+        // capacity must be a multiple of 8 — the heap-ergonomics young size
+        // can arrive unaligned (observed live: 1 GiB - 4), and an unaligned
+        // bump tail makes `remaining()` carry a permanent mod-8 dreg that
+        // `refill_tlab`'s `requested.min(available)` then mints into
+        // unaligned TLAB sizes and +4 free-list split remnants — the
+        // trigger-ON bt18 walk-grid corruption. Rounding down loses at most
+        // 7 bytes of arena.
+        let capacity = capacity & !7;
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
         let data = vec![0u8; capacity];
@@ -126,6 +157,9 @@ impl Arena {
     fn push_block_routed(&mut self, block: FreeBlock) {
         if block.size == 0 {
             return;
+        }
+        if (block.offset | block.size) & 7 != 0 {
+            warn_unaligned_block("route", block.offset, block.size);
         }
         if block.size < LARGE_BLOCK_MIN {
             self.free_small.push(block);
@@ -193,6 +227,16 @@ impl Arena {
     /// isn't enough space.
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
+        if size & 7 != 0 {
+            // An unrounded size mints an unaligned split remainder / bump
+            // cursor — the free-list alignment hazard above.
+            warn_unaligned_block("alloc-size", self.cursor, size);
+        }
+        // Alignment invariant: consume whole 8-byte grid units so split
+        // remainders and the bump cursor stay on the object grid no matter
+        // what a caller passes. Every walker size formula already rounds the
+        // same way, so this matches how the walk will stride the region.
+        let size = size.checked_add(7)? & !7;
 
         // Free-list fast path: if a prior non-moving sweep reclaimed any
         // holes, satisfy the request from the first block large enough to
@@ -286,6 +330,9 @@ impl Arena {
         );
         if size == 0 {
             return;
+        }
+        if (offset | size) & 7 != 0 {
+            warn_unaligned_block("add_free_block", offset, size);
         }
         self.max_free_upper = self.max_free_upper.max(size);
         self.push_block_routed(FreeBlock { offset, size });
@@ -520,6 +567,8 @@ impl Arena {
     ///
     /// Returns the old base pointer so callers can compute relocation offsets.
     pub fn grow(&mut self, new_capacity: usize) -> *const u8 {
+        // Same alignment invariant as `new()` — see the constructor note.
+        let new_capacity = new_capacity & !7;
         if new_capacity <= self.data.len() {
             return self.data.as_ptr();
         }
@@ -592,11 +641,12 @@ mod tests {
     fn arena_alignment() {
         let mut arena = Arena::new(256);
 
-        // Allocate 3 bytes with alignment 1
+        // Allocate 3 bytes with alignment 1 — the arena consumes whole
+        // 8-byte grid units (alignment invariant), so used() advances to 8.
         arena.alloc(3, 1).unwrap();
-        assert_eq!(arena.used(), 3);
+        assert_eq!(arena.used(), 8);
 
-        // Next allocation with alignment 8 should align up to offset 8
+        // Next allocation with alignment 8 lands on the grid at offset 8.
         let p2 = arena.alloc(8, 8).unwrap();
         let offset = unsafe { p2.offset_from(arena.base_ptr_mut()) } as usize;
         assert_eq!(offset, 8); // aligned to 8

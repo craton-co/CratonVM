@@ -84,7 +84,7 @@ affected classes:
 | `WebFluxObservationAutoConfigurationTests` | PASS |
 | `DefaultErrorWebExceptionHandlerIntegrationTests` | PASS (was HANG at 180s, now completes ~148s) |
 | `PropertiesMigrationListenerTests` | FAIL — new residual, see above |
-| `H2ConsoleAutoConfigurationTests` | PASS (4/4) — the 2 CapturedOutput-specific tests were fixed by this change; the other 2, previously failing from the separately-tracked `jooq-destroy-method-ambiguity-and-hang.md` bug, started passing after merging in `origin/dev`'s concurrent `Class.getMethods` override-shadowing fix (unrelated to this doc) |
+| `H2ConsoleAutoConfigurationTests` | PASS (4/4) — the 2 CapturedOutput-specific tests were fixed by this change; the other 2, previously failing from the separately-tracked `jooq-destroy-method-ambiguity-and-hang-FIXED.md` bug, started passing after merging in `origin/dev`'s concurrent `Class.getMethods` override-shadowing fix (unrelated to this doc) |
 | `HttpClientMetricsAutoConfigurationTests` | PASS |
 | `OpenTelemetryEnvironmentVariableEnvironmentPostProcessorTests` | PASS |
 | `OpenTelemetryEnvironmentVariablesTests` | PASS |

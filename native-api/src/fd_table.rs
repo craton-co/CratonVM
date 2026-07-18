@@ -1106,6 +1106,53 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Connect a UDP socket to its peer address.
+    ///
+    /// A connected datagram socket still uses UDP, but it gains the JDK
+    /// `DatagramChannel.write` / `read` contract and rejects datagrams from
+    /// other peers at the OS boundary.
+    pub fn udp_connect(&self, fd: FdId, target: &str) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp connect"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => sock.lock().connect(target),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for udp connect",
+            )),
+        }
+    }
+
+    /// Send a UDP datagram through a connected socket.
+    pub fn udp_send_connected(&self, fd: FdId, data: &[u8]) -> Result<usize, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp write"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => sock.lock().send(data),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for udp write",
+            )),
+        }
+    }
+
+    /// Clone a UDP socket for selector polling without transferring ownership
+    /// from the Java-visible channel.
+    pub fn udp_try_clone(&self, fd: FdId) -> Result<std::net::UdpSocket, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp clone"))?;
+        match &*entry {
+            FileEntry::UdpSocket(sock) => sock.lock().try_clone(),
+            _ => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "bad fd for udp clone",
+            )),
+        }
+    }
+
     /// Receive a UDP datagram. Returns (bytes_read, source_addr).
     pub fn udp_recv(&self, fd: FdId, buf: &mut [u8]) -> Result<(usize, String), io::Error> {
         let entry = self

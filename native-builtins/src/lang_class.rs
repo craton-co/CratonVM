@@ -103,7 +103,9 @@ pub(crate) fn dotted_class_name(class_id: ClassId, slashed: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&DOTTED_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
-    let dotted: Arc<str> = if slashed.contains('/') {
+    let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
+        Arc::from(primitive)
+    } else if slashed.contains('/') {
         Arc::from(slashed.replace('/', "."))
     } else {
         Arc::from(slashed)
@@ -434,16 +436,20 @@ fn check_access(
     )
 }
 
-/// Check access to a reflected field, including the ordinary Java-language
-/// access that the declaring class has to its own private members.
+/// Check a reflective field access using the caller-sensitive part of the
+/// ordinary Java member-access rules.
 ///
-/// `Field.get*` and `Field.set*` do not require `setAccessible(true)` when
-/// their immediate caller is the declaring class. HikariCP relies on that for
-/// its private-final `AtomicReference` during `HikariConfig.copyStateTo`:
-/// final fields are not made accessible because they are read, not reassigned.
-/// Keeping this separate from [`check_access`] avoids broadening the existing
-/// Method/Constructor policy while every Field entry point shares the correct
-/// caller-aware rule.
+/// `Field.get` is not intrinsically a deep-reflection operation.  In
+/// particular, code may reflectively read a private field it declares itself
+/// without first calling `setAccessible(true)`.  HikariConfig relies on this
+/// for its private-final `AtomicReference<Credentials>` while copying config
+/// state.  The old blanket non-public rejection incorrectly treated that
+/// legal same-class read as an access violation.
+///
+/// Keep the existing conservative rule for callers outside the declaring
+/// class: those still need a public member or the explicit accessible
+/// override.  JPMS/open-package validation remains in the caller after this
+/// check and continues to govern cross-class deep reflection.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
@@ -511,10 +517,11 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// `StackFrameBuffer` frame (allowed by `caller_is_jdk_internal`) instead of
 /// the user `main` further out, which previously produced a spurious
 /// `IllegalAccessException` (Spring Boot `deduceMainApplicationClass`).
+// Use exact frame ClassIds rather than resolving stack-trace display names:
+// two classes from different loaders can share a binary name.
 fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
-    let trace = ctx.capture_stack_trace(0);
-    for entry in trace.iter().rev() {
-        let name: &str = &entry.class_name;
+    for cid in ctx.frame_class_ids() {
+        let name = ctx.class_name_of_id(cid)?;
         let is_internal = REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
             if prefix.ends_with('/') {
                 name.starts_with(prefix)
@@ -525,9 +532,7 @@ fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
         if is_internal {
             continue;
         }
-        if let Some(cid) = ctx.class_id_by_name(name) {
-            return Some(cid);
-        }
+        return Some(cid);
     }
     None
 }
@@ -602,6 +607,27 @@ fn check_reflection_module_access(
     target_class_name: &str,
     accessible_override: bool,
 ) -> Result<(), String> {
+    check_reflection_module_access_with_target_id(
+        ctx,
+        target_class_name,
+        None,
+        accessible_override,
+    )
+}
+
+/// Exact-identity variant of [`check_reflection_module_access`]. A reflective
+/// object already carries its declaring `Class` mirror; callers that have
+/// decoded that mirror must preserve its `ClassId` rather than looking the
+/// binary name up again. The latter is ambiguous when two child loaders define
+/// the same non-public class (Mockito's sequential modified-classpath forks
+/// are one such case), and can turn a valid same-loader constructor call into
+/// a spurious "cannot resolve target class" access failure.
+fn check_reflection_module_access_with_target_id(
+    ctx: &mut dyn NativeContext,
+    target_class_name: &str,
+    target_class_id: Option<ClassId>,
+    accessible_override: bool,
+) -> Result<(), String> {
     if accessible_override {
         // Once setAccessible(true) has been granted, subsequent reflective
         // operations trust the override flag (JEP 403 В§"API changes").
@@ -637,7 +663,7 @@ fn check_reflection_module_access(
     }
 
     // From here on the caller is user code (Application / UserDefined loader).
-    let target_cid = match ctx.class_id_by_name(target_class_name) {
+    let target_cid = match target_class_id.or_else(|| ctx.class_id_by_name(target_class_name)) {
         Some(cid) => cid,
         // Fail CLOSED for user-initiated reflection when the target class is
         // not loaded: we cannot evaluate the module edge, and user code must
@@ -845,7 +871,9 @@ pub(crate) fn native_class_get_name(
                     spring_configuration_cglib_display_name(ctx, class_id, &strict_name)
                 })
                 .unwrap_or(strict_name);
-            let dotted = display_name.replace('/', ".");
+            let dotted = primitive_descriptor_name(&display_name)
+                .map(str::to_string)
+                .unwrap_or_else(|| display_name.replace('/', "."));
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -892,7 +920,9 @@ pub(crate) fn native_class_get_name(
                 .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
             let display_name =
                 spring_configuration_cglib_display_name(ctx, class_id, &name).unwrap_or(name);
-            let dotted_name = if display_name.contains('/') {
+            let dotted_name = if let Some(primitive) = primitive_descriptor_name(&display_name) {
+                primitive.to_string()
+            } else if display_name.contains('/') {
                 display_name.replace('/', ".")
             } else {
                 display_name
@@ -923,7 +953,9 @@ pub(crate) fn native_class_get_name(
             // this is rare (only primitive `getName()` calls; user code
             // usually goes through the `Some(class_id)` arm above).
             if let Some(prim_name) = mirror_class_name(ctx, this) {
-                let dotted_name = if prim_name.contains('/') {
+                let dotted_name = if let Some(primitive) = primitive_descriptor_name(&prim_name) {
+                    primitive.to_string()
+                } else if prim_name.contains('/') {
                     prim_name.replace('/', ".")
                 } else {
                     prim_name
@@ -1234,7 +1266,16 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
-    match ctx.find_resource(&resource_name) {
+    // A package-directory resource has a URL but no byte content to read.
+    // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
+    // `SomeClass`'s package directory and HotSpot returns a non-null stream.
+    // `find_resource` correctly declines to open a directory as a file, so use
+    // the URL lookup solely to distinguish that existing directory from a
+    // missing resource and serve an empty stream for the former.
+    let bytes = ctx
+        .find_resource(&resource_name)
+        .or_else(|| (!ctx.find_all_resource_urls(&resource_name).is_empty()).then(Vec::new));
+    match bytes {
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
             let len = bytes.len();
@@ -8311,7 +8352,12 @@ pub(crate) fn native_constructor_new_instance(
     };
     let ctor_is_public = (ctor_modifiers & 0x0001) != 0;
     if !ctor_is_public {
-        if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
+        if let Err(msg) = check_reflection_module_access_with_target_id(
+            ctx,
+            &class_name,
+            declaring_cid,
+            accessible,
+        ) {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalAccessException {
                     message: format!("Constructor.newInstance: {class_name}: {msg}"),
@@ -10579,6 +10625,45 @@ pub(crate) fn annotation_element_to_java(
     annotation_element_to_java_typed(ctx, val, None, None)
 }
 
+/// Preserve the declared array shape when the class-file annotation reader
+/// reports a lone nested annotation as a scalar element. Java permits the
+/// shorthand `member = @Nested(...)` for a `Nested[]` member, but consumers
+/// such as Spring still receive the declared array type at runtime.
+fn normalize_single_annotation_array(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    return_type_desc: Option<&str>,
+) -> Value {
+    let Some(component_name) = return_type_desc
+        .and_then(|desc| desc.strip_prefix("[L"))
+        .and_then(|desc| desc.strip_suffix(';'))
+    else {
+        return value;
+    };
+    let component_id = ctx.class_id_by_name(component_name).or_else(|| {
+        let _ = ctx.load_class(component_name);
+        ctx.class_id_by_name(component_name)
+    });
+    let Some(component_id) = component_id else {
+        return value;
+    };
+    let value_pin = match value {
+        Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+        _ => None,
+    };
+    let array = ctx.new_ref_array(component_id, 1);
+    let element = match (value, value_pin) {
+        (Value::Object(Some(object)), Some(pin)) => {
+            let forwarded = ctx.read_native_pin(pin, object);
+            ctx.unpin_native_roots(pin);
+            Value::Object(Some(forwarded))
+        }
+        (other, _) => other,
+    };
+    ctx.set_array_element(array, 0, element);
+    Value::Object(Some(array))
+}
+
 /// S111r19 вЂ” typed variant: when called for a known annotation-element method,
 /// the caller passes the method's return-type descriptor (e.g.
 /// `[Ljava/lang/String;`).  Used to recover the array component class for
@@ -10820,7 +10905,7 @@ pub(crate) fn annotation_element_to_java_typed(
         }
         AnnotationElementValue::Annotation(nested) => {
             let proxy = create_annotation_proxy(ctx, nested, container_loader);
-            Value::Object(Some(proxy))
+            normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
             // Pick a component class for the array based on the element kind so
@@ -13247,8 +13332,22 @@ fn t19_h10_class_manifest_attr(
     class_id: cratonvm_types::ClassId,
     attr: &str,
 ) -> Option<String> {
-    let url = ctx.class_code_base(class_id)?;
-
+    // A Class mirror normally carries the exact CodeSource captured during
+    // loading. Some real-class loader routes do not retain that mirror edge,
+    // however; the class-path index is the authoritative fallback and still
+    // resolves the JAR containing this precise internal class name.
+    let class_name = ctx.class_name_of_id(class_id);
+    let package_path = class_name
+        .as_deref()
+        .and_then(|name| name.rsplit_once('/').map(|(package, _)| format!("{package}/")));
+    let code_base = ctx.class_code_base(class_id).unwrap_or_default();
+    let url = if code_base.is_empty() || code_base.starts_with("class:") {
+        class_name
+            .as_deref()
+            .and_then(|name| ctx.find_class_source_path(name))?
+    } else {
+        code_base.clone()
+    };
     // Spring Boot nested-jar handling.
     // 2.x: `jar:file:/<outer>!/BOOT-INF/lib/<inner>.jar!/`
     // 3.x: `jar:nested:/<outer>/!BOOT-INF/lib/<inner>.jar!/`
@@ -13280,7 +13379,12 @@ fn t19_h10_class_manifest_attr(
                 std::path::PathBuf::from(format!("/{}", outer_path))
             };
             if outer_pb.is_file() {
-                if let Some(val) = nested_jar_manifest_attr(&outer_pb, inner_entry, attr) {
+                if let Some(val) = nested_jar_manifest_attr(
+                    &outer_pb,
+                    inner_entry,
+                    package_path.as_deref(),
+                    attr,
+                ) {
                     return Some(val);
                 }
             }
@@ -13302,35 +13406,42 @@ fn t19_h10_class_manifest_attr(
     if !path.is_file() {
         return None;
     }
-    plain_jar_manifest_attr(&path, attr)
+    plain_jar_manifest_attr(&path, package_path.as_deref(), attr)
 }
 
 /// Cache of parsed plain-jar manifests keyed by canonicalised path string.
-/// Stores ALL main attributes (case-insensitive keys) so the 6 attribute
+/// Stores main and per-package attributes (case-insensitive keys) so the 6
 /// lookups per `Class.getPackage()` only parse the jar once.
 fn plain_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
     static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn plain_jar_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String> {
+fn plain_jar_manifest_attr(
+    path: &std::path::Path,
+    package_path: Option<&str>,
+    attr: &str,
+) -> Option<String> {
     let cache_key = path.display().to_string();
-    let attr_lc = attr.to_ascii_lowercase();
 
     if let Ok(cache) = plain_manifest_cache().lock() {
         if let Some(map) = cache.get(&cache_key) {
-            return map.get(&attr_lc).cloned();
+            return manifest_attr_for_package(map, package_path, attr);
         }
     }
 
-    let manifest = cratonvm_classloading::ClassPath::read_jar_manifest(path);
-    let mut map: HashMap<String, String> = HashMap::new();
-    if let Some(m) = &manifest {
-        for (k, v) in m.attributes.iter() {
-            map.insert(k.to_ascii_lowercase(), v.clone());
-        }
-    }
-    let result = map.get(&attr_lc).cloned();
+    use std::io::Read;
+    let map = std::fs::File::open(path)
+        .ok()
+        .and_then(|file| {
+            let mut archive = zip::ZipArchive::new(file).ok()?;
+            let mut entry = archive.by_name("META-INF/MANIFEST.MF").ok()?;
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).ok()?;
+            Some(parse_package_manifest(&bytes))
+        })
+        .unwrap_or_default();
+    let result = manifest_attr_for_package(&map, package_path, attr);
     if let Ok(mut cache) = plain_manifest_cache().lock() {
         cache.insert(cache_key, map);
     }
@@ -13338,8 +13449,8 @@ fn plain_jar_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String>
 }
 
 /// Cache of parsed nested-jar manifest attributes, keyed by
-/// `(outer_jar_path, inner_jar_entry)`. Value is a fully-parsed map of
-/// MANIFEST.MF main attributes (case-insensitive lookups handled by
+/// `(outer_jar_path, inner_jar_entry)`. Value is a fully-parsed map of main
+/// and per-package MANIFEST.MF attributes (case-insensitive lookups handled by
 /// lowercasing keys at insertion time). This is essential for Spring Boot
 /// fat-jar startup: `Class.getPackage()` queries 6 manifest attributes per
 /// invocation, and Tomcat's `StringManager.getManager(Class)` calls
@@ -13364,23 +13475,23 @@ fn nested_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, Str
 fn nested_jar_manifest_attr(
     outer_jar: &std::path::Path,
     inner_entry: &str,
+    package_path: Option<&str>,
     attr: &str,
 ) -> Option<String> {
     let entry_name = inner_entry.trim_start_matches('/');
     let cache_key = format!("{}!{}", outer_jar.display(), entry_name);
-    let attr_lc = attr.to_ascii_lowercase();
 
     // Fast path: cache hit.
     {
         let cache = nested_manifest_cache().lock().ok()?;
         if let Some(map) = cache.get(&cache_key) {
-            return map.get(&attr_lc).cloned();
+            return manifest_attr_for_package(map, package_path, attr);
         }
     }
 
     // Cold path: parse the nested manifest exactly once.
     let parsed = parse_nested_jar_manifest(outer_jar, entry_name).unwrap_or_default();
-    let result = parsed.get(&attr_lc).cloned();
+    let result = manifest_attr_for_package(&parsed, package_path, attr);
     if let Ok(mut cache) = nested_manifest_cache().lock() {
         cache.insert(cache_key, parsed);
     }
@@ -13408,20 +13519,113 @@ fn parse_nested_jar_manifest(
         let mut mf = inner.by_name("META-INF/MANIFEST.MF").ok()?;
         mf.read_to_string(&mut mf_str).ok()?;
     }
-    // Parse MANIFEST.MF main attributes (no continuation-line handling for
-    // the simple `Implementation-Version: X.Y.Z` cases we care about).
-    let mut map = HashMap::new();
-    for line in mf_str.lines() {
-        if let Some((k, v)) = line.split_once(": ") {
-            map.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+    Some(parse_package_manifest(mf_str.as_bytes()))
+}
+
+/// Parse a JAR manifest's main section plus its named package sections.
+/// A flattened key has the form `"<package>\\0<attribute>"`; main-section
+/// keys use an empty package prefix. Package values override main values,
+/// exactly as `java.lang.Package` specifies.
+fn parse_package_manifest(bytes: &[u8]) -> HashMap<String, String> {
+    let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
+    let mut result = HashMap::new();
+    let mut section: Vec<String> = Vec::new();
+
+    let mut commit_section = |section: &mut Vec<String>| {
+        if section.is_empty() {
+            return;
+        }
+        let mut attrs = HashMap::new();
+        for line in section.drain(..) {
+            if let Some((key, value)) = line.split_once(": ") {
+                attrs.insert(key.to_ascii_lowercase(), value.to_string());
+            }
+        }
+        let name = attrs.remove("name").unwrap_or_default();
+        for (key, value) in attrs {
+            result.insert(format!("{name}\0{key}"), value);
+        }
+    };
+
+    for line in text.lines() {
+        if line.is_empty() {
+            commit_section(&mut section);
+        } else if let Some(continuation) = line.strip_prefix(' ') {
+            if let Some(previous) = section.last_mut() {
+                previous.push_str(continuation);
+            }
+        } else {
+            section.push(line.to_string());
         }
     }
-    Some(map)
+    commit_section(&mut section);
+    result
+}
+
+fn manifest_attr_for_package(
+    attributes: &HashMap<String, String>,
+    package_path: Option<&str>,
+    attr: &str,
+) -> Option<String> {
+    let attr = attr.to_ascii_lowercase();
+    package_path
+        .and_then(|package| attributes.get(&format!("{package}\0{attr}")).cloned())
+        .or_else(|| attributes.get(&format!("\0{attr}")).cloned())
 }
 
 /// Real `Class.getPackage()` native вЂ” returns a `java.lang.Package` mirror
 /// or null when the class has no resolvable package (primitive / array of
 /// primitive). Always non-null for a real reference type.
+/// Materialise the JDK 9+ `Package$VersionInfo` record that backs every
+/// manifest-derived Package accessor. The real `Package` has no flat
+/// `implVersion` field, so direct writes on the Package object are discarded.
+fn package_version_info(
+    ctx: &mut dyn NativeContext,
+    spec_title: Option<String>,
+    spec_version: Option<String>,
+    spec_vendor: Option<String>,
+    impl_title: Option<String>,
+    impl_version: Option<String>,
+    impl_vendor: Option<String>,
+) -> Option<Value> {
+    if spec_title.is_none()
+        && spec_version.is_none()
+        && spec_vendor.is_none()
+        && impl_title.is_none()
+        && impl_version.is_none()
+        && impl_vendor.is_none()
+    {
+        return None;
+    }
+
+    // `VersionInfo` has no superclass fields: its six strings are slots 0..5
+    // in the exact declaration order below, followed by `sealBase` at slot 6.
+    // `set_field_by_name` can be a no-op before real JDK field metadata is
+    // reflected, so use this stable layout rather than silently losing values.
+    let info = alloc_concurrent_synthetic(ctx, "java/lang/Package$VersionInfo", 7);
+    let info_pin = ctx.pin_native_root(info);
+    for (slot, value) in [
+        spec_title,
+        spec_version,
+        spec_vendor,
+        impl_title,
+        impl_version,
+        impl_vendor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(value) = value {
+            let string = ctx.create_string(&value);
+            let info = ctx.read_native_pin(info_pin, info);
+            ctx.set_field(info, slot, Value::Object(Some(string)));
+        }
+    }
+    let info = ctx.read_native_pin(info_pin, info);
+    ctx.unpin_native_roots(info_pin);
+    Some(Value::Object(Some(info)))
+}
+
 pub(crate) fn native_class_get_package(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -13482,11 +13686,13 @@ pub(crate) fn native_class_get_package(
             (None, None, None, None, None, None)
         };
     let pkg = alloc_concurrent_synthetic(ctx, "java/lang/Package", 12);
+    let pkg_pin = ctx.pin_native_root(pkg);
     // Slot 0: name (synthetic-mode layout used by `getPackageName`/`getName`
     // shims pre-real-class-load). Also happens to be `NamedPackage.name`'s
     // real slot, so the by-index write is harmless there; every other field
     // below is by-name ONLY вЂ” see the raw-index corruption note above.
     let name_str = ctx.create_string(&pkg_name);
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
     // Manifest-derived attributes. NOT written by raw slot index (see the
@@ -13495,19 +13701,28 @@ pub(crate) fn native_class_get_package(
     // currently no-op for a real-class Package (tracked as a follow-up);
     // what matters here is that they can never clobber `module` /
     // `versionInfo` / `packageInfo` the way the old by-index writes did.
-    let write_optional = |ctx: &mut dyn NativeContext, field: &str, val: Option<String>| {
-        let obj = match val {
-            Some(s) => Value::Object(Some(ctx.create_string(&s))),
-            None => Value::Object(None),
-        };
-        ctx.set_field_by_name(pkg, field, obj);
-    };
-    write_optional(ctx, "specTitle", spec_title);
-    write_optional(ctx, "specVersion", spec_version);
-    write_optional(ctx, "specVendor", spec_vendor);
-    write_optional(ctx, "implTitle", impl_title);
-    write_optional(ctx, "implVersion", impl_version);
-    write_optional(ctx, "implVendor", impl_vendor);
+    if let Some(version_info) = package_version_info(
+        ctx,
+        spec_title,
+        spec_version,
+        spec_vendor,
+        impl_title,
+        impl_version,
+        impl_vendor,
+    ) {
+        // NamedPackage contributes name and module at slots 0 and 1; the
+        // real JDK Package.versionInfo field is consequently slot 2.
+        let pkg = ctx.read_native_pin(pkg_pin, pkg);
+        ctx.set_field(pkg, 2, version_info);
+    } else if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
+            let null_version_info = ctx.get_static_field(vi_cid, idx);
+            if matches!(null_version_info, Value::Object(Some(_))) {
+                let pkg = ctx.read_native_pin(pkg_pin, pkg);
+                ctx.set_field(pkg, 2, null_version_info);
+            }
+        }
+    }
     // Wire `versionInfo` to the real `Package$VersionInfo.NULL_VERSION_INFO`
     // sentinel, matching what the real `Package(String, Module)` constructor
     // does unconditionally (`javap -c` confirms `getstatic
@@ -13519,14 +13734,6 @@ pub(crate) fn native_class_get_package(
     // resolved (e.g. pure synthetic-JDK mode with no real `java.lang.Package`
     // on the classpath), leave `versionInfo` unset вЂ” real bytecode isn't
     // running against this object in that mode anyway.
-    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
-        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
-            let null_version_info = ctx.get_static_field(vi_cid, idx);
-            if matches!(null_version_info, Value::Object(Some(_))) {
-                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
-            }
-        }
-    }
     // Wire the Package's `module` from the class's own module so the *real*
     // `Package.getDeclaredAnnotations()` bytecode works. That JDK body does
     // `packageInfo()` -> `module().getClassLoader()`; with a null module it
@@ -13541,6 +13748,7 @@ pub(crate) fn native_class_get_package(
         _ => Value::Object(None),
     };
     if matches!(module_val, Value::Object(Some(_))) {
+        let pkg = ctx.read_native_pin(pkg_pin, pkg);
         ctx.set_field_by_name(pkg, "module", module_val);
     }
     // Eagerly resolve `<pkg>.package-info` and cache it in the Package's
@@ -13558,9 +13766,12 @@ pub(crate) fn native_class_get_package(
     if !pkg_name.is_empty() {
         let pi_internal = format!("{}/package-info", pkg_name.replace('.', "/"));
         if let Ok(Some(v @ Value::Object(Some(_)))) = ctx.load_class(&pi_internal) {
+            let pkg = ctx.read_native_pin(pkg_pin, pkg);
             ctx.set_field_by_name(pkg, "packageInfo", v);
         }
     }
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
+    ctx.unpin_native_roots(pkg_pin);
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -13617,9 +13828,12 @@ pub(crate) fn i2_classloader_get_defined_packages(
 /// `Package.getName()` see the right value.
 fn i2_alloc_synthetic_package(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     let pkg = alloc_concurrent_synthetic(ctx, "java/lang/Package", 12);
+    let pkg_pin = ctx.pin_native_root(pkg);
     let name_str = ctx.create_string(name);
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(pkg_pin);
     pkg
 }
 
@@ -13639,11 +13853,13 @@ pub(crate) fn i2_classloader_get_named_package(
         _ => String::new(),
     };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
+    let pkg_pin = ctx.pin_native_root(pkg);
     // Persist the module reference too so `Package.module()` returns the
     // caller-supplied module if it does get queried later.
     if let Some(module_val) = args.get(2).copied() {
         ctx.set_field_by_name(pkg, "module", module_val);
     }
+    ctx.unpin_native_roots(pkg_pin);
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -13659,9 +13875,11 @@ pub(crate) fn i2_classloader_define_package_string_module(
         _ => String::new(),
     };
     let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
+    let pkg_pin = ctx.pin_native_root(pkg);
     if let Some(module_val) = args.get(2).copied() {
         ctx.set_field_by_name(pkg, "module", module_val);
     }
+    ctx.unpin_native_roots(pkg_pin);
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -13727,27 +13945,29 @@ pub(crate) fn i2_classloader_define_package_class(
     // `versionInfo` object; slots 1-3 are actually `module`/`versionInfo`/
     // `packageInfo`), so a by-index write here clobbers them exactly like
     // the `native_class_get_package` bug did.
-    let write_optional = |ctx: &mut dyn NativeContext, field: &str, val: Option<String>| {
-        let obj = match val {
-            Some(s) => Value::Object(Some(ctx.create_string(&s))),
-            None => Value::Object(None),
-        };
-        ctx.set_field_by_name(pkg, field, obj);
-    };
-    write_optional(ctx, "specTitle", spec_title);
-    write_optional(ctx, "specVersion", spec_version);
-    write_optional(ctx, "specVendor", spec_vendor);
-    write_optional(ctx, "implTitle", impl_title);
-    write_optional(ctx, "implVersion", impl_version);
-    write_optional(ctx, "implVendor", impl_vendor);
-    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+    let pkg_pin = ctx.pin_native_root(pkg);
+    if let Some(version_info) = package_version_info(
+        ctx,
+        spec_title,
+        spec_version,
+        spec_vendor,
+        impl_title,
+        impl_version,
+        impl_vendor,
+    ) {
+        let pkg = ctx.read_native_pin(pkg_pin, pkg);
+        ctx.set_field(pkg, 2, version_info);
+    } else if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
         if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
             let null_version_info = ctx.get_static_field(vi_cid, idx);
             if matches!(null_version_info, Value::Object(Some(_))) {
-                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
+                let pkg = ctx.read_native_pin(pkg_pin, pkg);
+                ctx.set_field(pkg, 2, null_version_info);
             }
         }
     }
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
+    ctx.unpin_native_roots(pkg_pin);
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -16602,6 +16822,18 @@ mod tests {
     }
 
     #[test]
+    fn class_get_name_normalizes_primitive_descriptors() {
+        assert_eq!(
+            dotted_class_name(ClassId::new(0xfff0_0001), "Z").as_ref(),
+            "boolean"
+        );
+        assert_eq!(
+            dotted_class_name(ClassId::new(0xfff0_0002), "I").as_ref(),
+            "int"
+        );
+    }
+
+    #[test]
     fn class_get_name_spring_configuration_cglib_uses_aot_hint_alias() {
         let mut ctx = mock_ctx();
         let marker_id = ctx
@@ -17442,6 +17674,45 @@ mod tests {
             )) => assert_eq!(message, "bad"),
             other => panic!("expected IllegalArgumentException, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn field_access_allows_private_field_from_its_declaring_class() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(vec![declaring]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn field_access_rejects_private_field_from_another_class_without_override() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/OtherCaller")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -18317,6 +18588,33 @@ mod tests {
     }
 
     #[test]
+    fn t19_h10_manifest_uses_named_package_section_before_main_section() {
+        let manifest = b"Manifest-Version: 1.0\r\n\
+Implementation-Version: main\r\n\
+\r\n\
+Name: org/opensaml/core/\r\n\
+Implementation-Version: 5.2.1\r\n\
+Implementation-Title: opensaml-core-api\r\n\
+\r\n";
+        let attrs = parse_package_manifest(manifest);
+
+        assert_eq!(
+            manifest_attr_for_package(
+                &attrs,
+                Some("org/opensaml/core/"),
+                "Implementation-Version"
+            )
+            .as_deref(),
+            Some("5.2.1")
+        );
+        assert_eq!(
+            manifest_attr_for_package(&attrs, Some("org/other/"), "Implementation-Version")
+                .as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
     fn t19_h10_get_package_manifest_writes_do_not_corrupt_module_or_package_info() {
         // Regression test for the `Package.getAnnotation()` ->
         // `NoSuchMethodError: java/lang/String.getAnnotation` crash (see
@@ -18363,7 +18661,16 @@ mod tests {
         // so the earlier (legitimate, unrelated-to-this-bug) `name` by-name
         // write lands there too. Slots 2-6 are the ones a raw-index
         // manifest-attribute write would corrupt.
-        for slot in 2..=6 {
+        let version_info = match ctx.get_field(pkg, 2) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected Package.versionInfo at slot 2, got {other:?}"),
+        };
+        let vendor = match ctx.get_field(version_info, 2) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected VersionInfo.specVendor at slot 2, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(vendor).as_deref(), Some("JBoss by Red Hat"));
+        for slot in 3..=6 {
             assert_eq!(
                 ctx.get_field(pkg, slot),
                 Value::Int(0),
@@ -18406,7 +18713,16 @@ mod tests {
             other => panic!("expected non-null Package, got {other:?}"),
         };
         // See the sibling test above for why slot 1 is excluded.
-        for slot in 2..=6 {
+        let version_info = match ctx.get_field(pkg, 2) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected Package.versionInfo at slot 2, got {other:?}"),
+        };
+        let vendor = match ctx.get_field(version_info, 2) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected VersionInfo.specVendor at slot 2, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(vendor).as_deref(), Some("JBoss by Red Hat"));
+        for slot in 3..=6 {
             assert_eq!(
                 ctx.get_field(pkg, slot),
                 Value::Int(0),

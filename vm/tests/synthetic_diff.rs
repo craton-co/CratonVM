@@ -483,9 +483,10 @@ fn real_annotations_path() {
     );
 }
 
-/// Smoke test: AQS / ReentrantLock routes to real JDK bytecode under
-/// CRATONVM_REAL_AQS=1.  Acquires a lock on the main thread, observes it
-/// from a second thread, releases it, and confirms both states.
+/// Smoke test: AQS, ReentrantLock, and ReentrantReadWriteLock route to real
+/// JDK bytecode under CRATONVM_REAL_AQS=1. Acquires a lock on the main thread,
+/// observes it from a second thread, releases it, and creates a WriteLock
+/// condition through the real lock view.
 #[test]
 fn real_aqs_path() {
     let run = match run_class_env("RealAqs", &[("CRATONVM_REAL_AQS", "1")]) {
@@ -513,6 +514,10 @@ fn real_aqs_path() {
     assert!(
         run.stdout.contains("r:now_unlocked=true"),
         "lock still appears locked after unlock"
+    );
+    assert!(
+        run.stdout.contains("r:rw_write_condition=true"),
+        "real WriteLock.newCondition() did not produce a Condition"
     );
 }
 

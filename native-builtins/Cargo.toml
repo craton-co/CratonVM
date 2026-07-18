@@ -88,6 +88,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # whenever both are enabled, so `zip`'s own default `rust_backend` feature
 # request does not fight this.
 flate2 = { version = "1", features = ["zlib-rs"] }
+# The real GZIPOutputStream bridge requires stock-zlib's deterministic
+# DEFLATE stream, not merely a standards-compatible stream: Spring Boot's
+# Zipkin sender verifies the exact bytes produced by HotSpot.
+libz-sys = { version = "1.1.29", features = ["static"] }
 # Kafka third-party compression JNI shims (compression_native.rs): the Apache
 # Kafka record codecs use snappy-java (`org.xerial.snappy.SnappyNative`, block
 # format) and zstd-jni (`com.github.luben.zstd.*`, streaming format). We back
@@ -191,3 +195,8 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Only the legacy DSA server fallback needs OpenSSL's per-context security
+# policy API. Keeping it Unix-scoped preserves the Windows dependency graph.
+openssl = "0.10"

@@ -39,6 +39,8 @@ use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 // ---------------------------------------------------------------------------
 // Bug 2 fix: JAR cache to make Spring Boot fat-jar autoconfig walk fast.
@@ -1754,7 +1756,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -4505,6 +4507,23 @@ const HUC_BODY: usize = 6;
 const HUC_DO_INPUT: usize = 7;
 const HUC_DO_OUTPUT: usize = 8;
 const HUC_CONNECTED: usize = 9;
+// Field 10 caches the `java/util/jar/JarFile` returned by
+// `JarURLConnection.getJarFile()` so repeat calls see the SAME instance
+// (matching `sun.net.www.protocol.jar.JarURLConnection`, which opens the
+// JarFile once and caches it). Without this, each call minted a fresh
+// JarFile, so closing the jar via one reference never affected another —
+// Spring Boot's `StaticResourceJarsTests.closesJarFromNonCachedConnection`
+// expects `getJarFile().getComment()` to see the CLOSED state after
+// `StaticResourceJars` already closed the connection's jar.
+const HUC_JAR_FILE: usize = 10;
+// Tracks `URLConnection.useCaches` for the `java/net/JarURLConnection`
+// carrier (see the class-scoped `setUseCaches`/`getUseCaches` registrations
+// below `getJarFile`). Reuses HUC_CODE's slot: never read or written by any
+// JarURLConnection-specific native (HUC_CODE only matters for an HTTP
+// response code), and — unlike field 11, which was tried first and proved
+// to silently not persist across calls — sits inside the confirmed-safe
+// 0..=10 field range for this carrier.
+const HUC_USE_CACHES: usize = HUC_CODE;
 
 struct HttpResponse {
     status: i32,
@@ -4553,6 +4572,7 @@ fn http_perform_request(
     headers: &[(String, String)],
     body: &[u8],
     max_redirects: usize,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> std::io::Result<HttpResponse> {
     http_perform_request_with_timeout(
         method,
@@ -4561,6 +4581,7 @@ fn http_perform_request(
         body,
         Duration::from_secs(30),
         max_redirects,
+        tls_config,
     )
 }
 
@@ -4574,6 +4595,7 @@ fn http_perform_request_with_timeout(
     body: &[u8],
     timeout: Duration,
     max_redirects: usize,
+    tls_config: Option<Arc<ClientConfig>>,
 ) -> std::io::Result<HttpResponse> {
     let deadline = Instant::now()
         .checked_add(timeout)
@@ -4581,7 +4603,7 @@ fn http_perform_request_with_timeout(
     let mut current_url = url.to_string();
     let mut current_method = method.to_string();
     let mut current_body = body.to_vec();
-    for _ in 0..=max_redirects {
+    for redirects_followed in 0..=max_redirects {
         let (https, host, port, path, userinfo) = http_parse_url(&current_url)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         // JDK parity: a URL carrying user-info (`http://alice:secret@host/…`)
@@ -4606,15 +4628,27 @@ fn http_perform_request_with_timeout(
             _ => headers,
         };
         let resp = if https {
-            http_exchange_tls(
-                &host,
-                port,
-                &path,
-                &current_method,
-                eff_headers,
-                &current_body,
-                deadline,
-            )?
+            match tls_config.as_ref() {
+                Some(config) => http_exchange_rustls(
+                    config.clone(),
+                    &host,
+                    port,
+                    &path,
+                    &current_method,
+                    eff_headers,
+                    &current_body,
+                    deadline,
+                )?,
+                None => http_exchange_tls(
+                    &host,
+                    port,
+                    &path,
+                    &current_method,
+                    eff_headers,
+                    &current_body,
+                    deadline,
+                )?,
+            }
         } else {
             http_exchange_plain(
                 &host,
@@ -4634,6 +4668,12 @@ fn http_perform_request_with_timeout(
                     .find(|(k, _)| k.eq_ignore_ascii_case("location"))
                     .map(|(_, v)| v.clone());
                 if let Some(loc) = loc_opt {
+                    // A policy that disallows redirects must expose the first
+                    // redirect response, not convert it into a synthetic
+                    // "too many redirects" I/O error.
+                    if redirects_followed == max_redirects {
+                        return Ok(resp);
+                    }
                     let next = if loc.starts_with("http") {
                         loc
                     } else {
@@ -4947,6 +4987,12 @@ impl HttpDeadlineSocket for native_tls::TlsStream<TcpStream> {
     }
 }
 
+impl HttpDeadlineSocket for StreamOwned<ClientConnection, TcpStream> {
+    fn set_http_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
 /// Re-arms the operating-system receive timeout before every response read so
 /// a peer that drips bytes cannot extend a request deadline indefinitely.
 struct HttpDeadlineReader<S> {
@@ -5066,6 +5112,76 @@ fn http_exchange_tls(
     )
 }
 
+/// HTTPS exchange using the rustls configuration scoped to an explicit Java
+/// SSLContext. Unlike native-tls, this honours the context's trust/key manager
+/// state, which is required by `HttpClient.Builder.sslContext(...)`.
+fn http_exchange_rustls(
+    config: Arc<ClientConfig>,
+    host: &str,
+    port: u16,
+    path: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    deadline: Instant,
+) -> std::io::Result<HttpResponse> {
+    let tcp = http_connect_with_deadline(host, port, deadline)?;
+    tcp.set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
+    tcp.set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
+    let server_name = ServerName::try_from(host.to_owned()).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad TLS server name: {e}"),
+        )
+    })?;
+    let conn = ClientConnection::new(config, server_name)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS init: {e}")))?;
+    let mut tls: StreamOwned<ClientConnection, TcpStream> = StreamOwned::new(conn, tcp);
+    while tls.conn.is_handshaking() {
+        if tls.conn.wants_write() {
+            tls.sock
+                .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
+            tls.conn.write_tls(&mut tls.sock).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("TLS handshake write: {e}"),
+                )
+            })?;
+        }
+        if tls.conn.wants_read() {
+            tls.sock
+                .set_read_timeout(Some(http_timeout_remaining(deadline)?))?;
+            let count = tls.conn.read_tls(&mut tls.sock).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("TLS handshake read: {e}"),
+                )
+            })?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "TLS handshake: peer closed connection",
+                ));
+            }
+            tls.conn.process_new_packets().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, format!("TLS handshake: {e}"))
+            })?;
+        }
+    }
+    let request = http_build_request(method, host, port, path, headers, body, 443);
+    tls.sock
+        .set_write_timeout(Some(http_timeout_remaining(deadline)?))?;
+    tls.write_all(&request)?;
+    tls.flush()?;
+    http_read_response(
+        HttpDeadlineReader {
+            stream: tls,
+            deadline,
+        },
+        method.eq_ignore_ascii_case("HEAD"),
+    )
+}
+
 fn huc_extract_req_headers(ctx: &dyn NativeContext, hdrs: Value) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Value::Object(Some(a)) = hdrs {
@@ -5129,7 +5245,7 @@ fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult
     if url.is_empty() {
         return Err(ioex("HttpURLConnection: missing URL"));
     }
-    let resp = http_perform_request(&method, &url, &headers, &[], 10)
+    let resp = http_perform_request(&method, &url, &headers, &[], 10, None)
         .map_err(|e| ioex(format!("HTTP {method} {url}: {e}")))?;
     ctx.set_field(this, HUC_CODE, Value::Int(resp.status));
     let hdr_arr = ctx.new_ref_array(ClassId::new(0), resp.headers.len());
@@ -5755,7 +5871,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // I/O, no ctx interaction inside → safe to park. Mirrors the
             // blocking-region use in http_url_connection.rs::perform.
             ctx.begin_blocking_region();
-            let resp = http_perform_request("GET", &url_str, &[], &[], 10);
+            let resp = http_perform_request("GET", &url_str, &[], &[], 10, None);
             ctx.end_blocking_region();
             let resp = resp.map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
             resp.body
@@ -5875,6 +5991,46 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             if ext.contains("spring.factories") && spring_dbg_enabled() {
                 eprintln!("[CONN-DBG] URL.openConnection: {}", ext);
             }
+            // Let the real JDK FileURLConnection own `file:` resources. Its
+            // getInputStream body is precisely what URLClassLoader expects;
+            // routing a file URL through the synthetic HTTP carrier leaves the
+            // concrete HTTP connection without response state and returns EOF.
+            if let Some(raw_path) = ext.strip_prefix("file:") {
+                let decoded = uri_percent_decode(raw_path);
+                let mut path = decoded.trim_start_matches('/').to_string();
+                #[cfg(windows)]
+                {
+                    let bytes = path.as_bytes();
+                    if bytes.len() >= 2
+                        && bytes[0].is_ascii_alphabetic()
+                        && (bytes[1] == b'/' || bytes[1] == b'\\')
+                    {
+                        path.insert(1, ':');
+                    }
+                }
+                let file = match ctx.new_object("java/io/File")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(ioex("URL.openConnection: allocate File")),
+                };
+                let path_string = ctx.create_string(&path);
+                ctx.invoke_special(
+                    "java/io/File",
+                    "<init>",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(file)), Value::Object(Some(path_string))],
+                )?;
+                let conn = match ctx.new_object("sun/net/www/protocol/file/FileURLConnection")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(ioex("URL.openConnection: allocate FileURLConnection")),
+                };
+                ctx.invoke_special(
+                    "sun/net/www/protocol/file/FileURLConnection",
+                    "<init>",
+                    "(Ljava/net/URL;Ljava/io/File;)V",
+                    &[Value::Object(Some(conn)), Value::Object(Some(this)), Value::Object(Some(file))],
+                )?;
+                return Ok(Some(Value::Object(Some(conn))));
+            }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
             // that cast it continue to work. All other schemes need the
             // concrete HttpURLConnection carrier, including `file:`. The
@@ -5977,6 +6133,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/util/jar/JarFile;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Cached from a prior call — return the SAME instance so a
+            // caller that closes it (e.g. `StaticResourceJars` on a
+            // non-cached connection) observes the closed state on every
+            // later `getJarFile()` call, matching real-JDK's cached
+            // `sun.net.www.protocol.jar.JarURLConnection.jarFile` field.
+            if let Value::Object(Some(cached)) = ctx.get_field(this, HUC_JAR_FILE) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
@@ -6044,6 +6208,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
             )?;
+            ctx.set_field(this, HUC_JAR_FILE, Value::Object(Some(jar_file)));
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
@@ -6154,6 +6319,55 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
+    // JarURLConnection.setUseCaches(boolean) / getUseCaches() — class-scoped
+    // override (more specific than the base-class no-op above, so it wins
+    // in dispatch for actual JarURLConnection-carrier instances) giving
+    // real get/set semantics instead of the base no-op / real-bytecode
+    // fallback, which always answered `false` regardless of what a caller
+    // set. That made `StaticResourceJars.isResourcesJar(JarURLConnection)`'s
+    // `closeJarFile = !connection.getUseCaches()` unconditionally close a
+    // cached JarFile (see HUC_JAR_FILE, above) even on a `useCaches(true)`
+    // connection, breaking `StaticResourceJarsTests
+    // .doesNotCloseJarFromCachedConnection` once `getJarFile()` started
+    // returning the same instance across calls.
+    //
+    // Storage: reuses HUC_USE_CACHES (field 2, aka HUC_CODE — never read or
+    // written by any JarURLConnection-specific native; only meaningful for
+    // an HTTP response code). Field 11 was tried first and DISCARDED: this
+    // carrier's real backing class (`java/net/JarURLConnection`) apparently
+    // reports a real total-field count of 11 (fields 0..=10), so index 11
+    // silently failed to persist across calls — confirmed empirically with
+    // a probe (`set` landed, the very next `get` read back the unset
+    // default). Field 2 sits well inside the confirmed-persisting 0..=10
+    // range (field 10, HUC_JAR_FILE, is proven reliable elsewhere in this
+    // file), so this is the safe choice, not merely the convenient one.
+    r.register(
+        "java/net/JarURLConnection",
+        "setUseCaches",
+        "(Z)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let v = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
+            ctx.set_field(this, HUC_USE_CACHES, Value::Int(if v { 1 } else { 0 }));
+            Ok(None)
+        },
+    );
+    r.register(
+        "java/net/JarURLConnection",
+        "getUseCaches",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Unset (never called setUseCaches): real-JDK default is `true`
+            // for every protocol except `file:`, which this carrier never
+            // represents (file: uses the real FileURLConnection class).
+            let v = match ctx.get_field(this, HUC_USE_CACHES) {
+                Value::Int(n) => n != 0,
+                _ => true,
+            };
+            Ok(Some(Value::Int(if v { 1 } else { 0 })))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLength",
@@ -7079,6 +7293,86 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 // runtime class IS the abstract class — every instance method therefore has to
 // be registered directly on it (a real concrete `HttpClientImpl`/
 // `HttpResponseImpl` is never materialised on this path).
+//
+// Client and builder configuration is deliberately represented by actual Java
+// values, not presence flags.  Spring reads these values back through the JDK
+// accessors and invokes ProxySelector during a request, so a one-field
+// placeholder silently loses both identity and behaviour.
+const RE5_CLIENT_VERSION: usize = 0;
+const RE5_CLIENT_REDIRECT: usize = 1;
+const RE5_CLIENT_CONNECT_TIMEOUT: usize = 2;
+const RE5_CLIENT_SSL_CONTEXT: usize = 3;
+const RE5_CLIENT_EXECUTOR: usize = 4;
+const RE5_CLIENT_PROXY: usize = 5;
+const RE5_CLIENT_AUTHENTICATOR: usize = 6;
+const RE5_CLIENT_COOKIE_HANDLER: usize = 7;
+const RE5_CLIENT_SSL_PARAMETERS: usize = 8;
+const RE5_CLIENT_NUM_FIELDS: usize = 9;
+
+const RE5_BUILDER_VERSION: usize = 0;
+const RE5_BUILDER_REDIRECT: usize = 1;
+const RE5_BUILDER_CONNECT_TIMEOUT: usize = 2;
+const RE5_BUILDER_SSL_CONTEXT: usize = 3;
+const RE5_BUILDER_EXECUTOR: usize = 4;
+const RE5_BUILDER_PROXY: usize = 5;
+const RE5_BUILDER_AUTHENTICATOR: usize = 6;
+const RE5_BUILDER_COOKIE_HANDLER: usize = 7;
+const RE5_BUILDER_SSL_PARAMETERS: usize = 8;
+const RE5_BUILDER_NUM_FIELDS: usize = 9;
+
+fn re5_alloc_client(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let client = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", RE5_CLIENT_NUM_FIELDS);
+    ctx.set_field(client, RE5_CLIENT_VERSION, Value::Object(None));
+    ctx.set_field(client, RE5_CLIENT_REDIRECT, Value::Object(None));
+    for field in [
+        RE5_CLIENT_CONNECT_TIMEOUT,
+        RE5_CLIENT_SSL_CONTEXT,
+        RE5_CLIENT_EXECUTOR,
+        RE5_CLIENT_PROXY,
+        RE5_CLIENT_AUTHENTICATOR,
+        RE5_CLIENT_COOKIE_HANDLER,
+        RE5_CLIENT_SSL_PARAMETERS,
+    ] {
+        ctx.set_field(client, field, Value::Object(None));
+    }
+    client
+}
+
+fn re5_alloc_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let builder = alloc_concurrent_synthetic(
+        ctx,
+        "java/net/http/HttpClient$Builder",
+        RE5_BUILDER_NUM_FIELDS,
+    );
+    for field in 0..RE5_BUILDER_NUM_FIELDS {
+        ctx.set_field(builder, field, Value::Object(None));
+    }
+    builder
+}
+
+fn re5_optional(ctx: &mut dyn NativeContext, value: Value) -> MethodCallResult {
+    ctx.invoke(
+        "java/util/Optional",
+        "ofNullable",
+        "(Ljava/lang/Object;)Ljava/util/Optional;",
+        &[value],
+    )
+}
+
+fn re5_enum_name(ctx: &mut dyn NativeContext, value: Value) -> Option<String> {
+    let obj = match value {
+        Value::Object(Some(obj)) => obj,
+        _ => return None,
+    };
+    let value = ctx
+        .invoke_virtual(obj, "name", "()Ljava/lang/String;", &[])
+        .ok()??;
+    match value {
+        Value::Object(Some(name)) => ctx.read_string(name),
+        _ => None,
+    }
+}
+
 const RE5_RESP_STATUS: usize = 0; // Int
 const RE5_RESP_BODY_BYTES: usize = 1; // byte[]
 const RE5_RESP_HEADERS: usize = 2; // String[] of "key: value"
@@ -7816,9 +8110,33 @@ fn re5_request_timeout(
     Ok(Duration::from_millis(millis.max(1) as u64))
 }
 
+/// Read the real `SSLParameters` cipher list instead of assuming its private
+/// field layout.  In real-JDK mode the object originates in Spring/JDK code,
+/// so its public accessor is the stable contract.
+fn re5_ssl_parameter_ciphers(
+    ctx: &mut dyn NativeContext,
+    parameters: ObjectRef,
+) -> Result<Vec<String>, MethodCallFailed> {
+    let array =
+        match ctx.invoke_virtual(parameters, "getCipherSuites", "()[Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(array))) => array,
+            _ => return Ok(Vec::new()),
+        };
+    let mut ciphers = Vec::with_capacity(ctx.array_length(array));
+    for index in 0..ctx.array_length(array) {
+        if let Value::Object(Some(cipher)) = ctx.get_array_element(array, index) {
+            if let Some(name) = ctx.read_string(cipher) {
+                ciphers.push(name);
+            }
+        }
+    }
+    Ok(ciphers)
+}
+
 /// Shared request driver for `HttpClient.send` / `sendAsync`. `args[0]` is the
 /// `HttpClient`, `args[1]` the `HttpRequest`, `args[2]` the `BodyHandler`.
 fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let client = obj_arg(args, 0)?;
     let req = obj_arg(args, 1)?;
     let handler_val = args.get(2).copied();
     let handler_tag = re5_handler_tag(ctx, handler_val);
@@ -7835,6 +8153,53 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if uri.is_empty() {
         return Err(ioex("HttpRequest.uri is empty"));
     }
+    // Spring's filtered ProxySelector is the policy boundary for JDK-client
+    // requests. Run the real selector before opening a socket so its exception
+    // (not a later, unrelated connection error) reaches the caller.
+    if let Value::Object(Some(proxy)) = ctx.get_field(client, RE5_CLIENT_PROXY) {
+        let text = ctx.create_string(&uri);
+        let uri_obj = match ctx.invoke(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[Value::Object(Some(text))],
+        )? {
+            Some(Value::Object(Some(uri_obj))) => uri_obj,
+            _ => return Err(ioex("URI.create returned null for HttpClient request")),
+        };
+        ctx.invoke_virtual(
+            proxy,
+            "select",
+            "(Ljava/net/URI;)Ljava/util/List;",
+            &[Value::Object(Some(uri_obj))],
+        )?;
+    }
+    let redirect = ctx.get_field(client, RE5_CLIENT_REDIRECT);
+    let max_redirects = match re5_enum_name(ctx, redirect) {
+        Some(name) if name == "NEVER" => 0,
+        // JDK's default is NEVER. Spring explicitly configures NORMAL for its
+        // request factory, and BOTH NORMAL/ALWAYS are allowed to follow the
+        // local HTTP redirects used by these integration tests.
+        Some(_) => 10,
+        None => 0,
+    };
+    let tls_config = match ctx.get_field(client, RE5_CLIENT_SSL_CONTEXT) {
+        Value::Object(Some(ssl_context)) => {
+            let ciphers = match ctx.get_field(client, RE5_CLIENT_SSL_PARAMETERS) {
+                Value::Object(Some(parameters)) => re5_ssl_parameter_ciphers(ctx, parameters)?,
+                _ => Vec::new(),
+            };
+            Some(
+                crate::t27_tls::client_config_for_ssl_context_with_ciphers(
+                    ctx,
+                    ssl_context,
+                    &ciphers,
+                )
+                .map_err(|e| ioex(format!("HttpClient SSLContext configuration failed: {e}")))?,
+            )
+        }
+        _ => None,
+    };
     // A real (non-synthetic) BodyHandler must survive the blocking exchange:
     // the moving collector can run from other threads while this thread is
     // off in socket I/O, so pin it for the duration.
@@ -7875,19 +8240,56 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // hit it on ~2/13 attempts, always on this JDK-connector code path,
     // never on the Reactor-Netty/Jetty/HttpComponents connectors that don't
     // route through this raw-socket implementation).
-    ctx.begin_blocking_region();
-    let perform_result =
-        http_perform_request_with_timeout(&method, &uri, &headers, &body, request_timeout, 10);
-    ctx.end_blocking_region();
+    let perform_result = match tls_config {
+        Some(config) => {
+            // A context-scoped config may resolve Java KeyManager/TrustManager
+            // callbacks during the rustls handshake. Keep this native context
+            // active and do not mark the thread as GC-blocked while that happens.
+            let _active_context = crate::t27_tls::set_active_native_context(ctx);
+            http_perform_request_with_timeout(
+                &method,
+                &uri,
+                &headers,
+                &body,
+                request_timeout,
+                max_redirects,
+                Some(config),
+            )
+        }
+        None => {
+            ctx.begin_blocking_region();
+            let result = http_perform_request_with_timeout(
+                &method,
+                &uri,
+                &headers,
+                &body,
+                request_timeout,
+                max_redirects,
+                None,
+            );
+            ctx.end_blocking_region();
+            result
+        }
+    };
     let resp = perform_result.map_err(|e| {
+        let message = e.to_string();
         if re5_dbg() {
-            eprintln!("[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request FAILED: {e}");
+            eprintln!("[RE5-DBG] re5_do_request method={method} uri={uri} http_perform_request FAILED: {message}");
         }
         if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
-            ioex("HttpClient request timed out")
-        } else {
-            ioex(format!("HttpClient request failed: {e}"))
+            return ioex("HttpClient request timed out");
         }
+        // JSSE surfaces a rejected TLS negotiation as SSLHandshakeException.
+        // Preserve that Java contract rather than wrapping the transport's
+        // platform-specific certificate error in a generic IOException.
+        if let Some(detail) = message.strip_prefix("TLS handshake: ") {
+            return crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                detail,
+            );
+        }
+        ioex(format!("HttpClient request failed: {message}"))
     })?;
     if re5_dbg() {
         eprintln!(
@@ -8011,7 +8413,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newHttpClient",
         "()Ljava/net/http/HttpClient;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
+            let obj = re5_alloc_client(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -8020,70 +8422,116 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpClient$Builder;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient$Builder", 1);
+            let obj = re5_alloc_client_builder(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
 
     let bld = "java/net/http/HttpClient$Builder";
-    r.register(
-        bld,
-        "build",
-        "()Ljava/net/http/HttpClient;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 1);
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+    r.register(bld, "build", "()Ljava/net/http/HttpClient;", |ctx, args| {
+        let builder = obj_arg(args, 0)?;
+        let obj = re5_alloc_client(ctx);
+        for (from, to) in [
+            (RE5_BUILDER_VERSION, RE5_CLIENT_VERSION),
+            (RE5_BUILDER_REDIRECT, RE5_CLIENT_REDIRECT),
+            (RE5_BUILDER_CONNECT_TIMEOUT, RE5_CLIENT_CONNECT_TIMEOUT),
+            (RE5_BUILDER_SSL_CONTEXT, RE5_CLIENT_SSL_CONTEXT),
+            (RE5_BUILDER_EXECUTOR, RE5_CLIENT_EXECUTOR),
+            (RE5_BUILDER_PROXY, RE5_CLIENT_PROXY),
+            (RE5_BUILDER_AUTHENTICATOR, RE5_CLIENT_AUTHENTICATOR),
+            (RE5_BUILDER_COOKIE_HANDLER, RE5_CLIENT_COOKIE_HANDLER),
+            (RE5_BUILDER_SSL_PARAMETERS, RE5_CLIENT_SSL_PARAMETERS),
+        ] {
+            ctx.set_field(obj, to, ctx.get_field(builder, from));
+        }
+        Ok(Some(Value::Object(Some(obj))))
+    });
     r.register(
         bld,
         "connectTimeout",
         "(Ljava/time/Duration;)Ljava/net/http/HttpClient$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(
+                this,
+                RE5_BUILDER_CONNECT_TIMEOUT,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
     r.register(
         bld,
         "followRedirects",
         "(Ljava/net/http/HttpClient$Redirect;)Ljava/net/http/HttpClient$Builder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(
+                this,
+                RE5_BUILDER_REDIRECT,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
 
     // These are abstract interface methods. In the real-JDK build `newBuilder`
-    // creates this one-field synthetic directly, so every fluent method must be
-    // registered here rather than in the synthetic-only HTTP/2 registrar.
-    for (method, descriptor) in [
-        (
-            "version",
-            "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        ("priority", "(I)Ljava/net/http/HttpClient$Builder;"),
-        (
-            "executor",
-            "(Ljava/util/concurrent/Executor;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        (
-            "cookieHandler",
-            "(Ljava/net/CookieHandler;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        (
-            "proxy",
-            "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        (
-            "authenticator",
-            "(Ljava/net/Authenticator;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        (
-            "sslContext",
-            "(Ljavax/net/ssl/SSLContext;)Ljava/net/http/HttpClient$Builder;",
-        ),
-        (
-            "sslParameters",
-            "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;",
-        ),
-    ] {
-        r.register(bld, method, descriptor, |_ctx, args| Ok(Some(args[0])));
+    // creates this synthetic directly, so every fluent method must retain its
+    // argument here rather than relying on the synthetic-only HTTP/2 registrar.
+    macro_rules! register_builder_value {
+        ($method:literal, $descriptor:literal, $field:expr) => {
+            r.register(bld, $method, $descriptor, |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                ctx.set_field(
+                    this,
+                    $field,
+                    args.get(1).copied().unwrap_or(Value::Object(None)),
+                );
+                Ok(Some(Value::Object(Some(this))))
+            });
+        };
     }
+    register_builder_value!(
+        "version",
+        "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_VERSION
+    );
+    r.register(
+        bld,
+        "priority",
+        "(I)Ljava/net/http/HttpClient$Builder;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    register_builder_value!(
+        "executor",
+        "(Ljava/util/concurrent/Executor;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_EXECUTOR
+    );
+    register_builder_value!(
+        "cookieHandler",
+        "(Ljava/net/CookieHandler;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_COOKIE_HANDLER
+    );
+    register_builder_value!(
+        "proxy",
+        "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_PROXY
+    );
+    register_builder_value!(
+        "authenticator",
+        "(Ljava/net/Authenticator;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_AUTHENTICATOR
+    );
+    register_builder_value!(
+        "sslContext",
+        "(Ljavax/net/ssl/SSLContext;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_SSL_CONTEXT
+    );
+    register_builder_value!(
+        "sslParameters",
+        "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;",
+        RE5_BUILDER_SSL_PARAMETERS
+    );
 
     r.register(
         hc,
@@ -8125,27 +8573,40 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     // call throws `AbstractMethodError: ... has no Code attribute`. Spring's
     // `JdkClientHttpRequestFactory` ctor calls `executor()`; the rest are filled
     // for parity so they degrade to JDK-default values instead of crashing.
-    let opt_empty: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |ctx, _args| ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]);
-    r.register(hc, "executor", "()Ljava/util/Optional;", opt_empty);
-    r.register(hc, "connectTimeout", "()Ljava/util/Optional;", opt_empty);
-    r.register(hc, "proxy", "()Ljava/util/Optional;", opt_empty);
-    r.register(hc, "authenticator", "()Ljava/util/Optional;", opt_empty);
-    r.register(hc, "cookieHandler", "()Ljava/util/Optional;", opt_empty);
+    macro_rules! register_client_optional {
+        ($method:literal, $field:expr) => {
+            r.register(hc, $method, "()Ljava/util/Optional;", |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let value = ctx.get_field(this, $field);
+                re5_optional(ctx, value)
+            });
+        };
+    }
+    register_client_optional!("executor", RE5_CLIENT_EXECUTOR);
+    register_client_optional!("connectTimeout", RE5_CLIENT_CONNECT_TIMEOUT);
+    register_client_optional!("proxy", RE5_CLIENT_PROXY);
+    register_client_optional!("authenticator", RE5_CLIENT_AUTHENTICATOR);
+    register_client_optional!("cookieHandler", RE5_CLIENT_COOKIE_HANDLER);
     // version() -> HttpClient.Version (default HTTP_2); fetch the real enum
     // constant so the returned object is a genuine Version, not an int proxy.
     r.register(
         hc,
         "version",
         "()Ljava/net/http/HttpClient$Version;",
-        |ctx, _args| {
-            let name = ctx.create_string("HTTP_2");
-            ctx.invoke(
-                "java/net/http/HttpClient$Version",
-                "valueOf",
-                "(Ljava/lang/String;)Ljava/net/http/HttpClient$Version;",
-                &[Value::Object(Some(name))],
-            )
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field(this, RE5_CLIENT_VERSION) {
+                configured @ Value::Object(Some(_)) => Ok(Some(configured)),
+                _ => {
+                    let name = ctx.create_string("HTTP_2");
+                    ctx.invoke(
+                        "java/net/http/HttpClient$Version",
+                        "valueOf",
+                        "(Ljava/lang/String;)Ljava/net/http/HttpClient$Version;",
+                        &[Value::Object(Some(name))],
+                    )
+                }
+            }
         },
     );
     // followRedirects() -> HttpClient.Redirect (newHttpClient() default: NEVER).
@@ -8153,14 +8614,20 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         hc,
         "followRedirects",
         "()Ljava/net/http/HttpClient$Redirect;",
-        |ctx, _args| {
-            let name = ctx.create_string("NEVER");
-            ctx.invoke(
-                "java/net/http/HttpClient$Redirect",
-                "valueOf",
-                "(Ljava/lang/String;)Ljava/net/http/HttpClient$Redirect;",
-                &[Value::Object(Some(name))],
-            )
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field(this, RE5_CLIENT_REDIRECT) {
+                configured @ Value::Object(Some(_)) => Ok(Some(configured)),
+                _ => {
+                    let name = ctx.create_string("NEVER");
+                    ctx.invoke(
+                        "java/net/http/HttpClient$Redirect",
+                        "valueOf",
+                        "(Ljava/lang/String;)Ljava/net/http/HttpClient$Redirect;",
+                        &[Value::Object(Some(name))],
+                    )
+                }
+            }
         },
     );
     // sslContext() -> the JVM default SSLContext.
@@ -8168,13 +8635,29 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         hc,
         "sslContext",
         "()Ljavax/net/ssl/SSLContext;",
-        |ctx, _args| {
-            ctx.invoke(
-                "javax/net/ssl/SSLContext",
-                "getDefault",
-                "()Ljavax/net/ssl/SSLContext;",
-                &[],
-            )
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field(this, RE5_CLIENT_SSL_CONTEXT) {
+                configured @ Value::Object(Some(_)) => Ok(Some(configured)),
+                _ => ctx.invoke(
+                    "javax/net/ssl/SSLContext",
+                    "getDefault",
+                    "()Ljavax/net/ssl/SSLContext;",
+                    &[],
+                ),
+            }
+        },
+    );
+    r.register(
+        hc,
+        "sslParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field(this, RE5_CLIENT_SSL_PARAMETERS) {
+                configured @ Value::Object(Some(_)) => Ok(Some(configured)),
+                _ => ctx.new_object_initialized("javax/net/ssl/SSLParameters", "()V", &[]),
+            }
         },
     );
     // close()/shutdown()/shutdownNow() (JDK 21+ AutoCloseable surface) — no-ops;
@@ -8439,14 +8922,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let body =
                 alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            let bytes = match args.first().copied() {
-                Some(Value::Object(Some(arr))) => {
-                    String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
-                }
-                _ => String::new(),
-            };
-            let s = ctx.create_string(&bytes);
-            ctx.set_field(body, 0, Value::Object(Some(s)));
+            // A request body is binary data.  Keeping it as a String replaces
+            // every non-UTF-8 byte with U+FFFD, then re-encodes that character
+            // as EF BF BD when `re5_request_body_bytes` builds the wire body.
+            // This was invisible for textual HTTP requests but corrupted gzip,
+            // protobuf, and arbitrary binary `ofByteArray` payloads.
+            ctx.set_field(
+                body,
+                0,
+                args.first().copied().unwrap_or(Value::Object(None)),
+            );
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -8943,13 +9428,29 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
     );
     // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
     // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
-    // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
+    // keyed by ObjectRef via engine_id_or_alloc).  It is intentionally a
+    // synthetic allocation, but it still participates in real JDK bytecode:
+    // Netty configures ALPN through SSLEngineImpl's
+    // setHandshakeApplicationProtocolSelector(), which takes engineLock.  A
+    // bare allocation leaves that final constructor field null and turns a
+    // normal TLS setup into an NPE.  Supply the one JDK-visible invariant that
+    // method needs without running SSLEngineImpl's full JSSE constructor (the
+    // rustls-backed native state owns the rest of the engine lifecycle).
     for desc in [
         "()Ljavax/net/ssl/SSLEngine;",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
             let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            let lock = match ctx.new_object_initialized(
+                "java/util/concurrent/locks/ReentrantLock",
+                "()V",
+                &[],
+            )? {
+                Some(Value::Object(Some(lock))) => lock,
+                _ => return Err(npe("ReentrantLock <init> failed")),
+            };
+            ctx.set_field_by_name(eng, "engineLock", Value::Object(Some(lock)));
             // Copy this SSLContext's per-context identity (its keystore cert+key)
             // onto the engine, so the rustls handshake presents THIS context's
             // cert (server cert, or client cert for mTLS) instead of the global.
@@ -9045,6 +9546,15 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 _ => None,
             }
             .or_else(crate::t27_tls::huc_default_client_identity);
+            #[cfg(unix)]
+            let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
+            #[cfg(unix)]
+            let legacy_dsa_client = client_ident
+                .as_ref()
+                .is_some_and(|(_, key_pem)| crate::t27_tls::is_dsa_private_key_pem(key_pem))
+                || legacy_dsa_roots
+                    .iter()
+                    .any(|der| crate::t27_tls::is_dsa_certificate_der(der));
             // Use the rustls client path rather than a default native-tls
             // connector: (1) trust the gathered test/truststore roots (the
             // native-tls default trusts only the OS root store, so it cannot
@@ -9074,10 +9584,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // forever for this thread to reach a safepoint it can't reach until
             // the (now-deadlocked-behind-the-GC) network call returns.
             ctx.begin_blocking_region();
-            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16);
+            #[cfg(unix)]
+            let connect_result = if legacy_dsa_client {
+                crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+            } else {
+                crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                    .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                    .map_err(std::io::Error::other)
+            };
+            #[cfg(not(unix))]
+            let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let rid = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
-            let id = crate::servlet::RUSTLS_SOCK_ID_BASE + rid;
+            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
@@ -9178,6 +9697,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let cfg = match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
                 &["http/1.1"],
                 client_ident.as_ref().map(|(c, k)| (c.as_str(), k.as_str())),
+                None,
+                None,
                 &ciphers,
             ) {
                 Ok(cfg) => cfg,
@@ -11346,6 +11867,7 @@ mod tests {
             &[],
             Duration::from_millis(10),
             0,
+            None,
         ) {
             Ok(_) => panic!("a delayed response head must exceed the request deadline"),
             Err(error) => error,
@@ -11631,7 +12153,7 @@ mod tests {
     }
 
     #[test]
-    fn re5_body_publishers_of_byte_array_reads_static_arg_slot_zero() {
+    fn re5_body_publishers_of_byte_array_preserves_binary_static_arg_slot_zero() {
         let mut registry = NativeMethodRegistry::new();
         register_re5_http_client(&mut registry);
         let native = registry
@@ -11643,21 +12165,24 @@ mod tests {
             .expect("ofByteArray native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let bytes = ctx.new_array(ArrayElementType::Byte, 3);
-        ctx.set_array_element(bytes, 0, Value::Int(b'a' as i32));
-        ctx.set_array_element(bytes, 1, Value::Int(b'b' as i32));
-        ctx.set_array_element(bytes, 2, Value::Int(b'c' as i32));
+        let bytes = ctx.new_array(ArrayElementType::Byte, 4);
+        for (index, byte) in [0x1f_u8, 0x8b, b'a', 0xff].into_iter().enumerate() {
+            ctx.set_array_element(bytes, index, Value::Int(byte as i8 as i32));
+        }
 
         let publisher = match native(&mut ctx, &[Value::Object(Some(bytes))]).unwrap() {
             Some(Value::Object(Some(publisher))) => publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
         };
-        let body = match ctx.get_field(publisher, 0) {
-            Value::Object(Some(body)) => body,
-            other => panic!("expected publisher body string, got {other:?}"),
-        };
-
-        assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
+        assert!(matches!(
+            ctx.get_field(publisher, 0),
+            Value::Object(Some(body)) if body == bytes
+        ));
+        let stored = ctx.get_field(publisher, 0);
+        assert_eq!(
+            re5_request_body_bytes(&mut ctx, stored).unwrap(),
+            [0x1f, 0x8b, b'a', 0xff]
+        );
     }
 
     fn re5_test_byte_buffer(ctx: &mut MockNativeContext, bytes: &[u8]) -> ObjectRef {
@@ -12072,6 +12597,69 @@ mod tests {
                 "missing {method}{descriptor}"
             );
         }
+    }
+
+    #[test]
+    fn re5_http_client_builder_retains_configured_object_values() {
+        let mut registry = NativeMethodRegistry::new();
+        register_re5_http_client(&mut registry);
+        let mut ctx = MockNativeContext::new();
+
+        let new_builder = registry
+            .find(
+                "java/net/http/HttpClient",
+                "newBuilder",
+                "()Ljava/net/http/HttpClient$Builder;",
+            )
+            .expect("HttpClient.newBuilder native");
+        let builder = match new_builder(&mut ctx, &[]).unwrap() {
+            Some(Value::Object(Some(builder))) => builder,
+            other => panic!("newBuilder returned {other:?}"),
+        };
+        let executor = alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0);
+        let proxy = alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0);
+
+        for (method, descriptor, value) in [
+            (
+                "executor",
+                "(Ljava/util/concurrent/Executor;)Ljava/net/http/HttpClient$Builder;",
+                executor,
+            ),
+            (
+                "proxy",
+                "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;",
+                proxy,
+            ),
+        ] {
+            let setter = registry
+                .find("java/net/http/HttpClient$Builder", method, descriptor)
+                .expect("builder setter native");
+            setter(
+                &mut ctx,
+                &[Value::Object(Some(builder)), Value::Object(Some(value))],
+            )
+            .expect("builder setter should succeed");
+        }
+
+        let build = registry
+            .find(
+                "java/net/http/HttpClient$Builder",
+                "build",
+                "()Ljava/net/http/HttpClient;",
+            )
+            .expect("HttpClient.Builder.build native");
+        let client = match build(&mut ctx, &[Value::Object(Some(builder))]).unwrap() {
+            Some(Value::Object(Some(client))) => client,
+            other => panic!("build returned {other:?}"),
+        };
+        assert_eq!(
+            ctx.get_field(client, RE5_CLIENT_EXECUTOR),
+            Value::Object(Some(executor))
+        );
+        assert_eq!(
+            ctx.get_field(client, RE5_CLIENT_PROXY),
+            Value::Object(Some(proxy))
+        );
     }
 
     #[test]

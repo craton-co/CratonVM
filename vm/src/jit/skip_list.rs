@@ -104,6 +104,10 @@ pub enum SkipReason {
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
     BigIntegerArithmetic,
+    /// Javac's `JavacTool.getTask` loses the compiler file-manager context
+    /// after tiered compilation. Keep this cold compiler setup method
+    /// interpreted until its JIT lowering is understood.
+    JavacToolContext,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -345,6 +349,20 @@ fn should_skip_jit_internal(
     // invokeinterface PIC invalidation handles changing lambda receivers.
     if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
         return Some(SkipReason::JavaUtilCollection);
+    }
+
+    // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
+    // in-process javac invocation per fixture. Once the real JDK's
+    // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
+    // fileManager)` state does not survive into `ClassReader`: JDK 25 then
+    // aborts compilation with `AssertionError: FileManager initialization
+    // error`. The identical 65-test class passes under --nojit and under JIT
+    // when this method alone is excluded. This setup path is cold relative to
+    // application execution; keep it interpreted until the JIT producer is
+    // root-caused. The guard is deliberately unconditional: allowing a broad
+    // javac package experiment must not re-enable this known corrupting method.
+    if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
+        return Some(SkipReason::JavacToolContext);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
@@ -4408,5 +4426,22 @@ mod tests {
             ),
             Some(SkipReason::RustJvmTestFixture)
         );
+    }
+
+    #[test]
+    fn javac_tool_get_task_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/api/JavacTool",
+                    "getTask",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::JavacToolContext),
+                "JavacTool.getTask must remain excluded under every policy",
+            );
+        }
     }
 }

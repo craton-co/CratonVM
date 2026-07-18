@@ -4347,6 +4347,11 @@ struct NativeDispatchCache {
 enum ObjectNativeKind {
     HashMap,
     Matcher,
+    /// Registered `java/lang/StringBuilder` natives (the `append(I)/(C)/
+    /// (String)` family + `toString`/`length`). Exact-receiver-guarded like
+    /// the other kinds; resolution consults the native registry ONCE at
+    /// cache-fill time instead of a 3-string hash per call.
+    StringBuilder,
 }
 
 #[derive(Clone, Copy)]
@@ -5206,7 +5211,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // every iteration.
     let object_native_kind = hashmap_native_arg_count(info)
         .map(|_| ObjectNativeKind::HashMap)
-        .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher));
+        .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher))
+        .or_else(|| stringbuilder_native_arg_count(info).map(|_| ObjectNativeKind::StringBuilder));
     if matches!(info.invoke_kind, 0 | 2)
         && !crate::classloading::any_class_redefined()
         && object_native_kind.is_some()
@@ -5234,6 +5240,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     let expected_class = match kind {
                         ObjectNativeKind::HashMap => "java/util/HashMap",
                         ObjectNativeKind::Matcher => "java/util/regex/Matcher",
+                        ObjectNativeKind::StringBuilder => "java/lang/StringBuilder",
                     };
                     let is_exact_receiver = {
                         let classes = vm.class_manager.read();
@@ -5246,6 +5253,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         let callback = match kind {
                             ObjectNativeKind::HashMap => hashmap_native_callback(info),
                             ObjectNativeKind::Matcher => matcher_native_callback(info),
+                            ObjectNativeKind::StringBuilder => {
+                                stringbuilder_native_callback(vm, info)
+                            }
                         };
                         if let Some(callback) = callback {
                             let entry = NativeDispatchCache {
@@ -5573,23 +5583,40 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 } else {
                     None
                 };
-                let object = match tlab_object {
-                    Some(object) => object,
-                    None => {
-                        use cratonvm_native_api::NativeContext as _;
-                        // Reborrow: `thread` is used again after this arm for
-                        // the pending-return publication.
-                        let mut ctx = crate::vm::NativeContextImpl {
-                            shared: vm,
-                            thread: &mut *thread,
-                        };
-                        ctx.alloc_object(class_id, 1)
+                if let Some(object) = tlab_object {
+                    // Raw primitive-cell write: this arm JUST allocated
+                    // `object` through the legacy TLAB path
+                    // (`init_object_header`, zeroed 16-byte Value cells), so
+                    // field 0 is the Value cell at HEADER_SIZE — the exact
+                    // bytes `set_field_as(.., b'I')` would store, minus that
+                    // path's per-call header read + layout dispatch. A
+                    // primitive store takes no write barrier.
+                    // SAFETY: `object` is a live legacy-layout allocation
+                    // with >= 1 slot (`slots.max(1)` above); the cell is
+                    // exclusively ours until published below.
+                    unsafe {
+                        std::ptr::write(
+                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                            Value::Int(value),
+                        );
                     }
+                    // Object-return handoff root (see `call_integer_native_raw`).
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                use cratonvm_native_api::NativeContext as _;
+                let object = {
+                    // Reborrow: `thread` is used again after this arm for
+                    // the pending-return publication.
+                    let mut ctx = crate::vm::NativeContextImpl {
+                        shared: vm,
+                        thread: &mut *thread,
+                    };
+                    ctx.alloc_object(class_id, 1)
                 };
-                // Direct descriptor-typed write: `Integer.value` is declared
-                // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
-                // per-call `class_id_of` + descriptor resolution and hand the
-                // heap the same normalized store it would have produced.
+                // Descriptor-typed write (`Integer.value`, field 0, `I`) —
+                // this cold arm's allocator may pick a non-legacy layout, so
+                // keep the layout-aware store.
                 vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
                 thread.native_pending_return = Some(object);
@@ -5930,7 +5957,7 @@ fn call_integer_native_raw(
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.heap.young_spill_pressure() {
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.heap.needs_gc()
+                        && vm.heap.needs_gc_for_jit_allocation()
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
@@ -6043,6 +6070,87 @@ fn matcher_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::
 }
 
 #[inline]
+fn stringbuilder_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
+    match (info.method_name, info.descriptor) {
+        ("append", "(I)Ljava/lang/StringBuilder;")
+        | ("append", "(C)Ljava/lang/StringBuilder;")
+        | ("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;") => Some(2),
+        ("toString", "()Ljava/lang/String;") | ("length", "()I") => Some(1),
+        _ => None,
+    }
+}
+
+/// Resolve the registered StringBuilder native for this site ONCE (the
+/// registry's 3-string hash) — cached per callsite afterwards, exactly like
+/// the HashMap/Matcher kinds. Returns `None` (no caching, generic dispatch)
+/// when no native is registered for the triple.
+#[inline]
+fn stringbuilder_native_callback(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    vm.native_methods
+        .find("java/lang/StringBuilder", info.method_name, info.descriptor)
+}
+
+/// Invoke a cached StringBuilder native from raw JIT argument slots.
+#[inline]
+fn call_stringbuilder_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_ref: ObjectRef,
+    args_slice: &[i64],
+    callback: cratonvm_native_api::NativeCallback,
+) -> Option<i64> {
+    let expected_len = stringbuilder_native_arg_count(info)?;
+    if args_slice.len() != expected_len {
+        return None;
+    }
+    let mut values = [Value::Object(None); 2];
+    values[0] = Value::Object(Some(receiver_ref));
+    if expected_len == 2 {
+        match info.descriptor.as_bytes().get(1) {
+            // int / char parameter — the natives take Value::Int for both.
+            Some(b'I') | Some(b'C') => values[1] = Value::Int(args_slice[1] as i32),
+            Some(b'L') => {
+                let raw = args_slice[1];
+                // `append((String) null)` must append "null" — the generic
+                // path (appendNull routing) owns that; don't serve it here.
+                if raw == 0 {
+                    return None;
+                }
+                let bits = raw as u64;
+                if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+                    return None;
+                }
+                let object = vm.heap.is_object_address(bits as usize)?;
+                values[1] = Value::Object(Some(object));
+            }
+            _ => return None,
+        }
+    }
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        callback,
+        &values[..expected_len],
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(value)) => value as i64,
+        Some(Value::Long(value)) => value,
+        Some(Value::Float(value)) => value.to_bits() as i64,
+        Some(Value::Double(value)) => value.to_bits() as i64,
+        Some(Value::Object(Some(object))) => object.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => 0,
+    })
+}
+
+#[inline]
 fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
     let vm_key = vm as *const SharedVm as usize;
     let raw_class_id = class_id.as_u32();
@@ -6078,6 +6186,14 @@ fn call_object_native_raw(
         ObjectNativeKind::Matcher => {
             call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, entry.callback)
         }
+        ObjectNativeKind::StringBuilder => call_stringbuilder_native_raw(
+            vm,
+            thread,
+            info,
+            receiver_ref,
+            args_slice,
+            entry.callback,
+        ),
     }
 }
 

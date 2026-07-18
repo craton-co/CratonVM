@@ -24,6 +24,7 @@ use crate::native::registry::{
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
+use cratonvm_native_api::ThreadJmxSnapshot;
 
 use super::SharedVm;
 use crate::classloading::ClassStore;
@@ -1377,11 +1378,21 @@ pub(crate) fn monitor_enter_blocking(
     thread: &mut JvmThread,
     obj: ObjectRef,
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
+    ctx.thread
+        .gc_block_state
+        .java_state
+        .store(2, std::sync::atomic::Ordering::Release);
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
@@ -1428,6 +1439,9 @@ pub(crate) fn monitor_enter_blocking(
         .copied()
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed);
     fixed
 }
 
@@ -1444,7 +1458,13 @@ pub(crate) fn monitor_enter_synchronized_method(
     obj: ObjectRef,
     args: &mut [Value],
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(monitor) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
 
@@ -1498,6 +1518,9 @@ pub(crate) fn monitor_enter_synchronized_method(
         }
     }
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed_monitor);
     fixed_monitor
 }
 
@@ -5689,7 +5712,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
+        self.shared
+            .thread_registry
+            .set_jmx_contended_monitor(self.thread.thread_id, obj);
         self.shared.monitors.enter(obj, self.thread.thread_id);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, obj);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
         }
@@ -5725,6 +5754,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
         let _ = self.shared.monitors.exit(obj, self.thread.thread_id);
+        if !self.shared.monitors.holds(obj, self.thread.thread_id) {
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+        }
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -5759,6 +5793,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // filler write can happen after a concurrent census has already
         // decided it may proceed without waiting for this thread.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // KC16-watchdog: stash a snapshot of the current frame chain in a
@@ -5810,6 +5848,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+            self.shared
+                .thread_registry
+                .set_jmx_waiting_monitor(self.thread.thread_id, obj);
             let r = self.shared.monitors.wait(
                 obj,
                 self.thread.thread_id,
@@ -5828,6 +5872,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // every later census permanently excluded the thread and a moving
         // collection could run concurrently with its bytecode.
         self.check_post_block_gc();
+        // `Object.wait` returns only after re-acquiring the monitor, including
+        // the InterruptedException path. Re-establish the ownership snapshot
+        // before propagating that result to Java.
+        let waited_on = self
+            .shared
+            .thread_registry
+            .take_jmx_waiting_monitor(self.thread.thread_id)
+            .unwrap_or(obj);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, waited_on);
         let was_interrupted = was_interrupted?;
         // Emit JFR monitor wait event
         {
@@ -6539,6 +6594,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
         // grow/realloc the young arena while we are joined.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
@@ -6576,7 +6635,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             None => 0, // NEW — never started
             Some(id) => {
                 if self.shared.thread_registry.is_alive(id) {
-                    1 // RUNNABLE
+                    match self.shared.thread_registry.java_block_state(id) {
+                        1 => 3, // WAITING
+                        2 => 4, // BLOCKED
+                        _ => 1, // RUNNABLE
+                    }
                 } else {
                     2 // TERMINATED
                 }
@@ -6605,6 +6668,86 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // carry the ClassId/descriptor needed to resolve source lines, but
         // class.method is sufficient to pinpoint where a parked thread is stuck.
         self.shared.thread_registry.frame_trace_of(tid)
+    }
+
+    fn thread_jmx_snapshot(&self, thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        let thread_id = read_java_thread_tid(self.shared, thread_obj)
+            .map(|id| id as i64)
+            .unwrap_or(tid.0 as i64);
+        let thread_name = self
+            .shared
+            .thread_registry
+            .thread_name(tid)
+            .unwrap_or_else(|| format!("Thread-{thread_id}"));
+        let thread_status = if !self.shared.thread_registry.is_alive(tid) {
+            0x0002 // JVMTI_THREAD_STATE_TERMINATED
+        } else {
+            match self.shared.thread_registry.java_block_state(tid) {
+                2 => 0x0401, // ALIVE | BLOCKED_ON_MONITOR_ENTER
+                1 => 0x0011, // ALIVE | WAITING_INDEFINITELY
+                _ => 0x0005, // ALIVE | RUNNABLE
+            }
+        };
+        let stack_trace = if self.thread.java_thread_obj == Some(thread_obj) {
+            let cm = self.shared.class_manager.read();
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames)
+        } else {
+            self.shared.thread_registry.frame_trace_of(tid)
+        };
+        let (contended, waiting, locked_monitors, locked_synchronizers) =
+            self.shared.thread_registry.jmx_lock_snapshot(tid)?;
+        // `LockSupport` records the AQS/Condition blocker in the real JDK
+        // `Thread.parkBlocker` field before it enters Unsafe.park. It is the
+        // authoritative lock object for WAITING threads that are not in
+        // Object.wait(), and it is already rooted by the Thread mirror.
+        let park_blocker = match self.get_field_by_name(thread_obj, "parkBlocker") {
+            Value::Object(Some(blocker)) => Some(blocker),
+            _ => None,
+        };
+        let lock = contended.or(waiting).or(park_blocker);
+        // The compatibility CountDownLatch implementation blocks on the
+        // public latch monitor rather than allocating the JDK-private `Sync`.
+        // Preserve the public JMM contract: ThreadInfo exposes that logical
+        // synchronizer, not the implementation's monitor surrogate.
+        let lock_class_name = waiting.and_then(|monitor| {
+            (self.class_name_of_id(self.class_id_of_object(monitor)).as_deref()
+                == Some("java/util/concurrent/CountDownLatch"))
+                .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
+        });
+        let (lock_owner_id, lock_owner_name) = contended
+            .and_then(|monitor| self.shared.monitors.current_owner(monitor))
+            .map(|owner| {
+                let owner_id = self
+                    .shared
+                    .thread_registry
+                    .java_thread_obj(owner)
+                    .and_then(|obj| read_java_thread_tid(self.shared, obj))
+                    .map(|id| id as i64)
+                    .unwrap_or(owner.0 as i64);
+                (owner_id, self.shared.thread_registry.thread_name(owner))
+            })
+            .unwrap_or((-1, None));
+        Some(ThreadJmxSnapshot {
+            thread_object: Some(thread_obj),
+            thread_id,
+            thread_name,
+            thread_status,
+            stack_trace,
+            lock,
+            lock_class_name,
+            lock_owner_id,
+            lock_owner_name,
+            locked_monitors,
+            locked_synchronizers,
+        })
+    }
+
+    fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        let owner = owner.and_then(|thread| resolve_thread_id_from_thread_obj(self.shared, thread));
+        self.shared
+            .thread_registry
+            .set_jmx_owned_synchronizer(owner, synchronizer);
     }
 
     fn current_thread_object(&mut self) -> ObjectRef {
@@ -7110,6 +7253,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
         // blocked region, while the young arena it points into is still valid.
         // While we are GC-blocked a stop-the-world moving collection can run on
@@ -7537,6 +7684,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // grow/realloc the young arena while this thread is parked, freeing
         // the buffer the TLAB points into.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
 
@@ -7843,7 +7994,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     } else {
                         let private_impl_class =
                             crate::runtime::interpreter::lambda_private_impl_dispatch_class(
-                                self.shared, &lcs,
+                                self.shared,
+                                &lcs,
                             );
                         let rcv_id_opt = match &full_args[0] {
                             Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
@@ -8314,26 +8466,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             full_args.push(Value::Object(Some(receiver)));
             full_args.extend_from_slice(args);
 
-            // Per-loader identity (JVMS §5.3): when the receiver's class name
-            // resolves (globally, by name) to a DIFFERENT class id than the
-            // receiver actually has — i.e. another loader defined a same-named
-            // class first — dispatch on the receiver's EXACT class id so a
-            // reflective `Method.invoke` on a loader-private (e.g. load-time
-            // weaved) instance runs ITS body, not the global one.
-            // `invoke_on_class_shared` resolves via
-            // `find_method_recursive(receiver_class_id, ...)` and keeps
-            // native-override precedence, matching `invoke_or_native`'s
-            // semantics minus the name→global-id collapse. The common
-            // single-loader case (name resolves back to `receiver_class_id`)
-            // keeps the original `invoke_or_native` path byte-for-byte.
-            let diverges = resolved_from_receiver
-                && self
-                    .shared
-                    .class_manager
-                    .read()
-                    .get_loaded_class_id(&class_name)
-                    != Some(receiver_class_id);
-            if diverges {
+            // Dispatch ordinary object calls through the receiver's exact
+            // loaded class. Re-resolving its name through the global class map
+            // can select an inherited Object member even when the receiver has
+            // a concrete override (notably a method-local anonymous class
+            // reached from a native call such as String.format's `%s`).
+            // `invoke_on_class_shared` preserves native-override precedence
+            // while resolving the actual receiver hierarchy.
+            if resolved_from_receiver {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,
@@ -8868,8 +9008,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         #[cfg(windows)]
         // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
         // RegisterNatives-on-load pattern as tcnative on CratonVM.
-        let skip_jni_onload_tcnative = basename_lc.contains("tcnative")
-            || basename_lc.contains("conscrypt_openjdk_jni");
+        let skip_jni_onload_tcnative =
+            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
         #[cfg(not(windows))]
         let skip_jni_onload_tcnative = false;
 
@@ -12059,7 +12199,22 @@ pub(crate) fn annotation_proxy_invoke_shared(
     // `AnnotationAttributes[]`, surfacing as the `TypeFilterUtils.java:77`
     // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
     // (`@Filter` attribute is null).
+    if method_name == "asAnnotationAttributes" {
+        // `MergedAnnotation.asAnnotationAttributes(Adapt...)` has one
+        // argument: the Adapt[] varargs array. `annotation_proxy_as_map`
+        // accepts `(Function factory, Adapt[] adapts)`, so preserve the
+        // adaptation array in its second slot and use no factory.
+        let adapts = args.first().copied().unwrap_or(Value::Object(None));
+        return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+    }
     if method_name == "asMap" {
+        // The `asMap(Adapt...)` overload similarly has no factory. Without
+        // this routing, CLASS_TO_STRING is mistaken for a factory argument
+        // and Class[] values leak into AnnotationAttributes.
+        if args.len() <= 1 {
+            let adapts = args.first().copied().unwrap_or(Value::Object(None));
+            return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+        }
         return annotation_proxy_as_map(shared, thread, proxy, args);
     }
     // Annotation equality is symmetric, but our native `AnnotationProxy` equals
@@ -12228,6 +12383,66 @@ fn annotation_proxy_as_map(
     Ok(Some(Value::Object(Some(dest_map))))
 }
 
+/// Materialize a real or synthetic annotation proxy as a one-element
+/// `AnnotationAttributes[]`. This is used at Spring's scalar-to-array
+/// metadata boundary for a nested annotation that the forked class-path
+/// reader reports without its declared array wrapper.
+pub(crate) fn annotation_proxy_to_annotation_attributes_array(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let attrs_cid = shared
+        .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
+    // The servlet API's `WebFilter.initParams()` default is an empty array.
+    // In the forked class-path reader it can appear as a zero-field
+    // WebInitParam placeholder rather than a real annotation proxy. It holds
+    // no member data, so its faithful AnnotationAttributes representation is
+    // the declared empty array.
+    if class_name_is(shared, value, "jakarta/servlet/annotation/WebInitParam")
+        && shared.heap.num_fields(value) == 0
+    {
+        return Ok(Some(shared.heap.alloc_array(
+            attrs_cid,
+            cratonvm_types::ArrayElementType::Reference,
+            0,
+        )));
+    }
+    let proxy = if class_name_is(shared, value, "java/lang/annotation/AnnotationProxy") {
+        Some(value)
+    } else {
+        match shared.heap.get_field(value, 0) {
+            Value::Object(Some(handler))
+                if class_name_is(shared, handler, "java/lang/annotation/AnnotationProxy") =>
+            {
+                Some(handler)
+            }
+            _ => None,
+        }
+    };
+    let Some(proxy) = proxy else {
+        return Ok(None);
+    };
+    let attrs = match annotation_proxy_as_map(
+        shared,
+        thread,
+        proxy,
+        &[Value::Object(None), Value::Object(None)],
+    )? {
+        Some(Value::Object(Some(attrs))) => attrs,
+        _ => return Ok(None),
+    };
+    let array = shared
+        .heap
+        .alloc_array(attrs_cid, cratonvm_types::ArrayElementType::Reference, 1);
+    shared
+        .heap
+        .set_array_element(array, 0, Value::Object(Some(attrs)))
+        .ok();
+    Ok(Some(array))
+}
+
 /// Test whether the given (possibly-null) Adapt[] varargs array contains
 /// an enum constant whose `name` slot equals `target_name`.
 fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: &str) -> bool {
@@ -12270,7 +12485,7 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
 /// return `val` unchanged. Implements the `Adapt.CLASS_TO_STRING` semantics
 /// for `MergedAnnotation.asMap` so that downstream
 /// `AnnotationAttributes.getStringArray("basePackageClasses")` succeeds.
-fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
+pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
     use crate::memory::heap::ObjectKind;
     let obj = match val {
         Value::Object(Some(o)) => o,
@@ -13668,6 +13883,89 @@ fn invoke_on_class_shared_inner(
                 .map(|value| coerce_native_return(value, descriptor));
         }
     }
+    // `Socket.setKeepAlive` on a real-JDK socket can read CratonVM's
+    // synthetic TLS state as its private `impl` field.  The resulting
+    // receiver is a String and the JDK attempts the impossible call below.
+    // It is an internal socket-option write only; String has no such API, so
+    // suppressing it is both narrower and safer than allowing an NSME.
+    if class_name == "java/lang/String"
+        && method_name == "setOption"
+        && descriptor == "(ILjava/lang/Object;)V"
+    {
+        return Ok(None);
+    }
+    // `ServerSocket.accept()` has a native parent implementation, so the
+    // later abstract-method rescue cannot displace it. A synthetic
+    // SSLServerSocket owns a separate TLS listener registry and must always
+    // prefer its concrete bridge before inherited-native lookup.
+    if method_name == "accept" && descriptor == "()Ljava/net/Socket;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLServerSocket" {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        .find(&receiver_name, method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+    // UnboundID retains an SSLServerSocketFactory in a field whose declared
+    // type is ServerSocketFactory, then invokes its concrete parent overloads
+    // (`createServerSocket(II)` and `(IILjava/net/InetAddress;)`).  The
+    // parent has registered native implementations, so ordinary resolution
+    // never reaches the TLS factory's more-specific bridge.  Prefer that
+    // bridge from the receiver's actual synthetic class before the parent
+    // native can manufacture a plaintext listener.
+    if method_name == "createServerSocket"
+        && matches!(
+            descriptor,
+            "(I)Ljava/net/ServerSocket;"
+                | "(II)Ljava/net/ServerSocket;"
+                | "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;"
+        )
+    {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if matches!(
+                receiver_name.as_str(),
+                "javax/net/ssl/SSLServerSocketFactory"
+                    | "sun/security/ssl/SSLServerSocketFactoryImpl"
+            ) {
+                if let Some(callback) = shared
+                    .native_methods
+                    // The real JDK factory carries its SSLContext in the
+                    // same first instance slot consumed by the bridge.
+                    // Reuse the bridge registered on its public API type
+                    // rather than interpreting `SSLServerSocketImpl`,
+                    // whose host socket path bypasses the TLS registry.
+                    .find(
+                        "javax/net/ssl/SSLServerSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // The real-JDK Thread methods read the host field layout directly.  A
     // CratonVM Thread can instead carry a stale/mis-slotted value there, which
     // made Mockito plugin discovery dispatch `getResources` on a String.
@@ -14072,6 +14370,28 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                // `URLClassLoader` declares its OWN
+                                // `getResourceAsStream` override (real OpenJDK
+                                // wraps the stream for `closeables` tracking),
+                                // unlike `getResource`/`getResources`/
+                                // `findResource` above, which it leaves to
+                                // `ClassLoader`/its own extension point. The
+                                // `java/lang/ClassLoader` entry elsewhere in
+                                // this list never matches such a call, so its
+                                // real bytecode ran unforced — same shimmed-`ucp`
+                                // problem as `findResource` above, but ALSO
+                                // missing the native bridge's parent-delegation,
+                                // so a `new URLClassLoader(urls, parent)` whose
+                                // own URL held only a generated resource index
+                                // (Spring Boot's `ServletComponentScanIntegrationTests
+                                // .indexedComponentsAreRegistered`) got `null`
+                                // for every `.class` resource that only the
+                                // PARENT classloader's classpath holds, despite
+                                // `getResource` resolving it fine moments
+                                // earlier. Keep in sync with
+                                // `force_native_over_real_jdk_bytecode`.
+                                || (method_name == "getResourceAsStream"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
@@ -14655,6 +14975,29 @@ fn invoke_on_class_shared_inner(
                                 | "size"
                                 | "close"
                                 | "getName"
+                            ))
+                        // `JarFile` inherits its ZipFile operations.  A
+                        // subclass `super.close()` (or another inherited
+                        // super call) resolves from the JarFile constant-pool
+                        // reference to ZipFile, where the real JDK body reads
+                        // fields that the native-backed constructor does not
+                        // populate.  Keep the ZipFile side of the bridge
+                        // allow-list in sync with the methods registered in
+                        // `register_jar_natives` so those inherited special
+                        // calls use the same Rust-backed state as direct
+                        // JarFile calls.
+                        || (class_name == "java/util/zip/ZipFile"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEntry"
+                                | "getInputStream"
+                                | "entries"
+                                | "stream"
+                                | "getComment"
+                                | "close"
+                                | "getName"
+                                | "size"
                             ))
                         || (class_name == "java/util/jar/Manifest"
                             && matches!(
@@ -15318,6 +15661,26 @@ fn invoke_on_class_shared_inner(
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
                         || crate::runtime::interpreter::is_undertow_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_netty_event_executor_group_shutdown_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_destroy_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_customize_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_datagram_channel_open_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -16125,7 +16488,22 @@ fn invoke_on_class_shared_inner(
                     // the interface-exclusion above retargeted `class_id`) and check
                     // its native registry too -- this generalises the rescue to any
                     // interface-stamped synthetic receiver, not just concrete ones.
-                    if !native && method.is_abstract() {
+                    // The static method reference can already have selected a
+                    // generic native on the abstract parent (for example
+                    // `ServerSocketFactory.createServerSocket(II)`), which
+                    // used to suppress this receiver-specific rescue.  The
+                    // concrete synthetic receiver's bridge is more specific
+                    // and must win even in that case: otherwise an
+                    // `SSLServerSocketFactory` silently constructs a
+                    // plaintext listener through its parent factory.
+                    // `ServerSocket.accept()` is concrete on the parent, but a
+                    // synthetic SSLServerSocket must still route to its own
+                    // TLS-aware native. Without this one concrete exception,
+                    // the parent accept path bypasses the listener registry
+                    // entirely and an LDAPS client waits until timeout.
+                    if method.is_abstract()
+                        || (method_name == "accept" && descriptor == "()Ljava/net/Socket;")
+                    {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
                                 let rc = shared.heap.class_id_of(*o);
