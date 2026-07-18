@@ -1,18 +1,16 @@
-# DoHead family — post-fix sporadic residuals (FIXED)
+# DoHead family — post-fix sporadic residuals (OPEN)
 
-**Status: CLOSED 2026-07-17.** This record is retained as an internal history
-because the former singleton failures were traced to aliasing of live NIO
-objects in native tables keyed only by Java identity hash code. Java identity
-hashes are stable across moving GC but are not unique; collisions made channel,
-SelectionKey, and Selector state cross-wire under the repeated Tomcat
-start/stop pressure used by this family.
+**Status: OPEN 2026-07-18.** The earlier 2026-07-17 closure was not
+sufficient: a fresh isolated build still shows low-rate HTTP response loss and
+read timeouts in the 64-class DoHead matrix. This record has consequently been
+restored to `docs/known-issues` in accordance with the project issue policy.
 
-The fix buckets each table by stable identity hash and disambiguates the row by
-its ObjectRef. Those references are explicitly rooted and remapped after a
-moving collection. This covers SocketChannel/ServerSocketChannel synthetic
-state, SelectionKey state, and Selector-to-native-id state.
+The identity-hash collision hardening remains part of the current work. It
+buckets native socket state by the stable hash, disambiguates by `ObjectRef`,
+and roots/remaps references across moving GC. It does not, by itself, eliminate
+the remaining transport residuals.
 
-## 2026-07-17 closure evidence
+## 2026-07-17 superseded closure evidence
 
 - Commit: `fbd790c7 fix(nio): disambiguate identity hash side tables`.
 - Remote probe binary: `/data/data/cvm-dohead-postfix-eintr9-20260717`.
@@ -131,3 +129,63 @@ cd apps\tomcat-suite-runner
 Expect ≥95% of classes 288/288; the shapes above appear as isolated
 287/288 singletons (or the rare crash face #6). None reproduced on a
 targeted rerun of the affected class this session.
+
+
+## 2026-07-18 clean-worktree progress and current residuals
+
+**Status: OPEN.** The final clean attempt was run from a fresh worktree
+`/data/wt-dohead-residuals-clean-20260718` on branch
+`fix/dohead-residuals-clean-20260718`, created directly from
+`origin/dev` at `ef60e4792`. This was necessary because the older purportedly
+isolated worktree acquired unrelated concurrent edits; its C17 binaries and
+results are discarded as invalid evidence.
+
+### Current changes under test
+
+1. Collision-safe, GC-rooted buckets for the native server-socket port table
+   and the `SocketChannel` wrapper/back-reference table. Rows are matched by
+   the actual Java `ObjectRef`, not only its non-unique identity hash.
+2. Selector close now writes its wakeup byte, retains epoll/self-pipe handles
+   while `epoll_wait` is in flight, and releases those handles only after the
+   final in-flight selector call returns. This removes the direct close-vs-wait
+   descriptor-reuse race; it does not yet explain every HTTP transport loss.
+
+The clean selector regression suite passed:
+
+```text
+cargo test -p cratonvm-native-io --lib nio_selector -- --test-threads=1
+20 passed; 0 failed
+```
+
+The fresh release binary was
+`/data/data/cvm-dohead-clean-c18-20260718`, built with unique target directory
+`/data/data/target-dohead-clean-c18-20260718`. A six-pass focused run of the
+previous C17-only `0 -> 1024` failure class was clean:
+`/data/data/dohead-clean-c18-0-1024-focus-20260718` (6/6 PASS).
+
+### Full clean matrix — residuals remain
+
+The decisive run
+`/data/data/dohead-clean-c18-full-20260718` used two processes, `-Xmx1g`, one
+pass, and a 900-second per-class timeout. It completed all 64 classes and
+ended `ALL_DONE`, but reported four failures (60 pass, 4 fail):
+
+| Class | Parameterized failure face |
+| --- | --- |
+| `1023 -> 1` | `HttpURLConnection response failed: connection closed before response head` |
+| `0 -> 1025` | `SocketTimeoutException: Read timed out` |
+| `513 -> 1025` | `SocketTimeoutException: Read timed out` |
+| `513 -> 512` | `SocketTimeoutException: Read timed out` |
+
+Each failing class completed 288 parameterizations with one failing case. The
+retained logs are the corresponding `p1-*.log` files under the matrix output
+above. The host load was modest during the later sweep (roughly 5–10 on the
+16-core host), so these cannot be dismissed as only the earlier severe host
+contention. No DoHead probe process remained after the matrix; the requested
+post-attempt cleanup also found no matching runner or binary process.
+
+**Next diagnostic gate:** trace the server-side close/selector and socket I/O
+sequence for the four residual faces from this clean branch. Do not move this
+record back under `docs/internal` or claim the family fixed until a newly built
+clean binary completes the same full 64-class matrix with zero transport,
+header, timeout, selector, loader, or native-stack residuals.

@@ -3844,6 +3844,7 @@ fn re2_bind_listener(
     // (Narayana's TransactionStatusManager recovery listener) fails / hangs.
     cratonvm_native_api::server_socket_ports::record_addr(
         ctx.identity_hash_code(this),
+        this,
         &actual_host,
         actual_port,
     );
@@ -3895,6 +3896,7 @@ fn re2_server_socket_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         s.closed = 1;
         s.listener_id = -1;
     });
+    cratonvm_native_api::server_socket_ports::remove(ctx.identity_hash_code(this), this);
     Ok(None)
 }
 
@@ -7535,7 +7537,10 @@ fn re5_collect_publisher_body(
             break;
         }
         let wait_for = deadline.saturating_duration_since(now);
-        let (next_state, wait) = collector.done.wait_timeout(state, wait_for).unwrap_or_else(|e| e.into_inner());
+        let (next_state, wait) = collector
+            .done
+            .wait_timeout(state, wait_for)
+            .unwrap_or_else(|e| e.into_inner());
         state = next_state;
         if wait.timed_out() {
             break;

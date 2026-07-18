@@ -707,6 +707,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     reachable only through sk_table could be swept before the remap ran.
     cratonvm_native_io::nio_selector::gc_scan_selector_roots(&mut roots);
     cratonvm_native_io::socket_channel::gc_scan_channel_roots(&mut roots);
+    cratonvm_native_io::socket_channel::gc_scan_ss_back_ref_roots(&mut roots);
+    cratonvm_native_api::server_socket_ports::gc_scan_roots(&mut roots);
     //     ScheduledThreadPoolExecutor pending runnables (stored as relocatable
     //     addresses; remap companion `scheduled_pump::gc_update_scheduled_refs`).
     cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(&mut roots);

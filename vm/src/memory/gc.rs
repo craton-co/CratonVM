@@ -540,6 +540,8 @@ pub fn update_all_roots(
     // early-returns when nothing moved (non-moving GC).
     cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
     cratonvm_native_io::socket_channel::channel_fields_update_after_gc(pointer_map);
+    cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(pointer_map);
+    cratonvm_native_api::server_socket_ports::gc_update_after_gc(pointer_map);
 
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {

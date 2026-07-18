@@ -22,63 +22,96 @@
 //! `ss_back_ref_table`; identity hashes are GC-stable, so no post-GC remap is
 //! needed — worst case is a missed lookup, never a wild value.)
 
+use cratonvm_types::ObjectRef;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone)]
 struct BoundServerSocket {
+    object: ObjectRef,
     host: String,
     port: i32,
 }
 
-fn table() -> &'static Mutex<HashMap<i32, BoundServerSocket>> {
-    static T: OnceLock<Mutex<HashMap<i32, BoundServerSocket>>> = OnceLock::new();
+fn table() -> &'static Mutex<HashMap<i32, Vec<BoundServerSocket>>> {
+    static T: OnceLock<Mutex<HashMap<i32, Vec<BoundServerSocket>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Record the actual bound (ephemeral-resolved) local port of a plain synthetic
-/// `ServerSocket`, keyed by its identity hash. Called from the binding native.
-pub fn record(identity_hash: i32, port: i32) {
-    record_addr(identity_hash, "0.0.0.0", port);
+/// Record a plain ServerSocket's port. The identity hash selects only a bucket:
+/// the receiver ObjectRef prevents a collision from redirecting a later
+/// getLocalPort/bind/close operation to a different listener.
+pub fn record(identity_hash: i32, object: ObjectRef, port: i32) {
+    record_addr(identity_hash, object, "0.0.0.0", port);
 }
 
-/// Record the actual bound local address of a plain synthetic `ServerSocket`,
-/// keyed by its identity hash.
-pub fn record_addr(identity_hash: i32, host: &str, port: i32) {
+pub fn record_addr(identity_hash: i32, object: ObjectRef, host: &str, port: i32) {
     if let Ok(mut t) = table().lock() {
-        t.insert(
-            identity_hash,
-            BoundServerSocket {
+        let bucket = t.entry(identity_hash).or_default();
+        if let Some(row) = bucket.iter_mut().find(|row| row.object == object) {
+            row.host = host.to_string();
+            row.port = port;
+        } else {
+            bucket.push(BoundServerSocket {
+                object,
                 host: host.to_string(),
                 port,
-            },
-        );
+            });
+        }
     }
 }
 
-/// Look up the bound local port previously recorded for this `ServerSocket`'s
-/// identity hash, if any. Called from the winning `getLocalPort` native when it
-/// has no channel back-ref (i.e. a plain `ServerSocket`).
-pub fn get(identity_hash: i32) -> Option<i32> {
-    table()
-        .lock()
-        .ok()
-        .and_then(|t| t.get(&identity_hash).map(|bound| bound.port))
+pub fn get(identity_hash: i32, object: ObjectRef) -> Option<i32> {
+    table().lock().ok().and_then(|t| {
+        t.get(&identity_hash)
+            .and_then(|bucket| bucket.iter().find(|row| row.object == object))
+            .map(|bound| bound.port)
+    })
 }
 
-/// Look up the bound local address previously recorded for this `ServerSocket`'s
-/// identity hash, if any.
-pub fn get_addr(identity_hash: i32) -> Option<(String, i32)> {
-    table()
-        .lock()
-        .ok()
-        .and_then(|t| t.get(&identity_hash).cloned())
-        .map(|bound| (bound.host, bound.port))
+pub fn get_addr(identity_hash: i32, object: ObjectRef) -> Option<(String, i32)> {
+    table().lock().ok().and_then(|t| {
+        t.get(&identity_hash)
+            .and_then(|bucket| bucket.iter().find(|row| row.object == object))
+            .map(|bound| (bound.host.clone(), bound.port))
+    })
 }
 
-/// Drop the recorded port for a closed `ServerSocket` (best-effort).
-pub fn remove(identity_hash: i32) {
+pub fn remove(identity_hash: i32, object: ObjectRef) {
     if let Ok(mut t) = table().lock() {
-        t.remove(&identity_hash);
+        let remove_bucket = if let Some(bucket) = t.get_mut(&identity_hash) {
+            bucket.retain(|row| row.object != object);
+            bucket.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            t.remove(&identity_hash);
+        }
+    }
+}
+
+/// The registry is a live native edge while a ServerSocket is bound; retain and
+/// remap its receivers across moving GC, exactly like the consumer side tables.
+pub fn gc_scan_roots(out: &mut Vec<ObjectRef>) {
+    if let Ok(t) = table().lock() {
+        for bucket in t.values() {
+            out.extend(bucket.iter().map(|row| row.object));
+        }
+    }
+}
+
+pub fn gc_update_after_gc<S: std::hash::BuildHasher>(pointer_map: &HashMap<usize, usize, S>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    if let Ok(mut t) = table().lock() {
+        for bucket in t.values_mut() {
+            for row in bucket {
+                if let Some(&new_addr) = pointer_map.get(&(row.object.as_ptr() as usize)) {
+                    row.object = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
     }
 }
