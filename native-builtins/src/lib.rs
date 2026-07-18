@@ -8521,6 +8521,7 @@ pub mod charset;
 pub mod classloader_value_sidetable;
 #[cfg(feature = "experimental-jmx")]
 pub mod jmx;
+pub mod jfr;
 pub mod panama;
 pub mod panama_libffi;
 pub mod properties_sidetable;
@@ -25133,6 +25134,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    crate::jfr::register_jfr_natives(registry);
     crate::tls::register_conscrypt_native_bridges(registry);
     register_ecj_problem_overrides(registry);
     registry.register(
@@ -30337,6 +30339,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getName",
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
+    );
+    registry.register(
+        "java/lang/Class",
+        "forPrimitiveName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        lang_class::native_class_get_primitive_class,
     );
     // Synthetic bootstrap may still stub `java/lang/Class` when no real JDK
     // classfile is available. Keep the public name accessors declared by the

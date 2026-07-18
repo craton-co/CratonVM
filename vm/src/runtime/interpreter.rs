@@ -22151,6 +22151,10 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
+                | (
+                    "forPrimitiveName",
+                    "(Ljava/lang/String;)Ljava/lang/Class;"
+                )
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24122,6 +24126,13 @@ fn force_native_over_real_jdk_bytecode(
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // JFR's Type bootstrap table compares Class mirrors by reference.  A
+    // bootstrap type can reach this point through a separately materialised
+    // mirror, so run the registered bridge which canonicalises through the VM
+    // ClassId before delegating to JFR's String-keyed lookup.
+    if is_jfr_metadata_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
     // The platform-server bridge returns a synthetic MBeanServer receiver.
     // Interface call sites must select its registered bridge methods rather
     // than executing the abstract interface declarations.
@@ -25828,6 +25839,34 @@ fn redefine_immune_path_native(
         && method_descriptor == "()Ljava/lang/String;"
 }
 
+fn redefine_immune_jfr_native(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    is_jfr_metadata_native_override(class_name, method_name, method_descriptor)
+}
+
+fn is_jfr_metadata_native_override(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    matches!(
+        (class_name, method_name, method_descriptor),
+        (
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;"
+        ) | (
+            "jdk/jfr/internal/util/Utils",
+            "getValidType",
+            "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;"
+        ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+            | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+    )
+}
+
 fn redefine_immune_forced_native(
     class_name: &str,
     method_name: &str,
@@ -25836,6 +25875,7 @@ fn redefine_immune_forced_native(
     redefine_immune_reflection_native(class_name, method_name)
         || redefine_immune_string_builder_native(class_name, method_name, method_descriptor)
         || redefine_immune_path_native(class_name, method_name, method_descriptor)
+        || redefine_immune_jfr_native(class_name, method_name, method_descriptor)
         || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
 }
@@ -36960,6 +37000,30 @@ mod tests {
             "org/apache/tomcat/unittest/TesterRequest",
             "getRequestURI",
             "()Ljava/lang/String;",
+        ));
+    }
+
+    #[test]
+    fn jfr_known_type_class_lookup_uses_the_canonical_native_bridge() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(redefine_immune_forced_native(
+            "jdk/jfr/internal/Type",
+            "getKnownType",
+            "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(is_jfr_metadata_native_override(
+            "jdk/jfr/internal/util/Utils",
+            "getValidType",
+            "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;",
+        ));
+        assert!(is_class_mirror_native_override(
+            "java/lang/Class",
+            "forPrimitiveName",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
         ));
     }
 
