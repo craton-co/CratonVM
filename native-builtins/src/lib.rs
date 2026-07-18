@@ -38536,8 +38536,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     register_synchronized_collection_wrapper_natives(registry);
     register_function_identity_natives(registry);
     // WildFly can load java.time.Instant through a bootstrap synthetic stub even
-    // in real-JDK mode. The interpreter already force-routes the hot Instant
-    // factories to native dispatch; make the bridge available in essentials too.
+    // in real-JDK mode. Keep its SyntheticStub bridge available in essentials;
+    // a loaded real-JDK Instant remains on its own bytecode path.
     register_synthetic_instant_stub_natives(registry);
     // Real-JDK boot can still resolve `java/util/Objects` through a synthetic
     // fallback when java.base stubs are partial. Install the existing spec

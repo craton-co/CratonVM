@@ -10399,6 +10399,7 @@ pub fn invoke_or_native(
                         | "java/util/concurrent/LinkedBlockingDeque"
                         | "java/util/concurrent/atomic/AtomicBoolean"
                         | "java/util/EnumSet"
+                        | "java/time/Instant"
                         | "java/util/StringJoiner"
                         | "java/io/FileInputStream"
                         | "java/lang/ref/Cleaner"
@@ -15977,11 +15978,6 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_jython_pymodule_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
-                        || crate::runtime::interpreter::is_time_native_override(
                             class_name,
                             method_name,
                             descriptor,
