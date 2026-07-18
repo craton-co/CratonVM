@@ -104,6 +104,7 @@ fn alloc_initialized_array_list(
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     let list_pin = ctx.pin_native_root(list);
+    let list = ctx.read_native_pin(list_pin, list);
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
     let list = ctx.read_native_pin(list_pin, list);
     ctx.unpin_native_roots(list_pin);
@@ -1336,7 +1337,6 @@ fn provider_construction_error(
         _ => ctx.read_native_pin(original_cause_pin, cause),
     };
     let cause_pin = ctx.pin_native_root(cause);
-    ctx.unpin_native_roots(original_cause_pin);
     let message = ctx.create_string(&format!("Provider {provider} could not be instantiated"));
     let message_pin = ctx.pin_native_root(message);
     let cause = ctx.read_native_pin(cause_pin, cause);
@@ -1346,8 +1346,11 @@ fn provider_construction_error(
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
         &[Value::Object(Some(message)), Value::Object(Some(cause))],
     );
-    ctx.unpin_native_roots(cause_pin);
-    ctx.unpin_native_roots(message_pin);
+    // Refresh the fallback before releasing the one LIFO scope rooted at the
+    // original cause. Truncating `original_cause_pin` immediately after taking
+    // `cause_pin` used to discard the latter and made the fallback stale.
+    let cause = ctx.read_native_pin(cause_pin, cause);
+    ctx.unpin_native_roots(original_cause_pin);
     match wrapped {
         Ok(Some(Value::Object(Some(error)))) => MethodCallFailed::ExceptionThrown(error),
         _ => MethodCallFailed::ExceptionThrown(cause),
@@ -1373,7 +1376,6 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         })
     })?;
     let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
-    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
     // Pin the providers list as a GC root: the loop below repeatedly calls into
     // Java (forName / newInstance / add), each of which can trigger a moving-GC
     // collection that relocates `list`. Without re-reading the forwarded
@@ -1381,6 +1383,11 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // silently produce zero providers (the keycloak `CryptoIntegration` "Not
     // able to load any cryptoProvider" failure under real BouncyCastle).
     let list_pin = ctx.pin_native_root(list);
+    // `<init>` is itself a Java invocation and can move the freshly allocated
+    // list. The pin must therefore precede it, and the argument must be read
+    // back through that pin before dispatch.
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
 
     let diag = matches!(
         std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
@@ -1616,11 +1623,12 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let pi_cid = match ctx.ensure_class_initialized(PROVIDER_IMPL) {
         Ok(cid) => cid,
         Err(_) => {
+            let sl = ctx.read_native_pin(sl_pin, sl);
             ctx.unpin_native_roots(sl_pin);
             if diag {
                 eprintln!("[SL-DBG] stream(): ProviderImpl unavailable, draining instances");
             }
-            return drain_instances_to_stream(ctx, args);
+            return drain_instances_to_stream(ctx, &[Value::Object(Some(sl))]);
         }
     };
     let pi_fields = ctx.class_num_total_fields(pi_cid).max(4);
@@ -1635,8 +1643,9 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         })
     })?;
     let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
-    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
     let list_pin = ctx.pin_native_root(list);
+    list = ctx.read_native_pin(list_pin, list);
+    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
 
     for fqn in &providers {
         // Re-read sl through the pin so we have a fresh reference after
@@ -1665,7 +1674,9 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
             0,
         );
+        let empty_types_pin = ctx.pin_native_root(empty_types);
         let type_now = ctx.read_native_pin(type_pin, type_class);
+        let empty_types = ctx.read_native_pin(empty_types_pin, empty_types);
         let ctor = match ctx.invoke(
             "java/lang/Class",
             "getDeclaredConstructor",
@@ -1685,6 +1696,7 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 continue;
             }
         };
+        ctx.unpin_native_roots(empty_types_pin);
         let ctor_pin = ctx.pin_native_root(ctor);
         // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
         // succeeds for non-public providers.
@@ -1696,12 +1708,9 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             &[Value::Object(Some(ctor_now)), Value::Int(1)],
         );
 
-        // Read everything back post-GC for the wrapper construction.
-        let sl_now = ctx.read_native_pin(sl_pin, sl);
-        let service = match ctx.get_field_by_name(sl_now, "service") {
-            v @ Value::Object(Some(_)) => v,
-            _ => ctx.get_field(sl_now, 0),
-        };
+        // Read the pinned constructor inputs back post-GC. The service Class is
+        // re-read from the pinned ServiceLoader for every constructor attempt
+        // below rather than being held raw across provider allocation/retries.
         let type_final = ctx.read_native_pin(type_pin, type_class);
         let ctor_final = ctx.read_native_pin(ctor_pin, ctor);
 
@@ -1753,6 +1762,11 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let provider_now = ctx.read_native_pin(provider_pin, provider);
             let type_now = ctx.read_native_pin(type_pin, type_final);
             let ctor_now = ctx.read_native_pin(ctor_pin, ctor_final);
+            let sl_now = ctx.read_native_pin(sl_pin, sl);
+            let service = match ctx.get_field_by_name(sl_now, "service") {
+                v @ Value::Object(Some(_)) => v,
+                _ => ctx.get_field(sl_now, 0),
+            };
             let mut args = vec![
                 Value::Object(Some(provider_now)),
                 service,
@@ -1841,7 +1855,7 @@ fn drain_instances_to_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // GC-safety: each `invoke_virtual` call below can trigger a moving GC;
     // `iter_obj` is reused on every loop iteration, unpinned otherwise.
     let iter_pin = ctx.pin_native_root(iter_obj);
-    let mut collected: Vec<Value> = Vec::new();
+    let mut collected: Vec<(Value, Option<usize>)> = Vec::new();
     const SAFETY_CAP: usize = 1_000_000;
     loop {
         let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
@@ -1852,15 +1866,31 @@ fn drain_instances_to_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
         let next = ctx.invoke_virtual(iter_obj, "next", "()Ljava/lang/Object;", &[]);
         match next {
-            Ok(Some(v)) => collected.push(v),
+            Ok(Some(v)) => {
+                let pin = match v {
+                    Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                    _ => None,
+                };
+                collected.push((v, pin));
+            }
             _ => break,
         }
         if collected.len() >= SAFETY_CAP {
             break;
         }
     }
+    let collected: Vec<Value> = collected
+        .into_iter()
+        .map(|(value, pin)| match (value, pin) {
+            (Value::Object(Some(original)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, original)))
+            }
+            (value, _) => value,
+        })
+        .collect();
+    let result = alloc_synthetic_stream(ctx, &collected);
     ctx.unpin_native_roots(iter_pin);
-    alloc_synthetic_stream(ctx, &collected)
+    result
 }
 
 fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1885,7 +1915,6 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return empty_optional(ctx);
     }
     let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
-    ctx.unpin_native_roots(iter_pin);
     let first = ctx.invoke(
         "java/util/Iterator",
         "next",
@@ -1894,14 +1923,20 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     )?;
     let first_obj = match first {
         Some(Value::Object(Some(o))) => o,
-        _ => return empty_optional(ctx),
+        _ => {
+            ctx.unpin_native_roots(iter_pin);
+            return empty_optional(ctx);
+        }
     };
+    let first_pin = ctx.pin_native_root(first_obj);
+    let first_obj = ctx.read_native_pin(first_pin, first_obj);
     let opt = ctx.invoke(
         "java/util/Optional",
         "of",
         "(Ljava/lang/Object;)Ljava/util/Optional;",
         &[Value::Object(Some(first_obj))],
     )?;
+    ctx.unpin_native_roots(iter_pin);
     Ok(opt)
 }
 
@@ -2098,9 +2133,30 @@ fn native_stream_support_stream_from_spliterator(
 }
 
 fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> MethodCallResult {
+    // `new_array` can collect before any input element has entered the Java
+    // heap. Root every object-valued slice entry first, and refresh each one
+    // immediately before its store.
+    let mut elem_pin_base = None;
+    let elem_pins: Vec<Option<usize>> = elems
+        .iter()
+        .map(|value| match value {
+            Value::Object(Some(object)) => {
+                let pin = ctx.pin_native_root(*object);
+                elem_pin_base.get_or_insert(pin);
+                Some(pin)
+            }
+            _ => None,
+        })
+        .collect();
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     for (i, v) in elems.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+        let value = match (*v, elem_pins[i]) {
+            (Value::Object(Some(original)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, original)))
+            }
+            (value, _) => value,
+        };
+        ctx.set_array_element(arr, i, value);
     }
     // GC-safety: `ensure_class_initialized`/`alloc_object` below can trigger
     // a moving GC; `arr` is stored into the new stream afterward.
@@ -2111,7 +2167,7 @@ fn alloc_synthetic_stream(ctx: &mut dyn NativeContext, elems: &[Value]) -> Metho
     let nfields = ctx.class_num_total_fields(cid).max(1);
     let stream = ctx.alloc_object(cid, nfields);
     let arr = ctx.read_native_pin(arr_pin, arr);
-    ctx.unpin_native_roots(arr_pin);
+    ctx.unpin_native_roots(elem_pin_base.unwrap_or(arr_pin));
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -2222,7 +2278,6 @@ fn drain_real_spliterator(
                 if try_advance_dispatched {
                     // Genuine Java exception mid-drain — propagate.
                     ctx.unpin_native_roots(spl_pin);
-                    ctx.unpin_native_roots(col_pin);
                     return Err(e);
                 }
                 // First call failed (tryAdvance not dispatchable on this
@@ -2259,8 +2314,9 @@ fn drain_real_spliterator(
         }
         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
     };
+    // `spl_pin` is the first pin owned by this scope; one truncate also
+    // releases the later collector pin without a redundant stale handle read.
     ctx.unpin_native_roots(spl_pin);
-    ctx.unpin_native_roots(col_pin);
     Ok(result)
 }
 
@@ -2300,8 +2356,22 @@ fn native_sl_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Ok(None) => Value::Object(None),
             Err(e) => break Err(e),
         };
+        let elem_pin = match elem {
+            Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+            _ => None,
+        };
         let action_cur = ctx.read_native_pin(action_pin, action);
-        if let Err(e) = ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem]) {
+        let elem = match (elem, elem_pin) {
+            (Value::Object(Some(original)), Some(pin)) => {
+                Value::Object(Some(ctx.read_native_pin(pin, original)))
+            }
+            (value, _) => value,
+        };
+        let accept = ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem]);
+        if let Some(pin) = elem_pin {
+            ctx.unpin_native_roots(pin);
+        }
+        if let Err(e) = accept {
             break Err(e);
         }
     };
