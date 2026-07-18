@@ -637,3 +637,32 @@ pattern of recurring via a new specific trigger each time. Whoever picks this up
 the same CPU-activity-aware repro loop and `CRATONVM_DBG_STW_CENSUS=1`/gdb-attach recipe the prior three
 resolutions used (see "Final resolution" and the 2026-07-15 follow-up above) rather than assuming it's
 the same exact mechanism as any prior fix.
+
+## New evidence 2026-07-18 (same session) — mechanism looks different this time: recurring stall, not permanent wedge
+
+Follow-up isolated-repro batch (10 attempts, round-7 binary `frozen-cratonvm-wildfly-bugbash-v7-20260718`,
+`org.jboss.as.test.integration.basic` module) to characterize this recurrence more precisely than the
+initial reopening note above:
+
+- **`pending=1`, not `pending=6`.** Every attempt that hit the warning showed exactly one uncooperative
+  mutator, not six — closer to the original, already-fixed `bee86ff0` shape (`main-vm` post-`main()`)
+  than the `pending=6` shape this doc originally filed. Worth checking whether `bee86ff0`'s specific fix
+  has a narrow gap, rather than assuming this is the same `pending=6`/multi-worker mechanism recurring.
+- **Not a permanent wedge this time.** A 30s-timeout batch (5 runs) showed the warning firing once early
+  (~1s into boot) in all 5, then boot **continuing** for thousands of further log lines (deployment
+  scanner `Scan complete`, `read-children-resources` management operations) — clearly past the point
+  where the original bug went permanently silent. A follow-up 90s run showed the warning firing **twice**
+  (12:56:05 and 12:57:14, ~69s apart, both `pending=1`), with substantial real work happening between
+  occurrences, and still had not reached `WFLYSRV0025` (final started banner) by the 90s cutoff.
+- **Net effect: boot is now recurringly-stalling-but-progressing, rather than permanently wedged** — it
+  still never completes within any timeout tried (30s/90s isolated; Arquillian's own internal timeout in
+  the real harness gives up well before that), so the practical symptom (0 OK, "Could not start
+  container") is unchanged, but the underlying mechanism producing it looks different from either the
+  original `pending=6` filing or the `bee86ff0` single-thread-post-main() case. Possibly a partial fix
+  landed between 2026-07-15 and now that narrowed but did not eliminate the wedge duration per
+  occurrence, or a different, lower-severity variant of the same class of bug.
+- **CCE_CRASH did not reproduce** in this same batch (0/10 across two rounds of 5) — see the companion
+  doc's new-evidence section for why this might just be a low-probability-per-attempt event rather than
+  fixed, given round 7's real harness run separately observed it at 18/240 (7.5%).
+
+Raw logs: `/tmp/r7repro1.log` .. `/tmp/r7repro10.log`, `/tmp/r7repro_long.log` on the Azure host.
