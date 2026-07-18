@@ -38803,6 +38803,42 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // `SpringApplication.run()`-driving test (`SimpleMainTests`/
     // `BannerTests`) after this change — see the doc for the verification
     // run this was checked against.
+    //
+    // A concurrent session (`e21d80307`, "fix spring boot captured output
+    // logging") independently patched this SAME symptom with a different,
+    // lower-risk approach: keep the synthetic `Log`/`Logger` stubs but route
+    // their formatted text through `emit_framework_log`/`stream_writeln` so
+    // it reaches whatever `System.out`/`System.err` currently is. That
+    // patch is superseded here — it doesn't fix per-logger dynamic level
+    // control (`((LoggerContext) LoggerFactory.getILoggerFactory())
+    // .getLogger(X).setLevel(Level.DEBUG)`, which several of this doc's own
+    // tests rely on) since the stub's `isDebugEnabled`/`Logger.setLevel`
+    // stay hardcoded, and it doesn't use real Logback pattern/appender
+    // formatting — so it wasn't a complete fix for this doc's affected
+    // classes. Its one genuinely orthogonal addition,
+    // `org/springframework/core/log/LogMessage.toString()`, is kept below —
+    // real Logback message formatting can call it on a lazy `LogMessage`
+    // argument regardless of which Log/Logger path produced it.
+    registry.register(
+        "org/springframework/core/log/LogMessage",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(this))) => *this,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(result)) = ctx.get_field_by_name(this, "result") {
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            let result = ctx.invoke_virtual(this, "buildString", "()Ljava/lang/String;", &[])?;
+            if let Some(Value::Object(Some(result))) = result {
+                ctx.set_field_by_name(this, "result", Value::Object(Some(result)));
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
 
     // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
     // real `java.base` bytecode from `--java-home` provides the anonymous
@@ -44067,6 +44103,76 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
             let _ = ctx.fd_table().write_string(fd, &sep);
         }
     });
+}
+
+/// Emit a framework log record through the live Java-level console stream.
+///
+/// Native logging fallbacks must not merely add entries to `printed_lines`:
+/// Spring Boot's `OutputCaptureExtension` observes the `PrintStream` installed
+/// by `System.setOut`, so bypassing that stream loses the record to tests (and
+/// to any other Java-level redirection).  Routing through `stream_writeln`
+/// preserves the canonical fd fast path for the original stream while calling
+/// a capture stream's real `OutputStream.write` override after redirection.
+fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
+    ctx.record_printed_line(text.to_string());
+    // `NativeContext::get_system_stream` is the process's canonical fd-backed
+    // stream. `System.setOut` intentionally leaves that canonical stream in
+    // place and records the Java-level replacement in the override table, so
+    // native-originated logs must prefer the override just as GETSTATIC does.
+    if let Some(out) = system_overridden_stream("out").or_else(|| ctx.get_system_stream("out")) {
+        stream_writeln(ctx, &[Value::Object(Some(out))], text);
+    }
+}
+
+/// Include the Throwable's Java representation for overloads whose contract
+/// carries an exception.  Calling `printStackTrace` here would bypass the
+/// capture stream on some JDK paths; `toString` is sufficient for framework
+/// diagnostics and remains part of the same captured record.
+fn emit_framework_log_with_throwable(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: &str,
+    throwable: Option<&Value>,
+) {
+    let throwable = match throwable {
+        Some(Value::Object(Some(throwable))) => {
+            match native_throwable_to_string(ctx, &[Value::Object(Some(*throwable))]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let text = match throwable {
+        Some(throwable) if !throwable.is_empty() => format!("{level} {message}\n{throwable}"),
+        _ => format!("{level} {message}"),
+    };
+    emit_framework_log(ctx, &text);
+}
+
+/// Commons Logging accepts arbitrary objects. Spring uses `LogMessage` for
+/// lazy formatting, so only reading `String` receivers loses those records.
+fn emit_framework_log_object(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: ObjectRef,
+    throwable: Option<&Value>,
+) {
+    let message = ctx
+        .read_string(message)
+        .or_else(|| {
+            match ctx.invoke_virtual(message, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        })
+        .or_else(|| match ctx.get_field_by_name(message, "format") {
+            Value::Object(Some(format)) => ctx.read_string(format),
+            _ => None,
+        });
+    if let Some(message) = message {
+        emit_framework_log_with_throwable(ctx, level, &message, throwable);
+    }
 }
 
 fn native_println_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -71723,19 +71829,21 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Level checks — return false so log call sites short-circuit. The
-    // synthetic-jdk path overrides these with level-aware versions,
-    // which is fine because the registration order in
-    // `register_slf4j_natives` is binder-LAST and we only get called
-    // there if no level-aware override has been registered yet.
+    // Retain trace/debug suppression, but keep the production log levels
+    // live. Spring's commons-logging and SLF4J adapters guard their warning
+    // paths with these checks; returning false here silently erased records
+    // instead of delivering them to the Java console stream.
     fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(0)))
     }
+    fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(1)))
+    }
     registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
     // Marker-aware variants: SLF4J `Logger` interface declares
     // `is{Trace,Debug,Info,Warn,Error}Enabled(Marker)`. Kafka (kafka.Kafka via
     // Scala) routes log calls through these overloads on first startup; the
@@ -71758,19 +71866,19 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isInfoEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isWarnEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isErrorEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
 
     // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
@@ -71805,12 +71913,10 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // accumulation recurs it must be fixed at its source (the map/collection
     // layer), not by skipping this method.
 
-    // No-op log methods (covers the most common arities that JCL /
-    // commons-logging / direct-SLF4J callers use). The synthetic-jdk
-    // `register_slf4j_natives` overrides several of these with
-    // dispatched-to-stdout versions; that override is harmless because
-    // the binder helper runs last in synthetic mode, but here in
-    // real-JDK mode we want pure no-ops.
+    // Preserve lightweight native fallback logging without discarding its
+    // observable console output. The full Logback pipeline is not available
+    // on every supported classpath, but Spring's OutputCaptureExtension must
+    // see INFO/WARN/ERROR records exactly as it sees direct System.out writes.
     fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
     }
@@ -71824,9 +71930,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(lg, "trace", sig, slf4j_noop);
         registry.register(lg, "debug", sig, slf4j_noop);
-        registry.register(lg, "info", sig, slf4j_noop);
-        registry.register(lg, "warn", sig, slf4j_noop);
-        registry.register(lg, "error", sig, slf4j_noop);
+        registry.register(lg, "info", sig, slf4j_log_msg);
+        registry.register(lg, "warn", sig, slf4j_log_msg);
+        registry.register(lg, "error", sig, slf4j_log_msg);
     }
 
     // Logback LoggerContext bridge — paired with the
@@ -71877,9 +71983,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
 
     // `ch/qos/logback/classic/Logger` (getLogger, addAppender, info/warn/
     // error/etc., filterAndLog_*) is intentionally NOT natively overridden
-    // here anymore — see the FIXED note above the `getLogger` removal.
-    // Real Logback bytecode now owns logger creation, appender attachment,
-    // and the filterAndLog → appender dispatch chain.
+    // here anymore — see the FIXED note above the `getLogger` removal. A
+    // concurrent session's alternative fix (keep the stub, route info/warn/
+    // error through `emit_framework_log`, `setLevel`/`isDebugEnabled` still
+    // hardcoded) is superseded here for the reasons noted above the
+    // `LogMessage.toString()` native. Real Logback bytecode now owns logger
+    // creation, appender attachment, and the filterAndLog → appender
+    // dispatch chain.
 }
 
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
@@ -72768,7 +72878,7 @@ fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Format as: [LEVEL] logger - message
     let short_name = logger_name.rsplit('.').next().unwrap_or(&logger_name);
     let formatted = format!("[LOG] {} - {}", short_name, result);
-    ctx.record_printed_line(formatted);
+    emit_framework_log(ctx, &formatted);
     Ok(None)
 }
 

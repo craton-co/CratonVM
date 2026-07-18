@@ -2,25 +2,53 @@
 
 **Status: OPEN (majority FIXED 2026-07-18) — found 2026-07-17**
 
-## Update 2026-07-18 — root cause fixed, most of this doc's classes now pass
+## Update 2026-07-18 — two independent concurrent fixes; reconciled in favor of the real-bytecode one
 
-The root cause (not the "ConsoleAppender caches a stale `System.out`"
-hypothesis below, which was directly disproven by a standalone repro) was
-that `ch/qos/logback/classic/Logger`/`LoggerContext.getLogger` and
-`org/apache/commons/logging/LogFactory`/`Log` were natively overridden to
-hand back throwaway synthetic objects whose `addAppender`/`info`/`warn`/
-`error` never reached `System.out`/`System.err` at all — see
-`docs/internal/springboot/conditionevaluationreport-capturedoutput-empty-cluster-FIXED.md`
-for the full resolution writeup (filed against the sibling doc that first
-found this cluster). Fixed in `native-builtins/src/lib.rs` by removing
-those overrides so real Logback/commons-logging bytecode runs.
+Two different sessions independently fixed this same symptom concurrently:
+
+1. **This session** (`fix/captured-output-empty-cluster-20260717`) removed
+   the native overrides on `ch/qos/logback/classic/Logger`/
+   `LoggerContext.getLogger` and `org/apache/commons/logging/LogFactory`/
+   `Log` entirely, so real Logback/commons-logging bytecode runs. See
+   `docs/internal/springboot/conditionevaluationreport-capturedoutput-empty-cluster-FIXED.md`
+   for the full resolution writeup (filed against the sibling doc that
+   first found this cluster). The "`ConsoleAppender` caches a stale
+   `System.out`" hypothesis below was directly disproven by a standalone
+   repro — Logback's `ConsoleTarget$1` reads `System.out` fresh on every
+   write, so caching was never the issue; the real bug was upstream (the
+   `Logger`/`Log` objects themselves never delivered writes anywhere).
+2. **A concurrent session** (`e21d80307`, "fix spring boot captured output
+   logging", merged to `dev` as `029d62f06`) took a different, lower-risk
+   approach: kept the synthetic `Logger`/`Log` stubs, but routed their
+   formatted text through a new `emit_framework_log` helper into whichever
+   `System.out`/`System.err` is currently installed, and flipped
+   `isInfoEnabled`/`isWarnEnabled`/`isErrorEnabled` from hardcoded-`false`
+   to hardcoded-`true`. That session reported all 22 of this doc's classes
+   passing in `--nojit` mode (and the same cluster in JIT mode, apart from
+   the separately-tracked `SimpleMainTests.basePackageScan`).
+
+**Reconciled in favor of (1)**, the real-bytecode fix, when merging these
+two branches: (2)'s stub-routing approach does not support **dynamic
+per-logger level control**
+(`((LoggerContext) LoggerFactory.getILoggerFactory()).getLogger(X)
+.setLevel(Level.DEBUG)`), which this cluster's own sibling doc
+(`conditionevaluationreport-capturedoutput-empty-cluster-FIXED.md`)
+depends on for 3 of `ConditionEvaluationReportLoggerTests`'s 6 tests —
+`isDebugEnabled`/`Logger.setLevel` stayed hardcoded — so (2) was not a
+complete fix for that doc's classes. (2)'s one genuinely orthogonal
+addition, `org/springframework/core/log/LogMessage.toString()` (helps
+real Logback's own message formatting reach a lazy `LogMessage` argument
+regardless of which Log/Logger path produced it), and its
+`org/slf4j/Logger`-interface `isInfoEnabled`/`isWarnEnabled`/
+`isErrorEnabled` fix (for the generic fallback path used when no concrete
+implementation is resolvable at all) were kept.
 
 Re-verified 2026-07-18 with binary `cratonvm-captured-output-fix-20260717.exe`
 (worktree `C:\craton\CratonVM-captured-output-cluster-20260717`, branch
-`fix/captured-output-empty-cluster-20260717`) against every class this
-doc lists:
+`fix/captured-output-empty-cluster-20260717`, **before** merging in (2)
+above) against every class this doc lists:
 
-**Now PASS** (15 classes) — `RemoteClientConfigurationTests`,
+**PASS** (15 classes) — `RemoteClientConfigurationTests`,
 `RestartApplicationListenerTests`,
 `ServletManagementContextAutoConfigurationIntegrationTests`,
 `WebMvcObservationAutoConfigurationTests`, `WelcomePageHandlerMappingTests`,
@@ -30,10 +58,14 @@ doc lists:
 `AbstractReactiveHealthIndicatorTests`,
 `LoggingApplicationListenerIntegrationTests`.
 
-**Still FAIL** (7 classes, all in `core/spring-boot` specifically) — with
+**FAIL** (7 classes, all in `core/spring-boot` specifically) — with
 several genuinely different shapes, not re-investigated at the source
 level this session (out of scope for the fix above, which targeted a
-different doc):
+different doc). Because approach (2) never runs real Logback/log4j2
+bytecode for these logger calls at all, it may not hit (or may mask) some
+of these — not independently re-verified against a build combining both
+fixes; whoever picks this up next should re-run this doc's full class list
+against the merged tip before further triaging these:
 - `SimpleMainTests`, `ConfigurationWarningsApplicationContextInitializerTests` —
   still empty/wrong-content (`ConfigurationWarningsApplicationContextInitializerTests`:
   actual `""`; `SimpleMainTests`: banner present but not the
@@ -60,9 +92,11 @@ different doc):
   logback variants) — still FAIL, not triaged this session.
 
 Given a substantial, multi-shaped residual remains concentrated in
-`core/spring-boot`, this doc stays OPEN rather than archiving — the 15
-now-passing classes are removed from the "Affected classes" table below;
-the 7 `core/spring-boot` classes remain listed pending further triage.
+`core/spring-boot` under the real-bytecode fix, this doc stays OPEN in
+`docs/known-issues/springboot/` rather than archiving to `docs/internal/`
+— the 15 now-passing classes are removed from the "Affected classes"
+table below; the 7 `core/spring-boot` classes remain listed pending
+further triage.
 
 ---
 

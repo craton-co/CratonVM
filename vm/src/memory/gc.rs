@@ -115,6 +115,10 @@ pub fn update_all_roots(
     // primitive long colliding with the reused address would otherwise pass
     // the rewrite gate).
     crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
+    // Throwable backtraces are VM-wide, non-owning side data. Keep the stored
+    // object handle in sync with a move and prune traces for collected
+    // throwables before any early return for a non-relocating sweep.
+    shared.remap_and_sweep_throwable_stack_traces(pointer_map);
     if pointer_map.is_empty() {
         return;
     }
