@@ -48,7 +48,7 @@ This is the **same general defect shape** as two previously-fixed sibling
 bugs (`docs/internal/fixed-suite-bugs/x509trustmanager-getacceptedissuers-abstractmethod-FIXED.md`,
 `docs/internal/fixed-suite-bugs/SC-stream-collector-supplier-no-code.md`)
 and this rerun's own
-[`hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md`](hateoas-stream-reduce-triarg-missing-native-abstractmethoderror.md) —
+[`hateoas-stream-reduce-triarg-missing-native-abstractmethoderror-FIXED.md`](../../internal/springboot/hateoas-stream-reduce-triarg-missing-native-abstractmethoderror-FIXED.md) —
 a synthetic/native object stamped with (or falling back to) a bare interface
 type, where one specific method of that interface was never given a native
 registration. Fix shape, by precedent: register

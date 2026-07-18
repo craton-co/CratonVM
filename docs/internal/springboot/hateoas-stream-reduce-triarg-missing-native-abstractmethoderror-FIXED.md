@@ -1,6 +1,6 @@
 # `Stream.reduce(identity, accumulator, combiner)` 3-arg overload not registered — `AbstractMethodError` breaks all HATEOAS media-type configuration
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-18**
 
 ## Symptom
 
@@ -77,6 +77,25 @@ earlier occurrence of this exact same missing-overload shape for
 understood bug class in this codebase — this specific instance (the 3-arg
 `Stream.reduce`) has just never been covered.
 
+## Fix
+
+`register_stream_natives` now registers the missing descriptor on synthetic
+`java/util/stream/Stream` receivers:
+
+```text
+(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;
+```
+
+The native implementation performs sequential reduction through the
+`BiFunction` accumulator and retains moving-GC roots for the accumulator,
+intermediate result, and stream elements across callback execution. Synthetic
+streams are sequential, so the combiner is not invoked, matching the JDK's
+sequential reduction behavior.
+
+The focused regression invokes `Stream.reduce` with a `BiFunction` accumulator
+and a `BinaryOperator` combiner, so its bytecode contains this exact
+three-argument descriptor.
+
 ## Update 2026-07-17 (bin13 rerun triage) — 2 more classes, same module family
 
 `module/spring-boot-restdocs`'s `MockMvcRestDocsAutoConfigurationAdvancedConfigurationIntegrationTests`
@@ -102,3 +121,16 @@ logs:
 | `module/spring-boot-hateoas` | `org.springframework.boot.hateoas.autoconfigure.HypermediaWebMvcTestIntegrationTests` |
 | `module/spring-boot-restdocs` | `org.springframework.boot.restdocs.test.autoconfigure.MockMvcRestDocsAutoConfigurationAdvancedConfigurationIntegrationTests` (added bin13) |
 | `module/spring-boot-restdocs` | `org.springframework.boot.restdocs.test.autoconfigure.MockMvcRestDocsAutoConfigurationIntegrationTests` (added bin13) |
+
+## Validation
+
+Using the uniquely built `cratonvm-hateoas-reduce-20260718.exe`, all four
+classes above plus the duplicate HTTP-converter report passed on 2026-07-18:
+
+| Mode | Classes | Tests | Result |
+|---|---:|---:|---|
+| JIT | 5 | 48 | all PASS |
+| `--nojit` | 5 | 48 | all PASS |
+
+Neither run contained the former `Stream.reduce(...BiFunction...BinaryOperator)`
+`AbstractMethodError`.
