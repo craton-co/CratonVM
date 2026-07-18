@@ -109,6 +109,47 @@ Default-heap Binary Trees no longer wedges: it now runs like `-Xmx8g`
 8. **`1b7caa01b4` chore** — removed six stray `*.remote.rs` scp-staging
    copies (5.5 MB) accidentally committed at the repo root by cacb642162.
 
+## Follow-up: the Binary Trees ~56x reading was half a CODE regression
+
+The halfgap-20260717 round attributed the bt collapse (1.30-1.48 s on
+2026-07-14 → ~8.8 s anchor rebuild) entirely to the host re-provision and
+re-based the table. That was wrong by half: `dee2e26f` (2026-07-15,
+"preserve Mockito inline real-method dispatch") re-routed every NON-tail
+static self-recursive call site through `jit_invoke_dispatch` as a
+precautionary loader-identity hardening — the commit's actual Mockito fix
+was in the native `MockMethodAdvice.isOverridden` bridge, and no failing
+case was attributed to the raw self-call. The cost: `bottomUpTree` and
+`itemCheck` dispatched once per NODE — `push_entry_full` (21%) +
+`pop_jit_entry` (18%) + the `lookup_jit_code_range` mutex scan (13%) +
+`jit_invoke_dispatch` (9%) = >60% of the whole bt18 run (~90M chain
+push/pops), and the re-provisioned host made exactly this bookkeeping
+relatively costlier (THP was ruled out — the heap is 99% huge-page-backed).
+
+Fix: non-tail static self-recursion is raw-routed to the guarded direct
+self-CALL again, but only under a compile-time identity proof supplied by
+the VM caller (`set_self_call_identity_stable`, consume-once per compile):
+the compiling class was defined by a BUILTIN loader (bootstrap/extension/
+application) AND the loader-blind global name lookup maps its name back to
+its own `ClassId`. Builtin registries hold one class per name and always
+resolve a self-reference to the already-defined class, so the
+loader-identity hazard the hardening feared cannot arise; `UserDefined`
+(enhancement/duplicating) loaders keep the dispatch route unconditionally —
+Mockito subclass/inline mocks stay loader-correct. The x64 arm's inline
+stack-floor check + `self_call_stack_guard` still convert runaway recursion
+into a catchable StackOverflowError. The dee2e26f regression test now
+asserts BOTH regimes (dispatch without the proof, direct with it, and that
+the proof never leaks into the next compile).
+
+Result: bt18 `-Xmx8g` 10.6 s → **3,842/3,855/3,883 ms** (±0.5%), ~20.5x vs
+JDK's 188 ms (from 56.6x); default heap ~5.0-5.9 s (from ~12-14 s). All
+checksums exact (incl. HashMap 10M = 1549999915000000 and StringRegex 100K
+= 5000050000 vs HotSpot); jit 911/911, gc 791/791, Mockito registration
+test, StreamOnlyStressRepro, and the SB/long-div/BCE parity probes all
+green. Remaining bt profile: the legacy-layout `jit_putfield_object` helper
+(~17%, the ctor's two ref stores per node — the opt-in
+`CRATONVM_JIT_INLINE_PUTFIELD` fast path showed no decisive win under host
+noise and stays off) and the O(heap) non-moving sweep (~20-25%).
+
 ## Fibonacci: no session-scale lever remains
 
 The "self-call dispatch" residual was already closed by earlier work:

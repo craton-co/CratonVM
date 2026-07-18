@@ -30777,12 +30777,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
-                // Reverse-lookup the backing ClassId from the mirror via the
-                // VM's class_mirrors_reverse map (the real-JDK Class layout
-                // doesn't store our class_id in any Java-visible field).
-                ctx.class_id_from_mirror(*mirror)
-                    .and_then(|cid| ctx.class_name_of_id(cid))
-                    .and_then(|name| ctx.find_class_source_path(&name))
+                // The code source belongs to a class *identity*, not merely a
+                // binary name. `find_class_source_path(name)` is intentionally
+                // loader-blind and reports the application copy when an
+                // isolated URLClassLoader defines its own same-named class.
+                // Prefer the CodeSource saved on this mirror's exact ClassId;
+                // retain the old path lookup only for legacy mirrors that have
+                // no CodeSource metadata.
+                ctx.class_id_from_mirror(*mirror).and_then(|cid| {
+                    ctx.class_code_base(cid).or_else(|| {
+                        ctx.class_name_of_id(cid)
+                            .and_then(|name| ctx.find_class_source_path(&name))
+                    })
+                })
             } else {
                 None
             };
@@ -30817,11 +30824,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 // single-segment Path whose `getParent()` is null — exactly the
                 // QuarkusEntryPoint.doRun:67 NPE.  Canonicalize so the URL is
                 // always absolute (`file:/C:/.../lib/quarkus-run.jar`).
-                let abs_path = std::fs::canonicalize(&raw_path)
+                // `class_code_base` is already a URL (`file:/...` or
+                // `jar:file:/...`), while the legacy fallback above returns a
+                // filesystem path. Normalize both before canonicalizing and
+                // constructing the URL object below.
+                let raw_path = raw_path
+                    .strip_prefix("jar:file:")
+                    .or_else(|| raw_path.strip_prefix("file:"))
+                    .unwrap_or(&raw_path);
+                let abs_path = std::fs::canonicalize(raw_path)
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
                     .map(|s| s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-                    .unwrap_or(raw_path);
+                    .unwrap_or_else(|| raw_path.to_string());
                 // Normalise backslashes to forward slashes so Path/File code
                 // further up the stack works the same on every platform.
                 let fwd = abs_path.replace('\\', "/");
@@ -34978,6 +34993,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.1 — SSLEngine RFC 8446 wrapping rustls 0.23 (TLS 1.3 + 1.2 fallback,
     //         mTLS, session resumption). Engine-handle registry pattern.
     t27_tls::register_sslengine_real(registry);
+    // T2.7 server-side TLS bridges. The real-JDK CLI also needs
+    // SSLServerSocketFactory/SSLServerSocket registrations: without this
+    // complete phase, a configured SSL server factory falls through to the
+    // plaintext ServerSocketFactory overloads (notably UnboundID LDAPS).
+    t27_tls::register_t27_natives(registry);
     // WP5.2 — real PKCS12 + JKS parser via the `p12` crate + hand-rolled JKS.
     keystore::register_keystore_real(registry);
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection

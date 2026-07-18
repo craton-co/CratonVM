@@ -3426,19 +3426,25 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             let this_pin = ctx.pin_native_root(this_ref);
             let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
             let this_live = ctx.read_native_pin(this_pin, this_ref);
-            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this_live, "parent") {
-                let parent_pin = ctx.pin_native_root(parent);
-                let parent_live = ctx.read_native_pin(parent_pin, parent);
-                let parent_result = ctx.invoke_virtual(
-                    parent_live,
-                    "getResource",
-                    "(Ljava/lang/String;)Ljava/net/URL;",
-                    &[name_for_parent],
-                );
-                ctx.unpin_native_roots(parent_pin);
-                if matches!(parent_result, Ok(Some(Value::Object(Some(_))))) {
-                    ctx.unpin_native_roots(this_pin);
-                    return parent_result;
+            // ModifiedClassPathClassLoader deliberately uses the platform
+            // loader as its parent so its URL set is the complete, isolated
+            // test class path. Parent-first resource lookup would reintroduce
+            // application resources that its exclusions removed.
+            if !url_classloader_isolated_from_app(ctx, this_live) {
+                if let Value::Object(Some(parent)) = ctx.get_field_by_name(this_live, "parent") {
+                    let parent_pin = ctx.pin_native_root(parent);
+                    let parent_live = ctx.read_native_pin(parent_pin, parent);
+                    let parent_result = ctx.invoke_virtual(
+                        parent_live,
+                        "getResource",
+                        "(Ljava/lang/String;)Ljava/net/URL;",
+                        &[name_for_parent],
+                    );
+                    ctx.unpin_native_roots(parent_pin);
+                    if matches!(parent_result, Ok(Some(Value::Object(Some(_))))) {
+                        ctx.unpin_native_roots(this_pin);
+                        return parent_result;
+                    }
                 }
             }
             let this_live = ctx.read_native_pin(this_pin, this_ref);
@@ -5289,12 +5295,22 @@ pub(crate) fn ucl_try_define_local_class(
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
-    let bytes = if !paths.is_empty() {
-        cratonvm_classloading::ClassPath::new(&paths).find_resource(&resource_name)
-    } else {
-        None
+    // Keep the source metadata coupled to the exact classpath that supplied
+    // the bytes. Falling back to ClassManager's process-wide lookup after a
+    // successful local definition can attach a same-named application JAR as
+    // this class's CodeSource (for example, a URLClassLoader override JAR).
+    let local_class_path =
+        (!paths.is_empty()).then(|| cratonvm_classloading::ClassPath::new(&paths));
+    let (bytes, local_code_source) = match local_class_path.as_ref() {
+        Some(class_path) => match class_path.find_resource(&resource_name) {
+            Some(bytes) => (
+                Some(bytes),
+                class_path.find_class_code_source_info(internal_name),
+            ),
+            None => (None, None),
+        },
+        None => (None, None),
     };
-
     let http_bases = loader_constructor_http_bases(ctx, loader);
     let bytes = match bytes {
         Some(b) => Some(b),
@@ -5321,7 +5337,14 @@ pub(crate) fn ucl_try_define_local_class(
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);
     let loader_id = loader_namespace_id(ctx, loader_live);
-    let opts = cratonvm_native_api::DefineClassFull::default();
+    let opts = match local_code_source {
+        Some((code_source_url, code_source_certificates)) => cratonvm_native_api::DefineClassFull {
+            code_source_url: Some(code_source_url),
+            code_source_certificates,
+            ..Default::default()
+        },
+        None => cratonvm_native_api::DefineClassFull::default(),
+    };
     let define_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.define_class_full(internal_name, &bytes, loader_id, opts)
     }));

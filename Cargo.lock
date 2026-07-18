@@ -637,6 +637,7 @@ dependencies = [
  "lz4_flex",
  "native-tls",
  "num-bigint",
+ "openssl",
  "p12",
  "p256",
  "p384",

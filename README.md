@@ -49,7 +49,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | **QuickBench TOTAL**                | **8,925 ms**  | **23,068 ms**     | **2.58x**     |
 | HashMap (1M put/get, isolated)      | 45 ms         | 201 ms            | 4.47x         |
 | String/Regex (1M, isolated)         | 147 ms        | 1,561 ms          | 10.6x         |
-| Binary Trees (depth=18, isolated)   | 188 ms        | 10,650 ms         | 56.6x²        |
+| Binary Trees (depth=18, isolated)   | 188 ms        | 3,855 ms          | 20.5x²        |
 
 *All rows remeasured 2026-07-18 (residuals round) on the Azure Linux benchmark
 host (EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians of
@@ -72,14 +72,19 @@ bench/ is gitignored, which is how earlier copies kept getting lost.*
 a guarded DIRECT call (no dispatch helper); the remaining gap is register
 allocation and recursion inlining, which the template/IR backends do not do
 yet.
-² Binary Trees at `-Xmx8g` (same flags both sides), taken from a same-day
-quiet-window (~load 5) triple — 10,642/10,644/10,663 ms, the row is by far
-the most contention-sensitive (it measured 12.6 s inside this sweep's loaded
-window). Default heap now behaves like `-Xmx8g`: the TLAB-refill GC triggers
-are **default ON** — the young-walk corruption that had them quarantined was
-root-caused (a non-8-aligned young-arena capacity desyncing the sweep's walk
-grid) and fixed; see
-`docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md`.
+² Binary Trees at `-Xmx8g` (same flags both sides), 3,842/3,855/3,883 ms
+(±0.5%). Two fixes landed for this row on 2026-07-18. First, the TLAB-refill
+GC triggers are **default ON** — the young-walk corruption that had them
+quarantined was root-caused (a non-8-aligned young-arena capacity desyncing
+the sweep's walk grid) and fixed
+(`docs/internal/tlab-trigger-gc-young-walk-corruption-FIXED.md`). Second, the
+earlier ~56x reading was NOT all host-side as previously believed: a
+2026-07-15 hardening had re-routed every non-tail self-recursive call through
+the dispatch helper (per-call conservative-roots bookkeeping was >60% of the
+run — one dispatch round trip per allocated node). Direct self-recursive
+calls are restored under a compile-time loader-identity proof
+(builtin-loaded class whose name resolves to its own ClassId; custom-loader
+classes keep the loader-correct dispatch route).
 
 **This round (2026-07-18 residuals,
 `docs/internal/performance/halfgap-residuals-20260718.md`):** the
@@ -144,7 +149,7 @@ matches HotSpot bit-for-bit.
 | Benchmark (N = 2²⁴)                              | HotSpot C2 | TornadoVM GPU  | **CratonVM GPU** | vs HotSpot | vs TornadoVM |
 |---------------------------------------------------|------------|----------------|-------------------|------------|--------------|
 | Integer div-chain (48 unvectorizable divs/elem)    | 1,910 ms   | 28 ms          | **9 ms**          | **212x**   | **3.1x**     |
-| Double div-chain (64 divs/elem, IEEE-exact)¹        | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
+| Double div-chain (64 divs/elem, IEEE-exact)¹       | 1,508 ms   | 129 ms         | **91 ms**         | **16.6x**  | **1.4x**     |
 | 96 multiply-adds/elem (AVX2-vectorized on CPU)     | 8 ms       | 17 ms          | **11 ms**         | 0.7x       | 1.5x         |
 | Dot-product reduction (`int·int` → `long`)         | 7 ms       | unimplemented²  | **18 ms**         | 0.4x       | n/a²          |
 
