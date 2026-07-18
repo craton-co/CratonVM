@@ -2163,6 +2163,65 @@ fn dbg_refill_fail(stage: usize, requested: usize) {
     }
 }
 
+/// Wedge-breaker for the guarded TLAB refill (perf/halfgap-20260717, the
+/// second TLAB-remnant wedge — see `cratonvm_gc::tlab::FRAG_TLAB_FLOOR` for
+/// the live capture).
+///
+/// The guarded-refill young-room gate can fail on EVERY allocation for the
+/// rest of a run: tiny per-object allocations keep succeeding off free-list
+/// slivers, so no allocation failure ever forces the young collection whose
+/// sweep+coalesce would heal the fragmentation (observed live: 10.5 million
+/// consecutive gate failures, one young GC in a 23-second run). This
+/// counts CONSECUTIVE gate failures and, past a threshold, forces one
+/// orchestrated collection so TLAB flow can resume.
+///
+/// Storm guard: a forced break re-arms only after `WEDGE_REARM_BYTES` of
+/// further allocation (read from `shared.bytes_allocated_total`). If the
+/// collection did not heal the free list (nothing coalescable — genuinely
+/// full young of live data), the gate keeps failing but no further forced
+/// collections fire until real allocation progress has been made, so the
+/// worst case adds one young GC per `WEDGE_REARM_BYTES` allocated — never
+/// a per-allocation GC storm (the failure mode that forced the round-1
+/// unconditional-refill revert documented at the JIT call site).
+/// Wedge-breaker state — module-scope so the gate-pass reset in
+/// `tlab_alloc_object_inner` shares the counter with the breaker.
+static TLAB_GATE_CONSECUTIVE_FAILS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static TLAB_LAST_BREAK_ALLOC_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
+    use std::sync::atomic::Ordering;
+    /// Consecutive gate failures before a forced collection. At the
+    /// observed wedge rate this is a few milliseconds of per-object
+    /// slow-path work — long enough that transient pressure never trips
+    /// it, short enough that a real wedge is broken almost immediately.
+    const WEDGE_BREAK_THRESHOLD: u64 = 16_384;
+    /// Allocation progress required before a second forced collection.
+    const WEDGE_REARM_BYTES: u64 = 64 * 1024 * 1024;
+
+    let fails = TLAB_GATE_CONSECUTIVE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+    if fails < WEDGE_BREAK_THRESHOLD {
+        return false;
+    }
+    let alloc_total = shared.bytes_allocated_total.load(Ordering::Relaxed);
+    let last = TLAB_LAST_BREAK_ALLOC_TOTAL.load(Ordering::Relaxed);
+    if last != 0 && alloc_total.saturating_sub(last) < WEDGE_REARM_BYTES {
+        return false;
+    }
+    if TLAB_LAST_BREAK_ALLOC_TOTAL
+        .compare_exchange(last, alloc_total.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another thread is breaking the same wedge; let it.
+        return false;
+    }
+    TLAB_GATE_CONSECUTIVE_FAILS.store(0, Ordering::Relaxed);
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    true
+}
+
 #[inline(always)]
 fn tlab_alloc_object_inner(
     thread: &mut JvmThread,
@@ -2229,13 +2288,32 @@ fn tlab_alloc_object_inner(
     // ~2 GiB of 131056-byte blocks vs a 131072-byte request, every
     // allocation crawling through the per-object slow path while the young
     // collection that would re-coalesce them never triggered).
-    let free_block_floor = cratonvm_gc::tlab::min_tlab_size().max(256).min(requested);
+    // Second-wedge fix (perf/halfgap-20260717): probe at the FRAGMENTATION
+    // floor, not `min_tlab_size()`. Steady-state splitting converges on
+    // remnants just under whatever floor this gate probes for (observed
+    // live: a free list of exactly-4080-byte blocks against the old 8192
+    // floor — 10.5M consecutive gate failures, every allocation in the
+    // per-object slow path). `refill_tlab`'s fragmentation fallback serves
+    // the largest available block at the same floor, so gate and server
+    // agree — the [[tlab-remnant-wedge]] "allocator gate and server must
+    // agree on satisfiability" rule, applied one level further down.
+    let free_block_floor = cratonvm_gc::tlab::frag_tlab_floor().min(requested);
     if refill_needs_young_room
         && !shared.heap.young_bump_headroom(requested)
         && !shared.heap.young_has_free_block(free_block_floor)
     {
         dbg_refill_fail_state(shared, requested);
-        return None;
+        // Sustained gate failure = the wedge: per-object allocations keep
+        // succeeding so nothing else will ever trigger the collection that
+        // coalesces the free list. Force one (rate-limited) and re-probe.
+        if !tlab_refill_wedge_break(thread, shared)
+            || (!shared.heap.young_bump_headroom(requested)
+                && !shared.heap.young_has_free_block(free_block_floor))
+        {
+            return None;
+        }
+    } else if refill_needs_young_room {
+        TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Bug-D fix (TLAB tail-filler on refill, 2026-06-12): retire the OUTGOING
@@ -2260,9 +2338,21 @@ fn tlab_alloc_object_inner(
     // is already computed, so retiring here does not disturb the sizer.
     thread.tlab.retire();
 
-    let refill = shared.heap.refill_tlab(requested);
+    let mut refill = shared.heap.refill_tlab(requested);
     if refill.is_none() {
         dbg_refill_fail(1, requested);
+        // Second-wedge fix, stage-1 arm (perf/halfgap-20260717): the gate
+        // above can keep PASSING on a stale cached free-block bound while
+        // the real free list has degraded to sub-floor dust, so
+        // `refill_tlab` itself is where a wedge can spin (observed live:
+        // 9.4M consecutive stage-1 failures with ZERO stage-0 gate
+        // failures). Count these toward the same breaker; on a sustained
+        // run force one coalescing collection and retry the refill once.
+        if refill_needs_young_room && tlab_refill_wedge_break(thread, shared) {
+            refill = shared.heap.refill_tlab(requested);
+        }
+    } else {
+        TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some((buf, size)) = refill {
         shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
@@ -32038,6 +32128,21 @@ fn background_compile_task(
             // loaded method. Prevent a failed background artifact from being
             // re-enqueued forever now that pending work no longer consumes the
             // frame's permanent-rejection budget.
+            //
+            // Surface the denial under the existing compile-trace flag: this
+            // is a PERMANENT, process-lifetime decision that silently leaves
+            // the method's loops interpreted forever (a once-invoked harness
+            // main with the hot loop inline runs ~8x slow with zero other
+            // diagnostics — found the hard way, perf/halfgap-20260717).
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] OSR-compile FAILED {}.{}{} osr_bci={} — method marked OSR-denied for the rest of this process",
+                    task.method_key.class_name,
+                    task.method_key.method_name,
+                    task.method_key.descriptor,
+                    osr_bci,
+                );
+            }
             crate::jit::tiered::mark_osr_denied(task.method_key.clone());
         }
         return CompileOutcome {

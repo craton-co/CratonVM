@@ -157,13 +157,59 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 /// is registered (and the index is in range); else `None`. Used by the JIT
 /// field helpers, which only have the raw object pointer (`class_id` from the
 /// header) and the resolved field index — not a heap handle.
+///
+/// PERF (perf/halfgap-20260717): this is on the per-field-access hot path of
+/// every JIT `putfield`/`getfield` helper and several interpreter compact
+/// arms, and the naked `class_layout` lookup underneath it (registry RwLock
+/// read + `Arc` clone/drop per call) measured **41% of all CPU** in a
+/// BinTreesClassic d=18 profile (every `Node.left/right` store resolving the
+/// same layout through the lock). Mirror the generation-validated
+/// small-working-set thread-local cache that `gc/src/gen_heap.rs`'s own
+/// `compact_field_slot` has used since 2026-07-11 (same key, same
+/// invalidation rule: a class redefine bumps `layout_generation`, which
+/// makes every cached entry miss). Layout *content* per `class_id` is
+/// immutable once registered — redefines replace the Arc and bump the
+/// generation — so a generation-validated hit can never serve a stale
+/// layout.
 #[inline]
 pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
-    let layout = class_layout(class_id)?;
-    Some((
-        layout.field_offset(index)? as usize,
-        layout.field_is_ref(index)?,
-    ))
+    struct SlotCache {
+        entries: [Option<(u32, u64, Arc<CompactLayout>)>; 8],
+        next: usize,
+    }
+    impl SlotCache {
+        const fn new() -> Self {
+            Self {
+                entries: [None, None, None, None, None, None, None, None],
+                next: 0,
+            }
+        }
+    }
+    thread_local! {
+        static SLOT_CACHE: std::cell::RefCell<SlotCache> =
+            const { std::cell::RefCell::new(SlotCache::new()) };
+    }
+    let generation = layout_generation();
+    SLOT_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        for entry in &cache.entries {
+            if let Some((cached_cid, cached_gen, layout)) = entry {
+                if *cached_cid == class_id && *cached_gen == generation {
+                    return Some((
+                        layout.field_offset(index)? as usize,
+                        layout.field_is_ref(index)?,
+                    ));
+                }
+            }
+        }
+        let layout = class_layout(class_id)?;
+        let offset = layout.field_offset(index)? as usize;
+        let is_ref = layout.field_is_ref(index)?;
+        let slot = cache.next;
+        cache.entries[slot] = Some((class_id, generation, layout));
+        cache.next = (slot + 1) % cache.entries.len();
+        Some((offset, is_ref))
+    })
 }
 
 /// Clear the registry (test/debug-only).
