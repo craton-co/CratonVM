@@ -36160,7 +36160,21 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
             let mut i = start;
             while i < bytes.len() {
                 if bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?' {
-                    i += 1;
+                    let after_punctuation = i + 1;
+                    // A dot inside an identifier/domain-like token is not a sentence
+                    // boundary. In particular, Spring Boot metadata reasons commonly
+                    // contain names such as `spring.server`; returning at the dot
+                    // silently truncates the generated short reason to `spring.`.
+                    // Keep the deliberately small ASCII implementation, but preserve
+                    // the essential BreakIterator contract: sentence terminators break
+                    // only at end-of-text or before whitespace.
+                    if after_punctuation < bytes.len()
+                        && !bytes[after_punctuation].is_ascii_whitespace()
+                    {
+                        i = after_punctuation;
+                        continue;
+                    }
+                    i = after_punctuation;
                     // Skip trailing whitespace
                     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                         i += 1;
@@ -36346,6 +36360,26 @@ mod break_iterator_line_boundary_tests {
         assert_eq!(bi_find_next(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(64));
         assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(39));
         assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 49, BI_LINE), Some(48));
+    }
+}
+
+#[cfg(test)]
+mod break_iterator_sentence_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn sentence_does_not_end_inside_dotted_identifier() {
+        let text = "Server namespace has moved to spring.server";
+        assert_eq!(
+            bi_find_next(text, 0, BI_SENTENCE),
+            Some(java_text_len(text))
+        );
+    }
+
+    #[test]
+    fn sentence_ends_before_whitespace_separated_successor() {
+        let text = "First sentence. Second sentence.";
+        assert_eq!(bi_find_next(text, 0, BI_SENTENCE), Some(16));
     }
 }
 
