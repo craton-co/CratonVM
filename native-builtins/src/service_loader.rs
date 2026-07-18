@@ -2032,10 +2032,14 @@ fn native_stream_support_stream_from_spliterator(
         // elements (0) and close-handlers (1).
         let nfields = ctx.class_num_total_fields(cid).max(3);
         let stream = ctx.alloc_object(cid, nfields);
+        // cce0079 hardening: keep the spliterator pinned through BOTH field
+        // stores (refresh immediately before its own store), and unpin only
+        // afterwards — closes any residual in-store GC window.
         let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
-        ctx.unpin_native_roots(spliterator_pin);
         ctx.set_field(stream, 0, Value::Object(None));
+        let spliterator = ctx.read_native_pin(spliterator_pin, spliterator);
         ctx.set_field(stream, 2, Value::Object(Some(spliterator)));
+        ctx.unpin_native_roots(spliterator_pin);
         return Ok(Some(Value::Object(Some(stream))));
     }
     // Synthetic spliterator: field 0 is the fully-materialised Object[]

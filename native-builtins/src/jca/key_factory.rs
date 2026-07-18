@@ -117,49 +117,103 @@ fn synthetic_base_offset(ctx: &mut dyn NativeContext, class_name: &str) -> usize
 // below are kept as a secondary store for synthetic-mode callers.
 // ---------------------------------------------------------------------------
 
-fn kpg_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+// GC-stable side-table key (cce0079 follow-up): these tables were keyed by
+// the raw `ObjectRef` ADDRESS. A moving young GC that relocates a live
+// KeyPairGenerator made every later lookup MISS (silently falling back to
+// default algo/keysize), and a fresh allocation landing on the freed old
+// address ALIASED the stale entry (wrong algorithm for an unrelated
+// object). Key by identity hash + a per-hash generation instead — the same
+// proven pattern as `xnio_async::xnio_obj_key_for` / native-collections'
+// `widened_obj_key`. The `last_ptr` adoption handles relocation (same
+// object, new address); distinct same-hash objects get distinct
+// generations. Values are plain Rust data (i32/String/bool), so no GC
+// scan/remap companion is needed once the keys are address-independent.
+struct KpgObjKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn kpg_obj_key_registry() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>>
+{
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> = OnceLock::new();
+    static R: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>>> =
+        OnceLock::new();
+    R.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+#[inline]
+fn pack_kpg_obj_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+fn kpg_obj_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = kpg_obj_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_kpg_obj_key(hash, slot.generation);
+    }
+    if slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_kpg_obj_key(hash, slots[0].generation);
+    }
+    let generation = slots.len() as u32;
+    slots.push(KpgObjKeyEntry {
+        last_ptr: ptr,
+        generation,
+    });
+    pack_kpg_obj_key(hash, generation)
+}
+
+fn kpg_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn kpg_keysize_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>> {
+fn kpg_keysize_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, i32>>> = OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn set_kpg_algo(this: ObjectRef, idx: i32) {
-    kpg_algo_table().lock().insert(this, idx);
+fn set_kpg_algo(ctx: &dyn NativeContext, this: ObjectRef, idx: i32) {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_algo_table().lock().insert(key, idx);
 }
 
-fn get_kpg_algo(this: ObjectRef) -> Option<i32> {
-    kpg_algo_table().lock().get(&this).copied()
+fn get_kpg_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_algo_table().lock().get(&key).copied()
 }
 
 /// Preserve the caller's requested spelling for `getAlgorithm()` and diagnostic
 /// errors. An algorithm index alone cannot represent unrecognised names.
-fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, String>> {
+fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, String>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, String>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, String>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn set_kpg_name(this: ObjectRef, name: String) {
-    kpg_name_table().lock().insert(this, name);
+fn set_kpg_name(ctx: &dyn NativeContext, this: ObjectRef, name: String) {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_name_table().lock().insert(key, name);
 }
 
-fn get_kpg_name(this: ObjectRef) -> Option<String> {
-    kpg_name_table().lock().get(&this).cloned()
+fn get_kpg_name(ctx: &dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_name_table().lock().get(&key).cloned()
 }
 
-fn set_kpg_keysize(this: ObjectRef, bits: i32) {
-    kpg_keysize_table().lock().insert(this, bits);
+fn set_kpg_keysize(ctx: &dyn NativeContext, this: ObjectRef, bits: i32) {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_keysize_table().lock().insert(key, bits);
 }
 
-fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
-    kpg_keysize_table().lock().get(&this).copied()
+fn get_kpg_keysize(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_keysize_table().lock().get(&key).copied()
 }
 
 /// Records whether a `KeyPairGenerator` was obtained via the BouncyCastle
@@ -168,21 +222,22 @@ fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
 /// BC-specific code (`BCECDSACryptoProvider.getPublicFromPrivate`, which casts to
 /// `org.bouncycastle.jce.interfaces.ECPrivateKey` and uses BC point math) works —
 /// while BC keys still sign/verify through our `Signature` natives.
-fn kpg_bcprov_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, bool>> {
+fn kpg_bcprov_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, bool>> {
     use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, bool>>> =
-        OnceLock::new();
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, bool>>> = OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn set_kpg_bcprov(this: ObjectRef, bc: bool) {
-    kpg_bcprov_table().lock().insert(this, bc);
+fn set_kpg_bcprov(ctx: &dyn NativeContext, this: ObjectRef, bc: bool) {
+    let key = kpg_obj_key_for(ctx, this);
+    kpg_bcprov_table().lock().insert(key, bc);
 }
 
-fn get_kpg_bcprov(this: ObjectRef) -> bool {
+fn get_kpg_bcprov(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = kpg_obj_key_for(ctx, this);
     kpg_bcprov_table()
         .lock()
-        .get(&this)
+        .get(&key)
         .copied()
         .unwrap_or(false)
 }
@@ -253,12 +308,12 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> Method
     // keycloak gets genuine `BCECPrivate/PublicKey` (its `getPublicFromPrivate`
     // casts to BC's EC key interface + uses BC point math). BC keys still
     // sign/verify through our `Signature` natives. Default = SunEC.
-    let spi_class = if get_kpg_bcprov(this) {
+    let spi_class = if get_kpg_bcprov(ctx, this) {
         "org/bouncycastle/jcajce/provider/asymmetric/ec/KeyPairGeneratorSpi$EC"
     } else {
         "sun/security/ec/ECKeyPairGenerator"
     };
-    drive_ec_keypair_spi(ctx, this, spi_class)
+    drive_real_keypair_spi(ctx, this, spi_class)
 }
 
 /// Drive SunEC's curve-specific EdDSA key generators. Their public constructors
@@ -308,16 +363,20 @@ fn drive_real_eddsa_keyfactory(
     drive_keyspec_spi(ctx, spi_class, spec, engine, ret_desc)
 }
 
-/// Drive a real EC `KeyPairGenerator` SPI (SunEC or BouncyCastle) honouring the
-/// stored keysize / `ECGenParameterSpec` curve, returning a real `KeyPair`.
-fn drive_ec_keypair_spi(
+/// Drive a real JDK `KeyPairGenerator`, honouring the stored key size and an
+/// optional `AlgorithmParameterSpec`, then returning a real `KeyPair`.
+///
+/// SunEC needs direct allocation to avoid its no-argument constructor's
+/// default-curve initialization; other provider generators use their public
+/// no-argument constructor.
+fn drive_real_keypair_spi(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     spi_class: &'static str,
 ) -> MethodCallResult {
     // Read the requested keysize + spec (curve) BEFORE any allocation.
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let keysize = get_kpg_keysize(this)
+    let keysize = get_kpg_keysize(ctx, this)
         .filter(|n| *n > 0)
         .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
             Value::Int(n) if n > 0 => Some(n),
@@ -429,6 +488,22 @@ fn drive_real_dsa_keyfactory(
         spec,
         engine,
         ret_desc,
+    )
+}
+
+/// Drive the real JDK `sun.security.provider.DSAKeyPairGenerator$Current`.
+///
+/// DSA has no compatible synthetic key representation: consumers expect the
+/// concrete `DSAPublicKey` / `DSAPrivateKey` objects, including their domain
+/// parameters.  Use the same real-SPI path as EC so default generation and
+/// callers that explicitly initialize a key size both return genuine JDK keys.
+/// `Current` is the JDK 25 provider implementation selected for ordinary
+/// `KeyPairGenerator.getInstance("DSA")` calls.
+fn drive_real_dsa_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    drive_real_keypair_spi(
+        ctx,
+        this,
+        "sun/security/provider/DSAKeyPairGenerator$Current",
     )
 }
 
@@ -1296,19 +1371,19 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // boundary. The side table (keyed on the receiver ObjectRef) carries
     // the algorithm index reliably across the call chain, mirroring the
     // proven pattern in `message_digest::accumulators`.
-    set_kpg_algo(kpg, idx);
-    set_kpg_name(kpg, alg.clone());
+    set_kpg_algo(ctx, kpg, idx);
+    set_kpg_name(ctx, kpg, alg.clone());
     // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
     // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
-    set_kpg_bcprov(kpg, is_bc);
-    let default_bits = if idx == ALGO_RSA {
+    set_kpg_bcprov(ctx, kpg, is_bc);
+    let default_bits = if idx == ALGO_RSA || idx == ALGO_DSA {
         2048
     } else if idx == ALGO_EC {
         256
     } else {
         0
     };
-    set_kpg_keysize(kpg, default_bits);
+    set_kpg_keysize(ctx, kpg, default_bits);
     // Also write the algorithm string to the real-JDK named field so the
     // bytecode-side `getAlgorithm()` (if ever reached on this receiver)
     // sees the expected value.
@@ -1329,7 +1404,7 @@ fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Int(n)) => *n,
         _ => 2048,
     };
-    set_kpg_keysize(this, bits);
+    set_kpg_keysize(ctx, this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
@@ -1345,14 +1420,14 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // keygen drive (`drive_real_ec_keypair`) honours the requested curve.
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
-    let cur = get_kpg_keysize(this).unwrap_or_else(|| {
+    let cur = get_kpg_keysize(ctx, this).unwrap_or_else(|| {
         match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
             Value::Int(n) => n,
             _ => 0,
         }
     });
     let algo =
-        get_kpg_algo(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
+        get_kpg_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
             Value::Int(i) => i,
             _ => -1,
         });
@@ -1366,7 +1441,7 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     } else {
         cur
     };
-    set_kpg_keysize(this, bits);
+    set_kpg_keysize(ctx, this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
     ctx.set_field(this, base + KPG_OFF_STATE, Value::Int(1));
     Ok(None)
@@ -1381,7 +1456,7 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     // SigProbe fix: prefer the side-table read (survives real-JDK class
     // layouts where slot 0 collides with an inherited Object field).
-    let algo = get_kpg_algo(this).or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
+    let algo = get_kpg_algo(ctx, this).or_else(|| match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => Some(i),
         _ => None,
     });
@@ -1394,7 +1469,7 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into())
         }
     };
-    let bits = get_kpg_keysize(this)
+    let bits = get_kpg_keysize(ctx, this)
         .filter(|n| *n > 0)
         .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
             Value::Int(n) if n > 0 => Some(n),
@@ -1488,6 +1563,10 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         )))));
     }
 
+    if algo == ALGO_DSA && crate::route_dsa_to_real() {
+        return drive_real_dsa_keypair(ctx, this);
+    }
+
     if crate::route_ec_to_real() && matches!(algo, ALGO_ED25519 | ALGO_ED448) {
         return drive_real_eddsa_keypair(ctx, algo);
     }
@@ -1505,7 +1584,7 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // JDK contract and throw `NoSuchAlgorithmException` rather than minting a
     // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
     // returned above with real keys.
-    let requested = get_kpg_name(this).unwrap_or_else(|| algo_name(algo).to_string());
+    let requested = get_kpg_name(ctx, this).unwrap_or_else(|| algo_name(algo).to_string());
     Err(throw_no_such_algorithm(
         ctx,
         &format!("{requested} KeyPairGenerator not available"),
@@ -1519,7 +1598,7 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Value::Int(i) => i,
         _ => -1,
     };
-    let name = get_kpg_name(this).unwrap_or_else(|| algo_name(idx).to_string());
+    let name = get_kpg_name(ctx, this).unwrap_or_else(|| algo_name(idx).to_string());
     let s = ctx.create_string(&name);
     Ok(Some(Value::Object(Some(s))))
 }
@@ -2523,6 +2602,8 @@ mod tests {
         assert_eq!(algo_idx("Ed25519"), ALGO_ED25519);
         assert_eq!(algo_idx("Ed448"), ALGO_ED448);
         assert_eq!(algo_idx("RSASSA-PSS"), ALGO_RSA);
+        assert_eq!(algo_idx("DSA"), ALGO_DSA);
+        assert_eq!(algo_idx("DSS"), ALGO_DSA);
         assert_eq!(algo_idx("Garbage"), -1);
     }
 
@@ -2532,6 +2613,7 @@ mod tests {
         assert_eq!(algo_name(ALGO_EC), "EC");
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
         assert_eq!(algo_name(ALGO_ED448), "Ed448");
+        assert_eq!(algo_name(ALGO_DSA), "DSA");
         assert_eq!(algo_name(-1), "Unknown");
     }
 

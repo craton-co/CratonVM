@@ -520,6 +520,15 @@ impl VmHeap {
         }
     }
 
+    /// DIAGNOSTIC-ONLY (cce0079): minor-GC epoch for the `[SETFIELD-GC]`
+    /// assertion. Zero on non-Generational backends.
+    pub fn debug_minor_gc_count(&self) -> u64 {
+        match self {
+            VmHeap::Generational(h) => h.debug_minor_gc_count(),
+            _ => 0,
+        }
+    }
+
     /// Loose validity check: alignment + heap-region containment.
     ///
     /// Unlike [`Self::is_object_address`] this does NOT read the object

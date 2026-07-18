@@ -1531,6 +1531,12 @@ impl GenerationalHeap {
         objects
     }
 
+    /// DIAGNOSTIC-ONLY (cce0079 tree-key tail): current minor-GC count, for
+    /// the `[SETFIELD-GC]` epoch assertion in the VM's `set_field` wrapper.
+    pub fn debug_minor_gc_count(&self) -> u64 {
+        self.stats.minor_gc_count.load(Ordering::Relaxed)
+    }
+
     // ----- Header access -----------------------------------------------------
 
     /// Read the object header from a heap reference.
@@ -1914,13 +1920,29 @@ impl GenerationalHeap {
     /// deref of garbage.
     /// DIAGNOSTIC-ONLY (cceres3): see `VmHeap::debug_forwarded_target`.
     pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
-        if !crate::stale_objref_debug::enabled() || addr % 8 != 0 {
+        if !crate::stale_objref_debug::enabled() || addr == 0 || addr % 8 != 0 {
             return None;
         }
-        self.is_heap_addr(addr)?;
-        // SAFETY: `is_heap_addr` confirmed containment in a mapped arena; the
-        // quarantine ring keeps evacuated from-space readable while the
-        // canary flag is on.
+        // PROBE FIX (cce0079 tree-key tail): `is_heap_addr` covers only the
+        // LIVE arenas — but a stale (evacuated) address lives in the
+        // quarantine RING, which is deliberately unpublished. Gating on
+        // `is_heap_addr` alone made this probe (and both PIN canaries built
+        // on it) structurally blind to exactly the addresses it exists to
+        // catch. Also accept addresses inside any ring arena.
+        let in_live = self.is_heap_addr(addr).is_some();
+        if !in_live {
+            let in_ring = self
+                .quarantine
+                .lock()
+                .iter()
+                .any(|a| a.contains(addr as *const u8));
+            if !in_ring {
+                return None;
+            }
+        }
+        // SAFETY: containment in a mapped (live or quarantined) arena was
+        // just confirmed; the quarantine ring keeps evacuated from-space
+        // readable while the canary flag is on.
         let header = unsafe { &*(addr as *const ObjectHeader) };
         if header.is_forwarded() {
             let fwd = header.forwarding_address() as usize;
@@ -2190,6 +2212,21 @@ impl GenerationalHeap {
         // the equivalent check in `set_array_element`).
         if crate::stale_objref_debug::enabled() {
             if let Value::Object(Some(v)) = value {
+                // Operand attribution (cce0079 tree-key tail): peek the
+                // header word first so the imminent canary panic can be
+                // attributed to the STORED VALUE (vs the receiver, whose
+                // own get_header follows below).
+                let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
+                if peek.is_forwarded() {
+                    eprintln!(
+                        "[storechk] set_field: STALE stored VALUE 0x{:x} \
+                         (receiver 0x{:x} slot {index}) thread={} cycle={} — canary panic follows",
+                        v.as_ptr() as usize,
+                        obj_ref.as_ptr() as usize,
+                        std::thread::current().name().unwrap_or("?"),
+                        self.stats.minor_gc_count.load(Ordering::Relaxed),
+                    );
+                }
                 let _ = self.get_header(v);
             }
         }
@@ -2674,6 +2711,17 @@ impl GenerationalHeap {
         // header panic (producer-side attribution).
         if crate::stale_objref_debug::enabled() {
             if let Value::Object(Some(v)) = value {
+                // Operand attribution — see the matching peek in `set_field`.
+                let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
+                if peek.is_forwarded() {
+                    eprintln!(
+                        "[storechk] set_array_element: STALE stored VALUE 0x{:x} \
+                         (array 0x{:x} index {index}) thread={} — canary panic follows",
+                        v.as_ptr() as usize,
+                        obj_ref.as_ptr() as usize,
+                        std::thread::current().name().unwrap_or("?"),
+                    );
+                }
                 let _ = self.get_header(v);
             }
         }

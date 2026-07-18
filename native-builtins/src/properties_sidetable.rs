@@ -2887,9 +2887,24 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     //    Also copy `other`'s CHM-only entries (non-String key/value pairs —
     //    e.g. a `ManagedProperties` whose `<props>` keys are `TypedStringValue`)
     //    so a Properties->Properties putAll/merge doesn't drop them.
+    // Family-1 fix (cce0079 tree-key tail, T21_001 capture): the snapshot /
+    // side-key / chm-extra helpers and every per-entry dispatch below can
+    // move `this`/`other`/the extra-entry refs — `put_kv` then read the
+    // receiver's identity hash through a STALE header (canary-caught in
+    // `CorbaNamingService.<init>`). Pin the two receivers and refresh
+    // before each use; pin the extra-entry refs per iteration.
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let mut this = this;
+    let mut other = other;
     let snapshot = snapshot_kv(ctx, other);
+    this = ctx.read_native_pin(this_pin, this);
+    other = ctx.read_native_pin(other_pin, other);
     let other_side_keys = side_key_set(ctx, other);
+    this = ctx.read_native_pin(this_pin, this);
+    other = ctx.read_native_pin(other_pin, other);
     let other_chm_extra = chm_extra_entries(ctx, other, &other_side_keys);
+    this = ctx.read_native_pin(this_pin, this);
     if !snapshot.is_empty() || !other_chm_extra.is_empty() {
         for (k, v) in &snapshot {
             put_kv(ctx, this, k, v);
@@ -2897,9 +2912,25 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
         mirror_loaded_entries_to_properties_backend(ctx, this, &snapshot);
+        this = ctx.read_native_pin(this_pin, this);
         for (key_obj, value, _kstr) in other_chm_extra {
+            let ko_pin = ctx.pin_native_root(key_obj);
+            let vh = match value {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let key_obj = ctx.read_native_pin(ko_pin, key_obj);
+            let value = match (value, vh) {
+                (Value::Object(Some(o)), Some(h)) => {
+                    Value::Object(Some(ctx.read_native_pin(h, o)))
+                }
+                (v, _) => v,
+            };
             put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), value);
+            this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(ko_pin);
         }
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
     // 2) Fallback — source is a regular Map (HashMap/LinkedHashMap).  Walk
@@ -2919,8 +2950,12 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         &[Value::Object(Some(other))],
     ) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
     };
+    this = ctx.read_native_pin(this_pin, this);
     let it = match ctx.invoke(
         "java/util/Set",
         "iterator",
@@ -2928,8 +2963,17 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         &[Value::Object(Some(entries_obj))],
     ) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return Ok(None),
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
     };
+    this = ctx.read_native_pin(this_pin, this);
+    // Family-1 fix (cce0079): pin the iterator; refresh it and `this` after
+    // every per-entry dispatch; pin `entry`/`key_obj` across the dispatches
+    // within one iteration.
+    let it_pin = ctx.pin_native_root(it);
+    let mut it = it;
     loop {
         let has_next = match ctx.invoke(
             "java/util/Iterator",
@@ -2940,6 +2984,8 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             Ok(Some(Value::Int(n))) => n != 0,
             _ => false,
         };
+        it = ctx.read_native_pin(it_pin, it);
+        this = ctx.read_native_pin(this_pin, this);
         if !has_next {
             break;
         }
@@ -2952,6 +2998,8 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => break,
         };
+        it = ctx.read_native_pin(it_pin, it);
+        let entry_pin = ctx.pin_native_root(entry);
         let key_obj = match ctx.invoke(
             "java/util/Map$Entry",
             "getKey",
@@ -2959,8 +3007,13 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             &[Value::Object(Some(entry))],
         ) {
             Ok(Some(Value::Object(Some(o)))) => o,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
+        let entry = ctx.read_native_pin(entry_pin, entry);
+        let key_pin = ctx.pin_native_root(key_obj);
         let val_v = match ctx.invoke(
             "java/util/Map$Entry",
             "getValue",
@@ -2968,8 +3021,14 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             &[Value::Object(Some(entry))],
         ) {
             Ok(Some(v)) => v,
-            _ => continue,
+            _ => {
+                ctx.unpin_native_roots(entry_pin);
+                continue;
+            }
         };
+        let key_obj = ctx.read_native_pin(key_pin, key_obj);
+        it = ctx.read_native_pin(it_pin, it);
+        this = ctx.read_native_pin(this_pin, this);
         let k_opt = ctx.read_string(key_obj);
         let v_str = match val_v {
             Value::Object(Some(val_obj)) => ctx.read_string(val_obj),
@@ -2986,13 +3045,17 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 // (A non-String key — e.g. Spring's `TypedStringValue` — was
                 // previously dropped by the `k.is_empty()` skip.)
                 put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), val_v);
+                this = ctx.read_native_pin(this_pin, this);
+                it = ctx.read_native_pin(it_pin, it);
             }
         }
+        ctx.unpin_native_roots(entry_pin);
     }
     for (k, v) in &str_collected {
         put_kv(ctx, this, k, v);
     }
     mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 

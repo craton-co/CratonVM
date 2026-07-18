@@ -5844,16 +5844,28 @@ fn native_map_put_evict_pinned(
     let value_pin = pin_value(ctx, value);
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
-    // Re-read the pinned roots at their post-GC addresses.
-    let this = ctx.read_native_pin(this_pin, this);
-    let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
+    // cce0079 tree-key-tail ROOT FIX: EVERY reference-typed `set_field`
+    // below can itself trigger a write-barrier remembered-set allocation
+    // (and therefore a moving young GC) — the tail comment on the linking
+    // writes already knew this for `this`, but the node-POPULATION stores
+    // had the same hazard: the KEY ref-store between `value`'s refresh and
+    // `value`'s own store moved the value object, so a CURRENT-at-refresh
+    // value was stored STALE (canary-proven: PIN-TABLE-STALE silent, store
+    // canary firing — the gap is exactly one ref-store wide). Pin
+    // `new_node` too and refresh every ref through its pin IMMEDIATELY
+    // before its own store.
+    let node_pin = ctx.pin_native_root(new_node);
     let key_val = read_pinned_elem(ctx, key_pin, key_val);
-    let value = read_pinned_elem(ctx, value_pin, value);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
+    let new_node = ctx.read_native_pin(node_pin, new_node);
+    let value = read_pinned_elem(ctx, value_pin, value);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
+    let new_node = ctx.read_native_pin(node_pin, new_node);
     ctx.set_field(new_node, NODE_FIELD_NEXT, Value::Object(None));
+    let new_node = ctx.read_native_pin(node_pin, new_node);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
+    let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
     match tail_node {
         // Non-empty chain: link after the last node walked above.
         Some(t) => ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(new_node))),
@@ -30661,28 +30673,75 @@ fn tm_insert_at(
     key: Value,
     value: Value,
 ) {
+    // cce0079 tree-key-tail fix: a reference-typed store can itself
+    // cooperate with a GC (canary-proven in the sibling
+    // `native_map_put_evict_pinned` node-population sequence: value CURRENT
+    // at refresh, STALE one ref-store later). Every ref crossing a store
+    // here — `data`, the shifted `k`/`v` snapshots, and the final
+    // `key`/`value` — must be refreshed through a pin immediately before
+    // its own store.
+    let data_pin = ctx.pin_native_root(data);
+    let kh = pin_value(ctx, key);
+    let vh = pin_value(ctx, value);
+    let mut data = data;
     let s = size as usize;
     for i in (pos..s).rev() {
         let k = ctx.get_array_element(data, i * 2);
         let v = ctx.get_array_element(data, i * 2 + 1);
+        let ke = pin_value(ctx, k);
+        let ve = pin_value(ctx, v);
+        data = ctx.read_native_pin(data_pin, data);
+        let k = read_pinned_elem(ctx, ke, k);
         ctx.set_array_element(data, (i + 1) * 2, k);
+        data = ctx.read_native_pin(data_pin, data);
+        let v = read_pinned_elem(ctx, ve, v);
         ctx.set_array_element(data, (i + 1) * 2 + 1, v);
+        data = ctx.read_native_pin(data_pin, data);
+        // Truncate this iteration's two element pins (LIFO: ke is the
+        // lowest handle pushed this iteration).
+        if ke != usize::MAX {
+            ctx.unpin_native_roots(ke);
+        } else if ve != usize::MAX {
+            ctx.unpin_native_roots(ve);
+        }
     }
+    let key = read_pinned_elem(ctx, kh, key);
     ctx.set_array_element(data, pos * 2, key);
+    data = ctx.read_native_pin(data_pin, data);
+    let value = read_pinned_elem(ctx, vh, value);
     ctx.set_array_element(data, pos * 2 + 1, value);
+    ctx.unpin_native_roots(data_pin);
 }
 
 // Remove entry at position, shifting elements left
 fn tm_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: usize) {
+    // cce0079 tree-key-tail fix: same per-store refresh discipline as
+    // `tm_insert_at`.
+    let data_pin = ctx.pin_native_root(data);
+    let mut data = data;
     let s = size as usize;
     for i in pos..(s - 1) {
         let k = ctx.get_array_element(data, (i + 1) * 2);
         let v = ctx.get_array_element(data, (i + 1) * 2 + 1);
+        let ke = pin_value(ctx, k);
+        let ve = pin_value(ctx, v);
+        data = ctx.read_native_pin(data_pin, data);
+        let k = read_pinned_elem(ctx, ke, k);
         ctx.set_array_element(data, i * 2, k);
+        data = ctx.read_native_pin(data_pin, data);
+        let v = read_pinned_elem(ctx, ve, v);
         ctx.set_array_element(data, i * 2 + 1, v);
+        data = ctx.read_native_pin(data_pin, data);
+        if ke != usize::MAX {
+            ctx.unpin_native_roots(ke);
+        } else if ve != usize::MAX {
+            ctx.unpin_native_roots(ve);
+        }
     }
     ctx.set_array_element(data, (s - 1) * 2, Value::Object(None));
+    data = ctx.read_native_pin(data_pin, data);
     ctx.set_array_element(data, (s - 1) * 2 + 1, Value::Object(None));
+    ctx.unpin_native_roots(data_pin);
 }
 
 // ----- TreeSet helpers -----

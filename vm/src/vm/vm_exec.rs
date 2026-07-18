@@ -3364,8 +3364,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if let Some(new) = self.shared.heap.debug_forwarded_target(obj.as_ptr() as usize) {
                 static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    // Identify WHAT went stale: read the class off the
+                    // forwarded (live) copy.
+                    let fwd_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new as *mut u8) };
+                    let fwd_cid = self.shared.heap.class_id_of(fwd_ref);
+                    let fwd_class = self
+                        .shared
+                        .class_manager
+                        .read()
+                        .get_class(fwd_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("cid={}", fwd_cid.as_u32()));
                     eprintln!(
-                        "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} caller:\n{}",
+                        "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} class={fwd_class} caller:\n{}",
                         self.thread.thread_id.0,
                         obj.as_ptr() as usize,
                         std::backtrace::Backtrace::force_capture(),
@@ -3429,11 +3440,38 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             }
         }
-        self.thread
+        let entry = self
+            .thread
             .native_pin_roots
             .get(handle)
             .copied()
-            .unwrap_or(fallback)
+            .unwrap_or(fallback);
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): the PIN-STALE canary
+        // covers pin TIME; this covers READ time - a forwarded address
+        // sitting in the pin table means a GC between pin and read failed
+        // to remap THIS entry, which no other canary distinguishes from
+        // caller-side misuse.
+        if handle != usize::MAX && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(entry.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-TABLE-STALE tid={} handle={} len={} 0x{:x}->0x{new:x} \
+                         (pin-table entry missed a remap) reader:\n{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        entry.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        entry
     }
 
     fn unpin_native_roots(&mut self, base: usize) {
@@ -4145,6 +4183,42 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
+        // the minor-GC epoch at entry and compare at exit. A delta proves a
+        // GC completed INSIDE a plain ref store (and names the stack);
+        // zero deltas across a firing run pins all staleness on producers.
+        let epoch_entry = if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            Some(self.shared.heap.debug_minor_gc_count())
+        } else {
+            None
+        };
+        struct EpochGuard<'a> {
+            heap: &'a crate::memory::VmHeap,
+            entry: Option<u64>,
+        }
+        impl Drop for EpochGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(e) = self.entry {
+                    let now = self.heap.debug_minor_gc_count();
+                    if now != e {
+                        static N: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                            eprintln!(
+                                "[SETFIELD-GC] minor epoch changed INSIDE set_field \
+                                 ({e} -> {now}) thread={}:\n{}",
+                                std::thread::current().name().unwrap_or("?"),
+                                std::backtrace::Backtrace::force_capture(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _epoch_guard = EpochGuard {
+            heap: &self.shared.heap,
+            entry: epoch_entry,
+        };
         // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): a NATIVE writing through a
         // STRAY/STALE receiver (relocated-but-unremapped or wild). Same stray
         // header signature as the interpreter putfield check. Dumps the native
