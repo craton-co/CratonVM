@@ -9154,7 +9154,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // aastore (0x53) — needs SATB pre-barrier + write barrier
                 0x53 => {
-                    let value = coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
+                    let raw_value = coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
+                    // A valid `aastore` always receives a reference.  A few
+                    // native/reflection bridges can nevertheless surface a raw
+                    // primitive at this boundary (notably serialization's
+                    // primitive field path).  Do the Java boxing here, while
+                    // the executing thread is still available, instead of
+                    // letting the GC manufacture an untyped AUTOBOX sentinel.
+                    let value = box_aastore_value_fast(shared, raw_value);
                     // Round-3: typed int pop for the array index.
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
@@ -12849,7 +12856,8 @@ fn execute_instruction(
             // Reference array store — needs write barrier for generational GC
             // Mirror fast-path 0x53: JNI / invoke bridges may leave jobject bits as
             // `Value::Long` on the stack; Spring (`is_jdk_class`) uses this slow path.
-            let value = coerce_value_for_return(thread.frames[frame_idx].stack.pop()?, b'L');
+            let raw_value = coerce_value_for_return(thread.frames[frame_idx].stack.pop()?, b'L');
+            let value = box_aastore_value(shared, thread, raw_value)?;
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
@@ -20025,6 +20033,53 @@ fn widen_unboxed_primitive(target: char, value: Value) -> Value {
         ('D', Value::Float(value)) => Value::Double(value as f64),
         (_, value) => value,
     }
+}
+
+/// Normalize a value crossing into `aastore`.
+///
+/// The verifier guarantees an object reference at this opcode, but native and
+/// reflective bridges can expose an unboxed primitive despite an `Object`
+/// return descriptor.  Reference-array storage must materialize a real Java
+/// wrapper in that case: the GC's compact-reference-array fallback is an
+/// internal sentinel, not a Java object that reflection or serialization may
+/// inspect with `getClass()`.
+fn box_aastore_value(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
+    match value {
+        Value::Object(_) | Value::Uninitialized | Value::ReturnAddress(_) => Ok(value),
+        Value::Int(_) => box_primitive(shared, thread, 'I', value),
+        Value::Long(_) => box_primitive(shared, thread, 'J', value),
+        Value::Float(_) => box_primitive(shared, thread, 'F', value),
+        Value::Double(_) => box_primitive(shared, thread, 'D', value),
+    }
+}
+
+/// Fast-interpreter counterpart of [`box_aastore_value`].
+///
+/// The bytecode dispatch loop holds a mutable borrow of its current frame, so
+/// it cannot recursively invoke `valueOf`.  Allocate the same real wrapper
+/// layout directly instead.  This is deliberately only the recovery path for
+/// a value that was already invalid at the verifier boundary; ordinary Java
+/// boxing continues through `valueOf` and retains its cache semantics.
+fn box_aastore_value_fast(shared: &SharedVm, value: Value) -> Value {
+    let (class_name, payload) = match value {
+        Value::Int(_) => ("java/lang/Integer", value),
+        Value::Long(_) => ("java/lang/Long", value),
+        Value::Float(_) => ("java/lang/Float", value),
+        Value::Double(_) => ("java/lang/Double", value),
+        _ => return value,
+    };
+    let class_id = shared
+        .class_manager
+        .write()
+        .load_class(class_name)
+        .unwrap_or(ClassId::new(0));
+    let wrapper = shared.heap.alloc_object(class_id, 1);
+    shared.heap.set_field(wrapper, 0, payload);
+    Value::Object(Some(wrapper))
 }
 
 /// Box a primitive `Value` by invoking the wrapper's `valueOf(prim)`.
