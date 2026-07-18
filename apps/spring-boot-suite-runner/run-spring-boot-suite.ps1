@@ -572,6 +572,12 @@ function Get-EffectiveClassTimeoutSec {
   # See docs/internal/springboot/contextrunner-resource-cycle-then-silent-stall-cluster-FIXED.md.
   $slowClasses = @{
     'module/spring-boot-cache|org.springframework.boot.cache.autoconfigure.CacheAutoConfigurationTests' = 600
+    # Hibernate's complete JPA auto-configuration class is CPU-bound and has
+    # completed naturally in roughly 9.5 minutes under both Craton execution
+    # modes. Keep the ordinary 300-second default for every other class, but
+    # leave enough headroom for real failure reporting instead of labelling the
+    # class as a hang before its result is available.
+    'module/spring-boot-hibernate|org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfigurationTests' = 1200
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.JerseyEndpointRequestIntegrationTests' = 600
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.MvcEndpointRequestIntegrationTests' = 700
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.reactive.EndpointRequestIntegrationTests' = 1000

@@ -484,6 +484,12 @@ pub(crate) fn native_module_layer_modules(
                     &[Value::Object(Some(values))],
                     "layer modules",
                 )?;
+                // The service-catalog population below re-enters Java and can
+                // trigger a moving GC. Keep the newly created set rooted and
+                // refresh its address before storing or returning it; an
+                // unrooted pre-GC reference can later surface as an arbitrary
+                // Object at Collection.stream() in Spring's module scanner.
+                let modules_pin = ctx.pin_native_root(modules);
                 let catalog = match ctx.invoke(
                     "jdk/internal/module/ServicesCatalog",
                     "create",
@@ -528,10 +534,12 @@ pub(crate) fn native_module_layer_modules(
                     ctx.unpin_native_roots(catalog_pin);
                 }
                 let layer = ctx.read_native_pin(layer_pin, *layer);
+                let modules = ctx.read_native_pin(modules_pin, modules);
                 ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
                 ctx.unpin_native_roots(values_pin);
                 ctx.unpin_native_roots(map_pin);
                 ctx.unpin_native_roots(layer_pin);
+                ctx.unpin_native_roots(modules_pin);
                 return Ok(Some(Value::Object(Some(modules))));
             }
             ctx.unpin_native_roots(map_pin);

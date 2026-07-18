@@ -3462,7 +3462,13 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         if is_classloader_instance(ctx, this_ref) {
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
+                // URLClassLoader itself is parent-first too.  Its exact
+                // native registration may receive the base-loader identity
+                // even when the live receiver is a subclass, so restricting
+                // this to non-builtin names drops a parent's resource stream.
+                if object_extends(ctx, this_ref, "java/net/URLClassLoader")
+                    || !is_builtin_loader_class(&class_name)
+                {
                     // JDK `ClassLoader.getResource` contract: delegate to the
                     // PARENT's getResource FIRST, then fall back to this loader's
                     // own `findResource` override. The previous code skipped
@@ -6929,6 +6935,28 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         cl,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        cl_get_resource_as_stream,
+    );
+    // Install the exact URLClassLoader declarations here as well. This
+    // registrar runs after the early servlet/S1 setup in real-JDK mode, so it
+    // is the authoritative callback for concrete URLClassLoader resource
+    // methods and their subclasses.
+    r.register(
+        UCL_CLASS,
+        "getResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        cl_get_resource,
+    );
+    r.register(
+        UCL_CLASS,
+        "getResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        cl_get_resources,
+    );
+    r.register(
+        UCL_CLASS,
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         cl_get_resource_as_stream,

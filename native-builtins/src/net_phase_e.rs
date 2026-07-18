@@ -5875,6 +5875,46 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             if ext.contains("spring.factories") && spring_dbg_enabled() {
                 eprintln!("[CONN-DBG] URL.openConnection: {}", ext);
             }
+            // Let the real JDK FileURLConnection own `file:` resources. Its
+            // getInputStream body is precisely what URLClassLoader expects;
+            // routing a file URL through the synthetic HTTP carrier leaves the
+            // concrete HTTP connection without response state and returns EOF.
+            if let Some(raw_path) = ext.strip_prefix("file:") {
+                let decoded = uri_percent_decode(raw_path);
+                let mut path = decoded.trim_start_matches('/').to_string();
+                #[cfg(windows)]
+                {
+                    let bytes = path.as_bytes();
+                    if bytes.len() >= 2
+                        && bytes[0].is_ascii_alphabetic()
+                        && (bytes[1] == b'/' || bytes[1] == b'\\')
+                    {
+                        path.insert(1, ':');
+                    }
+                }
+                let file = match ctx.new_object("java/io/File")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(ioex("URL.openConnection: allocate File")),
+                };
+                let path_string = ctx.create_string(&path);
+                ctx.invoke_special(
+                    "java/io/File",
+                    "<init>",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(file)), Value::Object(Some(path_string))],
+                )?;
+                let conn = match ctx.new_object("sun/net/www/protocol/file/FileURLConnection")? {
+                    Some(Value::Object(Some(o))) => o,
+                    _ => return Err(ioex("URL.openConnection: allocate FileURLConnection")),
+                };
+                ctx.invoke_special(
+                    "sun/net/www/protocol/file/FileURLConnection",
+                    "<init>",
+                    "(Ljava/net/URL;Ljava/io/File;)V",
+                    &[Value::Object(Some(conn)), Value::Object(Some(this)), Value::Object(Some(file))],
+                )?;
+                return Ok(Some(Value::Object(Some(conn))));
+            }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
             // that cast it continue to work. All other schemes need the
             // concrete HttpURLConnection carrier, including `file:`. The
