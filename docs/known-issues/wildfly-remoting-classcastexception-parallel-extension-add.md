@@ -217,3 +217,24 @@ this up next should pull the specific failing classes' logs from this round's ou
 (`/data/data/wt-wildfly-bugbash-20260718-runner/out/round7-s*of6-*/`) and grep for
 `ClassCastException.*AttributeDefinition` to identify which extension is implicated this time before
 assuming it's a reopened instance of the original `org.jboss.as.remoting` site.
+
+## New evidence 2026-07-18 (same session) — did not reproduce in 10 isolated attempts; likely low per-attempt probability, not fixed
+
+Follow-up: ran 10 isolated repro attempts (round-7 binary, `org.jboss.as.test.integration.basic` module,
+20-30s timeout each, same command as the original repro) specifically trying to catch this exception
+live. **0/10 hit it** — every attempt instead showed the companion
+[[wildfly-standalone-boot-stw-jit-takeover-hang]]'s STW warning (see that doc's matching new-evidence
+section for the mechanism details, which also changed shape this pass: `pending=1`, not `pending=6`,
+and no longer a permanent wedge).
+
+This is **not** strong evidence the bug is fixed — round 7's real 6-shard harness run separately observed
+this exact signature at 18/240 (7.5%) in the same time window these isolated attempts were made, so a
+10-attempt isolated sample missing it entirely (expected hits at 7.5%: <1) is unsurprising, not
+contradictory. Isolated single-process reproduction may simply have a lower probability-per-attempt than
+the real harness's 6-concurrent-shard host-load conditions, consistent with this bug's original filing
+describing it as inherently non-deterministic (~1/5 in the first investigation, run under different host
+load than today). Whoever next chases this should pull the actual failing classes directly from round 7's
+output (`/data/data/wt-wildfly-bugbash-20260718-runner/out/round7-s*of6-*/results.tsv`, filter for
+`exited unexpectedly with code \[1\]` in the FAIL rows' logs) rather than relying on fresh isolated
+repro attempts, since those have now twice failed to reproduce it (this session's 10 attempts, plus the
+earlier "did not reproduce" note above) despite the real harness continuing to hit it.
