@@ -59,6 +59,14 @@ public class StreamComplete {
         return sum; // 15
     }
 
+    // ---- Test 3b: generic reduce(U, BiFunction, BinaryOperator) ----
+
+    public static int testReduceWithGenericAccumulator() {
+        int sum = Stream.of(1, 2, 3)
+            .reduce(10, (total, value) -> total + value, (left, right) -> left + right);
+        return sum == 16 ? 1 : 0;
+    }
+
     // ---- Test 4: forEach() ----
 
     static int forEachSum = 0;
