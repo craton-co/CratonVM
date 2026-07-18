@@ -21388,21 +21388,6 @@ pub(crate) fn is_jython_pymodule_native_override(
         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
 }
 
-pub(crate) fn is_time_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/time/Instant"
-        && matches!(
-            (method_name, descriptor),
-            ("now", "()Ljava/time/Instant;")
-                | ("ofEpochSecond", "(J)Ljava/time/Instant;")
-                | ("ofEpochSecond", "(JJ)Ljava/time/Instant;")
-                | ("ofEpochMilli", "(J)Ljava/time/Instant;")
-        )
-}
-
 pub(crate) fn is_jdk_wrapper_math_native_override(
     class_name: &str,
     method_name: &str,
@@ -23288,14 +23273,6 @@ fn force_native_over_real_jdk_bytecode(
             method_descriptor,
         )
     {
-        return true;
-    }
-    // H2 calls `Instant.now()` for every SQL statement command swap during
-    // Hibernate schema creation. The registered java.time bridge creates the
-    // same two-field Instant directly and avoids the real-JDK
-    // Clock.currentInstant -> VM.getNanoTimeAdjustment path, which is a hot
-    // interpreted layer under FunctionTests.
-    if is_time_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // Tiny JDK wrapper arithmetic helpers are already registered as exact

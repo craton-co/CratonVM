@@ -22819,21 +22819,6 @@ pub(crate) fn is_jython_pymodule_native_override(
         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
 }
 
-pub(crate) fn is_time_native_override(
-    class_name: &str,
-    method_name: &str,
-    descriptor: &str,
-) -> bool {
-    class_name == "java/time/Instant"
-        && matches!(
-            (method_name, descriptor),
-            ("now", "()Ljava/time/Instant;")
-                | ("ofEpochSecond", "(J)Ljava/time/Instant;")
-                | ("ofEpochSecond", "(JJ)Ljava/time/Instant;")
-                | ("ofEpochMilli", "(J)Ljava/time/Instant;")
-        )
-}
-
 pub(crate) fn is_jdk_wrapper_math_native_override(
     class_name: &str,
     method_name: &str,
@@ -25082,14 +25067,6 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // H2 calls `Instant.now()` for every SQL statement command swap during
-    // Hibernate schema creation. The registered java.time bridge creates the
-    // same two-field Instant directly and avoids the real-JDK
-    // Clock.currentInstant -> VM.getNanoTimeAdjustment path, which is a hot
-    // interpreted layer under FunctionTests.
-    if is_time_native_override(class_name, method_name, method_descriptor) {
-        return true;
-    }
     // Tiny JDK wrapper arithmetic helpers are already registered as exact
     // natives in `phases_early`; route real-JDK bytecode through them so hot
     // collection reductions such as Hibernate's JoinedList constructor do not
@@ -26237,6 +26214,11 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 | "java/util/concurrent/LinkedBlockingDeque"
                 | "java/util/concurrent/atomic/AtomicBoolean"
                 | "java/util/EnumSet"
+                // The fallback bridge is needed only if bootstrap had to
+                // synthesize Instant.  With a loaded real JDK Instant, every
+                // factory must run its real bytecode so the result has the
+                // real field layout and ISO-8601 `toString()` semantics.
+                | "java/time/Instant"
                 // NOT "java/util/StringJoiner" (2026-07-10): yielding this
                 // class's SyntheticStub natives to real bytecode here exposes
                 // a deterministic heap-reference-integrity defect (the
@@ -27106,10 +27088,20 @@ fn execute_invokestatic(
     // Walk the superclass chain because the constant pool may reference a subclass
     // while the native is registered on the declaring superclass.
     // Skip hierarchy walk for <init> — constructors are NOT inherited.
-    let direct_native = shared
+    // SyntheticStub registrations on real-protected classes must not suppress
+    // loading the real owner. Otherwise the first call materializes a stub and
+    // seeds a native invoke-cache entry before real bytecode can take over.
+    let direct_native_registered = shared
         .native_methods
         .find(&method_class_name, &method_name, &method_descriptor)
         .is_some();
+    let direct_synthetic_stub_may_yield = direct_native_registered
+        && shared
+            .native_methods
+            .kind_of(&method_class_name, &method_name, &method_descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+        && real_protected_stub_class(&method_class_name);
+    let direct_native = direct_native_registered && !direct_synthetic_stub_may_yield;
     let is_native = direct_native
         || (method_name.as_ref() != "<init>" && {
             let cm = shared.class_manager.read();
@@ -27889,6 +27881,25 @@ fn execute_invokestatic_cached(
     if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
+    }
+    // A call site can first resolve while a bootstrap fallback class is
+    // synthetic, then observe that class upgraded in place to real bytecode.
+    // Cached native entries do not otherwise revisit the SyntheticStub
+    // precedence gate, so evict instead of serving a stale fallback callback.
+    if matches!(&target, CachedInvokeTarget::Native { .. }) {
+        if let Ok((class_name, method_name, descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if synthetic_stub_should_yield_to_real_bytecode(
+                shared,
+                &class_name,
+                &method_name,
+                &descriptor,
+            ) {
+                thread.invoke_cache.evict(caller_class_id, cp_index, false);
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
     }
     if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
@@ -34806,6 +34817,34 @@ fn execute_invokevirtual_cached(
                     }
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
+                    }
+                    // The class may have been upgraded in place after this
+                    // call site cached a SyntheticStub callback. Re-run the
+                    // real-bytecode precedence gate before serving that
+                    // cached callback; otherwise an earlier stub result can
+                    // keep the same receiver ClassId pinned to its fallback
+                    // `toString()` forever.
+                    if let Ok((_owner, method_name, descriptor, _)) =
+                        resolve_method_ref(shared, caller_class_id, cp_index)
+                    {
+                        let receiver_name = shared
+                            .class_manager
+                            .read()
+                            .get_class(actual_class_id)
+                            .map(|class| class.name.clone());
+                        if let Some(receiver_name) = receiver_name {
+                            if synthetic_stub_should_yield_to_real_bytecode(
+                                shared,
+                                &receiver_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
+                                thread
+                                    .invoke_cache
+                                    .evict(caller_class_id, cp_index, is_special);
+                                return Ok(CachedCallResult::CacheMiss);
+                            }
+                        }
                     }
                     // The callback identity proves this cache entry is one of
                     // the eight real-layout Matcher leaves. The receiver was

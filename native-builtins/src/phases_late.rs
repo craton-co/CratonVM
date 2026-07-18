@@ -22618,36 +22618,31 @@ fn spring_class_utils_for_name_impl(
     // BOOT-INF/lib fat-jars) and carries the LaunchedURLClassLoader rescue that
     // routing through `loadClass` would lose; its inner-class retry also covers
     // the Spring-Boot `a.b.Outer.Factory` → `a/b/Outer$Factory` factory names.
-    // Spring passes `null` to mean its default loader, which is the current
-    // thread context loader when available.  This native replaces the Java
-    // body, so it must materialize that default itself before deciding whether
-    // to use the global scanner.  Treating null as the bootstrap/global path
-    // bypassed FilteredClassLoader in ClassUtils.isPresent(name, null).
-    let effective_loader = match args.get(1) {
+    // Spring's ClassUtils substitutes getDefaultClassLoader() when the caller
+    // passes null. That is normally the thread context class loader (TCCL),
+    // which is how ModifiedClassPathExtension makes ClassUtils.isPresent
+    // observe its filtered class path. The previous native treated null as the
+    // unified application class path, leaking excluded clients back into
+    // ClientHttpRequestFactoryBuilder.detect().
+    //
+    // Use the Thread accessor rather than reading its field directly: the
+    // accessor owns the real-JDK layout and explicit-null handling. As with
+    // Spring's getDefaultClassLoader(), an unavailable/null TCCL falls through
+    // to the normal application-loader path below.
+    let current_thread = ctx.current_thread_object();
+    let loader = match args.get(1) {
         Some(Value::Object(Some(loader))) => Some(*loader),
-        _ => match ctx.invoke(
-            "java/lang/Thread",
-            "currentThread",
-            "()Ljava/lang/Thread;",
+        _ => match ctx.invoke_virtual(
+            current_thread,
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
             &[],
         ) {
-            Ok(Some(Value::Object(Some(thread)))) => ctx
-                .invoke_virtual(
-                    thread,
-                    "getContextClassLoader",
-                    "()Ljava/lang/ClassLoader;",
-                    &[],
-                )
-                .ok()
-                .flatten()
-                .and_then(|value| match value {
-                    Value::Object(Some(loader)) => Some(loader),
-                    _ => None,
-                }),
+            Ok(Some(Value::Object(Some(loader)))) => Some(loader),
             _ => None,
         },
     };
-    if let Some(loader) = effective_loader {
+    if let Some(loader) = loader {
         if crate::classloader::is_user_defined_loader(ctx, loader) {
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
                 crate::lang_class::native_class_for_name(
