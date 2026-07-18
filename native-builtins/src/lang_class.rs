@@ -1900,13 +1900,16 @@ pub(crate) fn native_class_for_name(
             // authoritative answer about module visibility. Detect Spring Boot's
             // LaunchedURLClassLoader by class name prefix.
             Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref)) => {
-                // Check if this is a LaunchedURLClassLoader (Spring Boot 2/3)
-                // or a URLClassLoader subclass that might have the same issues.
-                // For these, bootstrap fallback is safe. For module loaders, propagate.
+                // Only the Spring Boot launcher itself needs the nested-JAR
+                // rescue. A general URLClassLoader can deliberately reject a
+                // class (notably Spring's FilteredClassLoader); treating that
+                // ClassNotFoundException as a global lookup makes conditional
+                // auto-configuration observe classes the requested loader hid.
                 let loader_class_name = loader_class_name_debug.clone();
-                let is_launched_url_cl = loader_class_name.contains("LaunchedURLClassLoader")
-                    || loader_class_name.contains("launch/LaunchedURLClassLoader")
-                    || loader_class_name == "java/net/URLClassLoader";
+                let is_launched_url_cl = loader_class_name
+                    == "org/springframework/boot/loader/LaunchedURLClassLoader"
+                    || loader_class_name
+                        == "org/springframework/boot/loader/launch/LaunchedURLClassLoader";
                 if is_launched_url_cl {
                     s111_dbg!(
                         "[S111-DBG] loadClass({}) -> ExceptionThrown for LaunchedURLCL, fallback",
@@ -3006,13 +3009,13 @@ pub(crate) fn native_class_new_instance(
 /// "mapped with targetEntity=`X`, but the attribute is declared as `X`" error
 /// (same name, divergent loader identity).
 ///
-/// Uses an exact `(loader, name)` namespace probe (no Java `loadClass`, no global
-/// fallback inside the probe) so it is GC-safe to call mid-reflection-object
-/// build. Falls back to the global [`descriptor_to_class_mirror`] for
-/// primitives/arrays, gate-off, a built-in declaring loader, or a type the
-/// declaring loader did not itself define (e.g. a parent-delegated JDK type),
-/// preserving the legacy answer in every case the enhancing loader is not the
-/// type's definer.
+/// It first uses an exact `(loader, name)` namespace probe. If a recorded
+/// user-defined loader has not resolved the reference yet, it drives that
+/// loader's `loadClass` before falling back to the global
+/// [`descriptor_to_class_mirror`] path. This is required because reflection
+/// resolves a method descriptor just as bytecode does: returning the global
+/// same-named class makes `Method.getReturnType()` disagree with the method's
+/// own `new` and `ldc` instructions.
 pub(crate) fn descriptor_to_class_mirror_via_loader(
     ctx: &mut dyn NativeContext,
     desc: &str,
@@ -3027,6 +3030,40 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
             if loader_id >= 3 {
                 if let Some(cid) = ctx.class_id_defined_by_loader_exact(inner, loader_id as u32) {
                     return ctx.get_class_mirror(cid);
+                }
+            }
+            // A real-JDK ClassLoader can define a class whose manager entry
+            // still reports the pre-existing application namespace. The
+            // defining-loader side table is authoritative for that case. Use
+            // it for an exact already-loaded lookup first, then initiate the
+            // descriptor through that loader if necessary.
+            if let Some(loader) =
+                crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+            {
+                if let Some(mirror) =
+                    crate::classloader::find_loaded_class_for_loader(ctx, loader, inner)
+                {
+                    return mirror;
+                }
+                // Native calls are not represented by an interpreter frame,
+                // so pin both objects across the potentially allocating /
+                // re-entrant loader call. A failure deliberately retains the
+                // historical global fallback below.
+                let loader_pin = ctx.pin_native_root(loader);
+                let name = ctx.create_string(&inner.replace('/', "."));
+                let name_pin = ctx.pin_native_root(name);
+                let loader = ctx.read_native_pin(loader_pin, loader);
+                let name = ctx.read_native_pin(name_pin, name);
+                let loaded = ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name))],
+                );
+                ctx.unpin_native_roots(name_pin);
+                ctx.unpin_native_roots(loader_pin);
+                if let Ok(Some(Value::Object(Some(mirror)))) = loaded {
+                    return mirror;
                 }
             }
         }
@@ -13309,16 +13346,30 @@ pub(crate) fn native_class_get_package(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let class_id = ctx.class_id_from_mirror(this);
+    // Synthetic lambda proxies deliberately have no class-store entry, so
+    // `mirror_class_name` cannot resolve their generated ClassId. Their
+    // defining host is the authoritative package source, just as it is for
+    // `getPackageName()` above. Preserve the non-null `Package` contract for
+    // callers (such as Spring GraphQL) that immediately dereference it.
+    let lambda_pkg = class_id
+        .and_then(|class_id| ctx.lambda_proxy_host(class_id))
+        .map(|host| match host.rfind('/') {
+            Some(pos) => Arc::from(host[..pos].replace('/', ".")),
+            None => Arc::from(""),
+        });
     let name = mirror_class_name(ctx, this).unwrap_or_default();
     // Array classes have no Package object; Class.getPackageName() separately
     // reports the component package (java.lang for primitive arrays).
-    if name.is_empty() || name.starts_with('[') {
+    if (name.is_empty() && lambda_pkg.is_none()) || name.starts_with('[') {
         return Ok(Some(Value::Object(None)));
     }
     // Cache the dotted package prefix per `ClassId` for VM-registered
     // mirrors (class_id_from_mirror = Some). Synthetic / test mirrors
     // derive on-call so tests are not contaminated.
-    let pkg_name: Arc<str> = if let Some(class_id) = ctx.class_id_from_mirror(this) {
+    let pkg_name: Arc<str> = if let Some(pkg_name) = lambda_pkg {
+        pkg_name
+    } else if let Some(class_id) = class_id {
         if let Some(arc) = cache_get(&PACKAGE_NAME_CACHE, class_id) {
             arc
         } else {
@@ -19223,6 +19274,72 @@ mod tests {
             Some(sentinel_cid),
             "Class.forName(String) must use caller loader before global lookup"
         );
+    }
+
+    #[test]
+    fn s111_filtered_url_class_loader_cnfe_is_authoritative() {
+        let mut ctx = mock_ctx();
+        let target = "tools/jackson/databind/json/JsonMapper";
+        ctx.ensure_class_initialized(target)
+            .expect("make target globally discoverable");
+        let loader_cid = ctx
+            .ensure_class_initialized("org/springframework/boot/test/context/FilteredClassLoader")
+            .expect("make filtered loader class");
+        let loader = ctx.alloc_object(loader_cid, 0);
+        let thrown = ctx.fresh_object_ref();
+        ctx.set_invoke_virtual_result(Err(
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown),
+        ));
+        let name = ctx.create_string("tools.jackson.databind.json.JsonMapper");
+
+        let err = native_class_for_name(
+            &mut ctx,
+            &[
+                Value::Object(Some(name)),
+                Value::Int(0),
+                Value::Object(Some(loader)),
+            ],
+        )
+        .expect_err("a FilteredClassLoader rejection must not fall back globally");
+
+        assert!(matches!(
+            err,
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc) if exc == thrown
+        ));
+    }
+
+    #[test]
+    fn s111_launched_url_class_loader_cnfe_keeps_nested_jar_rescue() {
+        let mut ctx = mock_ctx();
+        let target = "com/example/NestedJarTarget";
+        let target_cid = ctx
+            .ensure_class_initialized(target)
+            .expect("make nested-jar target globally discoverable");
+        let loader_cid = ctx
+            .ensure_class_initialized("org/springframework/boot/loader/LaunchedURLClassLoader")
+            .expect("make launcher loader class");
+        let loader = ctx.alloc_object(loader_cid, 0);
+        let thrown = ctx.fresh_object_ref();
+        ctx.set_invoke_virtual_result(Err(
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(thrown),
+        ));
+        let name = ctx.create_string("com.example.NestedJarTarget");
+
+        let resolved = native_class_for_name(
+            &mut ctx,
+            &[
+                Value::Object(Some(name)),
+                Value::Int(0),
+                Value::Object(Some(loader)),
+            ],
+        )
+        .expect("launcher fallback should resolve through the nested-jar scanner")
+        .expect("Class.forName should return a class mirror");
+
+        let Value::Object(Some(mirror)) = resolved else {
+            panic!("expected Class mirror, got {resolved:?}");
+        };
+        assert_eq!(ctx.class_id_from_mirror(mirror), Some(target_cid));
     }
 
     #[test]

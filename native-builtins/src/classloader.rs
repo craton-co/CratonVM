@@ -3330,7 +3330,16 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // a sibling loader's entry or misses the receiver's own nested resource.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
         if object_extends(ctx, this_ref, "java/net/URLClassLoader") {
-            return ucl_find_resource(ctx, args);
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(this_ref))
+                .unwrap_or_default();
+            // URLClassLoader subclasses remain user loaders: their inherited
+            // getResource must consult the parent before local URL lookup.
+            // Spring's FilteredClassLoader relies on this to reach a
+            // resource-only parent while still filtering a specific class.
+            if is_builtin_loader_class(&class_name) {
+                return ucl_find_resource(ctx, args);
+            }
         }
     }
 

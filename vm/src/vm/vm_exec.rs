@@ -7654,21 +7654,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
-        // GC-safety: `lambda_args_sam_compatible` (invoked from the
-        // `.filter()` predicate immediately below) can trigger class loading
-        // -- a GC-triggering call -- through its proxy/annotation-satisfies
-        // helpers (the same helper family flagged in
-        // `checkcast_lambda_instantiated_args`'s own GC-safety comment
-        // elsewhere in this codebase). `receiver` and every object element of
-        // `args` are plain Rust locals here, invisible to the collector, so a
-        // moving GC landing inside that predicate leaves them stale for the
-        // `get_field`/`extend_from_slice` reads used to build `full_args`
-        // just below. Pin both before the predicate runs and re-read through
-        // the pins once it returns, instead of trusting the original locals.
-        // Confirmed live via `CRATONVM_DBG_STALE_OBJREF` during WildFly
-        // `parallel-extension-add` (a `java.util.stream` lambda pipeline
-        // stage triggered it) -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // Keep the receiver and arguments rooted across the dispatch decision:
+        // the selected lambda body can allocate immediately after this block.
         let sam_compat_pin_base = self.thread.native_pin_roots.len();
         self.thread.native_pin_roots.push(receiver);
         let arg_pins: Vec<Option<usize>> = args
@@ -7684,35 +7671,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .collect();
 
         if let Some(lcs) = call_site.filter(|lcs| {
-            // Match the SAM by name AND parameter count. A functional
-            // interface may declare OTHER same-named methods (overloaded
-            // `default` methods) whose body delegates to the real SAM — e.g.
-            // JUnit5's `TestInstancesProvider` has a 2-arg
-            // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)`
-            // default that calls the 3-arg abstract SAM
-            // `getTestInstances(ExtensionRegistry, ExtensionRegistrar,
-            // ThrowableCollector)`. Intercepting the 2-arg default as if it
-            // were the SAM routes it to the lambda body with one argument
-            // short, leaving the trailing param uninitialised. Only intercept
-            // when the supplied arg count matches the SAM's so the real
-            // default method runs and then re-invokes the SAM correctly.
-            method_name == &*lcs.sam_method_name
-                && crate::runtime::interpreter::split_method_descriptor(&lcs.sam_descriptor)
-                    .0
-                    .len()
-                    == args.len()
-                // Bug B: skip same-name/same-arity overloaded interface defaults
-                // whose parameter types don't match the SAM (e.g.
-                // AnnotationFilter.matches(Class) vs the SAM matches(String)).
-                && crate::runtime::interpreter::lambda_args_sam_compatible(
-                    self.shared,
-                    &lcs.sam_descriptor,
-                    args,
-                )
+            // A lambda only implements its exact SAM descriptor. Same-named
+            // defaults must run their bytecode, even when a null argument is
+            // assignable to both the default and SAM parameter types.
+            method_name == &*lcs.sam_method_name && descriptor == &*lcs.sam_descriptor
         }) {
-            // Re-read receiver and args through the pins established above --
-            // the SAM-compatibility check just run may have triggered a
-            // moving GC that relocated either one.
+            // Re-read receiver and args through the pins before the selected
+            // lambda body can allocate and move them.
             receiver = self.thread.native_pin_roots[sam_compat_pin_base];
             let refreshed_args: Vec<Value> = args
                 .iter()
@@ -11400,6 +11365,7 @@ pub(super) fn proxy_invoke_handler(
             handler_ref,
             handler_class_id,
             "invoke",
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
             &call_args,
         ) {
             Ok(d) => d,
@@ -11767,6 +11733,7 @@ pub(crate) fn proxy_invoke_handler_shared(
             handler_ref,
             handler_class_id,
             "invoke",
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
             &call_args,
         ) {
             Ok(d) => d,
@@ -12125,6 +12092,7 @@ fn annotation_proxy_as_map(
                 f,
                 f_cid,
                 "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
                 &[Value::Object(Some(proxy))],
             )?;
             dispatch.unwrap_or(None)
@@ -13540,6 +13508,7 @@ fn invoke_on_class_shared_inner(
                     recv,
                     recv_cid,
                     method_name,
+                    descriptor,
                     &args[1..],
                 )? {
                     return Ok(result);
@@ -16489,6 +16458,7 @@ fn invoke_on_class_shared_inner(
                                 recv,
                                 recv_cid,
                                 method_name,
+                                descriptor,
                                 &args[1..],
                             )? {
                                 return Ok(result);

@@ -1,6 +1,21 @@
 # `Class.getPackage()` returns null for a lambda-implemented GraphQL `DataFetcher` → NPE building the schema
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-18**
+
+## Resolution
+
+Two VM gaps were closed.
+
+- `Class.getPackage()` now derives a synthetic lambda proxy's package from its
+  defining host, matching `getPackageName()` and removing the GraphQL
+  `DataFetcher` NPE.
+- Real-JDK resource loading now preserves parent delegation for user-defined
+  `URLClassLoader` subclasses. Spring's `FilteredClassLoader` can therefore
+  hide Jackson 3 while still reaching the resource overlay that supplies the
+  GraphQL schema.
+
+The three affected Spring GraphQL classes pass against the rebuilt Linux
+fixture in both JIT and `--nojit` modes: RSocket 6/6, WebFlux 17/17, MVC 17/17.
 
 ## Symptom
 

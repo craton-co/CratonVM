@@ -19,6 +19,11 @@ use cratonvm_vm::vm::Vm;
 
 /// Path to the test resources directory.
 fn test_resources_dir() -> String {
+    if let Some(generated) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        if std::path::Path::new(generated).is_dir() {
+            return generated.to_owned();
+        }
+    }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/tests/resources")
 }
@@ -2933,6 +2938,11 @@ s20_test!(
 );
 s20_test!(test_s20_stream_of_count, "testStreamOfCount", 5);
 s20_test!(test_s20_reduce_with_identity, "testReduceWithIdentity", 15);
+s20_test!(
+    test_s20_reduce_with_generic_accumulator,
+    "testReduceWithGenericAccumulator",
+    1
+);
 s20_test!(test_s20_for_each, "testForEach", 60);
 s20_test!(test_s20_collect_to_set, "testCollectToSet", 3);
 s20_test!(test_s20_find_first, "testFindFirst", 10);
