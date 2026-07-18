@@ -47,10 +47,8 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 | Sieve (100K x 20,000)               | 2,851 ms      | 6,508 ms          | 2.28x         |
 | Matrix 1280x1280                    | 2,349 ms      | 6,875 ms          | 2.93x         |
 | **QuickBench TOTAL**                | **8,925 ms**  | **23,068 ms**     | **2.58x**     |
-| HashMap (1M put/get, isolated)      | 45 ms         | 201 ms            | 4.47x         |
 | HashMap (10M put/get, isolated)     | 1,471 ms      | 5,488 ms          | 3.73x         |
 | String/Regex (100K, isolated)       | 54 ms         | 193 ms            | 3.57x         |
-| String/Regex (1M, isolated)         | 147 ms        | 1,561 ms          | 10.6x         |
 | Binary Trees (depth=18, isolated)   | 188 ms        | 3,855 ms          | 20.5x²        |
 
 *All rows remeasured 2026-07-18 (residuals round) on the Azure Linux benchmark
