@@ -18,7 +18,7 @@ launcher, HotSpot/JDK 25 passes all three affected classes:
 |---|---:|---:|---:|
 | `JettyReactiveWebServerFactoryTests` | 35 pass, 1 skipped | timeout after 180s | timeout after 180s |
 | `JettyServletWebServerFactoryTests` | 113 pass, 2 skipped | timeout after 180s | timeout after 180s |
-| `JettyServletWebServerServletContextListenerTests` | 2 pass | 2 fail | 2 fail |
+| `JettyServletWebServerServletContextListenerTests` | 2 pass | 2 pass | 2 pass |
 
 The two factory logs show repeated successful `ServletContextHandler` and
 `Server` startups before the timeout, not recursion or duplicate servlet
@@ -39,11 +39,15 @@ threads are idle in `QueuedThreadPool` wait sites. This rules out continued
 `startContext()` recursion and narrows the timeout to post-startup request /
 response delivery.
 
-## Initial direction
+## Fixed reflective-supertype residual
 
-The listener has a real subclass/superclass relation, so its failure is likely
-a loader-faithful reflection assignability defect in the `Method.invoke`
-precondition (`native-builtins/src/lang_class.rs`), not a valid Java
-`IllegalArgumentException`. The factory timeouts reproduce with and without
-JIT and must be captured with a VM stack dump before changing dispatch or
+`loader_aware_reflect_assignable` now walks the receiver's resolved superclass
+chain before rejecting a class target. This preserves a valid relation when a
+reflective `Method` mirror holds a different loader copy of a superclass. The
+listener class passes 2/2 in JIT and `--nojit` with the correction.
+
+## Remaining direction
+
+The two factory timeouts reproduce with and without JIT. They must be traced
+through their post-startup request/response path before changing dispatch or
 timeout policy.
