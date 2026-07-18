@@ -2567,6 +2567,83 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Build a real TLS listener and its Java `SSLServerSocket` wrapper.  Keep
+/// every `SSLServerSocketFactory.createServerSocket` overload on this one
+/// path so callers cannot accidentally fall through to `ServerSocketFactory`'s
+/// plaintext implementation.
+fn create_ssl_server_socket(
+    ctx: &mut dyn NativeContext,
+    port: i32,
+    bind_address: &str,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+    if !(0..=65535).contains(&port) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("port out of range: {port}"),
+        }
+        .into());
+    }
+    let identity = require_runtime_tls_identity()?;
+    let config = build_server_config_single_cert(
+        &identity.cert_pem,
+        &identity.key_pem,
+        &["h2", "http/1.1"],
+        false,
+        None,
+    )
+    .map_err(|error| RuntimeError::IOException { message: error })?;
+
+    let listener = TcpListener::bind((bind_address, port as u16)).map_err(|error| {
+        RuntimeError::IOException {
+            message: format!("bind {bind_address}:{port}: {error}"),
+        }
+    })?;
+    let local_port = listener
+        .local_addr()
+        .map(|address| address.port())
+        .unwrap_or(port as u16);
+
+    let entry = TlsServerListenerEntry {
+        listener,
+        config,
+        local_port,
+    };
+    let id = {
+        let mut reg = sreg().lock();
+        let id = alloc_server_id(&mut reg);
+        reg.listeners.insert(id, entry);
+        id
+    };
+
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
+    ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
+    ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
+    ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
+    ctx.set_field(obj, 3, Value::Object(None));
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+fn ssl_server_bind_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    index: usize,
+) -> Result<String, cratonvm_types::error::MethodCallFailed> {
+    let address = obj_arg(args, index)?;
+    let pin_base = ctx.pin_native_root(address);
+    let resolved = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin_base);
+    let host = match resolved? {
+        Some(Value::Object(Some(value))) => ctx.read_string(value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "InetAddress has no host address".into(),
+        }
+        .into());
+    }
+    Ok(host)
+}
+
 fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2592,50 +2669,30 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "(I)Ljava/net/ServerSocket;",
         |ctx, args| {
             let port = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-            if !(0..=65535).contains(&port) {
-                return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("port out of range: {}", port),
-                }
-                .into());
-            }
-            let identity = require_runtime_tls_identity()?;
-            let config = build_server_config_single_cert(
-                &identity.cert_pem,
-                &identity.key_pem,
-                &["h2", "http/1.1"],
-                false,
-                None,
-            )
-            .map_err(|e| RuntimeError::IOException { message: e })?;
-
-            let listener = TcpListener::bind(("0.0.0.0", port as u16)).map_err(|e| {
-                RuntimeError::IOException {
-                    message: format!("bind 0.0.0.0:{}: {}", port, e),
-                }
-            })?;
-            let local_port = match listener.local_addr() {
-                Ok(a) => a.port(),
-                Err(_) => port as u16,
-            };
-
-            let entry = TlsServerListenerEntry {
-                listener,
-                config,
-                local_port,
-            };
-            let id = {
-                let mut reg = sreg().lock();
-                let id = alloc_server_id(&mut reg);
-                reg.listeners.insert(id, entry);
-                id
-            };
-
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
-            ctx.set_field(obj, SSS_LISTENER_ID, Value::Int(id));
-            ctx.set_field(obj, SSS_LOCAL_PORT, Value::Int(local_port as i32));
-            ctx.set_field(obj, SSS_CLOSED, Value::Int(0));
-            ctx.set_field(obj, 3, Value::Object(None));
-            Ok(Some(Value::Object(Some(obj))))
+            create_ssl_server_socket(ctx, port, "0.0.0.0")
+        },
+    );
+    // UnboundID's LDAP listener calls these overloads (with backlog 128).
+    // Without explicit bridges here, dispatch reaches `ServerSocketFactory`'s
+    // plaintext implementation and an LDAPS client gets "wrong version
+    // number" after the SocketFactory client-side fix succeeds.
+    r.register(
+        sssf,
+        "createServerSocket",
+        "(II)Ljava/net/ServerSocket;",
+        |ctx, args| {
+            let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
+            create_ssl_server_socket(ctx, port, "0.0.0.0")
+        },
+    );
+    r.register(
+        sssf,
+        "createServerSocket",
+        "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
+        |ctx, args| {
+            let port = args.get(1).and_then(|value| value.as_int()).unwrap_or(0);
+            let bind_address = ssl_server_bind_address(ctx, args, 3)?;
+            create_ssl_server_socket(ctx, port, &bind_address)
         },
     );
     r.register(

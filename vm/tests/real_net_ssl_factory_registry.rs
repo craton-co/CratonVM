@@ -85,5 +85,24 @@ fn real_net_sockets_keep_ssl_factory_bridge_without_synthetic_stubs() {
             "real-network SSLSocketFactory registry lost the createSocket{descriptor} bridge: {entries:?}"
         );
     }
+
+    let server_entries: Vec<&serde_json::Value> = census["natives"]
+        .as_array()
+        .expect("native registry census has no natives array")
+        .iter()
+        .filter(|entry| entry["class"] == "javax/net/ssl/SSLServerSocketFactory")
+        .collect();
+    for descriptor in [
+        "(I)Ljava/net/ServerSocket;",
+        "(II)Ljava/net/ServerSocket;",
+        "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
+    ] {
+        assert!(
+            server_entries.iter().any(|entry| {
+                entry["name"] == "createServerSocket" && entry["descriptor"] == descriptor
+            }),
+            "real-network SSLServerSocketFactory registry lost the createServerSocket{descriptor} bridge: {server_entries:?}"
+        );
+    }
     fs::remove_file(dump).expect("failed to remove native registry census");
 }
