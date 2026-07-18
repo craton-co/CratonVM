@@ -109,7 +109,8 @@ the abstract declaration itself, which has no Code attribute →
 `AbstractMethodError`. This is the same "instantiate the abstract class
 directly, real bytecode calls a method with no concrete implementation"
 pattern independently found for `java.net.http.HttpClient` in
-`jdk-httpclient-builder-config-loss-cluster.md`'s companion issues.
+the now-fixed `../../internal/springboot/jdk-httpclient-builder-config-loss-cluster-FIXED.md`
+companion issue.
 
 **Overlap with the already-`FIXED` `wrong-receiver-virtual-dispatch-corruption-cluster-FIXED.md`:**
 same architectural family (synthetic object handed to real bytecode with a
@@ -128,8 +129,8 @@ does not cover this code path.
 `SSLSocketFactory`, a third, independent code path from both HttpComponents
 and Jetty. The symptom (self-signed test certificate configured via the
 SSLBundle's trust store is rejected as `UnknownIssuer`) is the same
-high-level defect as the JDK `HttpClient`'s `os error -2146762487` (see
-`jdk-httpclient-builder-config-loss-cluster.md`) — a caller-configured trust
+high-level defect as the JDK `HttpClient`'s former `os error -2146762487` (see
+`../../internal/springboot/jdk-httpclient-builder-config-loss-cluster-FIXED.md`) — a caller-configured trust
 store is not being consulted by whatever validates the peer certificate —
 but this backend doesn't go through `java.net.http.HttpClient` at all, so
 it cannot be the same file:line defect; it is filed here as the same
