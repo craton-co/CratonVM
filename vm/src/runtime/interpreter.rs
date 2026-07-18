@@ -29381,6 +29381,19 @@ fn compile_osr_artifact(
             } else {
                 0
             };
+            // Pure-kernel GPR local homes, OSR tier (perf/halfgap-20260717):
+            // request them like `jit::try_compile` does for method-entry
+            // compiles. The backend engages ONLY when its own purity
+            // conditions hold (no invokes/direct-calls/fields/allocs/
+            // typechecks/spec-BCE — checked against the exact vectors passed
+            // below), keeps reference locals frame-homed, and — unlike the
+            // method-entry tier — publishes real OSR entries: the trampoline
+            // seeds every local into its `osr_local_assignments` register,
+            // which for a kernel body IS its home. Once-invoked kernels
+            // (benchArithmetic, matmul) live entirely in this artifact and
+            // previously ran memory-homed. Opt out:
+            // `CRATONVM_JIT_KERNEL_REG_OSR=0`.
+            crate::jit::x64::set_kernel_reg_homes_osr_request(true);
             let mut cm = crate::jit::x64::compile_with_param_slots(
                 &code,
                 code_len,
