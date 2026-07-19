@@ -3855,8 +3855,18 @@ fn re2_bind_listener(
         TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
+    // A wildcard listener address (0.0.0.0 / ::) is a valid bind target but
+    // not a valid client connect destination on Windows (WSAEADDRNOTAVAIL /
+    // os error 10049) — publish the loopback address instead, mirroring
+    // `native-io/src/socket_channel.rs::advertised_listener_host` (same
+    // rationale, sibling crate, duplicated rather than shared per this
+    // module's existing cross-crate-table pattern above).
     let actual_host = local_addr
-        .map(|a| a.ip().to_string())
+        .map(|a| match a {
+            SocketAddr::V4(a) if a.ip().is_unspecified() => "127.0.0.1".to_string(),
+            SocketAddr::V6(a) if a.ip().is_unspecified() => "::1".to_string(),
+            _ => a.ip().to_string(),
+        })
         .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {
@@ -5997,9 +6007,26 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // concrete HTTP connection without response state and returns EOF.
             if let Some(raw_path) = ext.strip_prefix("file:") {
                 let decoded = uri_percent_decode(raw_path);
-                let mut path = decoded.trim_start_matches('/').to_string();
+                // POSIX: the URL's decoded path (e.g. `/data/data/...`) IS
+                // the absolute filesystem path already -- keep it intact.
+                // Windows: strip the leading `/` and, for the MSYS/Cygwin-
+                // style `/c/...` form (no colon), reinject the drive-letter
+                // colon (`c/foo` -> `c:/foo`) so `new File(path)` resolves.
+                // A prior version unconditionally stripped every leading
+                // `/` before this cfg split existed, so on Linux a `file:`
+                // `URL.openConnection()` built a File from a now-RELATIVE
+                // path (resolved against the JVM's cwd instead of `/`) --
+                // silently breaking every real-bytecode `FileURLConnection`
+                // caller (Xerces DTD/schema entity resolution, WAR resource
+                // loading, ...) whenever the cwd wasn't the fixture root.
+                // `URL.openStream()`'s sibling fast path a few dozen lines
+                // up masked this by retrying with the untrimmed absolute
+                // path on failure; this constructor-based path had no such
+                // fallback. See docs/known-issues/tomcat-08-07/
+                // silent-hang-no-signature-cluster.md.
                 #[cfg(windows)]
-                {
+                let path = {
+                    let mut path = decoded.trim_start_matches('/').to_string();
                     let bytes = path.as_bytes();
                     if bytes.len() >= 2
                         && bytes[0].is_ascii_alphabetic()
@@ -6007,7 +6034,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     {
                         path.insert(1, ':');
                     }
-                }
+                    path
+                };
+                #[cfg(not(windows))]
+                let path = decoded.clone();
                 let file = match ctx.new_object("java/io/File")? {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),

@@ -501,6 +501,11 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // Drop out of `alive_count` / STW `expected` before reclaiming the TLAB so a
     // subsequent `request_stw` no longer waits for this thread.
     shared.thread_registry.mark_dead(tid);
+    // A thread torn down while blocked inside a native call made from within
+    // a `synchronized` region never executes its `monitorexit` bytecode —
+    // release anything it still holds so no future locker waits forever
+    // (see `MonitorTable::release_monitors_held_by`).
+    shared.monitors.release_monitors_held_by(tid);
     // Retire the TLAB: install its tail filler and reset, so the unfilled tail
     // is walkable to the sweep and the freed buffer is never handed back out
     // (the terminating-worker discipline — see jvm_thread/tlab). Dropping the
@@ -710,6 +715,7 @@ fn aio_dispatcher_main() {
         if let Some(tid) = with_foreign_thread(|jt| jt.thread_id) {
             shared.gc_barrier.mark_blocked_region_leave_after(|| {
                 shared.thread_registry.mark_dead(tid);
+                shared.monitors.release_monitors_held_by(tid);
             });
         } else {
             shared.gc_barrier.mark_blocked_region_leave();
@@ -6518,6 +6524,7 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
             if let Some(tid) = tid {
                 shared.gc_barrier.mark_blocked_region_leave_after(|| {
                     shared.thread_registry.mark_dead(tid);
+                    shared.monitors.release_monitors_held_by(tid);
                 });
             } else {
                 shared.gc_barrier.mark_blocked_region_leave();

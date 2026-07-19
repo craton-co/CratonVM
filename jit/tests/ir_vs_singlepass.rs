@@ -141,6 +141,7 @@ fn cached(
         is_synchronized: false,
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     }
 }
 
