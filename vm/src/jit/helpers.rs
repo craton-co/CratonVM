@@ -40,15 +40,29 @@ use crate::vm::SharedVm;
 // private/static helpers, `super` calls), so leaving this off by default is
 // a severe, general JIT throughput regression, not a narrow one.
 //
-// Known residual (pre-existing, not introduced or worsened here): the
-// static CP-owner cache is not a sound target resolver for every
-// invokespecial/static BRIDGE specifically (Lucene DataOutput's `writeByte`
-// bridge resolved as `Object.writeByte` was the originally-observed case) —
-// a synthetic-bridge target-resolution gap, not a receiver-ambiguity one.
-// Re-verified clean against `testSlicesSparseWithFilter` with this flag on
-// (see the ES-HANG doc's results); no reproduction of the bridge case was
-// attempted here. Opt out with `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY=0`
-// if a bridge-resolution regression is ever suspected.
+// Formerly known residual, now FIXED: the static CP-owner cache was not a
+// sound target resolver for every invokespecial/static BRIDGE specifically
+// (Lucene DataOutput's `writeByte` bridge resolved as `Object.writeByte` was
+// the originally-observed case) — a synthetic-bridge target-resolution gap,
+// not a receiver-ambiguity one. Root cause: `info.class_name` (and
+// `try_jit_compile_callee_slow`'s `class_name` parameter more generally) is
+// the literal constant-pool-referenced class for an `invokespecial` site,
+// but that is NOT always the class JVMS §6.5 says method *selection* should
+// start searching from — for a genuine `super.m(...)` call (ACC_SUPER set on
+// the calling class, target not `<init>`, CP-referenced class a genuine
+// superclass of the caller), selection restarts at the CALLING class's own
+// direct superclass instead. A class between the caller and the far-off
+// CP-referenced ancestor that overrides the method (a compiler-generated
+// bridge, or an ordinary override) was walked straight past, landing on a
+// much-less-specific declaration higher up the chain. Fixed by computing the
+// JVMS-correct selection-start class at JIT-compile time (before either
+// `DISPATCH_CACHE` or `jit_cache` ever see the site) via
+// `classloading::invokespecial_selection_start`, applied identically by both
+// the interpreter (`interpreter::invokespecial_owner_class_name`) and the
+// JIT compiler (`jit::try_compile_with_invokespecial_resolver`'s
+// `cp_invokespecial_owner_resolver`), so the two execution modes agree and
+// neither the per-callsite `DISPATCH_CACHE` nor the global `jit_cache` can
+// ever cache a target resolved from the wrong starting class.
 #[inline]
 fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

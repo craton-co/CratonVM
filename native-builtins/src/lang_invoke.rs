@@ -5375,6 +5375,28 @@ pub(crate) fn string_concat_render_value(ctx: &mut dyn NativeContext, v: Value) 
             if let Some(s) = ctx.read_string(obj) {
                 return s;
             }
+            // `java.nio.file.Path` is a genuine interface with no `toString()`
+            // body of its own; `ctx.invoke_virtual` below doesn't consult
+            // `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+            // `check_override` allow-list the way the bytecode interpreter's
+            // own `invokevirtual` handling does, so it silently resolves to
+            // `Object.toString()` for `"literal" + aPath` string
+            // concatenation, printing `java.nio.file.Path@<hash>` instead of
+            // the real path text. Same family as
+            // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+            // a third, distinct call site (this is the actual live
+            // `MH_KIND_STRING_CONCAT` dispatch path — `vm/src/runtime/invokedynamic.rs`'s
+            // own `execute_string_concat`/`value_to_string` has the identical
+            // fix for whatever shapes still reach that older code path).
+            // Route through the same display-string helper the registered
+            // `Path.toString()` native itself uses, bypassing `invoke_virtual`
+            // entirely for this type.
+            let cid = ctx.class_id_of_object(obj);
+            if let Some(path_id) = ctx.class_id_by_name("java/nio/file/Path") {
+                if ctx.is_subclass(cid, path_id) {
+                    return crate::phases_late::p57_path_display_string(ctx, obj);
+                }
+            }
             // Best-effort: call Object.toString(); if it returns a String,
             // unwrap it. Failure modes fall through to the class@hash form.
             //
