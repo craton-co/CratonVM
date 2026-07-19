@@ -11667,6 +11667,7 @@ mod deopt_step3_tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -11687,6 +11688,7 @@ mod deopt_step3_tests {
             is_synchronized: true,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -12182,6 +12184,7 @@ mod deopt_step3_tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -21070,6 +21073,7 @@ fn try_invoke_cached_lambda_impl(
                 is_synchronized: false,
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -26550,9 +26554,17 @@ fn intercept_force_registered_native_cached(
     {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find(class_name, method_name, method_descriptor)?;
+    // Perf (2026-07-19, TestResponsePerformance residual): memoize the
+    // resolved callback per invoke-cache entry, same shape as
+    // `force_native_cache` above -- native registration is immutable after
+    // boot, so this triple always resolves to the same callback. Confirmed
+    // via `perf` that `NativeMethodRegistry::find` was the #2 hottest
+    // symbol (~7% of samples) on this exact benchmark before this fix.
+    let cb = (*cached.native_callback_cache.get_or_init(|| {
+        shared
+            .native_methods
+            .find(class_name, method_name, method_descriptor)
+    }))?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
@@ -28577,6 +28589,7 @@ fn populate_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -31442,6 +31455,7 @@ fn try_jit_upgrade_with_gate(
                 is_synchronized: method.is_synchronized(),
                 is_static: method.is_static(),
                 force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
             };
             drop(cm);
 
@@ -32266,6 +32280,7 @@ fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
     drop(cm);
 
@@ -36749,6 +36764,7 @@ fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -40837,6 +40853,7 @@ mod tests {
             is_synchronized: false,
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(

@@ -13,6 +13,10 @@ more real allocator bugs were found and fixed along the way. **Severity:**
 downgraded from high (indefinite silent hang, 2 classes) / medium (1 class)
 to: RESOLVED (2 classes) / medium, fully diagnosed (1 class, no longer
 silent). **HotSpot:** PASS on all 3 (fresh-verified, prior checkpoint).
+**2026-07-19 follow-up**: confirmed via heap bisection that the `-Xmx2g` OOM
+is a hard floor, not a leak (`-Xmx2560m`+ runs clean) -- see that section
+below for the practical workaround (run at >=2.5g) and a new, separate,
+non-fatal "stale pointer" finding worth a dedicated pickup.
 
 ## 2026-07-19 update: real root cause found for the TestContextConfig/TestValidator hang
 
@@ -209,6 +213,124 @@ hang:
    retention bug) — not distinguished in this session. Worth a dedicated
    follow-up with heap-dump/root-tracing tooling rather than further gdb
    backtrace sampling.
+
+## 2026-07-19 follow-up session: native-callback caching + heap-threshold characterization
+
+Picked the `TestResponsePerformance` residual back up as a dedicated follow-up
+(worktree `/data/wt-tomcat-trp-residual-20260719`, branch
+`codex/fix-tomcat-trp-residual-20260719`, based on `dev` @ `63bdd1f72`).
+
+### Fix: memoize the resolved `NativeCallback` per invoke-cache entry (real, verified improvement)
+
+`intercept_force_registered_native_cached` (`vm/src/runtime/interpreter.rs`)
+already memoized the *boolean* `force_native_over_real_jdk_bytecode` result
+per callsite (landed 2026-07-15, `3d1449a7d`) but still called
+`NativeMethodRegistry::find(class_name, method_name, method_descriptor)` —
+a hash-keyed lookup — on **every** hit once `force_native` was `true`. A
+fresh `perf` profile confirmed this was still the #2 hottest symbol
+(~6.8-7.7% of samples, second only to the interpreter's own frame-dispatch
+loop) on the exact same `TestResponsePerformance` benchmark.
+
+Added `CachedBytecodeMethod::native_callback_cache: OnceLock<Option<NativeCallback>>`
+(`jit-api/src/lib.rs`, same pattern as the existing `force_native_cache`;
+required adding `cratonvm-native-api` as a dependency of `cratonvm-jit-api` —
+verified no circular dependency, `native-api` has no back-edge to `jit-api`),
+populated at all 28 `CachedBytecodeMethod` construction sites across
+`vm/`, `jit/`, and `classloading/`, and used it in place of the direct
+`.find()` call. Native registration is immutable after VM boot (no
+redefinition path touches the registry), so this is sound by the identical
+argument already used to justify `force_native_cache`.
+
+**Verified via before/after `perf` profiles** (same binary state, same
+benchmark, `-F 999` sampling): `NativeMethodRegistry::find` dropped from
+~6.8-7.7% to ~5.1-7.1% of samples (noisy across runs but consistently lower).
+**Wall-clock for `doHomebrew()` itself did not measurably change** — traced
+this to the fact that `toAbsolute()`'s dominant cost,
+`CharChunk.append()`, is real bytecode with no native override at all, so it
+never reaches this cached-dispatch path; only `CharChunk.toString()` (called
+once per iteration) benefits, a small fraction of the loop's total work. This
+fix is still a real, non-regressing win (confirmed via `cargo check`, a full
+release build, and TWO full reruns of `TestContextConfig`/`TestValidator`
+at the canonical `-Xmx2g`, both still `OK (8 tests)` / `OK (11 tests)`,
+~593-624s / ~428-436s) — landing it because "measurably reduces a top-2
+hotspot with zero regression risk" clears the bar even without moving this
+specific benchmark's needle, but it is **not** the fix for the relative-perf
+residual.
+
+### Heap-threshold bisection: `-Xmx2g` OOM is a hard floor, NOT a leak
+
+Ran `TestResponsePerformance` at `-Xmx2560m`, `-Xmx3g`, and `-Xmx3584m` (in
+parallel, same binary carrying both the 2026-07-19-morning OOM-safety fixes
+and the native-callback-cache fix above). **All three completed cleanly** —
+`Time: 611.5-624.5s`, `Tests run: 1, Failures: 1` (the known relative-perf
+assertion, not a crash) — **zero `FATAL:` OOM aborts** at any of the three
+sizes, vs. a reliable abort at the canonical `-Xmx2g` (confirmed same-day,
+same binary, separately). A genuine unbounded leak would be expected to
+still manifest (just later) at a 25-75% larger heap; a clean pass at
+`-Xmx2560m` (only 25% more than the failing `-Xmx2g`) is much more
+consistent with **`-Xmx2g` sitting just under this specific workload's
+actual live-set + fragmentation floor** on CratonVM's current object
+representation than with a retention bug. Recommend closing the "is it a
+leak" question as NO (floor, not leak) unless a future investigation finds
+contrary evidence; the remaining open question is *why* the floor is higher
+than HotSpot's for the identical logical workload (a separate,
+memory-density question from the relative-perf-vs-URI question).
+
+### New finding: non-fatal "stale pointer" defensive-recovery warning at 2.5g-3g (OPEN, not investigated further)
+
+Both the `-Xmx2560m` and `-Xmx3g` runs (but **not** `-Xmx3584m`, and never
+observed at the previously-tested `-Xmx4g`) repeatedly logged:
+
+```
+WARN cratonvm_vm::runtime::interpreter: Stale pointer detected in invokevirtual
+receiver (ptr=0x..., all-zero header) — falling back to CP class java/lang/String
+WARN cratonvm::gc::guard: gen_heap::get_field: out-of-bounds field read dropped
+(caller used slot index past receiver's layout — class layout is correct; the
+bug is in the caller's slot computation, typically a speculative
+collection-layout probe dispatched on a non-matching receiver type)
+obj=0x... index=0 num_slots=0 class_id=ClassId(0) class_name=java/lang/Object
+real_field_count=Some(0)
+```
+
+This is the VM's own defensive guard catching itself — it recovers instead of
+corrupting state or crashing, so it did **not** cause either the OOM abort or
+the relative-perf assertion failure (both already present/absent
+independently of this warning). But it IS evidence of a real, previously
+undetected bug: some **JIT speculative collection-layout probe** dispatches
+against a receiver whose pointer has gone stale (all-zero header — pointing
+at unformatted/zeroed memory) specifically in this narrow
+2.5g-3g memory-pressure window, twice per run in both cases observed. Given
+the extensive existing `stale-objectref`/precise-roots bug family already
+tracked in this codebase's history (see prior GC/roots work), this smells
+like the same class of issue, not a new mechanism — but was NOT
+root-caused or fixed this session (out of scope for a quick follow-up; needs
+the dedicated GC/JIT-roots investigation methodology already used for that
+bug family, e.g. `CRATONVM_DBG_STALE_OBJREF`-style tracing). Worth a
+dedicated pickup: reproduce reliably at `-Xmx2560m` (2 occurrences per
+~610s run observed, so not rare), then trace which specific collection-type
+speculative probe (HashMap/ArrayList-style inline field access, per the
+guard's own message) is involved and whether it's the same root cause as
+prior stale-ObjectRef findings or a new one.
+
+### Updated recommendation for this residual
+
+1. The relative-perf assertion (`CharChunk`-based home-brew ~3x slower than
+   `URI`-based) remains open and unattributed to any single fixable call
+   site — `perf` self-time profiling (flat and call-graph, both attempted)
+   didn't cleanly isolate a dominant cause beyond the general interpreter
+   dispatch machinery already characterized in the 2026-07-19-morning entry.
+   Next step, if picked up again: instrument per-bytecode-instruction
+   counts (not perf sampling) for `CharChunk.append()`'s real-bytecode body
+   specifically, compared against `URI`'s real-bytecode body, to find
+   whether one genuinely executes far more instructions per logical
+   operation (an algorithmic gap) vs. executes a similar instruction count
+   markedly slower (a dispatch-overhead gap) — the two point to very
+   different next fixes.
+2. The "stale pointer" finding above is a solid, reproducible, currently
+   uninvestigated lead — probably the highest-value next pickup given the
+   codebase's track record on this bug family.
+3. Heap-threshold question is closed (floor, not leak) — no further action
+   needed on that specific question.
 
 ## Summary (original 2026-07-13 finding, retained for history)
 
