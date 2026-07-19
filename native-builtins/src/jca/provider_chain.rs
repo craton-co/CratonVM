@@ -2600,8 +2600,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // practice: every other engine (`MessageDigest`/RSA/AES/…) keeps its
     // always-on synthetic native, so only real EC/DSA bytecode ever falls
     // through to here.
-    let ec_real =
-        crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real();
+    let ec_real = crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real();
     if ec_real {
         // Mirror SunEC's EC service table into our map so the no-provider
         // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.

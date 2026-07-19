@@ -505,7 +505,8 @@ fn build_parameter_array(
         let p = ctx.read_native_pin(p_pin, p);
         let name = ctx.read_native_pin(name_pin, name);
         ctx.unpin_native_roots(p_pin);
-        let declaring_executable = ctx.read_native_pin(declaring_executable_pin, declaring_executable);
+        let declaring_executable =
+            ctx.read_native_pin(declaring_executable_pin, declaring_executable);
 
         // Real-JDK Parameter layout (name, modifiers, executable, index) —
         // write by field name so the REAL Parameter bytecode works:
@@ -702,11 +703,18 @@ pub(crate) fn native_method_get_default_value(
     // empty arrays carry the correct component class (avoids the
     // `Object[]`-as-`Annotation[]` aliasing in Spring's `adaptValue`).
     let ret_desc = desc.strip_prefix("()").map(|s| s.to_string());
+    // Annotation defaults containing `Class` values are resolved by the JDK
+    // in the declaring annotation interface's defining loader. In particular,
+    // Spring compares an explicit `@Reflective(value = X.class)` value with
+    // the `processors()` default through identity-sensitive Class equality;
+    // resolving this default globally made the two otherwise identical
+    // `SimpleReflectiveProcessor.class` mirrors come from different forks.
+    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     Ok(Some(crate::lang_class::annotation_element_to_java_typed(
         ctx,
         &default,
         ret_desc.as_deref(),
-        None,
+        container_loader,
     )))
 }
 
@@ -1774,11 +1782,16 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     // bytecode getTypeName() path currently loses the first type argument while
     // joining names, so render the same field shape directly.
     let spring_spt = "org/springframework/core/ResolvableType$SyntheticParameterizedType";
-    registry.register(spring_spt, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
-        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-    });
+    registry.register(
+        spring_spt,
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let s = crate::phases_late::render_type_name(ctx, &Value::Object(Some(this)));
+            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+        },
+    );
     registry.register(
         spring_spt,
         "getTypeName",
@@ -2135,12 +2148,13 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         }
         None
     }
-    fn empty_annotation_array(
-        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
-    ) -> Value {
+    fn empty_annotation_array(ctx: &mut dyn cratonvm_native_api::registry::NativeContext) -> Value {
         let cid = ctx
             .class_id_by_name("java/lang/annotation/Annotation")
-            .or_else(|| ctx.ensure_class_initialized("java/lang/annotation/Annotation").ok())
+            .or_else(|| {
+                ctx.ensure_class_initialized("java/lang/annotation/Annotation")
+                    .ok()
+            })
             .unwrap_or(cratonvm_types::ClassId::new(0));
         Value::Object(Some(ctx.new_ref_array(cid, 0)))
     }

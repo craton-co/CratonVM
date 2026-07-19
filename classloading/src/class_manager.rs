@@ -1876,8 +1876,7 @@ impl ClassManager {
         match requesting_loader {
             ClassLoaderId::Bootstrap | ClassLoaderId::Extension | ClassLoaderId::Application => {
                 for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
-                    {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
                         return Some(id);
                     }
                     // A built-in loader never delegates DOWN to its children.
@@ -1899,8 +1898,7 @@ impl ClassManager {
                     }
                 }
                 for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name)
-                    {
+                    if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, name) {
                         return Some(id);
                     }
                 }
@@ -2763,9 +2761,7 @@ impl ClassManager {
     /// genuinely failing to find real bytes for `name` -- i.e. only when no
     /// better, classpath-backed answer could possibly exist.
     pub fn resolve_fast_path_class_id(&self, name: &str) -> Option<ClassId> {
-        if let Some(id) =
-            self.get_loaded_class_id_for_requester(name, ClassLoaderId::Application)
-        {
+        if let Some(id) = self.get_loaded_class_id_for_requester(name, ClassLoaderId::Application) {
             return Some(id);
         }
         let candidate = self.get_loaded_class_id(name)?;
@@ -5472,7 +5468,17 @@ impl ClassManager {
         name: &str,
         loader_id: ClassLoaderId,
     ) -> Option<ClassId> {
-        loaded_classes_probe(&self.loaded_classes, loader_id, name)
+        loaded_classes_probe(&self.loaded_classes, loader_id, name).or_else(|| {
+            // The per-loader index is the normal O(1) path.  A few
+            // re-entrant defineClass paths can expose a fully usable Class
+            // before that index has been populated; retain exact defining
+            // loader semantics on that cold path instead of collapsing to an
+            // unrelated application-loader copy.
+            self.class_store
+                .iter()
+                .find(|class| class.loader_id == loader_id && &*class.name == name)
+                .map(|class| class.id)
+        })
     }
 
     pub fn find_class_by_name_in_loader(
@@ -13998,7 +14004,6 @@ mod tests {
     }
 }
 
-
 /// Internal names of classes provided by jars appended at runtime via
 /// `Instrumentation.appendToBootstrapClassLoaderSearch` (Mockito injects its
 /// `MockMethodDispatcher` this way and asserts a null defining loader).
@@ -14007,9 +14012,8 @@ mod tests {
 /// fork, which re-defines every resolvable name from resources) still lets
 /// the BOOTSTRAP loader serve these classes -- exactly what HotSpot does,
 /// since parent delegation always runs before `findClass`.
-static BOOTSTRAP_APPENDED_CLASSES: std::sync::OnceLock<
-    std::sync::RwLock<FxHashSet<String>>,
-> = std::sync::OnceLock::new();
+static BOOTSTRAP_APPENDED_CLASSES: std::sync::OnceLock<std::sync::RwLock<FxHashSet<String>>> =
+    std::sync::OnceLock::new();
 
 fn bootstrap_appended_classes() -> &'static std::sync::RwLock<FxHashSet<String>> {
     BOOTSTRAP_APPENDED_CLASSES.get_or_init(|| std::sync::RwLock::new(FxHashSet::default()))

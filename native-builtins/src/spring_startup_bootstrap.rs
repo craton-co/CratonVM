@@ -232,6 +232,76 @@ fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 // Also stash the env on `SpringApplication.environment` so the field-read
 // fast path (`if (environment != null) return environment;`) finds it on
 // subsequent invocations.
+/// Build the `WebApplicationType`-specific environment
+/// (`ApplicationServletEnvironment` / `ApplicationReactiveWebEnvironment` /
+/// `ApplicationEnvironment`) via the real `ApplicationContextFactory
+/// .createEnvironment` SPI path, mirroring `SpringApplication
+/// .getOrCreateEnvironment()`'s real bytecode
+/// (`this.applicationContextFactory.createEnvironment(webApplicationType)`).
+///
+/// Without this, `spring_app_get_or_create_environment` below always built a
+/// generic `StandardEnvironment` regardless of web application type. The
+/// LATER `EnvironmentConverter.convertEnvironmentIfNecessary` pass (run from
+/// `SpringApplication.prepareEnvironment` after property binding) papers
+/// over this for callers that only observe the environment after `run()`
+/// returns — but an `ApplicationEnvironmentPreparedEvent` listener observes
+/// the environment BEFORE that conversion pass runs, and sees the wrong
+/// (generic) type. See `SpringApplicationWebServerTests
+/// .webApplicationSwitchedOffInListener`, which asserts the listener's
+/// environment ends with "ApplicationServletEnvironment".
+///
+/// Returns `None` (caller falls back to the generic environment) if the
+/// `properties`/`applicationContextFactory` fields aren't found or the
+/// factory returns null for this web application type (e.g. `NONE`, where
+/// Spring Boot itself falls through to a plain `ApplicationEnvironment` —
+/// handled by the caller's existing fallback).
+fn create_web_application_environment(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    // GC-safety: the invoke_virtual calls below can allocate/collect and
+    // relocate `this`; pin across the helper and re-read before the second
+    // field access.
+    let this_pin = ctx.pin_native_root(this);
+
+    let properties = match ctx.get_field_by_name(this, "properties") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+    let web_app_type = match ctx.invoke_virtual(
+        properties,
+        "getWebApplicationType",
+        "()Lorg/springframework/boot/WebApplicationType;",
+        &[],
+    ) {
+        Ok(Some(v @ Value::Object(_))) => v,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let factory = match ctx.get_field_by_name(this, "applicationContextFactory") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+
+    const DESC: &str = "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/core/env/ConfigurableEnvironment;";
+    let result = match ctx.invoke_virtual(factory, "createEnvironment", DESC, &[web_app_type]) {
+        Ok(Some(Value::Object(Some(env)))) => Some(env),
+        _ => None,
+    };
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn spring_app_get_or_create_environment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -243,6 +313,16 @@ fn spring_app_get_or_create_environment(
     // get_environment above).
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Value::Object(Some(env)) = ctx.get_field_by_name(*this, "environment") {
+            return Ok(Some(Value::Object(Some(env))));
+        }
+        // Prefer the WebApplicationType-specific environment over the
+        // generic StandardEnvironment fallback below — see
+        // create_web_application_environment's doc comment.
+        if let Some(env) = create_web_application_environment(ctx, *this) {
+            let this_pin = ctx.pin_native_root(*this);
+            let this = ctx.read_native_pin(this_pin, *this);
+            ctx.set_field_by_name(this, "environment", Value::Object(Some(env)));
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(Some(env))));
         }
         // GC-safety: `construct_real_standard_environment` below allocates
@@ -2933,15 +3013,11 @@ fn throw_cannot_load_bean_class_exception(
             let class_name_val = Value::Object(Some(ctx.create_string(bean_class_name)));
             let exc = ctx.read_native_pin(exc_pin, exc);
             let resource_val = match (resource_val, resource_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => resource_val,
             };
             let name_val = match (name_val, name_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => name_val,
             };
             let cause = ctx.read_native_pin(cause_pin, cause);

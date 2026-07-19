@@ -2431,14 +2431,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         "FINE" | "FINER" | "FINEST" => {
             publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
             if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-                publish_to_jul_handlers_src(
-                    ctx,
-                    logger,
-                    level,
-                    message,
-                    src_cls_obj,
-                    src_mth_obj,
-                )?;
+                publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
             }
             return Ok(None);
         }
@@ -2613,9 +2606,9 @@ fn jul_resolve_msg(ctx: &mut dyn NativeContext, o: ObjectRef) -> String {
     }
     let supplier_class = ctx.class_id_by_name("java/util/function/Supplier");
     let object_class = ctx.class_id_of_object(o);
-    if supplier_class.is_some_and(|supplier| {
-        object_class == supplier || ctx.is_subclass(object_class, supplier)
-    }) {
+    if supplier_class
+        .is_some_and(|supplier| object_class == supplier || ctx.is_subclass(object_class, supplier))
+    {
         if let Ok(Some(Value::Object(Some(r)))) =
             ctx.invoke_virtual(o, "get", "()Ljava/lang/Object;", &[])
         {

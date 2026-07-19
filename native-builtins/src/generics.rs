@@ -9,9 +9,11 @@
 //! GenericArrayType}` heap objects via `NativeContext`.
 
 use cratonvm_native_api::registry::NativeContext;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use std::cell::Cell;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 thread_local! {
     /// The `GenericDeclaration` (Class / Method / Constructor mirror) that owns
@@ -25,6 +27,49 @@ thread_local! {
     /// for the duration of its conversion via [`GenericDeclScope`].
     static GENERIC_DECL_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
     static TYPE_PARAM_BUILD_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
+}
+/// A recursive generic bound must reuse the TypeVariable currently being
+/// constructed. For example, while building L extends T, resolving T through
+/// Class.getTypeParameters() would otherwise re-enter the native builder; the
+/// guard below then creates a fallback T with Object as its bound.
+fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, ClassId, String), i32>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, ClassId, String), i32>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_building_type_parameter(
+    ctx: &mut dyn NativeContext,
+    decl: ObjectRef,
+    name: &str,
+) -> Option<Value> {
+    let key = (
+        ctx.vm_identity(),
+        ctx.class_id_from_mirror(decl)?,
+        name.to_string(),
+    );
+    let ident = *type_parameter_build_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)?;
+    ctx.read_var_handle_root(ident)
+        .map(|tv| Value::Object(Some(tv)))
+}
+
+fn cache_building_type_parameter(
+    ctx: &mut dyn NativeContext,
+    decl: ObjectRef,
+    name: &str,
+    tv: ObjectRef,
+) {
+    let Some(class_id) = ctx.class_id_from_mirror(decl) else {
+        return;
+    };
+    ctx.register_var_handle_root(tv);
+    let ident = ctx.identity_hash_code(tv);
+    type_parameter_build_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((ctx.vm_identity(), class_id, name.to_string()), ident);
 }
 
 /// RAII guard installing the current [`GENERIC_DECL_SCOPE`] and restoring the
@@ -83,11 +128,16 @@ fn current_generic_decl() -> Value {
 /// binary name: its reflective `ParameterizedType` must contain raw classes
 /// from that declaration's own loader, otherwise generic resolvers compare
 /// incompatible class identities.
-fn class_id_in_generic_scope(ctx: &dyn NativeContext, name: &str) -> Option<cratonvm_types::ClassId> {
-    let scoped = GENERIC_DECL_SCOPE.with(|scope| scope.get()).and_then(|decl| {
-        ctx.class_id_from_mirror(decl)
-            .and_then(|near| ctx.class_id_by_name_near(name, near))
-    });
+fn class_id_in_generic_scope(
+    ctx: &dyn NativeContext,
+    name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let scoped = GENERIC_DECL_SCOPE
+        .with(|scope| scope.get())
+        .and_then(|decl| {
+            ctx.class_id_from_mirror(decl)
+                .and_then(|near| ctx.class_id_by_name_near(name, near))
+        });
     scoped.or_else(|| ctx.class_id_by_name(name))
 }
 
@@ -124,6 +174,9 @@ fn resolve_declared_type_variable(
     decl: ObjectRef,
     name: &str,
 ) -> Option<Value> {
+    if let Some(type_variable) = cached_building_type_parameter(ctx, decl, name) {
+        return Some(type_variable);
+    }
     if is_building_type_params_for(decl) {
         return None;
     }
@@ -588,6 +641,14 @@ pub fn type_param_to_java(
     };
     let tv = ctx.read_native_pin(tv_pin, tv);
     ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
+    // Publish only after this variable's own bounds are complete. A self-bound
+    // such as T extends Comparable<T> must still use the bounded fallback while
+    // its recursive graph is being materialized; subsequent parameters (for
+    // example L extends T) reuse this canonical completed object.
+    if let Value::Object(Some(decl)) = generic_decl {
+        let tv = ctx.read_native_pin(tv_pin, tv);
+        cache_building_type_parameter(ctx, decl, &tp.name, tv);
+    }
     ctx.unpin_native_roots(tv_pin);
     Value::Object(Some(tv))
 }
@@ -642,21 +703,41 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 ctx.set_array_element(args, i, v);
             }
             args = ctx.read_native_pin(args_pin, args);
-            // Owner type: reify the enclosing `Outer<...>` node (recursively a
-            // real PTI when it is itself parameterized) so callers that walk
-            // getOwnerType() — Spring's ResolvableType/GenericTypeResolver
-            // variable resolvers — can bind type variables declared by the
-            // enclosing generic class. Null for top-level types and for
-            // `$`-flattened nested names where the signature carried no
-            // parameterized owner (owner == None).
+            // A nested generic class has an owner even when the classfile
+            // signature uses a flattened binary name and carries no
+            // parameterized owner node. HotSpot returns the raw enclosing
+            // Class in that case; returning null loses the declaration context
+            // and makes Spring resolve same-named variables against a sibling
+            // interface (Create.I versus Search.I).
             let owner_val = match owner {
                 Some(o) => typesig_to_real_type(ctx, o),
-                None => Value::Object(None),
+                None => match slashed.rsplit_once('$') {
+                    Some((outer, _)) => {
+                        let owner_id = class_id_in_generic_scope(ctx, outer).or_else(|| {
+                            let _ = ctx.load_class(outer);
+                            class_id_in_generic_scope(ctx, outer)
+                        });
+                        owner_id
+                            .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
+                            .unwrap_or(Value::Object(None))
+                    }
+                    None => Value::Object(None),
+                },
+            };
+            let owner_pin = match owner_val {
+                Value::Object(Some(owner)) => Some(ctx.pin_native_root(owner)),
+                _ => None,
             };
             args = ctx.read_native_pin(args_pin, args);
             raw_mirror = ctx.read_native_pin(raw_pin, raw_mirror);
             let nfields = ctx.class_num_total_fields(pti_cid).max(3);
             let pti = ctx.alloc_object(pti_cid, nfields);
+            let owner_val = match (owner_val, owner_pin) {
+                (Value::Object(Some(owner)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, owner)))
+                }
+                _ => owner_val,
+            };
             ctx.set_field_by_name(pti, "rawType", Value::Object(Some(raw_mirror)));
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
             ctx.set_field_by_name(pti, "ownerType", owner_val);

@@ -66,7 +66,48 @@ pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
     register_jdbc_service_loader(registry);
     register_jdbc_driver_helpers(registry);
     register_sql_datetime_natives(registry);
+    register_derby_embedded_connection_native(registry);
     registry.set_category(__prev_cat);
+}
+
+/// Derby runs an embedded login through a temporary executor solely to enforce
+/// the caller's login timeout.  Real-JDK startup is substantially slower under
+/// the interpreter than the default Hikari 30-second budget, even though the
+/// in-memory database opens correctly.  For the local `jdbc:derby:memory:`
+/// transport there is no external operation that could need cancellation, so
+/// invoke Derby's actual connection factory synchronously.  Non-memory Derby
+/// URLs retain Derby's ordinary timeout path.
+fn register_derby_embedded_connection_native(registry: &mut NativeMethodRegistry) {
+    const INTERNAL_DRIVER: &str = "org/apache/derby/iapi/jdbc/InternalDriver";
+    const CONNECT: &str = "(Ljava/lang/String;Ljava/util/Properties;I)Ljava/sql/Connection;";
+    const GET_ATTRIBUTES: &str = "(Ljava/lang/String;Ljava/util/Properties;)Lorg/apache/derby/iapi/services/io/FormatableProperties;";
+    const NEW_CONNECTION: &str = "(Ljava/lang/String;Ljava/util/Properties;)Lorg/apache/derby/impl/jdbc/EmbedConnection;";
+    registry.register(INTERNAL_DRIVER, "connect", CONNECT, |ctx, args| {
+        let this = crate::obj_arg(args, 0)?;
+        let is_memory_url = match args.get(1) {
+            Some(Value::Object(Some(url))) => ctx
+                .read_string(*url)
+                .is_some_and(|url| url.starts_with("jdbc:derby:memory:")),
+            _ => false,
+        };
+        if is_memory_url {
+            // `connect` normally parses URL attributes (notably `;create=true`) before
+            // constructing the connection. Preserve that setup while bypassing only the
+            // timeout executor.
+            let Some(attributes) =
+                ctx.invoke_virtual(this, "getAttributes", GET_ATTRIBUTES, &args[1..3])?
+            else {
+                return Ok(None);
+            };
+            return ctx.invoke_virtual(
+                this,
+                "getNewEmbedConnection",
+                NEW_CONNECTION,
+                &[args[1].clone(), attributes],
+            );
+        }
+        ctx.invoke_special_bytecode_only(INTERNAL_DRIVER, "connect", CONNECT, args)
+    });
 }
 
 fn register_sql_datetime_natives(registry: &mut NativeMethodRegistry) {

@@ -221,6 +221,27 @@ fn get_kpg_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
     kpg_algo_table().lock().get(&key).copied()
 }
 
+// `KeyFactory` has the same real-JDK-layout problem as KeyPairGenerator: its
+// private native state sits beyond the fields declared by the JDK class. A
+// raw-slot write can therefore be dropped or coerced, leaving generatePublic
+// to report the placeholder algorithm "Unknown". Keep its algorithm in the
+// same GC-stable identity-keyed side-table scheme.
+fn kf_algo_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, i32>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_kf_algo(ctx: &dyn NativeContext, this: ObjectRef, idx: i32) {
+    let key = kpg_obj_key_for(ctx, this);
+    kf_algo_table().lock().insert(key, idx);
+}
+
+fn get_kf_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    let key = kpg_obj_key_for(ctx, this);
+    kf_algo_table().lock().get(&key).copied()
+}
+
 /// Preserve the caller's requested spelling for `getAlgorithm()` and diagnostic
 /// errors. An algorithm index alone cannot represent unrecognised names.
 fn kpg_name_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, String>> {
@@ -1857,8 +1878,22 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = kf_algo_idx(&alg);
+    // `KeyFactory.getInstance` must reject an unrecognised name. In
+    // particular, `X509Key.buildX509Key` deliberately catches
+    // `NoSuchAlgorithmException` and falls back to a generic `X509Key` for
+    // certificates with an unknown SubjectPublicKeyInfo OID. Returning a
+    // synthetic factory with `Unknown` state instead makes its later
+    // `generatePublic` throw `InvalidKeySpecException`, bypassing that JDK
+    // fallback and rejecting certificates that HotSpot accepts.
+    if idx < 0 {
+        return Err(throw_no_such_algorithm(
+            ctx,
+            &format!("{alg} KeyFactory not available"),
+        ));
+    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let kf = alloc_concurrent_synthetic(ctx, "java/security/KeyFactory", base + KF_PRIVATE_SLOTS);
+    set_kf_algo(ctx, kf, idx);
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
     Ok(Some(Value::Object(Some(kf))))
 }
@@ -1874,10 +1909,10 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
+    let algo = get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
-    };
+    });
     // EdDSA / XDH: reconstruct concrete SunEC Ed25519/Ed448/X25519/X448 keys
     // from the standard EdECPublicKeySpec/XECPublicKeySpec/X509EncodedKeySpec.
     // Keycloak builds an EdECPublicKeySpec while importing OKP JWKs; Spring
@@ -2114,10 +2149,10 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
+    let algo = get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
-    };
+    });
     // EdDSA / XDH: mirrors `kf_generate_public`'s route (curve-specific or
     // generic "EdDSA"/"XDH", curve sniffed from the spec's own OID when
     // generic). This is the private-key half of the PemPrivateKeyParser fix
@@ -3011,6 +3046,15 @@ mod tests {
         ctx.set_field(spec, 0, Value::Object(Some(arr)));
         assert_eq!(resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true), ALGO_ED25519);
         assert_eq!(resolve_curve_algo(&mut ctx, ALGO_RSA, spec, true), ALGO_RSA);
+    }
+
+    #[test]
+    fn unknown_keyfactory_algorithm_throws_from_get_instance() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let name = ctx.create_string("1.2.840.113549.0.8456");
+        let err = kf_get_instance(&mut ctx, &[Value::Object(Some(name))])
+            .expect_err("unknown KeyFactory algorithm must not yield a synthetic factory");
+        assert!(matches!(err, MethodCallFailed::ExceptionThrown(_)));
     }
 
     #[test]
