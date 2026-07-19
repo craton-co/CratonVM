@@ -1773,7 +1773,6 @@ pub(crate) fn native_class_for_name(
         }),
         _ => None,
     };
-
     if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
         eprintln!(
             "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
@@ -1809,6 +1808,57 @@ pub(crate) fn native_class_for_name(
     // then reuses the first interpreter's generated MyMessenger class and
     // Spring's prototype script casts fail.
     if let Some((loader, initialize)) = effective_loader {
+        // Groovy CGLIB-proxy fix (2026-07-19): `Class.forName(name, init,
+        // loader)` on real HotSpot consults the JVM's internal "already
+        // defined by exactly this loader" table BEFORE ever calling
+        // `loader.loadClass(name)` -- it does not rely on the loader's own
+        // bytecode to rediscover a class the JVM itself already knows that
+        // loader defined. Groovy's `GroovyClassLoader$InnerLoader` breaks
+        // that assumption for us: its `loadClass(String)` override
+        // unconditionally forwards to the *outer* shared `GroovyClassLoader`
+        // (`return delegate.loadClass(name);`), never re-consulting its own
+        // namespace. A CGLIB proxy generated via `Lookup.defineClass` against
+        // a Groovy-compiled class is defined under the *InnerLoader's* own
+        // namespace (correctly), but the immediately-following
+        // `Class.forName(proxyName, true, innerLoader)` — cglib's
+        // `ReflectUtils.defineClass`'s final "force <clinit>" call, with no
+        // surrounding try/catch — dispatched straight to
+        // `invoke_virtual(loader, "loadClass", ...)` and so never looked at
+        // InnerLoader's own namespace either, instead riding whatever the
+        // outer loader's `findClass` happened to resolve. The outer loader's
+        // own delegation (`cl_load_class_base_delegation` ->
+        // `class_id_by_name_and_loader` -> `find_class_by_name_in_loader`'s
+        // parent-chain fallback) lands on the loader-blind, ambiguity-aware
+        // `find_class_by_name`, which "worked" only by accident while a
+        // single Groovy-compiled class of that generated name existed
+        // process-wide -- and correctly refused to guess (returning a miss)
+        // the moment a SECOND Groovy compile unit (a second test method, a
+        // second `GroovyClassLoader$InnerLoader`) defined its own distinct
+        // class under the exact same generated name, surfacing as a genuine
+        // `ClassNotFoundException` inside cglib's un-caught final line —
+        // `AopConfigException: Could not generate CGLIB subclass ...`
+        // (`GroovyAspectTests`/`GroovyAspectIntegrationTests`,
+        // `GroovyScriptFactoryTests::proxyTargetClassNotAllowedIfNotGroovy`).
+        // Checking the *exact* loader's own namespace first — the same
+        // authoritative relation `inherit_lookup_loader` already used to
+        // place the class there in the first place — resolves it directly,
+        // matching HotSpot's semantics and bypassing the loader's own
+        // (here, misleading) `loadClass` bytecode entirely when the answer
+        // is already known.
+        if crate::classloader::is_user_defined_loader(ctx, loader) {
+            if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(
+                ctx,
+                loader,
+                &internal_name,
+            ) {
+                if initialize {
+                    if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                        ctx.initialize_class(cid)?;
+                    }
+                }
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+        }
         let loader_class_name_debug = {
             let cid = ctx.class_id_of_object(loader);
             ctx.class_name_of_id(cid).unwrap_or_default()
