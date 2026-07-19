@@ -819,6 +819,7 @@ pub fn vtable_install_adapter(
                             is_synchronized: snap.is_synchronized,
                             is_static: snap.is_static,
                             force_native_cache: std::sync::OnceLock::new(),
+                            native_callback_cache: std::sync::OnceLock::new(),
                         });
                         (Some(cached), false)
                     }
@@ -1527,6 +1528,7 @@ mod tests {
             is_synchronized: false,
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     }
 

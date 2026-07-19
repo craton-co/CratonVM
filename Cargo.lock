@@ -564,6 +564,7 @@ dependencies = [
 name = "cratonvm-jit-api"
 version = "0.3.0"
 dependencies = [
+ "cratonvm-native-api",
  "cratonvm-reader",
  "cratonvm-types",
 ]
