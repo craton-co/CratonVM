@@ -6160,6 +6160,13 @@ fn native_map_remove_pinned(
         Some(b) => b,
         None => return Ok(Some(Value::Object(None))),
     };
+    // `map_keys_equal` below (via `node_matches_inner`) runs the key's
+    // `equals()` -- arbitrary Java bytecode that can allocate and trigger a
+    // GC. Root the array now, before any `equals()` call, mirroring
+    // `native_map_put`'s `buckets_pin` (added for the WildFly
+    // parallel-extension-add canary): pinning only after the chain walk
+    // would merely preserve an already-forwarded from-space address.
+    let buckets_pin = ctx.pin_native_root(buckets);
 
     let idx = map_bucket_index(hash, cap);
     let head_val = ctx.get_array_element(buckets, idx);
@@ -6188,13 +6195,27 @@ fn native_map_remove_pinned(
 
     // Check if the head node is the target
     if let Value::Object(Some(head)) = head_val {
-        if node_matches_inner(ctx, head, is_null_key, key_ref)? {
+        // `node_matches_inner` can invoke the key's `equals()` and therefore
+        // GC; pin `head` across it and refresh both `head` and `buckets`
+        // before dereferencing either again. Without this, a GC mid-`equals`
+        // leaves the plain Rust-local `head`/`buckets` dangling -- observed
+        // as `get_field`/`set_field` OOB drops on a genuine, unrelated,
+        // freshly-allocated `java/lang/Object` now sitting at the stale
+        // address (docs/known-issues/tomcat-08-07/
+        // dohead-post-fix-sporadic-residuals.md's header-count residual).
+        let head_pin = ctx.pin_native_root(head);
+        let head_matches = node_matches_inner(ctx, head, is_null_key, key_ref)?;
+        let head = ctx.read_native_pin(head_pin, head);
+        let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        ctx.unpin_native_roots(buckets_pin); // pops head_pin too (pushed after it)
+        if head_matches {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             set_map_size(ctx, this, size - 1);
             let old_value = get_node_value(ctx, head);
             return Ok(Some(old_value));
         }
+        // `buckets` is not referenced again below.
 
         // Walk chain.
         //
@@ -6223,7 +6244,16 @@ fn native_map_remove_pinned(
                 }
                 .into());
             }
-            if node_matches_inner(ctx, curr, is_null_key, key_ref)? {
+            // Same GC hazard as the head check above: pin `prev`/`curr`
+            // across `node_matches_inner` and refresh both before
+            // dereferencing either again.
+            let prev_pin = ctx.pin_native_root(prev);
+            let curr_pin = ctx.pin_native_root(curr);
+            let curr_matches = node_matches_inner(ctx, curr, is_null_key, key_ref)?;
+            prev = ctx.read_native_pin(prev_pin, prev);
+            let curr = ctx.read_native_pin(curr_pin, curr);
+            ctx.unpin_native_roots(prev_pin); // pops curr_pin too
+            if curr_matches {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 set_map_size(ctx, this, size - 1);
@@ -6233,6 +6263,8 @@ fn native_map_remove_pinned(
             prev = curr;
             curr_val = ctx.get_field(curr, NODE_FIELD_NEXT);
         }
+    } else {
+        ctx.unpin_native_roots(buckets_pin);
     }
 
     Ok(Some(Value::Object(None)))
