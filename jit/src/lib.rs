@@ -5882,47 +5882,34 @@ thread_local! {
 }
 
 /// RBC.6 local-handler-safety fix. Conservative, sound check answering: for
-/// this method's exception table, could ANY handler (or code reachable
-/// after it, up to the end of the method) observe a local variable that
-/// `route_jit_exception_through_method`'s params-only handler-frame
-/// reconstruction cannot recover — i.e. anything other than `this` /
-/// a declared parameter?
+/// this method's exception table, could ANY handler observe a local
+/// variable that `route_jit_exception_through_method`'s params-only
+/// handler-frame reconstruction cannot recover — i.e. anything other than
+/// `this` / a declared parameter?
 ///
-/// **Algorithm**: for each exception-table entry, walk `scan.local_slot_ops`
-/// (already in ascending bytecode-pc order — see `jit_scan`) starting from
-/// that entry's `handler_pc`, tracking a `safe` set of local slots
-/// (initially just `this` + params). A `*store`/`iinc`-write adds its slot
-/// to `safe` (from that point in the walk onward); a `*load`/`iinc`-read of
-/// a slot NOT in `safe` means this method is unsafe to compile — return
-/// `true` immediately.
+/// Delegates to `regalloc::handler_has_unsafe_local_read`, a real CFG-based
+/// forward "definitely assigned" dataflow (dominance-respecting, not just
+/// raw-pc-order) — see that function's own doc comment for the full
+/// algorithm and why an earlier, simpler raw-pc-order approximation here
+/// was both over-conservative (continued scanning past a handler's own
+/// `athrow`/`return` into unrelated later code — confirmed, via the real
+/// `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+/// Tomcat suite fixture, to be the actual remaining blocker for the doc's
+/// own motivating case even after the RBC.6 gate itself was relaxed) and
+/// had a latent, never-triggered soundness gap (path-insensitive: a store
+/// on one branch and a read on a different, non-overlapping branch could
+/// be wrongly accepted merely because the store's bytecode pc was lower).
 ///
-/// **Soundness**: this is control-flow-INSENSITIVE — it walks raw bytecode
-/// in pc order, ignoring every branch/goto/switch target, as if the method
-/// were straight-line code from `handler_pc` to the end. That is a STRICTLY
-/// STRONGER requirement than true liveness/definite-assignment (the real
-/// property that matters): if this scan finds no unsafe load, then no
-/// actual control-flow path can hit one either, because every real path's
-/// instruction sequence is some sub-selection of instructions that (for the
-/// portion at pc >= handler_pc) still executes in the same relative pc
-/// order this scan already verified as safe. It CAN reject methods that are
-/// actually safe (e.g. a local written on every real path before it's read,
-/// where a backward branch means the write's pc is LOWER than a load
-/// reachable from a later point) — acceptable: those methods simply keep
-/// the pre-existing "stay interpreted" behavior, no regression. It can
-/// never ACCEPT an unsafe method, which is the only property that matters
-/// for correctness.
-///
-/// **Confirmed necessary** via `AthrowCountBisect.twoThrowsSequential`
+/// **Confirmed necessary in the first place** via
+/// `AthrowCountBisect.twoThrowsSequential`
 /// (`vm/tests/jit_local_exception_handler_tests.rs`): two sequential,
 /// non-nested try/catch blocks in one method, where the second handler's
 /// own code reads a local (`a`) last assigned by the FIRST try's successful
-/// (non-exceptional) path. Without this check, that method compiled and
-/// silently produced a wrong checksum — the fresh interpreter frame pushed
-/// at the second handler's pc never ran the first try's bytecode, so `a`
-/// read back as its zero-initialized default instead of the value the
-/// compiled code actually computed.
+/// (non-exceptional) path. Without SOME such check, that method compiled
+/// and silently produced a wrong checksum.
 fn local_handler_reads_unsafe_local(
-    scan: &x64::JitScanResult,
+    code: &[u8],
+    code_len: usize,
     exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
     method_descriptor: &str,
     is_static: bool,
@@ -5930,26 +5917,33 @@ fn local_handler_reads_unsafe_local(
     // Widening: `this` (slot 0 for instance methods) + declared param slots.
     let param_slot_count =
         count_param_slots_jvm_spec(method_descriptor) as u16 + if is_static { 0 } else { 1 };
+    // Slots >= 64 can't be represented in the u64 bitmask the dataflow uses;
+    // `regalloc::handler_has_unsafe_local_read` conservatively treats any
+    // load of such a slot as unsafe regardless of this mask, so capping the
+    // shift here (rather than overflowing) just keeps this bit of arithmetic
+    // well-defined — it does not change which methods are accepted.
+    let initial_safe_slots: u64 = if param_slot_count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << param_slot_count) - 1
+    };
     let dbg = std::env::var_os("CRATONVM_DBG_RBC6").is_some();
     for entry in exception_table {
-        let handler_pc = entry.handler_pc;
-        let mut safe: std::collections::HashSet<u16> = (0..param_slot_count).collect();
-        for &(pc, is_store, slot) in scan.local_slot_ops.iter() {
-            // Widening: bytecode pc (usize, from the scan) vs. handler_pc (u16, class-file width) — both non-negative, fits.
-            if (pc as u32) < handler_pc as u32 {
-                continue;
+        let handler_pc = entry.handler_pc as usize;
+        let unsafe_found = regalloc::handler_has_unsafe_local_read(
+            code,
+            code_len,
+            handler_pc,
+            initial_safe_slots,
+        );
+        if unsafe_found {
+            if dbg {
+                eprintln!(
+                    "[rbc6-dbg] local_handler_reads_unsafe_local UNSAFE (CFG dataflow) handler_pc={} param_slot_count={}",
+                    handler_pc, param_slot_count
+                );
             }
-            if is_store {
-                safe.insert(slot);
-            } else if !safe.contains(&slot) {
-                if dbg {
-                    eprintln!(
-                        "[rbc6-dbg] local_handler_reads_unsafe_local UNSAFE handler_pc={} at_pc={} unsafe_slot={} param_slot_count={}",
-                        handler_pc, pc, slot, param_slot_count
-                    );
-                }
-                return true;
-            }
+            return true;
         }
     }
     false
@@ -6180,12 +6174,11 @@ fn try_compile_inner(
     // (vm/src/runtime/interpreter.rs) reconstructs the handler frame from
     // ONLY `this` + the method's declared incoming params (a documented,
     // pre-existing limitation — see that function's own doc comment). A
-    // handler (or code reachable after it, within the SAME method) that
-    // reads any OTHER local — one first assigned earlier in the method,
-    // whether inside this try, a DIFFERENT try/catch construct, or
-    // straight-line code before either — observes a stale zero/null instead
-    // of the value the compiled code actually computed. Confirmed via a
-    // differential repro: `AthrowCountBisect.twoThrowsSequential` (two
+    // handler that reads any OTHER local — one first assigned earlier in
+    // the method, whether inside this try, a DIFFERENT try/catch construct,
+    // or straight-line code before either — observes a stale zero/null
+    // instead of the value the compiled code actually computed. Confirmed
+    // via a differential repro: `AthrowCountBisect.twoThrowsSequential` (two
     // sequential, non-nested try/catch blocks in one method; the second
     // handler's own code reads a local last assigned by the FIRST try's
     // successful path) silently computed a wrong checksum once compiled —
@@ -6193,18 +6186,20 @@ fn try_compile_inner(
     // the newly-relaxed has-athrow ones, since the frame-reconstruction gap
     // is in the shared runtime routing, not anything athrow-specific. Gate
     // BOTH populations (any non-empty `exception_table`, not just the
-    // has_athrow case above) on `local_handler_reads_unsafe_local`, a
-    // conservative, sound, control-flow-insensitive check: for every
-    // exception-table entry, no `*load`/`iinc`-read of a non-param local is
-    // reachable (in raw bytecode-pc order, ignoring branches — a strictly
-    // stronger requirement than true liveness, so false rejections are
-    // possible but false acceptances are not) from that entry's handler_pc
-    // without a preceding store to the same slot. See
-    // `local_handler_reads_unsafe_local`'s own doc comment for the full
-    // algorithm and its soundness argument.
+    // has_athrow case above) on `local_handler_reads_unsafe_local`, a real
+    // CFG-based "definitely assigned" dataflow (dominance-respecting, not a
+    // raw-pc-order approximation — an earlier version of this check used
+    // exactly that simpler approximation and was found, via the REAL
+    // `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+    // Tomcat suite fixture, to over-reject it: it kept scanning past the
+    // handler's own `athrow` terminator into unrelated later code in the
+    // same method). See `local_handler_reads_unsafe_local`'s own doc
+    // comment, and `regalloc::handler_has_unsafe_local_read`'s, for the
+    // full algorithm and soundness argument.
     if !cached.exception_table.is_empty() {
         let unsafe_local = local_handler_reads_unsafe_local(
-            &scan,
+            code,
+            code_len,
             &cached.exception_table,
             &cached.method_descriptor,
             cached.is_static,
