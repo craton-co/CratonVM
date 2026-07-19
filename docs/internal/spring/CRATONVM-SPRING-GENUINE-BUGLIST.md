@@ -2443,22 +2443,35 @@ constructor-arg values `[scriptSource, interfaces]`, so Spring's OWN
 `getScriptedObject(ScriptSource, Class<?>...)` **reflectively** (`Method.invoke`) against the
 `scriptFactoryBeanName` singleton -- a varargs method, with the `interfaces` constructor-arg value
 being an already-materialized `Class<?>[]` that Spring's argument-matching has to bind onto the
-trailing `Class<?>...` parameter. Both probes in this doc call the method directly (a normal
-`invokevirtual`), never through reflection. The next session should instrument (temporarily) the
-reflective `Method.invoke` native path specifically for this call (or write a probe that invokes
-`GroovyScriptFactory.class.getMethod("getScriptedObject", ScriptSource.class, Class[].class)
-.invoke(factory, source, interfacesArray)` directly, HotSpot vs CratonVM) to see whether the
-REFLECTIVE call reaches the same `cachedResult` fast path / the same `this` instance as the
-`predictBeanType` call did, or whether reflection is (for this specific varargs-method-with-an-
-already-array-argument shape) resolving to a different overload, double-wrapping the varargs
-array, or -- most likely given the observed `NullBean` -- invoking a *different*
-`GroovyScriptFactory` instance than the one `predictBeanType` populated (i.e. the
-`scriptFactoryBeanName` singleton lookup inside the internal `scriptBeanFactory` returning a
-fresh/different object on the reflective path). That would explain everything: a fresh instance's
-`cachedResult` is null, `scriptClass` is null too, so it would need to re-parse+re-execute -- and
-if reflective invocation triggers a genuine re-execution that itself succeeds, this lead doesn't
-fully explain the observed `null` either, so confirm the ACTUAL invoked receiver identity first
-before going further.
+trailing `Class<?>...` parameter.
+
+**UPDATE, same session: reflective invocation is ALSO REFUTED.** A third standalone probe
+(`ReflectiveInvokeProbe.java`, `/data/tmp/`) resolved `getScriptedObject` via
+`ScriptFactory.class.getMethods()` (the exact interface-level `Method` object reflection would
+find) and invoked it with `Method.invoke(factory, source, new Class<?>[0])` -- the identical
+varargs-array-as-trailing-parameter shape Spring's `ConstructorResolver` uses -- against a factory
+whose `cachedResult` had already been populated by a prior direct `getScriptedObjectType` call
+(mirroring `predictBeanType`). **Byte-identical result to HotSpot again**: the reflective call
+correctly returns the live, cached `GroovyMessenger` instance. So neither the raw Groovy
+mechanism, nor `CachedResultHolder`/GC survival, nor reflective varargs `Method.invoke` dispatch
+is the defect -- all three, tested in isolation, behave identically to HotSpot.
+
+**Narrowed conclusion**: the defect is not in any of the *mechanisms* `GroovyScriptFactory` itself
+uses (script execution, result caching, reflective invocation) -- every one of those reproduces
+correctly outside a full `ApplicationContext`. It must be something specific to the FULL
+`ScriptFactoryPostProcessor` + internal `scriptBeanFactory` (`DefaultListableBeanFactory`)
+lifecycle that a minimal driver doesn't exercise: most likely that
+`this.scriptBeanFactory.getBean(scriptFactoryBeanName, ScriptFactory.class)` returns a
+**different `GroovyScriptFactory` object** at `postProcessBeforeInstantiation`/bean-creation time
+than the one `predictBeanType` populated earlier -- i.e. a singleton-identity or bean-caching bug
+in the internal child `BeanFactory` `ScriptFactoryPostProcessor` maintains, NOT in Groovy or
+reflection. **Concrete next step**: reproduce with `ScriptFactoryPostProcessor` +
+`DefaultListableBeanFactory` directly (register the two internal bean definitions exactly as
+`prepareScriptBeans` does, call `predictBeanType`-equivalent then the factory-method bean creation
+in sequence) and compare the two `getBean(scriptFactoryBeanName, ...)` calls' returned object
+*identities* (`==`, not just class) on CratonVM vs HotSpot -- if the identities differ where
+HotSpot's are equal, that IS the bug, and the fix would live in whatever CratonVM code path
+handles singleton-bean caching/identity for this specific nested-`BeanFactory` pattern.
 
 ### 6 found=0 ABEND cluster — reconciled
 
