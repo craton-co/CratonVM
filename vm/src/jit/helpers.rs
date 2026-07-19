@@ -18,6 +18,76 @@ use crate::memory::vm_heap::VmHeap;
 use crate::threading::jvm_thread::JvmThread;
 use crate::vm::SharedVm;
 
+// These two gate the RUNTIME dispatch helper's OWN direct-entry cache
+// (`jit_invoke_dispatch`'s `DISPATCH_CACHE`/`jit_cache` lookups and
+// `jit_invoke_virtual_mic`'s cached `entry_ptr` fast path) — NOT the same
+// thing as `cratonvm_jit::direct_jit_callee_calls_enabled` (which gates
+// compile-time eager-callee-compile in `jit/src/lib.rs` and the inline
+// MIC/PIC codegen in `jit/src/x64.rs`, and is default-ON: see that
+// function's doc comment for the closed RBP-mirror race and the
+// general-throughput regression its default avoids).
+//
+// `statically_bound` (this function's only caller-side gate, besides this
+// flag) is `matches!(info.invoke_kind, 1 | 3)` — invokespecial/invokestatic,
+// whose target is fully determined by the constant-pool entry under JVM
+// semantics, with no receiver-class ambiguity. Default-ON: measured on
+// `bench/BenchSuite.java` bintrees16 (self-recursive `static Node make(int)`/
+// `static long check(Node)`, the classic allocation+recursion micro-
+// benchmark) at 43.7s with this flag off vs. 2.8s on — every invokestatic/
+// invokespecial call site was paying the full `jit_invoke_dispatch` helper
+// round trip instead of a cached direct entry. invokestatic/invokespecial
+// are among the most common call forms in ordinary Java (constructors,
+// private/static helpers, `super` calls), so leaving this off by default is
+// a severe, general JIT throughput regression, not a narrow one.
+//
+// Formerly known residual, now FIXED: the static CP-owner cache was not a
+// sound target resolver for every invokespecial/static BRIDGE specifically
+// (Lucene DataOutput's `writeByte` bridge resolved as `Object.writeByte` was
+// the originally-observed case) — a synthetic-bridge target-resolution gap,
+// not a receiver-ambiguity one. Root cause: `info.class_name` (and
+// `try_jit_compile_callee_slow`'s `class_name` parameter more generally) is
+// the literal constant-pool-referenced class for an `invokespecial` site,
+// but that is NOT always the class JVMS §6.5 says method *selection* should
+// start searching from — for a genuine `super.m(...)` call (ACC_SUPER set on
+// the calling class, target not `<init>`, CP-referenced class a genuine
+// superclass of the caller), selection restarts at the CALLING class's own
+// direct superclass instead. A class between the caller and the far-off
+// CP-referenced ancestor that overrides the method (a compiler-generated
+// bridge, or an ordinary override) was walked straight past, landing on a
+// much-less-specific declaration higher up the chain. Fixed by computing the
+// JVMS-correct selection-start class at JIT-compile time (before either
+// `DISPATCH_CACHE` or `jit_cache` ever see the site) via
+// `classloading::invokespecial_selection_start`, applied identically by both
+// the interpreter (`interpreter::invokespecial_owner_class_name`) and the
+// JIT compiler (`jit::try_compile_with_invokespecial_resolver`'s
+// `cp_invokespecial_owner_resolver`), so the two execution modes agree and
+// neither the per-callsite `DISPATCH_CACHE` nor the global `jit_cache` can
+// ever cache a target resolved from the wrong starting class.
+#[inline]
+fn direct_static_compiled_callee_entry_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
+
+// The virtual-call counterpart of the flag above. Kept OFF by default,
+// unlike the static/special one: virtual dispatch's receiver-class ↔ entry
+// pairing is exactly the mechanism the IVFKnn investigation's stale-mirror
+// bug lived in, and this path was not independently validated against that
+// repro the way the static path was against bintrees16 — see
+// `direct_static_compiled_callee_entry_enabled` above for the flag this
+// mirrors and why that one is default-ON. Opt in for measurement/bisection
+// with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=1`.
+#[inline]
+fn direct_virtual_compiled_callee_entry_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var_os("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY").is_some()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // WS1 diagnostic profiling for the JIT dispatch helpers
 // (env-gated: CRATONVM_DBG_MIC_PROF=1; zero-cost when off beyond one cached
@@ -252,6 +322,89 @@ pub struct JitThreadScope {
 /// DIAGNOSTIC: read the current dispatched JIT callee name.
 fn current_jit_callee() -> String {
     CURRENT_JIT_CALLEE.with(|c| c.borrow().clone())
+}
+
+/// Return a replacement JIT argument buffer when a safepoint has forwarded an
+/// object argument.  The JIT ABI carries raw addresses, so canonicalizing only
+/// the receiver is insufficient for signatures such as `([BII)V`: a moved
+/// byte array can otherwise be decoded from its recycled pre-GC address.
+///
+/// The common case allocates nothing.  `num_jit_args` counts compact native
+/// values (including an instance receiver), so each parsed descriptor parameter
+/// advances one buffer position even for category-2 Java values.
+fn forward_jit_reference_args(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args: &[i64],
+) -> Option<Vec<i64>> {
+    let mut replacement: Option<Vec<i64>> = None;
+    let mut arg_index = if info.invoke_kind == 3 { 0 } else { 1 };
+
+    // Instance receivers are object references regardless of their descriptor.
+    if info.invoke_kind != 3 {
+        if let Some(&raw) = args.first() {
+            forward_jit_arg_at(vm, args, &mut replacement, 0, raw);
+        }
+    }
+
+    let bytes = info.descriptor.as_bytes();
+    let mut p = match bytes.iter().position(|&b| b == b'(') {
+        Some(i) => i + 1,
+        None => return replacement,
+    };
+    while p < bytes.len() && bytes[p] != b')' && arg_index < args.len() {
+        let is_ref = matches!(bytes[p], b'L' | b'[');
+        if is_ref {
+            let raw = args[arg_index];
+            forward_jit_arg_at(vm, args, &mut replacement, arg_index, raw);
+        }
+        match bytes[p] {
+            b'L' => {
+                while p < bytes.len() && bytes[p] != b';' {
+                    p += 1;
+                }
+                p = p.saturating_add(1);
+            }
+            b'[' => {
+                while p < bytes.len() && bytes[p] == b'[' {
+                    p += 1;
+                }
+                if p < bytes.len() && bytes[p] == b'L' {
+                    while p < bytes.len() && bytes[p] != b';' {
+                        p += 1;
+                    }
+                    p = p.saturating_add(1);
+                } else {
+                    p = p.saturating_add(1);
+                }
+            }
+            _ => p += 1,
+        }
+        arg_index += 1;
+    }
+    replacement
+}
+
+#[inline]
+fn forward_jit_arg_at(
+    vm: &SharedVm,
+    original: &[i64],
+    replacement: &mut Option<Vec<i64>>,
+    index: usize,
+    raw: i64,
+) {
+    if raw == 0 || (raw as u64 & 0x7) != 0 || (raw as u64) >= (1u64 << 48) {
+        return;
+    }
+    // The JIT calling convention guarantees that descriptor-declared
+    // references are live object pointers at this boundary; the canonicality
+    // checks above reject immediate/tagged values before constructing ObjectRef.
+    let object = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };
+    let forwarded = vm.heap.load_and_forward(object).as_ptr() as i64;
+    if forwarded != raw {
+        let args = replacement.get_or_insert_with(|| original.to_vec());
+        args[index] = forwarded;
+    }
 }
 
 /// DIAGNOSTIC: crash-handler-safe read of the current JIT callee name.
@@ -1479,6 +1632,7 @@ unsafe fn try_resume_trapped_callee(
             is_synchronized: method.is_synchronized(),
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     };
     if bci as usize >= cached.code.len() {
@@ -2171,9 +2325,8 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                     set_jit_pending_exception(exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
-                    let msg = format!(
-                        "JIT new class_id {class_id_raw} failed to initialize: {vm_err}"
-                    );
+                    let msg =
+                        format!("JIT new class_id {class_id_raw} failed to initialize: {vm_err}");
                     if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                         vm,
                         thread,
@@ -4846,6 +4999,13 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
 
+    // The SATB flush above can participate in a moving collection before the
+    // helper reads the JIT caller's raw argument array.  Forward every
+    // descriptor-declared reference, not only `this`: a compiled callee must
+    // not receive a stale byte-array/object argument after a moving GC.
+    let forwarded_args = forward_jit_reference_args(vm, info, args_slice);
+    let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
+
     // JIT dispatch normally calls a custom loader's inherited bytecode
     // directly. ClassLoader's resource methods must throw NPE for a null name
     // before that bytecode runs; the sentinel routes it through Java handlers.
@@ -4854,8 +5014,14 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -4986,7 +5152,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // actual receiver class, then cache and directly enter the compiled
     // concrete body. The generic helper otherwise re-enters invoke_virtual on
     // every element access, rebuilding conservative JIT roots each time.
-    if !statically_bound && !redefine_jit_quiesced && !args_slice.is_empty() {
+    if direct_virtual_compiled_callee_entry_enabled()
+        && !statically_bound
+        && !redefine_jit_quiesced
+        && !args_slice.is_empty()
+    {
         let raw = args_slice[0] as u64;
         if raw != 0 && (raw & 7) == 0 && raw < (1u64 << 48) {
             let receiver = ObjectRef::from_raw(raw as usize as *mut u8);
@@ -5049,7 +5219,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     }
 
-    let cached_entry = if statically_bound && !redefine_jit_quiesced {
+    let cached_entry = if direct_static_compiled_callee_entry_enabled()
+        && statically_bound
+        && !redefine_jit_quiesced
+    {
         DISPATCH_CACHE.with(|dc| {
             dc.borrow()
                 .get(&info_key)
@@ -5099,7 +5272,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // wasted allocations per hot call. Deref coercion handles the conversion.
     // Gated on `statically_bound`: the lookup key is the static CP class, which
     // is only the correct dispatch target for invokespecial/invokestatic.
-    if statically_bound && !redefine_jit_quiesced {
+    if direct_static_compiled_callee_entry_enabled() && statically_bound && !redefine_jit_quiesced {
         let jit_cache = vm.jit_cache.read();
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
@@ -5152,7 +5325,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // `statically_bound`: compiling `info` (the static CP-class method) and
     // caching it under the callsite key would re-introduce the supertype
     // miscompile for a virtual/interface site.
-    let should_compile = statically_bound
+    let should_compile = direct_static_compiled_callee_entry_enabled()
+        && statically_bound
         && !redefine_jit_quiesced
         && DISPATCH_COUNTER.with(|dc| {
             let mut map = dc.borrow_mut();
@@ -5331,17 +5505,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                 // null — keep the defensive 0 bail (does not mask a real NPE).
                 _ => return 0,
             };
-            let method_args: Vec<Value> = values[1..].to_vec();
-            let virt_result = {
-                let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
-                use crate::native::registry::NativeContext;
-                ctx.invoke_virtual(
-                    receiver_ref,
-                    info.method_name,
-                    info.descriptor,
-                    &method_args,
-                )
-            };
+            // Match the register-overflow bail path: `NativeContext::invoke_virtual`
+            // resolves solely from the heap object's class id. That is insufficient
+            // for a synthetic/ClassId(0) receiver (common for Lucene iterator
+            // adapters): it turns `Iterator.hasNext()` into `Object.hasNext()`.
+            // `virtual_dispatch_target_for_receiver` preserves the real receiver
+            // class when available and otherwise supplies the CP-resolved class;
+            // `invoke_or_native` then applies the VM's interface/abstract retarget.
+            let dispatch_class = virtual_dispatch_target_for_receiver(vm, receiver_ref, info).class_name;
+            let virt_result = crate::vm::invoke_or_native(
+                vm,
+                thread,
+                &dispatch_class,
+                info.method_name,
+                info.descriptor,
+                &values,
+            );
             match virt_result {
                 Ok(v) => v,
                 Err(e) => {
@@ -6541,8 +6720,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -6570,6 +6755,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // SAFETY: receiver_bits is non-zero, 8-byte aligned, and within the
     // 48-bit canonical address space — matches the invariants required by
     // ObjectRef::from_raw for live heap objects.
+    // The SATB flush above may have moved either the receiver or a reference
+    // parameter.  A MIC hit jumps straight into compiled code with this raw
+    // slice, so canonicalize every reference before the class lookup and the
+    // eventual direct call.
+    let forwarded_args = forward_jit_reference_args(vm, info, args_slice);
+    let args_slice = forwarded_args.as_deref().unwrap_or(args_slice);
+    let receiver_raw = args_slice[0];
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
 
     // WS1 (kafka JIT throughput): the `Value` decode is deferred. The MIC-hit
@@ -6641,15 +6833,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        if let Some(callback) = vm.native_methods.find(
-            "java/lang/ClassLoader",
-            info.method_name,
-            info.descriptor,
-        ) {
+        if let Some(callback) =
+            vm.native_methods
+                .find("java/lang/ClassLoader", info.method_name, info.descriptor)
+        {
             let values = decode_values();
             return match crate::vm::safe_native_call(vm, thread, callback, &values) {
                 Ok(Some(Value::Int(v))) => v as i64,
@@ -6805,7 +7002,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let entry = mic
             .cached_entry_ptr
             .load(std::sync::atomic::Ordering::Acquire);
-        if entry != 0 && !redefine_jit_quiesced {
+        if direct_virtual_compiled_callee_entry_enabled() && entry != 0 && !redefine_jit_quiesced {
             // Direct call to the compiled callee — same ABI as `jit_invoke_dispatch`
             // uses after a JIT-cache hit (receiver + params in `args_slice`, optional
             // leading `vm_ptr` when `cached_needs_context` is true).  **Do not** pass
@@ -6880,15 +7077,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // method table from `Object`; short-circuit accordingly.
         let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
         let cacheable_receiver = dispatch_target.cacheable_receiver;
-        let class_name: std::sync::Arc<str> = if cacheable_receiver {
-            let guard = mic.cached_class_name.lock();
-            match &*guard {
-                Some(name) => name.clone(),
-                None => dispatch_target.class_name,
-            }
-        } else {
-            dispatch_target.class_name
-        };
+        // An entryless slot can be retargeted by another thread after the
+        // class-id probe above. Its cached class name is therefore not a
+        // coherent companion to this receiver; resolve from the receiver
+        // itself until there is a callable entry to use.
+        let class_name = dispatch_target.class_name;
 
         // `decode_values` yields exactly `[receiver, args...]` — the full
         // argument vector `invoke_or_native` expects. (This path previously
@@ -6909,7 +7102,10 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
-        let compile_res = if redefine_jit_quiesced || !cacheable_receiver {
+        let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
+            || redefine_jit_quiesced
+            || !cacheable_receiver
+        {
             None
         } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
@@ -7029,7 +7225,10 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
-    let compile_res = if redefine_jit_quiesced || !cacheable_receiver {
+    let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
+        || redefine_jit_quiesced
+        || !cacheable_receiver
+    {
         None
     } else {
         let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);

@@ -686,13 +686,9 @@ impl JitEntryGuard {
     /// NEW-12: push a JIT entry that carries precise-frame metadata.
     ///
     /// When the root walker encounters an entry of this shape it uses
-    /// the compiled method's oop maps to enumerate oops exactly rather
-    /// than blindly scanning the spill region. A compiled method with
-    /// no oop maps (`cm.has_precise_oop_maps() == false`) usually falls
-    /// back to the conservative scan automatically. The exception is an
-    /// OSR frame under `CRATONVM_MOVING_YOUNG`: keep the metadata entry
-    /// so the moving-young coverage guard can inspect the OSR artifact's
-    /// rewritable shadow layout before allowing a moving collection.
+    /// the compiled method's oop maps to enumerate oops exactly where
+    /// available. Map-empty methods retain the same metadata so their
+    /// conservative fallback can scan a bounded compiled-frame band.
     ///
     /// **Safety**: the caller must hold a live borrow of `cm` for the
     /// duration of the returned guard. In practice this is trivial:
@@ -703,14 +699,11 @@ impl JitEntryGuard {
     /// valid for any in-flight GC walker.
     #[inline(always)]
     pub fn enter_with_compiled(cm: &cratonvm_jit::CompiledMethod) -> Self {
-        let keep_osr_moving_metadata = moving_young_enabled() && cm.compiled_via_osr;
-        if !cm.has_precise_oop_maps() && !keep_osr_moving_metadata {
-            // No maps populated and no moving-young OSR metadata needed:
-            // fall back to conservative. This is the default path today
-            // because the JIT compiler does not yet write oop maps during
-            // codegen.
-            return Self::enter();
-        }
+        // Retain frame metadata even when this method has no oop-map entries.
+        // The prologue still records its RBP whenever precise maps are enabled,
+        // and the conservative fallback can then scan this compiled frame's
+        // bounded spill band instead of every intervening interpreter/Rust
+        // frame. Map-empty entries simply contribute no exact slots.
         let sp = current_stack_pointer();
         let entry = JitFrameChainEntry {
             entry_sp: sp,
@@ -728,6 +721,17 @@ impl JitEntryGuard {
 
 impl Drop for JitEntryGuard {
     fn drop(&mut self) {
+        // A compiled OSR body can leave through a non-local deopt/exception
+        // path after entering another compiled body.  That nested bridge does
+        // not always get a Rust frame to run its own guard's Drop, so merely
+        // popping once here would remove the leaked child and strand *this*
+        // guard on the chain.  Restore the depth that this guard established
+        // first, then remove the guard itself.  The chain is thread-local and
+        // stack-disciplined, so entries above `depth_at_push` can only be
+        // abandoned descendants of this invocation; never touch outer frames.
+        while current_thread_jit_depth() > self.depth_at_push {
+            let _ = pop_jit_entry();
+        }
         let popped = pop_jit_entry();
         debug_assert!(
             popped.is_some(),
@@ -2053,8 +2057,73 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
     // spills between them; the sweep catches those. The
     // `heap.is_object_address` validation filters non-oop values so
     // false positives are harmless.
-    scan_one_frame(scanner_sp, info.frame_base, heap, out);
+    // A JIT entry can remain live while it calls deeply into the interpreter.
+    // The legacy whole-band sweep then revalidated those interpreter/Rust
+    // frames on every native call even though their roots are published by
+    // their own mechanisms. Prefer the bounded JIT frame bands recovered from
+    // the live RBP chain; retain the historical sweep as a fail-safe whenever
+    // a frame record or its size metadata is not trustworthy.
+    if !scan_compiled_frame_bands(info, scanner_sp, heap, out) {
+        scan_one_frame(scanner_sp, info.frame_base, heap, out);
+    }
     let _ = info.entry_ptr; // reserved for future PC-precise lookup
+}
+
+/// Conservatively scan only the live compiled-frame spill bands reachable from
+/// `info.exact_rbp`. Returns `false` when metadata is insufficient, allowing
+/// the caller to keep the existing whole-band fallback.
+///
+/// A compiled x64 frame owns `[rbp - osr_frame_size, rbp)`. The field's name
+/// is historical: normal compiled entries populate it too. Nested direct JIT
+/// calls use the normal saved-RBP chain, so this excludes intervening
+/// interpreter/Rust frames without excluding JIT spill space.
+fn scan_compiled_frame_bands(
+    info: PreciseFrameInfo,
+    scanner_sp: usize,
+    heap: &VmHeap,
+    out: &mut Vec<ObjectRef>,
+) -> bool {
+    let entry_sp = info.frame_base;
+    let mut rbp = info.exact_rbp;
+    if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+        return false;
+    }
+
+    // The innermost frame is the method retained by the entry guard. Parent
+    // frames are identified through the child frame's return address.
+    let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+    let mut frames = 0usize;
+    while frames < 4096 {
+        frames += 1;
+        let frame_size = cm.osr_frame_size;
+        if frame_size <= 0 {
+            return false;
+        }
+        let frame_size = frame_size as usize;
+        const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+        if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+            return false;
+        }
+        scan_one_frame(rbp - frame_size, rbp, heap, out);
+
+        // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
+        // A non-JIT parent ends the successful walk: it has no JIT spill band.
+        let parent_rbp = unsafe { (rbp as *const usize).read() };
+        let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+        let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+            return true;
+        };
+        if parent_rbp <= rbp
+            || parent_rbp & 0x7 != 0
+            || parent_rbp >= entry_sp
+            || parent_rbp < scanner_sp
+        {
+            return false;
+        }
+        cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+        rbp = parent_rbp;
+    }
+    false
 }
 
 /// Scan the one oop map selected by a live frame's safepoint-id slot.
@@ -2181,6 +2250,23 @@ mod tests {
         assert_eq!(current_thread_jit_depth(), depth_before + 1);
         let popped = pop_jit_entry();
         assert!(popped.is_some(), "pop must return the previously pushed sp");
+        assert_eq!(current_thread_jit_depth(), depth_before);
+    }
+
+    #[test]
+    fn guard_drop_heals_abandoned_nested_entries() {
+        let depth_before = current_thread_jit_depth();
+        let guard = JitEntryGuard::enter();
+        assert_eq!(current_thread_jit_depth(), depth_before + 1);
+
+        // Model an OSR/deopt non-local return that bypassed two nested bridge
+        // guards. Dropping the outer guard must remove those descendants before
+        // removing itself, leaving any pre-existing outer frames intact.
+        let _ = push_jit_entry();
+        let _ = push_jit_entry();
+        assert_eq!(current_thread_jit_depth(), depth_before + 3);
+
+        drop(guard);
         assert_eq!(current_thread_jit_depth(), depth_before);
     }
 
@@ -2498,11 +2584,10 @@ mod tests {
         assert!(cm.find_oop_map_for_pc(0x30).is_none());
     }
 
-    /// A CompiledMethod with no oop maps has `has_precise_oop_maps()
-    /// == false`, and `enter_with_compiled` falls through to the
-    /// conservative guard.
+    /// A CompiledMethod with no oop maps still registers its frame metadata so
+    /// the conservative fallback can use its bounded compiled-frame band.
     #[test]
-    fn new12_enter_with_compiled_empty_maps_falls_back_to_conservative() {
+    fn new12_enter_with_compiled_empty_maps_registers_frame_metadata() {
         let buf = cratonvm_jit::ExecutableBuffer::new(64)
             .expect("executable buffer alloc must succeed in tests");
         let cm = cratonvm_jit::CompiledMethod::new(buf);
@@ -2511,15 +2596,12 @@ mod tests {
         let local_before = current_thread_jit_depth();
         let _g = JitEntryGuard::enter_with_compiled(&cm);
         assert_eq!(current_thread_jit_depth(), local_before + 1);
-        // The newly pushed entry must have `precise = None` because
-        // the CompiledMethod had no maps.
         JIT_ENTRY_CHAIN.with(|c| {
             let chain = c.borrow();
             let top = chain.last().expect("chain must have one entry");
-            assert!(
-                top.precise.is_none(),
-                "entry with empty oop_maps should register as conservative"
-            );
+            let info = top.precise.expect("entry should retain frame metadata");
+            assert_eq!(info.compiled_method, &cm as *const _);
+            assert_eq!(info.entry_ptr, cm.entry_ptr());
         });
     }
 

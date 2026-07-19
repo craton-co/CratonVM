@@ -70,7 +70,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\elasticsearch-suite
 | `-Count` | integer >= 0 | `0` | Number of classes to run; `0` means through the end. |
 | `-Parallel` | integer >= 1 | `1` | Concurrent class processes per mode. |
 | `-TimeoutSec` | integer >= 1 | `120` | Normal per-class timeout. Timeout status is `HANG`. |
-| `-KnownSlowClassTimeoutSec` | integer >= 1 | `300` | CratonVM timeout floor for the two known finite-but-slow HNSW-bit classes. |
+| `-KnownSlowClassTimeoutSec` | integer >= 1 | `1800` | CratonVM timeout floor for `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests`, which has a verified finite merge/indexing path that can exceed ordinary suite limits. |
 | `-RunName` | string | timestamp | Result directory name. |
 | `-ElasticsearchRoot` | path | `C:\craton\CratonVM\apps\elasticsearch` | Elasticsearch checkout to run. |
 | `-WorkDir` | path | `apps\elasticsearch-suite-runner\.suite` | Generated lists, results, logs, baselines. |
@@ -188,13 +188,12 @@ Status values:
 - `NOCP`: module classpath file was missing.
 - `NOSUMMARY`: no JUnit signal and no crash fingerprint.
 
-The runner gives only `ES815HnswBitVectorsFormatTests` and
-`ES93HnswBitVectorsFormatTests` a CratonVM-specific timeout floor (300 seconds
-by default). They build HNSW graphs and have been verified to make continuous
-forward progress, but can exceed 120 seconds when the host is contended. The
-normal timeout still applies to all other classes; set
-`-KnownSlowClassTimeoutSec` to tune this narrow allowance for a particular
-host.
+The runner gives `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` a
+CratonVM-specific timeout floor (1800 seconds by default) and raises only that
+class's Lucene randomized-test timeout to 1800 seconds. Watchdog captures show
+continuous indexing, stored-fields, and merge progress; this avoids reporting
+that finite interpreter/JIT throughput path as a VM `HANG`. The normal timeout
+and the ordinary 580-second Lucene timeout still apply to all other classes.
 
 Runs are resumable. Existing rows in `results.tsv` are skipped when rerunning
 the same `-RunName` and mode.

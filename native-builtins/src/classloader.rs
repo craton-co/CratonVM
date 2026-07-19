@@ -863,7 +863,9 @@ pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
     internal.starts_with("java/")
         || internal.starts_with("javax/")
         || internal.starts_with("jdk/")
-        || internal.starts_with("sun/")
+        // MethodUtil deliberately defines this JDK helper through its private
+        // application loader; its static initializer rejects bootstrap ownership.
+        || (internal.starts_with("sun/") && internal != "sun/reflect/misc/Trampoline")
         || internal.starts_with("com/sun/")
         || internal.starts_with("org/w3c/dom")
         || internal.starts_with("org/xml/sax")
@@ -1794,10 +1796,12 @@ fn cl_load_class_base_delegation(
     // entries deliberately are not appended to the process-wide application
     // path, because that would make one temporary loader's classes and
     // resources visible to another.
-    if object_extends(ctx, this, "java/net/URLClassLoader") {
-        if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
-            return result;
-        }
+    // Some real-JDK subclasses do not expose their inherited
+    // URLClassLoader identity through `object_extends` during native
+    // dispatch. The helper is a no-op for receivers without recorded URLs,
+    // so probe it directly rather than dropping their isolated path.
+    if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
+        return result;
     }
 
     // 4. Custom-classloader extension point. The JVM `ClassLoader.loadClass`
@@ -2615,6 +2619,23 @@ pub(crate) fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
 /// (`JavaLangAccess.defineClass`, the `System$1` bridge that
 /// `jdk.internal.reflect.ClassDefiner` calls into) so both entry points
 /// share the same magic-check / panic-guard / PD-attribution behavior.
+///
+/// `loader`: the `ClassLoader` object passed to the `defineClassN` native
+/// (may be `Value::Object(None)` for the bootstrap loader). Recorded via
+/// `register_defining_loader` on success so this class's true defining
+/// loader is known to every `defining_loader_for` consumer (`getClassLoader`,
+/// GC loader-pinning, `inherit_lookup_loader`'s namespace lookup, ...) —
+/// previously only `Lookup.defineClass` (`lookup_define.rs`) recorded this,
+/// so any class defined the ordinary way (`ClassLoader.defineClass`, e.g.
+/// Groovy's `GroovyClassLoader` compiling a script class) had no recorded
+/// defining loader. That left `inherit_lookup_loader`'s legacy fallback
+/// (`loader_id_of_class`, which collapses small `UserDefined(n)` ids into
+/// the builtin-loader id range) as the only source of truth for a CGLIB
+/// proxy generated against such a class, mis-routing the proxy into the
+/// Application namespace and CNFE-failing the `Class.forName(name, true,
+/// loader)` CGLIB issues right after — see
+/// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md`'s Groovy cluster
+/// entry (`GroovyAspectTests`/`GroovyAspectIntegrationTests` residuals).
 pub(crate) fn define_class_via_full(
     ctx: &mut dyn NativeContext,
     name: &str,
@@ -2623,6 +2644,7 @@ pub(crate) fn define_class_via_full(
     opts: cratonvm_native_api::DefineClassFull,
     initialize: bool,
     class_data: Option<Value>,
+    loader: Value,
 ) -> MethodCallResult {
     use cratonvm_types::error::{LinkageError, RuntimeError};
 
@@ -2661,6 +2683,29 @@ pub(crate) fn define_class_via_full(
             // Stash classData (defineClass0 path) on the side-table.
             if let Some(data) = class_data {
                 set_class_data(mirror, data);
+            }
+            // Record the true defining loader (see the doc comment above)
+            // so later `defining_loader_for(cid)` consumers — including
+            // `inherit_lookup_loader`'s namespace lookup for a subsequent
+            // CGLIB/`Lookup.defineClass` proxy of this exact class — see the
+            // real loader instead of falling back to the legacy
+            // `loader_id_of_class` path, which can collapse a small
+            // `UserDefined(n)` id into the builtin-loader range.
+            //
+            // Gated on `is_user_defined_loader` to preserve the existing
+            // invariant that `defining_loader_store` only ever holds genuine
+            // custom-`ClassLoader` instances, never the built-in bootstrap/
+            // platform/application loader — registering the latter would add
+            // an entry for nearly every class defined during a run (the vast
+            // majority go through the system loader) for no behavioral
+            // benefit (every consumer either wants the true custom loader or
+            // already has its own built-in-loader fallback).
+            if loader_aware_resolution() {
+                if let Value::Object(Some(loader_obj)) = loader {
+                    if is_user_defined_loader(ctx, loader_obj) {
+                        register_defining_loader(cid.as_u32(), loader_obj);
+                    }
+                }
             }
             // Eager-init request: run <clinit> now (defineClass0 path
             // when `initialize == true`). `ctx.initialize_class` can
@@ -2754,7 +2799,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
 }
 
 /// JDK-internal: `static native Class<?> defineClass2(
@@ -2814,7 +2859,7 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
 }
 
 // JEP 371 / JEP 466 flag bits accepted by `defineClass0`.
@@ -2925,7 +2970,7 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data, loader)
 }
 
 /// WP2.3-C — register the JDK-internal `defineClass0/1/2` natives on
@@ -3412,6 +3457,23 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // receiver-local resolver; never fall through to the generic flat path,
     // which could leak sibling loader resources.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+        // A platform loader may expose JDK-module resources (`jrt:`), but it
+        // cannot see the application's flat classpath. Treating the global
+        // resource walk as its implementation makes a child whose explicit
+        // parent is platform observe application resources that HotSpot would
+        // reject. Spring's ModifiedClassPathClassLoader deliberately uses that
+        // topology to exclude individual JARs.
+        if is_platform_class_loader(ctx, this_ref) {
+            if let Some(first) = ctx
+                .find_all_resource_urls(resource_name)
+                .iter()
+                .find(|url| url.starts_with("jrt:"))
+            {
+                let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
+                return Ok(Some(Value::Object(Some(url))));
+            }
+            return Ok(Some(Value::Object(None)));
+        }
         if object_extends(ctx, this_ref, "java/net/URLClassLoader") {
             let class_name = ctx
                 .class_name_of_id(ctx.class_id_of_object(this_ref))
@@ -3449,10 +3511,8 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             }
             let this_live = ctx.read_native_pin(this_pin, this_ref);
             let name_for_local = Value::Object(Some(ctx.create_string(&name)));
-            let local_result = ucl_find_resource(
-                ctx,
-                &[Value::Object(Some(this_live)), name_for_local],
-            );
+            let local_result =
+                ucl_find_resource(ctx, &[Value::Object(Some(this_live)), name_for_local]);
             ctx.unpin_native_roots(this_pin);
             return local_result;
         }
@@ -4418,11 +4478,32 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // ensures a custom loader that doesn't override `findResource` still finds
     // resources its parent serves (SerializationHelperTest/ProxyClassReuseTest).
     // The raw `find_resource` fast-path below is kept for builtin loaders.
+    //
+    // `object_extends(.., "java/net/URLClassLoader")` mirrors the identical
+    // gate `cl_get_resource` already applies just above ("URLClassLoader
+    // itself is parent-first too... restricting this to non-builtin names
+    // drops a parent's resource stream") — `is_builtin_loader_class` treats
+    // the bare `java/net/URLClassLoader` class as builtin (it's in the same
+    // match arm as `SecureClassLoader`/`jdk/internal/loader/*`), so a plain,
+    // user-instantiated `new URLClassLoader(urls, parent)` (e.g. Spring
+    // Boot's `ServletComponentScanIntegrationTests.indexedComponentsAreRegistered`,
+    // which wraps just a `@TempDir` holding a generated `META-INF/spring.components`
+    // index, parented to the real test classloader) fell into the raw
+    // `ctx.find_resource` fallback below instead of this delegation-aware
+    // path. That raw store doesn't see resources reachable only through the
+    // dynamically-registered global URL walk (`ctx.find_all_resource_urls`,
+    // used by both `getResource` and `ucl_find_resource`'s own fallback), so
+    // `getResourceAsStream` returned null for a `.class` file `getResource`
+    // resolved moments earlier — `ClassPathResource.getInputStream()` then
+    // threw `FileNotFoundException` reading an indexed component's class
+    // file that plainly exists on the parent's classpath.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
         if is_classloader_instance(ctx, this_ref) {
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
+                if object_extends(ctx, this_ref, "java/net/URLClassLoader")
+                    || !is_builtin_loader_class(&class_name)
+                {
                     let pin = ctx.pin_native_root(this_ref);
                     let name_arg = Value::Object(Some(ctx.create_string(&name)));
                     let this_ref = ctx.read_native_pin(pin, this_ref);
@@ -4594,16 +4675,18 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // (path) is just `/X/foo.jar` (or on Windows `/C:/X/foo.jar`). To
     // distinguish the two cases we consult the FULL spec (slot 5) first
     // when present, so we know whether to keep the JAR-internal suffix.
-    let full_spec = if let Value::Object(Some(full_ref)) = ctx.get_field(url_obj, 5) {
-        ctx.read_string(full_ref)
-    } else {
-        None
+    // Real-JDK URL objects expose these as named instance fields.  Reading
+    // only the synthetic numeric slots loses constructor URLs for ordinary
+    // URLClassLoader instances and makes their local class path appear empty.
+    let read_field = |name: &str, slot: usize| match ctx.get_field_by_name(url_obj, name) {
+        Value::Object(Some(value)) => ctx.read_string(value),
+        _ => match ctx.get_field(url_obj, slot) {
+            Value::Object(Some(value)) => ctx.read_string(value),
+            _ => None,
+        },
     };
-    let path_field = if let Value::Object(Some(path_ref)) = ctx.get_field(url_obj, 3) {
-        ctx.read_string(path_ref)
-    } else {
-        None
-    };
+    let full_spec = read_field("file", 5);
+    let path_field = read_field("path", 3);
 
     // Pick the most descriptive string: if the path field encodes the
     // `!/<prefix>/` shape (which `build_synthetic_url` does — see
@@ -4617,7 +4700,11 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // Normalise: strip a leading `jar:` (so `jar:file:/X!/sub/` collapses
     // to `file:/X!/sub/`), then strip the `file:` scheme. We keep the
     // `!/<prefix>/` suffix intact for `ClassPath::add_path` to interpret.
-    let p = raw.strip_prefix("jar:").unwrap_or(&raw).to_string();
+    let p = raw
+        .strip_prefix("jar:")
+        .or_else(|| raw.strip_prefix("nested:"))
+        .unwrap_or(&raw)
+        .replace("/!", "!/");
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
@@ -4913,7 +5000,16 @@ pub(crate) fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &s
 /// application class to the process-wide application loader. Its recorded URL
 /// list is its complete application view (Spring's ModifiedClassPathClassLoader
 /// uses this shape to remove selected JARs from a test's classpath).
-pub(crate) fn url_classloader_isolated_from_app(
+pub(crate) fn is_platform_class_loader(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+        || platform_loader_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|platform| platform.as_ptr() == loader.as_ptr())
+}
+
+pub fn url_classloader_isolated_from_app(
     ctx: &dyn NativeContext,
     loader: ObjectRef,
 ) -> bool {
@@ -4922,9 +5018,7 @@ pub(crate) fn url_classloader_isolated_from_app(
     }
     match ctx.get_field_by_name(loader, "parent") {
         Value::Object(None) | Value::Int(0) | Value::Long(0) => true,
-        Value::Object(Some(parent)) => ctx
-            .class_name_of_id(ctx.class_id_of_object(parent))
-            .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader"),
+        Value::Object(Some(parent)) => is_platform_class_loader(ctx, parent),
         _ => false,
     }
 }
@@ -5333,7 +5427,13 @@ pub(crate) fn ucl_try_define_local_class(
 
     let bytes = match bytes {
         Some(b) => b,
-        None if http_bases.is_empty() => return None,
+        None if http_bases.is_empty() => {
+            if url_classloader_isolated_from_app(ctx, loader) {
+                let exception = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, internal_name);
+                return Some(Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception)));
+            }
+            return None;
+        }
         None => {
             let exc = crate::jboss_module_loader::alloc_single_message_exception(
                 ctx,
@@ -5346,6 +5446,12 @@ pub(crate) fn ucl_try_define_local_class(
             ));
         }
     };
+
+    if url_classloader_isolated_from_app(ctx, loader) {
+        if let Err(error) = crate::lang_system::preload_isolated_loader_supertypes(ctx, loader, &bytes) {
+            return Some(Err(error));
+        }
+    }
 
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);
@@ -5466,7 +5572,15 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
             return Ok(Some(Value::Object(Some(url))));
         }
-        if url_classloader_isolated_from_app(ctx, this) {
+        // A URLClassLoader's `findResource` is strictly local. Its public
+        // `getResource` caller has already performed parent-first delegation;
+        // consulting the process-wide classpath here leaks entries that a
+        // temporary child deliberately removed. In particular, Spring Boot's
+        // ModifiedClassPathClassLoader excludes Hibernate Validator from its
+        // recorded URL list, but can have a non-null platform-loader parent on
+        // real JDKs, so the narrower `isolated_from_app` predicate is not a
+        // sufficient guard.
+        if object_extends(ctx, this, "java/net/URLClassLoader") {
             return Ok(Some(Value::Object(None)));
         }
     }

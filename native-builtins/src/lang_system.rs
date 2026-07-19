@@ -1994,7 +1994,12 @@ pub(crate) fn native_system_getenv_all(
 
     // Legacy fallback: synthetic 3-field layout for environments where
     // the real HashMap class hierarchy isn't fully resolvable.
-    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
+    // A failed real-class initialization yields ClassId(0), whose Object layout
+    // has zero slots. This fallback writes map and node fields, so both need
+    // named synthetic layouts even when the real classes cannot initialize.
+    let fallback_map_class_id = ctx.ensure_synthetic_class("java/util/HashMap", 3);
+    let fallback_node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", 4);
+    let map = ctx.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
     ctx.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
@@ -2004,7 +2009,7 @@ pub(crate) fn native_system_getenv_all(
         let val_obj = ctx.create_string(&value);
         let hash = jdk_string_hash(&key);
         let idx = ((cap as u32 - 1) & hash as u32) as usize;
-        let node = ctx.alloc_object(ClassId::new(0), 4); // hash, key, value, next
+        let node = ctx.alloc_object(fallback_node_class_id, 4); // hash, key, value, next
         ctx.set_field(node, 0, Value::Int(hash));
         ctx.set_field(node, 1, Value::Object(Some(key_obj)));
         ctx.set_field(node, 2, Value::Object(Some(val_obj)));
@@ -3110,6 +3115,71 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
     ctx.unpin_native_roots(p_loader);
 }
 
+/// Resolve direct hierarchy edges through an isolated URL loader before its
+/// class is handed to the backend linker. Unlike the generic best-effort
+/// helper above, a miss is authoritative: a platform-parented loader cannot
+/// fall back to the process application classpath.
+pub(crate) fn preload_isolated_loader_supertypes(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let class_file = match cratonvm_reader::read_class(bytes) {
+        Ok(class_file) => class_file,
+        Err(_) => return Ok(()),
+    };
+    let mut names: Vec<String> = Vec::new();
+    if let Some(super_name) = &class_file.super_class {
+        if !super_name.is_empty() && &**super_name != "java/lang/Object" {
+            names.push(super_name.to_string());
+        }
+    }
+    names.extend(
+        class_file
+            .interfaces
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string()),
+    );
+    let loader_pin = ctx.pin_native_root(loader_obj);
+    let mut loader = loader_obj;
+    for internal_name in names {
+        loader = ctx.read_native_pin(loader_pin, loader);
+        let dotted_name = ctx.create_string(&internal_name.replace('/', "."));
+        let name_pin = ctx.pin_native_root(dotted_name);
+        loader = ctx.read_native_pin(loader_pin, loader);
+        let dotted_name = ctx.read_native_pin(name_pin, dotted_name);
+        let result = ctx.invoke_virtual(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(dotted_name))],
+        );
+        ctx.unpin_native_roots(name_pin);
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => {}
+            Err(error) => {
+                ctx.unpin_native_roots(loader_pin);
+                return Err(error);
+            }
+            _ => {
+                let exception = crate::jboss_module_loader::alloc_single_message_exception(
+                    ctx,
+                    "java/lang/ClassNotFoundException",
+                    1,
+                    &internal_name,
+                );
+                ctx.unpin_native_roots(loader_pin);
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exception,
+                ));
+            }
+        }
+    }
+    ctx.unpin_native_roots(loader_pin);
+    Ok(())
+}
+
 fn same_loader_already_defined_mirror(
     ctx: &mut dyn NativeContext,
     loader_obj: ObjectRef,
@@ -3179,39 +3249,17 @@ pub(crate) fn native_classloader_define_class1(
         }
     }
 
-    // Loader id from arg 0 (synthetic ClassLoader); 0 = app loader.
+    // Real JDK ClassLoader instances have no VM-owned integer field. Derive a
+    // namespace solely through the stable loader-identity map; reading a raw
+    // instance slot here can mistake an unrelated JDK field for a loader id.
     let loader_id = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => {
-            let mut lid = match ctx.get_field(*loader_obj, 6) {
-                Value::Int(v) if v > 0 => v as u32,
-                _ => 0,
-            };
-            // Override-first redefinition: when a USER-DEFINED loader (e.g.
-            // Spring's OverridingClassLoader) defines a class whose name is
-            // ALREADY loaded by another loader, defining it under the
-            // Application namespace (id 0) would collide ("already defined by
-            // application loader"). Give this loader its own namespace so the
-            // redefinition succeeds and `Class.getClassLoader()` reports it.
-            // (Real-JDK mode reaches here with lid == 0 because the synthetic
-            // CL_LOADER_ID slot is a real ClassLoader field there.) Legacy
-            // behavior only kicks in on an actual name collision, so
-            // ByteBuddy/cglib's fresh-name defines keep their existing
-            // Application-namespace behavior.
-            //
-            // Loader-faithful gate (CRATONVM_LOADER_AWARE_RESOLUTION): when on,
-            // EVERY user-loader define gets its own stable namespace вЂ” not just
-            // on collision вЂ” so the *first* definer of a name (an isolating
-            // loader) is isolated too instead of landing in the shared
-            // Application namespace (the ProxyClassReuseTest / IsoProbe bug).
-            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                if crate::classloader::loader_aware_resolution()
+        Some(Value::Object(Some(loader_obj)))
+            if crate::classloader::is_user_defined_loader(ctx, *loader_obj)
+                && (crate::classloader::loader_aware_resolution()
                     || name.is_empty()
-                    || ctx.class_id_by_name(&name).is_some()
-                {
-                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
-                }
-            }
-            lid
+                    || ctx.class_id_by_name(&name).is_some()) =>
+        {
+            crate::classloader::loader_namespace_id(ctx, *loader_obj)
         }
         _ => 0,
     };
@@ -3245,16 +3293,13 @@ pub(crate) fn native_classloader_define_class1(
     };
     match ctx.define_class_full(&name, &bytes, loader_id, opts) {
         Ok(class_id) => {
-            // Record the exact defining ClassLoader instance so
-            // `Class.getClassLoader()` returns it (not the app-loader fallback).
-            // ByteBuddy's `ByteArrayClassLoader.load` asserts
-            // `Class.forName(name, false, this).getClassLoader() == this` and
-            // throws "Class already loaded" otherwise вЂ” the blocker for
-            // Hibernate's ByteBuddy proxy generation.
+            let mirror = ctx.get_class_mirror(class_id);
+            // The JDK's Class.getClassLoader bytecode reads this instance
+            // field directly. Keep it aligned with the VM's loader registry.
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
-            let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
@@ -3300,20 +3345,13 @@ pub(crate) fn native_classloader_define_class2(
     validate_classfile_header(&name, "defineClass2", &bytes)?;
 
     let loader_id = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => {
-            let mut lid = match ctx.get_field(*loader_obj, 6) {
-                Value::Int(v) if v > 0 => v as u32,
-                _ => 0,
-            };
-            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                if crate::classloader::loader_aware_resolution()
+        Some(Value::Object(Some(loader_obj)))
+            if crate::classloader::is_user_defined_loader(ctx, *loader_obj)
+                && (crate::classloader::loader_aware_resolution()
                     || name.is_empty()
-                    || ctx.class_id_by_name(&name).is_some()
-                {
-                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
-                }
-            }
-            lid
+                    || ctx.class_id_by_name(&name).is_some()) =>
+        {
+            crate::classloader::loader_namespace_id(ctx, *loader_obj)
         }
         _ => 0,
     };
@@ -3341,10 +3379,11 @@ pub(crate) fn native_classloader_define_class2(
     };
     match ctx.define_class_full(&name, &bytes, loader_id, opts) {
         Ok(class_id) => {
+            let mirror = ctx.get_class_mirror(class_id);
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
                 crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
             }
-            let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
@@ -3397,25 +3436,13 @@ pub(crate) fn native_classloader_define_class0(
     validate_classfile_header(&name, "defineClass0", &bytes)?;
 
     let loader_id = match args.first() {
-        Some(Value::Object(Some(loader_obj))) => {
-            let mut lid = match ctx.get_field(*loader_obj, 6) {
-                Value::Int(v) if v > 0 => v as u32,
-                _ => 0,
-            };
-            // Same override-first / name-collision handling as defineClass1,
-            // plus the loader-faithful gate: when
-            // CRATONVM_LOADER_AWARE_RESOLUTION is on, every user-loader define
-            // gets its own namespace (not just on collision) so the first
-            // definer is isolated too.
-            if lid == 0 && crate::classloader::is_user_defined_loader(ctx, *loader_obj) {
-                if crate::classloader::loader_aware_resolution()
+        Some(Value::Object(Some(loader_obj)))
+            if crate::classloader::is_user_defined_loader(ctx, *loader_obj)
+                && (crate::classloader::loader_aware_resolution()
                     || name.is_empty()
-                    || ctx.class_id_by_name(&name).is_some()
-                {
-                    lid = crate::classloader::loader_namespace_id(ctx, *loader_obj);
-                }
-            }
-            lid
+                    || ctx.class_id_by_name(&name).is_some()) =>
+        {
+            crate::classloader::loader_namespace_id(ctx, *loader_obj)
         }
         _ => 0,
     };
@@ -3479,6 +3506,10 @@ pub(crate) fn native_classloader_define_class0(
     match ctx.define_class_full(&effective_name, &bytes, loader_id, opts) {
         Ok(class_id) => {
             let mirror = ctx.get_class_mirror(class_id);
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(*loader_obj)));
+            }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
