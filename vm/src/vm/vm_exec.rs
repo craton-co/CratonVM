@@ -1212,23 +1212,25 @@ fn safe_native_call_impl(
         });
     }
     thread.native_pin_roots.truncate(pin_base);
-    // A running JIT thread cannot be collected from this ordinary (non-blocking)
-    // return boundary: a peer-requested STW waits for the thread to reach its
-    // next safepoint, which refreshes the authoritative snapshot. Keep the
-    // object in native_pending_return across the short Rust-to-JIT handoff and
-    // avoid a full precise/conservative JIT-frame scan on every object-returning
-    // native call. Blocking natives publish through deposit_root_snapshot before
-    // they park, and interpreted callers retain the eager publication below.
+    // A running mutator cannot be collected from this ordinary, non-blocking
+    // return boundary: a peer-requested STW waits for it to reach its next
+    // safepoint, which refreshes the authoritative snapshot. That guarantee is
+    // independent of whether the Java caller is compiled or interpreted. Keep
+    // the result in `native_pending_return` during the short handoff instead of
+    // re-scanning every active interpreter frame after every object-returning
+    // native call. If a stop is already pending, publish synchronously before
+    // returning; blocking-native paths still use `deposit_root_snapshot` before
+    // they park.
     //
-    // This matters for native collection bridges: HashMap.get returns an object
-    // on every operation, and eagerly scanning the active compiled frame made
-    // root publication dominate the entire benchmark.
-    let running_jit_handoff = crate::jit::conservative_roots::current_thread_jit_depth() != 0
-        && !shared
-            .gc_barrier
-            .stw_requested
-            .load(std::sync::atomic::Ordering::Acquire);
-    if thread.native_pending_return.is_some() && !running_jit_handoff {
+    // Lucene's merge writers cross native collection bridges for nearly every
+    // term. Eagerly revalidating a deep frame chain here made root publication
+    // dominate `testSlicesDense` even though the same thread must safepoint
+    // before its result can be exposed to a collector.
+    let stop_pending = shared
+        .gc_barrier
+        .stw_requested
+        .load(std::sync::atomic::Ordering::Acquire);
+    if thread.native_pending_return.is_some() && stop_pending {
         crate::runtime::interpreter::update_root_snapshot(shared, thread);
     }
 
@@ -1240,15 +1242,12 @@ fn safe_native_call_impl(
 #[inline]
 pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) {
     thread.native_pending_return = None;
-    // The matching `safe_native_call` already published a root snapshot
-    // covering the just-returned object (via `native_pending_return`); now that
-    // the value is also an operand-stack root it stays covered by the next
-    // snapshot refresh, and a moving STW collector never reads THIS (post-return,
-    // interruptible) snapshot — it waits for this thread to refresh at the
-    // safepoint barrier. So this second publish is redundant. Skipping it halves
-    // `update_root_snapshot` frequency on the reflective-deploy hot path (bug 04:
-    // ~68% of an embedded-server deploy). Opt-in + default-OFF because it touches
-    // GC root publication; see `env_cache::skip_redundant_native_snapshot`.
+    // `safe_native_call` either already published the handoff because a stop was
+    // pending or kept it in `native_pending_return` until this point. The value
+    // is now an operand-stack root, and a moving STW collector waits for this
+    // thread's safepoint before reading a snapshot. A second eager publish is
+    // therefore redundant. The default-on cache avoids it; see
+    // `env_cache::skip_redundant_native_snapshot`.
     if crate::runtime::env_cache::skip_redundant_native_snapshot() {
         return;
     }
@@ -18411,6 +18410,32 @@ mod tests {
             0,
             "safe_native_call still owns and releases native handoff pins"
         );
+    }
+
+    #[test]
+    fn safe_native_call_keeps_runnable_return_in_handoff_root() {
+        fn returning_native(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
+            Ok(Some(Value::Object(Some(ctx.alloc_object(ClassId::new(0), 0)))))
+        }
+
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        let ordinary = safe_native_call(&shared, &mut thread, returning_native, &[])
+            .expect("ordinary native return");
+        let ordinary = match ordinary {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected object native return, got {other:?}"),
+        };
+        assert_eq!(thread.native_pending_return, Some(ordinary));
+        assert!(
+            thread.root_snapshot.lock().is_empty(),
+            "a runnable thread keeps the short return handoff in native_pending_return; a collector must wait for its safepoint"
+        );
+
     }
 
     // -----------------------------------------------------------------------
