@@ -14205,6 +14205,9 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(ks, "size", "()I", |ctx, args| {
+        if cfg!(not(feature = "legacy-synthetic-crypto")) {
+            return crate::keystore::keystore_size(ctx, args);
+        }
         let this = obj_arg(args, 0)?;
         #[cfg(feature = "legacy-synthetic-crypto")]
         {
@@ -14225,6 +14228,9 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.register(ks, "aliases", "()Ljava/util/Enumeration;", |ctx, args| {
+        if cfg!(not(feature = "legacy-synthetic-crypto")) {
+            return crate::keystore::keystore_aliases(ctx, args);
+        }
         let this = obj_arg(args, 0)?;
         #[cfg(feature = "legacy-synthetic-crypto")]
         {

@@ -54,9 +54,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use std::collections::HashMap;
-
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -1728,7 +1727,6 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         .get(1)
         .and_then(|v| read_string_arg(ctx, v))
         .unwrap_or_default();
-
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
     };
@@ -1895,11 +1893,31 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(en))))
 }
 
+/// Public `KeyStore.aliases()` is intercepted by the early security shim in
+/// real-JDK mode. Route that wrapper through the provider SPI's registry-backed
+/// implementation rather than returning the legacy synthetic empty view.
+pub(crate) fn keystore_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let spi = unwrap_keystore_spi(ctx, this);
+    let mut engine_args = args.to_vec();
+    engine_args[0] = Value::Object(Some(spi));
+    engine_aliases(ctx, &engine_args)
+}
+
 fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let n = keystore_lookup(id).map(|s| s.entries.len()).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// Registry-backed counterpart for the public `KeyStore.size()` shim.
+pub(crate) fn keystore_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let spi = unwrap_keystore_spi(ctx, this);
+    let mut engine_args = args.to_vec();
+    engine_args[0] = Value::Object(Some(spi));
+    engine_size(ctx, &engine_args)
 }
 
 fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

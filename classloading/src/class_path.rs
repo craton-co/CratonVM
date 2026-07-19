@@ -920,6 +920,7 @@ fn resource_name_matches_simple_glob(glob: &str, candidate: &str) -> bool {
 /// Examples:
 ///   "C:/dacapo.jar!/harness/" -> Some(("C:/dacapo.jar", "harness/"))
 ///   "/lib/foo.jar!/META-INF/"  -> Some(("/lib/foo.jar", "META-INF/"))
+///   "/apps/app.war!/WEB-INF/classes/" -> Some(("/apps/app.war", "WEB-INF/classes/"))
 ///   "C:/x.jar"                 -> None  (no `!/` separator)
 ///   "C:/x.jar!/"               -> None  (empty prefix → equivalent to root)
 fn parse_jar_subdir_spec(spec: &str) -> Option<(String, String)> {
@@ -929,12 +930,13 @@ fn parse_jar_subdir_spec(spec: &str) -> Option<(String, String)> {
     if jar_part.is_empty() || prefix_part.is_empty() {
         return None;
     }
-    // Only accept `.jar` / `.zip` outer archives so a `findResource`
-    // miss-with-colon (e.g. "https:") never trips this branch.
-    let lower = jar_part.to_ascii_lowercase();
-    if !(lower.ends_with(".jar") || lower.ends_with(".zip")) {
-        return None;
-    }
+    // The outer file's extension is deliberately not part of the grammar.
+    // `URLClassLoader` treats a `jar:` URL as an archive independently of its
+    // name, and application servers routinely use `.war`, `.ear`, and `.par`
+    // files. The caller verifies that the named file exists and that it is a
+    // readable ZIP before it contributes an entry, so accepting the syntactic
+    // `!/` form here cannot turn an arbitrary resource miss into a classpath
+    // entry.
     let prefix = if prefix_part.ends_with('/') {
         prefix_part.to_string()
     } else {
@@ -1223,6 +1225,30 @@ impl ClassPath {
         let mut entries = Vec::new();
         for raw in paths {
             for p in Self::expand_classpath_wildcard(raw) {
+                // A URLClassLoader rooted at an archive subdirectory hands us
+                // `<archive>!/<prefix>/`. Handle it before interpreting the
+                // token as a filesystem path so `.war`/`.ear` archives retain
+                // their internal root for both class and resource lookup.
+                if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
+                    let path = PathBuf::from(archive);
+                    if path.exists() {
+                        match read_file_for_classpath(&path) {
+                            Ok(data) => {
+                                if let Some(entry) =
+                                    Self::build_nested_directory_from_jar(&path, data, &prefix)
+                                {
+                                    entries.push(entry);
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Failed to read nested classpath archive {}: {e}", path.display());
+                            }
+                        }
+                    } else {
+                        debug!("Skipping missing nested classpath archive: {}", path.display());
+                    }
+                    continue;
+                }
                 let path = PathBuf::from(&p);
                 if path.is_dir() {
                     entries.push(ClassPathEntry::Directory(path));
@@ -3945,6 +3971,39 @@ impl ClassPath {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn jar_subdirectory_spec_accepts_war_archives() {
+        assert_eq!(
+            parse_jar_subdir_spec("/apps/test.war!/WEB-INF/classes/"),
+            Some((
+                "/apps/test.war".to_string(),
+                "WEB-INF/classes/".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn classpath_new_finds_resource_in_war_subdirectory() {
+        let dir = std::env::temp_dir().join("cratonvm_war_subdirectory_classpath");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let war_path = dir.join("test.war");
+        {
+            let file = fs::File::create(&war_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("WEB-INF/classes/test.txt", options).unwrap();
+            zip.write_all(b"test resource").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let spec = format!("{}!/WEB-INF/classes/", war_path.display());
+        let cp = ClassPath::new(&[spec]);
+        assert_eq!(cp.find_resource("test.txt"), Some(b"test resource".to_vec()));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn empty_classpath_finds_nothing() {
