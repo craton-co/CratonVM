@@ -1374,6 +1374,24 @@ fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
 /// wait for the connection to succeed/fail. In non-blocking mode we start a
 /// real non-blocking OS connect and return false immediately (or true if the
 /// OS completed it synchronously); `finishConnect()` later polls the live fd.
+/// A wildcard address (0.0.0.0 / :: / the all-zeros IPv6 literal) is a
+/// valid *bind* target ("all interfaces") but not a defined *connect*
+/// destination — Windows rejects it outright with WSAEADDRNOTAVAIL (os
+/// error 10049), which is exactly what a caller building its target via
+/// `new InetSocketAddress(port)` (the single-int ctor, which produces a
+/// wildcard address) hits. Real JDK's native connect path resolves this
+/// to loopback before dialing (confirmed empirically: HotSpot connects
+/// successfully to a wildcard-address target on this same Windows host).
+/// Mirror that here rather than handing the OS a destination it was never
+/// meant to receive.
+fn connect_target_host(host: String) -> String {
+    match host.as_str() {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "0:0:0:0:0:0:0:0" => "::1".to_string(),
+        _ => host,
+    }
+}
+
 fn sc_connect_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1381,6 +1399,7 @@ fn sc_connect_inner(
     allow_block: bool,
 ) -> Result<bool, MethodCallFailed> {
     let (host, port) = decode_socket_address(ctx, sa)?;
+    let host = connect_target_host(host);
     let target = format!("{host}:{port}");
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
 
@@ -3314,11 +3333,19 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
         let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
         // Real bound address, not the historical "0.0.0.0" placeholder —
-        // see `ssc_local_address` (same registry, same rationale).
+        // see `ssc_local_address` (same registry, same rationale). Also
+        // route through `advertised_listener_host` like `ssc_local_address`
+        // does: a wildcard listener is a valid bind target but not a valid
+        // client connect destination on Windows (WSAEADDRNOTAVAIL / os error
+        // 10049). Jetty's `ServerConnector` reads this via
+        // `ServerSocketChannel.socket().getLocalSocketAddress()` to publish
+        // the host its own reactor-netty-backed test client connects to, so
+        // this path needs the same loopback substitution the RSocket fix
+        // applied to `ssc_local_address`.
         let host = match tcp_registry().read().get(&id) {
             Some(TcpHandle::Listener(l)) => l
                 .local_addr()
-                .map(|a| a.ip().to_string())
+                .map(advertised_listener_host)
                 .unwrap_or_else(|_| "0.0.0.0".to_string()),
             _ => "0.0.0.0".to_string(),
         };
@@ -3427,6 +3454,29 @@ mod tests {
         assert_eq!(
             advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
             "127.0.0.2"
+        );
+    }
+
+    /// Regression guard for the Jetty `givenAnInflightRequestWhenTheServerIs
+    /// StoppedThenGracefulShutdownCallbackIsCalledWithRequestsActive` hang
+    /// (`jetty-webserver-factory-poststartup-timeout-and-reflective-
+    /// supertype-residuals.md`): `AbstractReactiveWebServerFactoryTests`
+    /// builds its client target via `new InetSocketAddress(port)`, which
+    /// produces a wildcard host. Connecting to that host verbatim throws
+    /// WSAEADDRNOTAVAIL on Windows instead of reaching the server, leaving
+    /// the test's `BlockingHandler.awaitQueue()` parked forever.
+    #[test]
+    fn connect_target_host_substitutes_loopback_for_wildcard_only() {
+        assert_eq!(connect_target_host("0.0.0.0".to_string()), "127.0.0.1");
+        assert_eq!(connect_target_host("::".to_string()), "::1");
+        assert_eq!(
+            connect_target_host("0:0:0:0:0:0:0:0".to_string()),
+            "::1"
+        );
+        assert_eq!(connect_target_host("127.0.0.2".to_string()), "127.0.0.2");
+        assert_eq!(
+            connect_target_host("example.invalid".to_string()),
+            "example.invalid"
         );
     }
 
