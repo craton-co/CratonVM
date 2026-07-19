@@ -2528,22 +2528,50 @@ somewhere in the resolution chain) but triggered through a DIFFERENT call path: 
 some native `ClassLoader`/`Class` operation to register or look up the class it just compiled),
 not through the `Class.forName(name, init, explicitLoader)` path cluster #1's fix covers.
 
-**Concrete next step for a follow-up session** (this should be a fast, well-scoped fix once
-found): reproduce with the minimal 3-bean XML above (`groovyContextBisectA.xml`-equivalent,
-reproducible with any two `GroovyScriptFactory` beans whose scripts declare a same-named class),
-trace exactly which native call inside `GroovyClassLoader.parseClass()` -> Groovy's compiler ->
-class-definition-and-registration sequence is consulting a loader-blind (rather than
-per-`InnerLoader`-scoped) class lookup -- candidates in rough likelihood order: (1) Groovy's own
-`GroovyClassLoader.defineClass(ClassNode, String, String)` or its class-collector step calling
-`Class.forName`/`loadClass` internally to hand back the compiled `Class` object by name, hitting
-the same `find_class_by_name` ambiguity-refusal fallback described in cluster #1 (in which case
-extending cluster #1's `find_loaded_class_for_loader`-first fix to whatever native backs this
-specific call site should close it identically); (2) the class VERIFICATION/linking step during
-`define_class_full` doing a global (not per-loader) duplicate-name check and rejecting/aliasing
-the second definition. `CRATONVM_S111_DBG`-style tracing (see cluster #1's methodology) on the
-`parseClass` call for the SECOND script, watching for any `Class.forName`/`loadClass`/
-`find_class_by_name` invocation for the literal name `org/springframework/scripting/groovy/
-GroovyMessenger`, is the fastest way to nail the exact site.
+**UPDATE, same session: `find_class_by_name` (the ambiguity-refusing global lookup implicated in
+cluster #1) is RULED OUT as the direct culprit here** -- temporary tracing (`CRATONVM_DBG_FCBN`,
+reverted before commit, not left in the tree) inside `find_class_by_name` itself, run against the
+minimal 3-bean repro, shows it being consulted many times for BeanInfo/Customizer-introspection
+lookups (`GroovyMessengerBeanInfo`, `GroovyMessengerCustomizer` -- standard `java.beans.
+Introspector` convention probes, all correctly returning "not found") as the second script's own
+class is being processed under its own new `UserDefined(4)` namespace, but it is **never once
+invoked for the plain, unqualified name** `org/springframework/scripting/groovy/GroovyMessenger`
+after the second `InnerLoader` exists -- the failure happens without that lookup ever running.
+
+**Sharper localization**: the actual failure signature is the SAME `NullBean` pattern already
+seen in the single-bean investigation above -- `scriptedObject.messengerInstanceInline` resolves
+to `NullBean`, i.e. `GroovyScriptFactory.getScriptedObject()`'s factory-method invocation
+genuinely returns Java `null`. Given every isolated mechanism probe upstream in this doc (script
+execution, `CachedResultHolder`, reflective invocation, bean-factory identity, the full real
+`ScriptFactoryPostProcessor` for a *single* bean) reproduces correctly, and `find_class_by_name`
+is not hit ambiguously at the relevant moment either, the remaining candidate is **the JVM-level
+constant-pool `CONSTANT_Class` resolution executed by the bytecode `new GroovyMessenger()`
+instruction itself**, inside the *second* script's compiled `Script` subclass's `run()` method
+body, when it is interpreted/executed. That symbolic reference must resolve relative to the
+defining class's own loader (`InnerLoader` #2) via ordinary JVMS §5.4.3.1 resolution (not
+`Class.forName`, not `ClassLoader.loadClass`, not `find_class_by_name` -- a third, distinct
+class-resolution code path in the interpreter/JIT that this investigation has not yet
+instrumented). If THAT resolution path also has a loader-blind fallback (structurally likely,
+given the same defining-loader-collision shape recurring a third time across three unrelated
+call sites in this codebase), it could plausibly resolve to the WRONG `GroovyMessenger` `ClassId`
+(the first script's), a stale/incompatible one for a `new` against the second script's own
+constant pool, causing allocation or construction to fail in a way that unwinds back through
+Groovy's own `Script.run()` / `InvokerHelper` exception handling as a silently-swallowed `null`
+rather than a propagated exception -- consistent with `getScriptedObjectType`'s own `catch
+(CompilationFailedException ex)` only catching *that* specific exception type, not a general
+`Throwable`, from `executeScript`.
+
+**Concrete next step for a follow-up session**: instrument the interpreter/JIT's
+`CONSTANT_Class` / symbolic-class-reference resolution path specifically (the code that backs
+bytecode `new`, `checkcast`, `instanceof`, `getstatic`, etc. resolving a `CONSTANT_Class` constant
+pool entry against the CURRENT frame's owning class's defining loader) -- NOT
+`Class.forName`/`loadClass`/`find_class_by_name`, all three already ruled out as the direct site
+for this specific failure -- using the same minimal 3-bean repro (`groovyContextBisectA.xml`-
+equivalent, `messengerInstance` + `messengerInstanceInline`, both declaring `class GroovyMessenger
+implements Messenger`) and the rename-based confirmation (`class GroovyMessengerRenamed` makes it
+pass) as the fast pass/fail oracle. Check specifically whether that resolution path is scoped to
+the referencing class's own defining loader or falls through to a global/first-match lookup when
+multiple `UserDefined` loaders each hold a class of the exact same name.
 
 ### 6 found=0 ABEND cluster — reconciled
 
