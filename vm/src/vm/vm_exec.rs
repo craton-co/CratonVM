@@ -1387,6 +1387,20 @@ pub(crate) fn monitor_enter_blocking(
             .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
+    // A monitor can be contended-and-inflated with its owner already dead:
+    // `ThreadRegistry::mark_dead`'s one-time sweep (`release_monitors_held_by`)
+    // only reaches monitors that were ALREADY inflated at the moment the
+    // owning thread died. A monitor that was still an uncontended thin lock
+    // at that moment is inflated later — right here, by whichever thread
+    // next contends it — and inflation pre-seeds the new `Monitor`'s owner
+    // straight from the stale thin-lock mark word. Without this check every
+    // future `monitorenter` on that object blocks forever on a dead owner
+    // that will never call `exit`/`notify` again.
+    if let Some(owner) = m.current_owner() {
+        if owner != thread.thread_id && !shared.thread_registry.is_alive(owner) {
+            m.force_release_if_owned_by(owner);
+        }
+    }
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
     ctx.thread
@@ -6555,6 +6569,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // the collector can never read a dangling pointer.
                 shared_arc.thread_registry.clear_tlab_addr(tid);
                 shared_arc.thread_registry.mark_dead(tid);
+                // A thread that terminated while blocked inside a native call
+                // made from within a `synchronized` region never executes its
+                // `monitorexit` bytecode — sweep anything it still holds so no
+                // future locker waits forever (see
+                // `MonitorTable::release_monitors_held_by`).
+                shared_arc.monitors.release_monitors_held_by(tid);
             });
 
             if let Some(monitor) = term_monitor {
@@ -7151,9 +7171,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if thread_id == 0 {
             return;
         }
-        self.shared
-            .thread_registry
-            .mark_dead(crate::threading::jvm_thread::ThreadId(thread_id));
+        let tid = crate::threading::jvm_thread::ThreadId(thread_id);
+        self.shared.thread_registry.mark_dead(tid);
+        self.shared.monitors.release_monitors_held_by(tid);
     }
 
     /// T19_K2 вЂ” Attach a `Box<JoinHandle<()>>` to an already-registered
