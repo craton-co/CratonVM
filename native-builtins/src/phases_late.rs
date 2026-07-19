@@ -79,6 +79,28 @@ fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usi
     }
 }
 
+#[cfg(test)]
+mod gzip_output_regression_tests {
+    use super::*;
+
+    #[test]
+    fn gzip_output_matches_hotspot_for_a_large_json_string() {
+        let mut body = Vec::with_capacity(10_002);
+        body.push(b'[');
+        body.extend(std::iter::repeat_n(b'a', 10_000));
+        body.push(b']');
+
+        let actual = p58_gzip_compress(&body).expect("gzip compression should succeed");
+        let expected = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xed, 0xc1, 0x31, 0x0d,
+            0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37, 0x51, 0x1f, 0x0d, 0x70,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x52, 0xc0, 0x19,
+            0x7d, 0xe0, 0x12, 0x27, 0x00, 0x00,
+        ];
+        assert_eq!(actual, expected);
+    }
+}
+
 fn read_pinned_object_value(
     ctx: &dyn NativeContext,
     pin: Option<(usize, ObjectRef)>,
@@ -5897,11 +5919,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;)Ljava/nio/file/Path;",
         |ctx, args| {
             let uri = obj_arg(args, 0)?;
+            let uri_text = p57_uri_full_text(ctx, uri);
+            // `Paths.get(jar:file:...!/entry)` is the resource-facing half of
+            // the jar-FS contract. Jetty's PathResourceFactory mounts the URI
+            // first, then calls this conversion for the root and every
+            // resolved child. Treating the full `jar:` text as an ordinary host
+            // path loses the mounted archive identity, making Files.isDirectory
+            // false and Files.list() empty despite a valid central directory.
+            if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
+                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                return Ok(Some(Value::Object(Some(result))));
+            }
             // Opaque file-scheme URIs (`file:.`, `file:foo`) are not
             // hierarchical: the real JDK throws here rather than yielding a
             // path. Match that so callers like Spring's PathEditor fall back
             // to their resource mechanism.
-            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+            if p57_uri_is_opaque_file(&uri_text) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "URI is not hierarchical".to_string(),
                 }
@@ -6815,7 +6850,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `getFileAttributeView(dir, DosFileAttributeView.class).setReadOnly(true)`;
     // an unregistered setter → AbstractMethodError aborted the cache-dir setup
     // → the bogus "… is not a directory" leaf (SB-14). No-ops are sufficient
-    // (the JDK call only needs to not throw). `setTimes` applies to both views.
+    // (the JDK call only needs to not throw). `setTimes` applies real
+    // filesystem timestamps on both views.
     for vclass in [
         "java/nio/file/attribute/BasicFileAttributeView",
         "java/nio/file/attribute/DosFileAttributeView",
@@ -6824,7 +6860,26 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             vclass,
             "setTimes",
             "(Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;)V",
-            |_ctx, _args| Ok(None),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let path_value = ctx.get_field(this, 0);
+                let path = extract_path_string(ctx, Some(&path_value));
+                let modified = args.get(1).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                let access = args.get(2).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                let creation = args.get(3).and_then(|value| match value {
+                    Value::Object(Some(time)) => Some(filetime_read_millis(ctx, *time)),
+                    _ => None,
+                });
+                set_file_attribute_times(&path, creation, access, modified)
+                    .map_err(|error| p57_io_error(&error))?;
+                Ok(None)
+            },
         );
     }
     for setter in ["setReadOnly", "setHidden", "setSystem", "setArchive"] {
@@ -11842,6 +11897,15 @@ fn p57_to_os_path(p: &str) -> String {
 }
 
 fn p57_absolute_path_string(path: &str) -> String {
+    // A mounted jar/jrt entry is absolute within its own filesystem. Several
+    // Path.toAbsolutePath registrations share this helper; letting any one of
+    // them anchor the opaque sentinel to the host CWD both leaks the sentinel
+    // through Path.toString() and changes the entry identity. Jetty's
+    // PathResource.getName() exercises exactly that sequence after listing a
+    // `jar:` URI.
+    if vfs_decode(path).is_some() {
+        return path.to_string();
+    }
     #[cfg(windows)]
     {
         return p57_windows_absolute_path_string(path);
@@ -11880,6 +11944,33 @@ fn p57_trim_file_trailing_separator(path: &str) -> String {
         return format!("{trimmed}/");
     }
     trimmed.to_string()
+}
+
+/// WindowsPath removes trailing separators from ordinary paths at construction
+/// time, but retains them for filesystem roots. Keep that representation
+/// invariant in CratonVM's synthetic Path objects so every consumer of a Path
+/// (including `Files.writeString`) sees the same canonical path.
+///
+/// Mounted jar/JRT paths use their trailing `/` as an in-filesystem entry
+/// marker, so they deliberately retain it.
+fn p57_trim_windows_path_trailing_separator(path: &str) -> String {
+    if !cfg!(windows) || vfs_decode(path).is_some() {
+        return path.to_string();
+    }
+
+    let canonical = path.replace('\\', "/");
+    if !canonical.ends_with('/') && !canonical.ends_with('\\') {
+        return canonical;
+    }
+
+    // Roots (drive, UNC, drive-less, and verbatim) must retain their terminal
+    // separator. Every non-root path has at least one name element.
+    let (_, names) = p57_parse_win_root(&canonical);
+    if names.is_empty() {
+        canonical
+    } else {
+        canonical.trim_end_matches(['/', '\\']).to_string()
+    }
 }
 
 #[cfg(windows)]
@@ -12094,7 +12185,25 @@ mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    use super::{p57_win_is_absolute, p57_win_parent_of};
+    use super::{p57_trim_windows_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
+
+    #[test]
+    fn trailing_separator_is_removed_only_from_non_roots() {
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("C:/work/one/two/"),
+            "C:/work/one/two"
+        );
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("one\\two\\"),
+            "one/two"
+        );
+        assert_eq!(p57_trim_windows_path_trailing_separator("C:/"), "C:/");
+        assert_eq!(
+            p57_trim_windows_path_trailing_separator("//server/share/"),
+            "//server/share/"
+        );
+        assert_eq!(p57_trim_windows_path_trailing_separator("/"), "/");
+    }
 
     #[test]
     fn is_absolute_matches_hotspot() {
@@ -12288,11 +12397,7 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // encoded strings carry a sentinel + their own '/'-separated entry, so
     // never rewrite those.
     #[cfg(windows)]
-    let stored = if jarfs_decode(path).is_some() {
-        path.to_string()
-    } else {
-        path.replace('\\', "/")
-    };
+    let stored = p57_trim_windows_path_trailing_separator(path);
     #[cfg(not(windows))]
     let stored = path.to_string();
     // Pin across the create_string below — a moving young GC there would
@@ -13394,6 +13499,17 @@ fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// Split a file-backed `jar:` URI into its backing archive and its path within
+/// that archive. This is deliberately separate from `p57_jar_uri_to_os_path`:
+/// callers such as `FileSystemProvider.newFileSystem` need only the container,
+/// whereas `Path.of(URI)` must retain the entry portion for `Files.*` calls.
+fn p57_jar_uri_to_entry_path(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("jar:")?;
+    let (container, entry) = rest.split_once("!/")?;
+    let jar = p57_jar_uri_to_os_path(container)?;
+    Some((jar, entry.to_string()))
 }
 
 /// Build a `java.io.IOException` runtime error from a Rust IO error — used so
@@ -16002,6 +16118,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .to_string();
             }
         }
+        // Decode percent-escapes (`%20` -> ` `, etc.) the way the real
+        // `URI.getPath()` accessor does — File(URI) calls that accessor, but
+        // both sources above (the by-name `path` field on a real-JDK URI,
+        // and the raw-text parse fallback) yield the RAW, still-encoded
+        // component. Without this, a jar/file path containing an encoded
+        // space or other reserved character never resolves to the real
+        // on-disk file (Spring Boot's `StaticResourceJars.toFile` silently
+        // treats the mis-decoded `File` as not found).
+        let path = crate::net_phase_e::uri_percent_decode(&path);
         // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
         let mut p = path;
         let chars: Vec<char> = p.chars().collect();
@@ -19350,13 +19475,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Finish compression if not already done (count >= 0 means not finished)
         let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
+        // `finish` invokes Java OutputStream methods, which may allocate and move
+        // the receiver. Keep it rooted across that call before using it again.
+        let this_pin = ctx.pin_native_root(this);
         if count >= 0 {
-            p58_gzip_out_finish(ctx, args)?;
+            let this_now = ctx.read_native_pin(this_pin, this);
+            p58_gzip_out_finish(ctx, &[Value::Object(Some(this_now))])?;
         }
         // Close underlying stream
-        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        if let Value::Object(Some(underlying)) = ctx.get_field(this_now, 2) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -19893,10 +20024,15 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
-    ctx.set_field(this, 0, Value::Object(Some(arr)));
-    ctx.set_field(this, 1, Value::Int(0));
+    // Store the pre-existing Java argument before the allocation below; it is
+    // then reachable through `this` if a moving collection occurs.
     ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let this_pin = ctx.pin_native_root(this);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 0, Value::Object(Some(arr)));
+    ctx.set_field(this_now, 1, Value::Int(0));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -19929,22 +20065,34 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
     if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
         let cap = ctx.array_length(arr);
         let new_count = count + bytes.len();
-        // Grow if needed
-        let target = if new_count > cap {
+        if new_count > cap {
+            // The new byte[] can trigger a moving collection. Both `this`
+            // and the old buffer are used after that allocation, so raw
+            // ObjectRefs would write stale memory and corrupt the compressed
+            // payload (Zipkin's 10,002-byte JSON body became 11,034 bytes).
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
             let new_cap = (new_count * 2).max(1024);
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
             for i in 0..count {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+                let arr_now = ctx.read_native_pin(arr_pin, arr);
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr_now, i));
             }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            new_arr
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 0, Value::Object(Some(new_arr)));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(new_arr, count + i, Value::Int(b as i8 as i32));
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 1, Value::Int(new_count as i32));
+            ctx.unpin_native_roots(arr_pin);
+            ctx.unpin_native_roots(this_pin);
         } else {
-            arr
-        };
-        for (i, &b) in bytes.iter().enumerate() {
-            ctx.set_array_element(target, count + i, Value::Int(b as i8 as i32));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, count + i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(this, 1, Value::Int(new_count as i32));
         }
-        ctx.set_field(this, 1, Value::Int(new_count as i32));
     }
 }
 
@@ -20096,57 +20244,22 @@ fn p58_crc32(data: &[u8]) -> u32 {
     !c
 }
 
-#[cfg(unix)]
 fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
-    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    let mut z_len = bound as libz_sys::uLong;
+    let rc =
+        unsafe { libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
     if rc != 0 || z_len < 6 {
         return None;
     }
     z.truncate(z_len as usize);
     // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
     Some(z[2..z.len() - 4].to_vec())
-}
-
-#[cfg(not(unix))]
-fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
-    None
 }
 
 fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -20172,6 +20285,7 @@ fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
 fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
     let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
 
     // Read accumulated uncompressed data
@@ -20190,13 +20304,18 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
     // Write compressed bytes to underlying OutputStream
     if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let underlying_pin = ctx.pin_native_root(underlying);
         for &b in &compressed {
-            let _ = ctx.invoke_virtual(underlying, "write", "(I)V", &[Value::Int(b as i32)]);
+            let underlying_now = ctx.read_native_pin(underlying_pin, underlying);
+            let _ = ctx.invoke_virtual(underlying_now, "write", "(I)V", &[Value::Int(b as i32)]);
         }
+        ctx.unpin_native_roots(underlying_pin);
     }
 
     // Mark as finished (set count to -1)
-    ctx.set_field(this, 1, Value::Int(-1));
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 1, Value::Int(-1));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -21852,6 +21971,23 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // JarFile.getComment() — inherited from ZipFile in real bytecode, whose
+    // `ensureOpen()` throws `IllegalStateException("zip file closed")` once
+    // `close()` has run. Our synthetic 2-field JarFile has no real ZipFile
+    // backing fields for that bytecode to check, so unregistered dispatch
+    // returned normally with no exception at all — Spring Boot's
+    // `StaticResourceJarsTests.closesJarFromNonCachedConnection` expects the
+    // throw. Mirror `close()`'s closed-marker (path field cleared to null).
+    r.register(jf, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if matches!(ctx.get_field(this, 0), Value::Object(None)) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "zip file closed".to_string(),
+            }
+            .into());
+        }
+        Ok(Some(Value::Object(None)))
+    });
     r.register(jf, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -22618,37 +22754,31 @@ fn spring_class_utils_for_name_impl(
     // BOOT-INF/lib fat-jars) and carries the LaunchedURLClassLoader rescue that
     // routing through `loadClass` would lose; its inner-class retry also covers
     // the Spring-Boot `a.b.Outer.Factory` → `a/b/Outer$Factory` factory names.
-    // ClassUtils.forName's real bytecode substitutes a null classLoader
-    // argument with ClassUtils.getDefaultClassLoader() (the thread context
-    // classloader, falling back only if that is itself null) BEFORE calling
-    // Class.forName -- but this native shim intercepts the call before that
-    // substitution ever runs, so a caller that deliberately passes null
-    // (e.g. Spring's SpringFactoriesLoader: AotServices.factories() builds
-    // one with a permanently-null this.classLoader field, used by every
-    // AOT TestRuntimeHintsRegistrar / BeanFactoryInitializationAotProcessor
-    // SPI lookup) silently fell through to the loader-blind global scanner
-    // below instead of the caller's actual thread-context loader. Under
-    // @CompileWithForkedClassLoader this always resolved an SPI
-    // implementation class (e.g. StandardTestRuntimeHints) to the stale
-    // app-loaded copy instead of the fork's own redefinition, breaking
-    // downstream identity checks (RuntimeHints predicates keyed off the
-    // fork-loaded literal Class object).
-    let explicit_loader = match args.get(1) {
+    // Spring's ClassUtils substitutes getDefaultClassLoader() when the caller
+    // passes null. That is normally the thread context class loader (TCCL),
+    // which is how ModifiedClassPathExtension makes ClassUtils.isPresent
+    // observe its filtered class path. The previous native treated null as the
+    // unified application class path, leaking excluded clients back into
+    // ClientHttpRequestFactoryBuilder.detect().
+    //
+    // Use the Thread accessor rather than reading its field directly: the
+    // accessor owns the real-JDK layout and explicit-null handling. As with
+    // Spring's getDefaultClassLoader(), an unavailable/null TCCL falls through
+    // to the normal application-loader path below.
+    let current_thread = ctx.current_thread_object();
+    let loader = match args.get(1) {
         Some(Value::Object(Some(loader))) => Some(*loader),
-        _ => match ctx.invoke("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[]) {
-            Ok(Some(Value::Object(Some(t)))) => match ctx.invoke(
-                "java/lang/Thread",
-                "getContextClassLoader",
-                "()Ljava/lang/ClassLoader;",
-                &[Value::Object(Some(t))],
-            ) {
-                Ok(Some(Value::Object(Some(tcl)))) => Some(tcl),
-                _ => None,
-            },
+        _ => match ctx.invoke_virtual(
+            current_thread,
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(loader)))) => Some(loader),
             _ => None,
         },
     };
-    if let Some(loader) = explicit_loader {
+    if let Some(loader) = loader {
         if crate::classloader::is_user_defined_loader(ctx, loader) {
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
                 crate::lang_class::native_class_for_name(
@@ -22776,13 +22906,159 @@ pub(crate) struct JarEntryRec {
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
+    pub(crate) times: JarEntryTimes,
     pub(crate) bytes: std::sync::Arc<Vec<u8>>,
+}
+
+/// ZIP extended timestamp fields are authoritative when a JDK-created entry
+/// has a DOS date of 1980. The latter is a lossy fallback, while the extra
+/// fields retain the actual FileTime values.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JarEntryTimes {
+    pub(crate) modified: Option<i64>,
+    pub(crate) access: Option<i64>,
+    pub(crate) creation: Option<i64>,
 }
 
 /// Whole-jar parsed contents: per-name records plus central-directory order.
 pub(crate) struct JarContents {
     pub(crate) by_name: std::collections::HashMap<String, JarEntryRec>,
     pub(crate) order: Vec<String>,
+}
+
+fn p59_zip_entry_times(entry: &zip::read::ZipFile<'_>) -> JarEntryTimes {
+    let mut times = JarEntryTimes::default();
+    for field in entry.extra_data_fields() {
+        let parsed = match field {
+            zip::extra_fields::ExtraField::ExtendedTimestamp(timestamp) => JarEntryTimes {
+                modified: timestamp.mod_time().map(|time| i64::from(time) * 1_000),
+                access: timestamp.ac_time().map(|time| i64::from(time) * 1_000),
+                creation: timestamp.cr_time().map(|time| i64::from(time) * 1_000),
+            },
+            zip::extra_fields::ExtraField::Ntfs(timestamp) => JarEntryTimes {
+                modified: Some(p59_windows_filetime_to_unix_millis(timestamp.mtime())),
+                access: Some(p59_windows_filetime_to_unix_millis(timestamp.atime())),
+                creation: Some(p59_windows_filetime_to_unix_millis(timestamp.ctime())),
+            },
+        };
+        p59_merge_zip_times(&mut times, parsed);
+    }
+    times
+}
+
+fn p59_windows_filetime_to_unix_millis(time: u64) -> i64 {
+    (i128::from(time) / 10_000 - 11_644_473_600_000i128) as i64
+}
+
+fn p59_merge_zip_times(target: &mut JarEntryTimes, source: JarEntryTimes) {
+    if source.modified.is_some() {
+        target.modified = source.modified;
+    }
+    if source.access.is_some() {
+        target.access = source.access;
+    }
+    if source.creation.is_some() {
+        target.creation = source.creation;
+    }
+}
+
+/// The JDK writes access and creation values into the local header's 0x5455
+/// extra field while the central directory often retains only modified time.
+fn p59_zip_local_entry_times(path: &str, entry: &zip::read::ZipFile<'_>) -> JarEntryTimes {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return JarEntryTimes::default();
+    };
+    if file.seek(SeekFrom::Start(entry.header_start())).is_err() {
+        return JarEntryTimes::default();
+    }
+    let mut header = [0u8; 30];
+    if file.read_exact(&mut header).is_err() || header[0..4] != *b"PK\x03\x04" {
+        return JarEntryTimes::default();
+    }
+    let name_len = usize::from(u16::from_le_bytes([header[26], header[27]]));
+    let extra_len = usize::from(u16::from_le_bytes([header[28], header[29]]));
+    if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
+        return JarEntryTimes::default();
+    }
+    let mut extra = vec![0u8; extra_len];
+    if file.read_exact(&mut extra).is_err() {
+        return JarEntryTimes::default();
+    }
+    p59_zip_extra_times(&extra)
+}
+
+fn p59_zip_extra_times(extra: &[u8]) -> JarEntryTimes {
+    let mut times = JarEntryTimes::default();
+    let mut offset = 0;
+    while offset + 4 <= extra.len() {
+        let tag = u16::from_le_bytes([extra[offset], extra[offset + 1]]);
+        let len = usize::from(u16::from_le_bytes([extra[offset + 2], extra[offset + 3]]));
+        offset += 4;
+        let Some(data) = extra.get(offset..offset + len) else {
+            break;
+        };
+        match tag {
+            0x5455 if !data.is_empty() => {
+                let flags = data[0];
+                let mut cursor = 1;
+                let mut read_time = |enabled: bool| {
+                    if !enabled || cursor + 4 > data.len() {
+                        return None;
+                    }
+                    let time = u32::from_le_bytes(data[cursor..cursor + 4].try_into().ok()?);
+                    cursor += 4;
+                    Some(i64::from(time) * 1_000)
+                };
+                times.modified = read_time(flags & 0x01 != 0 || data.len() == 5);
+                times.access = read_time(flags & 0x02 != 0);
+                times.creation = read_time(flags & 0x04 != 0);
+            }
+            0x000a if data.len() >= 32 && data[4..6] == [0x01, 0x00] && data[6..8] == [24, 0] => {
+                times.modified = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[8..16].try_into().unwrap(),
+                )));
+                times.access = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[16..24].try_into().unwrap(),
+                )));
+                times.creation = Some(p59_windows_filetime_to_unix_millis(u64::from_le_bytes(
+                    data[24..32].try_into().unwrap(),
+                )));
+            }
+            _ => {}
+        }
+        offset += len;
+    }
+    times
+}
+
+fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times: JarEntryTimes) {
+    let entry_pin = ctx.pin_native_root(entry);
+    for (field, millis) in [
+        ("mtime", times.modified),
+        ("atime", times.access),
+        ("ctime", times.creation),
+    ] {
+        let Some(millis) = millis else {
+            continue;
+        };
+        let time = match ctx.invoke(
+            "java/nio/file/attribute/FileTime",
+            "fromMillis",
+            "(J)Ljava/nio/file/attribute/FileTime;",
+            &[Value::Long(millis)],
+        ) {
+            Ok(Some(Value::Object(Some(time)))) => time,
+            _ => continue,
+        };
+        let time_pin = ctx.pin_native_root(time);
+        let entry = ctx.read_native_pin(entry_pin, entry);
+        let time = ctx.read_native_pin(time_pin, time);
+        ctx.set_field_by_name(entry, field, Value::Object(Some(time)));
+        ctx.unpin_native_roots(time_pin);
+    }
+    ctx.unpin_native_roots(entry_pin);
 }
 
 /// Per-path cache of a JAR's parsed central directory + decompressed entries.
@@ -22832,6 +23108,8 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         #[allow(deprecated)]
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let mut times = p59_zip_entry_times(&entry);
+        p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
         let mut buf = Vec::with_capacity(entry.size() as usize);
         if entry.read_to_end(&mut buf).is_err() {
             continue;
@@ -22844,6 +23122,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 csize,
                 method,
                 crc,
+                times,
                 bytes: Arc::new(buf),
             },
         );
@@ -22881,7 +23160,8 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc) = (rec.size, rec.csize, rec.method, rec.crc);
+        let (size, csize, method, crc, times) =
+            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
         let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
@@ -22903,6 +23183,7 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
+        p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
     // Re-read every entry to its current (post-GC) address before returning.
@@ -22925,13 +23206,14 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc) = match contents.by_name.get(entry_name) {
+    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
             rec.size,
             rec.csize,
             rec.method,
             rec.crc,
+            rec.times,
         ),
         None => return Value::Object(None),
     };
@@ -22956,6 +23238,7 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
+    p59_set_jar_entry_times(ctx, je, times);
     Value::Object(Some(je))
 }
 
@@ -23607,11 +23890,11 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         Ok(a) => a,
         Err(_) => return Value::Object(None),
     };
-    let manifest_content = match archive.by_name("META-INF/MANIFEST.MF") {
+    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
         Ok(mut entry) => {
             use std::io::Read;
-            let mut buf = String::new();
-            if entry.read_to_string(&mut buf).is_ok() {
+            let mut buf = Vec::new();
+            if entry.read_to_end(&mut buf).is_ok() {
                 buf
             } else {
                 return Value::Object(None);
@@ -23619,24 +23902,26 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         }
         Err(_) => return Value::Object(None),
     };
-    // Parse the main section (terminated by a blank line) into key/value pairs,
+    // Parse the main section, including folded continuation lines, through the
+    // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
+    // one parser prevents JarFile.getManifest() from drifting from the normal
+    // constructor path on long attributes such as Spring Boot's Class-Path.
+    // Build a REAL Manifest whose Attributes is backed by a real map —
+    // consistent with getValue/putValue/size/write (see
+    // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
+    // was wrong for the 1-field real layout and read back null/empty.
+    // Parse all sections, including signed-jar `Name:` entry attributes,
     // then build a REAL Manifest whose Attributes is backed by a real map —
     // consistent with getValue/putValue/size/write (see
     // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
     // was wrong for the 1-field real layout and read back null/empty.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    for line in manifest_content.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            break; // end of the main (manifest-wide) section
-        }
-        if let Some((key, value)) = line.split_once(": ") {
-            pairs.push((key.trim().to_string(), value.trim().to_string()));
-        }
-    }
+    let parsed = match p59_parse_manifest_bytes(&manifest_bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return Value::Object(None),
+    };
     // A real Manifest (its <init> native installs a real empty Attributes at
-    // slot 0 and a real entries map at slot 1); populate the main Attributes
-    // through real putValue. Pin across the allocating calls.
+    // slot 0 and a real entries map at slot 1); populate both maps through
+    // real bytecode. Pin across the allocating calls.
     let manifest = match ctx.new_object_initialized("java/util/jar/Manifest", "()V", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Value::Object(None),
@@ -23653,14 +23938,54 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         },
     };
     let attrs_pin = ctx.pin_native_root(attrs);
-    let ok = p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs).is_ok();
+    if p59_attrs_populate_real(ctx, attrs_pin, attrs, &parsed.main).is_err() {
+        ctx.unpin_native_roots(man_pin);
+        return Value::Object(None);
+    }
+    let manifest = ctx.read_native_pin(man_pin, manifest);
+    let entries_map = match ctx.get_field(manifest, 1) {
+        Value::Object(Some(entries)) => entries,
+        _ => match ctx.get_field_by_name(manifest, "entries") {
+            Value::Object(Some(entries)) => entries,
+            _ => {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
+        },
+    };
+    let entries_pin = ctx.pin_native_root(entries_map);
+    for (name, pairs) in &parsed.entries {
+        let entry_attrs = p59_manifest_new_attributes(ctx);
+        let entry_pin = ctx.pin_native_root(entry_attrs);
+        if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+        let name = ctx.create_string(name);
+        let name_pin = ctx.pin_native_root(name);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+        let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+        let name = ctx.read_native_pin(name_pin, name);
+        if ctx
+            .invoke(
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    Value::Object(Some(entries_map)),
+                    Value::Object(Some(name)),
+                    Value::Object(Some(entry_attrs)),
+                ],
+            )
+            .is_err()
+        {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+    }
     let manifest = ctx.read_native_pin(man_pin, manifest);
     ctx.unpin_native_roots(man_pin);
-    if ok {
-        Value::Object(Some(manifest))
-    } else {
-        Value::Object(None)
-    }
+    Value::Object(Some(manifest))
 }
 
 // =============================================================================
@@ -23902,14 +24227,26 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
         Ok(pairs)
     }
 
-    let mut iter = sections.into_iter();
-    let main = match iter.next() {
-        Some(s) => parse_section(&s)?,
-        None => Vec::new(),
+    let mut parsed_sections: Vec<Vec<(String, String)>> = Vec::with_capacity(sections.len());
+    for section in sections {
+        parsed_sections.push(parse_section(&section)?);
+    }
+    // `Manifest.write()` may emit an empty main section followed immediately
+    // by a `Name:` section when a manifest contains only per-entry attributes.
+    // Preserve that first section as an entry rather than mistaking it for the
+    // main attributes; signed-library detection relies on exactly this shape.
+    let first_is_entry = parsed_sections.first().is_some_and(|pairs| {
+        pairs
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("Name"))
+    });
+    let main = if first_is_entry || parsed_sections.is_empty() {
+        Vec::new()
+    } else {
+        parsed_sections.remove(0)
     };
     let mut entries: Vec<(String, Vec<(String, String)>)> = Vec::new();
-    for section in iter {
-        let pairs = parse_section(&section)?;
+    for pairs in parsed_sections {
         // Spec: entry sections start with a `Name: <path>` line.
         let name = pairs
             .iter()
@@ -23928,6 +24265,50 @@ fn p59_parse_manifest_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
 struct ParsedManifest {
     main: Vec<(String, String)>,
     entries: Vec<(String, Vec<(String, String)>)>,
+}
+
+#[cfg(test)]
+mod manifest_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signed_jar_entry_sections_after_main_attributes() {
+        let parsed = p59_parse_manifest_bytes(
+            b"Manifest-Version: 1.0\r\nCreated-By: CratonVM\r\n\r\nName: com/example/App.class\r\nSHA-256-Digest: abc\r\n def\r\n\r\nName: META-INF/services/example\r\nSHA-512-Digest: ghi\r\n\r\n",
+        )
+        .expect("valid signed-jar manifest");
+
+        assert_eq!(
+            parsed.main,
+            vec![
+                ("Manifest-Version".into(), "1.0".into()),
+                ("Created-By".into(), "CratonVM".into())
+            ]
+        );
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].0, "com/example/App.class");
+        assert_eq!(
+            parsed.entries[0].1,
+            vec![("SHA-256-Digest".into(), "abcdef".into())]
+        );
+        assert_eq!(parsed.entries[1].0, "META-INF/services/example");
+        assert_eq!(
+            parsed.entries[1].1,
+            vec![("SHA-512-Digest".into(), "ghi".into())]
+        );
+
+        let entry_only =
+            p59_parse_manifest_bytes(b"\r\nName: a/b/C.class\r\nSHA1-Digest: 0000\r\n\r\n")
+                .expect("valid manifest with an empty main section");
+        assert!(entry_only.main.is_empty());
+        assert_eq!(
+            entry_only.entries,
+            vec![(
+                "a/b/C.class".into(),
+                vec![("SHA1-Digest".into(), "0000".into())],
+            )]
+        );
+    }
 }
 
 /// Synthetic `java.util.jar.Manifest.<init>(InputStream)`. Reads the full
@@ -23965,14 +24346,45 @@ fn p59_manifest_init_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             },
         };
 
+    // `Manifest(Manifest)` is a copy constructor, not a view constructor.
+    // Spring Boot removes launcher-only keys from a copy before reading the
+    // original `Start-Class`, so sharing Attributes loses that source value.
     let this_pin = ctx.pin_native_root(this);
-    let attrs = source
-        .and_then(|src| source_field(ctx, src, "attr", 0))
-        .unwrap_or_else(|| p59_manifest_new_attributes(ctx));
+    let attrs = match source.and_then(|src| source_field(ctx, src, "attr", 0)) {
+        Some(source_attrs) => {
+            let source_pin = ctx.pin_native_root(source_attrs);
+            let source_attrs = ctx.read_native_pin(source_pin, source_attrs);
+            let copied = ctx.new_object_initialized(
+                "java/util/jar/Attributes",
+                "(Ljava/util/jar/Attributes;)V",
+                &[Value::Object(Some(source_attrs))],
+            )?;
+            ctx.unpin_native_roots(source_pin);
+            match copied {
+                Some(Value::Object(Some(attrs))) => attrs,
+                _ => p59_manifest_new_attributes(ctx),
+            }
+        }
+        None => p59_manifest_new_attributes(ctx),
+    };
     let attrs_pin = ctx.pin_native_root(attrs);
-    let entries = source
-        .and_then(|src| source_field(ctx, src, "entries", 1))
-        .unwrap_or_else(|| p59_manifest_new_entries_map(ctx));
+    let entries = match source.and_then(|src| source_field(ctx, src, "entries", 1)) {
+        Some(source_entries) => {
+            let source_pin = ctx.pin_native_root(source_entries);
+            let source_entries = ctx.read_native_pin(source_pin, source_entries);
+            let copied = ctx.new_object_initialized(
+                "java/util/LinkedHashMap",
+                "(Ljava/util/Map;)V",
+                &[Value::Object(Some(source_entries))],
+            )?;
+            ctx.unpin_native_roots(source_pin);
+            match copied {
+                Some(Value::Object(Some(entries))) => entries,
+                _ => p59_manifest_new_entries_map(ctx),
+            }
+        }
+        None => p59_manifest_new_entries_map(ctx),
+    };
     let entries_pin = ctx.pin_native_root(entries);
 
     let this = ctx.read_native_pin(this_pin, this);
@@ -26559,6 +26971,101 @@ fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
         Value::Long(v) => v,
         _ => 0,
     }
+}
+
+/// Apply the non-null fields passed to `BasicFileAttributeView.setTimes`.
+/// `filetime` provides portable access/modified-time updates; Windows also
+/// exposes a mutable creation time, which is handled with `SetFileTime`.
+fn set_file_attribute_times(
+    path: &str,
+    creation_millis: Option<i64>,
+    access_millis: Option<i64>,
+    modified_millis: Option<i64>,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        return set_file_attribute_times_windows(
+            path,
+            creation_millis,
+            access_millis,
+            modified_millis,
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = creation_millis;
+        if let Some(access_millis) = access_millis {
+            filetime::set_file_atime(path, filetime_from_millis(access_millis))?;
+        }
+        if let Some(modified_millis) = modified_millis {
+            filetime::set_file_mtime(path, filetime_from_millis(modified_millis))?;
+        }
+        Ok(())
+    }
+}
+
+fn filetime_from_millis(millis: i64) -> filetime::FileTime {
+    let seconds = millis.div_euclid(1_000);
+    let nanos = (millis.rem_euclid(1_000) * 1_000_000) as u32;
+    filetime::FileTime::from_unix_time(seconds, nanos)
+}
+
+#[cfg(windows)]
+fn set_file_attribute_times_windows(
+    path: &str,
+    creation_millis: Option<i64>,
+    access_millis: Option<i64>,
+    modified_millis: Option<i64>,
+) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    unsafe extern "system" {
+        fn SetFileTime(
+            file: *mut std::ffi::c_void,
+            creation: *const FileTime,
+            access: *const FileTime,
+            modified: *const FileTime,
+        ) -> i32;
+    }
+
+    fn as_filetime(millis: i64) -> FileTime {
+        let ticks = (i128::from(millis) + 11_644_473_600_000i128) * 10_000i128;
+        let ticks = ticks as u64;
+        FileTime {
+            low: ticks as u32,
+            high: (ticks >> 32) as u32,
+        }
+    }
+
+    let creation = creation_millis.map(as_filetime);
+    let access = access_millis.map(as_filetime);
+    let modified = modified_millis.map(as_filetime);
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)?;
+    let result = unsafe {
+        SetFileTime(
+            file.as_raw_handle().cast(),
+            creation.as_ref().map_or(ptr::null(), |time| time),
+            access.as_ref().map_or(ptr::null(), |time| time),
+            modified.as_ref().map_or(ptr::null(), |time| time),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Allocate a real platform `BasicFileAttributes` implementation.
@@ -33287,7 +33794,12 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     });
     r.register(stpe, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let core_pool_size = match ctx.get_field_by_name(this, "corePoolSize") {
+            Value::Int(value) => Value::Int(value),
+            // Synthetic STPE objects have only the historical slot layout.
+            _ => ctx.get_field(this, 0),
+        };
+        Ok(Some(core_pool_size))
     });
 
     // ScheduledExecutorService interface
@@ -35832,7 +36344,21 @@ fn bi_find_next(text: &str, pos: usize, kind: i32) -> Option<usize> {
             let mut i = start;
             while i < bytes.len() {
                 if bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?' {
-                    i += 1;
+                    let after_punctuation = i + 1;
+                    // A dot inside an identifier/domain-like token is not a sentence
+                    // boundary. In particular, Spring Boot metadata reasons commonly
+                    // contain names such as `spring.server`; returning at the dot
+                    // silently truncates the generated short reason to `spring.`.
+                    // Keep the deliberately small ASCII implementation, but preserve
+                    // the essential BreakIterator contract: sentence terminators break
+                    // only at end-of-text or before whitespace.
+                    if after_punctuation < bytes.len()
+                        && !bytes[after_punctuation].is_ascii_whitespace()
+                    {
+                        i = after_punctuation;
+                        continue;
+                    }
+                    i = after_punctuation;
                     // Skip trailing whitespace
                     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                         i += 1;
@@ -36018,6 +36544,26 @@ mod break_iterator_line_boundary_tests {
         assert_eq!(bi_find_next(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(64));
         assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 48, BI_LINE), Some(39));
         assert_eq!(bi_find_prev(PICOCLI_BREAK_TEXT, 49, BI_LINE), Some(48));
+    }
+}
+
+#[cfg(test)]
+mod break_iterator_sentence_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn sentence_does_not_end_inside_dotted_identifier() {
+        let text = "Server namespace has moved to spring.server";
+        assert_eq!(
+            bi_find_next(text, 0, BI_SENTENCE),
+            Some(java_text_len(text))
+        );
+    }
+
+    #[test]
+    fn sentence_ends_before_whitespace_separated_successor() {
+        let text = "First sentence. Second sentence.";
+        assert_eq!(bi_find_next(text, 0, BI_SENTENCE), Some(16));
     }
 }
 
@@ -42306,15 +42852,24 @@ fn p68_extract_trust_manager_roots(
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-fn p68_factory_trust_roots(args: &[Value]) -> Vec<Vec<u8>> {
+fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Vec<u8>> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
-            p68_ctx_trust_roots_table()
+            let direct = p68_ctx_trust_roots_table()
                 .lock()
                 .get(&key)
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if !direct.is_empty() {
+                return direct;
+            }
+            if ctx.object_num_fields(*this) > 0 {
+                if let Value::Object(Some(sslctx)) = ctx.get_field(*this, 0) {
+                    return crate::t27_tls::context_trust_root_ders(ctx, sslctx);
+                }
+            }
+            Vec::new()
         }
         _ => Vec::new(),
     }
@@ -42373,7 +42928,59 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     session
 }
 
-/// NEW-13: common body for the two `SSLSocketFactory.createSocket` overloads.
+/// Resolve an `InetAddress` argument without depending on its implementation
+/// class.  Real JSSE factories expose all of the `SocketFactory` overloads;
+/// our P68 bridge must do the same because its synthetic factory is allocated
+/// as `javax/net/ssl/SSLSocketFactory` itself.
+fn p68_inet_address_host(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+) -> Result<String, MethodCallFailed> {
+    let address = obj_arg(args, address_index)?;
+    let pin_base = ctx.pin_native_root(address);
+    let host_value = ctx.invoke_virtual(address, "getHostAddress", "()Ljava/lang/String;", &[]);
+    ctx.unpin_native_roots(pin_base);
+    let host = match host_value? {
+        Some(Value::Object(Some(host))) => ctx.read_string(host).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if host.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "InetAddress has no host address".into(),
+        }
+        .into());
+    }
+    Ok(host)
+}
+
+/// Bridge the `InetAddress` forms of `SSLSocketFactory.createSocket`.  The
+/// local-address variants share the P68 TLS connector's current connection
+/// semantics; their local bind arguments are accepted by the JDK signature
+/// but are not consumed by the native TLS stream implementation.
+fn p68_create_socket_inet_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    address_index: usize,
+    port_index: usize,
+) -> MethodCallResult {
+    let host = p68_inet_address_host(ctx, args, address_index)?;
+    let port = args
+        .get(port_index)
+        .and_then(|value| value.as_int())
+        .unwrap_or(443);
+    if !(0..=65535).contains(&port) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("port out of range: {port}"),
+        }
+        .into());
+    }
+    let extra_roots = p68_factory_trust_roots(ctx, args);
+    let java_tm_key = p68_factory_java_tm_key(ctx, args);
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+}
+
+/// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
 fn new13_do_create_socket(
     ctx: &mut dyn NativeContext,
     host: &str,
@@ -42381,6 +42988,13 @@ fn new13_do_create_socket(
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
 ) -> MethodCallResult {
+    #[cfg(unix)]
+    let legacy_dsa_context = extra_root_ders.iter().any(|der| {
+        openssl::x509::X509::from_der(der)
+            .ok()
+            .and_then(|cert| cert.public_key().ok())
+            .is_some_and(|key| key.dsa().is_ok())
+    });
     let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
@@ -42399,6 +43013,13 @@ fn new13_do_create_socket(
     // heap alone does not suppress it either since young-gen collections
     // still fire from ordinary allocation churn on OTHER threads.
     ctx.begin_blocking_region();
+    #[cfg(unix)]
+    let connect_result = if legacy_dsa_context {
+        crate::servlet::s2_legacy_dsa_tls_connect(host, port, extra_root_ders)
+    } else {
+        crate::servlet::s2_tls_connect(&connector, host, port)
+    };
+    #[cfg(not(unix))]
     let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
     ctx.end_blocking_region();
     let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
@@ -42411,7 +43032,20 @@ fn new13_do_create_socket(
     // a checkServerTrusted throw, aborts the socket with
     // SSLHandshakeException (matching JSSE, which aborts the handshake when
     // a configured TrustManager rejects the chain).
-    if let Some(tm_key) = java_tm_key {
+    // The legacy DSA bridge has already verified against the explicitly
+    // supplied roots (including Spring Boot's historical expired fixture).
+    // Re-running the VM TrustManager shim would reject that same accepted
+    // anchor solely on wall-clock validity.
+    if let Some(tm_key) = java_tm_key.filter(|_| {
+        #[cfg(unix)]
+        {
+            !legacy_dsa_context
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }) {
         let chain = crate::servlet::s2_tls_peer_cert_chain_der(tls_id).unwrap_or_default();
         if chain.is_empty() {
             let _ = crate::servlet::s2_tls_close(tls_id);
@@ -42778,10 +43412,59 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
+    );
+    // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
+    // though `SocketFactory` has a bridge registration.  A synthetic P68
+    // factory therefore resolves these calls at the abstract declaration
+    // instead of inheriting the ancestor native, yielding AbstractMethodError.
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| {
+            let host_ref = match args.get(1) {
+                Some(Value::Object(Some(reference))) => *reference,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("SSLSocketFactory.createSocket: host is null".into()),
+                    }
+                    .into());
+                }
+            };
+            let host = ctx.read_string(host_ref).unwrap_or_default();
+            if host.is_empty() {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "SSLSocketFactory.createSocket: host is empty".into(),
+                }
+                .into());
+            }
+            let port = args.get(2).and_then(|value| value.as_int()).unwrap_or(443);
+            if !(0..=65535).contains(&port) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!("port out of range: {port}"),
+                }
+                .into());
+            }
+            let extra_roots = p68_factory_trust_roots(ctx, args);
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+        },
+    );
+    r.register(
+        ssf,
+        "createSocket",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
     );
     // createSocket(Socket s, String host, int port, boolean autoClose) — we
     // ignore the supplied Socket (the TLS stream owns its own TCP connection)
@@ -42814,7 +43497,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(args);
+            let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
             new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
@@ -43612,6 +44295,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // (matches original behavior for `init((KeyStore) null)` / a
             // `getTrustManagers()` call with no preceding `init`).
             let this = obj_arg(args, 0)?;
+            let runtime_class = ctx
+                .class_name_of_id(ctx.class_id_of_object(this))
+                .unwrap_or_default();
+            // This bridge owns only the synthetic default factory made by
+            // TrustManagerFactory.getInstance(). A concrete provider factory
+            // (notably Netty's InsecureTrustManagerFactory) implements its
+            // policy through the real TrustManagerFactory bytecode and SPI.
+            // Treating every subclass as our synthetic default silently
+            // replaces that provider's manager with a PKIX manager. Execute
+            // the base bytecode without re-entering this native so virtual
+            // SPI dispatch returns the provider's configured manager.
+            if runtime_class != "javax/net/ssl/TrustManagerFactory" {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getTrustManagers",
+                    "()[Ljavax/net/ssl/TrustManager;",
+                    &[],
+                );
+            }
             let ih = ctx.identity_hash_code(this);
             let tm_id = if ih != 0 {
                 tmf_tm_id_by_identity()
@@ -63067,16 +63769,26 @@ fn bc_bcrypt_ints_to_be_bytes(ints: &[i32]) -> Vec<u8> {
     out
 }
 
-fn bc_bcrypt_generate_raw(
+/// Execute the common BCrypt key schedule against a library's published P/S
+/// constants. Both Bouncy Castle and Spring Security expose the same standard
+/// Blowfish tables, but they use different class/field names and otherwise
+/// leave this deliberately expensive work in Java bytecode.
+fn bc_bcrypt_generate_raw_with_constants(
     ctx: &mut dyn NativeContext,
     password: &[u8],
     salt: &[u8],
     cost: i32,
+    class_name: &str,
+    p_fields: &[&str],
+    s_fields: &[&str],
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let class_id = ctx.ensure_class_initialized("org/bouncycastle/crypto/generators/BCrypt")?;
-    let mut p = bc_bcrypt_read_static_i32_array(ctx, class_id, "KP")?;
+    let class_id = ctx.ensure_class_initialized(class_name)?;
+    let mut p = Vec::new();
+    for field in p_fields {
+        p.extend_from_slice(&bc_bcrypt_read_static_i32_array(ctx, class_id, field)?);
+    }
     let mut s = Vec::with_capacity(1024);
-    for field in ["KS0", "KS1", "KS2", "KS3"] {
+    for field in s_fields {
         s.extend_from_slice(&bc_bcrypt_read_static_i32_array(ctx, class_id, field)?);
     }
     if p.len() != 18 || s.len() != 1024 {
@@ -63139,6 +63851,23 @@ fn bc_bcrypt_generate_raw(
     Ok(bc_bcrypt_ints_to_be_bytes(&text))
 }
 
+fn bc_bcrypt_generate_raw(
+    ctx: &mut dyn NativeContext,
+    password: &[u8],
+    salt: &[u8],
+    cost: i32,
+) -> Result<Vec<u8>, MethodCallFailed> {
+    bc_bcrypt_generate_raw_with_constants(
+        ctx,
+        password,
+        salt,
+        cost,
+        "org/bouncycastle/crypto/generators/BCrypt",
+        &["KP"],
+        &["KS0", "KS1", "KS2", "KS3"],
+    )
+}
+
 fn bc_bcrypt_generate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let pw_arr = bc_bcrypt_byte_array_arg(ctx, args, 0, "pwInput and salt are required")?;
     let salt_arr = bc_bcrypt_byte_array_arg(ctx, args, 1, "pwInput and salt are required")?;
@@ -63163,6 +63892,58 @@ fn bc_bcrypt_generate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(out))))
 }
 
+/// Spring Security's BCrypt implementation spends virtually all of its time
+/// in `crypt_raw` repeatedly invoking its Java `encipher` loop. At the normal
+/// cost of 10, that is fast on HotSpot but takes minutes in the interpreter,
+/// turning ordinary password assertions into suite timeouts. Keep Spring's
+/// surrounding bytecode responsible for salt parsing, revision handling,
+/// output encoding, and comparison; replace only the standard key schedule.
+///
+/// `sign_ext_bug` is only used for the historical `$2x$` compatibility mode.
+/// Spring's supported `$2a$`, `$2b$`, and `$2y$` paths pass false and share the
+/// standard BCrypt schedule used below. Do not apply this intrinsic to `$2x$`:
+/// that obsolete compatibility variant must retain Spring's bytecode semantics.
+fn spring_security_bcrypt_crypt_raw(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let password_arr = bc_bcrypt_byte_array_arg(ctx, args, 1, "Bad password")?;
+    let salt_arr = bc_bcrypt_byte_array_arg(ctx, args, 2, "Bad salt length")?;
+    let cost = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let sign_ext_bug = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
+    if sign_ext_bug {
+        return ctx.invoke_special_bytecode_only(
+            "org/springframework/security/crypto/bcrypt/BCrypt",
+            "crypt_raw",
+            "([B[BIZIZ)[B",
+            args,
+        );
+    }
+    if ctx.array_length(salt_arr) != 16 {
+        return Err(bc_bcrypt_illegal("Bad salt length"));
+    }
+    if !(4..=31).contains(&cost) {
+        return Err(bc_bcrypt_illegal("Bad number of rounds"));
+    }
+    let password = bc_bcrypt_read_byte_array(ctx, password_arr);
+    let salt = bc_bcrypt_read_byte_array(ctx, salt_arr);
+    let hash = bc_bcrypt_generate_raw_with_constants(
+        ctx,
+        &password,
+        &salt,
+        cost,
+        "org/springframework/security/crypto/bcrypt/BCrypt",
+        &["P_orig"],
+        &["S_orig"],
+    )?;
+    let out = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hash.len());
+    ctx.write_byte_array_from(out, 0, &hash);
+    Ok(Some(Value::Object(Some(out))))
+}
+
 pub(crate) fn register_bc_bcrypt_generator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -63171,6 +63952,12 @@ pub(crate) fn register_bc_bcrypt_generator(r: &mut NativeMethodRegistry) {
         "generate",
         "([B[BI)[B",
         bc_bcrypt_generate,
+    );
+    r.register(
+        "org/springframework/security/crypto/bcrypt/BCrypt",
+        "crypt_raw",
+        "([B[BIZIZ)[B",
+        spring_security_bcrypt_crypt_raw,
     );
     r.set_category(__prev_cat);
 }
@@ -72240,6 +73027,27 @@ mod t10_manifest_input_stream_tests {
             Some(Value::Object(Some(s))) => ctx.read_string(s),
             _ => None,
         }
+    }
+
+    #[test]
+    fn t10_manifest_parser_preserves_folded_main_attribute() {
+        // `JarFile.getManifest()` and `Manifest(InputStream)` deliberately
+        // share this parser. This is the long-Class-Path shape Spring Boot
+        // writes when it emits a launcher manifest.
+        let parsed = p59_parse_manifest_bytes(
+            b"Manifest-Version: 1.0\r\nClass-Path: lib/one.jar lib/two.jar \r\n lib/three.jar\r\n\r\n",
+        )
+        .expect("valid folded manifest");
+        assert_eq!(
+            parsed.main,
+            vec![
+                ("Manifest-Version".to_string(), "1.0".to_string()),
+                (
+                    "Class-Path".to_string(),
+                    "lib/one.jar lib/two.jar lib/three.jar".to_string(),
+                ),
+            ]
+        );
     }
 
     // STALE (unit-test mock cannot exercise this path): the Manifest parser now

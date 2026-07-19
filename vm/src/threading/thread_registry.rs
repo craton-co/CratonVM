@@ -76,6 +76,13 @@ struct ThreadEntry {
     /// fixups while the thread is parked in a blocking native. See
     /// `GcBlockState` and `fold_pointer_map_into_blocked`.
     gc_block_state: Arc<GcBlockState>,
+    /// JMX diagnostic roots. These are deliberately separate from a blocked
+    /// thread's frame snapshot: a lock relationship must remain observable
+    /// while the owner is running, and must be remapped across a moving GC.
+    jmx_contended_monitor: Mutex<Option<ObjectRef>>,
+    jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
+    jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
+    jmx_locked_synchronizers: Mutex<Vec<ObjectRef>>,
     /// T1.5.1 — pending async exception slot. Set by cross-thread
     /// `Thread.stop` / `Thread.stop0` calls; consumed by the target
     /// thread's next `safepoint_check`.
@@ -247,6 +254,10 @@ impl ThreadRegistry {
             frame_trace: Arc::new(Mutex::new(Vec::new())),
             vm_state: Arc::new(Mutex::new(String::new())),
             gc_block_state: Arc::new(GcBlockState::new()),
+            jmx_contended_monitor: Mutex::new(None),
+            jmx_waiting_monitor: Mutex::new(None),
+            jmx_locked_monitors: Mutex::new(Vec::new()),
+            jmx_locked_synchronizers: Mutex::new(Vec::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
             os_tid: std::sync::atomic::AtomicU32::new(0),
@@ -795,6 +806,85 @@ impl ThreadRegistry {
         self.threads.lock().get(&thread_id).map(|e| e.name.clone())
     }
 
+    /// Publish a monitor acquisition attempt before it can block. The object
+    /// is rooted by this registry entry until the acquire completes.
+    pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_contended_monitor.lock() = Some(monitor);
+        }
+    }
+
+    /// Finish an acquisition attempt. Successful acquisitions become owned
+    /// monitor roots; failed/aborted attempts simply lose the contention root.
+    pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_contended_monitor.lock() = None;
+            let mut owned = entry.jmx_locked_monitors.lock();
+            if !owned.iter().any(|o| o.as_ptr() == monitor.as_ptr()) {
+                owned.push(monitor);
+            }
+        }
+    }
+
+    pub fn remove_jmx_locked_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            entry
+                .jmx_locked_monitors
+                .lock()
+                .retain(|o| o.as_ptr() != monitor.as_ptr());
+        }
+    }
+
+    pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            *entry.jmx_waiting_monitor.lock() = Some(monitor);
+        }
+    }
+
+    pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
+        if let Some(entry) = self.threads.lock().get(&thread_id) {
+            return entry.jmx_waiting_monitor.lock().take();
+        }
+        None
+    }
+
+    /// `AbstractOwnableSynchronizer` has one exclusive owner. Remove a
+    /// synchronizer from any former owner before attaching it to the new one.
+    pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
+        let threads = self.threads.lock();
+        for entry in threads.values() {
+            entry
+                .jmx_locked_synchronizers
+                .lock()
+                .retain(|o| o.as_ptr() != synchronizer.as_ptr());
+        }
+        if let Some(owner) = owner {
+            if let Some(entry) = threads.get(&owner) {
+                entry.jmx_locked_synchronizers.lock().push(synchronizer);
+            }
+        }
+    }
+
+    pub fn jmx_lock_snapshot(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<(
+        Option<ObjectRef>,
+        Option<ObjectRef>,
+        Vec<ObjectRef>,
+        Vec<ObjectRef>,
+    )> {
+        let threads = self.threads.lock();
+        let entry = threads.get(&thread_id)?;
+        let snapshot = (
+            *entry.jmx_contended_monitor.lock(),
+            *entry.jmx_waiting_monitor.lock(),
+            entry.jmx_locked_monitors.lock().clone(),
+            entry.jmx_locked_synchronizers.lock().clone(),
+        );
+        Some(snapshot)
+    }
+
     /// Return all (ThreadId, name) pairs for currently registered threads.
     pub fn all_thread_names(&self) -> Vec<(ThreadId, String)> {
         self.threads
@@ -998,11 +1088,55 @@ impl ThreadRegistry {
         }
     }
 
+    /// Whether a live registered thread is in a GC-safe blocking region.
+    ///
+    /// The same transition is the authoritative source for Java
+    /// `Thread.State.WAITING`: it is published before monitor/AQS/native waits
+    /// and cleared only after the thread wakes and applies post-GC fixups.
+    pub fn is_blocked(&self, thread_id: ThreadId) -> bool {
+        let threads = self.threads.lock();
+        threads.get(&thread_id).is_some_and(|entry| {
+            entry.alive.load(Ordering::Acquire)
+                && entry
+                    .gc_block_state
+                    .in_blocked_region
+                    .load(Ordering::Acquire)
+        })
+    }
+
+    /// The Java blocking state for a currently blocked thread: 1 is WAITING
+    /// and 2 is BLOCKED. Returns 0 for running, dead, and unknown threads.
+    pub fn java_block_state(&self, thread_id: ThreadId) -> u8 {
+        let threads = self.threads.lock();
+        threads
+            .get(&thread_id)
+            .filter(|entry| {
+                entry.alive.load(Ordering::Acquire)
+                    && entry
+                        .gc_block_state
+                        .in_blocked_region
+                        .load(Ordering::Acquire)
+            })
+            .map(|entry| entry.gc_block_state.java_state.load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     /// Clear the GC-blocked mark for a VM-registered native carrier thread.
     pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
         let threads = self.threads.lock();
         if let Some(entry) = threads.get(&thread_id) {
-            entry.gc_block_state.fixup.lock().clear();
+            {
+                let mut f = entry.gc_block_state.fixup.lock();
+                if !f.is_empty() && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                    eprintln!(
+                        "[blockgc] native-unblock DISCARDS {} fixups tid={}",
+                        f.len(),
+                        thread_id.0,
+                    );
+                }
+                f.clear();
+            }
+            entry.gc_block_state.slot_origins.lock().clear();
             entry.root_snapshot.lock().clear();
             entry
                 .gc_block_state
@@ -1122,6 +1256,14 @@ impl ThreadRegistry {
                 if let Some(obj) = entry.java_thread_obj {
                     all_roots.push(obj);
                 }
+                if let Some(obj) = *entry.jmx_contended_monitor.lock() {
+                    all_roots.push(obj);
+                }
+                if let Some(obj) = *entry.jmx_waiting_monitor.lock() {
+                    all_roots.push(obj);
+                }
+                all_roots.extend(entry.jmx_locked_monitors.lock().iter().copied());
+                all_roots.extend(entry.jmx_locked_synchronizers.lock().iter().copied());
             }
             // A posted async exception must survive even if the target
             // thread is dead-but-not-yet-reaped: it may still be consumed
@@ -1176,6 +1318,23 @@ impl ThreadRegistry {
                     rekeyed.push((old_addr, new_addr));
                     vacated.push((old_addr, *tid));
                 }
+            }
+            let mut remap_jmx = |obj: &mut ObjectRef| {
+                if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
+                    *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            };
+            if let Some(obj) = entry.jmx_contended_monitor.lock().as_mut() {
+                remap_jmx(obj);
+            }
+            if let Some(obj) = entry.jmx_waiting_monitor.lock().as_mut() {
+                remap_jmx(obj);
+            }
+            for obj in entry.jmx_locked_monitors.lock().iter_mut() {
+                remap_jmx(obj);
+            }
+            for obj in entry.jmx_locked_synchronizers.lock().iter_mut() {
+                remap_jmx(obj);
             }
             // B1 fix — repoint a pending async-exception slot too. It stores
             // the raw address of a posted `Throwable`; a moving collection
@@ -1285,6 +1444,17 @@ impl ThreadRegistry {
                     // SAFETY: `new` comes from the GC pointer map and points
                     // at the relocated object's header.
                     *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+            // cceres3 FIX: advance the exact per-slot tracker through THIS
+            // collection's pointer map (see `GcBlockState::slot_origins`).
+            // Exact lookups per map — no chain keys to strand.
+            {
+                let mut origins = entry.gc_block_state.slot_origins.lock();
+                for so in origins.iter_mut() {
+                    if let Some(&new) = pointer_map.get(&so.cur) {
+                        so.cur = new;
+                    }
                 }
             }
             if dbg && (composed > 0 || seeded > 0) {
@@ -1644,6 +1814,22 @@ mod tests {
     fn unknown_thread_not_alive() {
         let registry = ThreadRegistry::new();
         assert!(!registry.is_alive(ThreadId(99)));
+    }
+
+    #[test]
+    fn native_blocked_thread_is_reported_as_blocked_until_woken() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "waiter", None);
+
+        assert!(!registry.is_blocked(tid));
+        registry.mark_native_thread_blocked(tid);
+        assert!(registry.is_blocked(tid));
+        registry.mark_native_thread_unblocked(tid);
+        assert!(!registry.is_blocked(tid));
+
+        registry.mark_dead(tid);
+        assert!(!registry.is_blocked(tid));
     }
 
     // -----------------------------------------------------------------

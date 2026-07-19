@@ -662,6 +662,67 @@ fn try_class_bundle(
     result
 }
 
+/// Return the explicit `ClassLoader` passed to a `ResourceBundle.getBundle`
+/// overload, when there is one.  It is important not to replace this with the
+/// VM-wide class path: callers such as Spring's test-resource extension use a
+/// short-lived thread-context loader whose resources deliberately do not live
+/// on that class path.
+fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    let class_loader = ctx.class_id_by_name("java/lang/ClassLoader")?;
+    args.iter().skip(1).find_map(|arg| match arg {
+        Value::Object(Some(obj)) if ctx.is_subclass(ctx.class_id_of_object(*obj), class_loader) => {
+            Some(*obj)
+        }
+        _ => None,
+    })
+}
+
+/// Locate a `.properties` candidate through the loader supplied to
+/// `ResourceBundle.getBundle`, falling back to the application class path only
+/// for overloads that supplied no loader.  `ClassLoader.getResourceAsStream`
+/// already preserves parent-first delegation and user-defined loader overrides
+/// (including Spring Boot's `ResourcesClassLoader`).
+fn find_bundle_resource(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+    path: &str,
+) -> Option<Vec<u8>> {
+    let Some(loader) = loader else {
+        return ctx.find_resource(path);
+    };
+    let loader_pin = ctx.pin_native_root(loader);
+    let name = Value::Object(Some(ctx.create_string(path)));
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let stream = match ctx.invoke_virtual(
+        loader,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        &[name],
+    ) {
+        Ok(Some(Value::Object(Some(stream)))) => stream,
+        _ => {
+            ctx.unpin_native_roots(loader_pin);
+            return None;
+        }
+    };
+    ctx.unpin_native_roots(loader_pin);
+
+    let stream_pin = ctx.pin_native_root(stream);
+    let stream = ctx.read_native_pin(stream_pin, stream);
+    let bytes = match ctx.invoke_virtual(stream, "readAllBytes", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(bytes)))) => bytes,
+        _ => {
+            ctx.unpin_native_roots(stream_pin);
+            return None;
+        }
+    };
+    ctx.unpin_native_roots(stream_pin);
+    let mut out = vec![0; ctx.array_length(bytes)];
+    let copied = ctx.read_byte_array_into(bytes, 0, &mut out);
+    out.truncate(copied);
+    Some(out)
+}
+
 /// Read a `Locale`'s language/country/variant via its public accessors, so it
 /// works for both our synthetic Locales and the JDK's predefined constants
 /// (`Locale.FRENCH`, …) whose codes live in `BaseLocale`, not the synthetic
@@ -838,6 +899,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
 
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
+    let loader = bundle_class_loader(ctx, args);
 
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
@@ -848,7 +910,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let mut matched: Option<(String, String)> = None;
     for (cand, m_lang, m_country) in &chain {
         let path = format!("{}.properties", cand.replace('.', "/"));
-        if let Some(bytes) = ctx.find_resource(&path) {
+        if let Some(bytes) = find_bundle_resource(ctx, loader, &path) {
             parse_props_into_map(ctx, map, &bytes);
             matched = Some((m_lang.clone(), m_country.clone()));
         }
@@ -880,7 +942,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             let fallback_chain = build_locale_chain(&bundle_name, &f_lang, &f_country, &f_variant);
             for (cand, m_lang, m_country) in &fallback_chain {
                 let path = format!("{}.properties", cand.replace('.', "/"));
-                if let Some(bytes) = ctx.find_resource(&path) {
+                if let Some(bytes) = find_bundle_resource(ctx, loader, &path) {
                     parse_props_into_map(ctx, map, &bytes);
                     matched = Some((m_lang.clone(), m_country.clone()));
                 }

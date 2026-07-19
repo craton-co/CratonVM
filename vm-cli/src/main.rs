@@ -2810,7 +2810,7 @@ fn run() -> Result<()> {
             // `stackTrace` field on each Throwable when present. NOTE: in the
             // current cratonvm, `Throwable.fillInStackTrace` (see
             // `native-builtins/src/lang_misc.rs`) only stashes frames into the
-            // per-thread `JvmThread::throwable_stacks` map keyed by identity
+            // VM-wide Throwable trace registry keyed by identity
             // hash — it does NOT populate the heap-side `stackTrace` /
             // `backtrace` field. The Java code only writes that field lazily
             // when something calls `Throwable.getStackTrace()`. For unhandled
@@ -3014,8 +3014,8 @@ fn run() -> Result<()> {
                 // Fallback: when `Throwable.stackTrace[]` was never populated
                 // (the array is null or empty — the typical case for an
                 // exception that escapes `main()` without anyone calling
-                // `getStackTrace()`), pull frames from the per-thread
-                // `JvmThread::throwable_stacks` map keyed by identity hash
+                // `getStackTrace()`), pull frames from the VM-wide registry
+                // keyed by identity hash
                 // — that's where `Throwable.fillInStackTrace` actually
                 // stashes the captured frames in this VM. See
                 // `vm/src/vm/vm_init.rs::Vm::throwable_stack_for`.
@@ -3404,7 +3404,7 @@ fn run() -> Result<()> {
             // Missing-stack-trace diagnostic (2026-05-21).
             //
             // When an exception escapes `main()` and NEITHER the heap-side
-            // `Throwable.stackTrace[]` NOR the per-thread `throwable_stacks`
+            // `Throwable.stackTrace[]` NOR the VM-wide retained trace
             // capture produced a single `\tat ...` frame, the bare
             // `Exception in thread "main" <class>: <msg>` line is useless
             // for diagnosis — exactly the keycloak26 `NullPointerException:
@@ -3419,7 +3419,7 @@ fn run() -> Result<()> {
                         .to_string(),
                 );
                 // Last-ditch: dump whatever the head exception's
-                // `throwable_stacks` entry holds, even if the cause-chain
+                // retained trace entry holds, even if the cause-chain
                 // walk above skipped it.
                 match vm.throwable_stack_for(exc_ref) {
                     Some(frames) if !frames.is_empty() => {
@@ -3441,7 +3441,7 @@ fn run() -> Result<()> {
                     }
                     _ => {
                         lines.push(
-                            "[cratonvm-cli] the per-thread trace store has no entry for this \
+                            "[cratonvm-cli] the retained trace store has no entry for this \
                              throwable either — the exception was likely thrown on a \
                              non-main thread, or its constructor was shadowed by a native \
                              that skipped fillInStackTrace."

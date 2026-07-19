@@ -72,6 +72,11 @@ fn ipc_dbg(msg: impl AsRef<str>) {
 /// non-blocking semantics differ (accept vs read/write).
 pub enum TcpHandle {
     Stream(TcpStream),
+    /// A client socket after `SocketChannel.bind()` but before `connect()`.
+    /// Retaining the actual OS descriptor is essential: the later connect
+    /// must keep Hazelcast's requested outbound port instead of silently
+    /// opening a different ephemeral socket.
+    Bound(TcpStream),
     Listener(TcpListener),
     /// Non-blocking connect in progress. Holds a **real** OS socket whose
     /// `connect()` returned `WSAEWOULDBLOCK` / `EINPROGRESS`. Because it is a
@@ -83,6 +88,10 @@ pub enum TcpHandle {
     /// selector never reported `OP_CONNECT` → ES `testAsyncRequests` lost the
     /// request via `CancelledKeyException`.)
     Connecting(TcpStream),
+    /// A loopback connect that is known to have failed, retained until the
+    /// selector drives `finishConnect()` so Java observes an asynchronous
+    /// connect failure rather than a synchronous `connect()` throw.
+    ConnectFailed(TcpStream, std::io::Error),
     /// Closed but kept in the map so callers see -1 / -1 idempotently.
     Closed,
 }
@@ -101,10 +110,13 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
     match regs.get(&id) {
         Some(TcpHandle::Listener(l)) => l.try_clone().ok().map(TcpHandleClone::Listener),
         Some(TcpHandle::Stream(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        Some(TcpHandle::Bound(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
         // A connect-in-progress socket is a live pollable fd: clone it as a
         // Stream so the selector polls it for write-readiness and surfaces
         // OP_CONNECT naturally once the OS completes (or refuses) the connect.
-        Some(TcpHandle::Connecting(s)) => s.try_clone().ok().map(TcpHandleClone::Stream),
+        Some(TcpHandle::Connecting(s)) | Some(TcpHandle::ConnectFailed(s, _)) => {
+            s.try_clone().ok().map(TcpHandleClone::Stream)
+        }
         _ => None,
     }
 }
@@ -146,6 +158,7 @@ pub fn probe_connect_status(net_fd: i32) -> SelectorConnectProbe {
             crate::nb_connect::ConnectPoll::Connected
             | crate::nb_connect::ConnectPoll::Failed(_) => SelectorConnectProbe::Ready,
         },
+        Some(TcpHandle::ConnectFailed(_, _)) => SelectorConnectProbe::Ready,
         Some(TcpHandle::Stream(_)) => SelectorConnectProbe::Ready,
         _ => SelectorConnectProbe::NotConnecting,
     }
@@ -155,6 +168,16 @@ pub fn probe_connect_status(net_fd: i32) -> SelectorConnectProbe {
 fn tcp_blocking_state() -> &'static RwLock<HashMap<i32, bool>> {
     static FLAGS: OnceLock<RwLock<HashMap<i32, bool>>> = OnceLock::new();
     FLAGS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Socket options that the real JDK's SocketAdaptor exposes through a
+/// SocketChannel. The standard library does not provide portable buffer-size
+/// accessors, so retain successful Java-level settings here as the channel's
+/// authoritative values. In particular, returning zero for SO_SNDBUF makes
+/// Hazelcast allocate a zero-capacity protocol encoder buffer.
+fn tcp_option_state() -> &'static RwLock<HashMap<(i32, String), i32>> {
+    static OPTIONS: OnceLock<RwLock<HashMap<(i32, String), i32>>> = OnceLock::new();
+    OPTIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn tcp_next_id() -> i32 {
@@ -173,6 +196,36 @@ fn tcp_register(h: TcpHandle) -> i32 {
 fn tcp_remove(id: i32) {
     tcp_registry().write().remove(&id);
     tcp_blocking_state().write().remove(&id);
+    tcp_option_state()
+        .write()
+        .retain(|(option_id, _), _| *option_id != id);
+}
+
+fn tcp_take_bound(id: i32) -> Option<TcpStream> {
+    let mut registry = tcp_registry().write();
+    let stream = match registry.remove(&id) {
+        Some(TcpHandle::Bound(stream)) => Some(stream),
+        Some(other) => {
+            registry.insert(id, other);
+            None
+        }
+        None => None,
+    };
+    drop(registry);
+    if stream.is_some() {
+        tcp_blocking_state().write().remove(&id);
+    }
+    stream
+}
+
+fn tcp_replace_connect_state(id: i32, stream: TcpStream, connected: bool, blocking: bool) {
+    let handle = if connected {
+        TcpHandle::Stream(stream)
+    } else {
+        TcpHandle::Connecting(stream)
+    };
+    tcp_registry().write().insert(id, handle);
+    tcp_blocking_state().write().insert(id, blocking);
 }
 
 const ACCEPT_CLOSE_POLL: Duration = Duration::from_millis(10);
@@ -241,7 +294,11 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
     // the underlying refusal was detected correctly).
     match e.kind() {
         ErrorKind::ConnectionRefused => RuntimeError::ConnectException {
-            message: format!("{ctx}: {e}"),
+            // `std::io::Error` uses the localized Winsock text on Windows.
+            // Java callers (including Spring Boot's health assertions) rely
+            // on the portable `Connection refused` wording, so keep the
+            // public exception message stable across host locales.
+            message: format!("{ctx}: Connection refused"),
         }
         .into(),
         ErrorKind::TimedOut => RuntimeError::SocketTimeoutException {
@@ -1107,7 +1164,7 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let local = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => s.local_addr().ok(),
+            Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => s.local_addr().ok(),
             _ => None,
         }
     };
@@ -1115,6 +1172,151 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(Some(Value::Object(None)));
     };
     new_resolved_inet_socket_address(ctx, &addr.ip().to_string(), addr.port() as i32)
+}
+
+/// `SocketChannel.bind(SocketAddress)`: create and retain a real bound client
+/// socket. Hazelcast binds its `SocketChannel.socket()` before handing the
+/// channel to its NIO connector; keeping this descriptor is what makes the
+/// later connect honour a configured outbound-port range.
+fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_or_none(args, 0).ok_or_else(|| ioex("bind: null channel"))?;
+    let sa = obj_or_none(args, 1).ok_or_else(|| ioex("bind: null SocketAddress"))?;
+    if read_reg_id(ctx, this).is_some() {
+        return Err(ioex("bind: channel is already bound or connected"));
+    }
+    let (host, port) = decode_socket_address(ctx, sa)?;
+    let bind_text = if host.is_empty() {
+        format!("0.0.0.0:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let bind_addr = bind_text
+        .to_socket_addrs()
+        .map_err(|e| map_err(&bind_text, e))?
+        .next()
+        .ok_or_else(|| ioex(format!("bind: no addresses resolved for {bind_text}")))?;
+    let stream = crate::nb_connect::bind(&bind_addr).map_err(|e| map_err(&bind_text, e))?;
+    let local_port = stream
+        .local_addr()
+        .map(|a| a.port() as i32)
+        .unwrap_or(port as i32);
+    let blocking = read_blocking_flag(ctx, this);
+    let id = tcp_register(TcpHandle::Bound(stream));
+    tcp_blocking_state().write().insert(id, blocking);
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn sc_connect_bound(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    id: i32,
+    stream: TcpStream,
+    host: &str,
+    port: u16,
+    allow_block: bool,
+) -> Result<bool, MethodCallFailed> {
+    let target = format!("{host}:{port}");
+    let local = stream
+        .local_addr()
+        .map_err(|e| map_err("bound local address", e))?;
+    let remote = resolve_and_vet(&target)?
+        .into_iter()
+        .find(|addr| addr.is_ipv4() == local.is_ipv4())
+        .ok_or_else(|| {
+            ioex(format!(
+                "connect: {target} has no address compatible with bound {local}"
+            ))
+        })?;
+    let blocking = read_blocking_flag(ctx, this);
+    let started =
+        crate::nb_connect::start_bound(stream, &remote).map_err(|e| map_err(&target, e))?;
+    let (mut stream, connected) = match started {
+        crate::nb_connect::StartConnect::Connected(stream) => (stream, true),
+        crate::nb_connect::StartConnect::InProgress(stream) if !allow_block => (stream, false),
+        crate::nb_connect::StartConnect::DeferredFailure(stream, error) if !allow_block => {
+            // Keep the terminal error on the retained OS descriptor. This
+            // mirrors the unbound non-blocking path: the Java reactor must
+            // reach finishConnect()/its first write and observe the saved
+            // failure, rather than receiving a synchronous connect exception.
+            tcp_registry()
+                .write()
+                .insert(id, TcpHandle::ConnectFailed(stream, error));
+            tcp_blocking_state().write().insert(id, false);
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local.port() as i32));
+            let host_str = ctx.create_string(host);
+            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            return Ok(true);
+        }
+        crate::nb_connect::StartConnect::DeferredFailure(_stream, error) => {
+            return Err(map_err(&target, error));
+        }
+        crate::nb_connect::StartConnect::InProgress(stream) => {
+            let deadline = std::time::Instant::now() + crate::outbound_policy::connect_timeout();
+            ctx.begin_blocking_region();
+            let verdict = loop {
+                match crate::nb_connect::poll(&stream) {
+                    crate::nb_connect::ConnectPoll::Connected => break Ok(()),
+                    crate::nb_connect::ConnectPoll::Failed(e) => break Err(e),
+                    crate::nb_connect::ConnectPoll::Pending
+                        if std::time::Instant::now() >= deadline =>
+                    {
+                        break Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            "bound connect timed out",
+                        ));
+                    }
+                    crate::nb_connect::ConnectPoll::Pending => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                }
+            };
+            ctx.end_blocking_region();
+            verdict.map_err(|e| map_err(&target, e))?;
+            (stream, true)
+        }
+        crate::nb_connect::StartConnect::DeferredFailure(stream, error) => {
+            // A non-blocking channel must retain the live descriptor until the
+            // selector drives finishConnect(), just like the unbound channel
+            // path below. Throwing here would violate SocketChannel's async
+            // contract and can strand a caller waiting for OP_CONNECT.
+            if allow_block {
+                return Err(map_err(&target, error));
+            }
+            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+            tcp_registry()
+                .write()
+                .insert(id, TcpHandle::ConnectFailed(stream, error));
+            tcp_blocking_state().write().insert(id, false);
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+            let host_str = ctx.create_string(host);
+            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+            return Ok(true);
+        }
+    };
+    if connected && blocking {
+        stream
+            .set_nonblocking(false)
+            .map_err(|e| map_err("set_nonblocking", e))?;
+    }
+    let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
+    tcp_replace_connect_state(id, stream, connected, blocking);
+    cf_set(
+        ctx,
+        this,
+        F_CONNECTED,
+        Value::Int(if connected { 1 } else { 0 }),
+    );
+    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+    let host_str = ctx.create_string(host);
+    cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+    cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+    Ok(connected)
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,6 +1383,12 @@ fn sc_connect_inner(
     let (host, port) = decode_socket_address(ctx, sa)?;
     let target = format!("{host}:{port}");
     ipc_dbg(format!("connect target={target} allow_block={allow_block}"));
+
+    if let Some(id) = read_reg_id(ctx, this) {
+        let bound = tcp_take_bound(id)
+            .ok_or_else(|| ioex("connect: channel is already connected or connecting"))?;
+        return sc_connect_bound(ctx, this, id, bound, &host, port, allow_block);
+    }
 
     if allow_block {
         // Task #16: SSRF hardening. Route through `policy_connect`, which
@@ -1272,6 +1480,7 @@ fn sc_connect_inner(
     // manual selector OP_CONNECT injection (which double-fired the connecting
     // reactor's session request → IllegalStateException).
     let mut pending: Option<TcpStream> = None;
+    let mut deferred_failure: Option<(TcpStream, std::io::Error)> = None;
     let mut last_err: Option<std::io::Error> = None;
     for addr in &vetted {
         match crate::nb_connect::start(addr) {
@@ -1297,11 +1506,34 @@ fn sc_connect_inner(
                     pending = Some(stream);
                 }
             }
+            Ok(crate::nb_connect::StartConnect::DeferredFailure(stream, error)) => {
+                if deferred_failure.is_none() {
+                    deferred_failure = Some((stream, error));
+                }
+            }
             Err(e) => {
                 ipc_dbg(format!("connect start failed addr={addr}: {e}"));
                 last_err = Some(e);
             }
         }
+    }
+
+    if let Some((stream, error)) = deferred_failure {
+        let id = tcp_register(TcpHandle::ConnectFailed(stream, error));
+        tcp_blocking_state().write().insert(id, false);
+        cf_set(ctx, this, F_REG_ID, Value::Int(id));
+        // Windows' selector can fail to deliver OP_CONNECT for an untouched
+        // socket that has already been locally classified as refused. Treat
+        // this narrow terminal state as connected so the async reactor reaches
+        // its ordinary first write; that write below then reports the saved
+        // connection failure immediately instead of stranding the request in
+        // a never-observable pending state.
+        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+        let host_str = ctx.create_string(&host);
+        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
+        ipc_dbg(format!("connect deferred failure(nonblocking) id={id}"));
+        return Ok(true);
     }
 
     if let Some(stream) = pending {
@@ -1399,6 +1631,10 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                 }
                 ConnectPoll::Failed(e) => Verdict::Failed(map_err("finishConnect", e)),
             },
+            Some(TcpHandle::ConnectFailed(_, error)) => Verdict::Failed(map_err(
+                "finishConnect",
+                std::io::Error::new(error.kind(), error.to_string()),
+            )),
             _ => Verdict::NotConnecting,
         }
     };
@@ -1543,6 +1779,14 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 ctx.end_blocking_region();
                 ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
+            }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(map_err(
+                    "read",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
             }
             _ => {
                 ctx.end_blocking_region();
@@ -1694,6 +1938,14 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 ctx.unpin_native_roots(bb_pin);
                 return Ok(Some(Value::Int(0)));
             }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                ctx.unpin_native_roots(bb_pin);
+                return Err(map_err(
+                    "write",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
+            }
             _ => {
                 ctx.end_blocking_region();
                 ctx.unpin_native_roots(bb_pin);
@@ -1791,6 +2043,10 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
     if total == 0 {
+        ipc_dbg(format!(
+            "write(gathering) empty id={id} buffers={} window={start}..{end}",
+            arr_len
+        ));
         for (pin, _, _) in chunks {
             ctx.unpin_native_roots(pin);
         }
@@ -1822,6 +2078,16 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     ctx.unpin_native_roots(*pin);
                 }
                 return Ok(Some(Value::Long(0)));
+            }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Err(map_err(
+                    "write(gathering)",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
             }
             _ => {
                 ctx.end_blocking_region();
@@ -1919,7 +2185,15 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             Some(TcpHandle::Stream(s)) => {
                 try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e))?
             }
-            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
+            Some(TcpHandle::Connecting(_)) => {
+                return Ok(Some(Value::Long(0)));
+            }
+            Some(TcpHandle::ConnectFailed(_, error)) => {
+                return Err(map_err(
+                    "read(scattering)",
+                    std::io::Error::new(error.kind(), error.to_string()),
+                ));
+            }
             _ => return Err(ioex("read(scattering): channel not a stream")),
         }
     };
@@ -1983,7 +2257,35 @@ fn apply_option(stream: &TcpStream, name: &str, val: i32) -> Result<(), std::io:
 fn read_option(stream: &TcpStream, name: &str) -> Result<i32, std::io::Error> {
     match name {
         "TCP_NODELAY" => Ok(if stream.nodelay()? { 1 } else { 0 }),
+        // Keep an intentionally conservative non-zero fallback for channels
+        // whose options are inspected before Java has set them. A zero buffer
+        // size is not a valid Socket API result and causes NIO frameworks to
+        // allocate zero-capacity codec buffers.
+        "SO_RCVBUF" | "SO_SNDBUF" => Ok(64 * 1024),
         _ => Ok(0),
+    }
+}
+
+/// `SocketChannel.setOption` is erased to `(SocketOption, Object)`, so real
+/// JDK callers provide a boxed Integer or Boolean rather than a raw int.
+fn socket_option_value(ctx: &mut dyn NativeContext, value: Value) -> i32 {
+    match value {
+        Value::Int(v) => v,
+        Value::Object(Some(object)) => {
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(object))
+                .unwrap_or_default();
+            let (method, descriptor) = if class_name == "java/lang/Boolean" {
+                ("booleanValue", "()Z")
+            } else {
+                ("intValue", "()I")
+            };
+            match ctx.invoke_virtual(object, method, descriptor, &[]) {
+                Ok(Some(Value::Int(v))) => v,
+                _ => 0,
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -2000,11 +2302,14 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         None => String::new(),
     };
     // Accept either Int or Boolean payloads — both arrive as Value::Int here.
-    let val = int_arg(args, 2);
+    let val = socket_option_value(ctx, args.get(2).copied().unwrap_or(Value::Int(0)));
 
     if let Some(id) = read_reg_id(ctx, this) {
+        tcp_option_state()
+            .write()
+            .insert((id, opt_name.clone()), val);
         let map = tcp_registry().read();
-        if let Some(TcpHandle::Stream(s)) = map.get(&id) {
+        if let Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) = map.get(&id) {
             if let Err(e) = apply_option(s, &opt_name, val) {
                 return Err(map_err(&format!("setOption({opt_name})"), e));
             }
@@ -2031,10 +2336,20 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // null, and the `SocketAdaptor` getters then `((Boolean) ...).booleanValue()`
     // → NPE. Box by the option's value type.
     let raw = if let Some(id) = read_reg_id(ctx, this) {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
-            _ => 0,
+        if let Some(value) = tcp_option_state()
+            .read()
+            .get(&(id, opt_name.clone()))
+            .copied()
+        {
+            value
+        } else {
+            let map = tcp_registry().read();
+            match map.get(&id) {
+                Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => {
+                    read_option(s, &opt_name).unwrap_or(0)
+                }
+                _ => 0,
+            }
         }
     } else {
         0
@@ -2426,6 +2741,24 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "implCloseSelectableChannel", "()V", sc_close);
         r.register(c, "implCloseChannel", "()V", sc_close);
         r.register(c, "connect", "(Ljava/net/SocketAddress;)Z", sc_connect);
+        // `SocketChannel.bind` covariantly returns SocketChannel. Hazelcast
+        // reaches it through SocketAdaptor.bind before registering its client
+        // connection; without this exact descriptor dispatch falls through to
+        // the abstract no-Code declaration and throws AbstractMethodError.
+        r.register(
+            c,
+            "bind",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
+            sc_bind,
+        );
+        // Keep the superinterface descriptor reachable too for callers whose
+        // invokeinterface resolution preserves NetworkChannel's declaration.
+        r.register(
+            c,
+            "bind",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/NetworkChannel;",
+            sc_bind,
+        );
         r.register(
             c,
             "blockingConnect",
@@ -2624,8 +2957,9 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // Option setters on the `java.net.Socket` adapter returned by
     // SocketChannel.socket(). These are the methods Tomcat's
     // SocketProperties.setProperties invokes; the adapter has no real
-    // SocketImpl so the real bytecode would NPE in getImpl(). No-op them
-    // (gate-aware: dropped under CRATONVM_REAL_NET_SOCKETS).
+    // SocketImpl so the real bytecode would NPE in getImpl(). The adaptor
+    // owns its own setSoTimeout implementation, so do not shadow the base
+    // Socket setter: ordinary sockets must apply SO_RCVTIMEO to their stream.
     let client_socket = "java/net/Socket";
     for (m, d) in [
         ("setReceiveBufferSize", "(I)V"),
@@ -2635,7 +2969,6 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         ("setTcpNoDelay", "(Z)V"),
         ("setOOBInline", "(Z)V"),
         ("setSoLinger", "(ZI)V"),
-        ("setSoTimeout", "(I)V"),
         ("setPerformancePreferences", "(III)V"),
     ] {
         r.register(client_socket, m, d, socket_opt_noop);
@@ -2676,47 +3009,92 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
 // fix in `native-collections/src/lib.rs`.
 const SSC_SOCKET_CACHE: usize = 5; // unused F_REMOTE slot — see note below.
 
-fn ss_back_ref_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, ObjectRef>> {
-    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, ObjectRef>>> = OnceLock::new();
+/// One row per live ServerSocket wrapper. The hash only chooses a bucket:
+/// Java identity hashes are not unique, so every lookup also matches the
+/// wrapper receiver itself.
+struct SsBackRef {
+    wrapper: ObjectRef,
+    channel: ObjectRef,
+}
+
+fn ss_back_ref_table() -> &'static RwLock<rustc_hash::FxHashMap<i32, Vec<SsBackRef>>> {
+    static REG: OnceLock<RwLock<rustc_hash::FxHashMap<i32, Vec<SsBackRef>>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(rustc_hash::FxHashMap::default()))
 }
 
 fn ss_record_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef, ssc: ObjectRef) {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table().write().insert(key, ssc);
+    let mut table = ss_back_ref_table().write();
+    let bucket = table.entry(key).or_default();
+    if let Some(row) = bucket.iter_mut().find(|row| row.wrapper == ss) {
+        row.channel = ssc;
+    } else {
+        bucket.push(SsBackRef {
+            wrapper: ss,
+            channel: ssc,
+        });
+    }
 }
 
 fn ss_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) -> Option<ObjectRef> {
     let key = ctx.identity_hash_code(ss);
-    ss_back_ref_table().read().get(&key).copied()
+    ss_back_ref_table()
+        .read()
+        .get(&key)
+        .and_then(|bucket| bucket.iter().find(|row| row.wrapper == ss))
+        .map(|row| row.channel)
 }
 
-/// Post-GC hook — remap the SSC `ObjectRef` values that
-/// `ss_back_ref_table` stores. The KEYS are identity hash codes and are
-/// already GC-stable, so they need no rewrite; only the embedded
-/// ObjectRef values are repointed through `pointer_map`. Mirrors
-/// `gc_update_lambda_callsite_cache_refs` in
-/// `native-builtins/src/lang_invoke.rs`. Until this hook is wired into
-/// `vm/src/memory/gc.rs`'s post-compaction step, the table will return
-/// stale `ObjectRef` values for any SSC that was relocated. The
-/// identity-hash key fix alone eliminates the use-after-free risk that
-/// the previous `from_raw(usize)` resurrection carried — the worst-case
-/// behaviour now is a missed lookup rather than a wild dereference.
-#[allow(dead_code)]
-pub fn ss_back_ref_update_after_gc(pointer_map: &rustc_hash::FxHashMap<usize, usize>) {
+fn ss_remove_back_ref(ctx: &mut dyn NativeContext, ss: ObjectRef) {
+    let key = ctx.identity_hash_code(ss);
+    let mut table = ss_back_ref_table().write();
+    let remove_bucket = if let Some(bucket) = table.get_mut(&key) {
+        bucket.retain(|row| row.wrapper != ss);
+        bucket.is_empty()
+    } else {
+        false
+    };
+    if remove_bucket {
+        table.remove(&key);
+    }
+}
+
+/// Keep both ends of the adapter mapping alive during a collection. The
+/// mapping is dropped promptly by `ServerSocket.close`, so this is not a
+/// lifetime extension for closed endpoints.
+pub fn gc_scan_ss_back_ref_roots(roots: &mut Vec<ObjectRef>) {
+    let table = ss_back_ref_table().read();
+    for bucket in table.values() {
+        for row in bucket {
+            roots.push(row.wrapper);
+            roots.push(row.channel);
+        }
+    }
+}
+
+/// Relocate both receiver and channel references after moving GC. The
+/// identity-hash bucket remains stable while its ObjectRef discriminator must
+/// be updated to preserve collision-safe lookup.
+pub fn ss_back_ref_update_after_gc<S: std::hash::BuildHasher>(
+    pointer_map: &std::collections::HashMap<usize, usize, S>,
+) {
     if pointer_map.is_empty() {
         return;
     }
-    let mut table = ss_back_ref_table().write();
-    for v in table.values_mut() {
-        let old = v.as_ptr() as usize;
+    let remap = |obj: ObjectRef| {
+        let old = obj.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            // SAFETY: `new_addr` is the GC's relocated address for the
-            // same logical SSC object; the GC guarantees the new
-            // address is a valid heap object that satisfies
-            // ObjectRef's non-null/alignment invariants.
-            *v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            unsafe { ObjectRef::from_raw(new_addr as *mut u8) }
+        } else {
+            obj
+        }
+    };
+    let mut table = ss_back_ref_table().write();
+    for bucket in table.values_mut() {
+        for row in bucket {
+            row.wrapper = remap(row.wrapper);
+            row.channel = remap(row.channel);
         }
     }
 }
@@ -2780,6 +3158,19 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ss_value))))
 }
 
+/// The address Netty publishes from a listener must be usable as a client
+/// destination. Windows rejects a connect to an unspecified (`0.0.0.0`/`::`)
+/// listener address with WSAEADDRNOTAVAIL, even though binding that wildcard is
+/// valid. A local in-process client should therefore receive the corresponding
+/// loopback address while concrete listener addresses remain unchanged.
+fn advertised_listener_host(addr: SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => "127.0.0.1".to_string(),
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => "::1".to_string(),
+        _ => addr.ip().to_string(),
+    }
+}
+
 fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -2815,7 +3206,7 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let host = match tcp_registry().read().get(&id) {
         Some(TcpHandle::Listener(l)) => l
             .local_addr()
-            .map(|a| a.ip().to_string())
+            .map(advertised_listener_host)
             .unwrap_or_else(|_| "0.0.0.0".to_string()),
         _ => "0.0.0.0".to_string(),
     };
@@ -2909,8 +3300,8 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // The binding native records the actual OS-assigned port in the shared native-api
     // registry keyed by identity hash (object fields can't carry it — the real layout's
     // low slots are reference-typed, so an int does not round-trip). Read it back.
-    let p =
-        cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).unwrap_or(0);
+    let p = cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+        .unwrap_or(0);
     Ok(Some(Value::Int(p)))
 }
 
@@ -2938,10 +3329,10 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         // native-builtins, while this last-registered wrapper lives in native-io,
         // so the native-api side table is the cross-crate handoff.
         let identity = ctx.identity_hash_code(this);
-        match cratonvm_native_api::server_socket_ports::get_addr(identity) {
+        match cratonvm_native_api::server_socket_ports::get_addr(identity, this) {
             Some((host, port)) => (port, host),
             None => (
-                cratonvm_native_api::server_socket_ports::get(identity).unwrap_or(0),
+                cratonvm_native_api::server_socket_ports::get(identity, this).unwrap_or(0),
                 "0.0.0.0".to_string(),
             ),
         }
@@ -2969,7 +3360,8 @@ fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Some(ssc) = ss_back_ref(ctx, this) else {
         // Plain ServerSocket — bound iff the binder recorded a port (BUG-04).
         let bound =
-            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this)).is_some();
+            cratonvm_native_api::server_socket_ports::get(ctx.identity_hash_code(this), this)
+                .is_some();
         return Ok(Some(Value::Int(if bound { 1 } else { 0 })));
     };
     let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
@@ -2995,9 +3387,8 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     if let Some(ssc) = ss_back_ref(ctx, this) {
         let _ = ssc_close(ctx, &[Value::Object(Some(ssc))])?;
-        // C27: remove the identity-hashed key (was raw pointer before).
-        let key = ctx.identity_hash_code(this);
-        ss_back_ref_table().write().remove(&key);
+        // Remove only this receiver's collision bucket entry.
+        ss_remove_back_ref(ctx, this);
         return Ok(None);
     }
     // Plain ServerSocket (no ServerSocketChannel back-ref). This native is the
@@ -3024,6 +3415,22 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     #[test]
+    fn advertised_listener_host_converts_only_wildcard_listener_addresses() {
+        assert_eq!(
+            advertised_listener_host("0.0.0.0:49152".parse().unwrap()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            advertised_listener_host("[::]:49152".parse().unwrap()),
+            "::1"
+        );
+        assert_eq!(
+            advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
+            "127.0.0.2"
+        );
+    }
+
+    #[test]
     fn registers_without_panic() {
         let mut r = NativeMethodRegistry::new();
         register_socket_channel_real(&mut r);
@@ -3040,6 +3447,13 @@ mod tests {
                 "sun/nio/ch/SocketChannelImpl",
                 "configureBlocking",
                 "(Z)Ljava/nio/channels/SelectableChannel;"
+            )
+            .is_some());
+        assert!(r
+            .find(
+                "java/nio/channels/SocketChannel",
+                "bind",
+                "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;"
             )
             .is_some());
         assert!(r

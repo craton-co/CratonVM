@@ -178,6 +178,7 @@ const SK_ATTACHMENT: usize = 4;
 enum SelectableHandle {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
     /// Registered without a live handle — `kernel_select` skips it; useful
     /// for lifecycle tests that want a key in the map without a real socket.
     Dummy,
@@ -189,6 +190,7 @@ enum SelectableHandle {
 pub enum SelectableKind {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
 }
 
 impl SelectableHandle {
@@ -200,6 +202,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_fd() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_fd() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_fd() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -210,6 +213,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_socket() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_socket() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_socket() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -292,6 +296,10 @@ struct SelectorState {
     pending_accepted: VecDeque<(i32 /*listener fd*/, TcpStream)>,
     /// Woken flag — set by `wakeup()`, cleared on next select entry.
     woken: bool,
+    /// Kernel selects that have released this state lock and may still be
+    /// blocked in epoll_wait. Close keeps its wakeup descriptors alive until
+    /// the last such select has observed the close wakeup.
+    in_flight_selects: usize,
 }
 
 impl SelectorState {
@@ -310,6 +318,7 @@ impl SelectorState {
             wakeup_pipe_write: None,
             pending_accepted: VecDeque::new(),
             woken: false,
+            in_flight_selects: 0,
         }
     }
 
@@ -408,21 +417,36 @@ impl SelectorState {
     }
 }
 
+fn release_closed_selector_handles(st: &mut SelectorState) {
+    debug_assert!(!st.open);
+    if st.in_flight_selects != 0 {
+        return;
+    }
+    st.wakeup_sender.take();
+    st.wakeup_receiver.take();
+    st.wakeup_peer.take();
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(efd) = st.epoll_fd.take() {
+            // SAFETY: efd was a valid fd owned by this selector.
+            unsafe { libc::close(efd) };
+        }
+        if let Some(rfd) = st.wakeup_pipe_read.take() {
+            unsafe { libc::close(rfd) };
+        }
+        if let Some(wfd) = st.wakeup_pipe_write.take() {
+            unsafe { libc::close(wfd) };
+        }
+    }
+}
+
 impl Drop for SelectorState {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(efd) = self.epoll_fd.take() {
-                // SAFETY: efd was a valid fd.
-                unsafe { libc::close(efd) };
-            }
-            if let Some(rfd) = self.wakeup_pipe_read.take() {
-                unsafe { libc::close(rfd) };
-            }
-            if let Some(wfd) = self.wakeup_pipe_write.take() {
-                unsafe { libc::close(wfd) };
-            }
-        }
+        // The registry intentionally retains closed selectors so concurrent
+        // callers can finish safely. Drop is only reached at process teardown.
+        self.open = false;
+        self.in_flight_selects = 0;
+        release_closed_selector_handles(self);
     }
 }
 
@@ -489,25 +513,29 @@ pub fn selector_close(id: i32) {
     let regs = selectors().read();
     if let Some(s) = regs.get(&id) {
         let mut st = s.lock();
-        st.open = false;
-        st.keys.clear();
-        st.wakeup_sender.take();
-        st.wakeup_receiver.take();
-        st.wakeup_peer.take();
-        st.pending_accepted.clear();
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(efd) = st.epoll_fd.take() {
-                // SAFETY: efd was a valid fd; close is idempotent.
-                unsafe { libc::close(efd) };
-            }
-            if let Some(rfd) = st.wakeup_pipe_read.take() {
-                unsafe { libc::close(rfd) };
-            }
-            if let Some(wfd) = st.wakeup_pipe_write.take() {
-                unsafe { libc::close(wfd) };
-            }
+        if !st.open {
+            return;
         }
+        st.open = false;
+        // An in-flight epoll_wait must be woken before its self-pipe and
+        // epoll fd can be released. In particular, closing an epoll fd from a
+        // different thread is not a portable wakeup primitive. Keep those
+        // descriptors alive until the final in-flight select returns.
+        st.woken = true;
+        #[cfg(target_os = "linux")]
+        if let Some(wfd) = st.wakeup_pipe_write {
+            let byte: u8 = b'W';
+            // SAFETY: wfd remains owned by this selector until the last
+            // in-flight select calls release_closed_selector_handles().
+            let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let (Some(sender), Some(peer)) = (st.wakeup_sender.as_ref(), st.wakeup_peer) {
+            let _ = sender.send_to(b"W", peer);
+        }
+        st.keys.clear();
+        st.pending_accepted.clear();
+        release_closed_selector_handles(&mut st);
     }
 }
 
@@ -585,6 +613,10 @@ pub fn selector_register(
         Some(SelectableKind::Stream(s)) => {
             let _ = s.set_nonblocking(true);
             SelectableHandle::Stream(s)
+        }
+        Some(SelectableKind::Udp(s)) => {
+            let _ = s.set_nonblocking(true);
+            SelectableHandle::Udp(s)
         }
         None => SelectableHandle::Dummy,
     };
@@ -680,6 +712,18 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
             let _ =
                 unsafe { libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev) };
         }
+        // epoll_ctl(MOD) does not reliably interrupt an already-blocked
+        // epoll_wait. In particular, Tomcat arms OP_WRITE after a partial
+        // gathering write; without a nudge, the last HTTP/2 frame can remain
+        // queued until shutdown and the peer sees a truncated GOAWAY frame.
+        // Do not set the sticky `woken` bit: this is a readiness re-check, not
+        // a public Selector.wakeup() request.
+        if let Some(wfd) = st.wakeup_pipe_write {
+            let byte: u8 = b'I';
+            let _ = unsafe {
+                libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
+            };
+        }
     }
     Ok(())
 }
@@ -772,6 +816,24 @@ fn linux_ready_for(events: i32, interest: i32, is_listener: bool) -> i32 {
     r
 }
 
+#[cfg(target_os = "linux")]
+fn finish_in_flight_linux_select_locked(st: &mut SelectorState) {
+    debug_assert!(st.in_flight_selects > 0);
+    st.in_flight_selects -= 1;
+    if !st.open {
+        release_closed_selector_handles(st);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_in_flight_linux_select(id: i32) {
+    let regs = selectors().read();
+    if let Some(s) = regs.get(&id) {
+        let mut st = s.lock();
+        finish_in_flight_linux_select_locked(&mut st);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel-backed select — Linux (epoll)
 // ---------------------------------------------------------------------------
@@ -781,10 +843,10 @@ fn linux_ready_for(events: i32, interest: i32, is_listener: bool) -> i32 {
 /// interest mask). Drains the wakeup pipe before returning.
 #[cfg(target_os = "linux")]
 fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed> {
-    // Phase 1: snapshot prerequisites under the lock — fd, interest map,
-    // listener-set, connect candidates, current epoll fd. Then release the lock
-    // so wakeup() can hit it during the actual epoll_wait.
-    let (efd, interests, listeners, connect_candidates) = {
+    // Phase 1: snapshot prerequisites under the lock — fd and connect
+    // candidates. Interest bits intentionally remain live for phase 3. Then
+    // release the lock so wakeup() can hit it during the actual epoll_wait.
+    let (efd, connect_candidates) = {
         let regs = selectors().read();
         let Some(s) = regs.get(&id) else {
             return Err(closed_selector());
@@ -830,8 +892,6 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             Some(v) => v,
             None => return Err(ioex("Selector.select: epoll init failed")),
         };
-        let mut interests = HashMap::with_capacity(st.keys.len());
-        let mut listeners = HashMap::with_capacity(st.keys.len());
         // net_fds of keys with OP_CONNECT interest backed by a non-blocking
         // connect. epoll usually reports connect-completion as EPOLLOUT, but
         // the selector polls a cloned fd while finishConnect() operates on the
@@ -839,13 +899,14 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         // loopback connect cannot be missed and strand Netty's event loop.
         let mut connect_candidates: Vec<i32> = Vec::new();
         for (net_fd, k) in st.keys.iter() {
-            interests.insert(*net_fd, k.interest_ops);
-            listeners.insert(*net_fd, k.handle.is_listener());
             if !k.handle.is_listener() && k.interest_ops & OP_CONNECT != 0 && k.net_fd > 0 {
                 connect_candidates.push(k.net_fd);
             }
         }
-        (efd, interests, listeners, connect_candidates)
+        // From this point until phase 3, selector_close() must retain the
+        // wakeup handles because epoll_wait may be asleep without this lock.
+        st.in_flight_selects += 1;
+        (efd, connect_candidates)
     };
 
     // Phase 1b: actively probe each OP_CONNECT candidate's original socket for
@@ -895,18 +956,20 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     if n < 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR) {
+            finish_in_flight_linux_select(id);
             return Ok(0);
         }
-        // Closing from another thread may invalidate the epoll fd while this
-        // select is asleep. It is an in-flight close wakeup, not an I/O error.
+        // A close can race the wait. It is a wakeup, not an I/O error.
         if selectors()
             .read()
             .get(&id)
             .map(|s| !s.lock().open)
             .unwrap_or(true)
         {
+            finish_in_flight_linux_select(id);
             return Ok(0);
         }
+        finish_in_flight_linux_select(id);
         return Err(ioex(format!("epoll_wait: {err}")));
     }
 
@@ -921,6 +984,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         // The close raced a select already executing in epoll_wait. The JDK
         // wakes that existing operation; it must not surface as a teardown
         // failure. A later select still fails in the entry check above.
+        finish_in_flight_linux_select_locked(&mut st);
         return Ok(0);
     }
 
@@ -938,24 +1002,25 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
             continue;
         }
         let net_fd = ev.u64 as i32;
-        let interest = match interests.get(&net_fd) {
-            Some(v) => *v,
-            None => continue, // Race: key was removed/cancelled.
+        // `interest_ops` can change while epoll_wait is blocked (Tomcat arms
+        // OP_WRITE after a partial gathering write). Applying this event with
+        // the phase-1 snapshot can report a stale OP_READ bit, which makes the
+        // phase-3 safety probe skip this key and strands the newly armed write.
+        // Re-read the live key under this lock so the readiness mask and the
+        // later probe observe the same selector state.
+        let Some(k) = st.keys.get_mut(&net_fd) else {
+            continue; // Race: key was removed/cancelled.
         };
-        let is_listener = *listeners.get(&net_fd).unwrap_or(&false);
-        let ready = linux_ready_for(ev.events as i32, interest, is_listener);
-        // Translate _, _ — borrow check juggling: take a non-mut snapshot,
-        // then reapply.
+        let is_listener = k.handle.is_listener();
+        let ready = linux_ready_for(ev.events as i32, k.interest_ops, is_listener);
         if ready != 0 {
-            if let Some(k) = st.keys.get_mut(&net_fd) {
-                k.ready_ops = ready;
-                count += 1;
-                if is_listener && ready & OP_ACCEPT != 0 {
-                    if let SelectableHandle::Listener(listener) = &k.handle {
-                        match listener.accept() {
-                            Ok((stream, _)) => accepted_streams.push((net_fd, stream)),
-                            Err(_) => {}
-                        }
+            k.ready_ops = ready;
+            count += 1;
+            if is_listener && ready & OP_ACCEPT != 0 {
+                if let SelectableHandle::Listener(listener) = &k.handle {
+                    match listener.accept() {
+                        Ok((stream, _)) => accepted_streams.push((net_fd, stream)),
+                        Err(_) => {}
                     }
                 }
             }
@@ -985,16 +1050,24 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     // the selector may otherwise sleep until a later wakeup and reactor tests
     // observe request timeouts. The nonblocking probe is the same conservative
     // readiness check used by the generic selector fallback, applied only to
-    // keys that epoll/connect-probe have not already marked ready this cycle.
+    // interest bits that epoll/connect-probe have not already marked ready this cycle.
+    // A read event that raced an OP_WRITE arm must not suppress the write probe.
     let mut probed_accepts: Vec<(i32, TcpStream)> = Vec::new();
     for (fd, k) in st.keys.iter_mut() {
-        if k.cancelled || k.ready_ops != 0 || k.interest_ops == 0 {
+        if k.cancelled || k.interest_ops == 0 {
             continue;
         }
-        let (ready, accepted) = probe_handle(&k.handle, k.interest_ops);
+        let missing_interest = k.interest_ops & !k.ready_ops;
+        if missing_interest == 0 {
+            continue;
+        }
+        let (ready, accepted) = probe_handle(&k.handle, missing_interest);
         if ready != 0 {
-            k.ready_ops = ready;
-            count += 1;
+            let was_zero = k.ready_ops == 0;
+            k.ready_ops |= ready;
+            if was_zero {
+                count += 1;
+            }
         }
         if let Some(stream) = accepted {
             probed_accepts.push((*fd, stream));
@@ -1008,6 +1081,7 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
         st.woken = false;
         st.drain_wakeup_pipe();
     }
+    finish_in_flight_linux_select_locked(&mut st);
     Ok(count)
 }
 
@@ -1502,6 +1576,20 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                 ready |= OP_WRITE;
             }
         }
+        SelectableHandle::Udp(socket) => {
+            if interest & OP_READ != 0 {
+                let mut buf = [0u8; 1];
+                match socket.peek(&mut buf) {
+                    Ok(n) if n > 0 => ready |= OP_READ,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+            if interest & OP_WRITE != 0 {
+                ready |= OP_WRITE;
+            }
+        }
         SelectableHandle::Dummy => {}
     }
     (ready, accepted)
@@ -1781,6 +1869,7 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // The channel's registry id lives in the socket_channel side-table now
     // (its F_REG_ID object slot collides with a real-JDK reference field).
     crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
@@ -2349,7 +2438,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (its F_REG_ID object slot collides with a real-JDK reference field and
     // would coerce to null). A negative fd means the channel is not bound /
     // connected; selector_register still records the key (interest only).
-    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel).unwrap_or(-1);
+    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+        .unwrap_or(-1);
 
     // If the registered channel is backed by an entry in the WP3.4
     // tcp_registry, hand the selector a clone of the live socket so
@@ -2361,7 +2452,7 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Some(SelectableKind::Listener(l))
         }
         Some(crate::socket_channel::TcpHandleClone::Stream(s)) => Some(SelectableKind::Stream(s)),
-        None => None,
+        None => crate::datagram_channel_udp_clone(ctx, channel).map(SelectableKind::Udp),
     };
 
     let key_obj = ctx
@@ -2432,7 +2523,9 @@ fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     // The channel's net fd (tcp_registry id) is the per-selector key into the
     // registration map — exactly what `channel_register_native` stored under.
-    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel) else {
+    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+    else {
         // Not bound / connected → no live registration to find.
         return Ok(Some(Value::Object(None)));
     };
@@ -2462,16 +2555,40 @@ fn key_set_interest_ops_native(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if ctx.object_num_fields(key) > SK_INTEREST_OPS {
         ctx.set_field(key, SK_INTEREST_OPS, Value::Int(ops));
     }
-    let Some(fd) = key_fd(ctx, key) else {
-        return Ok(None);
+    // `interestOps0` is used by the real JDK implementation. A channel can
+    // be registered while still unconnected, in which case its selector key
+    // is currently stored under the placeholder fd (-1), whereas
+    // `channel_net_fd` already observes the later live socket id. Looking up
+    // by that current id loses the update, leaving OP_CONNECT at zero and the
+    // async reactor never receives its deferred connection result. Locate the
+    // key by its stable Java object instead, then keep both native tables in
+    // sync until `refresh_selector_handles` re-keys it to the live fd.
+    sk_state_with_mut(ctx, key, |s| {
+        s.interest_ops = ops;
+    });
+    let target: Option<(i32, i32)> = {
+        let regs = selectors().read();
+        let mut found = None;
+        for (sel_id, sel) in regs.iter() {
+            let mut st = sel.lock();
+            if let Some(fd) = st
+                .keys
+                .values_mut()
+                .find(|k| k.key_obj == Some(key))
+                .map(|k| {
+                    k.interest_ops = ops;
+                    k.net_fd
+                })
+            {
+                found = Some((*sel_id, fd));
+                break;
+            }
+        }
+        found
     };
-    let Some(sel_id) = key_selector_id(ctx, key) else {
-        return Ok(None);
-    };
-    if sel_id == 0 {
-        return Ok(None);
+    if let Some((sel_id, fd)) = target {
+        let _ = selector_set_interest(sel_id, fd, ops);
     }
-    let _ = selector_set_interest(sel_id, fd, ops);
     Ok(None)
 }
 
@@ -3336,6 +3453,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/SocketChannelImpl",
         "java/nio/channels/ServerSocketChannel",
         "sun/nio/ch/ServerSocketChannelImpl",
+        "java/nio/channels/DatagramChannel",
+        "sun/nio/ch/DatagramChannelImpl",
     ] {
         r.register(
             c,

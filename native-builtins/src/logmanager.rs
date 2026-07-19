@@ -1694,30 +1694,88 @@ fn native_jboss_logging_logger_do_logf(
         Some(Value::Object(o)) => *o,
         _ => None,
     };
-    let logger_name = this
-        .and_then(|o| match ctx.get_field_by_name(o, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
+
+    // `Object::toString` below re-enters Java and can trigger a moving GC.
+    // Root every object argument before the first field/string read so the
+    // params array and trailing throwable remain refreshable throughout the
+    // whole formatting pass.
+    let mut pin_base = None;
+    let this_pin = this.map(|object| {
+        let pin = ctx.pin_native_root(object);
+        pin_base.get_or_insert(pin);
+        (pin, object)
+    });
+    let level_pin = level_obj.map(|object| {
+        let pin = ctx.pin_native_root(object);
+        pin_base.get_or_insert(pin);
+        (pin, object)
+    });
+    let format_pin = format_obj.map(|object| {
+        let pin = ctx.pin_native_root(object);
+        pin_base.get_or_insert(pin);
+        (pin, object)
+    });
+    let params_pin = params_obj.map(|object| {
+        let pin = ctx.pin_native_root(object);
+        pin_base.get_or_insert(pin);
+        (pin, object)
+    });
+    let throwable_pin = throwable_obj.map(|object| {
+        let pin = ctx.pin_native_root(object);
+        pin_base.get_or_insert(pin);
+        (pin, object)
+    });
+
+    let logger_name = this_pin
+        .and_then(|(pin, object)| {
+            let object = ctx.read_native_pin(pin, object);
+            match ctx.get_field_by_name(object, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            }
         })
         .unwrap_or_default();
-    let level_name = level_obj
-        .and_then(|o| match ctx.get_field_by_name(o, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
+    let level_name = level_pin
+        .and_then(|(pin, object)| {
+            let object = ctx.read_native_pin(pin, object);
+            match ctx.get_field_by_name(object, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            }
         })
         .unwrap_or_else(|| "INFO".to_string());
-    let format = format_obj
-        .and_then(|o| ctx.read_string(o))
+    let format = format_pin
+        .and_then(|(pin, object)| {
+            let object = ctx.read_native_pin(pin, object);
+            ctx.read_string(object)
+        })
         .unwrap_or_default();
     // Substitute %s/%% /%n from the params Object[] so structured messages
     // (e.g. WFLYCTL0013 failure description) are visible in the output.
-    let message = if let Some(params) = params_obj {
+    let message = if let Some((params_pin, params)) = params_pin {
+        let params = ctx.read_native_pin(params_pin, params);
         let n = ctx.array_length(params);
-        // Build strings up-front so we don't hold a borrow while calling
-        // ctx.invoke_virtual (which needs &mut ctx).
-        let elems: Vec<Value> = (0..n).map(|i| ctx.get_array_element(params, i)).collect();
+        // Snapshot and root every object element before invoking even the
+        // first `toString`. Keeping raw Values here made a later element stale
+        // whenever an earlier element's callback collected.
+        let elems: Vec<(Value, Option<usize>)> = (0..n)
+            .map(|i| {
+                let value = ctx.get_array_element(params, i);
+                let pin = match value {
+                    Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                    _ => None,
+                };
+                (value, pin)
+            })
+            .collect();
         let mut param_strs: Vec<String> = Vec::with_capacity(n);
-        for elem in elems {
+        for (elem, elem_pin) in elems {
+            let elem = match (elem, elem_pin) {
+                (Value::Object(Some(original)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, original)))
+                }
+                (value, _) => value,
+            };
             let s = match elem {
                 Value::Object(Some(o)) => {
                     if let Some(s) = ctx.read_string(o) {
@@ -1772,8 +1830,12 @@ fn native_jboss_logging_logger_do_logf(
         format
     };
     eprintln!("{level_name} [{logger_name}] {message}");
-    if let Some(t) = throwable_obj {
+    if let Some((pin, original)) = throwable_pin {
+        let t = ctx.read_native_pin(pin, original);
         dump_throwable_to_stderr(ctx, t, "    ");
+    }
+    if let Some(pin) = pin_base {
+        ctx.unpin_native_roots(pin);
     }
     Ok(None)
 }
@@ -1863,9 +1925,25 @@ fn jboss_logger_emit_fqcn(ctx: &mut dyn NativeContext, args: &[Value], level: &s
             _ => None,
         })
         .unwrap_or_default();
-    let message = match args.get(2) {
-        Some(Value::Object(Some(o))) => {
-            let o = *o;
+    let message_obj = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let throwable_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    // A non-String message invokes Java `toString`; root both it and the
+    // trailing throwable before that callback so the latter cannot remain as
+    // a stale entry-argument copy.
+    let message_pin = message_obj.map(|object| (ctx.pin_native_root(object), object));
+    let throwable_pin = throwable_obj.map(|object| (ctx.pin_native_root(object), object));
+    let pin_base = message_pin
+        .map(|(pin, _)| pin)
+        .or_else(|| throwable_pin.map(|(pin, _)| pin));
+    let message = match message_pin {
+        Some((pin, original)) => {
+            let o = ctx.read_native_pin(pin, original);
             if let Some(s) = ctx.read_string(o) {
                 s
             } else {
@@ -1880,12 +1958,16 @@ fn jboss_logger_emit_fqcn(ctx: &mut dyn NativeContext, args: &[Value], level: &s
                 }
             }
         }
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => String::new(),
+        None if matches!(args.get(2), Some(Value::Object(None))) => "null".to_string(),
+        None => String::new(),
     };
     eprintln!("{level} [{logger_name}] {message}");
-    if let Some(Value::Object(Some(t))) = args.get(3) {
-        dump_throwable_to_stderr(ctx, *t, "    ");
+    if let Some((pin, original)) = throwable_pin {
+        let throwable = ctx.read_native_pin(pin, original);
+        dump_throwable_to_stderr(ctx, throwable, "    ");
+    }
+    if let Some(pin) = pin_base {
+        ctx.unpin_native_roots(pin);
     }
 }
 
@@ -3909,6 +3991,47 @@ mod tests {
     use cratonvm_native_api::NativeMethodRegistry;
     use cratonvm_types::Value;
 
+    static LOGF_SECOND_OLD: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_SECOND_NEW: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_THROWABLE_OLD: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_THROWABLE_NEW: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_SECOND_SEEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_TOSTRING_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn relocating_logf_to_string(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        receiver: ObjectRef,
+        method_name: &str,
+        _descriptor: &str,
+        _args: &[Value],
+    ) -> Option<MethodCallResult> {
+        if method_name != "toString" {
+            return None;
+        }
+        use std::sync::atomic::Ordering;
+        let call = LOGF_TOSTRING_CALLS.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            ctx.remap_native_pin_addr_for_test(
+                LOGF_SECOND_OLD.load(Ordering::SeqCst),
+                LOGF_SECOND_NEW.load(Ordering::SeqCst),
+            );
+            ctx.remap_native_pin_addr_for_test(
+                LOGF_THROWABLE_OLD.load(Ordering::SeqCst),
+                LOGF_THROWABLE_NEW.load(Ordering::SeqCst),
+            );
+        } else if call == 1 {
+            LOGF_SECOND_SEEN.store(receiver.as_ptr() as usize, Ordering::SeqCst);
+        }
+        let rendered = ctx.create_string(if call == 0 { "first" } else { "second" });
+        Some(Ok(Some(Value::Object(Some(rendered)))))
+    }
+
     // Tests that mutate the singleton + registry share process-wide
     // state; guard them with a mutex so parallel threads don't race.
     fn test_lock() -> &'static std::sync::Mutex<()> {
@@ -3987,6 +4110,52 @@ mod tests {
                 "()Ljava/lang/Object;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn do_logf_refreshes_later_params_after_earlier_to_string_moves_them() {
+        use std::sync::atomic::Ordering;
+
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctx = mock_ctx();
+        let first = ctx.fresh_object_ref();
+        let second_old = ctx.fresh_object_ref();
+        let second_new = ctx.fresh_object_ref();
+        let throwable_old = ctx.fresh_object_ref();
+        let throwable_new = ctx.fresh_object_ref();
+        let params = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+        ctx.set_array_element(params, 0, Value::Object(Some(first)));
+        ctx.set_array_element(params, 1, Value::Object(Some(second_old)));
+        let format = ctx.create_string("%s %s");
+
+        LOGF_SECOND_OLD.store(second_old.as_ptr() as usize, Ordering::SeqCst);
+        LOGF_SECOND_NEW.store(second_new.as_ptr() as usize, Ordering::SeqCst);
+        LOGF_THROWABLE_OLD.store(throwable_old.as_ptr() as usize, Ordering::SeqCst);
+        LOGF_THROWABLE_NEW.store(throwable_new.as_ptr() as usize, Ordering::SeqCst);
+        LOGF_SECOND_SEEN.store(0, Ordering::SeqCst);
+        LOGF_TOSTRING_CALLS.store(0, Ordering::SeqCst);
+        ctx.set_invoke_virtual_hook(relocating_logf_to_string);
+
+        native_jboss_logging_logger_do_logf(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(None),
+                Value::Object(Some(format)),
+                Value::Object(Some(params)),
+                Value::Object(Some(throwable_old)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(LOGF_TOSTRING_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            LOGF_SECOND_SEEN.load(Ordering::SeqCst),
+            second_new.as_ptr() as usize,
+            "the second parameter must be re-read from its remapped native pin"
+        );
+        assert_eq!(ctx.native_pin_count_for_test(), 0);
     }
 
     #[test]

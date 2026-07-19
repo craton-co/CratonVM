@@ -357,6 +357,11 @@ fn native_collections_singleton_list(
     args: &[Value],
 ) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonList") {
+        let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(list, "element", elem);
+        return Ok(Some(Value::Object(Some(list))));
+    }
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(arr, 0, elem);
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
@@ -370,6 +375,11 @@ fn native_collections_singleton_set(
     args: &[Value],
 ) -> MethodCallResult {
     let elem = args.first().copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonSet") {
+        let set = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(set, "element", elem);
+        return Ok(Some(Value::Object(Some(set))));
+    }
     let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
@@ -387,6 +397,12 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().copied().unwrap_or(Value::Object(None));
     let val = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/Collections$SingletonMap") {
+        let map = ctx.alloc_object(cid, ctx.class_num_total_fields(cid));
+        ctx.set_field_by_name(map, "k", key);
+        ctx.set_field_by_name(map, "v", val);
+        return Ok(Some(Value::Object(Some(map))));
+    }
     // Create HashMap with 1 entry
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
     let cap = 16;
@@ -6031,6 +6047,15 @@ fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // Mirror the real constructor's semantics by field name instead.
     if !ctx.is_class_synthetic_stub("java/util/EnumMap") {
         let key_type = args.get(1).copied().unwrap_or(Value::Object(None));
+        // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+        // `getEnumConstants` re-enters Java and the two array allocations can
+        // move `this`/`key_type`/`universe` before the by-name field stores
+        // below (live store-canary capture during a domain boot).
+        let this_pin = ctx.pin_native_root(this);
+        let kt_pin = match key_type {
+            Value::Object(Some(k)) => Some(ctx.pin_native_root(k)),
+            _ => None,
+        };
         let universe = match key_type {
             Value::Object(Some(enum_class)) => {
                 match ctx.invoke_virtual(
@@ -6040,29 +6065,47 @@ fn native_em_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     &[],
                 ) {
                     Ok(Some(Value::Object(Some(universe)))) => universe,
-                    _ => enum_constants_array_for_class(ctx, enum_class).unwrap_or_else(|| {
-                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
-                    }),
+                    _ => {
+                        let enum_class =
+                            kt_pin.map_or(enum_class, |p| ctx.read_native_pin(p, enum_class));
+                        enum_constants_array_for_class(ctx, enum_class).unwrap_or_else(|| {
+                            ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
+                        })
+                    }
                 }
             }
             _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
         };
+        let uni_pin = ctx.pin_native_root(universe);
         let vals = ctx.new_array(
             cratonvm_types::ArrayElementType::Reference,
             ctx.array_length(universe),
         );
+        let this = ctx.read_native_pin(this_pin, this);
+        let universe = ctx.read_native_pin(uni_pin, universe);
+        let key_type = match key_type {
+            Value::Object(Some(k)) => {
+                Value::Object(Some(kt_pin.map_or(k, |p| ctx.read_native_pin(p, k))))
+            }
+            other => other,
+        };
         ctx.set_field_by_name(this, "keyType", key_type);
         ctx.set_field_by_name(this, "keyUniverse", Value::Object(Some(universe)));
         ctx.set_field_by_name(this, "vals", Value::Object(Some(vals)));
         ctx.set_field_by_name(this, "size", Value::Int(0));
         ctx.set_field_by_name(this, "entrySet", Value::Object(None));
+        ctx.unpin_native_roots(this_pin);
         return Ok(None);
     }
     let cap = 16;
+    // cceres3: pin across GC-capable call (stream stale-at-store wave)
+    let this_pin = ctx.pin_native_root(this);
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, Value::Object(Some(buckets)));
     ctx.set_field(this, 1, Value::Int(0));
     ctx.set_field(this, 2, Value::Int(cap as i32));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -8721,6 +8764,12 @@ pub(crate) fn initialize_real_scheduled_thread_pool_executor(
 
     let this = ctx.read_native_pin(pin_base, this);
     if result.is_ok() {
+        // The real parent constructor is responsible for this assignment, but
+        // the interpreter's constructor fast path can leave the inherited
+        // field at its default value when the receiver is a user subclass.
+        // Preserve the argument supplied to the real STPE constructor so a
+        // ThreadPoolTaskScheduler subclass has the requested pool size.
+        ctx.set_field_by_name(this, "corePoolSize", Value::Int(cores));
         ctx.set_field_by_name(
             this,
             "continueExistingPeriodicTasksAfterShutdown",
@@ -8766,6 +8815,36 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
             initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
         },
     );
+    // The real-JDK registration pass drops the synthetic STPE surface because
+    // its historical two-slot layout corrupts real executors. Keep only this
+    // constructor as a Bridge: it initializes the real ThreadPoolExecutor
+    // state and covers Spring's anonymous ThreadPoolTaskScheduler subclass.
+    let __bridge_category = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register(
+        ses,
+        "<init>",
+        "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cores = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 1,
+            };
+            let factory = match args.get(2) {
+                Some(Value::Object(Some(factory))) => Some(*factory),
+                _ => None,
+            };
+            // The shared initializer delegates to ThreadPoolExecutor's real
+            // constructor, which supplies the JDK default abort policy. The
+            // caller-provided rejection handler is only observed by the
+            // scheduled executor's own bytecode; scheduler subclasses such as
+            // Spring's anonymous executor need their core-pool size preserved
+            // here instead of falling through an incomplete constructor path.
+            initialize_real_scheduled_thread_pool_executor(ctx, this, cores, factory)
+        },
+    );
+    r.set_category(__bridge_category);
     r.register(ses, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) > 1 {
@@ -8896,14 +8975,19 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
     // (register_essential_natives, phase 63) provides delay-aware scheduling.
     // These stubs used to overwrite p63 and return null / block real Surefire
     // fork shutdown sequencing.
+    let __core_getter_category = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(ses, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            Ok(Some(ctx.get_field(this, 0)))
-        } else {
-            Ok(Some(Value::Int(1)))
-        }
+        let core_pool_size = match ctx.get_field_by_name(this, "corePoolSize") {
+            Value::Int(value) => Value::Int(value),
+            // Synthetic STPE objects have only the historical slot layout.
+            _ if ctx.object_num_fields(this) > 0 => ctx.get_field(this, 0),
+            _ => Value::Int(1),
+        };
+        Ok(Some(core_pool_size))
     });
+    r.set_category(__core_getter_category);
     r.register(ses, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -15285,7 +15369,21 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             match read_retry_eintr(&mut stream_ref, &mut buf) {
                 Ok(0) => Ok(Some(Value::Int(-1))),
                 Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(Some(Value::Int(0))),
+                // A blocking TcpStream only yields WouldBlock here when the
+                // configured SO_RCVTIMEO expires. InputStream.read must throw
+                // the typed Java timeout instead of returning the forbidden
+                // zero-byte read (or pretending the peer closed).
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Err(RuntimeError::SocketTimeoutException {
+                        message: format!("Socket read timed out: {e}"),
+                    }
+                    .into())
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(Some(Value::Int(0))),
                 Err(_) => Ok(Some(Value::Int(-1))),
             }
@@ -15316,7 +15414,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(RuntimeError::SocketTimeoutException {
+                            message: format!("Socket read timed out: {e}"),
+                        }
+                        .into());
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }
@@ -15353,7 +15461,17 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 match read_retry_eintr(&mut stream_ref, &mut tmp) {
                     Ok(0) => -1i32,
                     Ok(n) => n as i32,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        return Err(RuntimeError::SocketTimeoutException {
+                            message: format!("Socket read timed out: {e}"),
+                        }
+                        .into());
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => 0,
                     Err(_) => -1,
                 }

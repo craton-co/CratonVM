@@ -2835,6 +2835,8 @@ fn native_bais_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_one(),
+        "read",
+        "()I",
     ) {
         return result;
     }
@@ -2869,6 +2871,8 @@ fn maybe_socket_input_stream_read(
     this: ObjectRef,
     args: &[Value],
     hook: Option<cratonvm_native_api::NativeCallback>,
+    method_name: &str,
+    descriptor: &str,
 ) -> Option<MethodCallResult> {
     let cls_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
@@ -2876,10 +2880,11 @@ fn maybe_socket_input_stream_read(
     if cls_name == "java/net/Socket$SocketInputStream" {
         return Some(match hook {
             Some(cb) => cb(ctx, args),
-            None => Err(RuntimeError::IOException {
-                message: "SocketInputStream read hook not installed".into(),
-            }
-            .into()),
+            // In CRATONVM_REAL_NET_SOCKETS mode the legacy synthetic-socket
+            // hook is intentionally absent. Run the real JDK inner stream
+            // bytecode instead; it delegates to NioSocketImpl, whose
+            // non-blocking timeout cycle is owned by native-io::net.
+            None => ctx.invoke_virtual_bytecode_only(this, method_name, descriptor, &args[1..]),
         });
     }
     None
@@ -2947,6 +2952,8 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_bytes(),
+        "read",
+        "([BII)I",
     ) {
         return result;
     }
@@ -3050,24 +3057,26 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Int(-1))),
     };
     let pos = match ctx.get_field(this, BAIS_FIELD_POS) {
-        Value::Int(v) => v as usize,
+        Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
     let count = match ctx.get_field(this, BAIS_FIELD_COUNT) {
-        Value::Int(v) => v as usize,
+        Value::Int(v) => v,
         _ => return Ok(Some(Value::Int(-1))),
     };
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
     }
-    let avail = count - pos;
+    let avail = (count - pos) as usize;
     let to_read = len.min(avail);
     for i in 0..to_read {
-        let byte_val = ctx.get_array_element(data, pos + i);
+        let byte_val = ctx.get_array_element(data, pos as usize + i);
         ctx.set_array_element(buf, off + i, byte_val);
     }
-    let new_pos = pos.checked_add(to_read).unwrap_or(usize::MAX);
-    ctx.set_field(this, BAIS_FIELD_POS, Value::Int(new_pos as i32));
+    ctx.set_field(this, BAIS_FIELD_POS, Value::Int(pos + to_read as i32));
     Ok(Some(Value::Int(to_read as i32)))
 }
 
@@ -3093,6 +3102,8 @@ fn native_bais_read_byte_array(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         this,
         args,
         cratonvm_native_api::socket_input_stream_read::get_read_array(),
+        "read",
+        "([B)I",
     ) {
         return result;
     }
@@ -5472,6 +5483,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     //     phase-72 (`phases_late`) and phase-92 registrations for signatures
     //     we implement (see `nio_native::register_t16_channel_overrides`). ---
     nio_native::register_t16_channel_overrides(registry);
+
+    // T16 may install broad DatagramChannel compatibility callbacks. Reapply
+    // the fd-table-backed Phase 92 channel surface after it so real-JDK DNS
+    // clients observe the bound channel's actual local-address state.
+    register_datagram_channel(registry);
     registry.set_category(__prev_cat);
 }
 
@@ -14959,10 +14975,42 @@ const WE_NUM_FIELDS: usize = 2;
 /// [0] = fd (Int) — UDP socket fd in fd_table
 /// [1] = bound_addr (Object — String local address)
 /// [2] = open (Int) — 1=open, 0=closed
-const DC_FIELD_FD: usize = 0;
-const DC_FIELD_ADDR: usize = 1;
-const DC_FIELD_OPEN: usize = 2;
 const DC_NUM_FIELDS: usize = 3;
+
+/// Real-JDK `DatagramChannel` objects have a private implementation layout;
+/// their field zero is not CratonVM's UDP fd slot. Keep the fd out of that
+/// layout in an identity-hash keyed table, which remains valid across moving
+/// GC and is the convention used by the real NIO selector bridges.
+fn dc_fds() -> &'static Mutex<HashMap<i32, FdId>> {
+    static FDS: OnceLock<Mutex<HashMap<i32, FdId>>> = OnceLock::new();
+    FDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
+    dc_fds().lock().get(&ctx.identity_hash_code(channel)).copied()
+}
+
+/// Expose the real-JDK DatagramChannel's fd-table identity to the selector
+/// bridge. The object fields are implementation-private and cannot carry it.
+pub(crate) fn datagram_channel_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<i32> {
+    dc_fd(ctx, channel).map(|fd| fd as i32)
+}
+
+/// Produce an independent UDP handle for readiness polling.
+pub(crate) fn datagram_channel_udp_clone(
+    ctx: &dyn NativeContext,
+    channel: ObjectRef,
+) -> Option<std::net::UdpSocket> {
+    dc_fd(ctx, channel).and_then(|fd| ctx.fd_table().udp_try_clone(fd).ok())
+}
+
+fn set_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef, fd: FdId) {
+    dc_fds().lock().insert(ctx.identity_hash_code(channel), fd);
+}
+
+fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
+    dc_fds().lock().remove(&ctx.identity_hash_code(channel))
+}
 
 /// Selector layout: 3 fields
 /// [0] = registrations (Object — array of SelectionKey objects)
@@ -15999,6 +16047,38 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/channels/DatagramChannel;",
         native_dc_open,
     );
+    // JDK 25's JNDI DNS client selects IPv4 explicitly before it binds its
+    // temporary UDP channel: `DatagramChannel.open(StandardProtocolFamily.INET)`.
+    // Leaving that overload on real `DatagramChannelImpl` bypasses the bridge
+    // above and its local-address state, so `getLocalAddress()` returns null
+    // after `bind(null)`. The synthetic channel is IPv4/wildcard-backed already;
+    // accept the protocol-family argument and use the same allocation path.
+    r.register(
+        dc,
+        "open",
+        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
+        native_dc_open,
+    );
+    // `DatagramChannel.open(ProtocolFamily)` delegates to this abstract
+    // SelectorProvider method. Registering only the public static factory is
+    // insufficient when real-JDK bytecode is selected, because the provider's
+    // concrete EPoll implementation then allocates a separate channel whose
+    // local-address fields CratonVM does not maintain. Keep the provider
+    // result on the same fd-table-backed DatagramChannel path.
+    r.register(
+        "java/nio/channels/spi/SelectorProvider",
+        "openDatagramChannel",
+        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
+        native_dc_open,
+    );
+    // Linux's default EPoll provider inherits the concrete implementation from
+    // SelectorProviderImpl, so its real bytecode must be overridden as well.
+    r.register(
+        "sun/nio/ch/SelectorProviderImpl",
+        "openDatagramChannel",
+        "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/DatagramChannel;",
+        native_dc_open,
+    );
 
     // bind(SocketAddress) → DatagramChannel
     r.register(
@@ -16007,6 +16087,18 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
         native_dc_bind,
     );
+
+    // `DnsClient` uses a connected datagram channel for its resolver traffic.
+    // The abstract JDK declaration has no Code attribute, so it must be
+    // bridged explicitly instead of falling through to bytecode dispatch.
+    r.register(
+        dc,
+        "connect",
+        "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
+        native_dc_connect,
+    );
+    r.register(dc, "write", "(Ljava/nio/ByteBuffer;)I", native_dc_write);
+    r.register(dc, "read", "(Ljava/nio/ByteBuffer;)I", native_dc_read);
 
     // send(ByteBuffer, SocketAddress) → int
     // The public send native is registered by datagram.rs; keep that guarded
@@ -16041,6 +16133,14 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         native_dc_local_addr,
     );
+    // `NetworkChannel` is the inherited contract the real-JDK resolver can
+    // resolve for this accessor. Keep that owner on the same bridge too.
+    r.register(
+        "java/nio/channels/NetworkChannel",
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        native_dc_local_addr,
+    );
 
     // socket() → DatagramSocket (stub for compat)
     r.register(dc, "socket", "()Ljava/net/DatagramSocket;", |_ctx, args| {
@@ -16065,24 +16165,24 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "setSendBufferSize", "(I)V", |ctx, args| {
         let this = obj_arg92(args, 0)?;
         let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
-            let _ = ctx.fd_table().udp_set_send_buffer_size(fd as u32, size);
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_send_buffer_size(fd, size);
         }
         Ok(None)
     });
     r.register(dc, "setReceiveBufferSize", "(I)V", |ctx, args| {
         let this = obj_arg92(args, 0)?;
         let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
-        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
-            let _ = ctx.fd_table().udp_set_recv_buffer_size(fd as u32, size);
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_recv_buffer_size(fd, size);
         }
         Ok(None)
     });
     r.register(dc, "setReuseAddress", "(Z)V", |ctx, args| {
         let this = obj_arg92(args, 0)?;
         let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        if let Value::Int(fd) = ctx.get_field(this, DC_FIELD_FD) {
-            let _ = ctx.fd_table().udp_set_reuse_address(fd as u32, on);
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_reuse_address(fd, on);
         }
         Ok(None)
     });
@@ -16111,33 +16211,31 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
         })?;
 
     let dc = alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS);
-    ctx.set_field(dc, DC_FIELD_FD, Value::Int(fd_id as i32));
-    let addr = ctx.fd_table().udp_local_addr(fd_id).unwrap_or_default();
-    let addr_s = ctx.create_string(&addr);
-    ctx.set_field(dc, DC_FIELD_ADDR, Value::Object(Some(addr_s)));
-    ctx.set_field(dc, DC_FIELD_OPEN, Value::Int(1));
+    set_dc_fd(ctx, dc, fd_id);
     Ok(Some(Value::Object(Some(dc))))
 }
 
 fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let addr_obj = obj_arg92(args, 1)?;
-
-    // Read address string from SocketAddress
-    let addr_str = ctx
-        .read_string(addr_obj)
-        .or_else(|| match ctx.get_field(addr_obj, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+    // `DatagramChannel.bind(null)` is the JDK contract for a wildcard,
+    // ephemeral UDP socket. The real JDK JNDI DNS client relies on it for TXT
+    // lookups; treating the null address as a required object turned that
+    // ordinary call into `NullPointerException: arg 1 is null`.
+    let addr_str = match args.get(1) {
+        Some(Value::Object(Some(addr_obj))) => ctx
+            .read_string(*addr_obj)
+            .or_else(|| match ctx.get_field(*addr_obj, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| "0.0.0.0:0".to_string()),
+        _ => "0.0.0.0:0".to_string(),
+    };
 
     // Close old socket and open a new one bound to the address
-    let old_fd = match ctx.get_field(this, DC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => 0,
-    };
-    let _ = ctx.fd_table().close(old_fd);
+    if let Some(old_fd) = dc_fd(ctx, this) {
+        let _ = ctx.fd_table().close(old_fd);
+    }
 
     let fd_id =
         ctx.fd_table()
@@ -16146,27 +16244,172 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 message: format!("DatagramChannel.bind: {e}"),
             })?;
 
-    ctx.set_field(this, DC_FIELD_FD, Value::Int(fd_id as i32));
-    let actual_addr = ctx.fd_table().udp_local_addr(fd_id).unwrap_or_default();
-    let addr_s = ctx.create_string(&actual_addr);
-    ctx.set_field(this, DC_FIELD_ADDR, Value::Object(Some(addr_s)));
+    set_dc_fd(ctx, this, fd_id);
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// Extract a printable host:port from both the real JDK 25 holder layout and
+/// CratonVM's small synthetic InetSocketAddress layout.
+fn dc_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<String> {
+    if let Value::Object(Some(holder)) = ctx.get_field_by_name(addr, "holder") {
+        let port = match ctx.get_field_by_name(holder, "port") {
+            Value::Int(port) if (0..=65_535).contains(&port) => port,
+            _ => return None,
+        };
+        let hostname = match ctx.get_field_by_name(holder, "hostname") {
+            Value::Object(Some(hostname)) => ctx.read_string(hostname).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if !hostname.is_empty() {
+            return Some(format!("{hostname}:{port}"));
+        }
+        if let Value::Object(Some(inet_addr)) = ctx.get_field_by_name(holder, "addr") {
+            if let Value::Object(Some(inet_holder)) = ctx.get_field_by_name(inet_addr, "holder") {
+                if let Value::Object(Some(host_name)) =
+                    ctx.get_field_by_name(inet_holder, "hostName")
+                {
+                    if let Some(host_name) = ctx.read_string(host_name) {
+                        if !host_name.is_empty() {
+                            return Some(format!("{host_name}:{port}"));
+                        }
+                    }
+                }
+                if let Value::Int(address) = ctx.get_field_by_name(inet_holder, "address") {
+                    let octets = (address as u32).to_be_bytes();
+                    let host = std::net::Ipv4Addr::from(octets);
+                    return Some(format!("{host}:{port}"));
+                }
+            }
+        }
+        return None;
+    }
+
+    let host = match ctx.get_field(addr, 0) {
+        Value::Object(Some(host)) => ctx.read_string(host)?,
+        _ => return None,
+    };
+    let port = match ctx.get_field(addr, 1) {
+        Value::Int(port) if (0..=65_535).contains(&port) => port,
+        _ => return None,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+fn native_dc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let peer = obj_arg92(args, 1)?;
+    let peer = dc_socket_addr(ctx, peer).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.connect: unsupported SocketAddress".into(),
+    })?;
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.connect: channel has no UDP socket".into(),
+    })?;
+    ctx.fd_table()
+        .udp_connect(fd, &peer)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.connect({peer}): {e}"),
+        })?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_dc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let buffer = obj_arg92(args, 1)?;
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.write: channel has no UDP socket".into(),
+    })?;
+    let view = bb_storage_view(ctx, buffer)?;
+    let remaining = (view.lim - view.pos).max(0) as usize;
+    let mut bytes = vec![0u8; remaining];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = bb_read_byte(ctx, view, view.pos as usize + index)?;
+    }
+    let sent = ctx
+        .fd_table()
+        .udp_send_connected(fd, &bytes)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.write: {e}"),
+        })?;
+    buf_set_position(ctx, buffer, view.pos + sent as i32);
+    Ok(Some(Value::Int(sent as i32)))
+}
+
+fn native_dc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let buffer = obj_arg92(args, 1)?;
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.read: channel has no UDP socket".into(),
+    })?;
+    let view = bb_storage_view(ctx, buffer)?;
+    let remaining = (view.lim - view.pos).max(0) as usize;
+    let mut bytes = vec![0u8; remaining];
+    let (received, _) = match ctx.fd_table().udp_recv(fd, &mut bytes) {
+        Ok(received) => received,
+        // Non-blocking channels report zero bytes when no datagram is ready;
+        // surfacing EAGAIN as IOException makes JNDI treat a normal poll as a
+        // resolver-wide communication failure.
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(Some(Value::Int(0)));
+        }
+        Err(error) => {
+            return Err(RuntimeError::IOException {
+                message: format!("DatagramChannel.read: {error}"),
+            }
+            .into());
+        }
+    };
+    for (index, byte) in bytes.into_iter().take(received).enumerate() {
+        bb_write_byte(ctx, view, view.pos as usize + index, byte)?;
+    }
+    buf_set_position(ctx, buffer, view.pos + received as i32);
+    Ok(Some(Value::Int(received as i32)))
+}
+
+/// Build a real-JDK-layout InetSocketAddress for a received IPv4 datagram.
+/// `DnsClient.blockingReceive` compares this object with its connected target,
+/// so a generic SocketAddress or a flat synthetic layout is insufficient.
+fn dc_inet_socket_address(ctx: &mut dyn NativeContext, source: &str) -> ObjectRef {
+    let (host, port) = source
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
+        .unwrap_or(("0.0.0.0", 0));
+    let packed = host
+        .parse::<std::net::Ipv4Addr>()
+        .map(|ip| i32::from_be_bytes(ip.octets()))
+        .unwrap_or(0);
+
+    let inet = alloc_synthetic(ctx, "java/net/Inet4Address", 2);
+    let inet_holder = alloc_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 3);
+    let host_string = ctx.create_string(host);
+    ctx.set_field_by_name(inet_holder, "hostName", Value::Object(Some(host_string)));
+    ctx.set_field_by_name(inet_holder, "address", Value::Int(packed));
+    ctx.set_field_by_name(inet_holder, "family", Value::Int(1));
+    ctx.set_field_by_name(inet, "holder", Value::Object(Some(inet_holder)));
+
+    let socket = alloc_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let socket_holder =
+        alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
+    let socket_host = ctx.create_string(host);
+    ctx.set_field_by_name(socket_holder, "hostname", Value::Object(Some(socket_host)));
+    ctx.set_field_by_name(socket_holder, "addr", Value::Object(Some(inet)));
+    ctx.set_field_by_name(socket_holder, "port", Value::Int(port));
+    ctx.set_field_by_name(socket, "holder", Value::Object(Some(socket_holder)));
+    socket
 }
 
 fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
     let bb = obj_arg92(args, 1)?;
 
-    if !matches!(ctx.get_field(this, DC_FIELD_OPEN), Value::Int(1)) {
+    if dc_fd(ctx, this).is_none() {
         return Err(RuntimeError::IOException {
             message: "DatagramChannel is closed".into(),
         }
         .into());
     }
 
-    let fd_id = match ctx.get_field(this, DC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(Some(Value::Object(None))),
+    let Some(fd_id) = dc_fd(ctx, this) else {
+        return Ok(Some(Value::Object(None)));
     };
 
     let view = bb_storage_view(ctx, bb)?;
@@ -16178,41 +16421,41 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
 
     let mut buf = vec![0u8; remaining];
-    let (n, source_addr) =
-        ctx.fd_table()
-            .udp_recv(fd_id, &mut buf)
-            .map_err(|e| RuntimeError::IOException {
-                message: format!("receive: {e}"),
-            })?;
+    let (n, source_addr) = match ctx.fd_table().udp_recv(fd_id, &mut buf) {
+        Ok(received) => received,
+        // NIO returns null, rather than throwing, when a non-blocking
+        // DatagramChannel has no packet ready yet.
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(Some(Value::Object(None)));
+        }
+        Err(error) => {
+            return Err(RuntimeError::IOException {
+                message: format!("receive: {error}"),
+            }
+            .into());
+        }
+    };
 
     for (i, &b) in buf.iter().enumerate().take(n) {
         bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
 
-    // Return source address as SocketAddress
-    let addr_s = ctx.create_string(&source_addr);
-    let sa = alloc_synthetic(ctx, "java/net/SocketAddress", 1);
-    ctx.set_field(sa, 0, Value::Object(Some(addr_s)));
+    let sa = dc_inet_socket_address(ctx, &source_addr);
     Ok(Some(Value::Object(Some(sa))))
 }
 
 fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    if matches!(ctx.get_field(this, DC_FIELD_OPEN), Value::Int(1)) {
-        let fd_id = match ctx.get_field(this, DC_FIELD_FD) {
-            Value::Int(v) => v as u32,
-            _ => 0,
-        };
+    if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
-        ctx.set_field(this, DC_FIELD_OPEN, Value::Int(0));
     }
     Ok(None)
 }
 
 fn native_dc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let open = matches!(ctx.get_field(this, DC_FIELD_OPEN), Value::Int(1));
+    let open = dc_fd(ctx, this).is_some();
     Ok(Some(Value::Int(if open { 1 } else { 0 })))
 }
 
@@ -16222,9 +16465,8 @@ fn native_dc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Int(b)) => *b != 0,
         _ => true,
     };
-    let fd_id = match ctx.get_field(this, DC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(Some(Value::Object(Some(this)))),
+    let Some(fd_id) = dc_fd(ctx, this) else {
+        return Ok(Some(Value::Object(Some(this))));
     };
     let _ = ctx.fd_table().udp_set_nonblocking(fd_id, !blocking);
     Ok(Some(Value::Object(Some(this))))
@@ -16232,14 +16474,24 @@ fn native_dc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
-    let fd_id = match ctx.get_field(this, DC_FIELD_FD) {
-        Value::Int(v) => v as u32,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let addr = ctx.fd_table().udp_local_addr(fd_id).unwrap_or_default();
-    let addr_s = ctx.create_string(&addr);
-    let sa = alloc_synthetic(ctx, "java/net/SocketAddress", 1);
-    ctx.set_field(sa, 0, Value::Object(Some(addr_s)));
+    // Phase T16 can allocate an older channel layout that does not retain the
+    // fd-table id in field zero. The JDK contract after bind(null) is still a
+    // non-null wildcard local address; use port zero when that legacy layout
+    // cannot expose its ephemeral port rather than returning null to JNDI.
+    let addr = dc_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
+    .unwrap_or_else(|| "0.0.0.0:0".to_string());
+    let (host, port) = addr
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
+        .unwrap_or(("0.0.0.0", 0));
+    let sa = alloc_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let sa_pin = ctx.pin_native_root(sa);
+    let host_s = ctx.create_string(host);
+    let sa = ctx.read_native_pin(sa_pin, sa);
+    ctx.unpin_native_roots(sa_pin);
+    ctx.set_field(sa, 0, Value::Object(Some(host_s)));
+    ctx.set_field(sa, 1, Value::Int(port));
     Ok(Some(Value::Object(Some(sa))))
 }
 
@@ -18844,6 +19096,48 @@ mod bais_layout_tests {
             }
         }
         assert_eq!(&got, b"hello world");
+    }
+
+    #[test]
+    fn offset_constructor_negative_length_is_immediate_eof_for_bulk_reads() {
+        let mut ctx = MockNativeContext::new();
+        let buf = ctx.new_array(ArrayElementType::Byte, 4);
+        let this = ctx.alloc_object_with_class(4, "java/io/ByteArrayInputStream");
+        native_bais_init_offset(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(buf)),
+                Value::Int(0),
+                Value::Int(-1),
+            ],
+        )
+        .expect("init ok");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+
+        let n = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(8),
+            ],
+        )
+        .expect("read ok");
+        assert_eq!(n, Some(Value::Int(-1)));
+
+        let zero_length = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(0),
+            ],
+        )
+        .expect("zero-length read ok");
+        assert_eq!(zero_length, Some(Value::Int(0)));
     }
 
     fn make_hibernate_lob_stream(ctx: &mut MockNativeContext, count: i64) -> ObjectRef {

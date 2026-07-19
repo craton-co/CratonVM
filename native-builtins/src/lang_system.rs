@@ -655,6 +655,8 @@ pub(crate) fn native_thread_get_state(
     let name = match ctx.thread_run_state(this) {
         1 => "RUNNABLE",
         2 => "TERMINATED",
+        3 => "WAITING",
+        4 => "BLOCKED",
         _ => "NEW",
     };
     let cid = match ctx.ensure_class_initialized("java/lang/Thread$State") {
@@ -1959,9 +1961,7 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, f_loadfactor, Value::Float(0.75));
         ctx.set_field(map, f_entryset, Value::Object(None));
 
-        let node_class_id = ctx
-            .ensure_class_initialized("java/util/HashMap$Node")
-            .unwrap_or(ClassId::new(0));
+        let node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", node_n_fields);
 
         for (key, value) in std::env::vars() {
             let key_obj = ctx.create_string(&key);
@@ -1994,7 +1994,12 @@ pub(crate) fn native_system_getenv_all(
 
     // Legacy fallback: synthetic 3-field layout for environments where
     // the real HashMap class hierarchy isn't fully resolvable.
-    let map = ctx.alloc_object(hashmap_class_id, 3); // MAP_NUM_FIELDS = 3
+    // A failed real-class initialization yields ClassId(0), whose Object layout
+    // has zero slots. This fallback writes map and node fields, so both need
+    // named synthetic layouts even when the real classes cannot initialize.
+    let fallback_map_class_id = ctx.ensure_synthetic_class("java/util/HashMap", 3);
+    let fallback_node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", 4);
+    let map = ctx.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE
     ctx.set_field(map, 2, Value::Int(cap as i32)); // MAP_FIELD_CAPACITY
@@ -2004,7 +2009,7 @@ pub(crate) fn native_system_getenv_all(
         let val_obj = ctx.create_string(&value);
         let hash = jdk_string_hash(&key);
         let idx = ((cap as u32 - 1) & hash as u32) as usize;
-        let node = ctx.alloc_object(ClassId::new(0), 4); // hash, key, value, next
+        let node = ctx.alloc_object(fallback_node_class_id, 4); // hash, key, value, next
         ctx.set_field(node, 0, Value::Int(hash));
         ctx.set_field(node, 1, Value::Object(Some(key_obj)));
         ctx.set_field(node, 2, Value::Object(Some(val_obj)));

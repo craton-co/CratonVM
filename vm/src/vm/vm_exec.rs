@@ -24,6 +24,7 @@ use crate::native::registry::{
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
+use cratonvm_native_api::ThreadJmxSnapshot;
 
 use super::SharedVm;
 use crate::classloading::ClassStore;
@@ -626,6 +627,21 @@ fn youngscan_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
 }
 
+/// Cached `CRATONVM_DBG_BLOCKGC` gate — blocked-GC/pin canaries on the
+/// native-call funnel and the pin/unpin paths. PERF (perf/halfgap-20260717):
+/// the uncached `std::env::var_os` probes of this flag ran on EVERY native
+/// call (the PIN-UNDERFLOW guard) and on pin-table operations; `getenv`
+/// linear-scans `environ`, and the probes measured ~7% of a HashMapOnly-4M
+/// run. Same read-once semantics every other debug flag in this codebase
+/// uses (see `dbg_jit_alloc_filter`'s identical history: a per-call getenv
+/// was once ~13% of binarytrees-18).
+#[inline]
+fn blockgc_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some())
+}
+
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
 #[inline]
 thread_local! {
@@ -698,6 +714,44 @@ fn safe_native_call_impl(
     args: &[Value],
     prevalidated_objects: bool,
 ) -> MethodCallResult {
+    // DIAGNOSTIC-ONLY (cceres3): pin-stack underflow detector. A native that
+    // returns with FEWER pins than it entered with truncated its CALLER's
+    // pins (`unpin_native_roots` is a truncate) — every handle the caller
+    // still holds now dangles and `read_native_pin` silently degrades to the
+    // raw, possibly-stale fallback. The guard fires on every exit path
+    // (including unwind) via Drop and names the culprit at the funnel.
+    struct PinFloorGuard {
+        floor: usize,
+        thread: *const JvmThread,
+        callee_addr: usize,
+    }
+    impl Drop for PinFloorGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard lives strictly within this call frame; the
+            // thread outlives it (debug-only read of a Vec length).
+            let len = unsafe { (*self.thread).native_pin_roots.len() };
+            if len < self.floor {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let callee = cratonvm_native_api::native_ring::name_of(self.callee_addr)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", self.callee_addr));
+                    eprintln!(
+                        "[blockgc] PIN-UNDERFLOW callee={callee} entry_pins={} exit_pins={len} — this native truncated its caller's pins",
+                        self.floor,
+                    );
+                }
+            }
+        }
+    }
+    let _pin_floor_guard = if blockgc_dbg() {
+        Some(PinFloorGuard {
+            floor: thread.native_pin_roots.len(),
+            thread: thread as *const JvmThread,
+            callee_addr: callback as usize,
+        })
+    } else {
+        None
+    };
     // letsgo postmortem: record native dispatch with the caller frame's
     // identity so a SEGV inside a native callback leaves a breadcrumb of
     // *who* called it. The callback itself is an opaque fn-pointer, but
@@ -989,8 +1043,8 @@ fn safe_native_call_impl(
     let mut out: MethodCallResult = match result {
         Ok(method_result) => {
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
-                thread.native_pending_return = None;
                 if exc_handle == u64::MAX {
+                    thread.native_pending_return = None;
                     thread.native_pin_roots.truncate(pin_base);
                     return Err(crate::runtime::exceptions::throw_runtime_error(
                         shared,
@@ -1002,7 +1056,14 @@ fn safe_native_call_impl(
                 }
                 let ptr = exc_handle as *mut u8;
                 if !ptr.is_null() && (ptr as usize) % 8 == 0 {
-                    let exc_ref = unsafe { crate::types::ObjectRef::from_raw(ptr) };
+                    // JNI `Throw`/`ThrowNew` publish the throwable through
+                    // `native_pending_return` before returning to native code.
+                    // That slot is a GC root and is remapped in place, unlike
+                    // the JNI ABI's raw handle.  Fall back to the raw handle
+                    // for legacy/no-context producers.
+                    let exc_ref = thread
+                        .native_pending_return
+                        .unwrap_or_else(|| unsafe { crate::types::ObjectRef::from_raw(ptr) });
                     thread.native_pending_return = Some(exc_ref);
                     thread.native_pin_roots.truncate(pin_base);
                     crate::runtime::interpreter::update_root_snapshot(shared, thread);
@@ -1135,6 +1196,21 @@ fn safe_native_call_impl(
     // an exception ref has already gone stale, a native may leave the live
     // exception as a handoff pin above the argument-root watermark; do not use
     // those temporary pins to reinterpret normal object returns.
+    if unpin_ring_enabled() && pin_base < thread.native_pin_roots.len() {
+        let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+            .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+        UNPIN_RING.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.len() >= 6 {
+                r.remove(0);
+            }
+            r.push((
+                pin_base,
+                thread.native_pin_roots.len(),
+                format!("funnel-return callee={callee}\n"),
+            ));
+        });
+    }
     thread.native_pin_roots.truncate(pin_base);
     // A running JIT thread cannot be collected from this ordinary (non-blocking)
     // return boundary: a peer-requested STW waits for the thread to reach its
@@ -1200,16 +1276,123 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
 /// the caller still needs is rooted AND remapped across the block (frame
 /// slots are; immutable `&[Value]` arg slices are NOT — see the
 /// synchronized-method prologue, which deliberately does not use this).
+/// cceres3 FIX (leaked blocked-region exit self-heal): apply any pending
+/// blocked-window fixup chain + exact slot-origin write-backs to this
+/// thread's frames and thread-level refs, WITHOUT touching the blocked flag
+/// or barrier accounting. Normally `check_post_block_gc` consumes these on
+/// wake; a blocked-region exit path that skips it (observed live: an EQE
+/// worker ran 43 frames -> 1 frame with fixup_pending=44 across four
+/// deposits) leaves the thread executing on stale frames and poisons every
+/// object graph it touches. Calling this from the safepoint publish bounds
+/// that damage to one safepoint interval. Returns the number of chain
+/// entries + write-backs applied.
+pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmThread) -> usize {
+    use crate::memory::gc::update_value_ref;
+    let fixup = {
+        let mut f = thread.gc_block_state.fixup.lock();
+        std::mem::take(&mut *f)
+    };
+    let origins = {
+        let mut o = thread.gc_block_state.slot_origins.lock();
+        std::mem::take(&mut *o)
+    };
+    if fixup.is_empty() && origins.iter().all(|so| so.cur == so.orig) {
+        return 0;
+    }
+    let mut applied = 0usize;
+    if !fixup.is_empty() {
+        applied += fixup.len();
+        for frame in &mut thread.frames {
+            frame.update_local_refs(&fixup, &shared.heap);
+            frame.stack.update_object_refs(&fixup, &shared.heap);
+            if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for val in &mut thread.printed {
+            update_value_ref(val, &fixup);
+        }
+        for slot in [
+            &mut thread.java_thread_obj,
+            &mut thread.native_pending_return,
+            &mut thread.pending_async_exception,
+        ] {
+            if let Some(obj_ref) = slot.as_mut() {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+        for obj_ref in thread
+            .native_pin_roots
+            .iter_mut()
+            .chain(thread.native_alloc_pool.iter_mut())
+        {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = fixup.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+        for (_key_id, key_ref, val) in &mut thread.scoped_values {
+            if let Some(obj_ref) = key_ref {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            update_value_ref(val, &fixup);
+        }
+        crate::native::jni::update_local_refs_after_gc(&fixup);
+    }
+    for so in &origins {
+        if so.cur == so.orig {
+            continue;
+        }
+        let fi = so.frame as usize;
+        let Some(fr) = thread.frames.get_mut(fi) else {
+            continue;
+        };
+        if so.is_stack {
+            if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) {
+                applied += 1;
+            }
+        } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+            if o.as_ptr() as usize == so.orig {
+                fr.set_local(
+                    so.idx as u16,
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(so.cur as *mut u8) })),
+                );
+                applied += 1;
+            }
+        }
+    }
+    applied
+}
+
 pub(crate) fn monitor_enter_blocking(
     shared: &SharedVm,
     thread: &mut JvmThread,
     obj: ObjectRef,
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
+    ctx.thread
+        .gc_block_state
+        .java_state
+        .store(2, std::sync::atomic::Ordering::Release);
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
@@ -1256,6 +1439,9 @@ pub(crate) fn monitor_enter_blocking(
         .copied()
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed);
     fixed
 }
 
@@ -1272,7 +1458,13 @@ pub(crate) fn monitor_enter_synchronized_method(
     obj: ObjectRef,
     args: &mut [Value],
 ) -> ObjectRef {
+    shared
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
     let Some(monitor) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        shared
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
 
@@ -1326,6 +1518,9 @@ pub(crate) fn monitor_enter_synchronized_method(
         }
     }
     ctx.thread.native_pin_roots.truncate(pin_base);
+    shared
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed_monitor);
     fixed_monitor
 }
 
@@ -1448,6 +1643,30 @@ thread_local! {
     static FIELD_DESCRIPTOR_LAST:
         std::cell::Cell<Option<(usize, u32, usize, u8)>> =
         const { std::cell::Cell::new(None) };
+
+    /// PERF (perf/halfgap-20260717): the single-entry cache above thrashes
+    /// on the alternating-(class,slot) pattern of hot native fast paths
+    /// (real-JDK Matcher: String.value/coder + Matcher scalars +
+    /// StringBuilder value/count in rotation — measured 8.7% of a
+    /// StringRegexOnly run falling through to the RwLock probe). Small
+    /// round-robin working set behind it, same shape as
+    /// `gen_heap::compact_field_slot`'s cache. Entries: (vm_key, class_id,
+    /// slot, byte); vacant slots have vm_key == 0 (never a real address).
+    static FIELD_DESCRIPTOR_RING:
+        std::cell::RefCell<([(usize, u32, usize, u8); 8], usize)> =
+        const { std::cell::RefCell::new(([(0, 0, 0, 0); 8], 0)) };
+}
+
+/// Record a definitive (byte, or 0 = confirmed-negative) descriptor result
+/// in both thread-local tiers.
+fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, byte: u8) {
+    FIELD_DESCRIPTOR_LAST.with(|last| last.set(Some((vm_key, class_id, slot_index, byte))));
+    FIELD_DESCRIPTOR_RING.with(|cell| {
+        let mut ring = cell.borrow_mut();
+        let next = ring.1;
+        ring.0[next] = (vm_key, class_id, slot_index, byte);
+        ring.1 = (next + 1) % ring.0.len();
+    });
 }
 
 fn resolve_field_descriptor_byte_cached(
@@ -1466,6 +1685,21 @@ fn resolve_field_descriptor_byte_cached(
     }) {
         return if cached == 0 { None } else { Some(cached) };
     }
+    // Second tier: the round-robin ring (see FIELD_DESCRIPTOR_RING's doc).
+    let ring_hit = FIELD_DESCRIPTOR_RING.with(|cell| {
+        let ring = cell.borrow();
+        ring.0
+            .iter()
+            .find(|(vm, cid, slot, _)| {
+                *vm == vm_key && *cid == class_id.as_u32() && *slot == slot_index
+            })
+            .map(|&(_, _, _, byte)| byte)
+    });
+    if let Some(byte) = ring_hit {
+        FIELD_DESCRIPTOR_LAST
+            .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, byte))));
+        return if byte == 0 { None } else { Some(byte) };
+    }
     // Fast path: read lock, hash lookup, early return on hit.
     //
     // PERF (negative-result memoization): the cache value `0u8` (NUL) is a
@@ -1481,8 +1715,7 @@ fn resolve_field_descriptor_byte_cached(
     {
         let cache = shared.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
             return if b == 0 { None } else { Some(b) };
         }
     }
@@ -1616,16 +1849,14 @@ fn resolve_field_descriptor_byte_cached(
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), b);
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, b))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
         }
         None if cacheable => {
             shared
                 .field_descriptor_cache
                 .write()
                 .insert((class_id, slot_index), 0u8);
-            FIELD_DESCRIPTOR_LAST
-                .with(|last| last.set(Some((vm_key, class_id.as_u32(), slot_index, 0u8))));
+            field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8);
         }
         None => {}
     }
@@ -1726,6 +1957,24 @@ fn normalize_system_property_key(key: &str) -> &str {
 }
 
 impl<'a> NativeContextImpl<'a> {
+    fn capture_current_stack_trace(&self) -> Vec<StackTraceEntry> {
+        let cm = self.shared.class_manager.read();
+        let trace =
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
+        drop(cm);
+        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_CAP frames={} depth={}",
+                self.thread.frames.len(),
+                trace.len()
+            );
+            for (i, e) in trace.iter().enumerate() {
+                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
+            }
+        }
+        trace
+    }
+
     /// Deposit a root snapshot of this thread's frames into the shared registry.
     /// Called before any blocking operation so GC can scan this thread's roots.
     ///
@@ -1830,6 +2079,46 @@ impl<'a> NativeContextImpl<'a> {
             // the wake-time `monitor_on_exit` remap misses.
             if let Some(m) = frame.monitor_on_exit {
                 snapshot.push(m);
+            }
+        }
+        // cceres3 FIX (blocked-window exact slot tracking): record every
+        // Object frame slot with the address it currently holds. GC folds
+        // advance each entry's `cur` through their pointer maps; the wake
+        // write-back in `check_post_block_gc_refs` stores `cur` back into
+        // the exact slot. Unlike the `fixup` chain (keyed by first-move
+        // addresses seeded from the FILTERED snapshot), this cannot strand a
+        // slot on a missed seed, a filtered entry, or a multi-block chain.
+        // Only the flag-raising deposit fills it — the wake-path refresh
+        // (`deposit_root_snapshot_no_flag`) must not, since a runnable
+        // thread's frames change under it.
+        if raise_blocked_flag {
+            let mut origins = self.thread.gc_block_state.slot_origins.lock();
+            origins.clear();
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: li as u32,
+                            is_stack: false,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        origins.push(crate::threading::jvm_thread::SlotOrigin {
+                            frame: fi as u32,
+                            idx: si as u32,
+                            is_stack: true,
+                            orig: a,
+                            cur: a,
+                        });
+                    }
+                }
             }
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
@@ -1947,6 +2236,61 @@ impl<'a> NativeContextImpl<'a> {
             let trace = crate::runtime::stackwalker::capture_frames_no_lines(&self.thread.frames);
             *self.thread.frame_trace.lock() = trace;
         }
+        // DIAGNOSTIC-ONLY (cceres3): catch a frame slot that is ALREADY stale
+        // at block entry — the deposited snapshot then can never chain it
+        // (`fold_pointer_map_into_blocked` seeds only from snapshot
+        // addresses), so the wake-time fixup misses it forever. Needs both
+        // CRATONVM_DBG_BLOCKGC and the CRATONVM_DBG_STALE_OBJREF ring.
+        if blockgc_dbg() {
+            let mut stale_n = 0usize;
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                            );
+                            stale_n += 1;
+                        }
+                    }
+                }
+            }
+            let pending = self.thread.gc_block_state.fixup.lock().len();
+            if stale_n > 0 || pending > 0 {
+                eprintln!(
+                    "[blockgc] deposit tid={} raise={} frames={} fixup_pending={} stale={}",
+                    self.thread.thread_id.0,
+                    raise_blocked_flag,
+                    self.thread.frames.len(),
+                    pending,
+                    stale_n,
+                );
+                if pending > 0 {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        eprintln!(
+                            "[blockgc] deposit-with-pending tid={} caller:\n{}",
+                            self.thread.thread_id.0,
+                            std::backtrace::Backtrace::force_capture(),
+                        );
+                    }
+                }
+            }
+        }
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
         // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
@@ -2038,7 +2382,7 @@ impl<'a> NativeContextImpl<'a> {
                     self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
                 );
             }
-            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if blockgc_dbg() {
                 eprintln!(
                     "[blockgc] wake tid={} applying {} composed fixups ({} frames)",
                     self.thread.thread_id.0,
@@ -2112,6 +2456,57 @@ impl<'a> NativeContextImpl<'a> {
             crate::native::jni::update_local_refs_after_gc(&fixup);
         }
 
+        // cceres3 FIX: exact per-slot write-back for the blocked window.
+        // Runs after the chain application above — any slot the chain already
+        // healed reads back != orig and is skipped; any slot the chain MISSED
+        // (seed gap / filtered snapshot / multi-block chain break) still
+        // holds `orig` and gets the tracked current address. Kind-strict on
+        // the operand stack (collision longs untouched); locals only rewrite
+        // when the slot still decodes to exactly `orig` as an object.
+        {
+            let origins = {
+                let mut o = self.thread.gc_block_state.slot_origins.lock();
+                std::mem::take(&mut *o)
+            };
+            if !origins.is_empty() {
+                let dbg = blockgc_dbg();
+                for so in &origins {
+                    if so.cur == so.orig {
+                        continue;
+                    }
+                    let fi = so.frame as usize;
+                    let Some(fr) = self.thread.frames.get_mut(fi) else {
+                        continue;
+                    };
+                    if so.is_stack {
+                        if fr.stack.rewrite_object_at(so.idx as usize, so.orig, so.cur) && dbg {
+                            eprintln!(
+                                "[blockgc] writeback healed tid={} frame#{fi} stack[{}] 0x{:x}->0x{:x}",
+                                self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                            );
+                        }
+                    } else if let Value::Object(Some(o)) = fr.get_local(so.idx as u16) {
+                        if o.as_ptr() as usize == so.orig {
+                            // SAFETY: `cur` is the object's current address,
+                            // advanced through the GC pointer maps by the
+                            // initiator folds.
+                            fr.set_local(
+                                so.idx as u16,
+                                Value::Object(Some(unsafe {
+                                    ObjectRef::from_raw(so.cur as *mut u8)
+                                })),
+                            );
+                            if dbg {
+                                eprintln!(
+                                    "[blockgc] writeback healed tid={} frame#{fi} local[{}] 0x{:x}->0x{:x}",
+                                    self.thread.thread_id.0, so.idx, so.orig, so.cur,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Refresh (don't clear) the snapshot: we are runnable again but may
         // not reach a safepoint before the next GC scans roots; an empty
         // snapshot would hide every object reachable only from our frames.
@@ -2119,6 +2514,42 @@ impl<'a> NativeContextImpl<'a> {
         // cleared atomically above; transiently re-raising it here would
         // re-open the excluded-while-running census window.
         self.deposit_root_snapshot_no_flag();
+        // DIAGNOSTIC-ONLY (cceres3): verify no frame slot is left stale after
+        // the wake-time fixup application — catches both "chain key missing"
+        // (was_key=false) and "frame held an intermediate address" desyncs at
+        // the exact wake where they surface.
+        if blockgc_dbg() {
+            for (fi, fr) in self.thread.frames.iter().enumerate() {
+                for li in 0..fr.locals_len() {
+                    if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+                for si in 0..fr.stack.len() {
+                    if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                        let a = o.as_ptr() as usize;
+                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                            eprintln!(
+                                "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
+                                self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
+                                fixup.contains_key(&a),
+                                fixup.values().any(|&v| v == a),
+                                fixup.len(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
@@ -2732,6 +3163,18 @@ fn reread_native_object_values(
         .collect()
 }
 
+thread_local! {
+    /// DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_UNPIN_RING): last few pin-stack
+    /// truncations with backtraces; dumped by the PIN-DANGLING canary.
+    static UNPIN_RING: std::cell::RefCell<Vec<(usize, usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn unpin_ring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_UNPIN_RING").is_some())
+}
+
 struct VmNativeThreadBlocker {
     shared: std::sync::Arc<SharedVm>,
     thread_id: ThreadId,
@@ -2824,7 +3267,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // the existing blocking-path deposit mechanism without actually
     // blocking.
     fn refresh_root_snapshot(&mut self) {
-        self.deposit_root_snapshot();
+        // cceres3 ROOT FIX (WildFly boot CCE long tail): this is a
+        // NON-blocking republish — the caller (the native-collections stream
+        // drain loops) keeps executing Java right after it. The old
+        // `deposit_root_snapshot()` call was the raise=true variant: it set
+        // `in_blocked_region` and nothing ever consumed it, so the identity
+        // census EXCLUDED the running thread from every subsequent STW pause
+        // (moving collections completed under its feet), its
+        // `gc_block_state.fixup` accumulated unconsumed (observed live:
+        // fixup_pending=44 across four raise=true deposits while running 43
+        // frames deep in infinispan/management-model stream work), and every
+        // frame ref it held or stored went stale — the poisoned-island
+        // producer behind the WFLYCTL0079 / "Object cannot be cast to X"
+        // family. The no-flag variant republishes pins/snapshot without
+        // touching the flag — exactly what a still-running thread needs.
+        self.deposit_root_snapshot_no_flag();
     }
 
     fn load_class(&mut self, name: &str) -> MethodCallResult {
@@ -2995,6 +3452,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_BLOCKGC): pin-time canary —
+        // pinning an ALREADY-forwarded address preserves the staleness (the
+        // GC only remaps pins through per-cycle pointer maps, which never
+        // contain long-dead addresses). A hit here means the CALLER received
+        // a stale value from upstream; the backtrace names it.
+        if blockgc_dbg() {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(obj.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    // Identify WHAT went stale: read the class off the
+                    // forwarded (live) copy.
+                    let fwd_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new as *mut u8) };
+                    let fwd_cid = self.shared.heap.class_id_of(fwd_ref);
+                    let fwd_class = self
+                        .shared
+                        .class_manager
+                        .read()
+                        .get_class(fwd_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("cid={}", fwd_cid.as_u32()));
+                    eprintln!(
+                        "[blockgc] PIN-STALE tid={} 0x{:x}->0x{new:x} class={fwd_class} caller:\n{}",
+                        self.thread.thread_id.0,
+                        obj.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
         // CRATONVM_DBG_BLOCKED_ACCESS: a pin pushed while this thread's
         // `in_blocked_region` flag is raised is invisible to BOTH the STW root
         // scan (which reads the deposit-time snapshot) and the blocked-thread
@@ -3019,15 +3509,90 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
-        self.thread
+        // DIAGNOSTIC-ONLY (cceres3): a handle past the pin stack means some
+        // callee truncated below this caller's pins (pin-stack imbalance) —
+        // the silent `unwrap_or(fallback)` then hands back the RAW address,
+        // which is stale if a GC ran since the pin. Name the reader loudly
+        // under the flag; the culprit truncator is inside its call subtree.
+        if handle != usize::MAX && handle >= self.thread.native_pin_roots.len() {
+            if blockgc_dbg() {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    let ring = if unpin_ring_enabled() {
+                        UNPIN_RING.with(|r| {
+                            r.borrow()
+                                .iter()
+                                .map(|(b, l, bt)| {
+                                    format!("\n  truncate base={b} prev_len={l} at:\n{bt}")
+                                })
+                                .collect::<String>()
+                        })
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "[blockgc] PIN-DANGLING tid={} handle={} len={} reader:\n{}\nrecent truncations:{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        std::backtrace::Backtrace::force_capture(),
+                        ring,
+                    );
+                }
+            }
+        }
+        let entry = self
+            .thread
             .native_pin_roots
             .get(handle)
             .copied()
-            .unwrap_or(fallback)
+            .unwrap_or(fallback);
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): the PIN-STALE canary
+        // covers pin TIME; this covers READ time — a forwarded address
+        // sitting in the pin table means a GC between pin and read failed
+        // to remap THIS entry (initiator/arrive/fold writeback gap), which
+        // no other canary distinguishes from caller-side misuse.
+        if handle != usize::MAX && blockgc_dbg() {
+            if let Some(new) = self
+                .shared
+                .heap
+                .debug_forwarded_target(entry.as_ptr() as usize)
+            {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                    eprintln!(
+                        "[blockgc] PIN-TABLE-STALE tid={} handle={} len={} 0x{:x}->0x{new:x} \
+                         (pin-table entry missed a remap) reader:\n{}",
+                        self.thread.thread_id.0,
+                        handle,
+                        self.thread.native_pin_roots.len(),
+                        entry.as_ptr() as usize,
+                        std::backtrace::Backtrace::force_capture(),
+                    );
+                }
+            }
+        }
+        entry
     }
 
     fn unpin_native_roots(&mut self, base: usize) {
         if base < self.thread.native_pin_roots.len() {
+            if unpin_ring_enabled() {
+                let bt = format!("{}", std::backtrace::Backtrace::force_capture());
+                let short: String = bt
+                    .lines()
+                    .skip(8)
+                    .take(12)
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                UNPIN_RING.with(|r| {
+                    let mut r = r.borrow_mut();
+                    if r.len() >= 6 {
+                        r.remove(0);
+                    }
+                    r.push((base, self.thread.native_pin_roots.len(), short));
+                });
+            }
             self.thread.native_pin_roots.truncate(base);
         }
     }
@@ -3644,50 +4209,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry> {
-        // WP1.9: resolve source file + line number + BCI for each frame via
-        // the method's LineNumberTable attribute (see
-        // `crate::runtime::stackwalker::entry_from_frame`).
-        let cm = self.shared.class_manager.read();
-        let trace =
-            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
-        drop(cm);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
-            eprintln!(
-                "STTRACE_DBG_CAP hash={throwable_hash} frames={} depth={}",
-                self.thread.frames.len(),
-                trace.len()
-            );
-            for (i, e) in trace.iter().enumerate() {
-                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
-            }
-        }
-        // Hash 0 is the VM's ephemeral stack-walk sentinel used by
-        // StackWalker/caller-sensitive helpers. Those callers consume the
-        // returned trace immediately and never retrieve it through
-        // get_stack_trace(), so cloning the full vector into the throwable
-        // trace map on every walk only adds work to hot logging/framework
-        // bootstrap paths.
-        if throwable_hash != 0 {
-            self.thread
-                .throwable_stacks
-                .insert(throwable_hash, trace.clone());
-        }
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        self.capture_current_stack_trace()
+    }
+
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        let trace = self.capture_current_stack_trace();
+        self.shared
+            .store_throwable_stack_trace(throwable, trace.clone());
         trace
     }
 
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]> {
-        let r = self
-            .thread
-            .throwable_stacks
-            .get(&throwable_hash)
-            .map(|v| v.as_slice());
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        let r = self.shared.throwable_stack_trace(throwable_hash);
         if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
-                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={} keys={:?}",
+                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
                 r.is_some(),
-                r.map_or(0, |s| s.len()),
-                self.thread.throwable_stacks.keys().collect::<Vec<_>>()
+                r.as_ref().map_or(0, Vec::len),
             );
         }
         r
@@ -3724,6 +4263,42 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        // DIAGNOSTIC-ONLY (cce0079 tree-key tail): decisive probe - capture
+        // the minor-GC epoch at entry and compare at exit. A delta proves a
+        // GC completed INSIDE a plain ref store (and names the stack);
+        // zero deltas across a firing run pins all staleness on producers.
+        let epoch_entry = if blockgc_dbg() {
+            Some(self.shared.heap.debug_minor_gc_count())
+        } else {
+            None
+        };
+        struct EpochGuard<'a> {
+            heap: &'a crate::memory::VmHeap,
+            entry: Option<u64>,
+        }
+        impl Drop for EpochGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(e) = self.entry {
+                    let now = self.heap.debug_minor_gc_count();
+                    if now != e {
+                        static N: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                            eprintln!(
+                                "[SETFIELD-GC] minor epoch changed INSIDE set_field \
+                                 ({e} -> {now}) thread={}:\n{}",
+                                std::thread::current().name().unwrap_or("?"),
+                                std::backtrace::Backtrace::force_capture(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _epoch_guard = EpochGuard {
+            heap: &self.shared.heap,
+            entry: epoch_entry,
+        };
         // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): a NATIVE writing through a
         // STRAY/STALE receiver (relocated-but-unremapped or wild). Same stray
         // header signature as the interpreter putfield check. Dumps the native
@@ -5137,7 +5712,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
+        self.shared
+            .thread_registry
+            .set_jmx_contended_monitor(self.thread.thread_id, obj);
         self.shared.monitors.enter(obj, self.thread.thread_id);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, obj);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
         }
@@ -5173,6 +5754,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
         let _ = self.shared.monitors.exit(obj, self.thread.thread_id);
+        if !self.shared.monitors.holds(obj, self.thread.thread_id) {
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+        }
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -5207,6 +5793,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // filler write can happen after a concurrent census has already
         // decided it may proceed without waiting for this thread.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         // KC16-watchdog: stash a snapshot of the current frame chain in a
@@ -5258,6 +5848,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
+            self.shared
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+            self.shared
+                .thread_registry
+                .set_jmx_waiting_monitor(self.thread.thread_id, obj);
             let r = self.shared.monitors.wait(
                 obj,
                 self.thread.thread_id,
@@ -5276,6 +5872,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // every later census permanently excluded the thread and a moving
         // collection could run concurrently with its bytecode.
         self.check_post_block_gc();
+        // `Object.wait` returns only after re-acquiring the monitor, including
+        // the InterruptedException path. Re-establish the ownership snapshot
+        // before propagating that result to Java.
+        let waited_on = self
+            .shared
+            .thread_registry
+            .take_jmx_waiting_monitor(self.thread.thread_id)
+            .unwrap_or(obj);
+        self.shared
+            .thread_registry
+            .complete_jmx_monitor_enter(self.thread.thread_id, waited_on);
         let was_interrupted = was_interrupted?;
         // Emit JFR monitor wait event
         {
@@ -5987,6 +6594,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
         // grow/realloc the young arena while we are joined.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
@@ -6024,7 +6635,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             None => 0, // NEW — never started
             Some(id) => {
                 if self.shared.thread_registry.is_alive(id) {
-                    1 // RUNNABLE
+                    match self.shared.thread_registry.java_block_state(id) {
+                        1 => 3, // WAITING
+                        2 => 4, // BLOCKED
+                        _ => 1, // RUNNABLE
+                    }
                 } else {
                     2 // TERMINATED
                 }
@@ -6053,6 +6668,86 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // carry the ClassId/descriptor needed to resolve source lines, but
         // class.method is sufficient to pinpoint where a parked thread is stuck.
         self.shared.thread_registry.frame_trace_of(tid)
+    }
+
+    fn thread_jmx_snapshot(&self, thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        let thread_id = read_java_thread_tid(self.shared, thread_obj)
+            .map(|id| id as i64)
+            .unwrap_or(tid.0 as i64);
+        let thread_name = self
+            .shared
+            .thread_registry
+            .thread_name(tid)
+            .unwrap_or_else(|| format!("Thread-{thread_id}"));
+        let thread_status = if !self.shared.thread_registry.is_alive(tid) {
+            0x0002 // JVMTI_THREAD_STATE_TERMINATED
+        } else {
+            match self.shared.thread_registry.java_block_state(tid) {
+                2 => 0x0401, // ALIVE | BLOCKED_ON_MONITOR_ENTER
+                1 => 0x0011, // ALIVE | WAITING_INDEFINITELY
+                _ => 0x0005, // ALIVE | RUNNABLE
+            }
+        };
+        let stack_trace = if self.thread.java_thread_obj == Some(thread_obj) {
+            let cm = self.shared.class_manager.read();
+            crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames)
+        } else {
+            self.shared.thread_registry.frame_trace_of(tid)
+        };
+        let (contended, waiting, locked_monitors, locked_synchronizers) =
+            self.shared.thread_registry.jmx_lock_snapshot(tid)?;
+        // `LockSupport` records the AQS/Condition blocker in the real JDK
+        // `Thread.parkBlocker` field before it enters Unsafe.park. It is the
+        // authoritative lock object for WAITING threads that are not in
+        // Object.wait(), and it is already rooted by the Thread mirror.
+        let park_blocker = match self.get_field_by_name(thread_obj, "parkBlocker") {
+            Value::Object(Some(blocker)) => Some(blocker),
+            _ => None,
+        };
+        let lock = contended.or(waiting).or(park_blocker);
+        // The compatibility CountDownLatch implementation blocks on the
+        // public latch monitor rather than allocating the JDK-private `Sync`.
+        // Preserve the public JMM contract: ThreadInfo exposes that logical
+        // synchronizer, not the implementation's monitor surrogate.
+        let lock_class_name = waiting.and_then(|monitor| {
+            (self.class_name_of_id(self.class_id_of_object(monitor)).as_deref()
+                == Some("java/util/concurrent/CountDownLatch"))
+                .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
+        });
+        let (lock_owner_id, lock_owner_name) = contended
+            .and_then(|monitor| self.shared.monitors.current_owner(monitor))
+            .map(|owner| {
+                let owner_id = self
+                    .shared
+                    .thread_registry
+                    .java_thread_obj(owner)
+                    .and_then(|obj| read_java_thread_tid(self.shared, obj))
+                    .map(|id| id as i64)
+                    .unwrap_or(owner.0 as i64);
+                (owner_id, self.shared.thread_registry.thread_name(owner))
+            })
+            .unwrap_or((-1, None));
+        Some(ThreadJmxSnapshot {
+            thread_object: Some(thread_obj),
+            thread_id,
+            thread_name,
+            thread_status,
+            stack_trace,
+            lock,
+            lock_class_name,
+            lock_owner_id,
+            lock_owner_name,
+            locked_monitors,
+            locked_synchronizers,
+        })
+    }
+
+    fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        let owner = owner.and_then(|thread| resolve_thread_id_from_thread_obj(self.shared, thread));
+        self.shared
+            .thread_registry
+            .set_jmx_owned_synchronizer(owner, synchronizer);
     }
 
     fn current_thread_object(&mut self) -> ObjectRef {
@@ -6558,6 +7253,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
         // blocked region, while the young arena it points into is still valid.
         // While we are GC-blocked a stop-the-world moving collection can run on
@@ -6985,6 +7684,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // grow/realloc the young arena while this thread is parked, freeing
         // the buffer the TLAB points into.
         self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
 
@@ -7153,21 +7856,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
-        // GC-safety: `lambda_args_sam_compatible` (invoked from the
-        // `.filter()` predicate immediately below) can trigger class loading
-        // -- a GC-triggering call -- through its proxy/annotation-satisfies
-        // helpers (the same helper family flagged in
-        // `checkcast_lambda_instantiated_args`'s own GC-safety comment
-        // elsewhere in this codebase). `receiver` and every object element of
-        // `args` are plain Rust locals here, invisible to the collector, so a
-        // moving GC landing inside that predicate leaves them stale for the
-        // `get_field`/`extend_from_slice` reads used to build `full_args`
-        // just below. Pin both before the predicate runs and re-read through
-        // the pins once it returns, instead of trusting the original locals.
-        // Confirmed live via `CRATONVM_DBG_STALE_OBJREF` during WildFly
-        // `parallel-extension-add` (a `java.util.stream` lambda pipeline
-        // stage triggered it) -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+        // Keep the receiver and arguments rooted across the dispatch decision:
+        // the selected lambda body can allocate immediately after this block.
         let sam_compat_pin_base = self.thread.native_pin_roots.len();
         self.thread.native_pin_roots.push(receiver);
         let arg_pins: Vec<Option<usize>> = args
@@ -7183,35 +7873,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .collect();
 
         if let Some(lcs) = call_site.filter(|lcs| {
-            // Match the SAM by name AND parameter count. A functional
-            // interface may declare OTHER same-named methods (overloaded
-            // `default` methods) whose body delegates to the real SAM — e.g.
-            // JUnit5's `TestInstancesProvider` has a 2-arg
-            // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)`
-            // default that calls the 3-arg abstract SAM
-            // `getTestInstances(ExtensionRegistry, ExtensionRegistrar,
-            // ThrowableCollector)`. Intercepting the 2-arg default as if it
-            // were the SAM routes it to the lambda body with one argument
-            // short, leaving the trailing param uninitialised. Only intercept
-            // when the supplied arg count matches the SAM's so the real
-            // default method runs and then re-invokes the SAM correctly.
-            method_name == &*lcs.sam_method_name
-                && crate::runtime::interpreter::split_method_descriptor(&lcs.sam_descriptor)
-                    .0
-                    .len()
-                    == args.len()
-                // Bug B: skip same-name/same-arity overloaded interface defaults
-                // whose parameter types don't match the SAM (e.g.
-                // AnnotationFilter.matches(Class) vs the SAM matches(String)).
-                && crate::runtime::interpreter::lambda_args_sam_compatible(
-                    self.shared,
-                    &lcs.sam_descriptor,
-                    args,
-                )
+            // A lambda only implements its exact SAM descriptor. Same-named
+            // defaults must run their bytecode, even when a null argument is
+            // assignable to both the default and SAM parameter types.
+            method_name == &*lcs.sam_method_name && descriptor == &*lcs.sam_descriptor
         }) {
-            // Re-read receiver and args through the pins established above --
-            // the SAM-compatibility check just run may have triggered a
-            // moving GC that relocated either one.
+            // Re-read receiver and args through the pins before the selected
+            // lambda body can allocate and move them.
             receiver = self.thread.native_pin_roots[sam_compat_pin_base];
             let refreshed_args: Vec<Value> = args
                 .iter()
@@ -7324,6 +7992,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             Ok(None)
                         }
                     } else {
+                        let private_impl_class =
+                            crate::runtime::interpreter::lambda_private_impl_dispatch_class(
+                                self.shared,
+                                &lcs,
+                            );
                         let rcv_id_opt = match &full_args[0] {
                             Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
                             _ => None,
@@ -7356,7 +8029,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         } else {
                             None
                         };
-                        let result = if let Some(rcv_cid) = vov {
+                        let result = if let Some(impl_cid) = private_impl_class {
+                            invoke_on_class_shared_no_retarget(
+                                self.shared,
+                                self.thread,
+                                impl_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        } else if let Some(rcv_cid) = vov {
                             invoke_on_class_shared(
                                 self.shared,
                                 self.thread,
@@ -7784,26 +8466,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             full_args.push(Value::Object(Some(receiver)));
             full_args.extend_from_slice(args);
 
-            // Per-loader identity (JVMS §5.3): when the receiver's class name
-            // resolves (globally, by name) to a DIFFERENT class id than the
-            // receiver actually has — i.e. another loader defined a same-named
-            // class first — dispatch on the receiver's EXACT class id so a
-            // reflective `Method.invoke` on a loader-private (e.g. load-time
-            // weaved) instance runs ITS body, not the global one.
-            // `invoke_on_class_shared` resolves via
-            // `find_method_recursive(receiver_class_id, ...)` and keeps
-            // native-override precedence, matching `invoke_or_native`'s
-            // semantics minus the name→global-id collapse. The common
-            // single-loader case (name resolves back to `receiver_class_id`)
-            // keeps the original `invoke_or_native` path byte-for-byte.
-            let diverges = resolved_from_receiver
-                && self
-                    .shared
-                    .class_manager
-                    .read()
-                    .get_loaded_class_id(&class_name)
-                    != Some(receiver_class_id);
-            if diverges {
+            // Dispatch ordinary object calls through the receiver's exact
+            // loaded class. Re-resolving its name through the global class map
+            // can select an inherited Object member even when the receiver has
+            // a concrete override (notably a method-local anonymous class
+            // reached from a native call such as String.format's `%s`).
+            // `invoke_on_class_shared` preserves native-override precedence
+            // while resolving the actual receiver hierarchy.
+            if resolved_from_receiver {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,
@@ -8086,7 +8756,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8144,7 +8814,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         &self,
         class_id: ClassId,
         field_name: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8166,7 +8836,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         method_name: &str,
         method_desc: &str,
-    ) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+    ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
         let cm = self.shared.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
@@ -8181,6 +8851,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
         Vec::new()
+    }
+
+    /// `Class.getAnnotatedSuperclass()` / `Class.getAnnotatedInterfaces()`
+    /// (and their `getAnnotatedActualTypeArguments()` chains) — see
+    /// `extract_class_extends_type_annotations` for why this re-parses the
+    /// cached original bytes rather than reading from `Class`.
+    fn class_extends_type_annotations(
+        &self,
+        class_id: ClassId,
+        supertype_index: u16,
+    ) -> crate::native::registry::TypeArgAnnotations {
+        let bytes = {
+            let cm = self.shared.class_manager.read();
+            match cm.class_bytes_cache.get(&class_id) {
+                Some(b) => b.clone(),
+                None => return Default::default(),
+            }
+        };
+        extract_class_extends_type_annotations(&bytes, supertype_index)
     }
 
     fn method_annotation_default(
@@ -8317,7 +9006,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
         #[cfg(windows)]
-        let skip_jni_onload_tcnative = basename_lc.contains("tcnative");
+        // Conscrypt's extracted OpenJDK JNI DLL uses the same unsafe
+        // RegisterNatives-on-load pattern as tcnative on CratonVM.
+        let skip_jni_onload_tcnative =
+            basename_lc.contains("tcnative") || basename_lc.contains("conscrypt_openjdk_jni");
         #[cfg(not(windows))]
         let skip_jni_onload_tcnative = false;
 
@@ -9133,14 +9825,40 @@ pub(super) fn extract_return_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting the method return type's direct
-/// TYPE ARGUMENTS (`target_type` 0x14, METHOD_RETURN) whose `type_path` is a
-/// single TYPE_ARGUMENT entry (`type_path_kind == 3`) -- e.g. an annotation on
-/// `String` in `List<@NotBlank String> getNames()`.
+/// Insert an `AnnotationData` into a `TypeArgAnnotations` forest at the
+/// position described by `path` (a `type_path` restricted to TYPE_ARGUMENT
+/// entries, per JVMS 4.7.20.2 — the caller has already filtered out any
+/// ARRAY/INNER_TYPE/WILDCARD_BOUND entries). `path` must be non-empty; each
+/// entry descends one nesting level (top-level index first), growing `tree`
+/// (and each level's `children`) as needed so arbitrarily deep generics
+/// (`ValueExtractor<ArgumentValue<@ExtractedValue ?>>`, two TYPE_ARGUMENT
+/// steps) land at the right node, not just the single-level case
+/// (`List<@NotBlank String>`) the extraction call sites used to hard-code.
+fn insert_type_arg_annotation(
+    tree: &mut Vec<crate::native::registry::TypeArgAnnotations>,
+    path: &[cratonvm_reader::attribute::TypePathEntry],
+    data: crate::native::registry::AnnotationData,
+) {
+    let idx = path[0].type_argument_index as usize;
+    if tree.len() <= idx {
+        tree.resize(idx + 1, Default::default());
+    }
+    if path.len() == 1 {
+        tree[idx].anns.push(data);
+    } else {
+        insert_type_arg_annotation(&mut tree[idx].children, &path[1..], data);
+    }
+}
+
+/// Extract TYPE_USE annotations targeting the method return type's TYPE
+/// ARGUMENTS, at any nesting depth (`target_type` 0x14, METHOD_RETURN, with a
+/// `type_path` made entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`)
+/// -- e.g. an annotation on `String` in `List<@NotBlank String> getNames()`,
+/// or a nested generic like `ValueExtractor<Wrapper<@Foo ?>>`.
 pub(super) fn extract_return_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_RETURN: u8 = 0x14;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9150,22 +9868,20 @@ pub(super) fn extract_return_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_RETURN {
+                if ta.target_type != TARGET_METHOD_RETURN || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
@@ -9215,24 +9931,23 @@ pub(super) fn extract_parameter_type_annotations(
 }
 
 /// Extract TYPE_USE annotations targeting method formal parameters'
-/// TYPE ARGUMENTS (`target_type` 0x16, METHOD_FORMAL_PARAMETER) whose
-/// `type_path` is a single TYPE_ARGUMENT entry (`type_path_kind == 3`) --
-/// i.e. an annotation on a generic type argument like the `@Valid` in
-/// `List<@Valid Person> persons`, as opposed to
+/// TYPE ARGUMENTS, at any nesting depth (`target_type` 0x16,
+/// METHOD_FORMAL_PARAMETER, with a `type_path` made entirely of
+/// TYPE_ARGUMENT entries, `type_path_kind == 3`) -- i.e. an annotation on a
+/// generic type argument like the `@Valid` in `List<@Valid Person> persons`,
+/// or a nested one like `Map<String, @Valid List<Person>>`, as opposed to
 /// [`extract_parameter_type_annotations`] which only keeps the
 /// empty-`type_path` (top-level parameter type) annotations.
 ///
 /// Outer `Vec` indexed by `formal_parameter_index`; inner `Vec` indexed by
-/// `type_argument_index` (0-based, JVMS 4.7.20.2). Multi-level nesting
-/// (e.g. `Map<String, @Valid List<Person>>`, `type_path` length > 1) is not
-/// modeled -- only a direct, single-level type argument is recognized,
-/// which covers the common `List<@Valid T>` / `Map<K, @Valid V>` cases.
-/// Backs `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
+/// the top-level `type_argument_index` (0-based, JVMS 4.7.20.2), with each
+/// entry's own `children` carrying the next nesting level. Backs
+/// `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()`
 /// for method parameters.
 pub(super) fn extract_parameter_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<Vec<crate::native::registry::AnnotationData>>> {
+) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_METHOD_FORMAL_PARAMETER: u8 = 0x16;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9242,19 +9957,18 @@ pub(super) fn extract_parameter_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<Vec<crate::native::registry::AnnotationData>>> = Vec::new();
+            let mut out: Vec<Vec<crate::native::registry::TypeArgAnnotations>> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER {
+                if ta.target_type != TARGET_METHOD_FORMAL_PARAMETER || ta.type_path.is_empty() {
                     continue;
                 }
-                // Only a single-level type-argument path: exactly one
-                // type_path entry, and it must be a TYPE_ARGUMENT.
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 // target_info for METHOD_FORMAL_PARAMETER is a single u1 index.
                 let param_idx = match ta.target_info.first() {
                     Some(&i) => i as usize,
@@ -9264,11 +9978,7 @@ pub(super) fn extract_parameter_type_argument_annotations(
                     if out.len() <= param_idx {
                         out.resize(param_idx + 1, Vec::new());
                     }
-                    let type_args = &mut out[param_idx];
-                    if type_args.len() <= type_arg_idx {
-                        type_args.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    type_args[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out[param_idx], &ta.type_path, data);
                 }
             }
             return out;
@@ -9302,14 +10012,14 @@ pub(super) fn extract_field_type_annotations(
     Vec::new()
 }
 
-/// Extract TYPE_USE annotations targeting a field type's direct TYPE ARGUMENTS
-/// (`target_type` 0x13, FIELD) whose `type_path` is a single TYPE_ARGUMENT
-/// entry (`type_path_kind == 3`) -- e.g. an annotation on `String` in
-/// `List<@NotBlank String> names`.
+/// Extract TYPE_USE annotations targeting a field type's TYPE ARGUMENTS, at
+/// any nesting depth (`target_type` 0x13, FIELD, with a `type_path` made
+/// entirely of TYPE_ARGUMENT entries, `type_path_kind == 3`) -- e.g. an
+/// annotation on `String` in `List<@NotBlank String> names`.
 pub(super) fn extract_field_type_argument_annotations(
     attributes: &[cratonvm_reader::attribute::LazyAttribute],
     cp: &cratonvm_reader::constant_pool::ConstantPool,
-) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+) -> Vec<crate::native::registry::TypeArgAnnotations> {
     use cratonvm_reader::attribute::Attribute;
     const TARGET_FIELD: u8 = 0x13;
     const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
@@ -9319,28 +10029,100 @@ pub(super) fn extract_field_type_argument_annotations(
             None => continue,
         };
         if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
-            let mut out: Vec<Vec<crate::native::registry::AnnotationData>> = Vec::new();
+            let mut out: Vec<crate::native::registry::TypeArgAnnotations> = Vec::new();
             for ta in tas {
-                if ta.target_type != TARGET_FIELD {
+                if ta.target_type != TARGET_FIELD || ta.type_path.is_empty() {
                     continue;
                 }
-                let type_arg_idx = match ta.type_path.as_slice() {
-                    [entry] if entry.type_path_kind == TYPE_PATH_KIND_TYPE_ARGUMENT => {
-                        entry.type_argument_index as usize
-                    }
-                    _ => continue,
-                };
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
                 if let Some(data) = convert_annotation(&ta.annotation, cp) {
-                    if out.len() <= type_arg_idx {
-                        out.resize(type_arg_idx + 1, Vec::new());
-                    }
-                    out[type_arg_idx].push(data);
+                    insert_type_arg_annotation(&mut out, &ta.type_path, data);
                 }
             }
             return out;
         }
     }
     Vec::new()
+}
+
+/// Extract the runtime-visible TYPE_USE annotations targeting one of a
+/// class's declared supertypes (`target_type` 0x10, CLASS_EXTENDS) from its
+/// original `.class` bytes, re-parsed on demand.
+///
+/// Unlike methods/fields (whose per-member attribute lists survive on the
+/// loaded [`crate::classloading::class::Class`]), the class-level
+/// `RuntimeVisibleTypeAnnotations` attribute is folded away during class
+/// loading (JVMS §4.7 attributes not recognized by the `Class` struct's
+/// field-by-field fold are dropped) — so there is nowhere to read it from
+/// post-load. Re-parsing the cached original bytes (`class_bytes_cache`,
+/// already retained for JVMTI retransformation) is the least invasive way to
+/// recover it without adding a new field threaded through every `Class`
+/// construction site in the codebase. This runs lazily, only when a
+/// framework actually calls `Class.getAnnotatedSuperclass()` /
+/// `getAnnotatedInterfaces()`, so the cost of a second parse pass is
+/// immaterial. Returns an empty tree (not an error) if the bytes were
+/// evicted from the FIFO-capped cache or fail to re-parse.
+///
+/// `supertype_index` is JVMS `CLASS_EXTENDS`'s `u2 supertype_index`: `0xFFFF`
+/// selects the superclass, `0..n` selects the n-th entry of `interfaces`.
+pub(super) fn extract_class_extends_type_annotations(
+    class_bytes: &[u8],
+    supertype_index: u16,
+) -> crate::native::registry::TypeArgAnnotations {
+    use cratonvm_reader::attribute::Attribute;
+    const TARGET_CLASS_EXTENDS: u8 = 0x10;
+    const TYPE_PATH_KIND_TYPE_ARGUMENT: u8 = 3;
+
+    let class_file = match cratonvm_reader::class_reader::read_class(class_bytes) {
+        Ok(cf) => cf,
+        Err(_) => return Default::default(),
+    };
+    let cp = &class_file.constant_pool;
+    for lazy in &class_file.attributes {
+        let attr = match lazy.decoded_or_decode(cp) {
+            Some(a) => a,
+            None => continue,
+        };
+        if let Attribute::RuntimeVisibleTypeAnnotations(tas) = attr.as_ref() {
+            let mut tree = crate::native::registry::TypeArgAnnotations::default();
+            for ta in tas {
+                if ta.target_type != TARGET_CLASS_EXTENDS {
+                    continue;
+                }
+                let idx = match ta.target_info.as_slice() {
+                    [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+                    _ => continue,
+                };
+                if idx != supertype_index {
+                    continue;
+                }
+                if ta
+                    .type_path
+                    .iter()
+                    .any(|e| e.type_path_kind != TYPE_PATH_KIND_TYPE_ARGUMENT)
+                {
+                    continue;
+                }
+                let data = match convert_annotation(&ta.annotation, cp) {
+                    Some(d) => d,
+                    None => continue,
+                };
+                if ta.type_path.is_empty() {
+                    tree.anns.push(data);
+                } else {
+                    insert_type_arg_annotation(&mut tree.children, &ta.type_path, data);
+                }
+            }
+            return tree;
+        }
+    }
+    Default::default()
 }
 
 /// Convert a reader Annotation to our AnnotationData.
@@ -9783,6 +10565,7 @@ pub fn invoke_or_native(
                         | "java/util/concurrent/LinkedBlockingDeque"
                         | "java/util/concurrent/atomic/AtomicBoolean"
                         | "java/util/EnumSet"
+                        | "java/time/Instant"
                         | "java/util/StringJoiner"
                         | "java/io/FileInputStream"
                         | "java/lang/ref/Cleaner"
@@ -10783,6 +11566,7 @@ pub(super) fn proxy_invoke_handler(
             handler_ref,
             handler_class_id,
             "invoke",
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
             &call_args,
         ) {
             Ok(d) => d,
@@ -11189,6 +11973,7 @@ pub(crate) fn proxy_invoke_handler_shared(
             handler_ref,
             handler_class_id,
             "invoke",
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
             &call_args,
         ) {
             Ok(d) => d,
@@ -11463,7 +12248,22 @@ pub(crate) fn annotation_proxy_invoke_shared(
     // `AnnotationAttributes[]`, surfacing as the `TypeFilterUtils.java:77`
     // / `ComponentScanAnnotationParser.java:137` NPE on the next iteration
     // (`@Filter` attribute is null).
+    if method_name == "asAnnotationAttributes" {
+        // `MergedAnnotation.asAnnotationAttributes(Adapt...)` has one
+        // argument: the Adapt[] varargs array. `annotation_proxy_as_map`
+        // accepts `(Function factory, Adapt[] adapts)`, so preserve the
+        // adaptation array in its second slot and use no factory.
+        let adapts = args.first().copied().unwrap_or(Value::Object(None));
+        return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+    }
     if method_name == "asMap" {
+        // The `asMap(Adapt...)` overload similarly has no factory. Without
+        // this routing, CLASS_TO_STRING is mistaken for a factory argument
+        // and Class[] values leak into AnnotationAttributes.
+        if args.len() <= 1 {
+            let adapts = args.first().copied().unwrap_or(Value::Object(None));
+            return annotation_proxy_as_map(shared, thread, proxy, &[Value::Object(None), adapts]);
+        }
         return annotation_proxy_as_map(shared, thread, proxy, args);
     }
     // Annotation equality is symmetric, but our native `AnnotationProxy` equals
@@ -11547,6 +12347,7 @@ fn annotation_proxy_as_map(
                 f,
                 f_cid,
                 "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
                 &[Value::Object(Some(proxy))],
             )?;
             dispatch.unwrap_or(None)
@@ -11631,6 +12432,66 @@ fn annotation_proxy_as_map(
     Ok(Some(Value::Object(Some(dest_map))))
 }
 
+/// Materialize a real or synthetic annotation proxy as a one-element
+/// `AnnotationAttributes[]`. This is used at Spring's scalar-to-array
+/// metadata boundary for a nested annotation that the forked class-path
+/// reader reports without its declared array wrapper.
+pub(crate) fn annotation_proxy_to_annotation_attributes_array(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let attrs_cid = shared
+        .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
+        .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
+    // The servlet API's `WebFilter.initParams()` default is an empty array.
+    // In the forked class-path reader it can appear as a zero-field
+    // WebInitParam placeholder rather than a real annotation proxy. It holds
+    // no member data, so its faithful AnnotationAttributes representation is
+    // the declared empty array.
+    if class_name_is(shared, value, "jakarta/servlet/annotation/WebInitParam")
+        && shared.heap.num_fields(value) == 0
+    {
+        return Ok(Some(shared.heap.alloc_array(
+            attrs_cid,
+            cratonvm_types::ArrayElementType::Reference,
+            0,
+        )));
+    }
+    let proxy = if class_name_is(shared, value, "java/lang/annotation/AnnotationProxy") {
+        Some(value)
+    } else {
+        match shared.heap.get_field(value, 0) {
+            Value::Object(Some(handler))
+                if class_name_is(shared, handler, "java/lang/annotation/AnnotationProxy") =>
+            {
+                Some(handler)
+            }
+            _ => None,
+        }
+    };
+    let Some(proxy) = proxy else {
+        return Ok(None);
+    };
+    let attrs = match annotation_proxy_as_map(
+        shared,
+        thread,
+        proxy,
+        &[Value::Object(None), Value::Object(None)],
+    )? {
+        Some(Value::Object(Some(attrs))) => attrs,
+        _ => return Ok(None),
+    };
+    let array = shared
+        .heap
+        .alloc_array(attrs_cid, cratonvm_types::ArrayElementType::Reference, 1);
+    shared
+        .heap
+        .set_array_element(array, 0, Value::Object(Some(attrs)))
+        .ok();
+    Ok(Some(array))
+}
+
 /// Test whether the given (possibly-null) Adapt[] varargs array contains
 /// an enum constant whose `name` slot equals `target_name`.
 fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: &str) -> bool {
@@ -11673,7 +12534,7 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
 /// return `val` unchanged. Implements the `Adapt.CLASS_TO_STRING` semantics
 /// for `MergedAnnotation.asMap` so that downstream
 /// `AnnotationAttributes.getStringArray("basePackageClasses")` succeeds.
-fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
+pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> Value {
     use crate::memory::heap::ObjectKind;
     let obj = match val {
         Value::Object(Some(o)) => o,
@@ -11994,14 +12855,21 @@ pub(crate) fn annotation_proxy_to_string(shared: &SharedVm, proxy: ObjectRef) ->
     s.push('@');
     s.push_str(&dotted);
     s.push('(');
+    let omit_single_value_name = elems.len() == 1 && elems[0].0 == "value";
     let mut first = true;
     for (name, val) in &elems {
         if !first {
             s.push_str(", ");
         }
         first = false;
-        s.push_str(name);
-        s.push('=');
+        // The JDK's AnnotationInvocationHandler elides `value=` for a
+        // single-member annotation whose sole element is conventionally named
+        // `value`, e.g. `@Qualifier("alpha")`, while retaining names for every
+        // multi-member annotation.
+        if !omit_single_value_name {
+            s.push_str(name);
+            s.push('=');
+        }
         s.push_str(&format_annotation_value(shared, *val));
     }
     s.push(')');
@@ -12979,6 +13847,7 @@ fn invoke_on_class_shared_inner(
                     recv,
                     recv_cid,
                     method_name,
+                    descriptor,
                     &args[1..],
                 )? {
                     return Ok(result);
@@ -13085,6 +13954,89 @@ fn invoke_on_class_shared_inner(
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
+    // `Socket.setKeepAlive` on a real-JDK socket can read CratonVM's
+    // synthetic TLS state as its private `impl` field.  The resulting
+    // receiver is a String and the JDK attempts the impossible call below.
+    // It is an internal socket-option write only; String has no such API, so
+    // suppressing it is both narrower and safer than allowing an NSME.
+    if class_name == "java/lang/String"
+        && method_name == "setOption"
+        && descriptor == "(ILjava/lang/Object;)V"
+    {
+        return Ok(None);
+    }
+    // `ServerSocket.accept()` has a native parent implementation, so the
+    // later abstract-method rescue cannot displace it. A synthetic
+    // SSLServerSocket owns a separate TLS listener registry and must always
+    // prefer its concrete bridge before inherited-native lookup.
+    if method_name == "accept" && descriptor == "()Ljava/net/Socket;" {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if receiver_name == "javax/net/ssl/SSLServerSocket" {
+                if let Some(callback) =
+                    shared
+                        .native_methods
+                        .find(&receiver_name, method_name, descriptor)
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
+    // UnboundID retains an SSLServerSocketFactory in a field whose declared
+    // type is ServerSocketFactory, then invokes its concrete parent overloads
+    // (`createServerSocket(II)` and `(IILjava/net/InetAddress;)`).  The
+    // parent has registered native implementations, so ordinary resolution
+    // never reaches the TLS factory's more-specific bridge.  Prefer that
+    // bridge from the receiver's actual synthetic class before the parent
+    // native can manufacture a plaintext listener.
+    if method_name == "createServerSocket"
+        && matches!(
+            descriptor,
+            "(I)Ljava/net/ServerSocket;"
+                | "(II)Ljava/net/ServerSocket;"
+                | "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;"
+        )
+    {
+        if let Some(Value::Object(Some(receiver))) = args.first() {
+            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_name = shared
+                .class_manager
+                .read()
+                .get_class(receiver_class)
+                .map(|class| class.name.to_string())
+                .unwrap_or_default();
+            if matches!(
+                receiver_name.as_str(),
+                "javax/net/ssl/SSLServerSocketFactory"
+                    | "sun/security/ssl/SSLServerSocketFactoryImpl"
+            ) {
+                if let Some(callback) = shared
+                    .native_methods
+                    // The real JDK factory carries its SSLContext in the
+                    // same first instance slot consumed by the bridge.
+                    // Reuse the bridge registered on its public API type
+                    // rather than interpreting `SSLServerSocketImpl`,
+                    // whose host socket path bypasses the TLS registry.
+                    .find(
+                        "javax/net/ssl/SSLServerSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
+                {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
         }
     }
     // The real-JDK Thread methods read the host field layout directly.  A
@@ -13472,6 +14424,28 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                // `URLClassLoader` declares its OWN
+                                // `getResourceAsStream` override (real OpenJDK
+                                // wraps the stream for `closeables` tracking),
+                                // unlike `getResource`/`getResources`/
+                                // `findResource` above, which it leaves to
+                                // `ClassLoader`/its own extension point. The
+                                // `java/lang/ClassLoader` entry elsewhere in
+                                // this list never matches such a call, so its
+                                // real bytecode ran unforced — same shimmed-`ucp`
+                                // problem as `findResource` above, but ALSO
+                                // missing the native bridge's parent-delegation,
+                                // so a `new URLClassLoader(urls, parent)` whose
+                                // own URL held only a generated resource index
+                                // (Spring Boot's `ServletComponentScanIntegrationTests
+                                // .indexedComponentsAreRegistered`) got `null`
+                                // for every `.class` resource that only the
+                                // PARENT classloader's classpath holds, despite
+                                // `getResource` resolving it fine moments
+                                // earlier. Keep in sync with
+                                // `force_native_over_real_jdk_bytecode`.
+                                || (method_name == "getResourceAsStream"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
@@ -14055,6 +15029,29 @@ fn invoke_on_class_shared_inner(
                                 | "size"
                                 | "close"
                                 | "getName"
+                            ))
+                        // `JarFile` inherits its ZipFile operations.  A
+                        // subclass `super.close()` (or another inherited
+                        // super call) resolves from the JarFile constant-pool
+                        // reference to ZipFile, where the real JDK body reads
+                        // fields that the native-backed constructor does not
+                        // populate.  Keep the ZipFile side of the bridge
+                        // allow-list in sync with the methods registered in
+                        // `register_jar_natives` so those inherited special
+                        // calls use the same Rust-backed state as direct
+                        // JarFile calls.
+                        || (class_name == "java/util/zip/ZipFile"
+                            && matches!(
+                                method_name,
+                                "<init>"
+                                | "getEntry"
+                                | "getInputStream"
+                                | "entries"
+                                | "stream"
+                                | "getComment"
+                                | "close"
+                                | "getName"
+                                | "size"
                             ))
                         || (class_name == "java/util/jar/Manifest"
                             && matches!(
@@ -14718,6 +15715,26 @@ fn invoke_on_class_shared_inner(
                         // and waits on the object monitor. Keep this slow-path
                         // gate in sync with force_native_over_real_jdk_bytecode.
                         || crate::runtime::interpreter::is_undertow_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_netty_event_executor_group_shutdown_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_destroy_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_springboot_mongo_reactive_customizer_customize_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_datagram_channel_open_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -15402,11 +16419,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        || crate::runtime::interpreter::is_time_native_override(
-                            class_name,
-                            method_name,
-                            descriptor,
-                        )
                         || crate::runtime::interpreter::is_ffm_symbol_lookup_native_override(
                             class_name,
                             method_name,
@@ -15530,7 +16542,22 @@ fn invoke_on_class_shared_inner(
                     // the interface-exclusion above retargeted `class_id`) and check
                     // its native registry too -- this generalises the rescue to any
                     // interface-stamped synthetic receiver, not just concrete ones.
-                    if !native && method.is_abstract() {
+                    // The static method reference can already have selected a
+                    // generic native on the abstract parent (for example
+                    // `ServerSocketFactory.createServerSocket(II)`), which
+                    // used to suppress this receiver-specific rescue.  The
+                    // concrete synthetic receiver's bridge is more specific
+                    // and must win even in that case: otherwise an
+                    // `SSLServerSocketFactory` silently constructs a
+                    // plaintext listener through its parent factory.
+                    // `ServerSocket.accept()` is concrete on the parent, but a
+                    // synthetic SSLServerSocket must still route to its own
+                    // TLS-aware native. Without this one concrete exception,
+                    // the parent accept path bypasses the listener registry
+                    // entirely and an LDAPS client waits until timeout.
+                    if method.is_abstract()
+                        || (method_name == "accept" && descriptor == "()Ljava/net/Socket;")
+                    {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
                                 let rc = shared.heap.class_id_of(*o);
@@ -15914,6 +16941,7 @@ fn invoke_on_class_shared_inner(
                                 recv,
                                 recv_cid,
                                 method_name,
+                                descriptor,
                                 &args[1..],
                             )? {
                                 return Ok(result);
@@ -17969,16 +18997,26 @@ mod tests {
     }
 
     #[test]
-    fn native_context_capture_stack_trace() {
+    fn native_context_throwable_trace_survives_producer_thread_context() {
         let shared = test_shared();
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mut ctx = NativeContextImpl {
+        let throwable = shared.heap.alloc_object(ClassId::new(0), 0);
+        let hash = shared.heap.identity_hash_code(throwable);
+        {
+            let mut producer = JvmThread::new(ThreadId(1), "producer");
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut producer,
+            };
+            let trace = ctx.capture_throwable_stack_trace(throwable);
+            assert!(trace.is_empty());
+        }
+
+        let mut consumer = JvmThread::new(ThreadId(2), "consumer");
+        let ctx = NativeContextImpl {
             shared: &shared,
-            thread: &mut thread,
+            thread: &mut consumer,
         };
-        let trace = ctx.capture_stack_trace(123);
-        assert!(trace.is_empty());
-        let stored = ctx.get_stack_trace(123);
+        let stored = ctx.get_stack_trace(hash);
         assert!(stored.is_some());
         assert!(stored.unwrap().is_empty());
     }

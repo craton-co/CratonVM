@@ -422,7 +422,7 @@ impl NativeContext for MockCtx {
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
         Vec::new()
     }
-    fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+    fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
         None
     }
 

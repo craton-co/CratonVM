@@ -19,6 +19,11 @@ use cratonvm_vm::vm::Vm;
 
 /// Path to the test resources directory.
 fn test_resources_dir() -> String {
+    if let Some(generated) = option_env!("CRATONVM_TEST_CLASSES_DIR") {
+        if std::path::Path::new(generated).is_dir() {
+            return generated.to_owned();
+        }
+    }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     format!("{manifest_dir}/tests/resources")
 }
@@ -2039,6 +2044,27 @@ fn test_s17_field_get_private() {
 }
 
 #[test]
+fn test_s17_field_get_own_private_final_reference_without_set_accessible() {
+    if !require_extended_interpreter_tests(
+        "test_s17_field_get_own_private_final_reference_without_set_accessible",
+    ) {
+        return;
+    }
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/ReflectionComplete",
+        "testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(42))) => {}
+        other => panic!("Expected Ok(Some(Int(42))), got: {other:?}"),
+    }
+}
+
+#[test]
 fn test_s17_field_set_private() {
     if !require_extended_interpreter_tests("test_s17_field_set_private") {
         return;
@@ -2933,6 +2959,11 @@ s20_test!(
 );
 s20_test!(test_s20_stream_of_count, "testStreamOfCount", 5);
 s20_test!(test_s20_reduce_with_identity, "testReduceWithIdentity", 15);
+s20_test!(
+    test_s20_reduce_with_generic_accumulator,
+    "testReduceWithGenericAccumulator",
+    1
+);
 s20_test!(test_s20_for_each, "testForEach", 60);
 s20_test!(test_s20_collect_to_set, "testCollectToSet", 3);
 s20_test!(test_s20_find_first, "testFindFirst", 10);
@@ -4650,6 +4681,10 @@ s49_test!(
     "testSemaphoreReleaseAboveInit"
 );
 s49_test!(test_s49_semaphore_acquire_n, "testSemaphoreAcquireN");
+s49_test!(
+    test_s49_semaphore_acquire_uninterruptibly_n,
+    "testSemaphoreAcquireUninterruptiblyN"
+);
 s49_test!(test_s49_semaphore_is_fair, "testSemaphoreIsFair");
 
 // --- CyclicBarrier ---

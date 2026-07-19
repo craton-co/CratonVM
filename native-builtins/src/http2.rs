@@ -2150,7 +2150,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         cls,
         "subscribe",
         "(Ljava/util/concurrent/Flow$Subscriber;)V",
-        |_ctx, args| {
+        |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
@@ -2159,9 +2159,17 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => Some(*s),
                 _ => None,
             };
-            let key = this.as_ptr() as u64;
+            // GC-stable keying + rooted value (cce0079 follow-up): the raw
+            // address key went stale after any moving GC and the subscriber
+            // value was neither rooted nor remapped. Key by identity hash;
+            // keep the value alive + remapped via the VarHandle-root
+            // registry; readers must resolve through
+            // `read_var_handle_root(skey)` for the CURRENT address.
+            let key = ctx.identity_hash_code(this) as u64;
             if let Some(s) = subscriber {
-                body_subscriber_subscribers().lock().insert(key, s);
+                ctx.register_var_handle_root(s);
+                let skey = ctx.identity_hash_code(s);
+                body_subscriber_subscribers().lock().insert(key, (skey, s));
             } else {
                 body_subscriber_subscribers().lock().remove(&key);
             }
@@ -2175,16 +2183,17 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
 /// Populated by `BodySubscriber.subscribe(Flow$Subscriber)` and queried by code
 /// that wants to forward data into the reactive pipeline.
 ///
-/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — the key is the
-/// BodySubscriber's raw address (stale after a move) and the subscriber value
-/// is neither a GC root nor remapped, so a later `onNext`/`onComplete`
-/// forward can dispatch on a stale/reclaimed ref. Follow-up: key by
-/// `ctx.identity_hash_code(this)` and store `(identity_key, ObjectRef)`
-/// var-handle-root pairs (ASYNC_POOL pattern), removing on unsubscribe.
+/// GC note (RESOLVED, cce0079 follow-up): keyed by the BodySubscriber's
+/// identity hash; the subscriber value is stored as a
+/// `(identity_key, last_addr)` VarHandle-root pair — registered via
+/// `ctx.register_var_handle_root` at subscribe, so it stays alive and
+/// registry-remapped across moving GCs. Readers must resolve the CURRENT
+/// address via `ctx.read_var_handle_root(identity_key)`, falling back to
+/// the stored address only when the registry has no entry.
 fn body_subscriber_subscribers(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, ObjectRef>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, (i32, ObjectRef)>> {
     use std::sync::OnceLock;
-    static MAP: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, ObjectRef>>> =
+    static MAP: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, (i32, ObjectRef)>>> =
         OnceLock::new();
     MAP.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }

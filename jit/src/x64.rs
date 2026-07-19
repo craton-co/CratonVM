@@ -2111,7 +2111,7 @@ pub fn precise_jit_maps_enabled() -> bool {
     })
 }
 
-/// Opt-IN inline reference-`putfield` fast path (`CRATONVM_JIT_INLINE_PUTFIELD`).
+/// Default-on inline reference-`putfield` fast path.
 ///
 /// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
 /// store INSTEAD of the `jit_putfield_object` helper CALL — but ONLY on the
@@ -2123,8 +2123,9 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// existing, validated `jit_putfield_object` helper, which performs the full
 /// SATB pre-barrier + card-marking write-barrier. This is the canonical
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
-/// allocation-heavy code (object binarytrees). DEFAULT-OFF pending GC-stress
-/// validation; opt in with `CRATONVM_JIT_INLINE_PUTFIELD`.
+/// allocation-heavy code (object binarytrees). Opt out with
+/// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
+/// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
 /// INT-6 (GC audit 2026-07-10): the YOUNG test reads `GC_FLAG_OLD_GEN`, which
 /// only the GENERATIONAL backend maintains — under G1/ZGC every object read
@@ -2136,7 +2137,23 @@ pub fn precise_jit_maps_enabled() -> bool {
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_INLINE_PUTFIELD").is_some())
+    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none())
+}
+
+fn inline_site_is_fresh_ctor_first_store(
+    site: &crate::InlineSite,
+    cpc: usize,
+    field_index: usize,
+) -> bool {
+    site.method_name == "<init>"
+        && !site
+            .field_info
+            .iter()
+            .any(|(prior_pc, prior_index, _)| {
+                *prior_pc < cpc
+                    && *prior_index == field_index
+                    && site.callee_code[*prior_pc] == 0xb5
+            })
 }
 
 /// Opt-IN inline `getfield` fast path (`CRATONVM_JIT_INLINE_GETFIELD`).
@@ -2746,6 +2763,57 @@ thread_local! {
 /// call on this thread (method-entry compiles only — never OSR).
 pub fn set_kernel_reg_homes_request(on: bool) {
     KERNEL_REG_HOMES_REQUEST.with(|c| c.set(on));
+}
+
+thread_local! {
+    /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
+    /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
+    static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Request pure-kernel GPR local homes for the NEXT OSR-artifact compile on
+/// this thread (perf/halfgap-20260717).
+///
+/// The original kernel-homes rollout vetoed OSR bodies wholesale ("publishes
+/// NO OSR entries") as blanket caution while the feature soaked on the
+/// method-entry tier. The machinery for a register-homed OSR ENTRY has
+/// always existed, though: the OSR trampoline seeds each interpreter local
+/// into `osr_local_assignments[i]`'s register (that is the normal
+/// graph-coloring entry contract), and with kernel homes those assignments
+/// ARE the kernel's callee-saved homes (reference locals are masked back to
+/// frame homes, so GC visibility is unchanged). A pure-kernel body accepted
+/// by the same call/field/alloc/typecheck/spec-BCE-free conditions has no
+/// in-body transition that could observe a stale frame slot. This matters
+/// because once-invoked benchmark-style kernels (`benchArithmetic`,
+/// `matmul`) live their entire life inside the OSR artifact and previously
+/// ran memory-homed. Opt out with `CRATONVM_JIT_KERNEL_REG_OSR=0`.
+pub fn set_kernel_reg_homes_osr_request(on: bool) {
+    KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.set(on));
+}
+
+/// `CRATONVM_JIT_KERNEL_REG_OSR` gate (default **OFF**, opt in with `=1`) —
+/// see [`set_kernel_reg_homes_osr_request`].
+///
+/// Measured 2026-07-18 on the QuickBench kernels this was built for:
+/// Arithmetic showed no wall-clock change (the kernel is long-division
+/// bound — `i/2` + `i%7` chains dwarf the local load/store traffic register
+/// homes remove), and no other kernel demonstrated a win before the round
+/// closed. Given the callee-saved-GPR family's miscompile history, an
+/// unproven-benefit default stays opt-in; bt18/QuickBench checksums were
+/// correct under it in the runs taken (68332206 et al.), so the lever is
+/// safe to experiment with.
+fn kernel_reg_osr_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_KERNEL_REG_OSR")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
 }
 
 thread_local! {
@@ -3983,6 +4051,45 @@ fn array_receiver_local(code: &[u8], pc: usize) -> Option<usize> {
         return Some(code[aload_pc + 1] as usize);
     }
     None
+}
+
+#[cfg(test)]
+mod magic_div64_tests {
+    /// Software model of the emitted `emit_ldiv_magic64` sequence:
+    /// t = mulhi_signed(magic, n) (+ n when magic < 0);
+    /// q = (t >> shift) + (n logical>> 63).
+    fn model_q(n: i64, magic: i64, shift: u32) -> i64 {
+        let mut t = ((n as i128 * magic as i128) >> 64) as i64;
+        if magic < 0 {
+            t = t.wrapping_add(n);
+        }
+        (t >> shift).wrapping_add(((n as u64) >> 63) as i64)
+    }
+
+    #[test]
+    fn magic_signed_div64_matches_exact_division() {
+        let divisors: [i64; 14] = [2, 3, 5, 6, 7, 9, 10, 11, 12, 25, 100, 1000, 7919, 1_000_003];
+        let mut dividends: Vec<i64> = vec![0, 1, -1, 2, -2, i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1];
+        // Pseudo-random spread (deterministic LCG) incl. sign flips.
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for _ in 0..2000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            dividends.push(x as i64);
+        }
+        for &d in &divisors {
+            let (magic, shift) = super::Compiler::magic_signed_div64(d);
+            let mut extra = vec![d, -d, d - 1, 1 - d, d + 1, -d - 1, d * 3, -d * 3];
+            extra.extend_from_slice(&dividends);
+            for &n in &extra {
+                let expect = n / d; // Rust trunc-toward-zero == JVM ldiv
+                let got = model_q(n, magic, shift);
+                assert_eq!(
+                    got, expect,
+                    "n={n} d={d} magic={magic:#x} shift={shift}: got {got}, want {expect}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5941,6 +6048,44 @@ fn find_fp_strength_reductions(
 /// `CRATONVM_JIT_NO_SPEC_BCE`. Cached in a `OnceLock` like the other env gates
 /// in this file (e.g. `precise_jit_maps_enabled`) so the lookup is paid once
 /// rather than per loop header on every compile.
+thread_local! {
+    static INCLUSIVE_SPEC_BCE_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only override for [`inclusive_spec_bce_enabled`].
+pub fn __set_inclusive_spec_bce_override(v: Option<bool>) {
+    INCLUSIVE_SPEC_BCE_TEST_OVERRIDE.with(|c| c.set(v));
+}
+
+/// Whether inclusive (`iv <= bound`) counted loops may take the SOUND
+/// speculative BCE guard (`array.length > bound` via JBE + the
+/// `bound != Integer.MAX_VALUE` entry check). **Default OFF**
+/// (`CRATONVM_JIT_INCLUSIVE_BCE=1` opts in): the machinery is correct
+/// (probe-verified against HotSpot incl. the `iv == bound == length`
+/// boundary), but on the memory-homed template bodies the elision is a
+/// measured NET LOSS for the Sieve OSR artifact (6.4s -> 12.7s, ~2x) —
+/// the per-element check it removes is a predicted-never-taken branch and
+/// a cache-hit length load (~free), while shrinking every unrolled loop
+/// body reshuffles code layout that this frontend-sensitive kernel is
+/// hostage to. Re-evaluate when the backend gets register-homed loop
+/// bodies or an IR-level BCE.
+fn inclusive_spec_bce_enabled() -> bool {
+    if let Some(v) = INCLUSIVE_SPEC_BCE_TEST_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_INCLUSIVE_BCE")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn jit_no_spec_bce() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -5995,6 +6140,120 @@ struct SpeculativeBCEGuard {
     /// guard is dropped (per-bci de-spec), these PCs MUST be removed from
     /// `bounds_safe_pcs` so their per-element checks are restored.
     covered_pcs: Vec<usize>,
+    /// Whether the loop's exit comparator is inclusive (`iv <= bound`). The
+    /// length guard must then prove `array.length > bound` (JBE deopt) — a
+    /// `>= bound` guard is stale by one at `iv == bound` (SECURITY FIX V17,
+    /// now guarded soundly instead of refusing the whole loop). The preheader
+    /// additionally proves `bound != Integer.MAX_VALUE` for inclusive loops
+    /// (at `iv == bound == MAX` the increment wraps negative while the exit
+    /// test keeps passing — the interpreter throws AIOOBE on the wrapped
+    /// index; elided code must deopt instead of accessing).
+    inclusive: bool,
+    /// For a variable-stride IV (canonical `iv += step` compound assignment):
+    /// the STEP's local index. The preheader proves `step >= 0` and
+    /// `step <= Integer.MAX_VALUE - bound` (deopt reason 2 on failure) so
+    /// every elided index is monotonically non-decreasing from the checked
+    /// non-negative entry value and can never wrap past the exit test —
+    /// without this a runtime-NEGATIVE step walks the elided index below
+    /// zero (an OOB write below the array base). `None` for `iinc iv, 1`.
+    step_local: Option<usize>,
+}
+
+/// How a loop's induction variable advances — the step provenance the
+/// speculative BCE guard needs to bound every elided index from below (no
+/// negative step) and above (no int wrap past the exit test).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvStep {
+    /// Canonical `iinc iv, 1`.
+    UnitInc,
+    /// Canonical compound `iv += step` (`iload iv; iload step; iadd;
+    /// istore iv`); payload = the step's local index. The step's runtime
+    /// SIGN and magnitude are unknown at compile time — the preheader guard
+    /// must prove `0 <= step <= Integer.MAX_VALUE - bound` before any elided
+    /// access runs.
+    VarAdd(usize),
+}
+
+/// Prove how the induction variable `iv` advances inside `[header,
+/// back_edge_end)`. Returns `None` when the step shape is anything but the
+/// two canonical forms — the caller must then refuse every bounds-check
+/// elision for the loop (`find_induction_variable` alone admits `iadd;istore`
+/// IVs without identifying the step operand, which is not enough to reason
+/// about sign or wrap).
+fn find_iv_step_provenance(
+    code: &[u8],
+    header: usize,
+    back_edge_end: usize,
+    iv: usize,
+) -> Option<IvStep> {
+    let mut unit_incs = 0usize;
+    let mut var_adds = 0usize;
+    let mut var_step: Option<usize> = None;
+    // PCs of the previous three instruction starts (linear order).
+    let mut prev: [Option<usize>; 3] = [None, None, None];
+    let mut pc = header;
+    while pc < back_edge_end {
+        let op = code[pc];
+        match op {
+            // iinc
+            0x84 => {
+                if code[pc + 1] as usize == iv {
+                    if code[pc + 2] as i8 == 1 {
+                        unit_incs += 1;
+                    } else {
+                        return None; // non-unit iinc — unsupported stride
+                    }
+                }
+            }
+            // wide istore/iinc aliasing the IV via a 2-byte index — unprovable.
+            0xc4 => {
+                if pc + 3 < back_edge_end {
+                    let real = code[pc + 1];
+                    // Widening: operand bytes -> usize index (value fits)
+                    let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+                    if (real == 0x36 || real == 0x84) && idx == iv {
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                // Widening: u8 operand/opcode-relative index -> usize
+                let istore_target = match op {
+                    0x36 => Some(code[pc + 1] as usize),
+                    0x3b..=0x3e => Some((op - 0x3b) as usize),
+                    _ => None,
+                };
+                if istore_target == Some(iv) {
+                    // Must be the canonical `iload iv; iload step; iadd;
+                    // istore iv` (javac's `iv += step`). Anything else —
+                    // including the commuted `step + iv` — is refused.
+                    let (Some(p1), Some(p2), Some(p3)) = (prev[0], prev[1], prev[2]) else {
+                        return None;
+                    };
+                    if code[p1] != 0x60 {
+                        return None;
+                    }
+                    let step = extract_iload_local(code, p2)?;
+                    let base = extract_iload_local(code, p3)?;
+                    if base != iv || step == iv {
+                        return None;
+                    }
+                    if var_step.is_some_and(|s| s != step) {
+                        return None;
+                    }
+                    var_step = Some(step);
+                    var_adds += 1;
+                }
+            }
+        }
+        prev = [Some(pc), prev[0], prev[1]];
+        pc += bytecode_len_at(code, pc);
+    }
+    match (unit_incs, var_adds, var_step) {
+        (1, 0, None) => Some(IvStep::UnitInc),
+        (0, 1, Some(step)) => Some(IvStep::VarAdd(step)),
+        _ => None,
+    }
 }
 
 /// Find induction variables in a loop body.
@@ -6972,15 +7231,28 @@ fn analyze_bounds_elimination(
             .bound_local
             .and_then(|bl| find_bound_arraylength_provenance(code, code_len, bl));
         let iv_start_nonneg = find_iv_nonneg_start(code, code_len, induction_var);
+        // Step 3d: step provenance. `find_induction_variable` admits
+        // `iadd;istore` IVs (the Sieve `j += i` inner loop) without naming the
+        // step operand; every elision below needs the step's identity (to
+        // guard its sign/magnitude) or the `iinc +1` proof. An unprovable
+        // step refuses the loop entirely.
+        let iv_step = find_iv_step_provenance(code, header, back_edge_end, induction_var);
 
-        // Step 4: Find safe array accesses (statically proven)
-        let loop_safe = find_safe_array_accesses(
-            &bounds,
-            modified,
-            &operands,
-            bound_from_array,
-            iv_start_nonneg,
-        );
+        // Step 4: Find safe array accesses (statically proven). Only the
+        // canonical +1 step qualifies: the static proof has no step-sign /
+        // no-wrap guard, so a variable-stride IV (whose runtime step could be
+        // negative) must go through the guarded speculative path below.
+        let loop_safe = if matches!(iv_step, Some(IvStep::UnitInc)) {
+            find_safe_array_accesses(
+                &bounds,
+                modified,
+                &operands,
+                bound_from_array,
+                iv_start_nonneg,
+            )
+        } else {
+            FxHashSet::default()
+        };
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -7004,13 +7276,31 @@ fn analyze_bounds_elimination(
         // (1) and (2) were already checked; (3) was NOT. Enforce it here so the
         // speculative guard is only installed when `bound_local` is invariant.
         //
-        // SECURITY FIX (V17): an inclusive comparator reaches `index == bound`,
-        // which the single `array.length >= bound` header guard does NOT cover
-        // (it would need `array.length >= bound + 1`). Refuse the speculative
-        // guard for inclusive loops so no per-element check is elided past the
-        // stale-by-one guard. (`find_safe_array_accesses` already refused the
-        // static elisions for the same reason.)
-        let bound_invariant = !bounds.inclusive
+        // SECURITY FIX (V17), sound-guard form (2026-07-18): an inclusive
+        // comparator reaches `index == bound`, which a `array.length >= bound`
+        // header guard does NOT cover. Instead of refusing the loop, the
+        // guard emission now proves `array.length > bound` (JBE deopt) plus
+        // `bound != Integer.MAX_VALUE` for inclusive loops — see
+        // `SpeculativeBCEGuard::inclusive`. (`find_safe_array_accesses` still
+        // refuses the guard-less STATIC elisions for inclusive loops.)
+        //
+        // Step-provenance guard (2026-07-18): a variable-stride IV is only
+        // admitted when the step local is identified, loop-invariant, and
+        // < 64 (representable in `modified`); the preheader then proves
+        // `0 <= step <= Integer.MAX_VALUE - bound` at runtime. `None` (an
+        // unprovable step shape) refuses the speculative path entirely —
+        // `find_induction_variable`'s `iadd;istore` admission alone said
+        // nothing about the step's sign, so a runtime-negative step could
+        // walk an elided index below the array base.
+        let step_guard: Option<Option<usize>> = match iv_step {
+            Some(IvStep::UnitInc) => Some(None),
+            Some(IvStep::VarAdd(sl)) if sl < 64 && (modified & (1u64 << sl)) == 0 => {
+                Some(Some(sl))
+            }
+            _ => None,
+        };
+        let bound_invariant = (!bounds.inclusive || inclusive_spec_bce_enabled())
+            && step_guard.is_some()
             && bounds
                 .bound_local
                 .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
@@ -7049,6 +7339,8 @@ fn analyze_bounds_elimination(
                         bound_local,
                         iv_local: induction_var,
                         covered_pcs,
+                        inclusive: bounds.inclusive,
+                        step_local: step_guard.flatten(),
                     });
                 }
             }
@@ -7289,7 +7581,7 @@ struct Compiler {
     bounds_safe_pcs: FxHashSet<usize>,
     /// Deferred out-of-line bounds-check failure stubs: (branch_patch_offset, bc_pc).
     /// After the main bytecode loop, we emit the slow-path code for each.
-    bounds_check_stubs: Vec<usize>,
+    bounds_check_stubs: Vec<(usize, usize)>,
     /// Round-8 CRIT fix (audit `round8-jit.md`, "false-promise abort" item):
     /// deferred null-check failure stubs for inline array load/store/length
     /// opcodes (iastore / bastore / aastore / lastore / fastore / dastore /
@@ -7766,6 +8058,8 @@ struct Compiler {
     /// result is a pure function of the divisor, so caching is behavior-
     /// preserving.
     magic_div_memo: FxHashMap<i32, (i64, u32)>,
+    /// 64-bit sibling of `magic_div_memo` for the long const-div peephole.
+    magic_div64_memo: FxHashMap<i64, (i64, u32)>,
 
     /// JVM local slot of each incoming JIT argument, in argument order
     /// (`this` first for instance methods, then declared params). Because a
@@ -8626,6 +8920,7 @@ impl Compiler {
             ldc_string_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
             magic_div_memo: FxHashMap::default(),
+            magic_div64_memo: FxHashMap::default(),
             // Set by `compile_with_param_slots` after construction; empty/0
             // here preserves legacy "arg index == slot" behavior.
             param_jvm_slots: Vec::new(),
@@ -11760,6 +12055,271 @@ impl Compiler {
 
     /// Emit optimized signed division by power-of-2 constant.
     /// Result: EAX = EAX / 2^k (rounded toward zero), sign-extended to RAX.
+    /// Long (cat-2) sibling of [`Self::try_const_arith_peephole`]: fuse a
+    /// resolved `ldc2_w` long constant with the immediately following
+    /// `lmul`/`ldiv`/`lrem`/`ladd`/`lsub`. Same merge-point rule: never fuse
+    /// when the arith op is a branch target. The JVMS ArithmeticException
+    /// guard is unnecessary — the constant divisor is known non-zero — and
+    /// LONG_MIN / -1 cannot arise (only positive divisors fuse).
+    fn try_const_arith_peephole_long(
+        &mut self,
+        const_val: i64,
+        next_op_pc: usize,
+        code: &[u8],
+        code_len: usize,
+        branch_targets: &[bool],
+    ) -> bool {
+        if next_op_pc >= code_len {
+            return false;
+        }
+        if branch_targets.get(next_op_pc).copied().unwrap_or(true) {
+            return false;
+        }
+        let fits_i32 = (-0x8000_0000i64..=0x7FFF_FFFF).contains(&const_val);
+        match code[next_op_pc] {
+            // lmul: left * const
+            0x69 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if fits_i32 {
+                    self.rex_w();
+                    self.buf.emit_byte(0x69); // IMUL RAX, RAX, imm32
+                    self.modrm_reg(RAX, RAX);
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                } else {
+                    self.emit_mov_imm64(RDX, const_val);
+                    self.rex_w();
+                    self.buf.emit(&[0x0F, 0xAF, 0xC2]); // IMUL RAX, RDX
+                }
+                self.push_from_rax();
+                true
+            }
+            // ldiv: left / const — power-of-2
+            0x6d if const_val > 0
+                && (const_val & (const_val - 1)) == 0
+                && const_val - 1 <= i32::MAX as i64 =>
+            {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_ldiv_pow2(const_val);
+                self.push_from_rax();
+                true
+            }
+            // lrem: left % const — power-of-2
+            0x71 if const_val > 0
+                && (const_val & (const_val - 1)) == 0
+                && const_val - 1 <= i32::MAX as i64 =>
+            {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_lrem_pow2(const_val);
+                self.push_from_rax();
+                true
+            }
+            // ldiv: left / const — non-power-of-2 (64-bit magic, mulhi form)
+            0x6d if const_val >= 2 => {
+                let (magic, shift) = self.magic_div64_cached(const_val);
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_ldiv_magic64(magic, shift);
+                self.push_from_rax();
+                true
+            }
+            // lrem: left % const — non-power-of-2
+            0x71 if const_val >= 2 => {
+                let (magic, shift) = self.magic_div64_cached(const_val);
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                self.emit_lrem_magic64(magic, shift, const_val);
+                self.push_from_rax();
+                true
+            }
+            // ladd: left + const (imm32 range only)
+            0x61 if fits_i32 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if const_val != 0 {
+                    self.rex_w();
+                    self.buf.emit(&[0x81, 0xC0]); // ADD RAX, imm32
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
+                self.push_from_rax();
+                true
+            }
+            // lsub: left - const (imm32 range only)
+            0x65 if fits_i32 => {
+                self.pc_to_native[next_op_pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                self.pop_to_rax();
+                if const_val != 0 {
+                    self.rex_w();
+                    self.buf.emit(&[0x81, 0xE8]); // SUB RAX, imm32
+                    self.buf.emit(&(const_val as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+                }
+                self.push_from_rax();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Signed 64-bit division by 2^k rounding toward zero (RAX in/out).
+    fn emit_ldiv_pow2(&mut self, divisor: i64) {
+        debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
+        let k = divisor.trailing_zeros();
+        if k == 0 {
+            return; // div by 1 = no-op
+        }
+        let mask = divisor - 1; // caller guarantees fits i32
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF9, 0x3F]); // SAR RCX, 63
+        self.rex_w();
+        if mask <= 127 {
+            self.buf.emit(&[0x83, 0xE1, mask as u8]); // AND RCX, imm8 // Cast: x86-64 immediate encoding
+        } else {
+            self.buf.emit(&[0x81, 0xE1]); // AND RCX, imm32
+            self.buf.emit(&(mask as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xC8]); // ADD RAX, RCX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF8, k as u8]); // SAR RAX, k // Cast: x86-64 immediate encoding
+    }
+
+    /// Signed 64-bit remainder by 2^k (RAX in/out).
+    fn emit_lrem_pow2(&mut self, divisor: i64) {
+        debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
+        let k = divisor.trailing_zeros();
+        if k == 0 {
+            self.emit_xor_reg_self(RAX); // a % 1 == 0
+            return;
+        }
+        let mask = divisor - 1; // caller guarantees fits i32
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX (save original)
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC2]); // MOV RDX, RAX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xFA, 0x3F]); // SAR RDX, 63
+        self.rex_w();
+        if mask <= 127 {
+            self.buf.emit(&[0x83, 0xE2, mask as u8]); // AND RDX, imm8 // Cast: x86-64 immediate encoding
+        } else {
+            self.buf.emit(&[0x81, 0xE2]); // AND RDX, imm32
+            self.buf.emit(&(mask as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xD0]); // ADD RAX, RDX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xF8, k as u8]); // SAR RAX, k // Cast: x86-64 immediate encoding
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xE0, k as u8]); // SHL RAX, k // Cast: x86-64 immediate encoding
+        self.rex_w();
+        self.buf.emit(&[0x29, 0xC1]); // SUB RCX, RAX
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC8]); // MOV RAX, RCX
+    }
+
+    /// Memoized [`Self::magic_signed_div64`].
+    fn magic_div64_cached(&mut self, d: i64) -> (i64, u32) {
+        if let Some(&pair) = self.magic_div64_memo.get(&d) {
+            return pair;
+        }
+        let pair = Self::magic_signed_div64(d);
+        self.magic_div64_memo.insert(d, pair);
+        pair
+    }
+
+    /// Compute the signed 64-bit magic number for division by constant
+    /// `d >= 2` (Hacker's Delight 10-4, W = 64, exact u128 arithmetic).
+    /// Returns `(magic, shift)` such that with `t = mulhi_signed(magic, n)`
+    /// (plus `n` when `magic < 0`):  `n / d = (t >> shift) + (n >>> 63)`.
+    fn magic_signed_div64(d: i64) -> (i64, u32) {
+        debug_assert!(d >= 2);
+        let ad = d as u128;
+        let two63: u128 = 1u128 << 63;
+        let anc = two63 - 1 - two63 % ad;
+
+        let mut p = 63u32;
+        let mut q1 = two63 / anc;
+        let mut r1 = two63 - q1 * anc;
+        let mut q2 = two63 / ad;
+        let mut r2 = two63 - q2 * ad;
+
+        loop {
+            p += 1;
+            q1 *= 2;
+            r1 *= 2;
+            if r1 >= anc {
+                q1 += 1;
+                r1 -= anc;
+            }
+            q2 *= 2;
+            r2 *= 2;
+            if r2 >= ad {
+                q2 += 1;
+                r2 -= ad;
+            }
+            let delta = ad - 1 - r2;
+            if q1 > delta || (q1 == delta && r1 == 0) {
+                break;
+            }
+            if p >= 127 {
+                break;
+            }
+        }
+
+        let magic = (q2 + 1) as u64 as i64; // two's-complement wrap intended
+        (magic, p - 64)
+    }
+
+    /// Signed 64-bit division by a non-power-of-2 constant via the mulhi
+    /// magic method (RAX in/out; clobbers RCX/RDX like the 32-bit variant).
+    fn emit_ldiv_magic64(&mut self, magic: i64, shift: u32) {
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC1]); // MOV RCX, RAX — save dividend
+        self.emit_mov_imm64(RDX, magic);
+        self.rex_w();
+        self.buf.emit(&[0xF7, 0xEA]); // IMUL RDX — RDX:RAX = RAX * RDX (signed)
+        if magic < 0 {
+            // d > 0 with a wrapped (negative-as-i64) magic: t += n.
+            self.rex_w();
+            self.buf.emit(&[0x01, 0xCA]); // ADD RDX, RCX
+        }
+        if shift > 0 {
+            self.rex_w();
+            self.buf.emit(&[0xC1, 0xFA, shift as u8]); // SAR RDX, shift // Cast: x86-64 immediate encoding
+        }
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xD0]); // MOV RAX, RDX
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xCA]); // MOV RDX, RCX
+        self.rex_w();
+        self.buf.emit(&[0xC1, 0xEA, 0x3F]); // SHR RDX, 63 — sign bit of n
+        self.rex_w();
+        self.buf.emit(&[0x01, 0xD0]); // ADD RAX, RDX — quotient
+    }
+
+    /// Signed 64-bit remainder by a non-power-of-2 constant (RAX in/out).
+    fn emit_lrem_magic64(&mut self, magic: i64, shift: u32, divisor: i64) {
+        self.emit_ldiv_magic64(magic, shift); // RAX = quotient; RCX = n
+        if (-0x8000_0000i64..=0x7FFF_FFFF).contains(&divisor) {
+            self.rex_w();
+            self.buf.emit_byte(0x69); // IMUL RAX, RAX, imm32
+            self.modrm_reg(RAX, RAX);
+            self.buf.emit(&(divisor as i32).to_le_bytes()); // Cast: x86-64 immediate encoding
+        } else {
+            self.emit_mov_imm64(RDX, divisor);
+            self.rex_w();
+            self.buf.emit(&[0x0F, 0xAF, 0xC2]); // IMUL RAX, RDX
+        }
+        self.rex_w();
+        self.buf.emit(&[0x29, 0xC1]); // SUB RCX, RAX — n - q*d
+        self.rex_w();
+        self.buf.emit(&[0x89, 0xC8]); // MOV RAX, RCX
+    }
+
     fn emit_idiv_pow2(&mut self, divisor: i32) {
         debug_assert!(divisor > 0 && (divisor & (divisor - 1)) == 0);
         let k = divisor.trailing_zeros();
@@ -13837,6 +14397,109 @@ impl Compiler {
         vec![self.emit_jcc_rel32_patch(0x84)] // JZ -> checked helper
     }
 
+    /// Emit a compact reference-field store with a barrier-free fast path and
+    /// the validated helper as its slow path.
+    ///
+    /// Small callees such as constructors are emitted by
+    /// `try_emit_inline_body`, not the top-level bytecode loop. Keeping this
+    /// emitter shared inside `Compiler` makes their field stores follow the
+    /// same safety contract as top-level compact `putfield`: only a mapped,
+    /// genuinely compact, young receiver whose old field is null is written
+    /// directly. Every case requiring SATB/card barriers goes through
+    /// `jit_putfield_object`.
+    fn emit_inline_body_compact_ref_putfield(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+        compact_body_offset: u32,
+    ) {
+        let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+        let mut bail: Vec<usize> = Vec::new();
+
+        self.load_slot_to_reg(RAX, obj_slot);
+        bail.extend(self.emit_guarded_getfield_receiver_check(self.helpers.region_bounds_addr));
+
+        // A registered compact class may still have legacy instances when a
+        // synthetic/native allocation used a mismatched slot count.
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
+
+        // Old receiver needs a generational card mark.
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+
+        // A non-null old value needs the SATB pre-barrier.
+        self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
+        self.emit_test_r64_r64(RCX);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
+
+        // Match the interpreter/helper's silent out-of-bounds drop.
+        self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
+        self.emit_mov_imm64(RDX, field_index as i64);
+        self.emit_cmp_r32_r32(RDX, RCX);
+        let oob = self.emit_jcc_rel32_patch(0x83); // JAE -> drop
+
+        // Compact reference fields are bare 8-byte pointers.
+        self.load_slot_to_reg(RDX, val_slot);
+        self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        let done = self.emit_jmp_rel32_patch();
+
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+
+        self.patch_rel32_to_here(oob);
+        self.patch_rel32_to_here(done);
+    }
+
+    /// Constructor-only specialization for the first syntactic write to a
+    /// compact reference field.
+    ///
+    /// JVM verification only permits `<init>` on a non-null uninitialized
+    /// object produced by `new`. The inline resolver additionally admits only
+    /// empty super-constructor chains and forward control flow. Therefore the
+    /// first write to a given field starts from null and its resolved slot is
+    /// in bounds. A young compact receiver needs no barrier; the only runtime
+    /// checks retained are the per-object compact flag (synthetic allocations
+    /// can still use legacy cells) and old-generation bit (allocation spill).
+    fn emit_inline_fresh_ctor_compact_ref_putfield(
+        &mut self,
+        obj_slot: StackSlot,
+        val_slot: StackSlot,
+        field_index: usize,
+        compact_body_offset: u32,
+    ) {
+        let cell_off = (HEADER_SIZE + compact_body_offset as usize) as i32;
+        let mut bail: Vec<usize> = Vec::new();
+
+        self.load_slot_to_reg(RAX, obj_slot);
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
+        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+
+        self.load_slot_to_reg(RDX, val_slot);
+        self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        let done = self.emit_jmp_rel32_patch();
+
+        for b in bail {
+            self.patch_rel32_to_here(b);
+        }
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+        self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+        self.load_slot_to_reg(ARG_REGS[3], val_slot);
+        self.emit_call_absolute(self.helpers.putfield_object);
+
+        self.patch_rel32_to_here(done);
+    }
+
     fn emit_inline_tlab_new(
         &mut self,
         class_id_raw: u32,
@@ -13856,30 +14519,43 @@ impl Compiler {
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
         // — no helper call, no per-alloc layout lookup. `class_layout` here runs
         // once at JIT-compile time, not per allocation.
-        // GROOVY-CLUSTER-20260717: class_layout(class_id_raw) is snapshotted
-        // ONCE here at JIT-compile time and its body_size/offsets get baked
-        // as immediate constants into the machine code below (bump-allocation
-        // size, array_length header write). Unlike the interpreter
-        // (vm/src/vm/vm_exec.rs) and the GC scan (gc/src/gen_heap.rs,
-        // gc/src/heap.rs), which both validate their own cached layout
-        // against layout_generation() before trusting it, this compile-time
-        // snapshot has no such check. When a class's registered compact
-        // layout is later replaced -- class_manager.rs's
-        // recompute_subclass_layouts / register_compact_layout_if_enabled,
-        // exercised whenever a synthetic-stub class gets upgraded to real
-        // bytecode with a different field count (the exact shape of ANTLR/
-        // Groovy-generated parser classes) -- any already-JIT-compiled new
-        // site keeps allocating objects at the OLD, now-wrong size while
-        // field-access code (correctly, dynamically, per-object) uses the
-        // CURRENT layout, corrupting the heap (confirmed via bisect +
-        // core-dump: SIGSEGV in JIT-generated code, RAX holding a garbage
-        // sign-extended int value used as a pointer). Disabling the fast
-        // inline-compact path here (falling back to the always-correct
-        // legacy-sized bump allocation, still avoiding the helper call) is
-        // the minimal safe fix; a full fix would thread layout_generation()
-        // through the JIT's compact-object fast paths the same way the
-        // interpreter/GC already do. See known-issues doc for detail.
-        let compact_body: Option<usize> = None;
+        // GROOVY-CLUSTER-20260717 → GUARDED RESTORE (perf/halfgap-20260717):
+        // class_layout(class_id_raw) is snapshotted ONCE at JIT-compile time
+        // and its body_size gets baked as immediate constants below
+        // (bump-allocation size, array_length header write). When a class's
+        // registered compact layout is later REPLACED (class_manager.rs's
+        // recompute_subclass_layouts — the synthetic-stub→real-bytecode
+        // upgrade, the exact shape of ANTLR/Groovy-generated parser
+        // classes), an already-compiled site would keep allocating at the
+        // OLD size while field access (correctly, per-object) uses the
+        // CURRENT layout — confirmed heap corruption; the interim fix
+        // disabled this path entirely (compact_body = None).
+        //
+        // The restore bakes the ADDRESS + compile-time VALUE of the class's
+        // layout-REPLACE counter (`types::field_layout::layout_replace_guard`
+        // — fixed-capacity table, addresses stable for process life; new
+        // class REGISTRATIONS don't bump it, only replacements do) and
+        // emits a 3-instruction guard at the top of the inline path:
+        //     mov r11, imm64(count_addr)
+        //     mov eax, [r11]
+        //     cmp eax, imm32(count_at_compile_time)  ;  jne slow_path
+        // A replaced layout therefore permanently routes this site to the
+        // always-correct `new_object` helper — for classes that never get
+        // replaced (every benchmark and the overwhelming majority of real
+        // classes), the full compact inline path is back.
+        let compact_snapshot: Option<(usize, *const u32, u32)> =
+            if cratonvm_types::compact_ref_fields_enabled() {
+                cratonvm_types::class_layout(class_id_raw)
+                    .filter(|l| l.field_count() == num_fields)
+                    .map(|l| {
+                        let (addr, expected) =
+                            cratonvm_types::layout_replace_guard(class_id_raw);
+                        (l.body_size as usize, addr, expected)
+                    })
+            } else {
+                None
+            };
+        let compact_body: Option<usize> = compact_snapshot.map(|(body, _, _)| body);
         // Object total size (header + body). Computed at compile time.
         let total_size = HEADER_SIZE + compact_body.unwrap_or(num_fields * SLOT_SIZE);
         // Cast: value to i32 (encoding immediate/displacement)
@@ -13888,6 +14564,18 @@ impl Compiler {
         let end_off = self.helpers.tlab_end_offset_in_thread as i32;
         // Cast: value to i32 (encoding immediate/displacement)
         let class_id_off = self.helpers.class_id_offset_in_obj as i32;
+
+        // Step 0: layout-replace guard (see the GUARDED RESTORE note above).
+        // Runs before anything else so a stale-layout site diverts to the
+        // helper with zero state to unwind. R11/RAX are scratch here.
+        let layout_guard_patch = compact_snapshot.map(|(_, count_addr, expected)| {
+            self.emit_mov_imm64_full(R11, count_addr as i64);
+            self.emit_mov_r32_mem_disp32(RAX, R11, 0);
+            // CMP EAX, imm32 (EAX-only short form 0x3D).
+            self.buf.emit_byte(0x3D);
+            self.buf.emit(&(expected as i32).to_le_bytes());
+            self.emit_jcc_rel32_patch(0x85) // JNE slow_path
+        });
 
         // Step 1: fetch the JvmThread*. Allocation-heavy methods cache it in
         // the prologue/OSR trampoline; otherwise use the small TLS helper.
@@ -14095,6 +14783,11 @@ impl Compiler {
         // ----- slow_path -----
         self.patch_rel32_to_here(null_thread_patch);
         self.patch_rel32_to_here(tlab_full_patch);
+        if let Some(patch) = layout_guard_patch {
+            // Layout-replace guard mismatch: the baked compact size is stale;
+            // the helper allocates per the CURRENT layout.
+            self.patch_rel32_to_here(patch);
+        }
         self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: ClassId fits in 32 bits
         self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
@@ -15285,11 +15978,47 @@ impl Compiler {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
                         if type_tag == b'L' || type_tag == b'[' {
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.load_slot_to_reg(ARG_REGS[1], obj_slot);
-                            self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
-                            self.load_slot_to_reg(ARG_REGS[3], val_slot);
-                            self.emit_call_absolute(self.helpers.putfield_object);
+                            let compact_offset = site
+                                .compact_field_info
+                                .iter()
+                                .find(|(p, _, is_ref)| *p == cpc && *is_ref)
+                                .map(|(_, offset, _)| *offset);
+                            let fresh_ctor_first_store =
+                                inline_site_is_fresh_ctor_first_store(&site, cpc, field_index);
+                            if inline_putfield_enabled()
+                                && cratonvm_types::compact_ref_fields_enabled()
+                                && self.helpers.region_bounds_addr != 0
+                            {
+                                if let Some(offset) = compact_offset {
+                                    if fresh_ctor_first_store {
+                                        self.emit_inline_fresh_ctor_compact_ref_putfield(
+                                            obj_slot,
+                                            val_slot,
+                                            field_index,
+                                            offset,
+                                        );
+                                    } else {
+                                        self.emit_inline_body_compact_ref_putfield(
+                                            obj_slot,
+                                            val_slot,
+                                            field_index,
+                                            offset,
+                                        );
+                                    }
+                                } else {
+                                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                    self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                    self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32);
+                                    self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                    self.emit_call_absolute(self.helpers.putfield_object);
+                                }
+                            } else {
+                                self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                                self.load_slot_to_reg(ARG_REGS[1], obj_slot);
+                                self.emit_mov_imm32_sx(ARG_REGS[2], field_index as i32); // Cast: x86-64 immediate encoding
+                                self.load_slot_to_reg(ARG_REGS[3], val_slot);
+                                self.emit_call_absolute(self.helpers.putfield_object);
+                            }
                         } else {
                             self.load_slot_to_reg(ARG_REGS[0], obj_slot);
                             self.emit_mov_imm32_sx(ARG_REGS[1], field_index as i32); // Cast: x86-64 immediate encoding
@@ -16133,7 +16862,7 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x83]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.bounds_check_stubs.push(patch_offset);
+        self.bounds_check_stubs.push((patch_offset, bc_pc));
     }
 
     /// Emit the CRC-32 (reflected) inner fold of ONE byte for the
@@ -16347,63 +17076,54 @@ impl Compiler {
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
     ///
-    /// Each stub: loads index (from RCX) and length (0 as placeholder) into
-    /// argument registers, then calls `jit_throw_aioobe` (which diverges).
+    /// Each bytecode array-access site gets its own cold landing pad. Besides
+    /// the index, length, and array pointer already live at the failing check,
+    /// the pad passes the originating bytecode PC to `jit_throw_aioobe`.
     ///
-    /// All stubs share a single landing pad to minimize code size.
+    /// Do not coalesce these pads. A shared landing pad makes a live AIOOBE
+    /// impossible to attribute to one of the method's array accesses: the
+    /// helper return PC identifies only the common pad, while the machine
+    /// instructions preceding the pad are merely the last-emitted main-code
+    /// block and need not be the branch that jumped there.
     fn emit_bounds_check_stubs(&mut self) {
         if self.bounds_check_stubs.is_empty() {
             return;
         }
 
-        // Single shared stub — all JAE branches jump here
-        let stub_offset = self.buf.pos();
+        // Clone the small metadata vector so emitting pads can mutably borrow
+        // `self`. Unrolled copies keep the same bci but have distinct branch
+        // offsets; a separate pad for each remains unambiguous.
+        let sites = self.bounds_check_stubs.clone();
+        for (patch_off, bc_pc) in sites {
+            let stub_offset = self.buf.pos();
 
-        // At this point, RCX = index (from the array access setup)
-        // R10D = array_length (loaded in the bounds check)
-        // We need to pass (index, length) to jit_throw_aioobe
+            // At this point RAX=array pointer, RCX=index, R10D=array length.
+            // Set up jit_throw_aioobe(index, length, array_ptr, bytecode_pc).
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: arg1=RCX, arg2=RDX, arg3=R8, arg4=R9.
+                self.buf.emit(&[0x49, 0x89, 0xC0]); // MOV R8, RAX
+                self.buf.emit(&[0x4C, 0x89, 0xD2]); // MOV RDX, R10
+                self.emit_mov_imm32_sx(R9, bc_pc as i32);
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // SysV: arg1=RDI, arg2=RSI, arg3=RDX, arg4=RCX.
+                self.rex_w();
+                self.buf.emit_byte(0x8B);
+                self.modrm_reg(RDX, RAX); // MOV RDX, RAX
+                self.rex_w();
+                self.buf.emit_byte(0x8B);
+                self.modrm_reg(RDI, RCX); // MOV RDI, RCX
+                self.buf.emit(&[0x4C, 0x89, 0xD6]); // MOV RSI, R10
+                self.emit_mov_imm32_sx(RCX, bc_pc as i32);
+            }
 
-        // Set up args for jit_throw_aioobe(index: i64, length: i64, array_ptr: i64)
-        //
-        // TEMP DIAGNOSTIC (BigInteger.smallToString AIOOBE investigation,
-        // 2026-07-17): RAX still holds the array pointer at this point (the
-        // bounds check only reads through it into R10D; nothing in this
-        // stub clobbers RAX before the CALL), so pass it as a 3rd arg for
-        // `CRATONVM_DBG_AIOOBE3` diagnostics. Behavior-neutral when unset.
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: arg1=RCX, arg2=RDX, arg3=R8
-            // RCX already contains the index
-            // MOV R8, RAX (move array pointer to arg3)
-            self.buf.emit(&[0x49, 0x89, 0xC0]); // REX.WB + MOV r/m64, r64 (R8 <- RAX)
-            // MOV RDX, R10 (move length to arg2)
-            self.buf.emit(&[0x4C, 0x89, 0xD2]); // REX.WR + MOV r/m64, r64
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            // SysV: arg1=RDI, arg2=RSI, arg3=RDX
-            // MOV RDX, RAX (move array pointer to arg3)
-            self.rex_w();
-            self.buf.emit_byte(0x8B);
-            self.modrm_reg(RDX, RAX);
-            // MOV RDI, RCX (move index to arg1)
-            self.rex_w();
-            self.buf.emit_byte(0x8B);
-            self.modrm_reg(RDI, RCX);
-            // MOV RSI, R10 (move length to arg2)
-            self.buf.emit(&[0x4C, 0x89, 0xD6]); // REX.WR + MOV r/m64, r64
-        }
+            // Return the sentinel through this method's epilogue; the
+            // interpreter materializes and routes the Java exception.
+            self.emit_call_absolute(self.helpers.throw_aioobe);
+            self.emit_epilogue();
 
-        // CALL jit_throw_aioobe (absolute) — returns i64::MIN sentinel in RAX
-        self.emit_call_absolute(self.helpers.throw_aioobe);
-
-        // jit_throw_aioobe returns i64::MIN in RAX. Clean up the frame
-        // and return to the interpreter, which will detect the sentinel
-        // and convert it to an ArrayIndexOutOfBoundsException.
-        self.emit_epilogue();
-
-        // Patch all JAE branches to point to the shared stub
-        for &patch_off in &self.bounds_check_stubs {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
@@ -17415,9 +18135,11 @@ impl Compiler {
                     .unwrap_or_default();
                 let had_guards = !guards.is_empty();
                 if let Some(first) = guards.first() {
-                    // iv >= 0 at entry: with the +1-only step invariant this
-                    // bounds every elided index from below. All guards at one
-                    // header share the loop's IV, so test it once.
+                    // iv >= 0 at entry: combined with the step guards below
+                    // (unit +1, or a proven `0 <= step <= MAX - bound`
+                    // variable stride) this bounds every elided index from
+                    // below. All guards at one header share the loop's IV,
+                    // bound and step, so test them once.
                     if let Some(reg) = self.reg_for_local(first.iv_local) {
                         self.emit_mov_reg_reg(RAX, reg);
                     } else {
@@ -17429,6 +18151,57 @@ impl Compiler {
                     let patch_offset = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     self.deopt_stubs.push((patch_offset, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    if first.inclusive || first.step_local.is_some() {
+                        // Load the loop bound into ECX for the entry guards.
+                        if let Some(reg) = self.reg_for_local(first.bound_local) {
+                            self.emit_mov_reg_reg(RCX, reg);
+                        } else {
+                            self.emit_load_local(RCX, self.local_offset(first.bound_local));
+                        }
+                    }
+                    if first.inclusive {
+                        // Inclusive wrap hazard: at `iv == bound ==
+                        // Integer.MAX_VALUE` the post-body increment wraps
+                        // negative while `iv <= bound` keeps passing; the
+                        // interpreter then throws AIOOBE on the wrapped index,
+                        // so elided code must deopt up front.
+                        // CMP ECX, imm32 (81 F9 id); JE rel32 (0F 84).
+                        self.buf.emit(&[0x81, 0xF9]);
+                        self.buf.emit(&0x7FFF_FFFFi32.to_le_bytes());
+                        self.buf.emit(&[0x0F, 0x84]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    }
+                    if let Some(step_local) = first.step_local {
+                        // Variable-stride guards: `step >= 0` (a negative
+                        // step walks the elided index below zero) and
+                        // `step <= Integer.MAX_VALUE - bound` (no int wrap
+                        // past the exit test: every reached index satisfies
+                        // `iv <= bound` pre-step, so `iv + step` stays
+                        // representable and the NEXT exit test is honest).
+                        if let Some(reg) = self.reg_for_local(step_local) {
+                            self.emit_mov_reg_reg(RDX, reg);
+                        } else {
+                            self.emit_load_local(RDX, self.local_offset(step_local));
+                        }
+                        // TEST EDX, EDX (85 D2); JS rel32 (0F 88).
+                        self.buf.emit(&[0x85, 0xD2]);
+                        self.buf.emit(&[0x0F, 0x88]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                        // MOV R11D, INT_MAX (41 BB id); SUB R11D, ECX (41 29 CB);
+                        // CMP EDX, R11D (44 39 DA); JG rel32 (0F 8F).
+                        self.buf.emit(&[0x41, 0xBB]);
+                        self.buf.emit(&0x7FFF_FFFFi32.to_le_bytes());
+                        self.buf.emit(&[0x41, 0x29, 0xCB]);
+                        self.buf.emit(&[0x44, 0x39, 0xDA]);
+                        self.buf.emit(&[0x0F, 0x8F]);
+                        let p = self.buf.pos();
+                        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                        self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
+                    }
                 }
                 for guard in guards {
                     // Load array reference into RAX
@@ -17467,8 +18240,16 @@ impl Compiler {
                     // CMP R10D, ECX — compare array.length vs loop_bound
                     // Encoding: 44 3B D1 (REX.R + CMP r32, r/m32 + ModRM(11, R10, ECX))
                     self.buf.emit(&[0x44, 0x3B, 0xD1]);
-                    // JB rel32 — if array.length < loop_bound (unsigned), deopt
-                    self.buf.emit(&[0x0F, 0x82]);
+                    // Exclusive: JB — deopt if length < bound. Inclusive: JBE —
+                    // the loop reaches `iv == bound`, so the guard must prove
+                    // length > bound (SECURITY FIX V17, sound-guard form). A
+                    // runtime-negative bound reads as huge unsigned and deopts
+                    // conservatively (zero-trip loops re-run interpreted).
+                    self.buf.emit(if guard.inclusive {
+                        &[0x0F, 0x86] // JBE rel32
+                    } else {
+                        &[0x0F, 0x82] // JB rel32
+                    });
                     let patch_offset = self.buf.pos();
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                     // Route to deopt stub (calls jit_uncommon_trap) instead of AIOOBE
@@ -18104,6 +18885,22 @@ impl Compiler {
                     let val = self.ldc2w_info_idx.get(&pc).map(|&i| self.ldc2w_info[i].1);
                     match val {
                         Some(v) => {
+                            // Long const-arith fusion (perf/halfgap residuals,
+                            // 2026-07-18): `ldc2_w K; l{mul,div,rem,add,sub}` is
+                            // the dominant shape of long arithmetic kernels
+                            // (`i * 3`, `i / 2`, `i % 7`). A long op as the next
+                            // opcode implies the constant is a long, not a
+                            // double (the verifier rejects the mix).
+                            if self.try_const_arith_peephole_long(
+                                v,
+                                pc + 3,
+                                code,
+                                code_len,
+                                &branch_targets,
+                            ) {
+                                pc += 4;
+                                continue;
+                            }
                             self.emit_mov_imm64(RAX, v);
                             self.push_from_rax();
                             pc += 3;
@@ -19795,10 +20592,10 @@ impl Compiler {
                                     .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_bounds_stubs: Vec<usize> = self
+                                let orig_bounds_stubs: Vec<(usize, usize)> = self
                                     .bounds_check_stubs
                                     .iter()
-                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
                                 let orig_excn_stubs: Vec<usize> = self
@@ -20005,8 +20802,11 @@ impl Compiler {
                                     // null-check-store, and self-call patch
                                     // sites so the late stub emitters see
                                     // every duplicated branch.
-                                    self.bounds_check_stubs
-                                        .extend(orig_bounds_stubs.iter().map(|&po| po + shift_us));
+                                    self.bounds_check_stubs.extend(
+                                        orig_bounds_stubs
+                                            .iter()
+                                            .map(|&(po, bci)| (po + shift_us, bci)),
+                                    );
                                     self.exception_check_stubs
                                         .extend(orig_excn_stubs.iter().map(|&po| po + shift_us));
                                     self.null_check_store_stubs.extend(
@@ -24400,11 +25200,19 @@ impl Compiler {
                                 self.buf.emit(&guard_class_id.to_le_bytes());
                                 bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
-                                // --- load running crc → ECX ---
+                                // --- load CRC state → ECX ---
                                 // MOV ECX, DWORD [RAX + pay_off]. The slot
-                                // holds a `Value::Int`; the running crc is
-                                // its 32-bit payload.
+                                // holds a `Value::Int`. CRC32C stores the
+                                // running (complemented) state, while real
+                                // JDK CRC32 stores the public value. The IEEE
+                                // folding helper consumes the former, so the
+                                // CRC32 path complements on either side.
                                 self.emit_mov_r32_mem_disp32(RCX, RAX, pay_off);
+                                if is_crc32_ieee {
+                                    // NOT ECX — public CRC32 value -> running
+                                    // reflected-CRC state before the fold.
+                                    self.buf.emit(&[0xF7, 0xD1]);
+                                }
 
                                 if is_byte_form {
                                     // --- update(I)V: fold one byte ---
@@ -24524,7 +25332,13 @@ impl Compiler {
                                     self.patch_rel32_to_here(done_patch);
                                 }
 
-                                // --- write running crc back to slot 0 ---
+                                if is_crc32_ieee {
+                                    // NOT ECX — running reflected-CRC state
+                                    // back to real JDK CRC32's public value.
+                                    self.buf.emit(&[0xF7, 0xD1]);
+                                }
+
+                                // --- write CRC state back to slot 0 ---
                                 // RAX = receiver again (reload — RAX was
                                 // clobbered by the array-length load / loop).
                                 self.emit_load_local(RAX, s_recv);
@@ -24534,7 +25348,8 @@ impl Compiler {
                                 // cell a well-formed Int even if a prior
                                 // write left a stale tag.
                                 self.emit_mov_dword_mem_disp32_imm32(RAX, tag_off, 0);
-                                // Payload word := ECX (running crc).
+                                // Payload word := ECX (the class-specific
+                                // state representation described above).
                                 // MOV DWORD [RAX + pay_off], ECX  (89 88 dd).
                                 self.buf.emit_byte(0x89);
                                 self.buf.emit_byte(0x88);
@@ -26350,6 +27165,12 @@ pub fn compile_with_param_slots(
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
+    // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
+    // but the published artifact KEEPS its OSR entries — the trampoline's
+    // register-seeded entry contract is exactly what the assignments
+    // describe. See `set_kernel_reg_homes_osr_request`.
+    let kernel_reg_homes_osr_requested =
+        KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
 
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -26624,7 +27445,7 @@ pub fn compile_with_param_slots(
     // field/static ops, no allocation, no typechecks, no inline sites, and no
     // speculative BCE guards (those deopt with frame-stashed state). Reference
     // locals are masked back to frame homes, so GC visibility is unchanged.
-    let kernel_reg_homes = kernel_reg_homes_requested
+    let kernel_reg_homes = (kernel_reg_homes_requested || kernel_reg_homes_osr_requested)
         && kernel_reg_locals_enabled()
         && !callee_saved_gpr_local_homes_enabled()
         && invoke_info.is_empty()
@@ -27201,10 +28022,16 @@ pub fn compile_with_param_slots(
     // pipeline compiles its own separate, memory-homed artifact
     // (`compile_osr_artifact` never requests kernel homes), so loop-hot
     // methods still get OSR service.
-    cm.osr_pc_to_native = if kernel_reg_homes {
-        // Same length, every entry -1: `can_osr_enter` refuses every pc.
+    cm.osr_pc_to_native = if kernel_reg_homes && !kernel_reg_homes_osr_requested {
+        // Method-entry kernel homes: same length, every entry -1 —
+        // `can_osr_enter` refuses every pc (the method-entry body was never
+        // built for trampoline entry).
         Some(vec![-1; compiler.osr_entry_native.len()])
     } else {
+        // Ordinary bodies AND OSR-tier kernel-homed bodies publish real
+        // entries: the OSR trampoline seeds every local into its
+        // `osr_local_assignments` register (or frame slot for `None`/ref
+        // locals), which for a kernel-homed body is exactly its homes.
         Some(compiler.osr_entry_native)
     };
     cm.osr_num_locals = compiler.num_locals;
@@ -33464,21 +34291,77 @@ mod tests {
         let bounds = analyze_loop_bound(&code, 0, 12, 15, 0).expect("loop bound recognized");
         assert!(bounds.inclusive, "if_icmpgt exit must be marked inclusive");
 
-        // The iaload at pc=7 must NOT be elided, and no speculative guard emitted.
+        // Default (opt-in flag off): inclusive loops take no guard at all.
+        __set_inclusive_spec_bce_override(Some(false));
+        let (off_safe, off_guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(!off_safe.contains(&7), "default-off must keep the check");
+        assert!(off_guards.is_empty(), "default-off must emit no guard");
+
+        // V17 sound-guard form (opt-in): the access IS elided, but only on
+        // the strength of a speculative guard flagged `inclusive` (emitted
+        // as `length > bound` / JBE + the bound != MAX entry check), never
+        // the guard-less static proof.
+        __set_inclusive_spec_bce_override(Some(true));
         let (safe_pcs, speculative_guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        __set_inclusive_spec_bce_override(None);
         assert!(
-            !safe_pcs.contains(&7),
-            "inclusive-loop iaload at pc=7 must keep its bounds check, got {:?}",
+            safe_pcs.contains(&7),
+            "inclusive-loop iaload at pc=7 should be guard-elided, got {:?}",
             safe_pcs
         );
-        assert!(
-            speculative_guards.is_empty(),
-            "no speculative guard may be installed for an inclusive loop, got {:?}",
-            speculative_guards
-                .iter()
-                .map(|g| (g.loop_header, g.array_local, g.bound_local))
-                .collect::<Vec<_>>()
+        assert_eq!(speculative_guards.len(), 1, "one guarded array expected");
+        let g = &speculative_guards[0];
+        assert!(g.inclusive, "guard must record the inclusive comparator");
+        assert_eq!(g.step_local, None, "iinc +1 loop needs no step guard");
+        assert!(g.covered_pcs.contains(&7));
+    }
+
+    #[test]
+    fn test_bce_varadd_step_guard_and_commuted_refusal() {
+        // Sieve inner-loop shape: `for (j = ..; j < n; j += i) a[j] = ..`.
+        //   locals: 0 = j (IV), 1 = n (bound), 2 = arr, 3 = i (step)
+        //   0: iload_0
+        //   1: iload_1
+        //   2: if_icmpge +16 -> 18
+        //   5: aload_2
+        //   6: iload_0
+        //   7: iconst_1
+        //   8: bastore
+        //   9: iload_0        (canonical j += i)
+        //  10: iload_3
+        //  11: iadd
+        //  12: istore_0
+        //  13: goto -13 -> 0
+        //  16..: return padding
+        let code = [
+            0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1a, 0x1d, 0x60, 0x3b, 0xa7,
+            0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        ];
+        let code_len = 17;
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0].0, 0);
+        assert_eq!(
+            find_iv_step_provenance(&code, 0, 16, 0),
+            Some(IvStep::VarAdd(3)),
+            "canonical j += i must name the step local"
         );
+        let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(safe_pcs.contains(&8), "bastore at pc=8 should be guard-elided");
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].step_local, Some(3), "guard must carry the step local");
+        assert!(!guards[0].inclusive);
+
+        // Commuted form `j = i + j` (iload_3; iload_0; iadd; istore_0) is NOT
+        // the canonical compound shape — the step cannot be proven, so the
+        // whole loop must be refused (no guard, no elision).
+        let commuted = [
+            0x1a, 0x1b, 0xa2, 0x00, 0x10, 0x2c, 0x1a, 0x04, 0x54, 0x1d, 0x1a, 0x60, 0x3b, 0xa7,
+            0xff, 0xf3, 0xb1, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
+        let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
+        assert!(!safe2.contains(&8), "unproven step must keep the bounds check");
+        assert!(guards2.is_empty());
     }
 
     #[test]
@@ -37139,6 +38022,7 @@ mod tests {
             callee_is_static,
             return_type,
             field_info: Vec::new(),
+            compact_field_info: Vec::new(),
             static_field_info: Vec::new(),
             ldc_info: Vec::new(),
             ldc2w_info: Vec::new(),
@@ -37148,6 +38032,31 @@ mod tests {
             descriptor,
             elided_invoke_pcs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn inline_ctor_fresh_store_proof_rejects_repeated_and_non_ctor_writes() {
+        let mut site = make_inline_site(
+            &[
+                0xb5, 0x00, 0x01, // pc 0: first write of field 0
+                0xb5, 0x00, 0x01, // pc 3: repeated write of field 0
+                0xb5, 0x00, 0x02, // pc 6: first write of field 1
+                0xb1,
+            ],
+            3,
+            3,
+            false,
+            b'V',
+        );
+        site.method_name = "<init>".to_string();
+        site.field_info = vec![(0, 0, b'L'), (3, 0, b'L'), (6, 1, b'L')];
+
+        assert!(inline_site_is_fresh_ctor_first_store(&site, 0, 0));
+        assert!(!inline_site_is_fresh_ctor_first_store(&site, 3, 0));
+        assert!(inline_site_is_fresh_ctor_first_store(&site, 6, 1));
+
+        site.method_name = "setFields".to_string();
+        assert!(!inline_site_is_fresh_ctor_first_store(&site, 0, 0));
     }
 
     #[test]
@@ -37777,8 +38686,8 @@ mod tests {
 
     thread_local! {
         /// Set by [`flagging_throw_aioobe`] so an inline out-of-bounds
-        /// access can be observed from a test: records `(index, length)`.
-        static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64)>> =
+        /// access can be observed from a test: `(index, length, bytecode_pc)`.
+        static TEST_AIOOBE_HIT: std::cell::Cell<Option<(i64, i64, i64)>> =
             const { std::cell::Cell::new(None) };
         /// Set by [`flagging_npe_with_action`] when an inline null-check deopt
         /// stub fires.
@@ -37789,14 +38698,19 @@ mod tests {
         static TEST_NPE_ACTION: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
     }
 
-    /// Test stand-in for `jit_throw_aioobe`: records `(index, length)`
+    /// Test stand-in for `jit_throw_aioobe`: records the failure payload
     /// and returns the `i64::MIN` deopt sentinel, exactly like the real
     /// helper. The bounds-check stub calls this when `idx >= len`.
     ///
-    /// SAFETY: plain `extern "C"` callback invoked by JIT code with two
+    /// SAFETY: plain `extern "C"` callback invoked by JIT code with four
     /// `i64` arguments; touches only a thread-local.
-    unsafe extern "C" fn flagging_throw_aioobe(index: i64, length: i64) -> i64 {
-        TEST_AIOOBE_HIT.with(|c| c.set(Some((index, length))));
+    unsafe extern "C" fn flagging_throw_aioobe(
+        index: i64,
+        length: i64,
+        _array_ptr: i64,
+        bytecode_pc: i64,
+    ) -> i64 {
+        TEST_AIOOBE_HIT.with(|c| c.set(Some((index, length, bytecode_pc))));
         i64::MIN
     }
 
@@ -38284,8 +39198,8 @@ mod tests {
         assert_eq!(result, i64::MIN, "OOB iaload must deopt with sentinel");
         assert_eq!(
             TEST_AIOOBE_HIT.with(|c| c.get()),
-            Some((3, 3)),
-            "OOB iaload must report (index=3, length=3) to throw_aioobe"
+            Some((3, 3, 2)),
+            "OOB iaload must report index, length, and originating bci"
         );
 
         // Negative index — unsigned compare catches it as huge.

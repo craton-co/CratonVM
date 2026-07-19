@@ -32,7 +32,7 @@ repro never calls `Thread.join()`.
 
 An initial live-gdb capture (from the sibling session that found this bug
 while investigating an unrelated Hibernate BigInteger AIOOBE, see
-`docs/known-issues/hibernate/hib-misc-residuals-20260716.md`) showed only 3
+`docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md`) showed only 3
 of the expected 5 OS threads (main + 4 workers) via `ps -T`, raising the
 question of whether all 4 worker threads even spawn. Fine-grained polling
 (`ps -T` every 50ms from process start) resolved this: all 4 spawn
@@ -178,7 +178,7 @@ Files: `native-builtins/src/lib.rs` (fix, `populate_real_thread_holder`),
   follow-up #7 — the primary writeup this file mirrors, with the fuller
   investigation narrative and the reasoning for why this is a distinct
   bug from follow-up #5 (`cce6e1c6`'s GC-barrier census-exclusion fix).
-- `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` — where
+- `docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md` — where
   this bug was originally found as a side-effect of an unrelated
   BigInteger AIOOBE investigation and spun off as a standalone follow-up.
 - `b4ab3ad3` (`fix(vm): get_or_create_main_thread_group TOCTOU race +

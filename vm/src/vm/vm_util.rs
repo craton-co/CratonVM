@@ -1509,7 +1509,7 @@ fn initialize_class_shared(
                         // bare-NPEs originate during boot.
                         if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                             let h = shared.heap.identity_hash_code(*exc_ref);
-                            if let Some(frames) = thread.throwable_stacks.get(&h) {
+                            if let Some(frames) = shared.throwable_stack_trace(h) {
                                 for (i, f) in frames.iter().enumerate().take(20) {
                                     tracing::warn!(
                                         "  [SWALLOW-TRACE {}] at {}.{} ({}:{}) bci={}",
@@ -1658,10 +1658,10 @@ fn initialize_class_shared(
                                     "<clinit> failed вЂ” wrapping in ExceptionInInitializerError"
                                 );
                                 // Diagnostic: dump captured stack trace from
-                                // throwable_stacks so we can pinpoint where
+                                // the VM-wide Throwable trace registry so we can pinpoint where
                                 // bare-NPEs originate during boot.
                                 let h = shared.heap.identity_hash_code(*exc_ref);
-                                if let Some(frames) = thread.throwable_stacks.get(&h) {
+                                if let Some(frames) = shared.throwable_stack_trace(h) {
                                     for (i, f) in frames.iter().enumerate().take(20) {
                                         tracing::warn!(
                                             "  [CLINIT-TRACE {}] at {}.{} ({}:{}) bci={}",
@@ -1758,7 +1758,7 @@ fn initialize_class_shared(
                                             cause_msg,
                                         );
                                         let ch = shared.heap.identity_hash_code(cause_obj);
-                                        if let Some(frames) = thread.throwable_stacks.get(&ch) {
+                                        if let Some(frames) = shared.throwable_stack_trace(ch) {
                                             for (i, f) in frames.iter().enumerate().take(15) {
                                                 tracing::warn!(
                                                     "    [CAUSE-TRACE {}] at {}.{} ({}:{}) bci={}",

@@ -960,7 +960,9 @@ impl Drop for ForeignCallGuard {
 ///
 /// Returns `Some(raw_value)` if an exception was set via `Throw` or `ThrowNew`,
 /// and clears it so subsequent calls return `None`. The raw value is the
-/// JNI-level handle (u64) — `u64::MAX` is the sentinel for `ThrowNew`.
+/// JNI-level handle (u64); `u64::MAX` is only a fallback marker when a JNI
+/// helper could not materialise a Java exception because no VM thread context
+/// was available.
 pub fn take_jni_pending_exception() -> Option<u64> {
     JNI_PENDING_EXCEPTION.with(|cell| {
         let val = cell.get();
@@ -971,6 +973,18 @@ pub fn take_jni_pending_exception() -> Option<u64> {
             None
         }
     })
+}
+
+/// Publish a real pending JNI exception and keep it in the VM's GC-updated
+/// native-return root slot until the interpreter observes it.  The raw JNI
+/// handle remains available to `ExceptionOccurred`, while `native_pending_return`
+/// is the authoritative (and moving-GC-safe) reference at native return.
+fn set_jni_pending_exception_object(exception: ObjectRef) {
+    let handle = obj_to_jobject(exception);
+    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+    let _ = with_jni_context(|_shared, thread| {
+        thread.native_pending_return = Some(exception);
+    });
 }
 
 /// Access the VM context from within a JNI function. Returns None if not set.
@@ -1868,28 +1882,70 @@ extern "C" fn jni_is_assignable_from(_env: JNIEnv, sub: JClass, sup: JClass) -> 
 
 // ---- Index 13: Throw ----
 extern "C" fn jni_throw(_env: JNIEnv, obj: JThrowable) -> JInt {
-    if obj == 0 {
+    let Some(exception) = jobject_to_obj(obj) else {
         return JNI_ERR;
-    }
-    JNI_PENDING_EXCEPTION.with(|cell| {
-        cell.set(obj as u64);
-    });
+    };
+    set_jni_pending_exception_object(exception);
     JNI_OK
 }
 
 // ---- Index 14: ThrowNew ----
-extern "C" fn jni_throw_new(_env: JNIEnv, _clazz: JClass, _msg: *const c_char) -> JInt {
-    // Store a marker that an exception was requested via ThrowNew.
-    // The interpreter will check this on return from native code.
-    JNI_PENDING_EXCEPTION.with(|cell| {
-        cell.set(u64::MAX); // sentinel for "exception requested"
+extern "C" fn jni_throw_new(_env: JNIEnv, clazz: JClass, msg: *const c_char) -> JInt {
+    if clazz == 0 {
+        return JNI_ERR;
+    }
+    let message = if msg.is_null() {
+        None
+    } else {
+        match unsafe { cstr_to_str(msg) } {
+            Some(message) => Some(message),
+            None => return JNI_ERR,
+        }
+    };
+
+    let result = with_jni_context(|shared, thread| {
+        let class_id = ClassId::new(clazz as u32);
+        let class_name = {
+            let cm = shared.class_manager.read();
+            cm.get_class(class_id).map(|class| class.name.to_string())
+        };
+        let Some(class_name) = class_name else {
+            return None;
+        };
+        crate::runtime::exceptions::create_exception_object_for_class(
+            shared,
+            thread,
+            class_id,
+            &class_name,
+            message,
+        )
+        .ok()
     });
-    JNI_OK
+
+    match result.flatten() {
+        Some(exception) => {
+            set_jni_pending_exception_object(exception);
+            JNI_OK
+        }
+        None => JNI_ERR,
+    }
 }
 
 // ---- Index 15: ExceptionOccurred ----
 extern "C" fn jni_exception_occurred(_env: JNIEnv) -> JThrowable {
-    JNI_PENDING_EXCEPTION.with(|cell| cell.get()) as JThrowable
+    let handle = JNI_PENDING_EXCEPTION.with(|cell| cell.get());
+    if handle == 0 {
+        return 0;
+    }
+    // A collection may have relocated the exception after its original raw
+    // handle was recorded.  Prefer the VM's remapped native-return root.
+    with_jni_context(|_shared, thread| {
+        thread
+            .native_pending_return
+            .map(obj_to_jobject)
+            .unwrap_or(handle)
+    })
+    .unwrap_or(handle)
 }
 
 // ---- Index 16: ExceptionDescribe ----
@@ -1898,6 +1954,9 @@ extern "C" fn jni_exception_describe(_env: JNIEnv) {}
 // ---- Index 17: ExceptionClear ----
 extern "C" fn jni_exception_clear(_env: JNIEnv) {
     JNI_PENDING_EXCEPTION.with(|cell| cell.set(0));
+    let _ = with_jni_context(|_shared, thread| {
+        thread.native_pending_return = None;
+    });
 }
 
 // ---- Index 18: FatalError ----
@@ -3416,8 +3475,7 @@ fn raise_jni_aioobe(index: usize, length: usize) {
                 Some(&msg),
             ) {
                 Ok(exc) => {
-                    let handle = obj_to_jobject(exc);
-                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    set_jni_pending_exception_object(exc);
                     true
                 }
                 Err(_) => false,
@@ -3738,8 +3796,7 @@ fn raise_jni_no_class_def_found(msg: &str) {
                 Some(msg),
             ) {
                 Ok(exc) => {
-                    let handle = obj_to_jobject(exc);
-                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    set_jni_pending_exception_object(exc);
                     true
                 }
                 Err(_) => false,
@@ -5084,8 +5141,7 @@ fn jni_throw_unsatisfied_link(msg: &str) {
                 Some(&full),
             ) {
                 Ok(exc) => {
-                    let handle = obj_to_jobject(exc);
-                    JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                    set_jni_pending_exception_object(exc);
                     true
                 }
                 Err(_) => false,
@@ -6553,6 +6609,7 @@ pub fn get_java_vm() -> JavaVM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
     use std::sync::Arc;
 
     /// Serializes tests that mutate the process-global `PROCESS_VM` cell or the
@@ -6875,6 +6932,56 @@ mod tests {
     #[test]
     fn jni_version_constant() {
         assert_eq!(JNI_VERSION_1_8, 0x00010008);
+    }
+
+    /// JNI `ThrowNew` must materialise the exact supplied throwable class and
+    /// its message, rather than using the historical generic sentinel.  This
+    /// is the contract jnr-ffi/posix relies on when it catches a native-load
+    /// failure and selects its Java fallback provider.
+    #[test]
+    fn jni_throw_new_preserves_class_message_and_gc_root() {
+        use crate::config::VmConfig;
+        use crate::vm::Vm;
+
+        let mut vm = Vm::new(VmConfig::default());
+        let class_id = vm
+            .shared
+            .load_class_concurrent("java/lang/IllegalArgumentException")
+            .expect("load IllegalArgumentException");
+        let message = CString::new("native provider unavailable").unwrap();
+
+        set_jni_context(&vm.shared);
+        set_jni_thread(&mut vm.main_thread as *mut _);
+        assert_eq!(
+            jni_throw_new(get_jni_env(), class_id.as_u32() as JClass, message.as_ptr(),),
+            JNI_OK
+        );
+
+        let occurred = jni_exception_occurred(get_jni_env());
+        assert_ne!(occurred, 0, "ThrowNew must set a pending exception");
+        let exception = vm
+            .main_thread
+            .native_pending_return
+            .expect("ThrowNew must publish a GC-rooted exception");
+        assert_eq!(
+            vm.shared.heap.class_id_of(exception),
+            class_id,
+            "ThrowNew must preserve the supplied jclass"
+        );
+
+        let Value::Object(Some(message_object)) = vm.shared.heap.get_field(exception, 1) else {
+            panic!("ThrowNew exception must retain its detailMessage");
+        };
+        assert_eq!(
+            read_java_string(&vm.shared.heap, message_object).as_deref(),
+            Some("native provider unavailable")
+        );
+
+        jni_exception_clear(get_jni_env());
+        assert_eq!(jni_exception_occurred(get_jni_env()), 0);
+        assert!(vm.main_thread.native_pending_return.is_none());
+        clear_jni_thread();
+        clear_jni_context();
     }
 
     /// Regression for the `AttachCurrentThread`/`GetEnv` JNIEnv* indirection bug:

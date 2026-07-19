@@ -57,6 +57,30 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+/// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
+///
+/// The object references are strong, GC-remapped registry roots for the short
+/// interval in which a thread owns, waits on, or contends for a lock.  Native
+/// JMX code pins them before doing any allocating work.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadJmxSnapshot {
+    pub thread_object: Option<ObjectRef>,
+    pub thread_id: i64,
+    pub thread_name: String,
+    /// JMM/JVMTI thread-status bits reserved for consumers that use the
+    /// encoded state rather than the JDK 25 `Thread.State` field.
+    pub thread_status: i32,
+    pub stack_trace: Vec<StackTraceEntry>,
+    pub lock: Option<ObjectRef>,
+    /// Logical JMM class name for `lock` when a VM shim deliberately models
+    /// the backing synchronizer without materializing its private JDK object.
+    pub lock_class_name: Option<String>,
+    pub lock_owner_id: i64,
+    pub lock_owner_name: Option<String>,
+    pub locked_monitors: Vec<ObjectRef>,
+    pub locked_synchronizers: Vec<ObjectRef>,
+}
+
 fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
     match element_type {
         ArrayElementType::Boolean
@@ -832,12 +856,24 @@ pub trait NativeContext {
         false
     }
 
-    /// Capture the current Java call stack for a throwable's `fillInStackTrace`.
-    /// Returns a unique key for later retrieval.
+    /// Capture the current Java call stack without retaining it. Used by
+    /// StackWalker and caller-sensitive helpers.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
 
-    /// Retrieve a previously captured stack trace.
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]>;
+    /// Capture and retain a stack trace for `Throwable.fillInStackTrace`.
+    ///
+    /// The default keeps lightweight/mock contexts source-compatible. The VM
+    /// implementation overrides it so retained frames are owned by the VM,
+    /// rather than by the Java thread that happened to construct the throwable.
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        self.capture_stack_trace(self.identity_hash_code(throwable))
+    }
+
+    /// Retrieve a previously captured stack trace as an owned snapshot.
+    ///
+    /// An owned value deliberately avoids lending a reference through a
+    /// VM-shared lock while another Java thread may replace or discard a trace.
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>>;
 
     /// The exact `ClassId` each live frame is currently executing in,
     /// innermost (most recent call) first.
@@ -1721,6 +1757,10 @@ pub trait NativeContext {
     ///   * `1` — RUNNABLE: started and still alive.
     ///   * `2` — TERMINATED: started and has since finished.
     ///
+    /// Value `3` represents an alive thread parked in a blocking region
+    /// (`WAITING`) and value `4` an alive thread acquiring a contended
+    /// monitor (`BLOCKED`); the default returns `0`.
+    ///
     /// Used to back `Thread.getState()` in real-JDK mode, where the JDK
     /// bytecode reads `holder.threadStatus` — a field the VM does not keep
     /// updated, so `getState()` would otherwise always report `NEW` (even for
@@ -1738,6 +1778,23 @@ pub trait NativeContext {
     /// / `Thread.dumpThreads()`. The default returns empty.
     fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
         Vec::new()
+    }
+
+    /// Atomically snapshot the thread state and lock relationships needed by
+    /// `ThreadMXBean`. The default leaves lightweight/mock contexts source
+    /// compatible; production VMs must return GC-safe registry-backed refs.
+    fn thread_jmx_snapshot(&self, _thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        None
+    }
+
+    /// Record the current ownership of an `AbstractOwnableSynchronizer`.
+    /// Implementations retain/remap the synchronizer while it is owned so a
+    /// later JMX dump can report `lockedSynchronizers` without heap walking.
+    fn record_jmx_owned_synchronizer(
+        &mut self,
+        _synchronizer: ObjectRef,
+        _owner: Option<ObjectRef>,
+    ) {
     }
 
     /// Get the Java Thread object for the current thread.
@@ -2252,19 +2309,20 @@ pub trait NativeContext {
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a method return
-    /// type's direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x14,
-    /// METHOD_RETURN, with a single TYPE_ARGUMENT `type_path` entry) -- e.g.
-    /// `List<@NotBlank String> getNames()`.
+    /// type's TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type`
+    /// 0x14, METHOD_RETURN, with a `type_path` made entirely of TYPE_ARGUMENT
+    /// entries) -- e.g. `List<@NotBlank String> getNames()`, or nested generics
+    /// like `ValueExtractor<Wrapper<@Foo ?>>`.
     ///
-    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
-    /// returns an empty `Vec`.
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
     fn method_return_type_argument_annotations(
         &self,
         _class_id: ClassId,
         _method_name: &str,
         _method_desc: &str,
-    ) -> Vec<Vec<AnnotationData>> {
+    ) -> Vec<TypeArgAnnotations> {
         Vec::new()
     }
 
@@ -2294,31 +2352,32 @@ pub trait NativeContext {
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a field type's
-    /// direct TYPE ARGUMENTS (JVMS 4.7.20 `target_type` 0x13, FIELD, with a
-    /// single TYPE_ARGUMENT `type_path` entry) -- e.g.
-    /// `List<@NotBlank String> names`.
+    /// TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type` 0x13,
+    /// FIELD, with a `type_path` made entirely of TYPE_ARGUMENT entries) --
+    /// e.g. `List<@NotBlank String> names`.
     ///
-    /// The outer `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Default impl
-    /// returns an empty `Vec`.
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
     fn field_type_argument_annotations(
         &self,
         _class_id: ClassId,
         _field_name: &str,
-    ) -> Vec<Vec<AnnotationData>> {
+    ) -> Vec<TypeArgAnnotations> {
         Vec::new()
     }
 
     /// Get the runtime-visible TYPE_USE annotations that target a method
-    /// formal parameter's type ARGUMENTS (JVMS 4.7.20 `target_type` 0x16,
-    /// METHOD_FORMAL_PARAMETER, with a `type_path` whose *last* entry has
-    /// `type_path_kind == 3`, TYPE_ARGUMENT) -- e.g. the `@Valid` in
+    /// formal parameter's type ARGUMENTS, at any nesting depth (JVMS 4.7.20
+    /// `target_type` 0x16, METHOD_FORMAL_PARAMETER, with a `type_path` made
+    /// entirely of TYPE_ARGUMENT entries) -- e.g. the `@Valid` in
     /// `List<@Valid Person> persons`, which annotates the type argument
     /// `Person`, not the top-level `List` parameter type.
     ///
     /// The outer `Vec` is indexed by `formal_parameter_index`; the inner
-    /// `Vec` is indexed by `type_argument_index` (0-based, per JVMS
-    /// 4.7.20.2); entries with no annotations are empty `Vec`s. Backs
+    /// `Vec` is indexed by the top-level `type_argument_index` (0-based, per
+    /// JVMS 4.7.20.2), and each entry's own `children` carries the next
+    /// nesting level. Backs
     /// `((AnnotatedParameterizedType) method.getAnnotatedParameterTypes()[i])
     /// .getAnnotatedActualTypeArguments()[j].getDeclaredAnnotations()`, which
     /// Spring's `HandlerMethod.MethodValidationInitializer
@@ -2330,7 +2389,7 @@ pub trait NativeContext {
         _class_id: ClassId,
         _method_name: &str,
         _method_desc: &str,
-    ) -> Vec<Vec<Vec<AnnotationData>>> {
+    ) -> Vec<Vec<TypeArgAnnotations>> {
         Vec::new()
     }
 
@@ -3127,6 +3186,30 @@ pub trait NativeContext {
         Vec::new()
     }
 
+    /// Get the runtime-visible TYPE_USE annotations targeting one of this
+    /// class's declared supertypes (JVMS 4.7.20 `target_type` 0x10,
+    /// CLASS_EXTENDS). `supertype_index` is the JVMS-defined index: `0xFFFF`
+    /// (65535) selects the superclass, `0..n` selects the n-th entry of
+    /// `getInterfaces()`.
+    ///
+    /// Returns a [`TypeArgAnnotations`] tree: `.anns` holds annotations with
+    /// an empty `type_path` (directly on the supertype itself, e.g.
+    /// `implements @Foo Bar`); `.children[i]` holds the subtree for the
+    /// supertype's i-th type argument (recursively, for arbitrarily nested
+    /// generics, e.g. `implements ValueExtractor<ArgumentValue<@ExtractedValue
+    /// ?>>`). Backs `Class.getAnnotatedSuperclass()` /
+    /// `Class.getAnnotatedInterfaces()` and their
+    /// `getAnnotatedActualTypeArguments()` chains. Default impl returns an
+    /// empty tree so mock `NativeContext` implementations don't need to plumb
+    /// the attribute store.
+    fn class_extends_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _supertype_index: u16,
+    ) -> TypeArgAnnotations {
+        TypeArgAnnotations::default()
+    }
+
     /// Get the nest host class name for a class.
     /// Returns None if the class is its own nest host.
     fn nest_host_name(&self, _class_id: ClassId) -> Option<String> {
@@ -3146,6 +3229,25 @@ pub struct AnnotationData {
     pub type_descriptor: String,
     /// Element-value pairs: (name, value_representation)
     pub elements: Vec<(String, AnnotationElementValue)>,
+}
+
+/// A tree of TYPE_USE annotations mirroring the nested-generic shape of a
+/// reified `Type`, keyed by `type_argument_index` at each nesting level
+/// (JVMS 4.7.20.2's `type_path`).
+///
+/// `.anns` holds the annotations whose `type_path` ends exactly at this
+/// node; `.children[i]` is the subtree reached by descending into the i-th
+/// type argument. A plain (non-generic) annotated type has `anns` populated
+/// and `children` empty; a nested generic like
+/// `ValueExtractor<ArgumentValue<@ExtractedValue ?>>` needs two levels:
+/// `children[0]` (the `ArgumentValue<?>` argument) has its own
+/// `children[0]` (the wildcard `?`) carrying `@ExtractedValue` in `anns`.
+#[derive(Debug, Clone, Default)]
+pub struct TypeArgAnnotations {
+    /// Annotations directly on this node (empty remaining `type_path`).
+    pub anns: Vec<AnnotationData>,
+    /// Per-type-argument subtrees, indexed by `type_argument_index`.
+    pub children: Vec<TypeArgAnnotations>,
 }
 
 /// A simplified representation of an annotation element value.
@@ -3693,8 +3795,23 @@ impl NativeMethodRegistry {
         // ContainerBase then failed in scheduleWithFixedDelay -> delayedExecute.
         // Let the real STPE constructors and scheduling bytecode initialize the
         // inherited executor state coherently.
+        // These two methods are real-layout bridges: the constructor delegates
+        // to ThreadPoolExecutor's real constructor and the getter resolves the
+        // inherited field by name. They are required by Spring's
+        // ThreadPoolTaskScheduler anonymous subclass. Every other STPE native
+        // remains unsafe against real JDK objects and is dropped.
+        let keep_real_scheduled_executor_bridge = self.current_category == NativeKind::Bridge
+            && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
+            && matches!(
+                (method_name, descriptor),
+                (
+                    "<init>",
+                    "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V"
+                ) | ("getCorePoolSize", "()I")
+            );
         if self.drop_real_layout_synthetic
             && class_name == "java/util/concurrent/ScheduledThreadPoolExecutor"
+            && !keep_real_scheduled_executor_bridge
         {
             return;
         }
@@ -4547,6 +4664,21 @@ mod tests {
                 "(ILjava/util/concurrent/ThreadFactory;)V",
             )
             .is_none());
+
+        real_layout.set_category(NativeKind::Bridge);
+        real_layout.register(
+            "java/util/concurrent/ScheduledThreadPoolExecutor",
+            "<init>",
+            "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+            dummy_native,
+        );
+        assert!(real_layout
+            .find(
+                "java/util/concurrent/ScheduledThreadPoolExecutor",
+                "<init>",
+                "(ILjava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V",
+            )
+            .is_some());
 
         real_layout.register(
             "java/util/concurrent/Executors",

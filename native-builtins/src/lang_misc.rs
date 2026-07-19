@@ -306,12 +306,12 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 /// bytecode (registered per-class by `register_throwable_subclass_natives`).
 /// The JDK constructor is the only thing that calls `fillInStackTrace()` —
 /// so when our native replaces it, nothing records the stack trace, and a
-/// later `printStackTrace()` / `getStackTrace()` (which read the trace store
-/// keyed by identity hash) come back empty. That hid the origin of every
+/// later `printStackTrace()` / `getStackTrace()` (which read the VM-owned trace
+/// store keyed by identity hash) come back empty. That hid the origin of every
 /// exception built via `new SomeException(...)` bytecode.
 ///
 /// We mirror `fillInStackTrace` here: capture the current frames into the
-/// thread-local trace store keyed by the throwable's identity hash, and set
+/// VM-owned trace store keyed by the throwable's identity hash, and set
 /// the `backtrace`/`depth` fields so the real-JDK `getOurStackTrace()` path
 /// also works for callers that hit it directly.
 ///
@@ -330,7 +330,7 @@ pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectR
     if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
         eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
     }
-    let trace = ctx.capture_stack_trace(hash);
+    let trace = ctx.capture_throwable_stack_trace(this);
     let depth = trace.len() as i32;
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
     // park a self-reference as the non-null marker (the real frame data lives
@@ -1056,8 +1056,11 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
     None
 }
 
-/// Format the captured stack-trace frames for `t` as "\tat C.m(F:L)" lines.
-fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String> {
+/// Format the captured stack-trace frames for `t`, innermost first, without
+/// indentation. Keeping the raw rendered frame text lets the print routine
+/// apply HotSpot's common-suffix elision consistently to causes and suppressed
+/// exceptions.
+fn throwable_frame_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<String> {
     let hash = ctx.identity_hash_code(t);
     let frames: Vec<(String, String, Option<String>, i32)> = ctx
         .get_stack_trace(hash)
@@ -1086,7 +1089,25 @@ fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<Strin
                 (None, n) if n > 0 => format!("Unknown Source:{n}"),
                 _ => "Unknown Source".to_string(),
             };
-            format!("\tat {cls}.{meth}({loc})")
+            format!("{cls}.{meth}({loc})")
+        })
+        .collect()
+}
+
+/// Return the real suppressed-throwable elements. The JDK sentinel is a List,
+/// while CratonVM's native `addSuppressed` replaces it with a Throwable array;
+/// only the latter represents user-visible suppressed exceptions.
+fn throwable_suppressed(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<ObjectRef> {
+    let Value::Object(Some(array)) = ctx.get_field_by_name(t, "suppressedExceptions") else {
+        return Vec::new();
+    };
+    if ctx.heap_kind_of(array) != cratonvm_types::ObjectKind::Array {
+        return Vec::new();
+    }
+    (0..ctx.array_length(array))
+        .filter_map(|index| match ctx.get_array_element(array, index) {
+            Value::Object(Some(throwable)) => Some(throwable),
+            _ => None,
         })
         .collect()
 }
@@ -1179,28 +1200,75 @@ pub(crate) fn native_throwable_print_stack_trace(
 /// text. The header path pins each throwable while it asks the receiver for its
 /// virtual localized message, matching `Throwable.toString()` semantics.
 fn collect_throwable_chain_lines(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<String> {
-    let mut lines = Vec::new();
-    let (this, header) = throwable_to_string_text(ctx, this);
-    lines.push(header);
-    lines.extend(throwable_frame_lines(ctx, this));
-
-    // Walk the cause chain with a cycle guard. Limit depth defensively
-    // to avoid pathological loops if `cause` was somehow self-referential
-    // through a non-equality identity.
-    let mut seen: Vec<ObjectRef> = vec![this];
-    let mut current = throwable_cause(ctx, this);
-    let mut depth = 0;
-    while let Some(c) = current {
-        depth += 1;
-        let (c, header) = throwable_to_string_text(ctx, c);
-        if depth > 32 || seen.iter().any(|s| *s == c) {
-            break;
+    fn append_throwable(
+        ctx: &mut dyn NativeContext,
+        lines: &mut Vec<String>,
+        seen: &mut Vec<ObjectRef>,
+        throwable: ObjectRef,
+        caption: &str,
+        prefix: &str,
+        enclosing_frames: &[String],
+        depth: usize,
+    ) {
+        if depth > 32
+            || seen
+                .iter()
+                .any(|seen_throwable| *seen_throwable == throwable)
+        {
+            return;
         }
-        seen.push(c);
-        lines.push(format!("Caused by: {header}"));
-        lines.extend(throwable_frame_lines(ctx, c));
-        current = throwable_cause(ctx, c);
+        let (throwable, header) = throwable_to_string_text(ctx, throwable);
+        if seen
+            .iter()
+            .any(|seen_throwable| *seen_throwable == throwable)
+        {
+            return;
+        }
+        seen.push(throwable);
+        let frames = throwable_frame_text(ctx, throwable);
+        let common = frames
+            .iter()
+            .rev()
+            .zip(enclosing_frames.iter().rev())
+            .take_while(|(frame, enclosing)| frame == enclosing)
+            .count();
+        lines.push(format!("{prefix}{caption}{header}"));
+        for frame in &frames[..frames.len().saturating_sub(common)] {
+            lines.push(format!("{prefix}\tat {frame}"));
+        }
+        if common > 0 {
+            lines.push(format!("{prefix}\t... {common} more"));
+        }
+
+        for suppressed in throwable_suppressed(ctx, throwable) {
+            append_throwable(
+                ctx,
+                lines,
+                seen,
+                suppressed,
+                "Suppressed: ",
+                &format!("{prefix}\t"),
+                &frames,
+                depth + 1,
+            );
+        }
+        if let Some(cause) = throwable_cause(ctx, throwable) {
+            append_throwable(
+                ctx,
+                lines,
+                seen,
+                cause,
+                "Caused by: ",
+                prefix,
+                &frames,
+                depth + 1,
+            );
+        }
     }
+
+    let mut lines = Vec::new();
+    let mut seen = Vec::new();
+    append_throwable(ctx, &mut lines, &mut seen, this, "", "", &[], 0);
     lines
 }
 

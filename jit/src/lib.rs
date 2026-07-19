@@ -2579,6 +2579,11 @@ pub struct InlineSite {
     pub return_type: u8,
     /// Resolved field access in callee bytecode: (callee_pc, field_index, type_tag).
     pub field_info: Vec<(usize, usize, u8)>,
+    /// Compact-layout metadata for resolved callee fields:
+    /// (callee_pc, byte_offset_from_object_body, is_reference).
+    /// Kept separate from `field_info` so legacy-layout compilation and
+    /// consumers that only need the abstract slot index stay unchanged.
+    pub compact_field_info: Vec<(usize, u32, bool)>,
     /// Resolved static field access: (callee_pc, class_id_raw, field_index, type_tag, is_volatile).
     pub static_field_info: Vec<(usize, u32, usize, u8, bool)>,
     /// Resolved ldc constants: (callee_pc, i64_value).
@@ -3127,6 +3132,28 @@ pub fn set_integer_value_of_direct_fn(addr: usize) {
 pub static INTEGER_INT_VALUE_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Exact-HashMap `put`/`get` thin direct-call helpers
+/// (perf/halfgap-20260717). `java/util/HashMap` is NOT final, so these
+/// register guard-free (`guard_class_id: 0`) and the helpers themselves
+/// verify the receiver's EXACT class, falling back to the full generic
+/// dispatcher for subclasses (LinkedHashMap at a HashMap-declared site),
+/// non-Integer keys, materialized maps, and redefine windows. The fast
+/// path is the Integer-overlay probe with no `safe_native_call` wrapper —
+/// the same wrapper-free contract as `INTEGER_INT_VALUE_DIRECT_FN`.
+pub static HASHMAP_PUT_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the exact-HashMap thin direct-call helpers (called once from the
+/// VM's `build_helpers`).
+pub fn set_hashmap_put_direct_fn(addr: usize) {
+    HASHMAP_PUT_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_hashmap_get_direct_fn(addr: usize) {
+    HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Register the `Integer.intValue` thin direct-call helper (called once from
 /// the VM's `build_helpers`).
 pub fn set_integer_int_value_direct_fn(addr: usize) {
@@ -3404,16 +3431,12 @@ pub fn try_resolve_intrinsic(
             _ => {}
         }
     }
+    // Real-JDK CRC32 stores its public (not complemented running) value in
+    // `crc`. Keep archive creation on the proven updateBytes0 native path
+    // until every compiled call shape has one state-representation contract.
+    // CRC32C uses its own running-state contract and remains eligible above.
     if class == "java/util/zip/CRC32" {
-        match (name, descriptor) {
-            ("update", "(I)V") => {
-                return Some((JitIntrinsic::Crc32UpdateByte.as_entry(), 1, b'V'));
-            }
-            ("update", "([BII)V") => {
-                return Some((JitIntrinsic::Crc32UpdateBytes.as_entry(), 3, b'V'));
-            }
-            _ => {}
-        }
+        return None;
     }
     // ===== INTRINSIC REGION END: CRC32 =====
 
@@ -3656,6 +3679,21 @@ impl JitMICSlot {
 
     /// Update all cached fields after a cache miss.
     pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
+        // cceres2: on a RETARGET (cached class X -> new class Y) a reader that
+        // already matched the old class_id can pair the NEW entry_ptr with the
+        // OLD needs_context (or call a different method's entry under the old
+        // guard). Invalidate the guard first so in-flight readers miss to the
+        // helper instead. This narrows (does not fully close — a reader past
+        // its guard load can still tear; the marshalling choke points now
+        // re-derive the ABI flag from the entry's own CompiledMethod) the
+        // window; first-install (0 -> X) keeps the BUG-24 publish order below.
+        let prev = self
+            .cached_class_id
+            .load(std::sync::atomic::Ordering::Acquire);
+        if prev != 0 && prev != class_id {
+            self.cached_class_id
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
         // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
         // (which checks class_id first, then loads entry_ptr) can never observe
         // the new class id paired with a stale entry_ptr.
@@ -5119,6 +5157,16 @@ fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
     }
 }
 
+fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
+    const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
 fn snakeyaml_emitter_emit_jit_deny_prefix(
     class_name: &str,
     method_name: &str,
@@ -5237,6 +5285,40 @@ fn note_jit_recursive_compile_cycle(class_name: &str, method_name: &str, descrip
     } else {
         false
     }
+}
+
+thread_local! {
+    /// Per-compile request flag (same consume-once pattern as
+    /// `x64::set_kernel_reg_homes_request`): the VM caller sets it right
+    /// before `try_compile` when it has PROVEN that the compiling class's
+    /// self-references resolve to the class itself — the class was defined
+    /// by a BUILTIN (bootstrap/extension/application) loader and the
+    /// loader-blind global name lookup maps its name back to its own
+    /// `ClassId`. Under that proof a NON-tail static self-recursive
+    /// invokestatic may be raw-routed to the guarded direct self-CALL
+    /// (`x64.rs` 0xb8 else-arm) instead of carrying dispatch metadata: the
+    /// loader-identity hazard that historically forced the dispatch route
+    /// ("a raw direct entry call ... can invoke a different same-named
+    /// method") cannot arise for a builtin-loaded class, whose registry
+    /// holds exactly one class per name and always resolves a
+    /// self-reference to the already-defined class. Custom (`UserDefined`)
+    /// loaders keep the dispatch route unconditionally.
+    ///
+    /// Motivation (bt18 regression): dispatch-mediated self-recursion pays
+    /// the full helper round trip per level — `jit_invoke_dispatch` +
+    /// `push_entry_full`/`pop_jit_entry` + the `lookup_jit_code_range`
+    /// mutex scan — measured at >60% of the whole BinTreesClassic d=18 run
+    /// (~90M chain pushes; the recursive `bottomUpTree`/`itemCheck` pair
+    /// dispatched once per NODE).
+    static SELF_CALL_IDENTITY_STABLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Set the per-compile self-call identity proof — see
+/// [`SELF_CALL_IDENTITY_STABLE`]. Consumed (reset to `false`) by the next
+/// `try_compile` on this thread, including on its early-bail paths.
+pub fn set_self_call_identity_stable(v: bool) {
+    SELF_CALL_IDENTITY_STABLE.with(|c| c.set(v));
 }
 
 /// Direct JIT-to-JIT calls into recursive compile-cycle participants bypass the
@@ -5396,6 +5478,13 @@ pub fn try_compile(
         return None;
     }
 
+    // Keep the final compiler admission gate aligned with the VM static
+    // skip-list. The tiered background worker bypasses VM-side eligibility and
+    // otherwise continued compiling MutableBigInteger after it was quarantined.
+    if tiered::is_biginteger_arithmetic_jit_denied(&cached.class_name) {
+        return None;
+    }
+
     // HIB-TEMPORAL.1 (2026-07-08): final fail-closed Hibernate guard. The VM
     // skip-list catches most eligibility paths, but tiered/background compile
     // can still reach this crate's final `try_compile` gate. The proven stable
@@ -5418,6 +5507,16 @@ pub fn try_compile(
     }
 
     if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
+        if !jit_allow_package(prefix) {
+            return None;
+        }
+    }
+
+    // Keep the final admission gate aligned with the VM-side Xerces parser
+    // guard. Background compilation bypasses the VM skip-list, and JITting
+    // this package corrupts SchemaGrammar's SymbolHash during Hazelcast XML
+    // schema validation.
+    if let Some(prefix) = xerces_schema_jit_deny_prefix(&cached.class_name) {
         if !jit_allow_package(prefix) {
             return None;
         }
@@ -5471,6 +5570,9 @@ pub fn try_compile(
         return None;
     }
 
+    // Consume the per-compile self-call identity proof FIRST — even an
+    // early bail below must not leak a stale `true` into a later compile.
+    let self_call_identity_stable = SELF_CALL_IDENTITY_STABLE.with(|c| c.replace(false));
     let _compile_stack_guard = JitCompileStackGuard::enter(cached);
 
     // Inner pipeline: returns None on either a transient resolver miss
@@ -5503,6 +5605,7 @@ pub fn try_compile(
         ir_emit_fp,
         cp_invokedynamic_descriptor_resolver,
         &mut backend_attempted,
+        self_call_identity_stable,
     );
 
     if result.is_none() && backend_attempted {
@@ -5655,6 +5758,7 @@ fn try_compile_inner(
     // transient miss (e.g. resolver returned None, profile not yet
     // present — worth retrying later).
     backend_attempted: &mut bool,
+    self_call_identity_stable: bool,
 ) -> Option<CompiledMethod> {
     // Architecture-specific backend selection.
     // On ARM64 (aarch64), the ARM64 backend would be used instead of x64.
@@ -6746,6 +6850,47 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                // Exact-HashMap `put`/`get` thin direct calls (see
+                // `HASHMAP_PUT_DIRECT_FN`): guard-free registration — the
+                // helper verifies the receiver's exact class at runtime and
+                // routes everything non-exact/non-overlay to the generic
+                // dispatcher, so a subclass receiver keeps full virtual
+                // semantics.
+                if invoke_kind == 0 && class_name == "java/util/HashMap" {
+                    let recognized = if method_name == "put"
+                        && descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
+                    {
+                        Some((
+                            HASHMAP_PUT_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            2usize,
+                        ))
+                    } else if method_name == "get"
+                        && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+                    {
+                        Some((
+                            HASHMAP_GET_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed),
+                            1usize,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((entry, num_params)) = recognized {
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+                }
                 // First the layout-independent instance intrinsics.
                 if let Some((entry, num_params, ret)) =
                     try_resolve_intrinsic(&class_name, &method_name, &descriptor)
@@ -6818,6 +6963,26 @@ fn try_compile_inner(
             // other recursive site gets dispatch metadata so the helper stack
             // guard runs before re-entering compiled code.
             if use_raw_tail_self_call {
+                continue;
+            }
+
+            // bt18-regression fix (2026-07-18): NON-tail static self-recursion
+            // may ALSO take the raw direct-CALL path — but only under the
+            // caller-supplied identity proof (see `SELF_CALL_IDENTITY_STABLE`:
+            // builtin-loaded class whose name maps back to its own ClassId,
+            // so the historical loader-identity hazard cannot arise) and
+            // never for mutual-recursion cycle targets (the dispatch depth
+            // guard is still their only stack protection). The x64 else-arm
+            // emits the inline stack-floor check + `self_call_stack_guard`
+            // helper before the direct CALL, so runaway recursion still
+            // surfaces as a catchable StackOverflowError. `needs_heap` is
+            // required: the guard is called with the vm_ptr frame slot.
+            if invoke_kind == 3
+                && is_same_method_recursive_call
+                && !recursive_cycle_target
+                && self_call_identity_stable
+            {
+                needs_heap = true;
                 continue;
             }
 
@@ -7895,6 +8060,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hibernate_biginteger_final_guard_matches_internal_and_dotted_names() {
+        assert!(tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/MutableBigInteger"
+        ));
+        assert!(tiered::is_biginteger_arithmetic_jit_denied(
+            "java.math.MutableBigInteger"
+        ));
+        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/BigInteger"
+        ));
+        assert!(!tiered::is_biginteger_arithmetic_jit_denied(
+            "java/math/MutableBigInteger$Helper"
+        ));
+    }
+
+    #[test]
     fn hibernate_temporal_jit_deny_matches_slash_and_dot_names() {
         assert_eq!(
             hibernate_temporal_jit_deny_prefix("org/hibernate/dialect/H2Dialect"),
@@ -7921,6 +8102,19 @@ mod tests {
             jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
             None
         );
+    }
+
+    #[test]
+    fn xerces_schema_jit_deny_matches_slash_and_dot_names() {
+        assert_eq!(
+            xerces_schema_jit_deny_prefix("com/sun/org/apache/xerces/internal/util/SymbolHash"),
+            Some("com/sun/org/apache/xerces/internal/")
+        );
+        assert_eq!(
+            xerces_schema_jit_deny_prefix("com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar"),
+            Some("com.sun.org.apache.xerces.internal.")
+        );
+        assert_eq!(xerces_schema_jit_deny_prefix("com/sun/org/apache/xml/internal/Foo"), None);
     }
 
     #[test]
@@ -7976,8 +8170,13 @@ mod tests {
 
     /// BUG-1 companion — routing of NON-tail static self-recursive call sites.
     ///
-    /// The site must retain `invoke_dispatch` even when a self-call guard is
-    /// available, so class-loader identity is resolved at dispatch time.
+    /// WITHOUT the caller-supplied identity proof the site must retain
+    /// `invoke_dispatch`, so class-loader identity is resolved at dispatch
+    /// time (dee2e26f hardening). WITH the proof
+    /// (`set_self_call_identity_stable(true)` — builtin-loaded class whose
+    /// name maps back to its own ClassId) the site takes the raw guarded
+    /// direct self-CALL (bt18-regression fix, 2026-07-18); the flag is
+    /// consume-once so the NEXT compile reverts to dispatch.
     /// Proven from the emitted machine code: `emit_call_absolute` bakes the
     /// helper address as a `MOV RAX, imm64`, so the 8-byte LE address pattern
     /// appearing in the code identifies which helper the site calls.
@@ -8099,6 +8298,78 @@ mod tests {
         assert!(
             contains(&bytes_off, DISPATCH_ADDR),
             "unwired guard must keep the historical invoke_dispatch routing"
+        );
+
+        // (c) bt18-regression fix: with the caller-supplied identity proof,
+        // the non-tail site takes the raw guarded direct self-CALL — the
+        // stack-guard helper is baked and no invoke_dispatch round trip
+        // remains for the recursion.
+        set_self_call_identity_stable(true);
+        let compiled_direct = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("identity-proven self-recursive method must compile");
+        let bytes_direct = compiled_direct.code_bytes().to_vec();
+        assert!(
+            contains(&bytes_direct, GUARD_ADDR),
+            "identity-proven non-tail self-call must bake the self-call stack guard"
+        );
+        assert!(
+            !contains(&bytes_direct, DISPATCH_ADDR),
+            "identity-proven non-tail self-call must not round-trip through invoke_dispatch"
+        );
+
+        // (d) The proof is consume-once: the very next compile reverts to
+        // loader-correct dispatch routing.
+        let compiled_after = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("post-proof compile must fall back to dispatch");
+        assert!(
+            contains(&compiled_after.code_bytes().to_vec(), DISPATCH_ADDR),
+            "identity proof must not leak into the next compile"
         );
     }
 

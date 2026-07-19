@@ -220,6 +220,12 @@ const CORPUS: &[TckTest] = &[
     tck(LANG, "cratonvm/TckStringBuilder", "sb_replace"),
     tck(LANG, "cratonvm/TckStringBuilder", "sb_substring"),
     tck(LANG, "cratonvm/TckStringBuilder", "sb_indexOf"),
+    // JsonReader's deprecation short reason uses BreakIterator sentence boundaries.
+    tck(
+        LANG,
+        "cratonvm/JsonReaderSubstringProbe",
+        "preservesSentenceAfterDottedIdentifier",
+    ),
     // T4.2.18 — TckThread (dedicated)
     tck(LANG, "cratonvm/TckThread", "thread_currentThread"),
     tck(LANG, "cratonvm/TckThread", "thread_getName"),
@@ -293,6 +299,11 @@ const CORPUS: &[TckTest] = &[
     tck(UTIL, "cratonvm/TckCollections", "max_min"),
     tck(UTIL, "cratonvm/TckCollections", "reverse"),
     tck(UTIL, "cratonvm/TckCollections", "singleton_map"),
+    tck(
+        UTIL,
+        "cratonvm/TckCollections",
+        "singleton_wrappers_are_real_and_immutable",
+    ),
     // T4.2.6 — TckAtomic (concurrent.atomic)
     tck(CONCURRENT, "cratonvm/TckAtomic", "atomic_int_get_set"),
     tck(CONCURRENT, "cratonvm/TckAtomic", "atomic_int_getAndSet"),

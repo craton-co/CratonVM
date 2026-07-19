@@ -5,7 +5,6 @@
 //!
 //! Each Java thread has its own `JvmThread` containing:
 //! - Call stack (for stack traces)
-//! - Throwable stack traces captured by `fillInStackTrace`
 //! - Test output buffer (`printed`)
 //! - Thread identity and flags
 //
@@ -20,13 +19,12 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
 use crate::classloading::resolution::InvokeCache;
-use crate::native::registry::StackTraceEntry;
 use crate::runtime::frame::Frame;
 use crate::runtime::fx_collections::FxHashMap;
 use crate::types::{ObjectRef, Value};
@@ -67,21 +65,52 @@ const MAX_POOL_SIZE: usize = 64;
 /// GC's pointer map into `fixup` (chaining `orig → cur → new` across
 /// multiple missed GCs, keyed by the address the frames still hold). On
 /// wake the thread applies and clears `fixup` in `check_post_block_gc`.
+/// cceres3: one precisely-tracked frame slot for the blocked window — see
+/// `GcBlockState::slot_origins`.
+#[derive(Clone, Copy)]
+pub struct SlotOrigin {
+    pub frame: u32,
+    pub idx: u32,
+    pub is_stack: bool,
+    /// Address the slot held at the blocking deposit.
+    pub orig: usize,
+    /// The object's current address, advanced by every GC initiator's fold
+    /// through that collection's pointer map (exact per-map lookup).
+    pub cur: usize,
+}
+
 pub struct GcBlockState {
     /// True from `deposit_root_snapshot` (just before the thread blocks)
     /// until the end of `check_post_block_gc` (after the fixup is applied).
     pub in_blocked_region: AtomicBool,
+    /// Java-visible blocking kind while `in_blocked_region` is true:
+    /// 1 = WAITING (wait/park/join), 2 = BLOCKED (monitor acquisition).
+    /// The GC protocol only needs the boolean above; preserving this small
+    /// distinction lets `Thread.getState()` report the JDK state correctly.
+    pub java_state: AtomicU8,
     /// Composed `frame-held address → current address` map accumulated by GC
     /// initiators for every collection that completed while the thread was
     /// in a blocked region. Applied + cleared on wake.
     pub fixup: PLMutex<std::collections::HashMap<usize, usize>>,
+    /// cceres3 (WildFly boot stale-frame family): exact per-slot tracking for
+    /// the blocked window. `fixup` above is keyed by the address the frames
+    /// held when each object FIRST moved — a chain that breaks if any link's
+    /// seed was missed (filtered snapshot, multi-block chains, recycled-address
+    /// ABA), permanently stranding the slot. Each entry here instead pins down
+    /// one (frame, slot) with the address it held at the blocking deposit;
+    /// folds advance `cur` with an exact per-collection lookup and the wake
+    /// write-back stores `cur` straight into the slot. Filled only by the
+    /// flag-raising deposit; taken (and cleared) on wake.
+    pub slot_origins: PLMutex<Vec<SlotOrigin>>,
 }
 
 impl GcBlockState {
     pub fn new() -> Self {
         Self {
             in_blocked_region: AtomicBool::new(false),
+            java_state: AtomicU8::new(0),
             fixup: PLMutex::new(std::collections::HashMap::new()),
+            slot_origins: PLMutex::new(Vec::new()),
         }
     }
 }
@@ -279,9 +308,6 @@ pub struct JvmThread {
 
     /// Human-readable thread name.
     pub name: String,
-
-    /// Stack traces captured by `fillInStackTrace`, keyed by identity hash.
-    pub throwable_stacks: HashMap<i32, Vec<StackTraceEntry>>,
 
     /// Live execution frames. The last element is the currently executing frame.
     /// Frames are pushed on method entry and popped on method return.
@@ -542,7 +568,6 @@ impl JvmThread {
         Self {
             thread_id,
             name: name.to_string(),
-            throwable_stacks: HashMap::new(),
             frames: Vec::new(),
             locals_pool: Vec::new(),
             stacks_pool: Vec::new(),

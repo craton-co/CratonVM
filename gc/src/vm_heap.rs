@@ -504,6 +504,29 @@ impl VmHeap {
         }
     }
 
+    /// DIAGNOSTIC-ONLY (cceres3, CRATONVM_DBG_BLOCKGC frame-desync hunt): if
+    /// `addr` is a heap address whose header is a forwarding marker (an
+    /// already-evacuated old address kept readable by the stale-objref
+    /// quarantine ring), return the forwarded (new) address. `None` when the
+    /// stale-objref canary is off, the address is outside the heap, or the
+    /// header is a live header. Generational backend only — the others never
+    /// quarantine old addresses.
+    pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
+        match self {
+            VmHeap::Generational(h) => h.debug_forwarded_target(addr),
+            _ => None,
+        }
+    }
+
+    /// DIAGNOSTIC-ONLY (cce0079): minor-GC epoch for the `[SETFIELD-GC]`
+    /// assertion. Zero on non-Generational backends.
+    pub fn debug_minor_gc_count(&self) -> u64 {
+        match self {
+            VmHeap::Generational(h) => h.debug_minor_gc_count(),
+            _ => 0,
+        }
+    }
+
     /// Loose validity check: alignment + heap-region containment.
     ///
     /// Unlike [`Self::is_object_address`] this does NOT read the object
@@ -921,6 +944,17 @@ impl VmHeap {
     pub fn needs_gc(&self) -> bool {
         match self {
             VmHeap::Generational(h) => h.needs_gc(),
+            VmHeap::G1(h) => h.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.needs_gc(),
+        }
+    }
+
+    /// GC trigger queried from a JIT allocation/refill helper while the
+    /// compiled caller remains discoverable on the native stack.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.needs_gc_for_jit_allocation(),
             VmHeap::G1(h) => h.needs_gc(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => h.needs_gc(),

@@ -210,8 +210,13 @@ fn real_reqs() -> &'static Mutex<HashMap<i32, RealReq>> {
 /// response-perform path then reads the body from the old location.
 /// Follow-up: store `(identity_key, ObjectRef)` var-handle-root pairs
 /// (ASYNC_POOL pattern) and re-read at perform time.
-fn real_body_streams() -> &'static Mutex<HashMap<i32, ObjectRef>> {
-    static R: OnceLock<Mutex<HashMap<i32, ObjectRef>>> = OnceLock::new();
+/// GC note (cce0079 follow-up): values are `(identity_key, last_addr)`
+/// VarHandle-root pairs — registered at insert so the BAOS stays alive and
+/// registry-remapped across moving GCs; readers resolve the CURRENT address
+/// via `ctx.read_var_handle_root(identity_key)` with the stored address as
+/// fallback. (Keys were already GC-stable identity hashes.)
+fn real_body_streams() -> &'static Mutex<HashMap<i32, (i32, ObjectRef)>> {
+    static R: OnceLock<Mutex<HashMap<i32, (i32, ObjectRef)>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -282,7 +287,9 @@ fn real_body_bytes(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         .ok()
         .and_then(|t| t.get(&key).copied())
     {
-        Some(b) => b,
+        // Resolve the CURRENT address through the VarHandle-root registry
+        // (the stored copy is stale after any moving GC).
+        Some((vkey, stored)) => ctx.read_var_handle_root(vkey).unwrap_or(stored),
         None => return Vec::new(),
     };
     if let Value::Object(Some(arr)) = ctx.get_field(baos, 0) {
@@ -844,9 +851,9 @@ fn build_header_map(
             groups.push((k.clone(), vec![v.clone()]));
         }
     }
-    let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])? {
+    let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
         Some(Value::Object(Some(o))) => o,
-        _ => return Err(ioex("getHeaderFields: could not allocate LinkedHashMap")),
+        _ => return Err(ioex("getHeaderFields: could not allocate HashMap")),
     };
     let map_pin = ctx.pin_native_root(map);
     for (k, vals) in &groups {
@@ -876,7 +883,7 @@ fn build_header_map(
         let list = ctx.read_native_pin(list_pin, list);
         let ks = ctx.read_native_pin(ks_pin, ks);
         ctx.invoke(
-            "java/util/LinkedHashMap",
+            "java/util/HashMap",
             "put",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[
@@ -1964,14 +1971,20 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ByteArrayInputStream — which surfaces as `SAXParseException: Premature
     // end of file` in Logback's Joran parser (Cassandra NodeTool boot).
     if let Value::Object(Some(maybe_url)) = ctx.get_field(this, HUC_CONN_ID) {
-        // Real-JDK http(s) connection (robust external form via toExternalForm):
-        // perform the request from the real URL and return its buffered body.
+        // Recover the URL through its public external form first.  This works
+        // for both real-JDK URLs and Craton's synthetic resource URLs, whereas
+        // probing individual URL fields confuses a real `file:` URL's authority
+        // or path with the complete URL.  `URLClassLoader.getResourceAsStream`
+        // uses `openConnection().getInputStream()`, so treating a non-HTTP URL
+        // as the HTTP carrier's empty response body makes inherited resources
+        // appear as zero-byte streams (Hazelcast's filtered-loader XML config).
         if let Some(full) = huc_real_object_url(ctx, this) {
             if full.starts_with("http://") || full.starts_with("https://") {
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
                 return Ok(Some(make_byte_array_input_stream(ctx, &body)));
             }
+            return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
         // Peek at the external form via the URL's full-URL string field
         // (field 5 in our URL synthetic), falling back to field 0.
@@ -2071,19 +2084,28 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             }
         });
         let key = ctx.identity_hash_code(this);
-        if let Some(existing) = real_body_streams()
+        if let Some((vkey, stored)) = real_body_streams()
             .lock()
             .ok()
             .and_then(|t| t.get(&key).copied())
         {
+            let existing = ctx.read_var_handle_root(vkey).unwrap_or(stored);
             return Ok(Some(Value::Object(Some(existing))));
         }
         let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
+        // Family-1 fix (cce0079): `new_array` below can move the
+        // still-unrooted `baos` — pin and refresh it before the field
+        // stores and the registry insert.
+        let baos_pin = ctx.pin_native_root(baos);
         let backing = ctx.new_array(ArrayElementType::Byte, 0);
+        let baos = ctx.read_native_pin(baos_pin, baos);
+        ctx.unpin_native_roots(baos_pin);
         ctx.set_field(baos, 0, Value::Object(Some(backing)));
         ctx.set_field(baos, 1, Value::Int(0));
+        ctx.register_var_handle_root(baos);
+        let vkey = ctx.identity_hash_code(baos);
         if let Ok(mut t) = real_body_streams().lock() {
-            t.insert(key, baos);
+            t.insert(key, (vkey, baos));
         }
         let streaming = real_reqs()
             .lock()

@@ -2703,24 +2703,37 @@ fn read_dep_names(
         Some(m) => m,
         None => return Vec::new(),
     };
+    let map_pin = ctx.pin_native_root(map);
+    let map = ctx.read_native_pin(map_pin, map);
     // invoke_virtual prepends the receiver; `args` is parameters ONLY (none here).
     let set = match ctx.invoke_virtual(map, "keySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(map_pin);
+            return Vec::new();
+        }
     };
+    let set_pin = ctx.pin_native_root(set);
+    let set = ctx.read_native_pin(set_pin, set);
     let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(map_pin);
+            return Vec::new();
+        }
     };
+    let arr_pin = ctx.pin_native_root(arr);
     let n = ctx.array_length(arr);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
+        let arr = ctx.read_native_pin(arr_pin, arr);
         if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
             if let Some(name) = read_service_name_robust(ctx, sn) {
                 out.push(name);
             }
         }
     }
+    ctx.unpin_native_roots(map_pin);
     out
 }
 
@@ -2901,17 +2914,32 @@ fn native_service_registry_get_service_names(
 /// `(dependency registration, injector)` pairs in the service's roots so
 /// [`inject_dependency_values`] can perform real MSC's inject-before-start.
 fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef, id: u64) {
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let requires = match ctx.get_field_by_name(builder, "requires") {
         Value::Object(Some(m)) => m,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
+    let requires_pin = ctx.pin_native_root(requires);
+    let requires = ctx.read_native_pin(requires_pin, requires);
     let values = match ctx.invoke_virtual(requires, "values", "()Ljava/util/Collection;", &[]) {
         Ok(Some(Value::Object(Some(v)))) => v,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
+    let values_pin = ctx.pin_native_root(values);
+    let values = ctx.read_native_pin(values_pin, values);
     let arr = match ctx.invoke_virtual(values, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
     let n = ctx.array_length(arr);
     // `arr` (the outer requires-entries array) is read again at the top of
@@ -2939,6 +2967,8 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
         // the table (the table's own remap only covers entries already
         // present at move time).
         let reg_pin = ctx.pin_native_root(reg);
+        let inj_list_pin = ctx.pin_native_root(inj_list);
+        let inj_list = ctx.read_native_pin(inj_list_pin, inj_list);
         let inj_arr = match ctx.invoke_virtual(inj_list, "toArray", "()[Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(a)))) => a,
             _ => {
@@ -2946,10 +2976,11 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
                 continue;
             }
         };
+        let inj_arr_pin = ctx.pin_native_root(inj_arr);
         let reg = ctx.read_native_pin(reg_pin, reg);
-        ctx.unpin_native_roots(reg_pin);
         let m = ctx.array_length(inj_arr);
         for j in 0..m {
+            let inj_arr = ctx.read_native_pin(inj_arr_pin, inj_arr);
             if let Value::Object(Some(inj)) = ctx.get_array_element(inj_arr, j) {
                 service_roots()
                     .lock()
@@ -2960,8 +2991,9 @@ fn capture_dependency_injections(ctx: &mut dyn NativeContext, builder: ObjectRef
                     .push((reg, inj));
             }
         }
+        ctx.unpin_native_roots(reg_pin);
     }
-    ctx.unpin_native_roots(arr_pin);
+    ctx.unpin_native_roots(builder_pin);
 }
 
 /// Real MSC's StartTask resolves every legacy-injected dependency's value
@@ -3000,27 +3032,45 @@ fn inject_dependency_values(ctx: &mut dyn NativeContext, id: u64) -> Result<(), 
 
 /// Read the builder's `provides` map keys as interned service names.
 fn read_provides_names(ctx: &mut dyn NativeContext, builder: ObjectRef) -> Vec<Arc<ServiceName>> {
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let provides = match ctx.get_field_by_name(builder, "provides") {
         Value::Object(Some(m)) => m,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return Vec::new();
+        }
     };
+    let provides_pin = ctx.pin_native_root(provides);
+    let provides = ctx.read_native_pin(provides_pin, provides);
     let set = match ctx.invoke_virtual(provides, "keySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return Vec::new();
+        }
     };
+    let set_pin = ctx.pin_native_root(set);
+    let set = ctx.read_native_pin(set_pin, set);
     let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return Vec::new(),
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return Vec::new();
+        }
     };
+    let arr_pin = ctx.pin_native_root(arr);
     let n = ctx.array_length(arr);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
+        let arr = ctx.read_native_pin(arr_pin, arr);
         if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
             if let Some(name) = read_service_name_robust(ctx, sn) {
                 out.push(name);
             }
         }
     }
+    ctx.unpin_native_roots(builder_pin);
     out
 }
 
@@ -3030,13 +3080,19 @@ fn wire_provides_injectors(
     id: u64,
     primary: &Arc<ServiceName>,
 ) {
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder = ctx.read_native_pin(builder_pin, builder);
     // `addAliases(...)` names resolve to this service too.
     if let Value::Object(Some(alias_set)) = ctx.get_field_by_name(builder, "aliases") {
+        let alias_set_pin = ctx.pin_native_root(alias_set);
+        let alias_set = ctx.read_native_pin(alias_set_pin, alias_set);
         if let Ok(Some(Value::Object(Some(arr)))) =
             ctx.invoke_virtual(alias_set, "toArray", "()[Ljava/lang/Object;", &[])
         {
+            let arr_pin = ctx.pin_native_root(arr);
             let n = ctx.array_length(arr);
             for i in 0..n {
+                let arr = ctx.read_native_pin(arr_pin, arr);
                 if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
                     if let Some(alias) = read_service_name_robust(ctx, sn) {
                         if alias != *primary {
@@ -3046,23 +3102,44 @@ fn wire_provides_injectors(
                 }
             }
         }
+        ctx.unpin_native_roots(alias_set_pin);
     }
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let provides = match ctx.get_field_by_name(builder, "provides") {
         Value::Object(Some(m)) => m,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
+    let provides_pin = ctx.pin_native_root(provides);
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let target = match ctx.get_field_by_name(builder, "serviceTarget") {
         Value::Object(Some(t)) => Some(t),
         _ => None,
     };
+    // Root the target at the point it is read. `entrySet` and `toArray` below
+    // are both GC-capable; pinning the raw target after them was the live MSC
+    // stale-at-pin residual.
+    let target_pin = target.map(|t| ctx.pin_native_root(t));
+    let provides = ctx.read_native_pin(provides_pin, provides);
     let set = match ctx.invoke_virtual(provides, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
+    let set_pin = ctx.pin_native_root(set);
+    let set = ctx.read_native_pin(set_pin, set);
     let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(builder_pin);
+            return;
+        }
     };
+    let arr_pin = ctx.pin_native_root(arr);
     let n = ctx.array_length(arr);
     // `arr` (the outer entries array) and `target` both live across every
     // loop iteration's `getKey`/`getValue`/`getOrCreateRegistration` hazards;
@@ -3070,8 +3147,6 @@ fn wire_provides_injectors(
     // iteration too (`entry` across `getKey`, `key` across `getValue`,
     // `writable` across `getOrCreateRegistration`) — pin everything and
     // re-read right before each subsequent use.
-    let arr_pin = ctx.pin_native_root(arr);
-    let target_pin = target.map(|t| ctx.pin_native_root(t));
     let mut arr_cur = arr;
     for i in 0..n {
         arr_cur = ctx.read_native_pin(arr_pin, arr_cur);
@@ -3115,6 +3190,7 @@ fn wire_provides_injectors(
                 Some(m) => m,
                 None => {
                     ctx.unpin_native_roots(entry_pin);
+                    ctx.unpin_native_roots(builder_pin);
                     return;
                 }
             }
@@ -3148,7 +3224,7 @@ fn wire_provides_injectors(
         }
         ctx.unpin_native_roots(entry_pin);
     }
-    ctx.unpin_native_roots(arr_pin);
+    ctx.unpin_native_roots(builder_pin);
 }
 
 /// Allocate a synthetic `StartContext` carrying `controller_id`, and root it.
@@ -3333,6 +3409,11 @@ fn drive_starts(
 /// register the service in the Rust container, and drive its real `start()`.
 fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let builder = obj_arg(args, 0)?;
+    // This native performs many class lookups, allocations, and Java calls
+    // before its last use of the builder. Root it at entry; pinning the raw
+    // entry copy near the end only captured an already-forwarded address.
+    let builder_pin = ctx.pin_native_root(builder);
+    let builder = ctx.read_native_pin(builder_pin, builder);
 
     // ServiceBuilderImpl field layout (jboss-msc 1.5.x, reversed via `javap -p`):
     //   serviceId : ServiceName        (the primary name)
@@ -3366,6 +3447,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     let name = match name {
         Some(n) => n,
         None => {
+            let builder = ctx.read_native_pin(builder_pin, builder);
             let provided = read_provides_names(ctx, builder);
             match provided.into_iter().next() {
                 Some(n) => n,
@@ -3383,6 +3465,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
             }
         }
     };
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let service_ref = match ctx.get_field_by_name(builder, "service") {
         Value::Object(Some(o)) => Some(o),
         _ => None,
@@ -3395,6 +3478,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Object(o) => read_mode_by_name(ctx, o),
         _ => Mode::Active,
     };
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let child_target = match ctx.get_field_by_name(builder, "serviceTarget") {
         Value::Object(Some(o)) => Some(o),
         _ => None,
@@ -3405,6 +3489,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // alongside `service_pin` (pushed right after it here, unwound together
     // via `service_pin`'s handle at the same points below).
     let child_target_pin = child_target.map(|o| (ctx.pin_native_root(o), o));
+    let builder = ctx.read_native_pin(builder_pin, builder);
     let deps = match ctx.get_field_by_name(builder, "requires") {
         Value::Object(Some(o)) => read_dep_names(ctx, Some(o)),
         _ => Vec::new(),
@@ -3446,8 +3531,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     let sn_for_mirror = sn_pin
         .map(|(pin, original)| ctx.read_native_pin(pin, original))
         .unwrap_or_else(|| alloc_java_service_name(ctx, &name));
+    // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
+    // controller-mirror allocation below can move `sn_for_mirror` (read from
+    // its pin just above, or freshly allocated in the anonymous branch) before
+    // the NAME-slot store; re-read it after the alloc.
+    let sn_mirror_pin = ctx.pin_native_root(sn_for_mirror);
     let ctrl_obj =
         alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceController", SC_NUM_SLOTS);
+    let sn_for_mirror = ctx.read_native_pin(sn_mirror_pin, sn_for_mirror);
     ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn_for_mirror)));
     ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
     ctx.set_field(
@@ -3478,9 +3569,19 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // P3 value plumbing: connect this builder's provides-consumers and the
     // per-name registrations real requires()-suppliers read from, and index
     // provided/alias names for dependency resolution.
-    wire_provides_injectors(ctx, builder, id, &name);
+    //
+    // cceres3 (DS2/DM_002 live captures): `builder` is a raw copy captured at
+    // native entry; the service-name/controller-mirror/list allocations above
+    // can move it, so handing the raw copy to these two helpers made their
+    // very first `get_field_by_name(builder, ..)` read recycled memory. Pin
+    // and re-read at the point of use.
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    wire_provides_injectors(ctx, builder_cur, id, &name);
     // Legacy addDependency(…, Injector) wiring — injected before start().
-    capture_dependency_injections(ctx, builder, id);
+    // (wire_provides_injectors is itself GC-capable — re-read again.)
+    let builder_cur = ctx.read_native_pin(builder_pin, builder);
+    capture_dependency_injections(ctx, builder_cur, id);
+    ctx.unpin_native_roots(builder_pin);
 
     if msc_dbg() {
         eprintln!(

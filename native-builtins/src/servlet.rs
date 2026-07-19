@@ -1723,58 +1723,22 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // URLClassLoader.getResource(String) → URL  (delegate to find_resource)
+    // This exact URLClassLoader registration is installed after the generic
+    // ClassLoader one. Keep it on the same parent-first implementation so a
+    // URLClassLoader child can see @WithResource files supplied by its parent.
     r.register(
         ucl,
         "getResource",
         "(Ljava/lang/String;)Ljava/net/URL;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            match ctx.find_resource(name.trim_start_matches('/')) {
-                Some(_) => {
-                    // Build a minimal URL object pointing to this resource
-                    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
-                    let full_str = ctx.create_string(&format!("classpath:{name}"));
-                    ctx.set_field(url, 5, Value::Object(Some(full_str)));
-                    Ok(Some(Value::Object(Some(url))))
-                }
-                None => Ok(Some(Value::Object(None))),
-            }
-        },
+        crate::classloader::cl_get_resource_essential,
     );
 
-    // URLClassLoader.getResourceAsStream(String) → InputStream
+    // Use the same delegation path for stream lookup.
     r.register(
         ucl,
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let name = ctx.read_string(name_obj).unwrap_or_default();
-            let resource_name = name.trim_start_matches('/');
-            match ctx.find_resource(resource_name) {
-                None => Ok(Some(Value::Object(None))),
-                Some(bytes) => {
-                    let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
-                    for (i, &b) in bytes.iter().enumerate() {
-                        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                    }
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-                    ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
-                    ctx.set_field(stream, 1, Value::Int(0)); // pos
-                    ctx.set_field(stream, 2, Value::Int(0)); // mark
-                    ctx.set_field(stream, 3, Value::Int(bytes.len() as i32)); // count
-                    Ok(Some(Value::Object(Some(stream))))
-                }
-            }
-        },
+        crate::classloader::cl_get_resource_as_stream_essential,
     );
 
     // URLClassLoader.close() — no-op
@@ -1998,7 +1962,7 @@ pub(crate) struct SocketRegistry {
 /// chain is stored as DER bytes so it can be handed out repeatedly through
 /// `SSLSession.getPeerCertificates()` without touching the live TLS stream.
 pub(crate) struct TlsEntry {
-    pub(crate) stream: native_tls::TlsStream<TcpStream>,
+    pub(crate) stream: TlsClientStream,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     /// T2.7.11: owned so real negotiated handshake values can live here
@@ -2011,6 +1975,22 @@ pub(crate) struct TlsEntry {
     /// `SSLSocket.getApplicationProtocol()` on the Java side.
     pub(crate) negotiated_alpn: Option<String>,
     pub(crate) peer_cert_chain_der: Vec<Vec<u8>>,
+}
+
+pub(crate) enum TlsClientStream {
+    Native(native_tls::TlsStream<TcpStream>),
+    #[cfg(unix)]
+    LegacyDsa(openssl::ssl::SslStream<TcpStream>),
+}
+
+impl TlsClientStream {
+    pub(crate) fn get_ref(&self) -> &TcpStream {
+        match self {
+            Self::Native(stream) => stream.get_ref(),
+            #[cfg(unix)]
+            Self::LegacyDsa(stream) => stream.get_ref(),
+        }
+    }
 }
 
 impl Default for SocketRegistry {
@@ -2155,7 +2135,7 @@ pub(crate) fn s2_tls_connect(
     }
 
     let entry = TlsEntry {
-        stream: tls_stream,
+        stream: TlsClientStream::Native(tls_stream),
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -2164,6 +2144,80 @@ pub(crate) fn s2_tls_connect(
         peer_cert_chain_der,
     };
 
+    let mut reg = s2_registry().lock();
+    let id = s2_next_free_id(&mut reg);
+    reg.tls_streams.insert(id, entry);
+    Ok(id)
+}
+
+/// Connect using a per-connection OpenSSL policy for a legacy DSA identity.
+/// The caller only selects this after recognizing a configured DSA trust root;
+/// certificate validation still happens immediately afterward through the
+/// Java TrustManager captured from the owning SSLContext.
+#[cfg(unix)]
+pub(crate) fn s2_legacy_dsa_tls_connect(
+    host: &str,
+    port: u16,
+    trust_root_ders: &[Vec<u8>],
+) -> std::io::Result<i32> {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use openssl::x509::{store::X509StoreBuilder, X509VerifyResult, X509};
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr)?;
+    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    builder.set_security_level(0);
+    builder
+        .set_cipher_list("ALL:@SECLEVEL=0")
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut roots = X509StoreBuilder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    for der in trust_root_ders {
+        let cert = X509::from_der(der).map_err(|e| std::io::Error::other(e.to_string()))?;
+        roots
+            .add_cert(cert)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    }
+    builder
+        .set_verify_cert_store(roots.build())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Spring Boot's historical embedded-LDAP fixture explicitly trusts a
+    // self-signed DSA certificate whose validity window ended in 2017.  The
+    // JVM trust-manager shim accepts that explicit anchor; retain normal
+    // chain verification but mirror that compatibility behavior for the
+    // one expiration error in this legacy-DSS bridge.
+    builder.set_verify_callback(SslVerifyMode::PEER, |verified, store| {
+        verified || store.error() == unsafe { X509VerifyResult::from_raw(10) }
+    });
+    // A plain JSSE SSLSocket validates the peer chain but does not perform
+    // hostname verification unless the caller sets an endpoint-identification
+    // algorithm in SSLParameters.  UnboundID connects its in-memory LDAPS
+    // server via 127.0.0.1 while the test certificate has no matching IP SAN.
+    let connector = builder.build();
+    let mut connection = connector
+        .configure()
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    connection.set_verify_hostname(false);
+    let stream = connection
+        .connect(host, tcp)
+        .map_err(|e| std::io::Error::other(format!("legacy DSA TLS handshake: {e}")))?;
+    let mut peer_cert_chain_der = Vec::new();
+    if let Some(cert) = stream.ssl().peer_certificate() {
+        peer_cert_chain_der.push(
+            cert.to_der()
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
+        );
+    }
+    let entry = TlsEntry {
+        stream: TlsClientStream::LegacyDsa(stream),
+        peer_host: host.to_string(),
+        peer_port: port,
+        negotiated_protocol: "TLSv1.2".to_string(),
+        negotiated_cipher: "UNKNOWN".to_string(),
+        negotiated_alpn: None,
+        peer_cert_chain_der,
+    };
     let mut reg = s2_registry().lock();
     let id = s2_next_free_id(&mut reg);
     reg.tls_streams.insert(id, entry);
@@ -2184,7 +2238,11 @@ pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
-        Some(entry) => entry.stream.read(buf),
+        Some(entry) => match &mut entry.stream {
+            TlsClientStream::Native(stream) => stream.read(buf),
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => stream.read(buf),
+        },
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no such TLS stream id",
@@ -2200,7 +2258,11 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     }
     let mut reg = s2_registry().lock();
     match reg.tls_streams.get_mut(&id) {
-        Some(entry) => entry.stream.write(data),
+        Some(entry) => match &mut entry.stream {
+            TlsClientStream::Native(stream) => stream.write(data),
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => stream.write(data),
+        },
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no such TLS stream id",
@@ -2220,7 +2282,15 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
         // Best-effort: if the peer already closed the connection, shutdown
         // can legitimately return an error that should not surface as an
         // exception to Java-side callers.
-        let _ = entry.stream.shutdown();
+        match &mut entry.stream {
+            TlsClientStream::Native(stream) => {
+                let _ = stream.shutdown();
+            }
+            #[cfg(unix)]
+            TlsClientStream::LegacyDsa(stream) => {
+                let _ = stream.shutdown();
+            }
+        }
     }
     Ok(())
 }
