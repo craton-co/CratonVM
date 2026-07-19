@@ -2458,20 +2458,92 @@ is the defect -- all three, tested in isolation, behave identically to HotSpot.
 
 **Narrowed conclusion**: the defect is not in any of the *mechanisms* `GroovyScriptFactory` itself
 uses (script execution, result caching, reflective invocation) -- every one of those reproduces
-correctly outside a full `ApplicationContext`. It must be something specific to the FULL
-`ScriptFactoryPostProcessor` + internal `scriptBeanFactory` (`DefaultListableBeanFactory`)
-lifecycle that a minimal driver doesn't exercise: most likely that
-`this.scriptBeanFactory.getBean(scriptFactoryBeanName, ScriptFactory.class)` returns a
-**different `GroovyScriptFactory` object** at `postProcessBeforeInstantiation`/bean-creation time
-than the one `predictBeanType` populated earlier -- i.e. a singleton-identity or bean-caching bug
-in the internal child `BeanFactory` `ScriptFactoryPostProcessor` maintains, NOT in Groovy or
-reflection. **Concrete next step**: reproduce with `ScriptFactoryPostProcessor` +
-`DefaultListableBeanFactory` directly (register the two internal bean definitions exactly as
-`prepareScriptBeans` does, call `predictBeanType`-equivalent then the factory-method bean creation
-in sequence) and compare the two `getBean(scriptFactoryBeanName, ...)` calls' returned object
-*identities* (`==`, not just class) on CratonVM vs HotSpot -- if the identities differ where
-HotSpot's are equal, that IS the bug, and the fix would live in whatever CratonVM code path
-handles singleton-bean caching/identity for this specific nested-`BeanFactory` pattern.
+correctly outside a full `ApplicationContext`.
+
+**UPDATE, same session: the nested-`BeanFactory` singleton-identity hypothesis is ALSO REFUTED**,
+and so is a follow-up "the property-value cross-reference matters" variant, and -- critically --
+**so is the FULL, REAL `ScriptFactoryPostProcessor` running inside a REAL `ApplicationContext`
+for a single bean**:
+
+- A fourth probe (`BeanFactoryIdentityProbe.java`) built a real `DefaultListableBeanFactory`,
+  registered the exact two internal bean definitions `prepareScriptBeans` builds (factory bean +
+  factory-method bean with indexed constructor-arg values `[scriptSource, new Class<?>[0]]`), and
+  compared the `GroovyScriptFactory` singleton identity across a `predictBeanType`-mimicking
+  fetch and a later bean-creation-mimicking fetch: `f1 == f2` is `true` on both VMs, and the
+  factory-method bean resolves correctly. **Byte-identical to HotSpot.**
+- Extending that same probe to add the `<property name="message" ref="myMessage"/>` cross-
+  reference exactly as `createScriptedObjectBeanDefinition`'s `new GenericBeanDefinition(bd)` copy
+  constructor would carry it forward (a `myMessage` singleton `String` bean in the same factory,
+  `RuntimeBeanReference("myMessage")` on the `message` property) -- **still byte-identical to
+  HotSpot**, no `NullBean`, correct property injection.
+- A fifth probe (`FullPostProcessorProbe.java`) went one step further and used the REAL,
+  unmodified `org.springframework.scripting.support.ScriptFactoryPostProcessor` class, registered
+  as an actual `BeanPostProcessor` bean in a real `GenericApplicationContext`, with a single
+  `messengerInstanceInline`-equivalent bean (class `GroovyScriptFactory`, inline instance script,
+  `message` property referencing a sibling `myMessage` bean) plus `ctx.refresh()` driving the
+  entire real Spring bean-creation lifecycle (`predictBeanType`, `postProcessBeforeInstantiation`,
+  property population) -- exactly the production code path, unmodified. **`getBeanNamesForType`
+  correctly includes the bean and `getBean` correctly returns a live `GroovyMessenger`, identical
+  to HotSpot.** This is the single strongest result of the whole investigation: the *entire*
+  `ScriptFactoryPostProcessor` mechanism, for one bean, in a real refreshing `ApplicationContext`,
+  works correctly on CratonVM.
+
+**This changes the conclusion entirely**: the defect requires the **multi-bean XML context**
+(`groovyContext.xml` declares eight beans: `calculator`, `messenger`, `messengerPrototype`,
+`messengerInstance`, `messengerInstanceInline`, `myMessage`, `refreshableFactory`, `factory`) to
+manifest -- a single isolated `GroovyScriptFactory` bean, even driven by the exact real
+`ScriptFactoryPostProcessor`/`ApplicationContext` lifecycle, does not reproduce it. The defect
+requires the **multi-bean XML context** to manifest.
+
+**FOUND IT, same session: root cause identified via bisection, and it is the SAME class of bug as
+cluster #1** -- a same-simple-name class defined by two DIFFERENT `GroovyClassLoader$InnerLoader`
+instances within one process colliding through a loader-blind lookup, not a Spring integration
+bug at all.
+
+Bisecting `groovyContext.xml` down to a 3-bean minimal XML (`messengerInstance` +
+`messengerInstanceInline` + `myMessage`, no `<lang:...>` schema needed) via
+`ClassPathXmlApplicationContext` **reproduces the failure exactly**: `getBeanNamesForType` returns
+only `[messengerInstance]` (missing `messengerInstanceInline`), and `getBean("messengerInstanceInline")`
+throws the same `BeanPostProcessor before instantiation of bean failed`. Removing either bean
+makes it pass (matches the single-bean probes above, which is why they never reproduced it).
+
+**The two Groovy scripts in this minimal repro both declare a class literally named
+`GroovyMessenger`** -- `MessengerInstance.groovy` (`class GroovyMessenger implements Messenger {
+GroovyMessenger() { println "GroovyMessenger" } ... }`) and the inline script (`class
+GroovyMessenger implements Messenger { ... }`) -- compiled under two DIFFERENT
+`GroovyClassLoader$InnerLoader` instances (one per `GroovyScriptFactory`/script source, exactly as
+established in cluster #1). **Confirmed decisively**: editing the bisect XML's inline script to
+declare `class GroovyMessengerRenamed` instead (same file, same structure, only the class name
+changed) makes the 3-bean repro **pass cleanly** -- `getBeanNamesForType` includes both beans,
+`getBean` succeeds. The class-name collision across independent `InnerLoader` namespaces -- not
+Groovy's script/instance mechanism, not `CachedResultHolder`, not reflection, not bean-factory
+identity, all four already individually confirmed fine above -- is the actual defect. This is
+architecturally the same shape as cluster #1's now-fixed bug (a same-named class defined under
+two different `GroovyClassLoader$InnerLoader`s colliding through a loader-blind fallback lookup
+somewhere in the resolution chain) but triggered through a DIFFERENT call path: cluster #1's fix
+(checking `find_loaded_class_for_loader` before `Class.forName`'s `invoke_virtual` dispatch) does
+**not** fix this one -- this binary (`cratonvm-groovyfix2-20260719`, built from the committed
+`d718d7b1b` fix) still reproduces it -- so the collision here happens somewhere INSIDE
+`GroovyClassLoader.parseClass()`'s own compile-and-define machinery (real Groovy bytecode calling
+some native `ClassLoader`/`Class` operation to register or look up the class it just compiled),
+not through the `Class.forName(name, init, explicitLoader)` path cluster #1's fix covers.
+
+**Concrete next step for a follow-up session** (this should be a fast, well-scoped fix once
+found): reproduce with the minimal 3-bean XML above (`groovyContextBisectA.xml`-equivalent,
+reproducible with any two `GroovyScriptFactory` beans whose scripts declare a same-named class),
+trace exactly which native call inside `GroovyClassLoader.parseClass()` -> Groovy's compiler ->
+class-definition-and-registration sequence is consulting a loader-blind (rather than
+per-`InnerLoader`-scoped) class lookup -- candidates in rough likelihood order: (1) Groovy's own
+`GroovyClassLoader.defineClass(ClassNode, String, String)` or its class-collector step calling
+`Class.forName`/`loadClass` internally to hand back the compiled `Class` object by name, hitting
+the same `find_class_by_name` ambiguity-refusal fallback described in cluster #1 (in which case
+extending cluster #1's `find_loaded_class_for_loader`-first fix to whatever native backs this
+specific call site should close it identically); (2) the class VERIFICATION/linking step during
+`define_class_full` doing a global (not per-loader) duplicate-name check and rejecting/aliasing
+the second definition. `CRATONVM_S111_DBG`-style tracing (see cluster #1's methodology) on the
+`parseClass` call for the SECOND script, watching for any `Class.forName`/`loadClass`/
+`find_class_by_name` invocation for the literal name `org/springframework/scripting/groovy/
+GroovyMessenger`, is the fastest way to nail the exact site.
 
 ### 6 found=0 ABEND cluster — reconciled
 
