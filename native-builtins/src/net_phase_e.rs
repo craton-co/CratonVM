@@ -4528,9 +4528,15 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
     } else {
         return Err(format!("unsupported URL: {url}"));
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // A query may immediately follow the authority (`http://host:port?x`)
+    // without a slash. Treat it as a request for `/?x`, rather than letting
+    // `?x` leak into the port text. Spring's JdkClientHttpRequest uses this
+    // form for TestRestTemplate requests with query-only paths.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -4546,7 +4552,7 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
         }
         None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path.to_string(), userinfo))
+    Ok((scheme, host, port, path, userinfo))
 }
 
 fn http_perform_request(
