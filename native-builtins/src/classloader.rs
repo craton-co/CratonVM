@@ -1794,10 +1794,12 @@ fn cl_load_class_base_delegation(
     // entries deliberately are not appended to the process-wide application
     // path, because that would make one temporary loader's classes and
     // resources visible to another.
-    if object_extends(ctx, this, "java/net/URLClassLoader") {
-        if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
-            return result;
-        }
+    // Some real-JDK subclasses do not expose their inherited
+    // URLClassLoader identity through `object_extends` during native
+    // dispatch. The helper is a no-op for receivers without recorded URLs,
+    // so probe it directly rather than dropping their isolated path.
+    if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
+        return result;
     }
 
     // 4. Custom-classloader extension point. The JVM `ClassLoader.loadClass`
@@ -4594,16 +4596,18 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // (path) is just `/X/foo.jar` (or on Windows `/C:/X/foo.jar`). To
     // distinguish the two cases we consult the FULL spec (slot 5) first
     // when present, so we know whether to keep the JAR-internal suffix.
-    let full_spec = if let Value::Object(Some(full_ref)) = ctx.get_field(url_obj, 5) {
-        ctx.read_string(full_ref)
-    } else {
-        None
+    // Real-JDK URL objects expose these as named instance fields.  Reading
+    // only the synthetic numeric slots loses constructor URLs for ordinary
+    // URLClassLoader instances and makes their local class path appear empty.
+    let read_field = |name: &str, slot: usize| match ctx.get_field_by_name(url_obj, name) {
+        Value::Object(Some(value)) => ctx.read_string(value),
+        _ => match ctx.get_field(url_obj, slot) {
+            Value::Object(Some(value)) => ctx.read_string(value),
+            _ => None,
+        },
     };
-    let path_field = if let Value::Object(Some(path_ref)) = ctx.get_field(url_obj, 3) {
-        ctx.read_string(path_ref)
-    } else {
-        None
-    };
+    let full_spec = read_field("file", 5);
+    let path_field = read_field("path", 3);
 
     // Pick the most descriptive string: if the path field encodes the
     // `!/<prefix>/` shape (which `build_synthetic_url` does — see
@@ -4617,7 +4621,11 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // Normalise: strip a leading `jar:` (so `jar:file:/X!/sub/` collapses
     // to `file:/X!/sub/`), then strip the `file:` scheme. We keep the
     // `!/<prefix>/` suffix intact for `ClassPath::add_path` to interpret.
-    let p = raw.strip_prefix("jar:").unwrap_or(&raw).to_string();
+    let p = raw
+        .strip_prefix("jar:")
+        .or_else(|| raw.strip_prefix("nested:"))
+        .unwrap_or(&raw)
+        .replace("/!", "!/");
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the

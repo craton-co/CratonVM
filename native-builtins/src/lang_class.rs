@@ -13323,7 +13323,9 @@ pub(crate) fn native_class_get_package_name(
 // ---------------------------------------------------------------------------
 
 /// Read a manifest attribute by name from the class's source jar, if any.
-/// Returns `None` for classes loaded from a directory or the boot path.
+/// Returns `None` for classes loaded from the boot path. For Spring Boot
+/// exploded archives, classes under `BOOT-INF/classes` and `WEB-INF/classes`
+/// inherit the enclosing archive root's manifest.
 ///
 /// Supports three CodeSource URL forms:
 ///   * `file:/C:/.../foo.jar`                              вЂ” plain jar
@@ -13392,10 +13394,33 @@ fn t19_h10_class_manifest_attr(
     } else {
         std::path::PathBuf::from(format!("/{}", path))
     };
-    if !path.is_file() {
+    if path.is_file() {
+        return plain_jar_manifest_attr(&path, attr);
+    }
+    spring_boot_exploded_manifest_attr(&path, attr)
+}
+
+/// Spring Boot's exploded launcher gives its URLClassLoader
+/// `.../BOOT-INF/classes` (or `WEB-INF/classes`) as the class path entry, but
+/// package metadata is defined from the archive root's `META-INF/MANIFEST.MF`.
+/// A plain directory has no such inheritance, so restrict this lookup to the
+/// two Boot layouts rather than searching arbitrary parent directories.
+fn spring_boot_exploded_manifest_attr(path: &std::path::Path, attr: &str) -> Option<String> {
+    if !path.is_dir() || path.file_name()?.to_string_lossy() != "classes" {
         return None;
     }
-    plain_jar_manifest_attr(&path, attr)
+    let layout_dir = path.parent()?;
+    let layout = layout_dir.file_name()?.to_string_lossy();
+    if layout != "BOOT-INF" && layout != "WEB-INF" {
+        return None;
+    }
+    let manifest = layout_dir.parent()?.join("META-INF").join("MANIFEST.MF");
+    let contents = std::fs::read_to_string(manifest).ok()?;
+    let wanted = attr.to_ascii_lowercase();
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (name.trim().eq_ignore_ascii_case(&wanted)).then(|| value.trim().to_string())
+    })
 }
 
 /// Cache of parsed plain-jar manifests keyed by canonicalised path string.
