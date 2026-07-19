@@ -2758,6 +2758,32 @@ pub(crate) fn rustls_server_wrap_existing_socket(
             stream.conn.wants_write()
         );
     }
+    // FIX (mockwebserver-taskqueue-shutdown): this stream's reads (via
+    // `rustls_stream_read`, both for the request that follows this handshake
+    // and any later HTTP/1.1 keep-alive request on the same connection) had
+    // no read timeout at all — unlike `rustls_server_accept`'s 30s, set
+    // before ITS handshake. A caller like MockWebServer's `SocketHandler`
+    // (`mockwebserver3`/`okhttp3.mockwebserver`) loops reading a next
+    // request after every response to support keep-alive; if the client
+    // (e.g. Reactor Netty, which pools connections rather than closing them
+    // eagerly) never sends one, that read blocks forever, so the
+    // connection's background task never finishes and `MockWebServer.close()`
+    // — which only waits 5s per task queue for an idle signal before
+    // throwing `AssertionError: Gave up waiting for queue to shut down` —
+    // reliably times out. 3s: (a) short enough that even the worst-case
+    // "response just sent, close() called immediately after" race (the
+    // common case in these tests — there's no deliberate delay between
+    // receiving the response and the test's `try`-block exit) leaves >1.5s
+    // of slack inside the 5s budget for the resulting IOException to
+    // propagate, get caught by `SocketHandler.handle()`'s own
+    // `catch (IOException)` (logged at FINE, not rethrown), and the task to
+    // signal idle; (b) generous enough to not false-trigger on genuine
+    // in-flight traffic — this is a loopback socket, so read latency for
+    // data the peer already sent is bounded by OS scheduling, not network
+    // RTT, and every handshake+request cycle observed in this investigation
+    // (`CRATONVM_DBG_TLS_SRV`-traced) completed in well under 100ms even on
+    // this heavily shared, contended build host.
+    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
     let negotiated_protocol = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",

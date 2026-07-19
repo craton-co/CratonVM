@@ -167,7 +167,7 @@ open each doc for the full picture):
 | [`security-saml2-package-version-npe-and-x509key-unknown-algo.md`](security-saml2-package-version-npe-and-x509key-unknown-algo.md) | OPEN — found 2026-07-17 |
 | [`servletcomponentscanintegrationtests-missing-registration.md`](servletcomponentscanintegrationtests-missing-registration.md) | OPEN — found 2026-07-17, not root-caused |
 | [`spring-boot-cloudfoundry-rerun-20260717-FIXED.md`](../../internal/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md) | FIXED — 2026-07-19; skip-SSL-verification honored, `$Proxy` livelock resolved (side effect of the same TLS bridge fixes) |
-| [`spring-boot-cloudfoundry-mockwebserver-taskqueue-shutdown.md`](spring-boot-cloudfoundry-mockwebserver-taskqueue-shutdown.md) | OPEN — found 2026-07-19; new residual uncovered by the fix above, `MockWebServer.close()` teardown assertion, not a TLS defect |
+| [`spring-boot-cloudfoundry-mockwebserver-taskqueue-shutdown-FIXED.md`](../../internal/springboot/spring-boot-cloudfoundry-mockwebserver-taskqueue-shutdown-FIXED.md) | FIXED — 2026-07-19; server-wrap TLS socket now has a bounded keep-alive read timeout so `MockWebServer.close()`'s 5s idle-queue wait no longer times out |
 | [`spring-boot-configuration-processor-testcompiler-hang-cluster.md`](spring-boot-configuration-processor-testcompiler-hang-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-devtools-residual-fails-cluster.md`](spring-boot-devtools-residual-fails-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-health-rerun-20260717.md`](spring-boot-health-rerun-20260717.md) | OPEN — found 2026-07-17 |
