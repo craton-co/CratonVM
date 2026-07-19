@@ -1,6 +1,15 @@
 # `@Nested` class construction fails under an isolated `ModifiedClassPathClassLoader` — outer-instance argument type mismatch
 
-**Status: OPEN — found 2026-07-19, residual of [`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](../../internal/springboot/modifiedclasspath-aether-network-hang-cluster-FIXED.md)**
+**Status: FIXED — resolved 2026-07-19, same day as filed.** Residual of
+[`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](modifiedclasspath-aether-network-hang-cluster-FIXED.md).
+Filed as OPEN after observing the failure against a binary built before
+merging ~106 commits of `origin/dev` drift into the fix branch; after that
+merge (which pulled in unrelated, already-landed fixes from other concurrent
+sessions working the same repo) and a rebuild, `ConnectionFactoryUnwrapperTests`
+passes **12/12** including `Unwrap.unwrapWithoutJmsPoolOnClasspath()`. Not
+independently root-caused — resolved as a side effect of the drift merge,
+exact fixing commit not identified. Kept here (rather than deleted) as a
+record of the symptom and hypothesis in case it regresses.
 
 ## Symptom
 

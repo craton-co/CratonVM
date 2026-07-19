@@ -5681,7 +5681,13 @@ fn native_quarkus_logging_handle_failed_start(
 /// class file, breaking real in-process javac compiles (Spring's
 /// `TestCompiler`/AOT generation) referencing any application-classpath
 /// class.
-pub(crate) fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+///
+/// Also called (as `pub`, cross-crate) from `vm/src/runtime/invokedynamic.rs`'s
+/// `value_to_string` — the same dead-dispatch gap exists in the
+/// `invokedynamic`/`StringConcatFactory` bootstrap for `"literal" + aPath`
+/// string concatenation (a third call site bypassing the interpreter's
+/// force-native gates, distinct from the `javac` one above).
+pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     let p = p57_read_path(ctx, this);
     match vfs_decode(&p) {
         // jar-FS / jrt-FS Path.toString() shows the in-archive entry with

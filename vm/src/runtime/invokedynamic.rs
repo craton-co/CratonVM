@@ -1635,6 +1635,29 @@ fn value_to_string(
             if let Some(t) = thread {
                 let mut ctx = NativeContextImpl { shared, thread: t };
                 use cratonvm_native_api::NativeContext;
+
+                // `java.nio.file.Path` is a genuine interface with no `toString()`
+                // body of its own; `ctx.invoke_virtual` below doesn't consult
+                // `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+                // `check_override` allow-list the way the bytecode interpreter's
+                // own `invokevirtual` handling does, so it silently resolves to
+                // `Object.toString()` here too (`java.nio.file.Path@<hash>`) for
+                // `"literal" + aPath` string concatenation. Same family as
+                // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+                // a third, distinct call site. Route through the same
+                // display-string helper the registered `Path.toString()` native
+                // itself uses, bypassing `invoke_virtual` entirely for this type.
+                let obj_class_id = shared.heap.class_id_of(*obj_ref);
+                if shared
+                    .class_manager
+                    .read()
+                    .is_subclass_of_by_name(obj_class_id, "java/nio/file/Path")
+                {
+                    return cratonvm_native_builtins::phases_late::p57_path_display_string(
+                        &mut ctx, *obj_ref,
+                    );
+                }
+
                 match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(str_ref)))) => {
                         return ctx

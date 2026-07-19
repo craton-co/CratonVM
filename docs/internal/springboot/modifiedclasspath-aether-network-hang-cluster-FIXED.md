@@ -518,17 +518,23 @@ harness, real classpaths, not mocks):
   and residual docs below; this doc is retired to `docs/internal/springboot/`
   with this fix.
 
-**3 residuals filed separately** (per this repo's known-issues triage rule —
-fixed goes to `docs/internal`, residuals get their own open doc so they don't
-block retiring this one):
+**3 residuals filed separately, all since independently resolved by dev
+drift** (per this repo's known-issues triage rule — fixed goes to
+`docs/internal`, residuals get their own open doc so they don't block
+retiring this one). Filed as OPEN against a binary built before merging
+~106 commits of `origin/dev` into the fix branch; after that merge (pulling
+in unrelated fixes already landed by other concurrent sessions) and a
+rebuild, all 3 were re-verified passing and moved to `docs/internal` too —
+kept as records of the symptoms/hypotheses rather than deleted, in case any
+regress:
 
-1. [`connectionfactoryunwrappertests-nested-outer-instance-identity.md`](connectionfactoryunwrappertests-nested-outer-instance-identity.md) —
+1. [`connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md`](connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md) —
    `ConnectionFactoryUnwrapperTests.Unwrap.unwrapWithoutJmsPoolOnClasspath()`
    (a `@Nested` class under a method-level `@ClassPathExclusions`) fails with
    `IllegalArgumentException: argument type mismatch` constructing the nested
    class's outer-instance reference. Narrow (only 1 of the ~29 affected
    classes in this cluster combines `@Nested` with `@ClassPathExclusions`).
-2. [`isolated-loader-onbeancondition-type-deduction-bypass.md`](isolated-loader-onbeancondition-type-deduction-bypass.md) —
+2. [`isolated-loader-onbeancondition-type-deduction-bypass-FIXED.md`](isolated-loader-onbeancondition-type-deduction-bypass-FIXED.md) —
    `OnBeanConditionTypeDeductionFailureTests` expects a `NoClassDefFoundError`
    from a class-path-excluded `jackson-core` when `ObjectMapper` is
    constructed via real `@Bean` method bytecode; on CratonVM the construction
@@ -543,7 +549,7 @@ block retiring this one):
    resolution failures below — plausibly all downstream of the same
    classloader-identity-split family as the now-fixed recursion bug, but not
    confirmed to share a single mechanism.
-3. [`isolated-loader-objectprovider-generic-identity-mismatch.md`](isolated-loader-objectprovider-generic-identity-mismatch.md) —
+3. [`isolated-loader-objectprovider-generic-identity-mismatch-FIXED.md`](isolated-loader-objectprovider-generic-identity-mismatch-FIXED.md) —
    `JerseyChildManagementContextConfigurationTests` (5/6 methods),
    `SecurityFilterAutoConfigurationEarlyInitializationTests`,
    `ManagementWebSecurityAutoConfigurationTests`, and
@@ -555,11 +561,17 @@ block retiring this one):
    registered bean definition's type, both nominally the same class loaded
    through the isolated loader.
 
-The full regression sweep (all ~29 classes) was still running as a background
-task at the time this doc was retired; see the residual docs above for the
-specific failures already captured, and check
-`apps/spring-boot-suite-runner` results for the complete before/after picture
-if further classes in the "Affected classes" table below need triage.
+A full regression sweep across all ~29 classes in the "Affected classes"
+table below (post dev-drift-merge binary) confirmed every class that
+previously HUNG now completes; every class-level failure this doc's fix
+work directly investigated (the 3 residuals above, plus
+`WebMvcEndpointManagementContextConfigurationTests`,
+`OAuth2AuthorizationServerAutoConfigurationTests`, and
+`ValidationAutoConfigurationWithHibernateValidatorMissingElImplTests`, which
+surfaced single-test failures mid-sweep before the drift merge) passed
+cleanly once re-run against the post-merge binary — consistent with the
+residuals above being resolved by the same unrelated upstream fixes, not
+independently re-verified one-by-one for these last 3.
 
 ## Affected classes
 
