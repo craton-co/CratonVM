@@ -771,6 +771,72 @@ the WRONG same-named copy. Eight fixes landed on
     baseline noise (see the `ApplicationContextAotGeneratorTests`
     2026-07-17 third-reverification entry above for the same baseline
     signature) — zero failures touch exception dispatch or classloading.
+
+    **2026-07-19 addendum — REGRESSED then RE-FIXED via a third, unrelated
+    bug (StackWalker self-referential-`<clinit>` frame resolution).** A
+    later session re-ran this class fresh (real JDK 25, from-scratch
+    `spring-orm` classpath, current `dev` tip at the time) expecting the
+    documented 8/8 and instead got `found=8 succ=1 fail=7`, ALL 7 with
+    `ExceptionInInitializerError` on `SpringFactoriesLoader`/
+    `EntityManagerFactoryUtils` `<clinit>` — a shape never seen in any prior
+    entry for this class, unrelated to the cold-attach/ByteBuddy-generics/
+    AssertJ-catch-type bugs above (all three of which stayed fixed and did
+    NOT reproduce). Root cause: both classes call
+    `LogFactory.getLog(SomeClass)` from their own static initializers;
+    commons-logging's `Log4jApiLogFactory` (when it selects the
+    context-aware `LogAdapter`, which needs the full Spring/JUnit bootstrap
+    to trigger — a minimal isolated repro calling `LogFactory.getLog()`
+    outside that context, even on the identical classpath, always got the
+    simpler `Log4j2Log` instead and never reproduced this) uses log4j-api's
+    `StackLocator`, which walks the stack via `StackWalker.walk(...)
+    .dropWhile(frame -> frame.getDeclaringClass().equals(...))` — and the
+    very first frame in that walk is the class whose `<clinit>` is
+    CURRENTLY RUNNING (i.e. it walks back to see its own frame).
+    `getDeclaringClass()` returned Java `null` for exactly that
+    self-referential frame, NPE'ing inside the `dropWhile` predicate.
+
+    The underlying VM bug: a stack frame's declaring class was captured as
+    a STRING NAME at stack-capture time, and every `getDeclaringClass()`
+    implementation re-resolved that name to a `ClassId` LATER, on demand,
+    via a global by-name lookup — unreliable for a class whose own
+    `<clinit>` is still executing on the same thread doing the walk, even
+    though the class is unquestionably loaded. Three independent,
+    near-duplicate `getDeclaringClass()`-family implementations shared this
+    fragility (`native-builtins/src/lang_stackwalker.rs`'s
+    `declaring_class_native` and a sibling closure backing
+    `java/lang/StackFrameInfo`, plus `native-builtins/src/phases_late.rs`'s
+    `register_p59_stackwalker`, backing the separate synthetic
+    `java/lang/StackWalker$StackFrame` class that `StackWalker.walk()`
+    actually dispatches through and the one this bug's frames went
+    through).
+
+    **Fixed** by threading the frame's own `ClassId` through directly
+    instead of round-tripping it via a name: `StackTraceEntry` (native-api/
+    src/registry.rs) gained a `class_id: Option<ClassId>` field, populated
+    directly from the live interpreter `Frame`'s own `class_id` at capture
+    time (`vm/src/runtime/stackwalker.rs`) — always valid for a real frame,
+    no lookup involved. `populate_stack_frame` (`phases_late.rs`, the
+    actively-dispatched path) now eagerly resolves and stores the `Class`
+    mirror using that ClassId at frame-population time (a new slot 6,
+    bumping the synthetic `StackFrame` class from 6 to 7 fields);
+    `getDeclaringClass()` just reads it back, no runtime lookup at all.
+    `populate_sfi` (`lang_stackwalker.rs`, the parallel dormant
+    implementation) got the same ClassId preference plus a fallback to its
+    existing `classOrMemberName` field for full consistency.
+
+    Verified: `found=8 succ=8 fail=0` again, confirmed on the
+    then-current `dev` tip after two further merge-and-reverify rounds
+    (picking up an unrelated concurrent `Class.forName` loader-namespace
+    fix and a dead-thread-owned-monitor fix along the way, neither of which
+    affected this result). `cargo test -p cratonvm-native-builtins --lib
+    --release`: 3033 passed / 2 failed (both pre-existing on a clean
+    `origin/dev` tip, confirmed via an isolated-worktree A/B —
+    `jca::key_factory`/`phases_late::p57_win_path_tests`, unrelated to
+    StackWalker or this class). `cargo test -p cratonvm-vm --lib
+    --release`: 2210 passed / 17 failed, all matching the documented
+    pre-existing `jit::skip_list`/`runtime::lock_order`/
+    `buffered_input_stream_real_jdk_uses_its_own_bytecode` release-mode
+    baseline. Landed on `dev` at `61dbe35e6`.
 *   ~~ByteBuddy repeat-redefine `NoSuchMethodError` family~~ **FIXED
     (2026-07-16, commit `c812b622`, merged to dev as `a2515075`).**
     Standalone repro (`BBProbe4.java`,
