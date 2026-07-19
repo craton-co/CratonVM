@@ -67,18 +67,31 @@ essentially the entire Lucene surface these tests run through (`Sorter`,
 correctness-driven ban (a JIT-vs-postings corruption bug), not a bug in the
 tiering mechanism itself.
 
-**Investigated whether that ban was still needed** — it was not. Re-ran the
-ban's own original repro plus much broader coverage (see
-`vm/src/jit/skip_list.rs`'s `LUCENE-POSTINGS.1` comment for the full
-verification log) with the ban lifted: zero corruption across ~1400s of
-Lucene-JIT-compiled execution. **Removed the ban** (this doc's session) —
-a real, independently valuable correctness fix (Lucene is one of the most
-exercised packages in the ES suite), but **it did NOT meaningfully speed up
-`testSlicesDense`**: 602.591s with the ban lifted vs. 602.662s interpreted
-— noise-level difference, both still cut short by the test's own 580s
-suite timeout. So this was never the dominant cost driver for *this*
-specific test, even though removing it is real progress for the JIT
-generally.
+**Investigated whether that ban was still needed — ban stays, but not for
+the reason initially thought.** Re-ran the ban's own original repro plus
+much broader coverage (see `vm/src/jit/skip_list.rs`'s `LUCENE-POSTINGS.1`
+comment for the full verification log) with the ban lifted: zero
+corruption across ~1400s of Lucene-JIT-compiled execution, and (separately)
+lifting it did NOT meaningfully speed up `testSlicesDense` (602.591s vs.
+602.662s interpreted — noise-level, both cut short by the test's own 580s
+suite timeout). Based on that evidence the ban was removed and merged with
+same-day `origin/dev` commits — but the very next verification run,
+immediately post-merge, hit a NEW `EXCEPTION_STACK_OVERFLOW` crash in
+`GenerationalHeap::get_field`. **Turned out to be unrelated to this whole
+investigation**: confirmed the SAME crash reproduces on a byte-for-byte
+clean, unmodified `origin/dev` build with the ban fully in place (default
+config) — a genuine, pre-existing `dev` regression that had nothing to do
+with Lucene/JIT, just discovered by coincidence while testing it. See
+[`ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`](ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md)
+for the full writeup — flagged as a higher-priority, separate issue (it's
+not gated behind any opt-in flag). The Lucene ban itself was left in its
+original (banned) state since lifting it never showed a performance
+benefit for this test — no reason to carry the extra unproven-safety risk
+alongside an already-serious unrelated crash. **This specific performance
+lead is closed** (the ban was never the dominant cost driver for
+`testSlicesDense`, so there's no more upside in chasing it further here)
+— any future work on the `get_field` stack overflow itself belongs in its
+own investigation, not this doc.
 
 **Finding 2** (not investigated further, real risk if touched): the
 *separate* `java/util/*` package ban in the same skip list (a documented

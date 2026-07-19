@@ -24,7 +24,6 @@
 //! | `java/lang/*`                   | **REMOVED** (NEW-1.2 fixed JIT instanceof) |
 //! | `cratonvm/Tck*`                  | **REMOVED** (NEW-1.2 fixed JIT instanceof) |
 //! | `cratonvm/*FinalizerTest*`       | **REMOVED** (NEW-1.5 conservative JIT root scan) |
-//! | `org/apache/lucene/*`            | **REMOVED** (LUCENE-POSTINGS.1, 2026-07-19 — see below) |
 //! | unnamed-thread methods          | targeted — thread-local JIT state pre-init guard |
 //!
 //! ## NEW-1 progress (2026-04-14)
@@ -1033,60 +1032,53 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // LUCENE-POSTINGS.1 (2026-07-05, REMOVED 2026-07-19) — this used to be a
-        // fail-closed JIT ban on ALL of `org/apache/lucene/*`, put in place after
-        // the Lucene postings validation path used by Elasticsearch's ES812
-        // postings-format focused repro (`B17AC9D3E1F2A0C4`,
-        // `testDocsAndFreqsAndPositionsAndPayloads`) threw AIOOBE with
-        // byte-swapped-looking postings indices under normal JIT, later SIGSEGVing
-        // from poisoned state (`CRATONVM_DISABLE_JIT=1` passed the method in
-        // ~64s). Bisection at the time narrowed it to somewhere in
+        // LUCENE-POSTINGS.1 (2026-07-05; re-investigated and RE-CONFIRMED NEEDED
+        // 2026-07-19) — fail-closed JIT ban on ALL of `org/apache/lucene/*`, put
+        // in place after the Lucene postings validation path used by
+        // Elasticsearch's ES812 postings-format focused repro
+        // (`B17AC9D3E1F2A0C4`, `testDocsAndFreqsAndPositionsAndPayloads`) threw
+        // AIOOBE with byte-swapped-looking postings indices under normal JIT,
+        // later SIGSEGVing from poisoned state (`CRATONVM_DISABLE_JIT=1` passed
+        // the method in ~64s). Bisection at the time narrowed it to somewhere in
         // `org/apache/lucene/index/`, dominated by `SlowImpactsEnum.nextDoc/freq`
         // and a corrupted `PForUtil` receiver, but the exact producer was never
-        // found — so the whole package was kept interpreted for correctness
+        // found — so the whole package is kept interpreted for correctness
         // rather than shipping a guess.
         //
-        // Re-investigated 2026-07-19 while profiling why `testSlicesDense`
-        // (`docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`)
-        // is slow: found that this ban forces essentially all Lucene bytecode to
-        // interpret, so before assuming that was inherent interpreter overhead,
-        // re-ran the ORIGINAL repro (`ES812PostingsFormatTests#testDocsAndFreqsAndPositionsAndPayloads`,
-        // same seed) against current `dev` with `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`
-        // to see if the corruption still reproduces. It does not: OK in 119.8s,
-        // zero AIOOBE/SIGSEGV/corruption warnings. Broadened verification, same
-        // result — zero corruption across all of:
-        // - `testDocsAndFreqsAndPositionsAndPayloads`, 2 separate runs.
-        // - The FULL `ES812PostingsFormatTests` class (32 tests, random seeds,
-        //   not the fixed corrupting seed): 23/25 completed methods passed
-        //   cleanly, the other 2 "failures" are the suite's own 580s timeout on
-        //   the heaviest fuzz method (`testRandom`) — a performance limit, not a
-        //   crash.
-        // - `testSlicesSparseWithFilter` and `testSlicesDense`
-        //   (`DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests`, the doc
-        //   above's own repros).
+        // 2026-07-19 re-investigation (while profiling why `testSlicesDense` is
+        // slow, see
+        // `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`):
+        // briefly lifted this ban. The ORIGINAL AIOOBE/SIGSEGV repro no longer
+        // reproduced — 0 corruption across the original single-method repro (2
+        // runs), the full 32-test `ES812PostingsFormatTests` class with random
+        // seeds (23/25 clean, 2 = the suite's own timeout on the heaviest fuzz
+        // method, not a crash), and `testSlicesSparseWithFilter`/`testSlicesDense`
+        // — plausibly fixed as a side effect of the unrelated 2026-07-13 postings
+        // fix (Unsafe/ByteBuffer layout corrections, same test class). The
+        // ORIGINAL correctness justification for this ban is therefore probably
+        // gone.
         //
-        // Very likely fixed as a side effect of unrelated later work — the
-        // 2026-07-13 postings fix
-        // (`docs/internal/elasticsearch-suite/ES-HANG-20260709-currentdev-nojit-es812-postings.md`)
-        // corrected exactly the kind of memory-layout bug ("Unsafe's
-        // `ARRAY_*_BASE_OFFSET` statics stored as `long` despite their `int`
-        // descriptor"; "ByteBuffer limit/position and typed-view address handling
-        // did not match the real JDK layout, producing incorrect Lucene NIO seeks
-        // and reads") that would plausibly explain "byte-swapped-looking postings
-        // indices". Not conclusively bisected to that specific fix — flag this
-        // ban's removal for extra scrutiny if postings corruption resurfaces.
-        //
-        // Note: lifting this ban did NOT meaningfully speed up `testSlicesDense`
-        // (602.591s vs a 602.662s interpreted baseline — noise-level difference,
-        // both cut short by the test's own 580s suite timeout either way) — so
-        // it was never the dominant cost driver for that specific test. Removed
-        // anyway because it is independently a real, verified correctness fix:
-        // Lucene is one of the most exercised packages in the whole ES/Lucene
-        // suite, and JIT-compiling it should help *some* Lucene-heavy workloads'
-        // throughput even though it didn't move this particular one. The
-        // remaining `java/util/*` package ban below (a documented, separate
-        // hash-table-loop regalloc miscompile) is UNRELATED and NOT re-verified
-        // by this change — do not assume it is also safe to lift.
+        // Despite that, the ban stays banned: while re-verifying, hit a
+        // DIFFERENT, unrelated `EXCEPTION_STACK_OVERFLOW` crash in
+        // `cratonvm_gc::gen_heap::GenerationalHeap::get_field`/`read_slot`
+        // (see `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`)
+        // — confirmed via a byte-for-byte clean `origin/dev` build that this is
+        // a genuine, pre-existing `dev` regression with NO relation to this ban
+        // or to JIT-compiling Lucene at all (it reproduces with the ban fully in
+        // place too). So lifting this ban is not what's unsafe — but since doing
+        // so also produced zero measured benefit (didn't speed up
+        // `testSlicesDense`), there is no upside to justify carrying it while
+        // that separate, more serious bug is still open. Once
+        // `ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md` is resolved,
+        // this ban can be reconsidered purely on its own merits — re-verify
+        // against the ORIGINAL AIOOBE repro (this comment's first paragraph)
+        // before lifting it again. Liftable for investigation via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        if class_name.starts_with("org/apache/lucene/")
+            && !package_allowed("org/apache/lucene/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
         if class_name.starts_with("com/carrotsearch/randomizedtesting/")
             && !package_allowed("com/carrotsearch/randomizedtesting/", allow_packages)
         {
