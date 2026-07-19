@@ -1484,7 +1484,11 @@ fn native_service_controller_set_mode(
             }
         };
         ctx.set_field(this, SC_FIELD_MODE, Value::Int(new_mode.ordinal()));
-        ctx.set_field(this, SC_FIELD_STATE, Value::Int(ServiceState::Removed.ordinal()));
+        ctx.set_field(
+            this,
+            SC_FIELD_STATE,
+            Value::Int(ServiceState::Removed.ordinal()),
+        );
         if removed {
             fire_lifecycle_event_all(ctx, id, "REMOVED");
         }
@@ -4523,7 +4527,10 @@ mod tests {
         // natives (whose slot-5 controller ID is not in its two-field layout).
         let delegating = "org/jboss/msc/service/DelegatingServiceController";
         for (method, descriptor) in [
-            ("getState", "()Lorg/jboss/msc/service/ServiceController$State;"),
+            (
+                "getState",
+                "()Lorg/jboss/msc/service/ServiceController$State;",
+            ),
             ("getService", descriptor),
             ("getName", "()Lorg/jboss/msc/service/ServiceName;"),
         ] {

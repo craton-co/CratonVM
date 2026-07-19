@@ -423,13 +423,16 @@ pub fn movable_jit_root_count() -> usize {
 // deposit) is safe — it only keeps a region out of one CSet.
 
 static PINNED_JIT_ROOTS_BY_THREAD: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>,
+    >,
 > = std::sync::OnceLock::new();
 
-fn pinned_jit_map(
-) -> &'static std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>>
-{
-    PINNED_JIT_ROOTS_BY_THREAD.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn pinned_jit_map() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::thread::ThreadId, std::collections::HashSet<usize>>,
+> {
+    PINNED_JIT_ROOTS_BY_THREAD
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// TLS guard: removes this thread's pin-registry entry when the thread exits,
@@ -468,7 +471,9 @@ pub fn clear_pinned_jit_roots() {
 pub fn add_pinned_jit_root(addr: usize) {
     arm_pinned_guard();
     if let Ok(mut map) = pinned_jit_map().lock() {
-        map.entry(std::thread::current().id()).or_default().insert(addr);
+        map.entry(std::thread::current().id())
+            .or_default()
+            .insert(addr);
     }
 }
 
