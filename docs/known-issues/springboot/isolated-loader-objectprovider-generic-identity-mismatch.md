@@ -62,6 +62,35 @@ consistent with resolution-path inconsistencies specific to isolated
 `URLClassLoader`s that weren't exercised (or weren't distinguishable from a
 total hang) before that fix.
 
+## Related: `@ClassPathOverrides`-triggered annotation-presence failure (same family, different mechanism)
+
+`module/spring-boot-liquibase`'s `Liquibase423AutoConfigurationTests`
+(`@ClassPathOverrides("org.liquibase:liquibase-core:4.23.1")`, an Aether
+dependency-download override rather than a plain exclusion) fails
+differently but in the same "isolated loader + reflection" family:
+
+```
+java.lang.IllegalStateException: No ConfigurationProperties annotation found on
+'org.springframework.boot.liquibase.autoconfigure.LiquibaseProperties'.
+	at org.springframework.util.Assert.state(Assert.java:102)
+	at org.springframework.boot.context.properties.ConfigurationPropertiesBeanRegistrar.registerBeanDefinition(...)
+```
+
+`LiquibaseProperties` genuinely is annotated `@ConfigurationProperties` in
+source — `Class.isAnnotationPresent(ConfigurationProperties.class)` (or the
+`MergedAnnotations` equivalent Spring actually uses) returns `false` for a
+class loaded through the isolated `ModifiedClassPathClassLoader`, when it
+would return `true` for the same class loaded normally. Reproduced with
+`cratonvm.exe` (`sb-runner` harness): `SBRUNNER_RESULT tests=1 failed=1`, not
+yet root-caused. Flagging here rather than filing a 4th separate doc, since
+it's most efficiently investigated together with the generic-identity gap
+above (both are "some reflective metadata query about a class loaded through
+an isolated `URLClassLoader` gives a different answer than the same query
+against the same class loaded normally") — but it may turn out to be a
+distinct mechanism (annotation retention/metadata lookup rather than
+`Class`-identity comparison), so don't assume they're the same bug without
+checking.
+
 ## Suggested next step
 
 Pick the smallest failing case (`SecurityFilterAutoConfigurationEarlyInitializationTests`,
