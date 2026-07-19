@@ -407,6 +407,20 @@ impl Monitor {
         state.owner == Some(thread_id)
     }
 
+    /// Non-blocking inspection of the current owner, if any. Used at the
+    /// contention point (`vm_exec::monitor_enter_blocking`) to detect a
+    /// monitor whose owner has since died — see
+    /// `MonitorTable::release_monitors_held_by` for why a one-time sweep at
+    /// thread-death time isn't sufficient by itself: a monitor that was
+    /// still a thin lock (never contended) when its owning thread died gets
+    /// inflated *later*, by whichever thread next contends it, and that
+    /// inflation pre-seeds the new `Monitor`'s owner from the stale mark
+    /// word — the death-time sweep can't have found an object that wasn't
+    /// inflated yet.
+    pub(crate) fn current_owner(&self) -> Option<ThreadId> {
+        self.state.lock().owner
+    }
+
     /// PERF (monitor-leak reclaim): returns true iff this monitor is fully
     /// idle — unowned and with a zero entry count. A monitor that is held,
     /// re-entered, or in the middle of a `wait()` (which temporarily clears
@@ -538,6 +552,29 @@ impl Monitor {
                 Ok(())
             }
             _ => Err(MonitorError::NotOwner),
+        }
+    }
+
+    /// Forcibly release this monitor if it is (still) owned by `thread_id`,
+    /// regardless of entry count. Used only when `thread_id` has already
+    /// terminated (`ThreadRegistry::mark_dead`) — a dead thread can never
+    /// call `monitorexit` for a monitor it happened to be holding when it
+    /// exited (e.g. interrupted out of a blocking native call while inside
+    /// a `synchronized` block), so without this every future `monitorenter`
+    /// on that object blocks forever on `entry_condvar`. Wakes ALL entry
+    /// waiters (not just one, unlike a normal `exit`) since we don't know
+    /// how many threads are parked and each must re-check for itself.
+    /// Returns `true` if a release actually happened (diagnostic only).
+    pub(crate) fn force_release_if_owned_by(&self, thread_id: ThreadId) -> bool {
+        let mut state = self.state.lock();
+        if state.owner == Some(thread_id) {
+            state.owner = None;
+            state.entry_count = 0;
+            state.jfr_enter_recorded = false;
+            self.entry_condvar.notify_all();
+            true
+        } else {
+            false
         }
     }
 
@@ -1554,6 +1591,28 @@ impl MonitorTable {
     ///   That requires editing `gc/src/collector.rs`, the four `remap_after_gc`
     ///   call sites (`gc/src/heap.rs`, `gc/src/g1.rs`, `gc/src/gen_heap.rs`),
     ///   and the impl in this file — left to the owner of those files.
+    /// Release every inflated monitor still owned by `thread_id`. Called
+    /// once from `ThreadRegistry::mark_dead` when a Java thread terminates.
+    ///
+    /// A thread normally releases every monitor it holds via ordinary
+    /// `monitorexit` bytecode (including on the exceptional path, via the
+    /// method's exception table) before it can ever finish running — but a
+    /// thread that is interrupted or otherwise torn down while blocked
+    /// inside a *native* call made from within a `synchronized` region never
+    /// executes that bytecode. Without this sweep, such a monitor stays
+    /// "held" by a thread ID that will never call `exit`/`notify` again,
+    /// and every future `monitorenter` on that same object blocks forever.
+    /// Only inflated monitors are covered (this is a registry walk, not a
+    /// heap scan) — an uncontended thin lock still held by a dead thread is
+    /// a separate, rarer gap (nothing else was contending it, so nothing
+    /// else is blocked on it either).
+    pub fn release_monitors_held_by(&self, thread_id: ThreadId) {
+        let monitors = self.monitors.lock().expect("monitors registry poisoned");
+        for monitor in monitors.values() {
+            monitor.force_release_if_owned_by(thread_id);
+        }
+    }
+
     pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         if pointer_map.is_empty() {
             return;
@@ -1737,6 +1796,48 @@ mod tests {
         // Enter and exit should succeed
         table.enter(obj, tid);
         assert!(table.exit(obj, tid).is_ok());
+    }
+
+    /// Regression guard for the Jetty `Deflater.end()`/`DeflaterPool.end()`
+    /// hang: a thread that dies while holding an inflated monitor (e.g.
+    /// interrupted/torn down while blocked in a native call made from
+    /// inside a `synchronized` region) must not permanently starve every
+    /// future `monitorenter` on that object. Without
+    /// `release_monitors_held_by`, thread B here would block forever.
+    #[test]
+    fn dead_thread_owned_monitor_is_released_and_future_enters_succeed() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid_a = ThreadId(1);
+        let tid_b = ThreadId(2);
+
+        let (monitor, contended) = table.enter_inflated_or_contend(obj, tid_a).expect("inflate");
+        assert!(!contended, "fresh monitor should be acquired immediately");
+        assert!(monitor.is_held_by(tid_a));
+
+        // Thread A "dies" without ever calling monitorexit.
+        table.release_monitors_held_by(tid_a);
+        assert!(!monitor.is_held_by(tid_a));
+
+        // A different thread must now be able to acquire the same object's
+        // monitor without blocking.
+        table.enter(obj, tid_b);
+        assert!(monitor.is_held_by(tid_b));
+        assert!(table.exit(obj, tid_b).is_ok());
+    }
+
+    #[test]
+    fn release_monitors_held_by_is_a_no_op_for_monitors_owned_by_other_threads() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid_a = ThreadId(1);
+        let tid_b = ThreadId(2);
+
+        let (monitor, _) = table.enter_inflated_or_contend(obj, tid_a).expect("inflate");
+        // Releasing a thread that owns nothing here must not disturb A's hold.
+        table.release_monitors_held_by(tid_b);
+        assert!(monitor.is_held_by(tid_a));
+        assert!(table.exit(obj, tid_a).is_ok());
     }
 
     #[test]
@@ -2363,5 +2464,53 @@ mod tests {
             types::MARK_INFLATED,
             "inflated mark word should persist after contention"
         );
+    }
+
+    /// Regression guard for the Jetty `Deflater.end()`/`DeflaterPool.end()`
+    /// hang: a monitor that was still an uncontended THIN lock when its
+    /// owning thread died (so `release_monitors_held_by` never saw it — it
+    /// wasn't inflated yet) gets inflated *later* by whichever thread next
+    /// contends it, and inflation pre-seeds the new `Monitor`'s owner from
+    /// the stale mark word. `current_owner`/`force_release_if_owned_by` are
+    /// what `vm_exec::monitor_enter_blocking` uses to detect and clear that
+    /// dead-owner seed at the contention point, right after inflation,
+    /// before blocking — this test exercises that exact mechanism directly.
+    #[test]
+    fn contended_inflation_of_a_dead_threads_thin_lock_is_recoverable() {
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let table = MonitorTable::new();
+        let tid_dead = ThreadId(1);
+        let tid_b = ThreadId(2);
+
+        // Thread "dead" takes the (uncontended) thin lock and never releases
+        // it — simulating termination while blocked in a native call made
+        // from inside the synchronized region.
+        table.enter(obj, tid_dead);
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::mark_state(mark),
+            types::MARK_THIN_LOCKED,
+            "uncontended enter should stay a thin lock"
+        );
+
+        // A live thread contends the same object. `enter_or_contend` must
+        // inflate (nothing has released the thin lock) and pre-seed the new
+        // Monitor's owner from the dead thread's ID — the exact zombie state
+        // this fix targets.
+        let m = table
+            .enter_or_contend(obj, tid_b)
+            .expect("contended thin lock must inflate, not silently succeed");
+        assert_eq!(m.current_owner(), Some(tid_dead));
+
+        // The dead-owner check + force-release (mirroring
+        // `monitor_enter_blocking`'s contention-point check).
+        assert!(m.force_release_if_owned_by(tid_dead));
+        assert_eq!(m.current_owner(), None);
+
+        // Thread B can now acquire immediately instead of blocking forever.
+        m.block_enter(tid_b);
+        assert_eq!(m.current_owner(), Some(tid_b));
+        assert!(m.exit(tid_b).is_ok());
     }
 }
