@@ -340,6 +340,14 @@ fn socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let ip = read_inet_addr(ctx, addr_obj)
         .ok_or_else(|| ioex("socketConnect: cannot resolve address"))?;
+    // Wildcard connect targets aren't a valid OS destination on Windows
+    // (WSAEADDRNOTAVAIL) — see the matching substitution and rationale in
+    // `native-io/src/socket_channel.rs::sc_connect_inner`.
+    let ip = match ip {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    };
     let sa = SocketAddr::new(ip, port as u16);
     let fd = read_fd(ctx, this);
     let sock_addr = SockAddr::from(sa);

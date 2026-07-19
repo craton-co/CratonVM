@@ -1046,7 +1046,9 @@ fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             .position(|entry| entry.vm_identity == vm_identity && entry.capacity >= size)
         {
             let entry = entries.remove(index);
-            reusable = ctx.resolve_global_root(entry.root).map(|buffer| (entry, buffer));
+            reusable = ctx
+                .resolve_global_root(entry.root)
+                .map(|buffer| (entry, buffer));
             if reusable.is_none() {
                 ctx.remove_global_root(entry.root);
             }
@@ -1069,11 +1071,17 @@ fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(buffer))))
 }
 
-fn temporary_direct_buffer_release(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn temporary_direct_buffer_release(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let Some(buffer) = arg_obj(args, 0) else {
         return Ok(None);
     };
-    let capacity = ctx.get_field_by_name(buffer, "capacity").as_int().unwrap_or(-1);
+    let capacity = ctx
+        .get_field_by_name(buffer, "capacity")
+        .as_int()
+        .unwrap_or(-1);
     if !(0..=TEMPORARY_BUFFER_MAX_CAPACITY).contains(&capacity) {
         return Ok(None);
     }
@@ -1227,9 +1235,23 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
     // Avoid the racy Java BufferCache while preserving real direct buffers
     // and their Cleaner contract. The pool is local to each native worker
     // thread and bounded to three buffers.
-    r.register("sun/nio/ch/Util", "getTemporaryDirectBuffer", "(I)Ljava/nio/ByteBuffer;", temporary_direct_buffer_get);
-    for method in ["releaseTemporaryDirectBuffer", "offerFirstTemporaryDirectBuffer", "offerLastTemporaryDirectBuffer"] {
-        r.register("sun/nio/ch/Util", method, "(Ljava/nio/ByteBuffer;)V", temporary_direct_buffer_release);
+    r.register(
+        "sun/nio/ch/Util",
+        "getTemporaryDirectBuffer",
+        "(I)Ljava/nio/ByteBuffer;",
+        temporary_direct_buffer_get,
+    );
+    for method in [
+        "releaseTemporaryDirectBuffer",
+        "offerFirstTemporaryDirectBuffer",
+        "offerLastTemporaryDirectBuffer",
+    ] {
+        r.register(
+            "sun/nio/ch/Util",
+            method,
+            "(Ljava/nio/ByteBuffer;)V",
+            temporary_direct_buffer_release,
+        );
     }
 
     // DirectBuffer interface methods.

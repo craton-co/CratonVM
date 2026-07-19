@@ -57,6 +57,30 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+/// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
+///
+/// The object references are strong, GC-remapped registry roots for the short
+/// interval in which a thread owns, waits on, or contends for a lock.  Native
+/// JMX code pins them before doing any allocating work.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadJmxSnapshot {
+    pub thread_object: Option<ObjectRef>,
+    pub thread_id: i64,
+    pub thread_name: String,
+    /// JMM/JVMTI thread-status bits reserved for consumers that use the
+    /// encoded state rather than the JDK 25 `Thread.State` field.
+    pub thread_status: i32,
+    pub stack_trace: Vec<StackTraceEntry>,
+    pub lock: Option<ObjectRef>,
+    /// Logical JMM class name for `lock` when a VM shim deliberately models
+    /// the backing synchronizer without materializing its private JDK object.
+    pub lock_class_name: Option<String>,
+    pub lock_owner_id: i64,
+    pub lock_owner_name: Option<String>,
+    pub locked_monitors: Vec<ObjectRef>,
+    pub locked_synchronizers: Vec<ObjectRef>,
+}
+
 fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
     match element_type {
         ArrayElementType::Boolean
@@ -1343,6 +1367,18 @@ pub trait NativeContext {
     /// without loading a class (for synthetic objects).
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef;
 
+    /// Fallible twin of [`alloc_object`](Self::alloc_object) for a native-call
+    /// safepoint where the caller holds no unpinned Java references (same
+    /// contract as `create_string_uninterned_gc_safe`). Returns `None`
+    /// instead of hard-aborting the process when the heap is exhausted, so
+    /// the caller can surface a catchable `java.lang.OutOfMemoryError`.
+    /// Defaults to the aborting `alloc_object` (wrapped in `Some`) for
+    /// mock/test contexts; the real VM implementation overrides this with
+    /// the actual fallible allocator.
+    fn try_alloc_object_gc_safe(&mut self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        Some(self.alloc_object(class_id, num_fields))
+    }
+
     /// Ensure a class is loaded and initialized. Returns the ClassId.
     fn ensure_class_initialized(
         &mut self,
@@ -1754,6 +1790,23 @@ pub trait NativeContext {
     /// / `Thread.dumpThreads()`. The default returns empty.
     fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
         Vec::new()
+    }
+
+    /// Atomically snapshot the thread state and lock relationships needed by
+    /// `ThreadMXBean`. The default leaves lightweight/mock contexts source
+    /// compatible; production VMs must return GC-safe registry-backed refs.
+    fn thread_jmx_snapshot(&self, _thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        None
+    }
+
+    /// Record the current ownership of an `AbstractOwnableSynchronizer`.
+    /// Implementations retain/remap the synchronizer while it is owned so a
+    /// later JMX dump can report `lockedSynchronizers` without heap walking.
+    fn record_jmx_owned_synchronizer(
+        &mut self,
+        _synchronizer: ObjectRef,
+        _owner: Option<ObjectRef>,
+    ) {
     }
 
     /// Get the Java Thread object for the current thread.
@@ -3246,6 +3299,20 @@ pub struct StackTraceEntry {
     /// Bytecode index of the last-executed instruction in the frame's method.
     /// `-1` for unknown / native. Used by `StackFrame.getByteCodeIndex()`.
     pub byte_code_index: i32,
+    /// The frame's own `ClassId`, when captured directly from a live
+    /// interpreter frame (`Frame::class_id`) rather than synthesized.
+    /// `StackFrame.getDeclaringClass()`/`declaringClass()` implementations
+    /// MUST prefer this over re-resolving `class_name` through a global
+    /// name-keyed lookup (`class_id_by_name`/`find_class_by_name`): a class
+    /// executing its OWN `<clinit>` is guaranteed loaded (this ClassId is
+    /// live proof of that) but is not reliably found by a fresh by-name
+    /// lookup made from deep inside that same `<clinit>` -- observed via
+    /// `SpringFactoriesLoader`/`EntityManagerFactoryUtils` invoking
+    /// `LogFactory.getLog()` from their own static initializers, which
+    /// walks the stack (log4j-api's `StackLocator`) back to that exact
+    /// self-frame and NPEs when `getDeclaringClass()` falls back to null.
+    /// `None` only for synthetic entries with no backing interpreter frame.
+    pub class_id: Option<ClassId>,
 }
 
 /// Callback signature for native method implementations.
@@ -4774,6 +4841,7 @@ mod tests {
             source_file: Some(Arc::from("Object.java")),
             line_number: 42,
             byte_code_index: 17,
+            class_id: None,
         };
         let cloned = entry.clone();
         assert_eq!(&*cloned.class_name, "java/lang/Object");
@@ -4790,6 +4858,7 @@ mod tests {
             source_file: None,
             line_number: -2, // native method
             byte_code_index: -1,
+            class_id: None,
         };
         assert_eq!(entry.line_number, -2);
         assert!(entry.source_file.is_none());

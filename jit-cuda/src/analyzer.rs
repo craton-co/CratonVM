@@ -1861,7 +1861,10 @@ mod tests {
             None
         );
         // Right class/name, mismatched descriptor — must not fuzzy-match.
-        assert_eq!(resolve_math_intrinsic("java/lang/Math", "sqrt", "(F)F"), None);
+        assert_eq!(
+            resolve_math_intrinsic("java/lang/Math", "sqrt", "(F)F"),
+            None
+        );
         assert_eq!(
             resolve_math_intrinsic("java/lang/Math", "min", "(DI)D"),
             None

@@ -63,6 +63,22 @@ pub struct CachedBytecodeMethod {
     /// after this entry is populated, so it is still re-evaluated on every
     /// hit (cheap: a single generation-counter read plus a short allowlist).
     pub force_native_cache: std::sync::OnceLock<bool>,
+    /// Perf follow-up (2026-07-19, TestResponsePerformance interpreter-
+    /// throughput residual): memoizes the resolved `NativeCallback` (or
+    /// `None`) for this callsite, mirroring `force_native_cache` above.
+    /// `intercept_force_registered_native_cached` previously called
+    /// `NativeMethodRegistry::find` (a hash-keyed lookup over all three of
+    /// class/method/descriptor) on every single cached-invoke hit whose
+    /// force-native decision was `true` -- confirmed via `perf` to be the
+    /// #2 hottest symbol (~7% of samples) on this same benchmark, second
+    /// only to the interpreter's own frame-dispatch loop. Native-method
+    /// registration is immutable after VM boot (no redefinition path
+    /// touches the registry), so the same (class, method, descriptor)
+    /// triple always resolves to the same callback for the life of the
+    /// process -- caching it here is sound by the same argument already
+    /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
+    /// silent-hang-no-signature-cluster.md.
+    pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a

@@ -1,6 +1,30 @@
 # Jetty embedded-server startup: private `this::lambda$doStart$0` method references dispatch onto a same-named private method in a *subclass* instead of the exact declaring class, causing `ServletContextHandler`/`WebAppContext` to re-run `startContext()` — manifests as `StackOverflowError`, duplicate servlet/filter registration, or a slow multi-minute-per-test hang
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED - 2026-07-17; verified for archival 2026-07-18**
+
+## Resolution
+
+The VM correction landed on `dev` as `310333a0ff` (`fix(lambda): preserve
+private implementation owner`), with Spring coverage in `6d7925651e`
+(`fix(spring): cover private lambda owner dispatch`). `try_lambda_dispatch`
+now resolves an `InvokeVirtual` lambda handle on its implementation owner when
+the resolved method is `ACC_PRIVATE`, then invokes that owner without receiver
+retargeting. The equivalent MethodHandle adapter path in
+`vm/src/vm/vm_exec.rs` applies the same rule, so it cannot retain a separate
+wrong-receiver residual.
+
+`regression-suite/src/RPrivateLambdaOwner.java` creates the relevant shape:
+both a parent and a child declare a private synthetic lambda body with the
+same generated name and descriptor. It proves that a lambda made by the parent
+remains bound to the parent while the child's own lambda still binds to the
+child. This is the general language-level regression for the Jetty
+`ContextHandler` / `ServletContextHandler` collision.
+
+The focused Spring Boot validation and the JIT/interpreter regression results
+are recorded in the verification section below. The unrelated
+`LoaderHidingResourceTests` jar-filesystem issue remains tracked separately in
+`jetty-loaderhidingresourcetests-empty-jar-listing-FIXED.md` and is not part of
+this closure.
 
 ## Symptom
 
@@ -158,7 +182,7 @@ incorrectly treating a `private`-method `REF_invokeVirtual` handle as
 subject to receiver-class-driven polymorphism, and is unrelated to that
 cluster's Case 1 or Case 2 mechanisms.
 
-## What would confirm/refine this
+## Original confirmation criteria (satisfied)
 
 A standalone repro with two classes replicating the shape (superclass and
 subclass each declaring a private `foo()` invoked via `this::foo` from a
@@ -175,7 +199,7 @@ entirely for that case.
 
 ## Affected classes
 
-| Module | Class | Status |
+| Module | Class | Original status |
 |---|---|---|
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.autoconfigure.AutoConfigureWebServerJettyReactiveTests` | FAIL |
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.autoconfigure.AutoConfigureWebServerJettyServletTests` | FAIL |
@@ -188,3 +212,25 @@ entirely for that case.
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.autoconfigure.servlet.JettyServletWebServerServletContextListenerTests` | HANG |
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.servlet.JettyServletWebServerMvcIntegrationTests` | FAIL |
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests` | HANG |
+
+## Verification
+
+- Built `/data/cratonvm-jetty-private-lambda-20260718.bin` from isolated
+  worktree `codex/fix-jetty-private-lambda-20260718` (SHA-256
+  `40ed36a95f024c1e31bef7f7f7c5eeb9aefe3195f92b4294bc6f44d9fc6d65b3`).
+- `RPrivateLambdaOwner` passed in normal and `--nojit` execution, proving the
+  resolved private owner is retained in both relevant execution modes.
+- The exact Spring Boot 4.1.0-SNAPSHOT / Jetty 12.1.8 fixture was regenerated
+  with Linux classpaths. HotSpot control completed the representative reactive
+  startup class 1/1.
+- Fresh CratonVM JIT results passed eight affected classes and 75 tests,
+  including all classes that formerly threw `StackOverflowError`, all
+  duplicate-registration shapes, and the 24-test
+  `JettyWebServerFactoryCustomizerTests` former-hang class. No log contained
+  `StackOverflowError`, `Possibly already registered`, or
+  `FilterRegistration.Dynamic`.
+
+Three post-startup/reflection residuals were independently reproduced against
+HotSpot and placed in
+`jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md`.
+They do not share this issue's private-lambda dispatch mechanism.

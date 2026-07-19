@@ -694,7 +694,9 @@ fn bootstrap_generic(
     if dbg {
         eprintln!(
             "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{} bsm_args_len={}",
-            info.target_name, info.target_descriptor, bsm_args.len()
+            info.target_name,
+            info.target_descriptor,
+            bsm_args.len()
         );
     }
     let callsite_val = crate::vm::invoke_shared(
