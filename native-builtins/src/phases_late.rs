@@ -66499,20 +66499,8 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // Introspector
+    // Introspector cache-management methods retain their bridge implementations.
     let intro = "java/beans/Introspector";
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
         // Introspector caches BeanInfo per Class. Our implementation doesn't cache
         // anything — each call walks the class freshly — so there's nothing to flush.
@@ -66810,6 +66798,20 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
+    // The two-argument overload is getBeanInfo(beanClass, stopClass). The
+    // native used to discard stopClass and always walked through Object, which
+    // made it expose inherited Object properties and methods despite the JDK
+    // contract. Spring's standard property resolver uses this overload.
+    let stop_class_id = match args.get(1) {
+        Some(Value::Object(Some(stop_mirror))) => {
+            let stop_pin = ctx.pin_native_root(*stop_mirror);
+            let id = crate::lang_class::mirror_class_id(ctx, *stop_mirror);
+            ctx.unpin_native_roots(stop_pin);
+            id
+        }
+        _ => None,
+    };
+
     // Discover properties from getters/setters across the class + superclasses,
     // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
     // JDK java.beans.Introspector property-merge rules that the Tomcat suite
@@ -66896,6 +66898,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
+        if Some(cid) == stop_class_id {
+            break;
+        }
         scan_cids.push(cid);
         sc = if ctx.is_interface_class(cid) {
             None
@@ -67158,7 +67163,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Object member) when introspecting a bare interface type — see the
     // `is_interface_class` gate on `scan_cids` above for the matching
     // rationale.
-    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
+    if stop_class_id.is_none()
+        && !ctx.is_interface_class(class_id)
+        && !properties.iter().any(|(n, ..)| n == "class")
+    {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             // Re-read from the pin: the discovery scan above (and the failed

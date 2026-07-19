@@ -3013,15 +3013,11 @@ fn throw_cannot_load_bean_class_exception(
             let class_name_val = Value::Object(Some(ctx.create_string(bean_class_name)));
             let exc = ctx.read_native_pin(exc_pin, exc);
             let resource_val = match (resource_val, resource_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => resource_val,
             };
             let name_val = match (name_val, name_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => name_val,
             };
             let cause = ctx.read_native_pin(cause_pin, cause);

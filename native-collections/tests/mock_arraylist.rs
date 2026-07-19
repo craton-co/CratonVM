@@ -16,20 +16,38 @@ const AL: &str = "java/util/ArrayList";
 fn arrays_sort_accepts_comparable_lambda_proxy() {
     let reg = build_registry();
     let mut ctx = MockCtx::new();
-    let comparable = ctx.ensure_class_initialized("java/lang/Comparable").unwrap();
-    let functional_interface = ctx.ensure_class_initialized("test/FunctionalComparable").unwrap();
+    let comparable = ctx
+        .ensure_class_initialized("java/lang/Comparable")
+        .unwrap();
+    let functional_interface = ctx
+        .ensure_class_initialized("test/FunctionalComparable")
+        .unwrap();
     ctx.set_class_interfaces(functional_interface, vec![comparable]);
 
     // A real lambda proxy is not a class-manager class. Its interface must be
     // resolved through lambda metadata rather than `class_interfaces(proxy)`.
     let lambda_class = ClassId::new(0x8000_0001);
-    ctx.set_lambda_proxy_metadata(lambda_class, "test/FunctionalComparable", "test/LambdaSortProbe");
+    ctx.set_lambda_proxy_metadata(
+        lambda_class,
+        "test/FunctionalComparable",
+        "test/LambdaSortProbe",
+    );
     let lambda = ctx.alloc_object_simple(lambda_class.as_u32());
     let array = ctx.new_ref_array(ClassId::new(0), 1);
     ctx.set_array_element(array, 0, Value::Object(Some(lambda)));
 
-    let result = call(&reg, &mut ctx, "java/util/Arrays", "sort", "([Ljava/lang/Object;)V", &[Value::Object(Some(array))]);
-    assert!(result.is_ok(), "Comparable lambda proxy must pass Arrays.sort precheck: {result:?}");
+    let result = call(
+        &reg,
+        &mut ctx,
+        "java/util/Arrays",
+        "sort",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(array))],
+    );
+    assert!(
+        result.is_ok(),
+        "Comparable lambda proxy must pass Arrays.sort precheck: {result:?}"
+    );
 }
 
 #[test]
@@ -43,9 +61,19 @@ fn arrays_sort_rejects_non_comparable_lambda_proxy() {
     let array = ctx.new_ref_array(ClassId::new(0), 1);
     ctx.set_array_element(array, 0, Value::Object(Some(lambda)));
 
-    let error = call(&reg, &mut ctx, "java/util/Arrays", "sort", "([Ljava/lang/Object;)V", &[Value::Object(Some(array))])
-        .expect_err("non-Comparable lambda proxy must fail Arrays.sort");
-    let MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::ClassCastException { message })) = error else {
+    let error = call(
+        &reg,
+        &mut ctx,
+        "java/util/Arrays",
+        "sort",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(array))],
+    )
+    .expect_err("non-Comparable lambda proxy must fail Arrays.sort");
+    let MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::ClassCastException {
+        message,
+    })) = error
+    else {
         panic!("expected ClassCastException, got {error:?}");
     };
     assert!(message.contains("test/LambdaSortProbe$$Lambda/0x80000002"));

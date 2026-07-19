@@ -1774,6 +1774,18 @@ pub(crate) fn native_class_for_name(
         _ => None,
     };
 
+    if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
+        eprintln!(
+            "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
+            dotted_name, args.len(), args, effective_loader.is_some()
+        );
+        if let Some((loader, _init)) = effective_loader {
+            let lcid = ctx.class_id_of_object(loader);
+            let lname = ctx.class_name_of_id(lcid).unwrap_or_default();
+            eprintln!("[FORNAME-TRACE] loader_class={} loader_obj={:?}", lname, loader);
+        }
+    }
+
     // RKC16N.12 вЂ” when `Class.forName` is invoked with an explicit non-null
     // classloader, route through `loader.loadClass(name)` so module-scoped
     // loaders (notably `org.jboss.modules.ModuleClassLoader`) get their
@@ -2990,6 +3002,20 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
     }
+    // Spring's ReflectionTypeReference builds its key from getPackageName()
+    // and getSimpleName(). A generated configuration subclass must therefore
+    // expose the same public $$SpringCGLIB$$ identity here as it does through
+    // getName(), rather than leaking Craton's internal EnhancerByCGLIB name.
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some(display_name) =
+                spring_configuration_cglib_display_name(ctx, class_id, &name)
+            {
+                let simple = display_name.rsplit('/').next().unwrap_or(&display_name);
+                return Ok(Some(Value::Object(Some(ctx.create_string(simple)))));
+            }
+        }
+    }
     // Cache the simple-name derivation per `ClassId` only when the VM's
     // reverse mirror map owns this mirror. Test-fixture mirrors that
     // encode ClassId only via field-0 are excluded to avoid cross-test
@@ -3105,6 +3131,38 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
     desc: &str,
     declaring_class_id: ClassId,
 ) -> cratonvm_types::ObjectRef {
+    // Arrays inherit the defining loader of their reference component
+    // (JVMS 5.3.3). ClassManager currently interns array ClassIds globally, so
+    // its canonical array mirror would lose a child loader's component identity.
+    // For reflective method metadata, return a descriptor-backed mirror that
+    // carries that child loader. native_class_get_component_type below then
+    // resolves the component in the same namespace. This preserves the
+    // observable Class API without changing the existing VM-wide array layout.
+    if crate::classloader::loader_aware_resolution() && desc.starts_with('[') {
+        let mut component = desc;
+        while let Some(rest) = component.strip_prefix('[') {
+            component = rest;
+        }
+        if let Some(inner) = component.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+            let loader_id = ctx.loader_id_of_class(declaring_class_id);
+            if loader_id >= 3
+                && ctx
+                    .class_id_defined_by_loader_exact(inner, loader_id as u32)
+                    .is_some()
+            {
+                if let Some(loader) =
+                    crate::classloader::defining_loader_for(declaring_class_id.as_u32())
+                {
+                    let loader_pin = ctx.pin_native_root(loader);
+                    let mirror = synthetic_class_mirror(ctx, desc);
+                    let loader = ctx.read_native_pin(loader_pin, loader);
+                    ctx.unpin_native_roots(loader_pin);
+                    ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader)));
+                    return mirror;
+                }
+            }
+        }
+    }
     if crate::classloader::loader_aware_resolution() {
         if let Some(inner) = desc.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
             let loader_id = ctx.loader_id_of_class(declaring_class_id);
@@ -4132,9 +4190,31 @@ where
 /// `Class[]` field during deserialization (ResolvableTypeTests.serialize) and
 /// would break any `(Class[])` cast. `java/lang/Class` is always loaded by the
 /// time reflection runs, so the fallback is defensive only.
-fn class_component_id(ctx: &mut dyn NativeContext) -> cratonvm_types::ClassId {
-    ctx.class_id_by_name("java/lang/Class")
+/// Resolve the component class for a typed reflection array. Returning
+/// `Object[]` from a `Class` reflection API violates the Java contract even
+/// when every element happens to be a valid reflection mirror.
+fn reflection_component_id(
+    ctx: &mut dyn NativeContext,
+    component_name: &str,
+) -> cratonvm_types::ClassId {
+    ctx.class_id_by_name(component_name)
         .unwrap_or_else(|| cratonvm_types::ClassId::new(0))
+}
+/// Allocate an empty reflection array without borrowing the runtime context
+/// twice in one expression.
+fn empty_reflection_array(
+    ctx: &mut dyn NativeContext,
+    component_name: &str,
+) -> cratonvm_types::ObjectRef {
+    let component = reflection_component_id(ctx, component_name);
+    ctx.new_ref_array(component, 0)
+}
+
+/// The `java/lang/Class` ClassId, for typing reflective `Class[]` results
+/// (`Method`/`Constructor` `getParameterTypes`/`getExceptionTypes`,
+/// `Class.getInterfaces`).
+fn class_component_id(ctx: &mut dyn NativeContext) -> cratonvm_types::ClassId {
+    reflection_component_id(ctx, "java/lang/Class")
 }
 
 pub(crate) fn create_field_object(
@@ -5200,7 +5280,7 @@ pub(crate) fn native_class_get_declared_fields(
         Some(id) => id,
         None => {
             // Primitive or array type вЂ” no declared fields
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let arr = empty_reflection_array(ctx, "java/lang/reflect/Field");
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -7301,7 +7381,7 @@ pub(crate) fn native_class_get_declared_methods(
         GET_DECLARED_METHODS_DEPTH.with(|d| d.set(prev_depth));
         // Bail safe: return an empty Method[] so ByteBuddy / Mockito can
         // recover rather than die on ExceptionInInitializerError.
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+        let arr = empty_reflection_array(ctx, "java/lang/reflect/Method");
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
@@ -7318,7 +7398,7 @@ pub(crate) fn native_class_get_declared_methods(
             Some(id) => id,
             None => {
                 // Primitive or array type
-                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                let arr = empty_reflection_array(ctx, "java/lang/reflect/Method");
                 return Ok(Some(Value::Object(Some(arr))));
             }
         };
@@ -7388,7 +7468,8 @@ pub(crate) fn native_class_get_declared_methods(
         }
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
-        let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
+        let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
+        let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
             create_method_object(ctx, visible[i])
         });
         Ok(Some(Value::Object(Some(arr))))
@@ -8516,7 +8597,7 @@ pub(crate) fn native_class_get_declared_constructors(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let arr = empty_reflection_array(ctx, "java/lang/reflect/Constructor");
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -8531,7 +8612,8 @@ pub(crate) fn native_class_get_declared_constructors(
     }
 
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
-    let arr = build_mirror_array(ctx, constructors.len(), |ctx, i| {
+    let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
+    let arr = build_mirror_array_comp(ctx, constructor_component, constructors.len(), |ctx, i| {
         create_constructor_object(ctx, constructors[i])
     });
     Ok(Some(Value::Object(Some(arr))))
@@ -8673,7 +8755,8 @@ fn collect_public_fields(
             stack.push(iface_id);
         }
     }
-    build_mirror_array(ctx, metas.len(), |ctx, i| {
+    let field_component = reflection_component_id(ctx, "java/lang/reflect/Field");
+    build_mirror_array_comp(ctx, field_component, metas.len(), |ctx, i| {
         create_field_object(ctx, &metas[i])
     })
 }
@@ -8777,10 +8860,77 @@ fn collect_public_methods(
 ) -> cratonvm_types::ObjectRef {
     let mut metas: Vec<MethodMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    collect_public_methods_from(ctx, class_id, true, &mut visited, &mut metas);
+    // Class.getMethods() retains all public declarations of the most-specific
+    // class (including compiler bridges) but must suppress any same-signature
+    // declaration inherited from a superclass. Track signatures contributed by
+    // more-specific classes separately from the emitted method list so a bridge
+    // and its bridged method declared by the same class both remain visible.
+    let mut inherited_class_method_keys = std::collections::HashSet::new();
+    let mut stack = vec![class_id];
+
+    while let Some(cid) = stack.pop() {
+        if !visited.insert(cid) {
+            continue;
+        }
+        // F2: include synthetic JDK declarations so frameworks that
+        // walk the public method table on a synthetic-stub class (e.g.
+        // java/lang/ClassLoader) still see the JDK-contracted methods.
+        let methods = declared_methods_with_synthetic(ctx, cid);
+        let is_interface = ctx.is_interface_class(cid);
+        let mut declared_class_method_keys = std::collections::HashSet::new();
+        for meta in methods {
+            if meta.name == "<init>" || meta.name == "<clinit>" {
+                continue;
+            }
+            if (meta.access_flags & 0x0001) != 0 {
+                // An overriding method suppresses inherited methods by name and
+                // parameter list, irrespective of a covariant return type. The
+                // return descriptor is deliberately omitted from this key: a
+                // covariant override has a compiler bridge with a different
+                // return type, and that bridge must suppress the ancestor too.
+                let parameter_end = meta
+                    .descriptor
+                    .find(')')
+                    .map(|index| index + 1)
+                    .unwrap_or(meta.descriptor.len());
+                let override_key = (
+                    meta.name.clone(),
+                    meta.descriptor[..parameter_end].to_string(),
+                );
+                if inherited_class_method_keys.contains(&override_key) {
+                    continue;
+                }
+                metas.push(meta);
+                declared_class_method_keys.insert(override_key);
+            }
+        }
+
+        // A more-specific interface default method suppresses the matching
+        // abstract/default declaration inherited from its parent interface just
+        // as a class override suppresses a superclass declaration. Keeping this
+        // set class-only leaked InterfaceMethods.getValue() alongside
+        // DefaultMethods.getValue(), confusing bridge resolution.
+        inherited_class_method_keys.extend(declared_class_method_keys);
+
+        // Process a class's superclass before its interfaces. Apart from
+        // matching the JDK's class-over-interface precedence, this makes the
+        // complete class override set available before any interface method is
+        // considered for inclusion.
+        for iface_id in ctx.class_interfaces(cid) {
+            stack.push(iface_id);
+        }
+        // G2-fix: interfaces intentionally skip their superclass
+        // (java/lang/Object) per JDK semantics.
+        if !is_interface {
+            if let Some(parent) = ctx.superclass_of(cid) {
+                stack.push(parent);
+            }
+        }
+    }
     // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
     // same fix, same residual-gap doc reference.
-    build_mirror_array(ctx, metas.len(), |ctx, i| {
+    let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
+    build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
         create_method_object(ctx, &metas[i])
     })
 }
@@ -8801,7 +8951,7 @@ pub(crate) fn native_class_get_fields(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let arr = empty_reflection_array(ctx, "java/lang/reflect/Field");
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -8917,7 +9067,7 @@ pub(crate) fn native_class_get_methods(
     });
     if prev_depth > 50 {
         GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
-        let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+        let arr = empty_reflection_array(ctx, "java/lang/reflect/Method");
         return Ok(Some(Value::Object(Some(arr))));
     }
     let result = (|| -> MethodCallResult {
@@ -8933,7 +9083,7 @@ pub(crate) fn native_class_get_methods(
         let class_id = match mirror_class_id(ctx, this) {
             Some(id) => id,
             None => {
-                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                let arr = empty_reflection_array(ctx, "java/lang/reflect/Method");
                 return Ok(Some(Value::Object(Some(arr))));
             }
         };
@@ -9109,11 +9259,16 @@ pub(crate) fn native_class_get_method(
             let method_obj = create_method_object(ctx, meta);
             return Ok(Some(Value::Object(Some(method_obj))));
         }
-        if let Some(parent) = ctx.superclass_of(cid) {
-            stack.push(parent);
-        }
+        // Depth-first class lookup precedes interfaces: for a package-private
+        // subclass that overrides an interface method, Class.getMethod must
+        // retain that non-public declaring class so callers can subsequently
+        // locate the public interface method themselves. Push interfaces first
+        // so the LIFO stack visits the superclass next.
         for iface_id in ctx.class_interfaces(cid) {
             stack.push(iface_id);
+        }
+        if let Some(parent) = ctx.superclass_of(cid) {
+            stack.push(parent);
         }
     }
 
@@ -9147,7 +9302,7 @@ pub(crate) fn native_class_get_constructors(
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => {
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let arr = empty_reflection_array(ctx, "java/lang/reflect/Constructor");
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -9161,11 +9316,10 @@ pub(crate) fn native_class_get_constructors(
         order_constructors_for_reflection(&class_name, &mut public_ctors);
     }
 
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), public_ctors.len());
-    for (i, meta) in public_ctors.iter().enumerate() {
-        let ctor_obj = create_constructor_object(ctx, meta);
-        ctx.set_array_element(arr, i, Value::Object(Some(ctor_obj)));
-    }
+    let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
+    let arr = build_mirror_array_comp(ctx, constructor_component, public_ctors.len(), |ctx, i| {
+        create_constructor_object(ctx, public_ctors[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -9278,7 +9432,7 @@ pub(crate) fn native_class_get_interfaces(
                 }
                 // No proxy has been created yet вЂ” fall through and
                 // return an empty array.
-                let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+                let empty = empty_reflection_array(ctx, "java/lang/Class");
                 return Ok(Some(Value::Object(Some(empty))));
             }
         }
@@ -9309,7 +9463,7 @@ pub(crate) fn native_class_get_interfaces(
                 this_name
             );
         }
-        let empty = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+        let empty = empty_reflection_array(ctx, "java/lang/Class");
         return Ok(Some(Value::Object(Some(empty))));
     }
 
@@ -9319,7 +9473,7 @@ pub(crate) fn native_class_get_interfaces(
             if dbg_bb {
                 eprintln!("[bb-dbg] getInterfaces({}) -> [] [no-class-id]", this_name);
             }
-            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let arr = empty_reflection_array(ctx, "java/lang/Class");
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
@@ -13135,6 +13289,36 @@ pub(crate) fn native_class_get_component_type(
                 return Ok(Some(Value::Object(Some(mirror))));
             }
             _ => {
+                // A descriptor-backed array mirror produced for reflective
+                // metadata retains its declaring loader in Class.classLoader.
+                // Resolve its component through that exact namespace before
+                // consulting the global array/class registry; otherwise
+                // Method.getReturnType() on a fork-defined T[] leaks the
+                // application-loader T and breaks repeatable-annotation and
+                // generic reflection identity checks.
+                if let Value::Object(Some(loader)) = ctx.get_field_by_name(this, "classLoader") {
+                    if let Some(loader_id) =
+                        crate::classloader::peek_loader_namespace_id(ctx, loader)
+                    {
+                        if comp_name.starts_with('[') {
+                            let loader_pin = ctx.pin_native_root(loader);
+                            let mirror = synthetic_class_mirror(ctx, comp_name);
+                            let loader = ctx.read_native_pin(loader_pin, loader);
+                            ctx.unpin_native_roots(loader_pin);
+                            ctx.set_field_by_name(
+                                mirror,
+                                "classLoader",
+                                Value::Object(Some(loader)),
+                            );
+                            return Ok(Some(Value::Object(Some(mirror))));
+                        }
+                        if let Some(cid) =
+                            ctx.class_id_defined_by_loader_exact(comp_name, loader_id)
+                        {
+                            return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
+                        }
+                    }
+                }
                 if let Ok(cid) = ctx.ensure_class_initialized(comp_name) {
                     return Ok(Some(Value::Object(Some(ctx.get_class_mirror(cid)))));
                 }
@@ -14222,6 +14406,19 @@ pub(crate) fn native_class_get_canonical_name(
             return Ok(Some(Value::Object(None)));
         }
     }
+    // Keep the canonical identity aligned with getName()/getSimpleName() for
+    // Craton-generated Spring configuration proxies. In particular, preserve
+    // the double-dollar CGLIB separators: Spring TypeReference equality is
+    // based on this exact canonical name.
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some(display_name) =
+                spring_configuration_cglib_display_name(ctx, class_id, &name)
+            {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&display_name.replace('/', "."))))));
+            }
+        }
+    }
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
         if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
@@ -14271,6 +14468,17 @@ pub(crate) fn native_class_get_type_name(
                 if let Some(tn) = array_descriptor_to_type_name(&name) {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&tn)))));
                 }
+            }
+        }
+    }
+    // Non-array configuration proxies use the same public CGLIB name for
+    // getTypeName() as for getName(); do this before the internal-name cache.
+    if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        if let Some(name) = ctx.class_name_of_id(class_id) {
+            if let Some(display_name) =
+                spring_configuration_cglib_display_name(ctx, class_id, &name)
+            {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&display_name.replace('/', "."))))));
             }
         }
     }
@@ -14418,6 +14626,25 @@ pub(crate) fn native_class_get_class_loader(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // In real-JDK mode `getClassLoader()` is intercepted before its ordinary
+    // field-reading bytecode runs. Honor a loader recorded on the mirror by
+    // ClassLoader.defineClass before consulting the VM side table or package
+    // fallback; this also makes a JDK-owned class intentionally defined by a
+    // private loader (MethodUtil's Trampoline) retain that ownership.
+    if let Value::Object(Some(loader)) = ctx.get_field_by_name(mirror, "classLoader") {
+        let is_loader = ctx
+            .class_id_by_name("java/lang/ClassLoader")
+            .map(|loader_class_id| {
+                let actual_class_id = ctx.class_id_of_object(loader);
+                actual_class_id == loader_class_id
+                    || ctx.is_subclass(actual_class_id, loader_class_id)
+            })
+            .unwrap_or(false)
+            || crate::classloader::is_user_defined_loader(ctx, loader);
+        if is_loader {
+            return Ok(Some(Value::Object(Some(loader))));
+        }
+    }
     // Prefer the authoritative reverse map; fall back to the legacy
     // slot-0 ClassId encoding for synthetic test fixtures.
     let class_id_opt = ctx.class_id_from_mirror(mirror).or_else(|| {
@@ -14445,27 +14672,16 @@ pub(crate) fn native_class_get_class_loader(
     // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
     // fails with "Class already loaded" and Hibernate's proxy generation breaks.
     if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
-        // Defining-loader entries live in a Rust side table.  Reject a stale
-        // object reference before returning it as a ClassLoader; otherwise a
-        // reused String slot reaches ServiceLoader as `findResources()`.
-        let is_loader = ctx
-            .class_id_by_name("java/lang/ClassLoader")
-            .map(|loader_class_id| {
-                let actual_class_id = ctx.class_id_of_object(loader);
-                actual_class_id == loader_class_id
-                    || ctx.is_subclass(actual_class_id, loader_class_id)
-            })
-            .unwrap_or(false);
-        if is_loader {
-            return Ok(Some(Value::Object(Some(loader))));
-        }
+        // This reverse relation is written only by successful defineClass paths
+        // and reconciled across GC; it is the authoritative loader identity.
+        return Ok(Some(Value::Object(Some(loader))));
     }
     let loader_type = ctx.loader_id_of_class(class_id);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let is_jdk_pkg = class_name.starts_with("java/")
         || class_name.starts_with("javax/")
         || class_name.starts_with("jdk/")
-        || class_name.starts_with("sun/")
+        || (class_name.starts_with("sun/") && class_name != "sun/reflect/misc/Trampoline")
         || class_name.starts_with("com/sun/");
     if loader_type == 0 && is_jdk_pkg {
         // Bootstrap loader в†’ null per JVM spec.

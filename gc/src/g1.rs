@@ -1930,8 +1930,7 @@ impl G1Collector {
                 // SAFETY: slot_idx < num_slots — inside the allocation. STW:
                 // no concurrent mutator stores, plain reads are fine.
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value =
-                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
+                let value = unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
                 if let Value::Object(Some(r)) = value {
                     record(r.as_ptr() as usize);
                 }
@@ -3439,8 +3438,9 @@ impl G1Collector {
     ) -> (GcResult, Vec<usize>) {
         *self.pending_finalizer_roots.lock() = finalizer_addrs.to_vec();
         self.resurrected_finalizers.lock().clear();
-        let result =
-            <Self as crate::collector::GarbageCollector>::collect_garbage(self, stw, roots, monitors);
+        let result = <Self as crate::collector::GarbageCollector>::collect_garbage(
+            self, stw, roots, monitors,
+        );
         // Belt-and-braces: clear any candidates a path did not consume
         // (e.g. an empty-CSet early return) so a later plain collection
         // never sees stale candidates.
@@ -7541,7 +7541,10 @@ fn plausible_mark_scan_target(region: &G1Region, obj_addr: usize) -> bool {
     let off = obj_addr.wrapping_sub(base);
     // Header must be fully inside the allocated prefix. (Real objects
     // satisfy start + size <= cursor, so start + HEADER_SIZE <= cursor.)
-    if off.checked_add(HEADER_SIZE).is_none_or(|end| end > region.cursor) {
+    if off
+        .checked_add(HEADER_SIZE)
+        .is_none_or(|end| end > region.cursor)
+    {
         return false;
     }
     // SAFETY: the header span was just confirmed inside this region's

@@ -13586,6 +13586,23 @@ fn execute_instruction(
             let b = thread.frames[frame_idx].stack.pop()?;
             let a = thread.frames[frame_idx].stack.pop()?;
             let eq = refs_equal(&a, &b);
+            if std::env::var_os("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE").is_some() {
+                let class_name = |value: &Value| match value {
+                    Value::Object(Some(mirror)) => crate::vm::class_id_from_mirror(shared, *mirror)
+                        .and_then(|cid| shared.class_manager.read().get_class(cid)
+                            .map(|c| c.name.to_string()))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let an = class_name(&a);
+                let bn = class_name(&b);
+                if an.contains("ActiveProfilesResolver") || bn.contains("ActiveProfilesResolver") {
+                    eprintln!(
+                        "[ACTIVE-PROFILES-IDENTITY] acmpne a={} b={} equal={}",
+                        an, bn, eq
+                    );
+                }
+            }
             if !eq {
                 thread.frames[frame_idx].pc = branch_target(saved_pc, *offset);
             }
@@ -17184,7 +17201,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
     name.starts_with("java/")
         || name.starts_with("javax/")
         || name.starts_with("jdk/")
-        || name.starts_with("sun/")
+        || (name.starts_with("sun/") && name != "sun/reflect/misc/Trampoline")
         || name.starts_with("com/sun/")
 }
 
@@ -17580,14 +17597,17 @@ fn resolve_field_ref_loader_aware(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first — identical fast path to `resolve_field_ref`.
-    if let Some(cached) = shared
+    // A field cache entry may have been populated by a loader-blind helper
+    // (verification, JIT metadata, or an earlier legacy path) before this
+    // opcode reaches its loader-aware resolver. Do not trust such an entry
+    // blindly for a user-loader caller: first resolve the symbolic owner in
+    // the caller's initiating-loader namespace, then validate that the cached
+    // declaring class is that owner or one of its actual ancestors.
+    let cached = shared
         .resolution_cache
         .read()
         .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
+        .cloned();
 
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
@@ -17627,6 +17647,16 @@ fn resolve_field_ref_loader_aware(
 
     let field_class_id =
         resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+    if let Some(cached) = cached {
+        let cache_matches_owner = {
+            let cm = shared.class_manager.read();
+            cached.declaring_class_id == field_class_id
+                || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
+        };
+        if cache_matches_owner {
+            return Ok(cached);
+        }
+    }
 
     resolve_field_in_class(
         shared,
@@ -20778,10 +20808,7 @@ pub(crate) fn lambda_impl_dispatch_override(
         .read()
         .get(&call_site.proxy_class_id)?;
     let name = &call_site.impl_handle.class_name;
-    lookup_loader_initiated(shared, host, name).filter(|cid| {
-        *cid != ClassId::new(0)
-            && shared.class_manager.read().get_loaded_class_id(name) != Some(*cid)
-    })
+    lookup_loader_initiated(shared, host, name).filter(|cid| *cid != ClassId::new(0))
 }
 
 /// Resolve a lambda implementation that is private in its declaring class.
@@ -27914,6 +27941,19 @@ fn execute_invokestatic(
         }
     });
 
+    if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+        && (method_class_name.contains("SpringFactoriesLoader")
+            || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
+            || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
+    {
+        let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let resolved_loader = static_dispatch_class_id
+            .and_then(|id| shared.class_manager.read().get_loader_id(id));
+        eprintln!(
+            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?}",
+            method_class_name, method_name, current_class_id, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader
+        );
+    }
     if !is_native {
         let target_class_id = if let Some(id) = static_dispatch_class_id {
             id

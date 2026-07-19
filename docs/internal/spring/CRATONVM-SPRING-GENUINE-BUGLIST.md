@@ -1829,6 +1829,70 @@ the WRONG same-named copy. Eight fixes landed on
     fixed by this change; #1 remains attributed to an existing tracked residual,
     #2–#3 remain open exactly as characterized above.
 
+    **2026-07-18/19 addendum — a further, DIFFERENT bug in this same SPI area
+    found and FIXED (branch codex/fix-spring-genuine-sweep-20260717, merged to
+    dev 9c4e6e414).** Independently root-caused via a from-scratch standalone
+    repro (`ForkedHintProbeTest`, a minimal `@CompileWithForkedClassLoader`
+    JUnit5 test replicating exactly what `StandardTestRuntimeHints.registerHints`
+    does) that `TestContextAotGeneratorIntegrationTests.endToEndTests()` still
+    threw `AssertionError: [Reflection hint for SpanishActiveProfilesResolver
+    with category INVOKE_DECLARED_CONSTRUCTORS]` even after the two fixes
+    above landed — i.e. `StandardTestRuntimeHints` now resolves and casts
+    correctly (per item 4's fix), but the `RuntimeHints` entry it registers for
+    an `@ActiveProfiles(resolver = ...)` class never took effect.
+
+    Root cause: the native shim backing Spring's
+    `org.springframework.util.ClassUtils.forName(String, ClassLoader)`
+    (`spring_class_utils_for_name_impl`, `native-builtins/src/phases_late.rs`)
+    only applied loader-aware resolution (routing through `loader.loadClass`)
+    when the caller passed an explicit *non-null* `ClassLoader`. Real Spring's
+    `ClassUtils.forName` bytecode substitutes
+    `Thread.currentThread().getContextClassLoader()` for a `null` argument
+    *before* ever calling `Class.forName` — but this native intercepts the
+    call before that substitution runs. `SpringFactoriesLoader.instantiateFactory`
+    calls `ClassUtils.forName(implementationName, this.classLoader)`, and
+    `AotServices.factories()` deliberately constructs its `SpringFactoriesLoader`
+    with a permanently-`null` `classLoader` field (by design — the resource
+    *lookup* classloader and the factory-*instantiation* classloader are
+    handled as two separate concerns in Spring's own code). A `null` loader
+    therefore silently fell through to CratonVM's loader-blind global class
+    scanner instead of the caller's actual thread-context loader — under
+    `@CompileWithForkedClassLoader` this resolved every SPI implementation
+    (`StandardTestRuntimeHints` included) to the stale app-loaded copy instead
+    of the fork's own redefinition. Confirmed via `CRATONVM_INVOKESTATIC_LOADER_TRACE`
+    / `CRATONVM_FORNAME_TRACE` (both new, permanent env-gated diagnostics) that
+    the entire `SpringFactoriesLoader`/`FactoryInstantiator` invokestatic chain
+    correctly resolved via the fork loader (`UserDefined(3)`) right up to the
+    `ClassUtils.forName` call itself, which is where the loader identity was
+    lost.
+
+    **Independently found and fixed by a separate, concurrent session too**
+    (already on `origin/dev` by the time this session's fix was ready to
+    merge — the two fixes are functionally identical, differing only in how
+    the current thread's Java `Thread` object is obtained; the version already
+    on `dev` was kept during the merge). Fix: substitute the thread context
+    classloader for a null/absent loader argument before deciding whether to
+    route through the existing loader-aware path.
+
+    Verified (this session, independently): the standalone `ForkedHintProbeTest`
+    repro now resolves `StandardTestRuntimeHints` via
+    `CompileWithForkedClassLoaderClassLoader` instead of `AppClassLoader`, and
+    `TestContextAotGeneratorIntegrationTests.endToEndTests()` no longer throws
+    the `SpanishActiveProfilesResolver` `RuntimeHints` `AssertionError`
+    (progresses to a later, unrelated generated-source-file-list assertion,
+    not investigated further this session — likely genuine, needs its own
+    triage with a faithfully-rebuilt `spring-webmvc`/`spring-websocket`/
+    `spring-webflux`/`spring-context-support`/`spring-oxm` classpath rather
+    than this session's classes-dir substitutions for missing jars).
+    Regression-clean: `cratonvm-native-builtins --lib --release` (3031/2
+    failed — both pre-existing on `origin/dev` tip independent of this fix,
+    confirmed via a clean-worktree A/B: `jca::key_factory::tests::
+    keyfactory_unproducible_key_throws_not_dead_key` and `phases_late::
+    p57_win_path_tests::trailing_separator_is_removed_only_from_non_roots`);
+    `cratonvm-vm --lib --release` (2210/17 failed, all 17 match the documented
+    pre-existing `jit::skip_list`/`runtime::lock_order`/
+    `buffered_input_stream_real_jdk_uses_its_own_bytecode` baseline).
+
 ---
 
 ## 3. Untriaged Clusters & Per-Class Details
@@ -2138,6 +2202,127 @@ session's root-cause-#1 fix). Every remaining failure is a distinct, unrelated, 
   dependency cache was partially evicted mid-session, consistent with this week's documented host
   disk instability), not a VM bug; needs a rerun with a complete classpath to confirm either way.
 
+### Groovy cluster follow-up 2026-07-18/19 -- 3 more classes CLOSED, 1 root-caused (partial), 2 residual clusters still open
+
+Goal for this pass: close out the whole Groovy scripting cluster (`GroovySpringContextTests` /
+`ScriptingDefaultsTests` family and every residual above) end to end. Branch
+`codex/fix-spring-genuine-sweep-20260717`, Azure host `20.83.144.174`, real JDK 25, Groovy 5.0.7,
+`KRun` JUnit-Platform harness, classpath rebuilt from the session's `groovy10-cp.txt` (substituting
+the vanished `/data/data/gradle-home` for the live `~/.gradle` cache -- see below).
+
+**Fixed this pass:**
+
+- **`scripting.config.ScriptingDefaultsTests`** (previously `ABEND rc=139`, "LIKELY STILL OPEN, no
+  dedicated fix" per the `6 found=0 ABEND cluster` section below) -- **re-verified OK 6/6 on
+  unmodified dev tip.** No new code change needed: it hits the exact same Groovy compilation
+  machinery as the 10-class cluster above and was already fixed by this session's root causes #1
+  (JIT inline-TLAB stale compact size) and #2 (`ArrayList$ListItr` stubs) from 2026-07-17 -- nobody
+  had re-run it since. Includes the `defaultProxyTargetClass` CGLIB-proxy-over-Groovy-bean test,
+  which also passes clean, confirming CGLIB-over-Groovy works for the *static* proxy case (contrast
+  with the dynamic-pointcut case still open below).
+
+- **`test.context.web.BasicGroovyWacTests`** (previously `FAIL 0/2`, `NoClassDefFoundError:
+  jakarta/servlet/ServletContext`) -- **confirmed environmental, now OK 2/2** after rebuilding the
+  classpath with `jakarta.servlet-api-6.1.0.jar` (`~/.gradle/caches/modules-2/files-2.1/
+  jakarta.servlet/jakarta.servlet-api/6.1.0/.../jakarta.servlet-api-6.1.0.jar`) included, exactly as
+  this doc's prior entry predicted. Not a VM bug.
+
+- **`context.groovy.GroovyBeanDefinitionReaderTests`** (previously `FAIL 33/36`:
+  `useTwoSpringNamespaces` + 2 bare `AssertionError`s) -- **now OK 36/36**, fixed by the
+  classloader-identity fix below (`useTwoSpringNamespaces` builds a scoped-proxy bean over a
+  Groovy-defined class via a JDK dynamic proxy, which goes through the exact `defineClass`-family
+  code path the fix closes).
+
+- **`scripting.groovy.GroovyScriptFactoryTests`** (previously `FAIL 21/38`) -- **improved to 33/38**
+  by the same fix (JSR223 script-tag beans and several other cases route through
+  `ClassLoader.defineClass`/`Lookup.defineClass` under a Groovy-compiled class's own loader). 5
+  residuals remain, root-caused below (2 distinct sub-clusters).
+
+**Fix landed** (`native-builtins/src/classloader.rs::define_class_via_full` +
+`native-builtins/src/shared_secrets_bridge.rs`, committed as part of `56383c47a`, gated on
+`is_user_defined_loader`/the existing `CRATONVM_LOADER_AWARE_RESOLUTION` flag -- byte-identical
+gate-off): the JDK-internal `defineClass1`/`defineClass2`/`defineClass0` natives (used by
+`ClassLoader.defineClass(String,byte[],int,int[,ProtectionDomain])`, i.e. exactly what
+`GroovyClassLoader`/`InnerLoader` calls to define a compiled script class) never called
+`register_defining_loader` -- only the specialized `Lookup.defineClass` path
+(`lookup_define.rs::lk_define_class_b`) did, and only by *inheriting* an already-registered
+defining loader from a class already known to have one. A class defined by `ClassLoader.defineClass`
+itself (the common Groovy/most-custom-loader case) had no recorded defining loader, so
+`inherit_lookup_loader`'s namespace lookup for a *later* CGLIB/JDK-proxy generated against that class
+fell through to the legacy `loader_id_of_class` path, which collapses a small `UserDefined(n)`
+namespace id into the built-in-loader range -- the same class of bug already fixed narrowly for
+Hibernate/ByteBuddy (see `inherit_lookup_loader`'s existing doc comment). Fix: `define_class_via_full`
+now also calls `register_defining_loader` when the `loader` argument is a genuine user-defined
+`ClassLoader` (checked via the existing `is_user_defined_loader` predicate, so the built-in
+system/app loader -- the overwhelming majority of class definitions -- is never added to the
+side-table, preserving its existing invariant of holding only genuine custom loaders). Verified:
+`cargo test -p cratonvm-native-builtins --lib --release` 3002/0/6 (matches/improves the documented
+baseline), no regressions.
+
+**Still OPEN -- two distinct residual clusters, both narrowed down but not fixed this pass:**
+
+1. **CGLIB *dynamic-pointcut* proxy generation over a Groovy-compiled class** --
+   `scripting.groovy.GroovyAspectTests::manualGroovyBeanWithDynamicPointcutProxyTargetClass` (3/4)
+   and `GroovyAspectIntegrationTests::groovyBeanProxyTargetClass` (3/4), plus (same symptom, likely
+   same cause) `GroovyScriptFactoryTests::proxyTargetClassNotAllowedIfNotGroovy`. Surface symptom:
+   `AopConfigException: Could not generate CGLIB subclass ...` wrapping `CodeGenerationException:
+   java.lang.ClassNotFoundException-->TargetClass$$SpringCGLIB$$0` (or a `BeanPostProcessor before
+   instantiation of bean failed` for the AOP-integration variant). **Root-caused this pass to a
+   specific, narrow point** (not yet fixed): live tracing (`CRATONVM_S111_DBG`, plus temporary
+   instrumentation in `native_class_for_name`/`inherit_lookup_loader`, reverted before commit -- not
+   left in the tree) showed: (a) the *other* 2-3 proxy generations for the same target class in the
+   same test class succeed cleanly end-to-end (`Lookup.defineClass` -> `inherit_lookup_loader`
+   resolves a real namespace -> `Class.forName(name, true, loader)` -> `loader.loadClass(name)`
+   succeeds via `invoke_virtual`); (b) for the *failing* one, cglib's
+   `AbstractClassGenerator.generate()`'s `attemptLoad` pre-check (`ReflectUtils.loadClass
+   (getClassName(), classLoader)`, wrapped in a local `try { ... } catch (ClassNotFoundException e)
+   { /* ignore */ }` -- a normal "does this name already exist" probe, expected to throw CNFE
+   harmlessly for a brand-new class) throws a **genuinely well-formed** `java.lang.
+   ClassNotFoundException` (confirmed: its `ClassId` matches the canonical `java/lang/
+   ClassNotFoundException` exactly, no dual-registration/synthetic-vs-real identity mismatch -- that
+   specific hypothesis is **refuted**) for the target class's own name -- but this exception is
+   never observed being caught by that local `catch`: `Lookup.defineClass` (traced via
+   `inherit_lookup_loader`) is never subsequently invoked for this test, meaning execution left
+   `generate()` entirely instead of continuing past the swallowed-CNFE attemptLoad check, landing
+   in the outer `catch (Exception ex) { throw new CodeGenerationException(ex); }` -- i.e. **a CNFE
+   that real Java code catches locally is somehow escaping that catch and being seen by the
+   caller's outer catch-all instead.** Not yet root-caused *why* the catch doesn't fire for this one
+   call -- candidate next steps: check whether this is specific to a native (`Class.forName`)
+   re-throwing an exception object captured from a *nested* `invoke_virtual` call (as opposed to a
+   native constructing+throwing its own exception directly), and whether the interpreter's
+   exception-table lookup for the calling bytecode frame is being consulted correctly in that
+   specific shape of call. This mechanism, if generalized, could plausibly explain other
+   "probe-forName-expected-to-fail-silently" bugs elsewhere -- worth a dedicated investigation, not
+   just a Groovy-cluster one.
+
+2. **Spring bean-type-matching for Groovy "instance scripts"** --
+   `GroovyScriptFactoryTests::staticScriptWithInstance`, `staticScriptWithInlineDefinedInstance`,
+   `staticScriptWithInlineDefinedInstanceUsingJsr223`, `inlineJsr223FromTag` (4 of the 5 remaining
+   failures): `ctx.getBeanNamesForType(Messenger.class)` (or equivalent) does not include the bean,
+   even though the underlying object genuinely implements the interface (no exception is thrown --
+   the bean just doesn't show up in the type index). An "instance script" here means Groovy source
+   that both defines a class AND has top-level executable code (e.g. `class GroovyMessenger
+   implements Messenger { ... }` followed by `return new GroovyMessenger();`) -- Groovy compiles this
+   as a synthetic `Script` subclass wrapping the top-level statements, with `GroovyMessenger` as a
+   secondary class in the same compilation unit; `GroovyScriptFactory.getScriptedObjectType`/
+   `getScriptedObject` call `GroovyClassLoader.parseClass(text, suggestedName)` and branch on
+   `Script.class.isAssignableFrom(result)`. **Ruled out**: the raw Groovy mechanism itself, isolated
+   in a minimal Spring-free/Groovy-only probe (`InstanceScriptProbe`, `/data/tmp/` on the Azure
+   host) reproducing the exact `MessengerInstance.groovy` source byte-for-byte -- `parseClass`
+   correctly returns the `Script` subclass, `run()` correctly returns a `GroovyMessenger` instance,
+   and `instanceof Messenger` is `true` -- **output is identical, HotSpot vs CratonVM, in every
+   respect.** So the defect is NOT in Groovy compilation/class-selection; it is somewhere in Spring's
+   own `ScriptFactoryPostProcessor`/bean-type-registration integration layer, specific to how it
+   reacts to a script whose *runtime* result type differs from the *statically parsed* script class
+   (i.e., `getScriptedObjectType`'s cached/precomputed type vs the actual bean instance's type at
+   creation time) -- not investigated further this pass. `proxyTargetClassNotAllowedIfNotGroovy` (the
+   5th residual) is almost certainly cluster #1 above, not this one (same `BeanPostProcessor before
+   instantiation` symptom).
+
+**Every one of the 10 originally-tracked classes is now green except `GroovyAspectTests` and
+`GroovyAspectIntegrationTests`** (3/4 each, cluster #1 above). Aggregate: **9/10 classes at 100%**,
+up from 5/10 before this pass; `GroovyScriptFactoryTests` alone went 21/38 -> 33/38.
+
 ### 6 found=0 ABEND cluster — reconciled
 
 The historical doc separately flagged 6 classes that crashed **before any test method was discovered**
@@ -2149,11 +2334,12 @@ The historical doc separately flagged 6 classes that crashed **before any test m
 | `core.codec.ResourceRegionEncoderTests` | ABEND `rc=139` | **UNKNOWN / untracked** — not `web.reactive.*` by package name, so likely (but not confirmed) outside §4's reactive-sweep scope even though `ResourceRegionEncoder` is reactive-stack machinery; needs a live rerun to confirm either way |
 | `jdbc.config.JdbcNamespaceIntegrationTests` | ABEND `rc=1` — hsqldb `RangeGroup$RangeGroupEmpty` OOB field read | **UNKNOWN / untracked** (also HIB-CV-32-list #15 above) |
 | `scheduling.quartz.QuartzSupportTests` | TIMEOUT (120s) | **UNKNOWN / untracked** — zero mentions anywhere in current `dev` |
-| `scripting.config.ScriptingDefaultsTests` | ABEND `rc=139` (dumped core) | **LIKELY STILL OPEN** — same Groovy/scripting family as above, no dedicated fix |
+| `scripting.config.ScriptingDefaultsTests` | ABEND `rc=139` (dumped core) | **FIXED** — re-verified `OK 6/6` 2026-07-18/19 (see "Groovy cluster follow-up" above); no dedicated fix needed, already resolved by the 2026-07-17 root causes #1/#2, just never re-run |
 | `test.web.servlet.htmlunit.MockWebResponseBuilderTests` | Actually **FAIL**, not ABEND, in the per-class detail (`buildContent() :: AssertionFailedError`, single method) — the historical doc's own summary and per-class sections disagree on this one's shape | **UNKNOWN / untracked**, but looks like a narrow single-assertion bug (same pattern as several other now-fixed single-method FAILs in this doc) — a plausible quick-fix candidate for a future session with a working classpath |
 
-Net: **1/6 fixed**, **5/6 unconfirmed/likely still open**, none of them tracked anywhere else in this
-document prior to this recovery pass.
+Net: **2/6 fixed** (updated 2026-07-18/19: `ScriptingDefaultsTests` re-verified OK, see "Groovy
+cluster follow-up" above), **4/6 unconfirmed/likely still open**, none of them tracked anywhere else
+in this document prior to this recovery pass.
 
 ## 4. Reactive cluster session 2026-07-15 (branch `fix/reactive-cluster-20260715`)
 

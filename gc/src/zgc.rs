@@ -1734,7 +1734,12 @@ impl ZgcRealHeap {
     /// `vm/src/runtime/interpreter.rs`), done internally here since
     /// `ZgcRealHeap::collect_garbage` is self-contained (no interpreter
     /// pre/post-GC cooperation step).
-    fn enumerate_references(&self, base: *mut u8, work: &mut Vec<usize>, skip_index: Option<usize>) {
+    fn enumerate_references(
+        &self,
+        base: *mut u8,
+        work: &mut Vec<usize>,
+        skip_index: Option<usize>,
+    ) {
         let header = self.header_mut(base);
         match header.kind {
             ObjectKind::Object => {
