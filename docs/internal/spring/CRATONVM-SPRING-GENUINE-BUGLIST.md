@@ -2421,20 +2421,44 @@ object when driven directly -- something about the *caching* of that already-com
 across the `predictBeanType` -> (later) `postProcessBeforeInstantiation` -> `getScriptedObject`
 call sequence loses it on CratonVM specifically.
 
-**Concrete next step for a future session**: `CachedResultHolder` is a trivial `final Object
-object` field written once in a constructor and read back later, with a real (if short) window
-between the two BeanPostProcessor-driven calls for other container work to run -- a plausible
-GC-related site (compare to the many other "stale ObjectRef surviving a moving collection"
-findings already closed elsewhere in this codebase). Confirm or refute by: (a) checking whether
-`GroovyScriptFactory`'s own instance fields (`scriptClass`, `scriptResultClass`, `cachedResult`)
-survive a moving GC correctly when read back through ordinary heap-object field access (this
-should already work generically -- if it doesn't, that is a much bigger bug than Groovy scripting
-alone); (b) instrumenting (temporarily) `CachedResultHolder`'s `<init>` and the `cachedResult`
-read site in `getScriptedObject`/`getScriptedObjectType` with a print of the object's identity
-hash at write time vs read time to see whether it's a plain `null` from the start (a script
-execution defect specific to *this* driven call path, not GC) or a genuinely non-null-then-later-
-null transition (pointing at GC/root-tracking). (b) is the faster differential and should be tried
-first.
+**UPDATE, same session: the GC/stale-reference hypothesis above is REFUTED.** Built a second
+standalone probe (`CachedResultProbe.java`, `/data/tmp/` on the Azure host) that drives
+`GroovyScriptFactory` directly (no Spring container at all): calls `getScriptedObjectType(source)`
+(populating `cachedResult` exactly as `predictBeanType` would), reads the private `cachedResult`
+field via reflection to confirm it holds the live `GroovyMessenger` instance, deliberately
+allocates ~1M objects of garbage and calls `System.gc()` twice to force a moving collection, reads
+`cachedResult` again, then calls `getScriptedObject(source)` to consume it. **CratonVM's result
+is byte-identical to HotSpot at every step** -- the cached holder and its `object` field survive
+the GC pressure with the correct identity, and `getScriptedObject()` correctly returns the live
+`GroovyMessenger`. So `CachedResultHolder` / GC-root-tracking is definitively NOT the defect;
+`GroovyScriptFactory`'s own caching mechanism works correctly on CratonVM when driven directly.
+
+**Sharper lead, not yet run down**: the ONLY structural difference between this probe (which
+works) and the real failing path is *how* `getScriptedObject` gets invoked.
+`ScriptFactoryPostProcessor.createScriptedObjectBeanDefinition` (line ~544) does NOT call
+`getScriptedObject` directly -- it registers a `GenericBeanDefinition` with
+`setFactoryBeanName(scriptFactoryBeanName)` / `setFactoryMethodName("getScriptedObject")` and
+constructor-arg values `[scriptSource, interfaces]`, so Spring's OWN
+`ConstructorResolver`/`instantiateUsingFactoryMethod` machinery resolves and invokes
+`getScriptedObject(ScriptSource, Class<?>...)` **reflectively** (`Method.invoke`) against the
+`scriptFactoryBeanName` singleton -- a varargs method, with the `interfaces` constructor-arg value
+being an already-materialized `Class<?>[]` that Spring's argument-matching has to bind onto the
+trailing `Class<?>...` parameter. Both probes in this doc call the method directly (a normal
+`invokevirtual`), never through reflection. The next session should instrument (temporarily) the
+reflective `Method.invoke` native path specifically for this call (or write a probe that invokes
+`GroovyScriptFactory.class.getMethod("getScriptedObject", ScriptSource.class, Class[].class)
+.invoke(factory, source, interfacesArray)` directly, HotSpot vs CratonVM) to see whether the
+REFLECTIVE call reaches the same `cachedResult` fast path / the same `this` instance as the
+`predictBeanType` call did, or whether reflection is (for this specific varargs-method-with-an-
+already-array-argument shape) resolving to a different overload, double-wrapping the varargs
+array, or -- most likely given the observed `NullBean` -- invoking a *different*
+`GroovyScriptFactory` instance than the one `predictBeanType` populated (i.e. the
+`scriptFactoryBeanName` singleton lookup inside the internal `scriptBeanFactory` returning a
+fresh/different object on the reflective path). That would explain everything: a fresh instance's
+`cachedResult` is null, `scriptClass` is null too, so it would need to re-parse+re-execute -- and
+if reflective invocation triggers a genuine re-execution that itself succeeds, this lead doesn't
+fully explain the observed `null` either, so confirm the ACTUAL invoked receiver identity first
+before going further.
 
 ### 6 found=0 ABEND cluster — reconciled
 
