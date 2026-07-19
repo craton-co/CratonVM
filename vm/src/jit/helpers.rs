@@ -248,6 +248,7 @@ thread_local! {
     static JIT_SIGNALS: JitSignals = const {
         JitSignals {
             exception: Cell::new(None),
+            athrow_bci: Cell::new(-1),
             aioobe: Cell::new(None),
             arithmetic: Cell::new(false),
             npe: Cell::new(false),
@@ -552,6 +553,24 @@ pub fn clear_jit_thread() {
 /// [`JIT_SIGNALS`] thread-local for field semantics.
 struct JitSignals {
     exception: Cell<Option<ObjectRef>>,
+    /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
+    /// `exception`, when statically known at JIT-compile time (`-1` = unknown,
+    /// e.g. an exception propagated up from a dispatched callee, which this
+    /// method has no bci for). Set ONLY by `jit_throw_exception` alongside
+    /// `exception`; every other site that stashes a general exception (no
+    /// known local throw site) leaves/resets this to `-1`. Consumed by
+    /// `execute_jit_call` to give `route_jit_exception_through_method` a real
+    /// `throw_pc` instead of the `usize::MAX`-means-unknown fallback, which
+    /// cannot range-check a *typed* handler against the entry it actually
+    /// belongs to — with 2+ exception-table entries whose catch types are in
+    /// a subtype relationship (e.g. one entry catches `RuntimeException`, a
+    /// LATER, unrelated entry catches `IllegalStateException`), the
+    /// declaration-order type-only match picks whichever entry comes first
+    /// regardless of which try-region actually threw, silently running the
+    /// wrong handler. Confirmed via a two-sequential-try/catch differential
+    /// repro (`AthrowCountBisect.twoThrowsSequential`,
+    /// `vm/tests/jit_local_exception_handler_tests.rs`) before this fix.
+    athrow_bci: Cell<i64>,
     aioobe: Cell<Option<(i64, i64)>>,
     arithmetic: Cell<bool>,
     npe: Cell<bool>,
@@ -565,6 +584,10 @@ struct JitSignals {
 /// `take_*` calls.
 pub(crate) struct DrainedJitSignals {
     pub exception: Option<ObjectRef>,
+    /// See `JitSignals::athrow_bci`. `-1` iff unknown (matches the field's
+    /// own sentinel, so callers can pass it straight through as `usize::MAX`
+    /// when negative without an extra branch).
+    pub athrow_bci: i64,
     pub aioobe: Option<(i64, i64)>,
     pub arithmetic: bool,
     pub npe: bool,
@@ -585,6 +608,7 @@ pub(crate) struct DrainedJitSignals {
 pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
     JIT_SIGNALS.with(|s| DrainedJitSignals {
         exception: s.exception.take(),
+        athrow_bci: s.athrow_bci.replace(-1),
         aioobe: s.aioobe.take(),
         arithmetic: s.arithmetic.take(),
         npe: s.npe.take(),
@@ -595,8 +619,30 @@ pub(crate) fn take_all_jit_signals() -> DrainedJitSignals {
 
 /// Store a pending Java exception from JIT dispatch. Called when
 /// `jit_invoke_dispatch` encounters an `ExceptionThrown` error.
+///
+/// Always resets `athrow_bci` to `-1` (unknown) — this is the general,
+/// origin-agnostic setter (a dispatched callee threw, or a re-stash), never
+/// the direct-local-athrow path. Only `jit_throw_exception`'s dedicated
+/// `set_jit_pending_exception_with_bci` may set a real bci, and only for the
+/// exception it is stashing in that same call.
 fn set_jit_pending_exception(exc: ObjectRef) {
-    JIT_SIGNALS.with(|s| s.exception.set(Some(exc)));
+    JIT_SIGNALS.with(|s| {
+        s.exception.set(Some(exc));
+        s.athrow_bci.set(-1);
+    });
+}
+
+/// RBC.6 correctness fix — sibling of `set_jit_pending_exception` for the ONE
+/// call site (`jit_throw_exception`) that knows the exact bytecode pc of the
+/// `athrow` producing this exception at JIT-compile time. See
+/// `JitSignals::athrow_bci` for why this matters (typed-handler routing
+/// correctness with 2+ exception-table entries when `throw_pc` would
+/// otherwise be `usize::MAX`).
+fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
+    JIT_SIGNALS.with(|s| {
+        s.exception.set(Some(exc));
+        s.athrow_bci.set(bci);
+    });
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -606,6 +652,12 @@ fn set_jit_pending_exception(exc: ObjectRef) {
 /// the next iteration via `take_jit_pending_exception`. Crate-pub because
 /// only the OSR entry path should use it; ordinary JIT helpers set the flag
 /// directly via the private `set_jit_pending_exception` above.
+///
+/// Deliberately loses any `athrow_bci` the exception may have carried before
+/// being taken (this is the general re-stash path, not the direct-athrow
+/// one) — always falls back to the pre-existing `usize::MAX`-means-unknown
+/// behavior for the re-stashed exception, never a regression, just not the
+/// newly-precise case.
 pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
     set_jit_pending_exception(exc);
 }
@@ -1442,6 +1494,16 @@ unsafe fn route_implicit_exc_through_callee(
     if rc != i64::MIN {
         return rc;
     }
+    if rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_implicit_exc_through_callee ENTER {}.{}{} has_last_deopt={} pending_exc={} pending_npe_or_aioobe_unread=?",
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            cratonvm_jit::deopt::has_last_deopt(),
+            jit_pending_exception_is_set(),
+        );
+    }
     // jit-invokedynamic-groovy-regression fix — FIRST chance: a frame-stashing
     // deopt (the unconditional invokedynamic reason-8 trap, or a precise guard
     // bail) in the compiled callee THIS helper just invoked. Resume the callee
@@ -1500,6 +1562,12 @@ unsafe fn route_implicit_exc_through_callee(
             if let Some((thread, _guard)) = jit_thread_mut() {
                 let _ = take_jit_pending_exception();
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
+                if rbc6_dbg() {
+                    eprintln!(
+                        "[rbc6-dbg] route_implicit_exc_through_callee KCFULL-13 bail_to_interpreter {}.{}{}",
+                        info.class_name, info.method_name, info.descriptor
+                    );
+                }
                 return bail_to_interpreter(vm, thread, info, &bail_args);
             }
         }
@@ -4428,6 +4496,16 @@ fn aioobe3_dbg() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE3").is_some())
 }
 
+/// RBC.6 — trace exception routing through `route_implicit_exc_through_callee`
+/// / `route_jit_exception_through_method` (which entry each takes, resolved
+/// handler pc). Cached read-once like the other `*_dbg()` gates in this file.
+#[inline]
+pub(crate) fn rbc6_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_RBC6").is_some())
+}
+
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
 /// sibling of [`jit_throw_aioobe`]. The x64 `idiv`/`irem`/`ldiv`/`lrem`
 /// zero-divisor guard jumps to a stub that calls this and immediately runs the
@@ -4460,20 +4538,32 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
 /// caller's handling. `exc_ptr == 0` (athrow on a null reference) sets
 /// the pending-NPE flag instead, per JVMS athrow semantics.
 ///
+/// `bci` is the bytecode pc of this `athrow` instruction — a compile-time
+/// immediate the x64 codegen bakes into the call site (RBC.6 correctness
+/// fix, see `JitSignals::athrow_bci`). Stashed alongside the exception so
+/// `execute_jit_call` can give `route_jit_exception_through_method` a real
+/// `throw_pc` instead of `usize::MAX`, which — for a method with 2+
+/// exception-table entries whose catch types are in a subtype relationship —
+/// can match the WRONG entry (declaration-order, type-only) regardless of
+/// which try-region actually threw. `exc_ptr == 0` still routes to the NPE
+/// flag (no bci needed there — `jit_pending_npe` has no such ambiguity path
+/// yet).
+///
 /// Same platform rationale as [`jit_throw_aioobe`]: JIT frames have no
 /// SEH unwind tables on Windows, so a Rust panic/unwind here would
 /// terminate the process; thread-local stashing sidesteps that.
 // SAFETY: Called from JIT-compiled code at an athrow site. `exc_ptr` is
 // either 0 or the heap pointer the JIT popped from the operand stack;
 // no dereference happens here — it is only wrapped and stored in a TLS.
-pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64) -> i64 {
+// `bci` is a bare immediate (no pointer semantics).
+pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
     if exc_ptr == 0 {
         stash_jit_pending_npe();
     } else {
-        stash_jit_pending_exception(ObjectRef::from_raw(exc_ptr as usize as *mut u8));
+        set_jit_pending_exception_with_bci(ObjectRef::from_raw(exc_ptr as usize as *mut u8), bci);
     }
     i64::MIN // deopt sentinel — interpreter drains the pending exception
 }
