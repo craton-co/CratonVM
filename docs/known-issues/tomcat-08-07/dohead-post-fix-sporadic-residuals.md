@@ -251,3 +251,203 @@ selector wakeup change for the HTTP/2 partial-write face.
 After this diagnostic attempt completed, every running DoHead VM process was
 terminated; a `/proc` executable-and-command-line sweep confirmed that no DoHead
 VM process remained.
+
+## 2026-07-18 C23-C29 map-layout closure and remaining transport residuals
+
+**Status: OPEN.** This checkpoint closes the sporadic HTTP header-map loss, but
+does not yet close the independent HTTP/2 EOF/timeout family. The document
+therefore remains under docs/known-issues.
+
+### Validated changes
+
+1. The selector phase-3 readiness safety-net now checks each missing interest
+   bit rather than treating any pre-existing ready bit as complete. Together
+   with C20's non-sticky post-epoll_ctl(MOD) self-pipe nudge, the focused
+   selector suite remains clean: cargo test -p cratonvm-native-io --lib
+   nio_selector -- --test-threads=1 reported 20/20.
+2. HttpURLConnection.getHeaderFields() now uses HashMap consistently rather
+   than constructing a LinkedHashMap while invoking HashMap.put.
+3. The decisive header bug was in native collection storage, not the response
+   parser: map_alloc_node() allocated ClassId(0) / java/lang/Object nodes and
+   then wrote HashMap node fields. The heap now correctly gives Object a
+   zero-slot layout, so those writes were guarded/dropped, intermittently
+   removing map entries such as Date. Nodes are now allocated as
+   java/util/HashMap$Node.
+4. Live entry snapshots root key, value, and source-map references across their
+   allocating entry creation, preventing pre-move references from being
+   published after a moving collection.
+
+### Evidence
+
+- C28's two-class pressure run reproduced the old header error once (23/24)
+  and emitted the zero-slot guard records. It established that only rooting the
+  live entry helper was insufficient.
+- C29 binary: /data/data/cvm-dohead-c29-mapnode-20260718.
+- C29 targeted pressure:
+  /data/data/dohead-c29-mapnode-headerpair-n2x4-20260718;
+  1 -> 1025 and 1025 -> 1025, two processes, four passes: **8/8 PASS**,
+  zero failures. The completed attempt left no DoHead process.
+- Focused native validation:
+  cratonvm-native-collections map filter **20/20**, and
+  cratonvm-native-builtins http_url_connection **30/30**.
+- C29 full JIT matrix:
+  /data/data/dohead-c29-mapnode-full64-n2x1-20260718; 64 classes, two
+  processes, -Xmx1g, one pass, 240-second class timeout, ALL_DONE.
+  Result: **61 PASS, 3 residuals**:
+  - 511 -> 1023: HTTP/2 End of input stream with [9] bytes left.
+  - 512 -> 0: timeout.
+  - 513 -> 511: timeout.
+  The first EOF coincided with a guarded zero-slot write at index 4, so the
+  remaining transport diagnosis must identify that distinct raw-object layout
+  producer before assigning the failures to selector or network timing.
+
+After the C29 matrix finished, the explicit DoHead process sweep found no
+matching runner or VM process. Do not move this record to docs/internal until
+a newly built binary completes the 64-class matrix with zero residuals,
+followed by a relevant --nojit control.
+
+## 2026-07-18 C32 system-environment map node residual
+
+C32 closes the remaining zero-slot HashMap node producer in
+native-builtins/lang_system. System.getenv() could receive an apparent
+HashMap$Node initialization success carrying Object class ID 0; its field
+writes were silently dropped. The path now unconditionally obtains the named
+synthetic HashMap$Node layout. C32 mixed transport pressure
+(511->1023, 512->0, 513->511; two processes, eight passes) completed 24/24
+PASS with ALL_DONE and no matching DoHead process remaining.
+
+## 2026-07-18 C33 full-matrix checkpoint
+
+**Status: OPEN.** C32's system-environment map-node fix removes the guarded
+zero-slot node writes seen in the previous matrix, but it does not yet close
+the entire DoHead family. The document remains under `docs/known-issues`.
+
+- C32 focused JIT pressure:
+  `/data/data/dohead-c32-systemnode-transport-n2x8-20260718`, covering
+  `511 -> 1023`, `512 -> 0`, and `513 -> 511` with two processes and eight
+  passes, completed **24/24 PASS** with `ALL_DONE`.
+- C32 full JIT matrix:
+  `/data/data/dohead-c32-systemnode-full64-n2x1-20260718`, 64 boundary
+  classes, two processes, one pass, `-Xmx1g`, and a 240-second class timeout,
+  completed with `ALL_DONE`: **63 PASS, 1 FAIL**.
+- The sole residual is `1023 -> 0`, parameter
+  `testDoHead[29: 0 false false 16,384 false 1,023 FULL 0 true]`, which
+  asserts three headers but receives two (`expected:<3> but was:<2>`). This is
+  an HTTP/1 FULL/keep-alive header-map loss, distinct from C29's zero-slot
+  producer and from the C32 focused transport cases.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.
+
+## 2026-07-18 C34 System.getenv fallback-layout closure
+
+**Status: OPEN.** The C34 fallback allocation repair closes C33's `1023 -> 0`
+header-map loss, but the independent partial-write/transport family remains.
+
+- The `System.getenv()` legacy fallback allocated a three-slot HashMap and
+  four-slot HashMap$Node with `ClassId(0)` after real layout resolution failed.
+  C34 now uses named synthetic layouts for both objects.
+- Exact JIT stress for the former residual:
+  `/data/data/dohead-c34-systemenvfallback-1023to0-n2x8-20260718`, two
+  processes and eight passes, completed **8/8 PASS** with `ALL_DONE`.
+- C34 full JIT matrix:
+  `/data/data/dohead-c34-systemenvfallback-full64-n2x1-20260718`, completed
+  **60 PASS, 4 FAIL**. `1023 -> 0` now passes. Current residuals are
+  `1023 -> 511`, `1024 -> 1023`, and `1 -> 1025` (each EOF with nine bytes
+  left), plus `512 -> 1` (expected HTTP 200, got -1). Two residual logs retain
+  guarded zero-slot accesses at field indices 4 or 5; their producer remains
+  to be identified before changing selector behavior.
+- Completion cleanup found no matching DoHead VM or runner process. No
+  `--nojit` control was run because the JIT full matrix remains non-zero.
+
+## 2026-07-18/19 C35-C38 — OSR exception-table regression found and fixed;
+## sporadic header-count family confirmed still open, unrelated
+
+**Status: OPEN**, but the family is smaller than it appeared going into this
+round. This session took over the investigation in a fresh continuation
+worktree (`/data/wt-dohead-mapresiduals-20260718`, fast-forwarded to
+`origin/dev`), since the worktree named in the original hand-off
+(`cvm-dohead-postfix-residuals-20260717`) was the already-abandoned,
+contaminated worktree referenced above under the 2026-07-18 clean-worktree
+entry, not the active lineage.
+
+**A fresh C35 baseline build at then-current `dev` HEAD (`139ac143e`, 164
+commits past the C34 checkpoint) showed 39 PASS / 25 FAIL on the full 64-class
+matrix — a massive, 100%-deterministic regression, not the low-rate sporadic
+family this document tracks.** Every failure shared the exact same shape:
+`useWriter=false` (raw `OutputStream`, not `PrintWriter`), `resetType` in
+`{BUFFER, FULL}` (never `NONE`), and enough `invalidWriteCount` bytes to
+overflow the response buffer before the reset call. `--nojit` passed the
+same class 288/288, isolating it to JIT.
+
+**Root cause:** `compile_osr_artifact()` in `vm/src/runtime/interpreter.rs`
+compiles a method via on-stack-replacement (OSR) when a hot loop inside it
+triggers tiered compilation mid-execution. Unlike the method-entry JIT path
+(which already bails whenever the method has a non-empty exception table),
+the OSR path only bailed on `scan.has_athrow` (the method throwing directly)
+— it did **not** bail when the method merely *contains* a `try/catch` around
+a call to something else that throws. `compile_with_param_slots` (the OSR
+backend entry point) has no exception-table parameter at all, so an
+OSR-compiled artifact **never** carries handler ranges: when a callee (e.g.
+`Response.resetBuffer()`, throwing a completely normal, real-bytecode
+`IllegalStateException`) unwinds into an OSR-compiled caller frame, the
+runtime finds no matching catch and the exception escapes uncaught, even
+though the source has a textually-correct `catch (IllegalStateException)`.
+Tomcat's container then aborts the connection mid-response, which is what
+surfaced as `HttpURLConnection response failed: chunked: socket closed
+mid-header` on the client.
+
+This bug is not new, but was masked: before `d6f642695` (part of the
+`perf/halfgap-20260717` round, landed between the C34 checkpoint and this
+session), **any** method referencing an `ldc` string constant was
+unconditionally OSR-denied, so a method like `HeadTestServlet.doGet`
+(string constants for `"* invalid data *"`, `"text/plain"`, etc., plus a hot
+`for` loop over `invalidWriteCount`) never got OSR-compiled and always ran
+this code path interpreted (correctly). Once `d6f642695` fixed that
+unrelated OSR-denial bug, `doGet` started succeeding OSR compilation and
+immediately exposed the pre-existing exception-table gap.
+
+**Fix** (`eda677f45`, merged to `dev` as `62693f104`): added an RBC.6b guard
+in `compile_osr_artifact` — look up the method's real Code attribute and
+bail OSR (permanently bail-list, matching the sibling RBC bails) whenever
+its `exception_table` is non-empty, mirroring the method-entry gate exactly.
+Verified:
+- Isolated reruns of `TestHttpServletDoHeadInvalidWrite1023ValidWrite0`:
+  3/3 PASS pre-merge, 3/3 PASS post-merge (after merging 5 unrelated
+  concurrent commits from other sessions into this branch).
+- Full 64-class matrix: 39 PASS / 25 FAIL (pre-fix) → 58 PASS / 6 FAIL
+  (post-fix, pre-merge) → 55 PASS / 9 FAIL (post-fix, post-merge, different
+  run). The post-fix failures are NOT the class this fix targeted (which
+  passed cleanly in both post-fix runs) and are NOT reproducible in
+  isolation (4/4 clean reruns of one).
+
+**The remaining post-fix failures are the pre-existing sporadic family this
+document already tracks**, not a new regression:
+- 8 of 9 residuals in the post-merge full-matrix run were the historical
+  header-count off-by-one assertion (`expected:<N> but was:<N±1>`, both
+  directions), always exactly 1/288 per class, always on the `useWriter=true`
+  (`PrintWriter`) path — a different code path than the OSR bug this session
+  fixed.
+- 1 was the historical `IOException: End of input stream with [9] bytes
+  left to read` EOF singleton (same family as the original 2026-07-15
+  catalogue's item 4 and the C29/C34-era EOF residuals).
+- Checked for correlation with the zero-slot/`ClassId(0)` map-node bug
+  family (the one C29/C32/C34 closed several producers of): the
+  `cratonvm::gc::guard` WARN lines present in these failing logs are a
+  fixed 4-line pattern (`index=3,1,0,1` on the same two objects) that
+  appears identically at the *start* of every test case in every class,
+  pass or fail — routine JUnit/Tomcat-bootstrap noise, not correlated with
+  the actual failure. A narrow always-on backtrace diagnostic was added to
+  `gc/src/gen_heap.rs`'s OOB guards (fires unconditionally, no env var
+  needed, only for the specific `num_slots == 0 && index ∈ {4, 5}` shape
+  matching the C34-era residual note) to help pin this down in a future
+  round if it recurs with that exact shape; it did not fire in this
+  session's repro attempts, so the current header-count residual likely has
+  a different root cause than the already-fixed map-node producers.
+
+**Next diagnostic gate:** the header-count residual needs its own repro
+strategy — single-class isolated reruns don't reproduce it (confirmed 4/4
+clean), so it likely needs sustained multi-pass, multi-process pressure
+across the full class list (matching how it was originally found) rather
+than a targeted single-class rerun. Do not move this record out of
+`docs/known-issues` until a full 64-class two-process matrix completes with
+zero residuals of any kind, followed by a `--nojit` control.

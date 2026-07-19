@@ -5835,7 +5835,13 @@ fn make_collect_args_adapter(
     let desc = mh_type_descriptor(ctx, target)
         .or_else(|| mh_read_desc(ctx, target))
         .unwrap_or_default();
-    let adapter = alloc_method_handle(ctx, "__adapter__", "collectargs", &desc, MH_KIND_COLLECT_ARGS);
+    let adapter = alloc_method_handle(
+        ctx,
+        "__adapter__",
+        "collectargs",
+        &desc,
+        MH_KIND_COLLECT_ARGS,
+    );
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));

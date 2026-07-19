@@ -74,6 +74,43 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
+/// The default non-moving young collector does not need Cheney-copy headroom:
+/// it reclaims dead spans in place and falls back to allocation-failure GC for
+/// fragmentation.  Let transient allocation fill most of the active semi-space
+/// before paying the O(heap) mark/sweep cost.  The moving-young opt-in retains
+/// the conservative 50% trigger above so the to-space can hold all survivors.
+/// Keeping a 10% reserve also leaves room for TLAB refill granularity and avoids
+/// turning every near-capacity refill into an allocation-failure collection.
+const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
+
+#[inline]
+const fn young_gc_trigger_bytes(
+    capacity: usize,
+    moving_threshold: usize,
+    non_moving_young: bool,
+) -> usize {
+    if non_moving_young {
+        capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100
+    } else {
+        moving_threshold
+    }
+}
+
+#[inline]
+const fn next_young_gc_is_guaranteed_non_moving(
+    jit_active: bool,
+    unregistered_jit_frame: bool,
+    jit_allocation_frame: bool,
+    moving_young_requested: bool,
+    allow_moving_young: bool,
+    force_moving: bool,
+) -> bool {
+    !force_moving
+        && ((jit_active && !allow_moving_young)
+            || ((jit_active || unregistered_jit_frame || jit_allocation_frame)
+                && !moving_young_requested))
+}
+
 /// "Humongous" object threshold as a percentage of the young semi-space
 /// capacity.  Allocations whose total in-memory footprint
 /// (`HEADER_SIZE + array_data_size`) exceeds this fraction of one young
@@ -2135,6 +2172,20 @@ impl GenerationalHeap {
                     }
                 }
             } // end rate-limited OOB-read diagnostics
+            // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
+            // unconditional backtrace for the specific shape seen in the
+            // known-issues residual logs (index 4/5, zero-slot receiver) —
+            // rare enough that this doesn't need the OOB_DIAG_CAP treatment.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             return Value::Object(None);
         }
         // Compact reference-field layout: reference fields are 8-byte pointers
@@ -2347,6 +2398,15 @@ impl GenerationalHeap {
                      (caller used slot index past receiver's layout — \
                      class layout is correct; the bug is in the caller's \
                      slot computation)",
+                );
+            }
+            // RESID-DIAG (dohead residuals investigation, 20260718): see the
+            // matching comment in get_field's OOB guard above.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                eprintln!(
+                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
                 );
             }
             return;
@@ -3041,6 +3101,19 @@ impl GenerationalHeap {
 
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(false)
+    }
+
+    /// The JIT allocation/refill helper calls this while its compiled caller
+    /// is still on the native stack. Even when that caller is the unregistered
+    /// compiled entry point, root gathering will detect it and select the
+    /// non-moving young collector, so that path may safely use its larger
+    /// occupancy trigger.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(true)
+    }
+
+    fn needs_gc_with_jit_allocation_frame(&self, jit_allocation_frame: bool) -> bool {
         let from = self.young_from.lock();
         let used = from.used();
         // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
@@ -3067,7 +3140,26 @@ impl GenerationalHeap {
         // itself, so this is a no-op there. The alloc-failure→GC-and-retry path
         // remains the hard backstop against fragmentation under-collection.
         let live = used.saturating_sub(from.free_list_bytes());
-        live >= *self.young_gc_threshold.lock()
+        // Cheney copying needs the unused half as worst-case survivor
+        // headroom. The default non-moving collector instead sweeps in place,
+        // so it can safely use the active semi-space almost to capacity.
+        // Only select the larger threshold when the next normal young cycle is
+        // guaranteed to take that path. In particular, `--nojit` collections
+        // remain moving even though `CRATONVM_MOVING_YOUNG` is unset.
+        let non_moving_young = next_young_gc_is_guaranteed_non_moving(
+            crate::gc_quiescence::is_active(),
+            crate::gc_quiescence::unregistered_jit_frame_on_stack(),
+            jit_allocation_frame,
+            crate::gc_quiescence::moving_young_enabled(),
+            std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_some(),
+            std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some(),
+        );
+        let threshold = young_gc_trigger_bytes(
+            from.capacity(),
+            *self.young_gc_threshold.lock(),
+            non_moving_young,
+        );
+        live >= threshold
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -3856,7 +3948,10 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && young_cursor + gap <= young_used
+                {
                     young_cursor += gap;
                     continue;
                 }
@@ -3871,7 +3966,11 @@ impl GenerationalHeap {
                 break;
             }
             let size = gen_object_total_size(header);
-            if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
+            if size < HEADER_SIZE
+                || young_cursor
+                    .checked_add(size)
+                    .is_none_or(|end| end > young_used)
+            {
                 tracing::warn!(
                     young_cursor,
                     young_used,
@@ -4918,7 +5017,6 @@ impl GenerationalHeap {
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
 
-
         // Build exact young-object bases before marking. The stack/JIT root
         // scan is conservative and can yield aligned interior words; treating
         // those as objects makes the side-mark channel retain the interior
@@ -4969,12 +5067,19 @@ impl GenerationalHeap {
             // walk above).
             if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
-                let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && exact_cursor + gap <= young_from.used() {
+                let gap =
+                    unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && exact_cursor + gap <= young_from.used()
+                {
                     exact_cursor += gap;
                     continue;
                 }
-                tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
+                tracing::warn!(
+                    exact_cursor,
+                    "GC: exact young-object walk found an implausible GAP-filler sentinel"
+                );
                 break;
             }
             let total = gen_object_total_size(header);
@@ -4983,12 +5088,20 @@ impl GenerationalHeap {
                     .checked_add(total)
                     .is_none_or(|end| end > young_from.used())
             {
-                tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
+                tracing::warn!(
+                    exact_cursor,
+                    used = young_from.used(),
+                    "GC: exact young-object walk stopped at an implausible extent"
+                );
                 break;
             }
             if let Some(&&(off, _)) = exact_free_iter.peek() {
                 if off > exact_cursor && off < exact_cursor + total {
-                    tracing::warn!(exact_cursor, off, "GC: exact young-object walk crossed a free/TLAB range");
+                    tracing::warn!(
+                        exact_cursor,
+                        off,
+                        "GC: exact young-object walk crossed a free/TLAB range"
+                    );
                     break;
                 }
             }
@@ -8594,8 +8707,7 @@ impl GenerationalHeap {
     #[inline]
     fn full_old_rset_scan_enabled() -> bool {
         static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*CARD_TABLE_ONLY
-            .get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+        !*CARD_TABLE_ONLY.get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -9518,12 +9630,12 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.array_length != 0 {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
+                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
                  class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
                  so the walker can re-sync.",
-                header.array_length,
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.array_length,
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -9534,10 +9646,10 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.num_slots > (1 << 24) {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
                  treating as corrupt so the walker can re-sync.",
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -10382,6 +10494,41 @@ mod tests {
         assert!(
             h_1k.young_semi_capacity() >= 1024,
             "tiny heap must still produce a non-trivial arena (>= 1 KiB)",
+        );
+    }
+
+    #[test]
+    fn young_gc_trigger_preserves_moving_headroom_but_fills_non_moving_space() {
+        let capacity = 1000;
+        let moving_threshold = 500;
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, false),
+            500,
+            "moving young must retain its configured Cheney-copy headroom",
+        );
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, true),
+            900,
+            "non-moving young should defer the O(heap) sweep until 90% occupancy",
+        );
+        let ordinary_cycle =
+            next_young_gc_is_guaranteed_non_moving(false, false, false, false, false, false);
+        assert!(!ordinary_cycle, "JIT-quiescent collection is moving by default");
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(true, false, false, false, false, false),
+            "live JIT frames require the default non-moving collector",
+        );
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(false, false, true, false, false, false),
+            "a JIT allocation helper has a compiled frame for root scanning",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, true, false),
+            "explicitly allowed moving-young must preserve copy headroom",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, false, false, true),
+            "the diagnostic forced-moving path must preserve copy headroom",
         );
     }
 

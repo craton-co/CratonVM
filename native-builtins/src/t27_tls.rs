@@ -5549,40 +5549,43 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.is_client {
         let config = match state.client_config.clone() {
             Some(c) => c,
-            // Per-context client identity (mTLS client-cert presentation) wins
-            // over the no-client-auth default.
-            None => match &state.identity_override {
-                Some((cert, key)) => {
-                    let trust_roots = state
-                        .trust_roots_override
-                        .clone()
-                        .or_else(take_selected_context_trust_roots);
-                    let roots = root_store_for_trust_roots(trust_roots.as_ref());
-                    build_client_config_ciphers(
-                        roots,
-                        &alpn_strs,
-                        Some((cert, key)),
-                        &state.enabled_ciphers,
-                    )?
-                }
-                None => {
-                    let trust_roots = state
-                        .trust_roots_override
-                        .clone()
-                        .or_else(take_selected_context_trust_roots);
-                    if trust_roots.is_some() {
-                        let roots = root_store_for_trust_roots(trust_roots.as_ref());
-                        build_client_config_ciphers(
-                            roots,
-                            &alpn_strs,
-                            None,
-                            &state.enabled_ciphers,
-                        )?
-                    } else {
-                        default_engine_client_config(&state.alpn_protocols)?
-                    }
-                }
-            },
+            // A real Java TrustManager is the authority for this context.
+            // Rustls must only perform cryptographic handshake verification in
+            // that case, then engine_run_trust_check invokes the manager with
+            // the peer chain.  Constructing the old root-store-only config
+            // here rejected self-signed test certificates before Netty's
+            // InsecureTrustManagerFactory (or any custom TrustManager) could
+            // make its Java-level decision.
+            None => {
+                let trust_roots = state
+                    .trust_roots_override
+                    .clone()
+                    .or_else(take_selected_context_trust_roots);
+                let revocation = trust_roots
+                    .as_ref()
+                    .and_then(|roots| roots.revocation.clone());
+                let roots = root_store_for_trust_roots(trust_roots.as_ref());
+                let use_java_trust_manager = state
+                    .trust_managers_ctx_key
+                    .and_then(|key| {
+                        ctx_trust_managers_table()
+                            .lock()
+                            .get(&key)
+                            .map(|managers| !managers.is_empty())
+                    })
+                    .unwrap_or(false);
+                let client_auth = state
+                    .identity_override
+                    .as_ref()
+                    .map(|(cert, key)| (cert.as_str(), key.as_str()));
+                build_client_config_ex(
+                    roots,
+                    &alpn_strs,
+                    ClientAuthMode::Fixed(client_auth),
+                    revocation,
+                    use_java_trust_manager,
+                )?
+            }
         };
         let host = state
             .peer_host

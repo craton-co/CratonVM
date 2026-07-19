@@ -565,7 +565,7 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = crate::classloader::loader_id_for(ctx, loader);
-    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
 }
 
 fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -638,14 +638,24 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => None,
     };
 
-    let loader_id =
-        if name.starts_with("java/") || name.starts_with("jdk/") || name.starts_with("sun/") {
-            0
-        } else {
-            crate::classloader::loader_id_for(ctx, loader)
-        };
+    let is_jdk_internal_name =
+        name.starts_with("java/") || name.starts_with("jdk/") || name.starts_with("sun/");
+    let loader_id = if is_jdk_internal_name {
+        0
+    } else {
+        crate::classloader::loader_id_for(ctx, loader)
+    };
+    // Don't record a defining loader for the forced-namespace-0 JDK-internal
+    // case above — the recorded loader must match the namespace the class
+    // actually landed in, or `defining_loader_for` would report a loader
+    // whose namespace disagrees with `loader_id_of_class(cid)`.
+    let loader_for_registration = if is_jdk_internal_name {
+        Value::Object(None)
+    } else {
+        loader
+    };
     crate::classloader::define_class_via_full(
-        ctx, &name, bytes, loader_id, opts, initialize, class_data,
+        ctx, &name, bytes, loader_id, opts, initialize, class_data, loader_for_registration,
     )
 }
 
