@@ -18858,7 +18858,17 @@ fn execute_invoke_kind(
     // Determine the class to invoke on.
     // invoke_class: Arc<str> — cheap clone, derefs to &str for all downstream calls.
     let invoke_class: Arc<str> = if is_special {
-        method_class_name
+        // JVMS §6.5 super-call redirect — see `invokespecial_owner_class_name`.
+        // A no-op for constructors, private-method calls, and any call whose
+        // CP-referenced class is not a genuine superclass of this frame's
+        // own class; `method_class_name` passes straight through those.
+        invokespecial_owner_class_name(
+            shared,
+            current_class_id,
+            cp_index,
+            &method_class_name,
+            &method_name,
+        )
     } else if let Some((_declaring_id, declaring_name)) = &private_virtual_target {
         Arc::clone(declaring_name)
     } else {
@@ -28334,6 +28344,19 @@ fn populate_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+    // JVMS §6.5 super-call redirect (see `invokespecial_owner_class_name`) —
+    // this is the PRIMARY invokespecial resolution path (the stackless
+    // `thread.invoke_cache`/`shared_resolution` builder consulted by every
+    // `execute_invokevirtual_cached(is_special=true)` probe); `execute_invoke_kind`
+    // only serves the rare exotic fallback. Must run before EVERY downstream
+    // use of `class_name` below (native lookup, loader-owner override,
+    // `target_class_id` resolution, the promoted-cache key), so a
+    // super-call bridge's cache entry is never built from the wrong class.
+    let class_name = if is_special {
+        invokespecial_owner_class_name(shared, caller_class_id, cp_index, &class_name, &method_name)
+    } else {
+        class_name
+    };
 
     // A ConstantPool Methodref is not a call-site identity: the same
     // `Object.equals(Object)` entry can be used by several bytecode offsets
@@ -31193,6 +31216,41 @@ fn try_jit_upgrade_with_gate(
             descriptor.to_string(),
         ))
     };
+    // JVMS §6.5 `invokespecial` super-call redirect — see `try_compile`'s
+    // doc comment on `cp_invokespecial_owner_resolver`. `class_id` here is
+    // the class whose bytecode is being compiled, i.e. the CALLING class for
+    // every invoke site scanned below — exactly the identity the redirect
+    // rule needs. Returns `None` (no override) whenever the redirect does
+    // not apply, which is the overwhelming majority of `invokespecial` sites
+    // (constructors, private methods, ordinary direct-superclass supers).
+    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, true),
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let store = cm.class_store();
+        let start = crate::classloading::invokespecial_selection_start(
+            class_id, cp_class_id, is_iface, method_name, store,
+        );
+        if start == cp_class_id {
+            return None;
+        }
+        store.get(start).map(|c| c.name.to_string())
+    };
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // just its target descriptor (no bootstrap/CallSite resolution needed —
     // the codegen only needs the call site's arg/return stack effect).
@@ -31589,6 +31647,39 @@ fn try_jit_upgrade_with_gate(
                     descriptor.to_string(),
                 ))
             };
+            // JVMS §6.5 `invokespecial` super-call redirect for the callee's
+            // own constant pool — see `invokespecial_owner_resolver` above /
+            // `try_compile`'s doc comment. `callee_cid` is the class whose
+            // bytecode is being compiled here (the eagerly-compiled callee),
+            // i.e. the calling class for every invoke site in ITS bytecode.
+            let c_invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(callee_cid)?;
+                let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index, false),
+                    Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index, true),
+                    _ => return None,
+                };
+                let target_class = class.constant_pool.get_class_name(class_idx)?;
+                let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                let cp_class_id = cm.find_class_by_name(target_class)?;
+                let store = cm.class_store();
+                let start = crate::classloading::invokespecial_selection_start(
+                    callee_cid, cp_class_id, is_iface, method_name, store,
+                );
+                if start == cp_class_id {
+                    return None;
+                }
+                store.get(start).map(|c| c.name.to_string())
+            };
             // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
             // index to its target descriptor for the callee's constant pool.
             let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
@@ -31687,12 +31778,13 @@ fn try_jit_upgrade_with_gate(
                 shared,
                 callee_cached.declaring_class_id,
             ));
-            let mut compiled = crate::jit::try_compile(
+            let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
                 &callee_cached,
                 Some(&c_resolver),
                 Some(&c_field_resolver),
                 Some(&c_static_field_resolver),
                 Some(&c_invoke_resolver),
+                Some(&c_invokespecial_owner_resolver),
                 None, // no recursive inlining
                 Some(&c_new_resolver),
                 Some(&c_ldc_resolver),
@@ -31831,12 +31923,13 @@ fn try_jit_upgrade_with_gate(
         shared,
         cached.declaring_class_id,
     ));
-    let mut compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
         Some(&field_resolver),
         Some(&static_field_resolver),
         Some(&invoke_resolver),
+        Some(&invokespecial_owner_resolver),
         Some(&callee_compiler),
         Some(&new_resolver),
         Some(&ldc_resolver),
@@ -32416,6 +32509,38 @@ fn try_jit_compile_callee_slow(
             descriptor.to_string(),
         ))
     };
+    // JVMS §6.5 `invokespecial` super-call redirect — see
+    // `invokespecial_owner_resolver` above / `try_compile`'s doc comment.
+    // `cid` is this callee's own declaring class, i.e. the calling class for
+    // every invoke site scanned in its bytecode.
+    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(cid)?;
+        let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, true),
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let store = cm.class_store();
+        let start = crate::classloading::invokespecial_selection_start(
+            cid, cp_class_id, is_iface, method_name, store,
+        );
+        if start == cp_class_id {
+            return None;
+        }
+        store.get(start).map(|c| c.name.to_string())
+    };
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor (no bootstrap/CallSite resolution needed).
     let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
@@ -32527,12 +32652,13 @@ fn try_jit_compile_callee_slow(
         shared,
         cached.declaring_class_id,
     ));
-    let mut compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
         Some(&field_resolver),
         Some(&static_field_resolver),
         Some(&invoke_resolver),
+        Some(&invokespecial_owner_resolver),
         None, // no recursive callee compilation
         Some(&new_resolver),
         Some(&ldc_resolver),
@@ -36887,6 +37013,66 @@ fn resolve_method_ref(
     );
 
     Ok((class_name, method_name, method_descriptor, num_params))
+}
+
+/// JVMS §6.5 `invokespecial` — apply the super-call "selection" redirect
+/// (see `classloading::invokespecial_selection_start`'s doc comment for the
+/// full rule) to the class named by an `invokespecial` constant-pool
+/// reference, so dispatch starts the method search at the CALLING class's
+/// own direct superclass rather than blindly at the CP-referenced ancestor
+/// whenever that redirect applies. `resolve_method_ref` (which produced
+/// `method_class_name`) returns the bare CP text and has no notion of the
+/// calling class, so this is a separate, deliberately narrow lookup.
+///
+/// A class between the caller and the CP-referenced ancestor may override
+/// the method (a compiler-generated bridge, or an ordinary override) —
+/// resolving from the CP-referenced class directly walks straight past it.
+/// Shared by both the interpreter's own `invokespecial` dispatch (here) and
+/// the JIT compiler's call-site resolution (`try_jit_compile_callee`'s
+/// `invoke_resolver` closures in this file), so the two execution modes
+/// never disagree on the target.
+///
+/// Returns `method_class_name` unchanged whenever the redirect does not
+/// apply (constructors, interface references, non-superclass references, a
+/// caller class file without `ACC_SUPER`, or any resolution miss) — always
+/// safe to substitute directly for `method_class_name` at the `is_special`
+/// call site.
+fn invokespecial_owner_class_name(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+    method_class_name: &Arc<str>,
+    method_name: &str,
+) -> Arc<str> {
+    if method_name == "<init>" {
+        return Arc::clone(method_class_name);
+    }
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(current_class_id) else {
+        return Arc::clone(method_class_name);
+    };
+    let is_interface_ref = matches!(
+        class.constant_pool.get(cp_index),
+        Some(ConstantPoolEntry::InterfaceMethodReference { .. })
+    );
+    let Some(cp_class_id) = cm.find_class_by_name(method_class_name) else {
+        return Arc::clone(method_class_name);
+    };
+    let store = cm.class_store();
+    let start = crate::classloading::invokespecial_selection_start(
+        current_class_id,
+        cp_class_id,
+        is_interface_ref,
+        method_name,
+        store,
+    );
+    if start == cp_class_id {
+        return Arc::clone(method_class_name);
+    }
+    match store.get(start) {
+        Some(c) => Arc::from(&*c.name),
+        None => Arc::clone(method_class_name),
+    }
 }
 
 // ---------------------------------------------------------------------------

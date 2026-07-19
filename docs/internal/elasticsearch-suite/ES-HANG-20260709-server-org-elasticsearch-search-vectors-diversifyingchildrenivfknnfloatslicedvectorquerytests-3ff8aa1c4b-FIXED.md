@@ -1,4 +1,14 @@
-# 2026-07-18/19 continuation: stale-precise-root-mirror bug FOUND and FIXED (raw JIT-to-JIT call RBP-mirror race); JIT-throughput regression from the fix's interim safety defaults FOUND and FIXED; end-to-end `testSlicesDense` re-verification BLOCKED by a newly-discovered, separate, pre-existing Windows-host `Thread.join()` hang
+Status: FIXED — archived 2026-07-19. Every hang/corruption/crash bug this
+doc tracked across its 2026-07-09 through 2026-07-19 history is now found
+and fixed (see the dated sections below for each one's own writeup). The
+one remaining open item, `testSlicesDense`'s raw interpreter throughput
+(genuinely slow, ~600s, never a hang or a correctness bug — characterized
+repeatedly throughout this doc's history), is split out to its own doc:
+[`ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`](../../known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md).
+
+---
+
+# 2026-07-18/19 continuation: stale-precise-root-mirror bug FOUND and FIXED (raw JIT-to-JIT call RBP-mirror race); JIT-throughput regression from the fix's interim safety defaults FOUND and FIXED; end-to-end `testSlicesDense` re-verification initially BLOCKED by a newly-discovered, separate, pre-existing `Thread.join()` lost-wakeup bug — that bug is now FOUND and FIXED too, and `testSlicesDense` has been re-verified to run to completion
 
 **Status update: took over `C:\craton\CratonVM-es-ivfknn-slicesdense-closure-20260717`
 from other agents' in-progress WIP (uncommitted, ~880 lines across
@@ -91,26 +101,40 @@ direct JUnitCore invocation, zero corruption/OOB warnings across
 multiple runs — see the caveat below for why it could not be observed to
 completion).
 
-## Blocker for full end-to-end confirmation:
+## Blocker for full end-to-end confirmation — NOW FIXED:
 [`ES-HANG-20260719-threadjoin-randomizedrunner-worker-windows.md`](ES-HANG-20260719-threadjoin-randomizedrunner-worker-windows.md)
-(NEW, OPEN, unrelated)
 
 While confirming `testSlicesSparseWithFilter`/`testRandomWithFilter`/
 `testSlicesDense` complete cleanly end-to-end (not just "no corruption
 warnings before an external timeout"), found that **every** direct
-`JUnitCore` invocation of a `RandomizedRunner`-based ES test class hangs
-on this Windows host — `Thread.join()` never returns for a worker thread
-that has already finished (`alive=false`). **Confirmed unrelated to
-everything in this doc**: reproduces identically on a clean, from-scratch
-`origin/dev` build with none of this session's changes; reproduces with
-`--nojit`; the identical repro passes cleanly under real HotSpot in
-~2.2s. See that doc for the full writeup. This means `testSlicesDense`
-itself — this doc's original subject — could not be re-run to actual
-completion this session; the GC/JIT fixes above are shipped on the
-strength of the non-ES-suite verification listed above, which is
-thorough but does not substitute for the doc's own original repro. A
-future session should first resolve the `Thread.join()` blocker, then
-re-run `testSlicesDense` to close this doc for real.
+`JUnitCore` invocation of a `RandomizedRunner`-based ES test class hung
+on this Windows host — `Thread.join()` never returned for a worker thread
+that had already finished (`alive=false`). **Confirmed unrelated to
+everything in this doc**: reproduced identically on a clean, from-scratch
+`origin/dev` build with none of this session's changes; reproduced with
+`--nojit`; the identical repro passed cleanly under real HotSpot in
+~2.2s. See that doc for the full root-cause writeup (a `release_monitors_held_by`
+call inside the `Thread.join()`-termination-notify sequence was
+force-releasing the terminating thread's own termination monitor before
+`notify_all()`, silently discarding the resulting `NotOwner` error — a
+lost wakeup, present regardless of OS/JIT/ES).
+
+**2026-07-19 re-verification, post-fix:** re-ran this doc's own original
+`testSlicesDense` repro recipe (below) against the fixed binary
+(worktree `serene-lamarr-01d83a`, fix merged to `dev` at `bd83c42fa`). The
+process now exits cleanly — `Time: 602.662`, `System.exit(1)` called
+normally, a proper JUnit failure report (2 failures, both
+`Test abandoned because suite timeout was reached` /
+`Suite timeout exceeded (>= 580000 msec)`) — instead of hanging
+indefinitely and requiring an external watchdog to abort it. This is
+exactly the previously-documented genuine-slow-progress shape (see the
+2026-07-13 section below: an earlier unbounded run also completed in
+~602s, stopped by the test framework's own `-Dtests.timeoutSuite=580000!`,
+not a VM-level hang) — `testSlicesDense`'s underlying performance
+characteristic is unchanged and NOT re-litigated here; this update only
+confirms the join-hang blocker no longer prevents the process from
+running to completion (or, in this test's case, to its own framework
+timeout) end-to-end.
 
 ---
 
