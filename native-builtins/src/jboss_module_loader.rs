@@ -839,6 +839,20 @@ fn build_module_object(
     let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
     let module = ctx.read_native_pin(module_pin, module);
     ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(module)));
+    // Real-JDK-mode fix: the real `org.jboss.modules.ModuleClassLoader` class
+    // (loaded from the actual jboss-modules.jar bytecode) declares `private
+    // final Module module;` -- a real field whose offset does not generally
+    // coincide with our synthetic MCL_SLOT_MODULE index. Every other field
+    // this function populates gets a name-based write alongside its
+    // index-based one (see "moduleLoader"/"name"/"moduleClassLoader" below)
+    // for exactly this reason; this one was missing it. Without it, real
+    // bytecode that reads `this.module` inside `ModuleClassLoader` (e.g. its
+    // `loadClass`/`loadModuleClass` delegation, reached via
+    // `Class.forName(name, resolve, mcl)` during `Module.run`) observes the
+    // default-zero/null value and NPEs with "Cannot invoke
+    // Module.loadModuleClass(...) because "module" is null" -- the exact
+    // WildFly `parallel-extension-add`-adjacent boot failure this blocks.
+    ctx.set_field_by_name(mcl, "module", Value::Object(Some(module)));
     ctx.set_field(module, MOD_SLOT_CLASSLOADER, Value::Object(Some(mcl)));
     ctx.set_field_by_name(module, "moduleClassLoader", Value::Object(Some(mcl)));
 
@@ -855,6 +869,47 @@ fn build_module_object(
         let main_str = ctx.create_string(main_class);
         let module = ctx.read_native_pin(module_pin, module);
         ctx.set_field_by_name(module, "mainClassName", Value::Object(Some(main_str)));
+    }
+    // Real-JDK-mode fix: the real `org.jboss.modules.Module` class declares
+    // `private volatile Linkage linkage;`, initialized by its real
+    // constructor. Our synthetic construction never runs that constructor,
+    // so the field stays default-null; the first real bytecode that reads
+    // `module.linkage` (e.g. `ConcurrentClassLoader.loadClass`'s
+    // `oldLinkage.getState()` check, reached transitively from
+    // `Module.getPaths()` during boot) NPEs on "oldLinkage is null".
+    //
+    // A first attempt seeded this with the real `Linkage.NONE` static field
+    // -- WRONG: `NONE = new Linkage(State.NEW)`, and `Module.getPaths()`'s
+    // real bytecode treats `NEW` (like `LINKING`) as "link in progress,
+    // wait()" (`synchronized (this) { while (state==LINKING||state==NEW)
+    // this.wait(); ... }`). Since CratonVM never runs the real linking
+    // machinery that would `notify()` this module, that produced a
+    // permanent single-thread self-deadlock (confirmed live via the T19.H1
+    // watchdog thread dump: the lone "main" thread parked forever in
+    // `Module.getPaths` pc=55, `Object.wait()`).
+    //
+    // Fixed: construct a real `Linkage` already in the `LINKED` terminal
+    // state via its real 1-arg constructor (`Linkage(State)`, which itself
+    // defaults dependencySpecs/dependencies to the real empty
+    // `NO_DEPENDENCY_SPECS`/`NO_DEPENDENCIES` and paths to
+    // `Collections.emptyMap()` -- exactly right for a module we resolve and
+    // serve resources for entirely through our own native machinery, not
+    // real dependency-linkage bytecode). This takes the `if (state ==
+    // LINKED) return linkage.getPaths();` fast path at `Module.getPaths`
+    // pc=10-21 unconditionally, never reaching the wait loop.
+    let module = ctx.read_native_pin(module_pin, module);
+    if let Ok(state_cid) = ctx.ensure_class_initialized("org/jboss/modules/Linkage$State") {
+        if let Some(idx) = ctx.static_field_index_by_name(state_cid, "LINKED") {
+            let linked_state = ctx.get_static_field(state_cid, idx);
+            if let Ok(Some(linkage_obj)) = ctx.new_object_initialized(
+                "org/jboss/modules/Linkage",
+                "(Lorg/jboss/modules/Linkage$State;)V",
+                &[linked_state],
+            ) {
+                let module = ctx.read_native_pin(module_pin, module);
+                ctx.set_field_by_name(module, "linkage", linkage_obj);
+            }
+        }
     }
     let module = ctx.read_native_pin(module_pin, module);
     ctx.unpin_native_roots(module_pin);
@@ -3392,6 +3447,33 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
         "findClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_module_classloader_find_class,
+    );
+    // Real-JDK-mode fix: real `ConcurrentClassLoader.performLoadClassUnchecked`
+    // calls the PROTECTED 3-arg `findClass(String, boolean exportsOnly,
+    // boolean resolve)` overload (`ModuleClassLoader`'s own declared
+    // signature), not the 1-arg `ClassLoader.findClass(String)` above. Only
+    // the 1-arg overload was registered, so every real boot class-load fell
+    // straight through to real `ModuleClassLoader`/`Module` bytecode instead
+    // of this native's closure walk -- exposing a chain of real-field-layout
+    // gaps in our synthetic `Module`/`ModuleClassLoader` objects (missing
+    // `module`/`linkage` fields, fixed above) that a from-scratch synthetic
+    // construction can never fully replicate. Registering the 3-arg overload
+    // too routes real boot class-loading through the native closure walk
+    // (which already correctly resolves dependency-closure classes like
+    // `org.jboss.as.server.Main`, re-exported into `org.jboss.as.standalone`
+    // via its `<module name="org.jboss.as.server" export="true"/>` module.xml
+    // dependency) instead of real bytecode that depends on state we don't
+    // (and, short of running real jboss-modules construction bytecode, can't
+    // fully) populate. The extra two `boolean` args only affect
+    // resolve/export-visibility bookkeeping our closure walk doesn't need.
+    registry.register(
+        CN_MODULE_CLASSLOADER,
+        "findClass",
+        "(Ljava/lang/String;ZZ)Ljava/lang/Class;",
+        |ctx, args| {
+            let trimmed: Vec<Value> = args.iter().take(2).copied().collect();
+            native_module_classloader_find_class(ctx, &trimmed)
+        },
     );
     // getResource / getResourceAsStream / findResource — all closure-bound.
     registry.register(

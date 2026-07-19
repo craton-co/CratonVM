@@ -16,6 +16,11 @@ smaller/individual differences not yet clustered.
 > [`docs/internal/springboot`](../../internal/springboot/); the legacy index
 > links below are retained as redirects.
 
+> Closure update (2026-07-19): the `Archive`/`Launcher` classpath URL
+> enumeration cluster is fixed (`JarFileArchive`/`ExplodedArchive`/
+> `ExecutableArchiveLauncher`). One pre-existing residual remains, tracked
+> by `propertieslauncher-loader-path-ignored-wrong-app-launched.md`.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -171,7 +176,7 @@ open each doc for the full picture):
 | [`spring-boot-configuration-processor-testcompiler-hang-cluster.md`](spring-boot-configuration-processor-testcompiler-hang-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-devtools-residual-fails-cluster.md`](spring-boot-devtools-residual-fails-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-health-rerun-20260717.md`](spring-boot-health-rerun-20260717.md) | OPEN — found 2026-07-17 |
-| [`spring-boot-loader-classpath-url-enumeration-empty-cluster.md`](spring-boot-loader-classpath-url-enumeration-empty-cluster.md) | OPEN — found 2026-07-17 |
+| `Archive`/`Launcher` classpath URL enumeration empty/wrong | **FIXED 2026-07-19** — verified 10/10 `JarFileArchiveTests`, 4/4 `WarLauncherTests`, 7/7 `ExplodedArchiveTests`, 5/5 `JarLauncherTests`; moved to [`../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md`](../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md). Residual: `propertieslauncher-loader-path-ignored-wrong-app-launched.md` (8 of its original 11 fixed as a side effect, 4 remain, still OPEN) |
 | [`spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md`](spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-restclient-residuals.md`](spring-boot-restclient-residuals.md) | OPEN — found 2026-07-17 |
 | Spring proxy layout-probe livelock blocking broad HttpClient consumers | **FIXED 2026-07-18** — JUnit adapter receiver admission now prevents the unrelated field probe; verified in JIT and `--nojit`; moved to [`../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md`](../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md) |
@@ -179,7 +184,9 @@ open each doc for the full picture):
 | [`spring-boot-webflux-residuals.md`](spring-boot-webflux-residuals.md) | OPEN — found 2026-07-17 |
 | [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) | OPEN — found 2026-07-17 |
 | `StaticResourceJarsTests` JAR/URL-encoded-path resource lookup failures | **FIXED 2026-07-18** — `File(URI)` percent-decoding + `JarURLConnection`/`JarFile` caching and closed-state tracking; verified in JIT and `--nojit`; moved to [`../../internal/springboot/staticresourcejarstests-jar-url-handling-cluster-FIXED.md`](../../internal/springboot/staticresourcejarstests-jar-url-handling-cluster-FIXED.md) |
-| [`thymeleaf-groovy-layoutdialect-cluster.md`](thymeleaf-groovy-layoutdialect-cluster.md) | OPEN — found 2026-07-17 |
+| Thymeleaf Groovy layout-dialect `DecorateProcessor` constructor mismatch + missing `CapturedOutput` warning | **FIXED 2026-07-19** — `invokedynamic`'s generic `MethodHandle.invoke` bridge erased trailing `boolean` call-site args to `Integer`; preserved the real target descriptor and boxed `Z` args as `Boolean`; `CapturedOutput` half was already fixed by the project-wide Logger/LogFactory cluster; verified in JIT; moved to [`../../internal/springboot/thymeleaf-groovy-layoutdialect-cluster-FIXED.md`](../../internal/springboot/thymeleaf-groovy-layoutdialect-cluster-FIXED.md) |
+| [`thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md`](thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md) | OPEN — found 2026-07-19, newly exposed by the fix above |
+| [`path-tostring-indy-stringconcat-dead-dispatch.md`](path-tostring-indy-stringconcat-dead-dispatch.md) | OPEN — found 2026-07-19, newly exposed by the fix above |
 | [`tls-sslbundle-trust-validation-gap-cluster.md`](tls-sslbundle-trust-validation-gap-cluster.md) | OPEN — found 2026-07-17 |
 | [`web-server-mockito-restub-no-op-cluster.md`](web-server-mockito-restub-no-op-cluster.md) | OPEN — found 2026-07-17 |
 | [`webclient-loopback-self-connect-timeout-os10060-cluster.md`](webclient-loopback-self-connect-timeout-os10060-cluster.md) | OPEN — found 2026-07-17, residual of the contextrunner-resource-cycle re-triage below |

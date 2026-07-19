@@ -3519,6 +3519,19 @@ fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // Ensure class is loaded so constructor resolution works at dispatch time
     let _ = ctx.ensure_class_initialized(&class);
     let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    // Stash the ALREADY-RESOLVED ClassId (from the caller's own Class
+    // mirror, class_obj) in the otherwise-unused MH_BOUND slot. Two
+    // classes minted under different ClassLoaders can share the same
+    // binary name (e.g. Groovy re-parseClass-ing textually-similar
+    // scripts) -- MH_KIND_CONSTRUCTOR dispatch re-resolving "class" (a
+    // plain name string) at invoke time would collapse back to "one class
+    // per name" and either construct the WRONG class or, since 2+ loaders
+    // now register that name, silently fail (see dispatch_override in
+    // execute_invoke_kind for the same class of bug on invokespecial).
+    // Recording the identity here lets dispatch skip that re-resolution.
+    if let Some(cid) = ctx.class_id_from_mirror(class_obj) {
+        ctx.set_field(mh, MH_BOUND, Value::Int(cid.as_u32() as i32));
+    }
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -5362,6 +5375,28 @@ pub(crate) fn string_concat_render_value(ctx: &mut dyn NativeContext, v: Value) 
             if let Some(s) = ctx.read_string(obj) {
                 return s;
             }
+            // `java.nio.file.Path` is a genuine interface with no `toString()`
+            // body of its own; `ctx.invoke_virtual` below doesn't consult
+            // `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+            // `check_override` allow-list the way the bytecode interpreter's
+            // own `invokevirtual` handling does, so it silently resolves to
+            // `Object.toString()` for `"literal" + aPath` string
+            // concatenation, printing `java.nio.file.Path@<hash>` instead of
+            // the real path text. Same family as
+            // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+            // a third, distinct call site (this is the actual live
+            // `MH_KIND_STRING_CONCAT` dispatch path — `vm/src/runtime/invokedynamic.rs`'s
+            // own `execute_string_concat`/`value_to_string` has the identical
+            // fix for whatever shapes still reach that older code path).
+            // Route through the same display-string helper the registered
+            // `Path.toString()` native itself uses, bypassing `invoke_virtual`
+            // entirely for this type.
+            let cid = ctx.class_id_of_object(obj);
+            if let Some(path_id) = ctx.class_id_by_name("java/nio/file/Path") {
+                if ctx.is_subclass(cid, path_id) {
+                    return crate::phases_late::p57_path_display_string(ctx, obj);
+                }
+            }
             // Best-effort: call Object.toString(); if it returns a String,
             // unwrap it. Failure modes fall through to the class@hash form.
             //
@@ -6163,10 +6198,31 @@ pub(crate) fn mh_dispatch(
             )
         }
         MH_KIND_CONSTRUCTOR => {
-            // Constructor: allocate new object then call <init>
-            let cid = match ctx.ensure_class_initialized(&class) {
-                Ok(id) => id,
-                Err(_) => return Ok(Some(Value::Object(None))),
+            // Constructor: allocate new object then call <init>.
+            //
+            // "class" is a plain binary-name STRING, which a name-based
+            // resolve (ensure_class_initialized/invoke) collapses to "one
+            // class per name" globally. findConstructor/unreflectConstructor
+            // stash the ALREADY-RESOLVED ClassId of the caller's own Class
+            // object in MH_BOUND (see lookup_find_constructor/
+            // lookup_unreflect_constructor) -- prefer that identity so a
+            // second same-named class minted by a different ClassLoader
+            // (e.g. Groovy re-parseClass-ing two textually-similar scripts)
+            // is constructed correctly instead of colliding with -- or being
+            // refused in favor of -- the first.
+            let bound_class_id = match bound {
+                Value::Int(raw) => Some(cratonvm_types::ClassId::new(raw as u32)),
+                _ => None,
+            };
+            let cid = match bound_class_id {
+                Some(cid) => match ctx.ensure_class_initialized_with_class_id(cid) {
+                    Ok(()) => cid,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
+                None => match ctx.ensure_class_initialized(&class) {
+                    Ok(id) => id,
+                    Err(_) => return Ok(Some(Value::Object(None))),
+                },
             };
             let new_obj = ctx.alloc_object(cid, 16); // generous field count
                                                      // Coerce/unbox args against the <init> descriptor. The constructor
@@ -6182,7 +6238,7 @@ pub(crate) fn mh_dispatch(
             let mut init_args = Vec::with_capacity(1 + adapted.len());
             init_args.push(Value::Object(Some(new_obj)));
             init_args.extend_from_slice(&adapted);
-            ctx.invoke(&class, "<init>", &desc, &init_args)?;
+            ctx.invoke_by_class_id(cid, &class, "<init>", &desc, &init_args)?;
             let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
             ctx.unpin_native_roots(new_obj_pin);
             Ok(Some(Value::Object(Some(new_obj))))
@@ -8721,6 +8777,11 @@ fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let _ = ctx.ensure_class_initialized(&class_name);
     let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    // See the matching comment in lookup_find_constructor: stash the
+    // already-resolved class_id (from the Constructor reflection
+    // object's own clazz mirror) so dispatch doesn't re-resolve class_name
+    // through the loader-blind, one-copy-per-name global map.
+    ctx.set_field(mh, MH_BOUND, Value::Int(class_id.as_u32() as i32));
     Ok(Some(Value::Object(Some(mh))))
 }
 

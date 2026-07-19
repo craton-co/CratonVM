@@ -528,3 +528,42 @@ stack across a long chain walk).
 failures are genuinely load-related and not a live bug — rerun the full
 64-class matrix on a quieter host, or with `--nojit` as a control, before
 moving this record out of `docs/known-issues`.
+
+## 2026-07-19 closure-gate runs — both root-caused bugs confirmed fixed;
+## residual is the pre-existing environmental flake family, doc stays OPEN
+
+Four independent full-64-class two-process matrix runs on the post-C41-fix
+binary (`cvm-dohead-c42-postmerge3-20260718`), spanning both a busy host
+(load ~6-7) and a quiet one (load ~1.8-3.6):
+
+| Run | Config | Result |
+| --- | --- | --- |
+| C41 verify | 2 passes, busy host | 125/128 — 1 TIMEOUT, 2 FAIL |
+| Quiet-host attempt 1 | 1 pass, quiet host | 63/64 — 1 TIMEOUT (non-reproducing: 3/3 clean isolated rerun) |
+| `--nojit` control | 1 pass, quiet host | **64/64 clean** |
+| Quiet-host attempt 2 | 1 pass, quiet host | 62/64 — 1 FAIL (`Connection reset: Broken pipe`), 1 TIMEOUT |
+
+Across all four runs (≈320 class-runs total): **zero recurrences of the
+header-count assertion** (the bug C41 fixed) and **zero recurrences of the
+OSR uncaught-exception failure** (the bug fixed earlier this session). Every
+residual was one of: `SocketException: Connection reset: Broken pipe`,
+`IOException: End of input stream with [9] bytes left`, or a `TIMEOUT` that
+did not reproduce on an immediate isolated 3-pass rerun. This is exactly the
+"WinSock 10053 connection abort... present at the same rate in every
+historical sweep, incl. pre-regression baselines" family this document
+identified as environmental back on 2026-07-15 — not a CratonVM-side
+correctness bug, and not affected by either of this session's two fixes
+(both are pushed to `dev`: `eda677f45` OSR exception-table bailout,
+`955031d30` HashMap.remove GC-safety).
+
+**Per the project's known-issues triage rule, this document stays OPEN
+in `docs/known-issues`**: its residual (the environmental transport-flake
+family) is not tracked by a separate distinct open doc, so the "fixed →
+internal" archival criterion is not met even though the two bugs this
+session diagnosed and root-caused are both confirmed fixed. What would
+justify moving this record: either (a) a fully clean 64-class matrix with
+zero residuals of any kind on a quiet host (not yet achieved — the
+environmental flake rate appears to be roughly 1-2% per class-run
+regardless of the fixes above), or (b) splitting out the environmental
+flake family into its own dedicated known-issues doc and archiving this one
+as closed for its originally-documented defects.

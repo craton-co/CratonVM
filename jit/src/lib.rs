@@ -5470,6 +5470,81 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>,
+    profile: Option<&profile::MethodProfile>,
+    helpers: &JitRuntimeHelpers,
+    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
+    optimize: bool,
+    ir_emit_calls: bool,
+    ir_emit_special_calls: bool,
+    ir_emit_long: bool,
+    ir_emit_virtual_calls: bool,
+    ir_emit_fp: bool,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> Option<CompiledMethod> {
+    // Thin compatibility wrapper: the overwhelming majority of callers
+    // (every `jit` crate test, plus any VM call site that hasn't been
+    // updated to supply one) have no need for the JVMS §6.5 `invokespecial`
+    // super-call redirect below — `None` here reproduces this function's
+    // exact pre-existing resolution behavior byte-for-byte.
+    try_compile_with_invokespecial_resolver(
+        cached,
+        cp_class_name_resolver,
+        cp_field_resolver,
+        cp_static_field_resolver,
+        cp_invoke_resolver,
+        None,
+        callee_compiler,
+        cp_new_resolver,
+        cp_ldc_resolver,
+        cp_ldc2w_resolver,
+        profile,
+        helpers,
+        inline_resolver,
+        string_layout_resolver,
+        cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
+        optimize,
+        ir_emit_calls,
+        ir_emit_special_calls,
+        ir_emit_long,
+        ir_emit_virtual_calls,
+        ir_emit_fp,
+        cp_invokedynamic_descriptor_resolver,
+    )
+}
+
+/// Full form of [`try_compile`] taking an additional resolver for the JVMS
+/// §6.5 `invokespecial` super-call redirect (`cp_invokespecial_owner_resolver`
+/// below) — used by the VM's own call sites (`try_jit_upgrade_with_gate`,
+/// `callee_compiler`, `try_jit_compile_callee_slow` in
+/// `vm/src/runtime/interpreter.rs`), which have a calling-class identity to
+/// resolve it against. Kept as a separate function (rather than adding the
+/// parameter to `try_compile` itself) so the ~30 existing `try_compile`
+/// call sites in this crate's own test suites need no changes.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn try_compile_with_invokespecial_resolver(
+    cached: &CachedBytecodeMethod,
+    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
+    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    // JVMS §6.5 `invokespecial` super-call redirect: given an `invokespecial`
+    // (0xb7) call-site's CP index, returns the JVMS-correct class at which
+    // method selection actually begins when that differs from the plain
+    // `cp_invoke_resolver` class name — i.e. a genuine `super.m(...)` whose
+    // constant-pool reference names an ancestor further up than this
+    // method's own direct superclass. `None` (resolver absent, or it
+    // returns `None` for a given site — the overwhelmingly common case)
+    // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
+    // `classloading::invokespecial_selection_start` for the algorithm.
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
     // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
     // resolvers that cannot compute them must return `(_, _, true, true)`
@@ -5685,6 +5760,7 @@ pub fn try_compile(
         cp_field_resolver,
         cp_static_field_resolver,
         cp_invoke_resolver,
+        cp_invokespecial_owner_resolver,
         callee_compiler,
         cp_new_resolver,
         cp_ldc_resolver,
@@ -5812,6 +5888,8 @@ fn try_compile_inner(
     cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    // See `try_compile_with_invokespecial_resolver`.
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
@@ -6721,6 +6799,21 @@ fn try_compile_inner(
                 0xb7 => 1,
                 0xb9 => 2,
                 _ => 3,
+            };
+            // JVMS §6.5 super-call redirect (see `try_compile`'s doc comment
+            // on `cp_invokespecial_owner_resolver`): for `invokespecial`
+            // sites only, substitute the JVMS-correct selection-start class
+            // when it differs from the plain CP-referenced class. Must run
+            // before EVERY downstream use of `class_name` below (the
+            // recursive-call check, inlining, direct-callee compile, and the
+            // `JitInvokeInfo` baked into the compiled code), so a wrong
+            // target is never baked into any of them.
+            let class_name = if invoke_kind == 1 {
+                cp_invokespecial_owner_resolver
+                    .and_then(|r| r(cp_idx))
+                    .unwrap_or(class_name)
+            } else {
+                class_name
             };
             let num_params = count_param_slots(&descriptor);
             let has_receiver = invoke_kind != 3;
