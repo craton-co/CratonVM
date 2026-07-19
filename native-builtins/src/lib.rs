@@ -9662,6 +9662,10 @@ const MOCKITO_LOCATION_FACTORY_DEFAULT: &str =
     "org/mockito/internal/debugging/LocationFactory$DefaultLocationFactory";
 const MOCKITO_JAVA8_LOCATION_IMPL: &str = "org/mockito/internal/debugging/Java8LocationImpl";
 const MOCKITO_MOCK_METHOD_ADVICE: &str = "org/mockito/internal/creation/bytebuddy/MockMethodAdvice";
+const MOCKITO_MODULE_MEMBER_ACCESSOR: &str =
+    "org/mockito/internal/util/reflection/ModuleMemberAccessor";
+const MOCKITO_REFLECTION_MEMBER_ACCESSOR: &str =
+    "org/mockito/internal/util/reflection/ReflectionMemberAccessor";
 const HIBERNATE_TESTING_UTIL: &str = "org/hibernate/testing/orm/junit/TestingUtil";
 const HIBERNATE_ANNOTATION_TARGET_SUPPORT: &str =
     "org/hibernate/models/internal/AnnotationTargetSupport";
@@ -15769,6 +15773,19 @@ fn native_mockito_mock_method_advice_is_overridden(
     Ok(Some(Value::Int(0)))
 }
 
+/// Mockito selects its Java-9 `InstrumentationMemberAccessor` by constructing
+/// a Byte Buddy subclass during `ModuleMemberAccessor` class initialization.
+/// CratonVM supports Mockito's ordinary reflection accessor, but that eager
+/// bootstrap enters a bytecode-generation path before the test has requested a
+/// mock.  Return Mockito's own supported fallback directly, preserving the
+/// public MemberAccessor contract without changing mock generation itself.
+fn native_mockito_module_member_accessor_delegate(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    ctx.new_object_initialized(MOCKITO_REFLECTION_MEMBER_ACCESSOR, "()V", &[])
+}
+
 fn bytebuddy_list_hash(
     ctx: &mut dyn NativeContext,
     list: Option<ObjectRef>,
@@ -17374,6 +17391,12 @@ fn register_mockito_debugging_intrinsics(registry: &mut NativeMethodRegistry) {
         "create",
         "(Z)Lorg/mockito/invocation/Location;",
         native_mockito_location_factory_create,
+    );
+    registry.register(
+        MOCKITO_MODULE_MEMBER_ACCESSOR,
+        "delegate",
+        "()Lorg/mockito/plugins/MemberAccessor;",
+        native_mockito_module_member_accessor_delegate,
     );
 }
 
@@ -19509,6 +19532,13 @@ mod antlr_prediction_context_tests {
                 MOCKITO_LOCATION_FACTORY_DEFAULT,
                 "create",
                 "(Z)Lorg/mockito/invocation/Location;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                MOCKITO_MODULE_MEMBER_ACCESSOR,
+                "delegate",
+                "()Lorg/mockito/plugins/MemberAccessor;",
             )
             .is_some());
     }

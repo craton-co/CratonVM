@@ -633,6 +633,7 @@ fn huc_real_perform(
         };
         let resp = perform(
             ctx,
+            Some(this),
             &parsed,
             &method,
             &req.headers,
@@ -1438,6 +1439,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 
 fn perform(
     ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
     parsed: &Url1,
     method: &str,
     headers: &[(String, String)],
@@ -1545,7 +1547,10 @@ fn perform(
         // It contains the configured trust roots/client identity and owns the
         // TLS ticket cache required for a following connection to resume.
         // If no custom SSLContext was captured, use cached system roots.
-        let cfg = crate::t27_tls::huc_default_client_config().unwrap_or_else(shared_legacy_config);
+        let cfg = connection
+            .and_then(|connection| crate::t27_tls::huc_client_config_for_connection(ctx, connection))
+            .or_else(crate::t27_tls::huc_default_client_config)
+            .unwrap_or_else(shared_legacy_config);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -1791,6 +1796,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     // see its doc — so this caller must not wrap the whole call in one.
     let (status, headers, body_bytes) = match perform(
         ctx,
+        Some(this),
         &parsed,
         &method,
         &headers,

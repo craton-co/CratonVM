@@ -43176,6 +43176,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, NEW13_CTX_TM, tm_arg);
             ctx.set_field(this, NEW13_CTX_RANDOM, sr_arg);
             ctx.set_field(this, NEW13_CTX_INIT, Value::Int(1));
+
+            // Keep the legacy p68 context coherent with the rustls-backed
+            // transport bridge.  A real-JDK dispatch may reach this handler
+            // through an inherited/cached SSLContext call; without these
+            // transfers, a Java-supplied TrustManager is retained only in the
+            // synthetic fields and HttpURLConnection silently falls back to
+            // the platform verifier.
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
+            let tms_array = match tm_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
+            let kms_array = match km_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
             Ok(None)
         },
     );
@@ -43184,12 +43202,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // Field 0 is the originating SSLContext, matching the factory
+            // shape consumed by the HttpURLConnection TLS bridge.
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             // FIX (es-restclient-https): carry this SSLContext's custom trust
             // anchors (if any) forward onto the factory so createSocket can
             // find them — createSocket only has `this` = the factory, not
             // the originating SSLContext.
             if let Ok(this) = obj_arg(args, 0) {
+                ctx.set_field(obj, 0, Value::Object(Some(this)));
                 let ctx_key = this.as_ptr() as usize;
                 if let Some(roots) = p68_ctx_trust_roots_table().lock().get(&ctx_key).cloned() {
                     let factory_key = obj.as_ptr() as usize;
@@ -43391,22 +43412,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "createSocket",
         "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
         |ctx, args| {
-            if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
+            let factory = obj_arg(args, 0)?;
+            let wrapped = match args.get(1) {
+                Some(Value::Object(Some(socket))) => *socket,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
+                    }
+                    .into())
+                }
+            };
+            if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
                 return Err(RuntimeError::NullPointerException {
-                    message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
+                    message: Some("SSLSocketFactory.createSocket: host is null".into()),
                 }
                 .into());
             }
-            let host_ref = match args.get(2) {
-                Some(Value::Object(Some(r))) => *r,
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("SSLSocketFactory.createSocket: host is null".into()),
-                    }
-                    .into());
-                }
-            };
-            let host = ctx.read_string(host_ref).unwrap_or_default();
             let port_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(443);
             if !(0..=65535).contains(&port_i) {
                 return Err(RuntimeError::IllegalArgumentException {
@@ -43414,9 +43435,49 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
+            let ssl_context = match ctx.get_field(factory, 0) {
+                Value::Object(Some(context)) => context,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SSLSocketFactory has no owning SSLContext".into(),
+                    }
+                    .into())
+                }
+            };
+            // The rustls handshake below is pure native socket I/O.  Mark this
+            // server worker blocked while it waits for the client's
+            // ClientHello, otherwise a concurrent VM safepoint can wait for
+            // this thread while the client event loop waits for its reply.
+            ctx.begin_blocking_region();
+            let stream_result = crate::t27_tls::rustls_server_wrap_existing_socket(
+                ctx,
+                wrapped,
+                ssl_context,
+            );
+            ctx.end_blocking_region();
+            let stream_id = stream_result.map_err(|message| RuntimeError::IOException { message })?;
+            let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
+                .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
+            let host = ctx.create_string("server");
+            let tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
+            // The real JDK SSLSocket field layout is not this synthetic
+            // adapter's layout, so these Int field writes may be rejected.
+            // Keep the stream id in the side table used by the SSLSocket I/O
+            // natives; otherwise getInputStream/getOutputStream resolve -1.
+            crate::net_phase_e::sock_set_for_create(ctx, socket, port_i, tls_id);
+            ctx.set_field(socket, NEW13_SOCK_HOST, Value::Object(Some(host)));
+            ctx.set_field(socket, NEW13_SOCK_PORT, Value::Int(port_i));
+            ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(tls_id));
+            ctx.set_field(socket, NEW13_SOCK_CLOSED, Value::Int(0));
+            let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+            let protocol = ctx.create_string(&protocol);
+            let cipher = ctx.create_string(&cipher);
+            ctx.set_field(session, 0, Value::Object(Some(protocol)));
+            ctx.set_field(session, 1, Value::Object(Some(cipher)));
+            ctx.set_field(session, 2, Value::Int(tls_id));
+            ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+            Ok(Some(Value::Object(Some(socket))))
         },
     );
 
@@ -43444,6 +43505,174 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Handshake already done in createSocket
         Ok(None)
     });
+    // setUseClientMode/getUseClientMode, setNeedClientAuth/getNeedClientAuth,
+    // setWantClientAuth/getWantClientAuth — unlike getApplicationProtocol
+    // (concrete-but-throws) these six are genuinely `abstract` in the real
+    // `javax.net.ssl.SSLSocket` base class (only a concrete provider
+    // subclass, e.g. SunJSSE's SSLSocketImpl, implements them). Since this
+    // synthetic object's class literally IS `javax/net/ssl/SSLSocket`, an
+    // `invokevirtual` against the abstract declaration throws
+    // `AbstractMethodError` — thrown from `MockWebServer$SocketHandler.
+    // handle()` immediately after `createSocket(Socket,...)` returns
+    // (`sslSocket.setUseClientMode(false)`, unconditional, BEFORE any
+    // ALPN/read/write call), caught by its generic `catch (Exception e)` and
+    // logged at SEVERE — invisible under CratonVM's apparently-inert
+    // `java.util.logging`, so the connection is silently abandoned having
+    // never read the request or written a response. This, not the ALPN
+    // accessors below, is the actual root cause of the request/response
+    // exchange never happening for a server socket obtained via
+    // `SSLSocketFactory.createSocket(Socket,...)` (MockWebServer's HTTPS
+    // listener contract) — `getApplicationProtocol`/`getSSLParameters` are
+    // still worth having registered (OkHttp calls them too, just later) but
+    // execution never reached them without this fix.
+    r.register(ssl_sock, "setUseClientMode", "(Z)V", |_ctx, _args| {
+        // This socket's mode (client vs. server) was fixed by which native
+        // path created it (rustls_client_connect vs.
+        // rustls_server_wrap_existing_socket); the handshake already ran.
+        Ok(None)
+    });
+    r.register(ssl_sock, "getUseClientMode", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "getNeedClientAuth", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "getWantClientAuth", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // getApplicationProtocol/getHandshakeApplicationProtocol — the real
+    // `javax.net.ssl.SSLSocket` base class's own body for these (unlike most
+    // of its methods, which are abstract) is CONCRETE and just throws
+    // `UnsupportedOperationException`; only a provider's concrete subclass
+    // (SunJSSE's SSLSocketImpl) overrides it. Since this synthetic object's
+    // class literally IS `javax/net/ssl/SSLSocket`, without a native
+    // registration here that base-class bytecode runs and throws. Callers
+    // like OkHttp's `Platform.getSelectedProtocol()` (used by MockWebServer's
+    // connection handler for ALPN bookkeeping right after `startHandshake()`)
+    // catch that as a generic `Exception`, log it at FINE/SEVERE (invisible
+    // by default under java.util.logging), and abandon the connection having
+    // never read the request or written a response — surfaced to the client
+    // as a silent hang (e.g. Reactor's `.block(Duration)` timing out).
+    fn ssl_sock_negotiated_alpn(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE {
+            return None;
+        }
+        let raw_id = tls_id - crate::servlet::RUSTLS_SOCK_ID_BASE;
+        crate::t27_tls::rustls_session_info(raw_id).and_then(|(_, _, alpn, _)| alpn)
+    }
+    r.register(
+        ssl_sock,
+        "getApplicationProtocol",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getApplicationProtocol sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    alpn
+                );
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&alpn)))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getHandshakeApplicationProtocol",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getHandshakeApplicationProtocol sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    alpn
+                );
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&alpn)))))
+        },
+    );
+    // getSSLParameters/setSSLParameters — like getApplicationProtocol above,
+    // the real `javax.net.ssl.SSLSocket` base class's default bodies call
+    // through to other (mostly abstract-in-the-base-class) accessors; without
+    // a concrete provider subclass backing this synthetic object, that chain
+    // is liable to throw. OkHttp's `Jdk9Platform.configureTlsExtensions()`
+    // calls `getSSLParameters()` then `setSSLParameters()` on every socket
+    // BEFORE `startHandshake()` (to offer its ALPN protocol list) — for
+    // MockWebServer's synthetic server socket the handshake has already run
+    // synchronously inside `createSocket`, so this call is moot for actual
+    // negotiation, but it must not throw or the caller (uncaught) abandons
+    // the connection having never read the request or written a response.
+    r.register(
+        ssl_sock,
+        "getSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getSSLParameters ENTER sock={:?}",
+                    std::thread::current().id(),
+                    this
+                );
+            }
+            let ciphers = ssl_sock_supported_cipher_suites(ctx);
+            let protocols = {
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+                let negotiated =
+                    if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
+                        match ctx.get_field(session, NEW13_SESS_PROTO) {
+                            Value::Object(Some(s)) => ctx.read_string(s),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                let s = ctx.create_string(&negotiated.unwrap_or_else(|| "TLSv1.3".to_string()));
+                ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+                arr
+            };
+            let params = match ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[
+                    Value::Object(Some(ciphers)),
+                    Value::Object(Some(protocols)),
+                ],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
+            };
+            Ok(Some(Value::Object(Some(params))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "setSSLParameters",
+        "(Ljavax/net/ssl/SSLParameters;)V",
+        |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} setSSLParameters sock={:?}",
+                    std::thread::current().id(),
+                    args.first()
+                );
+            }
+            let _ = ctx;
+            // Handshake already completed in createSocket; the ALPN/cipher
+            // preferences a caller sets here can no longer change anything.
+            // Accept and discard, matching setEnabledCipherSuites/
+            // setEnabledProtocols' no-op contract on this synthetic socket.
+            Ok(None)
+        },
+    );
     // getSupportedCipherSuites/getEnabledCipherSuites/getSupportedProtocols/
     // getEnabledProtocols — same AbstractMethodError family as TC0622's
     // SSLSession buffer-size gap: the accessors above cover I/O and
@@ -43562,6 +43791,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             // Return an InputStream that reads from the TLS fd
             let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+            // Real JDK stream layouts do not have our synthetic Int slot 0.
+            // Preserve the TLS id in the identity-keyed socket side table too.
+            crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
             ctx.set_field(is, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(is))))
         },
@@ -43582,6 +43814,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 );
             }
             let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+            crate::net_phase_e::sock_set_for_create(ctx, os, 0, fd_id);
             ctx.set_field(os, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(os))))
         },
@@ -43661,7 +43894,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let ssl_is = "javax/net/ssl/SSLSocketInputStream";
     r.register(ssl_is, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -43677,7 +43914,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(ssl_is, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -43731,7 +43972,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let ssl_os = "javax/net/ssl/SSLSocketOutputStream";
     r.register(ssl_os, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
@@ -43753,7 +43998,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(

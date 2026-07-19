@@ -262,6 +262,54 @@ pub(crate) fn sock_stream_id_for_upcall(ctx: &dyn NativeContext, this: ObjectRef
     sock_get(ctx, this).stream_id
 }
 
+/// Transfer an accepted plain Socket's TCP stream to a TLS layer.
+pub(crate) fn take_raw_socket_stream_for_tls(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<std::net::TcpStream, String> {
+    let side = sock_get(ctx, this);
+    if side.stream_id >= 0 {
+        let stream = crate::servlet::s2_registry()
+            .lock()
+            .streams
+            .remove(&side.stream_id)
+            .ok_or_else(|| "wrapped Socket stream is not available".to_string())?;
+        let tcp = match std::sync::Arc::try_unwrap(stream) {
+            Ok(tcp) => tcp,
+            Err(shared) => shared
+                .try_clone()
+                .map_err(|e| format!("clone wrapped Socket stream: {e}"))?,
+        };
+        sock_set(ctx, this, |s| {
+            s.stream_id = -1;
+            s.closed = 1;
+        });
+        return Ok(tcp);
+    }
+
+    // Real JDK ServerSocket.accept() creates a NioSocketImpl whose TCP stream
+    // is owned by native-io's sun.nio.ch.Net registry, not this module's
+    // legacy s2 registry.  Extract its FileDescriptor and hand the stream to
+    // rustls before MockWebServer calls SSLSocketFactory.createSocket(Socket,
+    // ...).
+    let implementation = match ctx.get_field_by_name(this, "impl") {
+        Value::Object(Some(implementation)) => implementation,
+        _ => return Err("wrapped Socket is not connected".to_string()),
+    };
+    let descriptor = match ctx.get_field_by_name(implementation, "fd") {
+        Value::Object(Some(descriptor)) => descriptor,
+        _ => return Err("wrapped Socket has no FileDescriptor".to_string()),
+    };
+    let fd = match ctx.get_field_by_name(descriptor, "fd") {
+        Value::Int(fd) if fd >= 0 => fd,
+        _ => match ctx.get_field_by_name(descriptor, "handle") {
+            Value::Long(fd) if (0..=i32::MAX as i64).contains(&fd) => fd as i32,
+            _ => return Err("wrapped Socket FileDescriptor has no Net fd".to_string()),
+        },
+    };
+    cratonvm_native_io::net::take_stream_for_tls(fd)
+}
+
 /// FIX (netty-client-socket-write-after-close): companion to
 /// [`sock_stream_id_for_upcall`] for `phases_late.rs`'s NEW-13
 /// `javax/net/ssl/SSLSocket` stream/lifecycle natives (`getInputStream`,
@@ -3564,6 +3612,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if sid < 0 {
                 return Err(ioex("Socket.getInputStream: not connected"));
             }
+            // A layered SSLSocket can be invoked through its java.net.Socket
+            // base type (MockWebServer does exactly this). Keep that virtual
+            // call on the rustls-aware stream adapter instead of treating its
+            // high-offset id as a plain raw s2 socket id.
+            if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+                let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+                sock_set_for_create(ctx, is, 0, sid);
+                return Ok(Some(Value::Object(Some(is))));
+            }
             let is = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3);
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
@@ -3581,6 +3638,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let sid = sock_get(ctx, this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getOutputStream: not connected"));
+            }
+            if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+                let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+                sock_set_for_create(ctx, os, 0, sid);
+                return Ok(Some(Value::Object(Some(os))));
             }
             let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
             stream_owner_set(ctx, os, this);
@@ -6024,6 +6086,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // URL.openStream() for every non-http scheme.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
+            } else if ext.starts_with("https:") {
+                // Spring's SkipSslVerificationHttpRequestFactory first tests
+                // the carrier with `instanceof HttpsURLConnection`.  Returning
+                // the plain HTTP base here skipped that whole configuration
+                // branch, so its permissive TrustManager was never created.
+                "javax/net/ssl/HttpsURLConnection"
             } else {
                 "java/net/HttpURLConnection"
             };
@@ -9112,6 +9180,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.getInstance");
+            }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
             let proto = value_or_string(ctx, proto_val, "TLS");
             if !(proto.eq_ignore_ascii_case("TLS")
@@ -9188,6 +9259,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
+            }
             ctx.set_field(this, 1, Value::Int(1));
             // Per-SSLContext mTLS identity: claim the identity staged by the
             // keystore load that fed this context's KeyManager (same thread),
@@ -9231,15 +9305,15 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}", ctx.identity_hash_code(this));
+            }
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
-            // getSocketFactory() is a client-side call (the server uses
-            // createSSLEngine / getServerSocketFactory). Capture the complete
-            // context for native HttpsURLConnection, including anonymous
-            // client contexts: its ClientConfig owns the TLS ticket cache.
-            // This is the reliable capture point because the real JDK
-            // setDefaultSSLSocketFactory bytecode cannot be overridden here.
-            crate::t27_tls::capture_huc_ssl_context(ctx, this);
+            // Obtaining a factory has no connection scope. The HttpsURLConnection
+            // setter captures it later, either as an instance-specific config
+            // or as the JDK process default; doing that here leaked an
+            // instance's permissive TrustManager into later connections.
             Ok(Some(Value::Object(Some(f))))
         },
     );

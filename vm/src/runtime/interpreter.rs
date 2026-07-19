@@ -24232,16 +24232,93 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Mockito's ModuleMemberAccessor eagerly selects an instrumentation-backed
+    // Java-9 implementation by bootstrapping Byte Buddy in its class
+    // initializer.  The registered bridge returns Mockito's own reflection
+    // implementation, which is the library's supported fallback and avoids
+    // that unsupported eager bootstrap.
+    if class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+        && method_name == "delegate"
+        && method_descriptor == "()Lorg/mockito/plugins/MemberAccessor;"
+    {
+        return true;
+    }
+    // A real SSLContext returns SunJSSE's concrete factory implementation.
+    // The layered Socket overload must still reach the public factory bridge:
+    // MockWebServer uses it to wrap its accepted socket as a TLS server.
+    if (class_name == "javax/net/ssl/SSLSocketFactory"
+        || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
+        && method_name == "createSocket"
+        && matches!(
+            method_descriptor,
+            "(Ljava/lang/String;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
+        )
+    {
+        return true;
+    }
+    if (class_name == "javax/net/ssl/SSLSocket"
+        || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
+        && matches!(
+            (method_name, method_descriptor),
+            ("startHandshake", "()V")
+                | ("getInputStream", "()Ljava/io/InputStream;")
+                | ("getOutputStream", "()Ljava/io/OutputStream;")
+                | ("getSession", "()Ljavax/net/ssl/SSLSession;")
+                | ("close", "()V")
+                | ("isClosed", "()Z")
+                | ("isConnected", "()Z")
+                | ("getPort", "()I")
+                // The real `javax.net.ssl.SSLSocket` base class's default body
+                // for these two just throws `UnsupportedOperationException` —
+                // only a concrete provider subclass (SunJSSE's SSLSocketImpl)
+                // overrides them. Our synthetic server-side socket (returned
+                // by `SSLSocketFactory.createSocket(Socket,...)`, e.g. for
+                // MockWebServer's HTTPS listener) IS that class literally, so
+                // without forcing native here the real base-class bytecode
+                // runs and throws — silently caught+logged at FINE by
+                // MockWebServer's connection handler, which then just closes
+                // the socket having never read the request or written a
+                // response (`skipSslValidation`-style 30s client-side hang).
+                | ("getApplicationProtocol", "()Ljava/lang/String;")
+                | ("getHandshakeApplicationProtocol", "()Ljava/lang/String;")
+                | ("getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
+                | ("setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V")
+                | ("setUseClientMode", "(Z)V")
+                | ("getUseClientMode", "()Z")
+                | ("setNeedClientAuth", "(Z)V")
+                | ("getNeedClientAuth", "()Z")
+                | ("setWantClientAuth", "(Z)V")
+                | ("getWantClientAuth", "()Z")
+        )
+    {
+        return true;
+    }
     // SSLContext's real-JDK bodies delegate through a provider-owned
     // SSLContextSpi. CratonVM stores configured key/trust material on the
     // public context object instead, so the native path must own the complete
     // init-to-engine handoff for a server identity to reach Tomcat's engine.
-    if class_name == "javax/net/ssl/SSLContext"
+    if (class_name == "javax/net/ssl/SSLContext"
+        || class_name.starts_with("sun/security/ssl/SSLContextImpl"))
         && matches!(
             (method_name, method_descriptor),
-            ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+            ("getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;")
+                | ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                | ("getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;")
                 | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
                 | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+        )
+    {
+        return true;
+    }
+    if class_name == "sun/security/ssl/SSLEngineImpl"
+        && matches!(
+            (method_name, method_descriptor),
+            ("setHandshakeApplicationProtocolSelector", "(Ljava/util/function/BiFunction;)V")
+                | ("getHandshakeApplicationProtocolSelector", "()Ljava/util/function/BiFunction;")
         )
     {
         return true;
@@ -26745,6 +26822,42 @@ fn try_stackless_invoke(
         shared
             .native_methods
             .find(class_name, method_name, descriptor)
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLContextImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLContext",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLSocketFactoryImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLSocketFactory",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLSocketImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLSocket",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
     })
     .or_else(|| {
         if method_name == "<init>" {

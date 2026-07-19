@@ -13674,6 +13674,90 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    // `SSLContext.getInstance` returns a SunJSSE provider object.  The TLS
+    // bridge is registered on the public API class and must own this complete
+    // family before provider bytecode can create an incompatible context SPI.
+    // Keep this at the invocation entry point: static getInstance calls do
+    // not have a provider receiver for a later hierarchy fallback to repair.
+    if (class_name == "javax/net/ssl/SSLContext"
+        || class_name.starts_with("sun/security/ssl/SSLContextImpl"))
+        && matches!(
+            (method_name, descriptor),
+            ("getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;")
+                | ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                | ("getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;")
+                | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
+                | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find("javax/net/ssl/SSLContext", method_name, descriptor)
+        {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
+    // `SSLContext.getSocketFactory()` exposes SunJSSE's concrete provider
+    // class. Route its factory methods to the public bridge, which owns the
+    // accepted-socket TLS upgrade used by MockWebServer.
+    if (class_name == "javax/net/ssl/SSLSocketFactory"
+        || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
+        && method_name == "createSocket"
+        && matches!(
+            descriptor,
+            "(Ljava/lang/String;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
+        )
+    {
+        if let Some(callback) = shared.native_methods.find(
+            "javax/net/ssl/SSLSocketFactory",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
+    // The SunJSSE factory can expose a concrete SSLSocket implementation.
+    // Route its stream/lifecycle methods through the public bridge that owns
+    // the rustls stream returned by createSocket(Socket, ...).
+    if (class_name == "javax/net/ssl/SSLSocket"
+        || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
+        && matches!(
+            (method_name, descriptor),
+            ("startHandshake", "()V")
+                | ("getInputStream", "()Ljava/io/InputStream;")
+                | ("getOutputStream", "()Ljava/io/OutputStream;")
+                | ("getSession", "()Ljavax/net/ssl/SSLSession;")
+                | ("close", "()V")
+                | ("isClosed", "()Z")
+                | ("isConnected", "()Z")
+                | ("getPort", "()I")
+                | ("getApplicationProtocol", "()Ljava/lang/String;")
+                | ("getHandshakeApplicationProtocol", "()Ljava/lang/String;")
+                | ("getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
+                | ("setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V")
+                | ("setUseClientMode", "(Z)V")
+                | ("getUseClientMode", "()Z")
+                | ("setNeedClientAuth", "(Z)V")
+                | ("getNeedClientAuth", "()Z")
+                | ("setWantClientAuth", "(Z)V")
+                | ("getWantClientAuth", "()Z")
+        )
+    {
+        if let Some(callback) = shared.native_methods.find(
+            "javax/net/ssl/SSLSocket",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
     if class_name == "com/sun/tools/attach/VirtualMachine"
         && matches!(
             (method_name, descriptor),
@@ -13831,14 +13915,69 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
-                        // SSLContext's native bridge owns per-context key/trust
-                        // material; a real provider SPI bypasses that handoff.
-                        || (class_name == "javax/net/ssl/SSLContext"
+                        // Mockito's Java-9 member accessor eagerly bootstraps
+                        // Byte Buddy just to choose its instrumentation path.
+                        // Use the registered bridge to its built-in reflection
+                        // fallback before that unsupported bootstrap begins.
+                        || (class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+                            && method_name == "delegate"
+                            && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
+                        || ((class_name == "javax/net/ssl/SSLSocketFactory"
+                                || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
+                            && method_name == "createSocket"
+                            && matches!(
+                                descriptor,
+                                "(Ljava/lang/String;I)Ljava/net/Socket;"
+                                    | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
+                                    | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                                    | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                                    | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
+                            ))
+                        || ((class_name == "javax/net/ssl/SSLSocket"
+                                || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
                             && matches!(
                                 (method_name, descriptor),
-                                ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                                ("startHandshake", "()V")
+                                    | ("getInputStream", "()Ljava/io/InputStream;")
+                                    | ("getOutputStream", "()Ljava/io/OutputStream;")
+                                    | ("getSession", "()Ljavax/net/ssl/SSLSession;")
+                                    | ("close", "()V")
+                                    | ("isClosed", "()Z")
+                                    | ("isConnected", "()Z")
+                                    | ("getPort", "()I")
+                                    | ("getApplicationProtocol", "()Ljava/lang/String;")
+                                    | ("getHandshakeApplicationProtocol", "()Ljava/lang/String;")
+                                    | ("getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
+                                    | ("setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V")
+                                    | ("setUseClientMode", "(Z)V")
+                                    | ("getUseClientMode", "()Z")
+                                    | ("setNeedClientAuth", "(Z)V")
+                                    | ("getNeedClientAuth", "()Z")
+                                    | ("setWantClientAuth", "(Z)V")
+                                    | ("getWantClientAuth", "()Z")
+                            ))
+                        // SSLContext's native bridge owns per-context key/trust
+                        // material; a real provider SPI bypasses that handoff.
+                        || ((class_name == "javax/net/ssl/SSLContext"
+                                || class_name.starts_with("sun/security/ssl/SSLContextImpl"))
+                            && matches!(
+                                (method_name, descriptor),
+                                ("getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;")
+                                    | ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                                    | ("getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;")
                                     | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
                                     | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+                            ))
+                        // Synthetic rustls engines do not instantiate
+                        // SunJSSE's private conContext graph. Netty still
+                        // calls this concrete ALPN-selector setter, whose real
+                        // JDK body dereferences that absent graph before the
+                        // native TLS state machine can run.
+                        || (class_name == "sun/security/ssl/SSLEngineImpl"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("setHandshakeApplicationProtocolSelector", "(Ljava/util/function/BiFunction;)V")
+                                    | ("getHandshakeApplicationProtocolSelector", "()Ljava/util/function/BiFunction;")
                             ))
                         // KeyManagerFactory must retain the per-entry JKS
                         // password and build a registry-backed X509 manager;
