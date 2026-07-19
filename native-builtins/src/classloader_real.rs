@@ -925,7 +925,10 @@ fn load_class_visible_to(
 /// `cause` is a fresh heap object that must stay rooted across the further
 /// allocations (`create_string`, the outer `new_object_initialized`) needed
 /// to build the final exception.
-pub(crate) fn no_class_def_found_error(ctx: &mut dyn NativeContext, missing_internal: &str) -> ObjectRef {
+pub(crate) fn no_class_def_found_error(
+    ctx: &mut dyn NativeContext,
+    missing_internal: &str,
+) -> ObjectRef {
     let dotted = missing_internal.replace('/', ".");
     let cnfe_msg = ctx.create_string(&dotted);
     let cause = match ctx.new_object_initialized(

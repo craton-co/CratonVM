@@ -1803,23 +1803,21 @@ fn native_iot_open_tcp_stream_connection(
         );
     }
 
-    let close_ref = match ctx.new_object_initialized(
-        "java/util/concurrent/atomic/AtomicReference",
-        "()V",
-        &[],
-    ) {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        Ok(_) => {
-            ctx.unpin_native_roots(pin_base);
-            return Err(mcf_runtime(
-                "StreamConnection: failed to allocate close listener ref",
-            ));
-        }
-        Err(e) => {
-            ctx.unpin_native_roots(pin_base);
-            return Err(e);
-        }
-    };
+    let close_ref =
+        match ctx.new_object_initialized("java/util/concurrent/atomic/AtomicReference", "()V", &[])
+        {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(_) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(mcf_runtime(
+                    "StreamConnection: failed to allocate close listener ref",
+                ));
+            }
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
     let close_pin = ctx.pin_native_root(close_ref);
 
     let source_obj = alloc_source_channel_obj(ctx, source_id);

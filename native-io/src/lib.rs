@@ -5520,7 +5520,10 @@ fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// chunks, same pattern as `native_is_transfer_to` below) — real
 /// `ZipInputStream`/`InflaterInputStream`/etc. already implement that
 /// overload efficiently (native inflate), so this just stops bypassing it.
-pub(crate) fn native_is_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_is_read_all_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -6427,7 +6430,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_cb_order);
         registry.register(c, "slice", "()Ljava/nio/CharBuffer;", native_cb_slice);
         registry.register(c, "slice", "(II)Ljava/nio/CharBuffer;", native_cb_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/CharBuffer;", native_cb_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/CharBuffer;",
+            native_cb_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",
@@ -6466,7 +6474,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_ib_order);
         registry.register(c, "slice", "()Ljava/nio/IntBuffer;", native_ib_slice);
         registry.register(c, "slice", "(II)Ljava/nio/IntBuffer;", native_ib_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/IntBuffer;", native_ib_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/IntBuffer;",
+            native_ib_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",
@@ -6515,7 +6528,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_lb_order);
         registry.register(c, "slice", "()Ljava/nio/LongBuffer;", native_lb_slice);
         registry.register(c, "slice", "(II)Ljava/nio/LongBuffer;", native_lb_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/LongBuffer;", native_lb_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/LongBuffer;",
+            native_lb_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",
@@ -6570,7 +6588,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_fb_order);
         registry.register(c, "slice", "()Ljava/nio/FloatBuffer;", native_fb_slice);
         registry.register(c, "slice", "(II)Ljava/nio/FloatBuffer;", native_fb_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/FloatBuffer;", native_fb_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/FloatBuffer;",
+            native_fb_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",
@@ -6624,7 +6647,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_db_order);
         registry.register(c, "slice", "()Ljava/nio/DoubleBuffer;", native_db_slice);
         registry.register(c, "slice", "(II)Ljava/nio/DoubleBuffer;", native_db_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/DoubleBuffer;", native_db_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/DoubleBuffer;",
+            native_db_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",
@@ -6673,7 +6701,12 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "order", "()Ljava/nio/ByteOrder;", native_sb_order);
         registry.register(c, "slice", "()Ljava/nio/ShortBuffer;", native_sb_slice);
         registry.register(c, "slice", "(II)Ljava/nio/ShortBuffer;", native_sb_slice2);
-        registry.register(c, "duplicate", "()Ljava/nio/ShortBuffer;", native_sb_duplicate);
+        registry.register(
+            c,
+            "duplicate",
+            "()Ljava/nio/ShortBuffer;",
+            native_sb_duplicate,
+        );
         registry.register(
             c,
             "asReadOnlyBuffer",

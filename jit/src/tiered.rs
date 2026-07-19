@@ -1047,7 +1047,8 @@ impl TieredCompilationManager {
         tier: CompilationTier,
         compile_time_ms: u64,
     ) {
-        self.core.complete_task(key, tier, compile_time_ms, true, false);
+        self.core
+            .complete_task(key, tier, compile_time_ms, true, false);
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────
@@ -1822,7 +1823,8 @@ mod tests {
         let mgr = TieredCompilationManager::with_default_policy();
         let key = test_key();
         mgr.on_method_invocation(&key); // create state
-        mgr.core.complete_task(&key, CompilationTier::C1, 10, false, false);
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 10, false, false);
         assert_eq!(
             mgr.current_tier(&key),
             CompilationTier::Interpreter,
@@ -1850,7 +1852,8 @@ mod tests {
         // leave the method eligible for another attempt (queued_for_compilation
         // reset, current_tier untouched).
         for i in 0..(MAX_TIER_FAIL_RETRIES - 1) {
-            mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
+            mgr.core
+                .complete_task(&key, CompilationTier::C1, 1, false, false);
             assert_eq!(
                 mgr.on_method_invocation(&key),
                 Some(CompilationTier::C1),
@@ -1859,7 +1862,8 @@ mod tests {
         }
         // One more failure reaches MAX_TIER_FAIL_RETRIES — should_compile
         // must now give up permanently.
-        mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 1, false, false);
         assert_eq!(
             mgr.on_method_invocation(&key),
             None,
@@ -1877,8 +1881,10 @@ mod tests {
         let mgr = TieredCompilationManager::new(policy);
         let key = test_key();
         mgr.on_method_invocation(&key);
-        mgr.core.complete_task(&key, CompilationTier::C1, 1, false, false);
-        mgr.core.complete_task(&key, CompilationTier::C1, 5, true, false);
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 1, false, false);
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 5, true, false);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
         let methods = mgr.core.methods.lock();
         assert_eq!(

@@ -862,7 +862,9 @@ pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
     internal.starts_with("java/")
         || internal.starts_with("javax/")
         || internal.starts_with("jdk/")
-        || internal.starts_with("sun/")
+        // MethodUtil deliberately defines this JDK helper through its private
+        // application loader; its static initializer rejects bootstrap ownership.
+        || (internal.starts_with("sun/") && internal != "sun/reflect/misc/Trampoline")
         || internal.starts_with("com/sun/")
         || internal.starts_with("org/w3c/dom")
         || internal.starts_with("org/xml/sax")
@@ -2527,6 +2529,23 @@ pub(crate) fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
 /// (`JavaLangAccess.defineClass`, the `System$1` bridge that
 /// `jdk.internal.reflect.ClassDefiner` calls into) so both entry points
 /// share the same magic-check / panic-guard / PD-attribution behavior.
+///
+/// `loader`: the `ClassLoader` object passed to the `defineClassN` native
+/// (may be `Value::Object(None)` for the bootstrap loader). Recorded via
+/// `register_defining_loader` on success so this class's true defining
+/// loader is known to every `defining_loader_for` consumer (`getClassLoader`,
+/// GC loader-pinning, `inherit_lookup_loader`'s namespace lookup, ...) —
+/// previously only `Lookup.defineClass` (`lookup_define.rs`) recorded this,
+/// so any class defined the ordinary way (`ClassLoader.defineClass`, e.g.
+/// Groovy's `GroovyClassLoader` compiling a script class) had no recorded
+/// defining loader. That left `inherit_lookup_loader`'s legacy fallback
+/// (`loader_id_of_class`, which collapses small `UserDefined(n)` ids into
+/// the builtin-loader id range) as the only source of truth for a CGLIB
+/// proxy generated against such a class, mis-routing the proxy into the
+/// Application namespace and CNFE-failing the `Class.forName(name, true,
+/// loader)` CGLIB issues right after — see
+/// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md`'s Groovy cluster
+/// entry (`GroovyAspectTests`/`GroovyAspectIntegrationTests` residuals).
 pub(crate) fn define_class_via_full(
     ctx: &mut dyn NativeContext,
     name: &str,
@@ -2535,6 +2554,7 @@ pub(crate) fn define_class_via_full(
     opts: cratonvm_native_api::DefineClassFull,
     initialize: bool,
     class_data: Option<Value>,
+    loader: Value,
 ) -> MethodCallResult {
     use cratonvm_types::error::{LinkageError, RuntimeError};
 
@@ -2573,6 +2593,29 @@ pub(crate) fn define_class_via_full(
             // Stash classData (defineClass0 path) on the side-table.
             if let Some(data) = class_data {
                 set_class_data(mirror, data);
+            }
+            // Record the true defining loader (see the doc comment above)
+            // so later `defining_loader_for(cid)` consumers — including
+            // `inherit_lookup_loader`'s namespace lookup for a subsequent
+            // CGLIB/`Lookup.defineClass` proxy of this exact class — see the
+            // real loader instead of falling back to the legacy
+            // `loader_id_of_class` path, which can collapse a small
+            // `UserDefined(n)` id into the builtin-loader range.
+            //
+            // Gated on `is_user_defined_loader` to preserve the existing
+            // invariant that `defining_loader_store` only ever holds genuine
+            // custom-`ClassLoader` instances, never the built-in bootstrap/
+            // platform/application loader — registering the latter would add
+            // an entry for nearly every class defined during a run (the vast
+            // majority go through the system loader) for no behavioral
+            // benefit (every consumer either wants the true custom loader or
+            // already has its own built-in-loader fallback).
+            if loader_aware_resolution() {
+                if let Value::Object(Some(loader_obj)) = loader {
+                    if is_user_defined_loader(ctx, loader_obj) {
+                        register_defining_loader(cid.as_u32(), loader_obj);
+                    }
+                }
             }
             // Eager-init request: run <clinit> now (defineClass0 path
             // when `initialize == true`). `ctx.initialize_class` can
@@ -2666,7 +2709,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
 }
 
 /// JDK-internal: `static native Class<?> defineClass2(
@@ -2726,7 +2769,7 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
 }
 
 // JEP 371 / JEP 466 flag bits accepted by `defineClass0`.
@@ -2837,7 +2880,7 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data)
+    define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data, loader)
 }
 
 /// WP2.3-C — register the JDK-internal `defineClass0/1/2` natives on
@@ -3296,7 +3339,9 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             1,
             "ClassLoader.getResource name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let name = {
         let mut found: Option<String> = None;
@@ -3636,7 +3681,9 @@ fn cl_get_resources_impl(
             1,
             "ClassLoader.getResources name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let name = {
         let mut found: Option<String> = None;
@@ -3680,10 +3727,9 @@ fn cl_get_resources_impl(
                 }
                 let this_live = ctx.read_native_pin(p_this, this_ref);
                 let name_for_local = Value::Object(Some(ctx.create_string(&name)));
-                if let Ok(Some(Value::Object(Some(enm)))) = ucl_find_resources(
-                    ctx,
-                    &[Value::Object(Some(this_live)), name_for_local],
-                ) {
+                if let Ok(Some(Value::Object(Some(enm)))) =
+                    ucl_find_resources(ctx, &[Value::Object(Some(this_live)), name_for_local])
+                {
                     collect_url_enumeration_objects(ctx, enm, &mut urls);
                 }
                 ctx.unpin_native_roots(p_this);
@@ -4231,7 +4277,9 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             1,
             "ClassLoader.getResourceAsStream name is null",
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     let Some(name) = args.iter().rev().find_map(|v| match v {
         Value::Object(Some(o)) => ctx.read_string(*o),

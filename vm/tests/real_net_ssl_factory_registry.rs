@@ -22,7 +22,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     ["release", "debug"]
         .into_iter()
         .map(|profile| workspace_root().join("target").join(profile).join(exe))
@@ -66,7 +70,10 @@ fn real_net_sockets_keep_ssl_factory_bridge_without_synthetic_stubs() {
         .iter()
         .filter(|entry| entry["class"] == "javax/net/ssl/SSLSocketFactory")
         .collect();
-    assert!(!entries.is_empty(), "SSLSocketFactory has no registered bridge methods");
+    assert!(
+        !entries.is_empty(),
+        "SSLSocketFactory has no registered bridge methods"
+    );
     assert!(
         entries.iter().all(|entry| entry["kind"] == "bridge"),
         "real-network SSLSocketFactory registry retained a non-bridge native: {entries:?}"

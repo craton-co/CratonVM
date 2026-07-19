@@ -497,7 +497,6 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-
     // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
     // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
     // ANTLR-runtime, and most of java.util together turns ordinary 9-second

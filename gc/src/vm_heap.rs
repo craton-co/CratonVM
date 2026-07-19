@@ -317,9 +317,7 @@ impl VmHeap {
         count: usize,
     ) -> Vec<ObjectRef> {
         match self {
-            VmHeap::Generational(h) => {
-                h.try_alloc_objects_old_batch(class_id, num_fields, count)
-            }
+            VmHeap::Generational(h) => h.try_alloc_objects_old_batch(class_id, num_fields, count),
             VmHeap::G1(_) => Vec::new(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => Vec::new(),
@@ -1090,13 +1088,11 @@ impl VmHeap {
     #[inline]
     pub fn write_barrier_keep_alive(&self, referent: ObjectRef) {
         match self {
-            VmHeap::Generational(h) => {
-                <GenerationalHeap as GarbageCollector>::write_barrier_pre(
-                    h,
-                    std::ptr::null_mut(),
-                    referent,
-                )
-            }
+            VmHeap::Generational(h) => <GenerationalHeap as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
             VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(
                 h,
                 std::ptr::null_mut(),

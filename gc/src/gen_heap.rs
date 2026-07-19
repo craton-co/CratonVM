@@ -3707,7 +3707,10 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && young_cursor + gap <= young_used
+                {
                     young_cursor += gap;
                     continue;
                 }
@@ -3722,7 +3725,11 @@ impl GenerationalHeap {
                 break;
             }
             let size = gen_object_total_size(header);
-            if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
+            if size < HEADER_SIZE
+                || young_cursor
+                    .checked_add(size)
+                    .is_none_or(|end| end > young_used)
+            {
                 tracing::warn!(
                     young_cursor,
                     young_used,
@@ -4769,7 +4776,6 @@ impl GenerationalHeap {
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
 
-
         // Build exact young-object bases before marking. The stack/JIT root
         // scan is conservative and can yield aligned interior words; treating
         // those as objects makes the side-mark channel retain the interior
@@ -4794,12 +4800,19 @@ impl GenerationalHeap {
             // walk above).
             if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
-                let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && exact_cursor + gap <= young_from.used() {
+                let gap =
+                    unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && exact_cursor + gap <= young_from.used()
+                {
                     exact_cursor += gap;
                     continue;
                 }
-                tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
+                tracing::warn!(
+                    exact_cursor,
+                    "GC: exact young-object walk found an implausible GAP-filler sentinel"
+                );
                 break;
             }
             let total = gen_object_total_size(header);
@@ -4808,12 +4821,20 @@ impl GenerationalHeap {
                     .checked_add(total)
                     .is_none_or(|end| end > young_from.used())
             {
-                tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
+                tracing::warn!(
+                    exact_cursor,
+                    used = young_from.used(),
+                    "GC: exact young-object walk stopped at an implausible extent"
+                );
                 break;
             }
             if let Some(&&(off, _)) = exact_free_iter.peek() {
                 if off > exact_cursor && off < exact_cursor + total {
-                    tracing::warn!(exact_cursor, off, "GC: exact young-object walk crossed a free/TLAB range");
+                    tracing::warn!(
+                        exact_cursor,
+                        off,
+                        "GC: exact young-object walk crossed a free/TLAB range"
+                    );
                     break;
                 }
             }
@@ -8311,8 +8332,7 @@ impl GenerationalHeap {
     #[inline]
     fn full_old_rset_scan_enabled() -> bool {
         static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*CARD_TABLE_ONLY
-            .get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+        !*CARD_TABLE_ONLY.get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -9235,12 +9255,12 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.array_length != 0 {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
+                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
                  class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
                  so the walker can re-sync.",
-                header.array_length,
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.array_length,
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -9251,10 +9271,10 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.num_slots > (1 << 24) {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
                  treating as corrupt so the walker can re-sync.",
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;

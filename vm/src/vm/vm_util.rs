@@ -523,9 +523,11 @@ pub fn ensure_class_initialized_shared(
                                     // released first — this non-reentrant
                                     // `RwLock` would otherwise self-deadlock.
                                     drop(cm);
-                                    return Err(crate::runtime::exceptions::raise_no_class_def_found(
-                                        shared, thread, &name,
-                                    ));
+                                    return Err(
+                                        crate::runtime::exceptions::raise_no_class_def_found(
+                                            shared, thread, &name,
+                                        ),
+                                    );
                                 }
                                 _ => {
                                     // Claim: set initializing_thread under the write lock.
@@ -2930,11 +2932,10 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             vec![(hex >> 32) as i32, (hex & 0xFFFF_FFFF) as i32]
                         };
                         if let Some(bi) = make_or_patch_bi(None, 1, &mag_words) {
-                            let _ = shared.heap.set_array_element(
-                                lr_arr,
-                                i,
-                                Value::Object(Some(bi)),
-                            );
+                            let _ =
+                                shared
+                                    .heap
+                                    .set_array_element(lr_arr, i, Value::Object(Some(bi)));
                         }
                     }
                     if set_static_by_name("longRadix", Value::Object(Some(lr_arr))) {

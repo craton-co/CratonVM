@@ -119,6 +119,18 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
     r.register(
         cls,
         "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljavax/management/ObjectName;",
+        native_object_name_get_instance_domain_key_value,
+    );
+    r.register(
+        cls,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/util/Hashtable;)Ljavax/management/ObjectName;",
+        native_object_name_get_instance_domain_table,
+    );
+    r.register(
+        cls,
+        "getInstance",
         "(Ljavax/management/ObjectName;)Ljavax/management/ObjectName;",
         native_object_name_get_instance_object,
     );
@@ -142,6 +154,12 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
     );
     r.register(
         cls,
+        "getSerializedNameString",
+        "()Ljava/lang/String;",
+        native_object_name_to_string,
+    );
+    r.register(
+        cls,
         "getDomain",
         "()Ljava/lang/String;",
         native_object_name_domain,
@@ -153,6 +171,12 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         native_object_name_get_key_property,
     );
     // RKC-ObjectName-01: `getCanonicalKeyPropertyListString` and the
+    r.register(
+        cls,
+        "getKeyPropertyList",
+        "()Ljava/util/Hashtable;",
+        native_object_name_get_key_property_list,
+    );
     // `is*Pattern` family are real, un-intercepted-until-now `ObjectName`
     // methods that `com.sun.jmx.mbeanserver.Repository`/`JmxMBeanServer`
     // call on every `addMBean`/`queryNames` dispatch as soon as real JDK
@@ -174,6 +198,12 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         native_object_name_get_canonical_key_property_list_string,
     );
     r.register(cls, "isPattern", "()Z", native_object_name_is_pattern);
+    r.register(
+        cls,
+        "getKeyPropertyListString",
+        "()Ljava/lang/String;",
+        native_object_name_get_canonical_key_property_list_string,
+    );
     r.register(
         cls,
         "isDomainPattern",
@@ -290,7 +320,7 @@ fn object_name_from_domain_table(
 ) -> String {
     let mut pairs = Vec::new();
     if let Some(table) = table {
-        for key in ["name", "type"] {
+        for key in ["name", "type", "hashCode", "identity"] {
             if let Some(value) = object_name_table_get(ctx, table, key) {
                 if !value.is_empty() {
                     pairs.push(format!("{key}={value}"));
@@ -305,13 +335,61 @@ fn object_name_from_domain_table(
     }
 }
 
+fn ensure_platform_mxbean_registered(ctx: &mut dyn NativeContext, name: ObjectRef, text: &str) {
+    let kind = match text {
+        "java.lang:type=Memory" => 0,
+        "java.lang:type=Threading" => 1,
+        _ => return,
+    };
+    let Some(factory) = ctx.class_id_by_name("java/lang/management/ManagementFactory") else {
+        return;
+    };
+    let Some(field) = ctx.static_field_index_by_name(factory, "platformMBeanServer") else {
+        return;
+    };
+    let Value::Object(Some(server)) = ctx.get_static_field(factory, field) else {
+        return;
+    };
+    let server_pin = ctx.pin_native_root(server);
+    let name_pin = ctx.pin_native_root(name);
+    let server = ctx.read_native_pin(server_pin, server);
+    let name = ctx.read_native_pin(name_pin, name);
+    let registered = matches!(
+        ctx.invoke_virtual(
+            server,
+            "isRegistered",
+            "(Ljavax/management/ObjectName;)Z",
+            &[Value::Object(Some(name))],
+        ),
+        Ok(Some(Value::Int(value))) if value != 0
+    );
+    if !registered {
+        let bean = if kind == 0 {
+            alloc_memory_mxbean(ctx)
+        } else {
+            alloc_thread_mxbean(ctx)
+        };
+        let server = ctx.read_native_pin(server_pin, server);
+        let name = ctx.read_native_pin(name_pin, name);
+        let _ = ctx.invoke_virtual(
+            server,
+            "registerMBean",
+            "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;",
+            &[Value::Object(Some(bean)), Value::Object(Some(name))],
+        );
+    }
+    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(server_pin);
+}
+
 fn native_object_name_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
     let text = object_name_string_arg(ctx, args, 1);
-    object_name_set_text(ctx, this, text);
+    object_name_set_text(ctx, this, text.clone());
+    ensure_platform_mxbean_registered(ctx, this, &text);
     Ok(None)
 }
 
@@ -331,7 +409,8 @@ fn native_object_name_init_domain_key_value(
     } else {
         format!("{domain}:{key}={value}")
     };
-    object_name_set_text(ctx, this, text);
+    object_name_set_text(ctx, this, text.clone());
+    ensure_platform_mxbean_registered(ctx, this, &text);
     Ok(None)
 }
 
@@ -349,8 +428,37 @@ fn native_object_name_init_domain_table(
         _ => None,
     };
     let text = object_name_from_domain_table(ctx, &domain, table);
-    object_name_set_text(ctx, this, text);
+    object_name_set_text(ctx, this, text.clone());
+    ensure_platform_mxbean_registered(ctx, this, &text);
     Ok(None)
+}
+
+fn object_name_malformed(ctx: &mut dyn NativeContext, text: &str) -> MethodCallFailed {
+    let message = format!("Invalid ObjectName: {text}");
+    let msg = ctx.create_string(&message);
+    match ctx.new_object_initialized(
+        "javax/management/MalformedObjectNameException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        _ => RuntimeError::IllegalArgumentException { message }.into(),
+    }
+}
+
+fn object_name_require_valid_text(
+    ctx: &mut dyn NativeContext,
+    text: &str,
+) -> Result<(), MethodCallFailed> {
+    let Some((_, properties)) = text.split_once(':') else {
+        return Err(object_name_malformed(ctx, text));
+    };
+    if properties != "*"
+        && (properties.is_empty() || properties.split(',').any(|pair| !pair.contains('=')))
+    {
+        return Err(object_name_malformed(ctx, text));
+    }
+    Ok(())
 }
 
 fn native_object_name_get_instance_string(
@@ -358,7 +466,42 @@ fn native_object_name_get_instance_string(
     args: &[Value],
 ) -> MethodCallResult {
     let text = object_name_string_arg(ctx, args, 0);
-    Ok(Some(Value::Object(Some(object_name_new(ctx, text)))))
+    object_name_require_valid_text(ctx, &text)?;
+    let object = object_name_new(ctx, text.clone());
+    ensure_platform_mxbean_registered(ctx, object, &text);
+    Ok(Some(Value::Object(Some(object))))
+}
+
+fn native_object_name_get_instance_domain_key_value(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let domain = object_name_string_arg(ctx, args, 0);
+    let key = object_name_string_arg(ctx, args, 1);
+    let value = object_name_string_arg(ctx, args, 2);
+    let text = if key.is_empty() {
+        format!("{domain}:*")
+    } else {
+        format!("{domain}:{key}={value}")
+    };
+    let object = object_name_new(ctx, text.clone());
+    ensure_platform_mxbean_registered(ctx, object, &text);
+    Ok(Some(Value::Object(Some(object))))
+}
+
+fn native_object_name_get_instance_domain_table(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let domain = object_name_string_arg(ctx, args, 0);
+    let table = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let text = object_name_from_domain_table(ctx, &domain, table);
+    let object = object_name_new(ctx, text.clone());
+    ensure_platform_mxbean_registered(ctx, object, &text);
+    Ok(Some(Value::Object(Some(object))))
 }
 
 fn native_object_name_get_instance_object(
@@ -397,72 +540,116 @@ fn native_object_name_domain(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn native_object_name_get_key_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_object_name_get_key_property(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = object_name_string_arg(ctx, args, 1);
-    let text = object_name_text(ctx, this);
-    let props = text.split_once(':').map(|(_, p)| p).unwrap_or("");
-    for pair in props.split(',') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                let unquoted = v
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .unwrap_or(v);
-                let s = ctx.create_string(unquoted);
-                return Ok(Some(Value::Object(Some(s))));
-            }
+    for (candidate_key, value) in object_name_parts(&object_name_text(ctx, this)).1 {
+        if candidate_key == key {
+            let s = ctx.create_string(&value);
+            return Ok(Some(Value::Object(Some(s))));
         }
     }
-    // Real JDK semantics: no such key property -> null (not an exception).
     Ok(Some(Value::Object(None)))
 }
 
-/// Simple JMX-style glob match:  = any run of characters,  = any
-/// single character, everything else literal. No escaping (matches the
-/// simplicity level of the rest of this synthetic ObjectName model).
+/// Build ObjectName's public key-property table without touching the real JDK
+/// _ca_array cache, which synthetic ObjectName instances intentionally lack.
+fn native_object_name_get_key_property_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let table = match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let table_pin = ctx.pin_native_root(table);
+    let (_, properties, _) = object_name_parts(&object_name_text(ctx, this));
+    for (key, value) in properties {
+        let key_obj = ctx.create_string(&key);
+        let key_pin = ctx.pin_native_root(key_obj);
+        let value_obj = ctx.create_string(&value);
+        let table = ctx.read_native_pin(table_pin, table);
+        let key_obj = ctx.read_native_pin(key_pin, key_obj);
+        let _ = ctx.invoke_virtual(
+            table,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key_obj)), Value::Object(Some(value_obj))],
+        );
+        ctx.unpin_native_roots(key_pin);
+    }
+    let table = ctx.read_native_pin(table_pin, table);
+    ctx.unpin_native_roots(table_pin);
+    Ok(Some(Value::Object(Some(table))))
+}
+
+/// Simple JMX-style glob match: star = any run of characters, question-mark
+/// = any single character, everything else literal.
 fn object_name_glob_match(pattern: &str, text: &str) -> bool {
-    fn go(p: &[u8], t: &[u8]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some(b'*') => go(&p[1..], t) || (!t.is_empty() && go(p, &t[1..])),
-            Some(b'?') => !t.is_empty() && go(&p[1..], &t[1..]),
-            Some(pc) => t.first() == Some(pc) && go(&p[1..], &t[1..]),
+    fn go(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some(b'*') => go(&pattern[1..], text) || (!text.is_empty() && go(pattern, &text[1..])),
+            Some(b'?') => !text.is_empty() && go(&pattern[1..], &text[1..]),
+            Some(ch) => text.first() == Some(ch) && go(&pattern[1..], &text[1..]),
         }
     }
     go(pattern.as_bytes(), text.as_bytes())
 }
 
+/// Split a JMX key-property list at commas outside quoted values. A quoted
+/// value may contain escaped quotes and arbitrary commas/equals signs.
+fn object_name_property_pairs(properties: &str) -> Vec<&str> {
+    let mut pairs = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in properties.char_indices() {
+        if quoted && escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            pairs.push(&properties[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    pairs.push(&properties[start..]);
+    pairs
+}
+
 /// Split a canonical ObjectName string into (domain, key=value pairs,
-/// is_property_pattern). is_property_pattern is true for a trailing ",*"
-/// or a bare "*" property list (JMX's "any additional properties allowed"
-/// wildcard) -- as opposed to an exact/full property list, which must match
-/// the candidate's property count exactly, not just be a subset.
+/// is_property_pattern).
 fn object_name_parts(text: &str) -> (String, Vec<(String, String)>, bool) {
-    let (domain, props_str) = text.split_once(':').unwrap_or((text, ""));
-    let is_pattern = props_str == "*" || props_str.ends_with(",*");
-    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
-    let props_str = if props_str == "*" { "" } else { props_str };
-    let mut props = Vec::new();
-    if !props_str.is_empty() {
-        for pair in props_str.split(',') {
-            if let Some((k, v)) = pair.split_once('=') {
-                props.push((k.to_string(), v.to_string()));
+    let (domain, properties) = text.split_once(':').unwrap_or((text, ""));
+    let is_pattern = properties == "*" || properties.ends_with(",*");
+    let properties = properties.strip_suffix(",*").unwrap_or(properties);
+    let properties = if properties == "*" { "" } else { properties };
+    let mut pairs = Vec::new();
+    if !properties.is_empty() {
+        for property in object_name_property_pairs(properties) {
+            if let Some((key, value)) = property.split_once('=') {
+                pairs.push((key.to_string(), value.to_string()));
             }
         }
     }
-    (domain.to_string(), props, is_pattern)
+    (domain.to_string(), pairs, is_pattern)
 }
 
-/// `ObjectName.getCanonicalKeyPropertyListString()`: the canonical
-/// (domain-and-pattern-suffix-stripped) key-property-list portion of the
-/// name, e.g. `"type=MBeanServerDelegate"` for
-/// `"JMImplementation:type=MBeanServerDelegate"`. Mirrors real JDK's
-/// `_canonicalName.substring(domainLength + 1, len)` but derived from the
-/// synthetic text model (field 0) instead of the real private fields.
+/// ObjectName.getCanonicalKeyPropertyListString() without relying on the
+/// JDK's private _ca_array cache.
 fn native_object_name_get_canonical_key_property_list_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -472,11 +659,11 @@ fn native_object_name_get_canonical_key_property_list_string(
         _ => return Ok(Some(Value::Object(None))),
     };
     let text = object_name_text(ctx, this);
-    let props_str = text.split_once(':').map(|(_, p)| p).unwrap_or("");
-    let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
-    let props_str = if props_str == "*" { "" } else { props_str };
-    let s = ctx.create_string(props_str);
-    Ok(Some(Value::Object(Some(s))))
+    let properties = text.split_once(':').map(|(_, p)| p).unwrap_or("");
+    let properties = properties.strip_suffix(",*").unwrap_or(properties);
+    let properties = if properties == "*" { "" } else { properties };
+    let result = ctx.create_string(properties);
+    Ok(Some(Value::Object(Some(result))))
 }
 
 fn native_object_name_is_domain_pattern(
@@ -643,7 +830,50 @@ pub fn register_management_factory_platform_server_stub(r: &mut NativeMethodRegi
         "java/lang/management/ManagementFactory",
         "getPlatformMBeanServer",
         "()Ljavax/management/MBeanServer;",
-        |ctx, _args| Ok(Some(Value::Object(Some(alloc_mbean_server(ctx))))),
+        |ctx, _args| {
+            let factory = ctx
+                .ensure_class_initialized("java/lang/management/ManagementFactory")
+                .ok();
+            if let Some(factory) = factory {
+                if let Some(field) = ctx.static_field_index_by_name(factory, "platformMBeanServer") {
+                    if let Value::Object(Some(server)) = ctx.get_static_field(factory, field) {
+                        return Ok(Some(Value::Object(Some(server))));
+                    }
+                    let server = alloc_mbean_server(ctx);
+                    ctx.set_static_field(factory, field, Value::Object(Some(server)));
+                    let server_pin = ctx.pin_native_root(server);
+                    // Each allocation below can collect, so retain both platform
+                    // beans before creating their ObjectNames or invoking the
+                    // server. In particular, the second bean allocation must not
+                    // leave the first raw ObjectRef stale.
+                    let memory = alloc_memory_mxbean(ctx);
+                    let memory_pin = ctx.pin_native_root(memory);
+                    let threading = alloc_thread_mxbean(ctx);
+                    let threading_pin = ctx.pin_native_root(threading);
+                    for (text, bean, bean_pin) in [
+                        ("java.lang:type=Memory", memory, memory_pin),
+                        ("java.lang:type=Threading", threading, threading_pin),
+                    ] {
+                        let name = object_name_new(ctx, text.to_string());
+                        let name_pin = ctx.pin_native_root(name);
+                        let server = ctx.read_native_pin(server_pin, server);
+                        let bean = ctx.read_native_pin(bean_pin, bean);
+                        let name = ctx.read_native_pin(name_pin, name);
+                        let _ = ctx.invoke_virtual(
+                            server,
+                            "registerMBean",
+                            "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;",
+                            &[Value::Object(Some(bean)), Value::Object(Some(name))],
+                        );
+                        ctx.unpin_native_roots(name_pin);
+                    }
+                    let server = ctx.read_native_pin(server_pin, server);
+                    ctx.unpin_native_roots(server_pin);
+                    return Ok(Some(Value::Object(Some(server))));
+                }
+            }
+            Ok(Some(Value::Object(Some(alloc_mbean_server(ctx)))))
+        },
     );
     r.set_category(__prev_cat);
 }
@@ -2116,13 +2346,18 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&cp);
         Ok(Some(Value::Object(Some(s))))
     });
-    r.register(cls, "getLibraryPath", "()Ljava/lang/String;", |ctx, _args| {
-        let lp = ctx
-            .get_system_property("java.library.path")
-            .unwrap_or_default();
-        let s = ctx.create_string(&lp);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    r.register(
+        cls,
+        "getLibraryPath",
+        "()Ljava/lang/String;",
+        |ctx, _args| {
+            let lp = ctx
+                .get_system_property("java.library.path")
+                .unwrap_or_default();
+            let s = ctx.create_string(&lp);
+            Ok(Some(Value::Object(Some(s))))
+        },
+    );
     r.register(
         cls,
         "getBootClassPath",
@@ -2180,12 +2415,15 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/PlatformLoggingMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
-    r.register(cls, "getLoggerNames", "()Ljava/util/List;", |ctx, _args| {
-        match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+    r.register(
+        cls,
+        "getLoggerNames",
+        "()Ljava/util/List;",
+        |ctx, _args| match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
             Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
             _ => Ok(Some(Value::Object(None))),
-        }
-    });
+        },
+    );
     r.register(
         cls,
         "getLoggerLevel",
@@ -2344,7 +2582,9 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
     });
     // isVerbose() -- not one of the 6 synthetic fields; matches
     // ClassLoadingMXBean.isVerbose's fixed-sentinel style.
-    r.register(cls, "isVerbose", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(cls, "isVerbose", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     r.set_category(__prev_cat);
 }
 
@@ -2437,7 +2677,6 @@ fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> Clas
         .unwrap_or(ClassId::new(0))
 }
 
-
 fn alloc_basic_thread_info(
     ctx: &mut dyn NativeContext,
     thread_id: i64,
@@ -2496,11 +2735,7 @@ fn alloc_basic_thread_info(
 /// build one ThreadInfo per actually-enumerated live thread (Tomcat's
 /// Diagnostics.getThreadDump() calls dumpAllThreads and greps the result for
 /// connector I/O thread names like "http-nio-...").
-fn alloc_named_thread_info(
-    ctx: &mut dyn NativeContext,
-    thread_id: i64,
-    name: &str,
-) -> ObjectRef {
+fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &str) -> ObjectRef {
     let stack_element_cid = jmx_class_id_or_object(ctx, "java/lang/StackTraceElement");
     let monitor_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/MonitorInfo");
     let lock_info_cid = jmx_class_id_or_object(ctx, "java/lang/management/LockInfo");
@@ -2545,20 +2780,22 @@ fn alloc_named_thread_info(
 /// Java `Thread.tid`. JMX APIs must never silently substitute the main thread
 /// when the requested id is unknown.
 fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<String> {
-    ctx.enumerate_threads(256).into_iter().find_map(|thread_obj| {
-        let id = match ctx.get_field_by_name(thread_obj, "tid") {
-            Value::Long(id) => id,
-            Value::Int(id) => id as i64,
-            _ => return None,
-        };
-        if id != thread_id {
-            return None;
-        }
-        match ctx.get_field_by_name(thread_obj, "name") {
-            Value::Object(Some(name)) => ctx.read_string(name),
-            _ => None,
-        }
-    })
+    ctx.enumerate_threads(256)
+        .into_iter()
+        .find_map(|thread_obj| {
+            let id = match ctx.get_field_by_name(thread_obj, "tid") {
+                Value::Long(id) => id,
+                Value::Int(id) => id as i64,
+                _ => return None,
+            };
+            if id != thread_id {
+                return None;
+            }
+            match ctx.get_field_by_name(thread_obj, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name),
+                _ => None,
+            }
+        })
 }
 
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
@@ -2632,12 +2869,9 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
-    r.register(
-        cls,
-        "isSynchronizerUsageSupported",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    r.register(cls, "isSynchronizerUsageSupported", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     // ES-FAIL-05 — Elasticsearch `HotThreads.initializeRuntimeMonitoring()` (run
     // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`;
     // it was unregistered on the synthetic ThreadMXBean → AbstractMethodError
@@ -3727,6 +3961,31 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
                 Some(b) => b,
                 None => return Err(jmx_instance_not_found(&key)),
             };
+            if key == "java.lang:type=Threading" && op_name == "getThreadInfo" {
+                let thread_id = params
+                    .map(|array| ctx.get_array_element(array, 0))
+                    .and_then(|value| match value {
+                        Value::Long(id) => Some(id),
+                        Value::Int(id) => Some(id as i64),
+                        Value::Object(Some(boxed)) => match ctx
+                            .invoke_virtual(boxed, "longValue", "()J", &[])
+                            .ok()
+                            .flatten()
+                        {
+                            Some(Value::Long(id)) => Some(id),
+                            Some(Value::Int(id)) => Some(id as i64),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or(-1);
+                return ctx.invoke_virtual(
+                    bean,
+                    "getThreadInfo",
+                    "(J)Ljava/lang/management/ThreadInfo;",
+                    &[Value::Long(thread_id)],
+                );
+            }
             // DynamicMBean (e.g. Tomcat modeler's BaseModelMBean, which wraps
             // a real managed resource like HostConfig) exposes operations
             // through its own invoke(String, Object[], String[]) -- that
@@ -3811,6 +4070,14 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
             };
             let key = object_name_key(ctx, name_ref);
             if let Some(bean) = mbs_lookup_bean(ctx, this, &key) {
+                if key == "java.lang:type=Memory" && attr_name == "HeapMemoryUsage" {
+                    return ctx.invoke_virtual(
+                        bean,
+                        "getHeapMemoryUsage",
+                        "()Ljava/lang/management/MemoryUsage;",
+                        &[],
+                    );
+                }
                 // DynamicMBean (e.g. Tomcat's modeler BaseModelMBean / a
                 // RequiredModelMBean) exposes attributes through its own
                 // `getAttribute(String)` rather than JavaBean accessors —
@@ -4356,7 +4623,11 @@ mod jmx_tests {
         register_jmx_natives(&mut r);
         let cls = "javax/management/ObjectName";
         assert!(r
-            .find(cls, "getCanonicalKeyPropertyListString", "()Ljava/lang/String;")
+            .find(
+                cls,
+                "getCanonicalKeyPropertyListString",
+                "()Ljava/lang/String;"
+            )
             .is_some());
         assert!(r.find(cls, "isPattern", "()Z").is_some());
         assert!(r.find(cls, "isDomainPattern", "()Z").is_some());
@@ -4420,29 +4691,90 @@ mod jmx_tests {
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
         );
-        let is_pattern = |ctx: &mut dyn NativeContext, f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult, obj: ObjectRef| {
-            matches!(f(ctx, &[Value::Object(Some(obj))]).unwrap().unwrap(), Value::Int(1))
+        let is_pattern = |ctx: &mut dyn NativeContext,
+                          f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+                          obj: ObjectRef| {
+            matches!(
+                f(ctx, &[Value::Object(Some(obj))]).unwrap().unwrap(),
+                Value::Int(1)
+            )
         };
-        assert!(!is_pattern(&mut ctx, native_object_name_is_pattern, concrete));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, concrete));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_property_pattern, concrete));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, concrete));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_pattern,
+            concrete
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_domain_pattern,
+            concrete
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_property_pattern,
+            concrete
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_property_list_pattern,
+            concrete
+        ));
 
         let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string());
-        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, domain_pattern));
-        assert!(is_pattern(&mut ctx, native_object_name_is_domain_pattern, domain_pattern));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, domain_pattern));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_pattern,
+            domain_pattern
+        ));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_domain_pattern,
+            domain_pattern
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_property_list_pattern,
+            domain_pattern
+        ));
 
         let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
-        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, plist_pattern));
-        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, plist_pattern));
-        assert!(is_pattern(&mut ctx, native_object_name_is_property_list_pattern, plist_pattern));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_domain_pattern, plist_pattern));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_pattern,
+            plist_pattern
+        ));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_property_pattern,
+            plist_pattern
+        ));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_property_list_pattern,
+            plist_pattern
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_domain_pattern,
+            plist_pattern
+        ));
 
         let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string());
-        assert!(is_pattern(&mut ctx, native_object_name_is_pattern, value_pattern));
-        assert!(is_pattern(&mut ctx, native_object_name_is_property_pattern, value_pattern));
-        assert!(!is_pattern(&mut ctx, native_object_name_is_property_list_pattern, value_pattern));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_pattern,
+            value_pattern
+        ));
+        assert!(is_pattern(
+            &mut ctx,
+            native_object_name_is_property_pattern,
+            value_pattern
+        ));
+        assert!(!is_pattern(
+            &mut ctx,
+            native_object_name_is_property_list_pattern,
+            value_pattern
+        ));
     }
 
     #[test]

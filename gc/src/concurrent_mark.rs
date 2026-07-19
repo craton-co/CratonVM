@@ -711,8 +711,7 @@ impl ConcurrentMarker {
         }
 
         for (obj_ptr, total_size) in objects {
-            if !self.bitmap.is_marked(obj_ptr as usize) && eligible.contains(&(obj_ptr as usize))
-            {
+            if !self.bitmap.is_marked(obj_ptr as usize) && eligible.contains(&(obj_ptr as usize)) {
                 freed.push((obj_ptr, total_size));
             }
         }

@@ -13172,6 +13172,23 @@ fn execute_instruction(
             let b = thread.frames[frame_idx].stack.pop()?;
             let a = thread.frames[frame_idx].stack.pop()?;
             let eq = refs_equal(&a, &b);
+            if std::env::var_os("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE").is_some() {
+                let class_name = |value: &Value| match value {
+                    Value::Object(Some(mirror)) => crate::vm::class_id_from_mirror(shared, *mirror)
+                        .and_then(|cid| shared.class_manager.read().get_class(cid)
+                            .map(|c| c.name.to_string()))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let an = class_name(&a);
+                let bn = class_name(&b);
+                if an.contains("ActiveProfilesResolver") || bn.contains("ActiveProfilesResolver") {
+                    eprintln!(
+                        "[ACTIVE-PROFILES-IDENTITY] acmpne a={} b={} equal={}",
+                        an, bn, eq
+                    );
+                }
+            }
             if !eq {
                 thread.frames[frame_idx].pc = branch_target(saved_pc, *offset);
             }
@@ -15499,6 +15516,22 @@ pub(crate) fn proxy_instance_satisfies_target(
         return true;
     }
 
+    // Real generated $ProxyN instances inherit the one-field Proxy.h layout;
+    // their interfaces are declared by the class and are already covered by
+    // the normal hierarchy check at the instanceof/checkcast caller. Slot 1 is
+    // reserved for the synthetic Proxy$Instance's Class[] metadata, so guard
+    // before touching it. The prior code placed this check later, after the
+    // out-of-bounds read it was meant to prevent.
+    let has_iface_slot = shared
+        .class_manager
+        .read()
+        .get_class(obj_class_id)
+        .map(|c| c.num_total_fields >= 2)
+        .unwrap_or(false);
+    if !has_iface_slot {
+        return obj_name == "java/lang/reflect/Proxy$Instance";
+    }
+
     let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
         cratonvm_types::Value::Object(Some(a)) => a,
         _ => {
@@ -16706,7 +16739,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
     name.starts_with("java/")
         || name.starts_with("javax/")
         || name.starts_with("jdk/")
-        || name.starts_with("sun/")
+        || (name.starts_with("sun/") && name != "sun/reflect/misc/Trampoline")
         || name.starts_with("com/sun/")
 }
 
@@ -17102,14 +17135,17 @@ fn resolve_field_ref_loader_aware(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first — identical fast path to `resolve_field_ref`.
-    if let Some(cached) = shared
+    // A field cache entry may have been populated by a loader-blind helper
+    // (verification, JIT metadata, or an earlier legacy path) before this
+    // opcode reaches its loader-aware resolver. Do not trust such an entry
+    // blindly for a user-loader caller: first resolve the symbolic owner in
+    // the caller's initiating-loader namespace, then validate that the cached
+    // declaring class is that owner or one of its actual ancestors.
+    let cached = shared
         .resolution_cache
         .read()
         .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
+        .cloned();
 
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
@@ -17149,6 +17185,16 @@ fn resolve_field_ref_loader_aware(
 
     let field_class_id =
         resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+    if let Some(cached) = cached {
+        let cache_matches_owner = {
+            let cm = shared.class_manager.read();
+            cached.declaring_class_id == field_class_id
+                || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
+        };
+        if cache_matches_owner {
+            return Ok(cached);
+        }
+    }
 
     resolve_field_in_class(
         shared,
@@ -18580,11 +18626,16 @@ fn execute_invoke_kind(
                                 if std::env::var_os("CRATONVM_DBG_A2").is_some() {
                                     let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
                                     if hist.is_empty() {
-                                        eprintln!("[stale-recv] [A2] NO event touches {stale_addr:#x}");
+                                        eprintln!(
+                                            "[stale-recv] [A2] NO event touches {stale_addr:#x}"
+                                        );
                                     } else {
                                         for r in hist {
                                             if r.kind == 0xFF {
-                                                eprintln!("[stale-recv] [A2] seq={} FREE @{:#x}", r.seq, r.addr);
+                                                eprintln!(
+                                                    "[stale-recv] [A2] seq={} FREE @{:#x}",
+                                                    r.seq, r.addr
+                                                );
                                             } else {
                                                 eprintln!("[stale-recv] [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}", r.seq, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size);
                                             }
@@ -20189,10 +20240,7 @@ pub(crate) fn lambda_impl_dispatch_override(
         .read()
         .get(&call_site.proxy_class_id)?;
     let name = &call_site.impl_handle.class_name;
-    lookup_loader_initiated(shared, host, name).filter(|cid| {
-        *cid != ClassId::new(0)
-            && shared.class_manager.read().get_loaded_class_id(name) != Some(*cid)
-    })
+    lookup_loader_initiated(shared, host, name).filter(|cid| *cid != ClassId::new(0))
 }
 
 /// Try to run a concrete default method declared by a lambda proxy's
@@ -24144,27 +24192,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-        // ClassLoader resource methods have the same issue: real JDK bytecode
-        // walks URLClassPath state which CratonVM intentionally replaces with
-        // native per-loader lookups.  Keep the singular, stream, and bulk
-        // methods together so URLClassLoader instances do not fall back to the
-        // process-wide dynamic classpath (which leaks resources between test
-        // loaders) and null arguments retain their specified NPE contract.
-        if class_name == "java/lang/ClassLoader"
-            && matches!(
-                method_name,
-                "getResource"
-                    | "getSystemResource"
-                    | "getResources"
-                    | "getSystemResources"
-                    | "getResourceAsStream"
-                    | "getSystemResourceAsStream"
-            )
-        {
-            return true;
-        }
+    // ClassLoader resource methods have the same issue: real JDK bytecode
+    // walks URLClassPath state which CratonVM intentionally replaces with
+    // native per-loader lookups.  Keep the singular, stream, and bulk
+    // methods together so URLClassLoader instances do not fall back to the
+    // process-wide dynamic classpath (which leaks resources between test
+    // loaders) and null arguments retain their specified NPE contract.
+    if class_name == "java/lang/ClassLoader"
+        && matches!(
+            method_name,
+            "getResource"
+                | "getSystemResource"
+                | "getResources"
+                | "getSystemResources"
+                | "getResourceAsStream"
+                | "getSystemResourceAsStream"
+        )
+    {
+        return true;
+    }
 
-        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25477,13 +25525,20 @@ fn intercept_force_registered_native(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
             if let Some(value) = result {
@@ -25620,13 +25675,20 @@ fn intercept_force_registered_native_cached(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         let ret_type = crate::jit::return_type(method_descriptor);
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -25881,8 +25943,14 @@ fn intercept_classloader_subclass_resource_native(
         || !matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         return None;
@@ -26992,6 +27060,19 @@ fn execute_invokestatic(
         }
     });
 
+    if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+        && (method_class_name.contains("SpringFactoriesLoader")
+            || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
+            || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
+    {
+        let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let resolved_loader = static_dispatch_class_id
+            .and_then(|id| shared.class_manager.read().get_loader_id(id));
+        eprintln!(
+            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?}",
+            method_class_name, method_name, current_class_id, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader
+        );
+    }
     if !is_native {
         let target_class_id = if let Some(id) = static_dispatch_class_id {
             id
@@ -28854,7 +28935,10 @@ fn compile_osr_artifact(
                                 let cm_lock = shared.class_manager.read();
                                 match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
                                     (Some(accessor), Some(target)) => {
-                                        crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                        crate::classloading::access_control::check_class_access(
+                                            accessor, target,
+                                        )
+                                        .is_ok()
                                     }
                                     _ => true,
                                 }
@@ -28866,7 +28950,13 @@ fn compile_osr_artifact(
                                     .get_class(target_id)
                                     .map(|c| c.num_total_fields)
                                     .unwrap_or(0);
-                                new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                                new_info2.push((
+                                    pc_new,
+                                    target_id.as_u32(),
+                                    num_fields,
+                                    true,
+                                    true,
+                                ));
                             } else {
                                 new_info2.push((pc_new, 0, 0, true, true));
                             }

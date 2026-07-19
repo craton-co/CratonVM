@@ -150,6 +150,8 @@ fn violation(what: &str, addr: usize) {
         let bt = std::backtrace::Backtrace::force_capture();
         eprintln!("[blocked-access] {msg}\n{bt}");
     } else if n == REPORT_CAP {
-        eprintln!("[blocked-access] report cap ({REPORT_CAP}) reached; suppressing further reports");
+        eprintln!(
+            "[blocked-access] report cap ({REPORT_CAP}) reached; suppressing further reports"
+        );
     }
 }

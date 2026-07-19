@@ -4115,6 +4115,13 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
     // silently breaking the equals/hashCode contract.
     let h = match ctx.invoke_virtual(key, "hashCode", "()I", &[])? {
         Some(Value::Int(v)) => v,
+        // A generated dynamic proxy surfaces its InvocationHandler's boxed
+        // Integer at this native boundary. Match Java bytecode's immediate
+        // unboxing so equal proxies are assigned to the same HashMap bucket.
+        Some(Value::Object(Some(obj))) => match unbox_wrapper(ctx, obj) {
+            Some(Value::Int(v)) => v,
+            _ => ctx.identity_hash_code(key),
+        },
         _ => ctx.identity_hash_code(key),
     };
     Ok(h ^ ((h as u32) >> 16) as i32)
@@ -4252,6 +4259,14 @@ fn map_keys_equal(
     }
     match res? {
         Some(Value::Int(v)) => Ok(v != 0),
+        // Generated dynamic proxies return their InvocationHandler's boxed
+        // Boolean result at the native boundary. Java bytecode immediately
+        // unboxes that value for an equals()Z call; native HashMap must do the
+        // same so structurally equal proxy keys replace rather than duplicate.
+        Some(Value::Object(Some(obj))) => match unbox_wrapper(ctx, obj) {
+            Some(Value::Int(v)) => Ok(v != 0),
+            _ => Ok(false),
+        },
         _ => Ok(false),
     }
 }
@@ -8377,18 +8392,14 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let mut source = source;
             let mut key = key;
             let mut want_val = want_val;
-            let has_key = match ctx.invoke_virtual(
-                source,
-                "containsKey",
-                "(Ljava/lang/Object;)Z",
-                &[key],
-            ) {
-                Ok(v) => matches!(v, Some(Value::Int(1))),
-                Err(e) => {
-                    ctx.unpin_native_roots(src_pin);
-                    return Err(e);
-                }
-            };
+            let has_key =
+                match ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[key]) {
+                    Ok(v) => matches!(v, Some(Value::Int(1))),
+                    Err(e) => {
+                        ctx.unpin_native_roots(src_pin);
+                        return Err(e);
+                    }
+                };
             source = ctx.read_native_pin(src_pin, source);
             key = read_pinned_elem(ctx, kh, key);
             want_val = read_pinned_elem(ctx, wh, want_val);
@@ -9814,8 +9825,16 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let (_, elem_handles) = pin_value_slice(ctx, &items);
     let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
     let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
-        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
         // JDK natural-order sorting probes the right run against the left
@@ -9830,7 +9849,11 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
     for (out, slot) in idx.iter().enumerate() {
-        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let i = if let Value::Int(v) = slot {
+            *v as usize
+        } else {
+            0
+        };
         let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
         ctx.set_array_element(arr, out, val);
     }
@@ -9905,8 +9928,14 @@ fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Opt
 fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
     let cid = ctx.class_id_of_object(obj);
     ctx.class_name_of_id(cid)
-        .or_else(|| ctx.lambda_proxy_host(cid).map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32())))
-        .or_else(|| ctx.lambda_functional_interface(cid).map(|iface| format!("lambda implementing {iface}")))
+        .or_else(|| {
+            ctx.lambda_proxy_host(cid)
+                .map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32()))
+        })
+        .or_else(|| {
+            ctx.lambda_functional_interface(cid)
+                .map(|iface| format!("lambda implementing {iface}"))
+        })
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
@@ -10285,8 +10314,16 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let (_, elem_handles) = pin_value_slice(ctx, &items);
     let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
     let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
-        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
         // See Arrays.sort(Object[]) above: retain the JDK's right-vs-left
@@ -10299,7 +10336,11 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     let data = ctx.read_native_pin(data_pin, data);
     for (out, slot) in idx.iter().enumerate() {
-        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let i = if let Value::Int(v) = slot {
+            *v as usize
+        } else {
+            0
+        };
         let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
         ctx.set_array_element(data, out, val);
     }
@@ -10366,8 +10407,8 @@ fn ensure_collections_empty_singletons(
     // (synthetic-jdk mode), preserving the old behaviour there.
     if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_LIST") {
         if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
-            let list = alloc_real_jdk(ctx, "java/util/Collections$EmptyList")
-                .unwrap_or_else(|| {
+            let list =
+                alloc_real_jdk(ctx, "java/util/Collections$EmptyList").unwrap_or_else(|| {
                     let __al_n_fields = al_slots(ctx).2;
                     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
                     let arr = alloc_ref_array(ctx, 0);
@@ -12760,7 +12801,7 @@ fn stream_process_chain(
                             }
                             cur = r.unwrap_or(Value::Object(None));
                             cur_pin = pin_value(ctx, cur);
-                        },
+                        }
                         Err(e) if is_placeholder_object_class_cast(ctx, cur, &e) => {
                             // SPR-AOT-JUNIT-URI.1 (2026-07-08) - JUnit suite
                             // discovery can leak a raw Object placeholder into
@@ -13032,8 +13073,16 @@ fn stream_pull_synthetic_downstream(
             let stream_cur = ctx.read_native_pin(stream_pin, stream);
             let empty = alloc_ref_array(ctx, 0);
             let stream_cur = ctx.read_native_pin(stream_pin, stream);
-            ctx.set_field(stream_cur, STREAM_FIELD_ELEMENTS, Value::Object(Some(empty)));
-            ctx.set_field(stream_cur, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            ctx.set_field(
+                stream_cur,
+                STREAM_FIELD_ELEMENTS,
+                Value::Object(Some(empty)),
+            );
+            ctx.set_field(
+                stream_cur,
+                STREAM_FIELD_LAZY_SPLITERATOR,
+                Value::Object(None),
+            );
             return Ok(if downstream_stopped {
                 PullStep::Stop
             } else {
@@ -13307,10 +13356,8 @@ fn native_stream_chain_collector_accept(
     }
 
     // SAFETY: see `SpliteratorPullFrame::emit`'s doc comment above.
-    let emit: &mut dyn FnMut(
-        &mut dyn NativeContext,
-        Value,
-    ) -> Result<PullStep, MethodCallFailed> = unsafe { &mut *emit_ptr };
+    let emit: &mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
+        unsafe { &mut *emit_ptr };
     let outcome = stream_process_chain(ctx, elem, &chain, &chain_pins, 0, &mut state, emit);
 
     SPLITERATOR_PULL_STACK.with(|s| {
@@ -13363,10 +13410,14 @@ fn drain_spliterator_inline(
     // (short) lifetime, then transmute away the lifetime so it fits the
     // frame's (unbounded) field type -- mirrors `ChmMonitorGuard::acquire`'s
     // `&mut dyn NativeContext` lifetime-erasure a few hundred lines above.
-    let emit_raw: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
-        emit;
-    let emit_ptr: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
-        unsafe { core::mem::transmute(emit_raw) };
+    let emit_raw: *mut dyn FnMut(
+        &mut dyn NativeContext,
+        Value,
+    ) -> Result<PullStep, MethodCallFailed> = emit;
+    let emit_ptr: *mut dyn FnMut(
+        &mut dyn NativeContext,
+        Value,
+    ) -> Result<PullStep, MethodCallFailed> = unsafe { core::mem::transmute(emit_raw) };
     let guard = PullFrameGuard::push(SpliteratorPullFrame {
         chain: chain.to_vec(),
         chain_pins: chain_pins.to_vec(),
@@ -15115,47 +15166,47 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // drives a still-lazy source inline through the chain via
     // `stream_pull_internal`.
     if !stream_has_chain(ctx, this) {
-    if let Some(spl) = stream_lazy_spliterator(ctx, this) {
-        // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
-        // element and can trigger a moving GC that relocates `this`; the
-        // trailing `set_field(this, ...)` after the loop was reading the
-        // stale address captured at function entry. Pin `this` alongside
-        // `spl`/`consumer` and re-read it before that final use. Confirmed
-        // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
-        // ServiceLoader stream draining -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
-        let this_pin = ctx.pin_native_root(this);
-        let spl_pin = ctx.pin_native_root(spl);
-        let con_pin = ctx.pin_native_root(consumer);
-        const SAFETY_CAP: usize = 1_000_000;
-        let mut n = 0usize;
-        let result = loop {
-            let s = ctx.read_native_pin(spl_pin, spl);
-            let c = ctx.read_native_pin(con_pin, consumer);
-            match ctx.invoke_virtual(
-                s,
-                "tryAdvance",
-                "(Ljava/util/function/Consumer;)Z",
-                &[Value::Object(Some(c))],
-            ) {
-                Ok(Some(Value::Int(v))) if v != 0 => {
-                    n += 1;
-                    if n >= SAFETY_CAP {
-                        break Ok(None);
+        if let Some(spl) = stream_lazy_spliterator(ctx, this) {
+            // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
+            // element and can trigger a moving GC that relocates `this`; the
+            // trailing `set_field(this, ...)` after the loop was reading the
+            // stale address captured at function entry. Pin `this` alongside
+            // `spl`/`consumer` and re-read it before that final use. Confirmed
+            // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
+            // ServiceLoader stream draining -- see
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let this_pin = ctx.pin_native_root(this);
+            let spl_pin = ctx.pin_native_root(spl);
+            let con_pin = ctx.pin_native_root(consumer);
+            const SAFETY_CAP: usize = 1_000_000;
+            let mut n = 0usize;
+            let result = loop {
+                let s = ctx.read_native_pin(spl_pin, spl);
+                let c = ctx.read_native_pin(con_pin, consumer);
+                match ctx.invoke_virtual(
+                    s,
+                    "tryAdvance",
+                    "(Ljava/util/function/Consumer;)Z",
+                    &[Value::Object(Some(c))],
+                ) {
+                    Ok(Some(Value::Int(v))) if v != 0 => {
+                        n += 1;
+                        if n >= SAFETY_CAP {
+                            break Ok(None);
+                        }
                     }
+                    Ok(_) => break Ok(None),
+                    Err(e) => break Err(e),
                 }
-                Ok(_) => break Ok(None),
-                Err(e) => break Err(e),
-            }
-        };
-        let this = ctx.read_native_pin(this_pin, this);
-        ctx.unpin_native_roots(this_pin);
-        ctx.unpin_native_roots(spl_pin);
-        ctx.unpin_native_roots(con_pin);
-        // Mark consumed so a (illegal) second terminal sees an empty stream.
-        ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
-        return result;
-    }
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
+            ctx.unpin_native_roots(spl_pin);
+            ctx.unpin_native_roots(con_pin);
+            // Mark consumed so a (illegal) second terminal sees an empty stream.
+            ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            return result;
+        }
     }
     let elements = stream_elements(ctx, this)?;
     // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
@@ -23285,7 +23336,11 @@ fn ll_pinned_find(
     let mut this = this;
     let mut target = target;
     let start_field = if from_tail { "tail" } else { "head" };
-    let step_slot = if from_tail { LL_NODE_PREV } else { LL_NODE_NEXT };
+    let step_slot = if from_tail {
+        LL_NODE_PREV
+    } else {
+        LL_NODE_NEXT
+    };
     let mut cur_opt = match ll_get(ctx, this, start_field) {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -29581,15 +29636,16 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // `this`/`data`/`key` (shadowed here) instead of the pre-search copies
     // above; `key`'s own staleness (not just `this`/`data`) was the actual
     // root cause of the residual panics that survived the earlier fix.
-    let (search, mut this, data, key) = match tm_binary_search(ctx, this, data, size, &comparator, &key) {
-        Ok(t) => t,
-        Err(e) => {
-            if pin_base != usize::MAX {
-                ctx.unpin_native_roots(pin_base);
+    let (search, mut this, data, key) =
+        match tm_binary_search(ctx, this, data, size, &comparator, &key) {
+            Ok(t) => t,
+            Err(e) => {
+                if pin_base != usize::MAX {
+                    ctx.unpin_native_roots(pin_base);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     let value = read_pinned_elem(ctx, vh0, value);
     let result = match search {
         Ok(idx) => {

@@ -1543,8 +1543,7 @@ fn run() -> Result<()> {
     #[cfg(feature = "gpu")]
     {
         if args.print_gpu_decisions {
-            env_filter =
-                env_filter.add_directive("cratonvm_vm::runtime::offload=debug".parse()?);
+            env_filter = env_filter.add_directive("cratonvm_vm::runtime::offload=debug".parse()?);
         }
     }
 

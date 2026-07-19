@@ -22618,8 +22618,37 @@ fn spring_class_utils_for_name_impl(
     // BOOT-INF/lib fat-jars) and carries the LaunchedURLClassLoader rescue that
     // routing through `loadClass` would lose; its inner-class retry also covers
     // the Spring-Boot `a.b.Outer.Factory` → `a/b/Outer$Factory` factory names.
-    if let Some(Value::Object(Some(loader))) = args.get(1) {
-        let loader = *loader;
+    // ClassUtils.forName's real bytecode substitutes a null classLoader
+    // argument with ClassUtils.getDefaultClassLoader() (the thread context
+    // classloader, falling back only if that is itself null) BEFORE calling
+    // Class.forName -- but this native shim intercepts the call before that
+    // substitution ever runs, so a caller that deliberately passes null
+    // (e.g. Spring's SpringFactoriesLoader: AotServices.factories() builds
+    // one with a permanently-null this.classLoader field, used by every
+    // AOT TestRuntimeHintsRegistrar / BeanFactoryInitializationAotProcessor
+    // SPI lookup) silently fell through to the loader-blind global scanner
+    // below instead of the caller's actual thread-context loader. Under
+    // @CompileWithForkedClassLoader this always resolved an SPI
+    // implementation class (e.g. StandardTestRuntimeHints) to the stale
+    // app-loaded copy instead of the fork's own redefinition, breaking
+    // downstream identity checks (RuntimeHints predicates keyed off the
+    // fork-loaded literal Class object).
+    let explicit_loader = match args.get(1) {
+        Some(Value::Object(Some(loader))) => Some(*loader),
+        _ => match ctx.invoke("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", &[]) {
+            Ok(Some(Value::Object(Some(t)))) => match ctx.invoke(
+                "java/lang/Thread",
+                "getContextClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[Value::Object(Some(t))],
+            ) {
+                Ok(Some(Value::Object(Some(tcl)))) => Some(tcl),
+                _ => None,
+            },
+            _ => None,
+        },
+    };
+    if let Some(loader) = explicit_loader {
         if crate::classloader::is_user_defined_loader(ctx, loader) {
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
                 crate::lang_class::native_class_for_name(
@@ -65662,20 +65691,8 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // Introspector
+    // Introspector cache-management methods retain their bridge implementations.
     let intro = "java/beans/Introspector";
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
         // Introspector caches BeanInfo per Class. Our implementation doesn't cache
         // anything — each call walks the class freshly — so there's nothing to flush.
@@ -65973,6 +65990,20 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
+    // The two-argument overload is getBeanInfo(beanClass, stopClass). The
+    // native used to discard stopClass and always walked through Object, which
+    // made it expose inherited Object properties and methods despite the JDK
+    // contract. Spring's standard property resolver uses this overload.
+    let stop_class_id = match args.get(1) {
+        Some(Value::Object(Some(stop_mirror))) => {
+            let stop_pin = ctx.pin_native_root(*stop_mirror);
+            let id = crate::lang_class::mirror_class_id(ctx, *stop_mirror);
+            ctx.unpin_native_roots(stop_pin);
+            id
+        }
+        _ => None,
+    };
+
     // Discover properties from getters/setters across the class + superclasses,
     // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
     // JDK java.beans.Introspector property-merge rules that the Tomcat suite
@@ -66059,6 +66090,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
+        if Some(cid) == stop_class_id {
+            break;
+        }
         scan_cids.push(cid);
         sc = if ctx.is_interface_class(cid) {
             None
@@ -66321,7 +66355,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Object member) when introspecting a bare interface type — see the
     // `is_interface_class` gate on `scan_cids` above for the matching
     // rationale.
-    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
+    if stop_class_id.is_none()
+        && !ctx.is_interface_class(class_id)
+        && !properties.iter().any(|(n, ..)| n == "class")
+    {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             // Re-read from the pin: the discovery scan above (and the failed

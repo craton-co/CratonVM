@@ -2145,9 +2145,8 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                     set_jit_pending_exception(exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
-                    let msg = format!(
-                        "JIT new class_id {class_id_raw} failed to initialize: {vm_err}"
-                    );
+                    let msg =
+                        format!("JIT new class_id {class_id_raw} failed to initialize: {vm_err}");
                     if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                         vm,
                         thread,
@@ -4220,9 +4219,7 @@ array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags=
 forwarding_ptr={fwd_ptr:#x}"
             );
         } else {
-            eprintln!(
-                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL"
-            );
+            eprintln!("[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL");
         }
     }
     JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
@@ -4817,8 +4814,14 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -6179,8 +6182,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -6279,15 +6288,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        if let Some(callback) = vm.native_methods.find(
-            "java/lang/ClassLoader",
-            info.method_name,
-            info.descriptor,
-        ) {
+        if let Some(callback) =
+            vm.native_methods
+                .find("java/lang/ClassLoader", info.method_name, info.descriptor)
+        {
             let values = decode_values();
             return match crate::vm::safe_native_call(vm, thread, callback, &values) {
                 Ok(Some(Value::Int(v))) => v as i64,

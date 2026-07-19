@@ -1340,7 +1340,11 @@ impl NativeContext for MockNativeContext {
         mock_undertow_exchange_field_slot(Some(class_name), field_name)
     }
 
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
     }
 
@@ -1716,7 +1720,10 @@ impl NativeContext for MockNativeContext {
     fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
         // SAFETY: single-threaded test code.
         let overrides = unsafe { &*self.inner_classes_override.get() };
-        overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {

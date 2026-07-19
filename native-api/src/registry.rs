@@ -926,7 +926,8 @@ pub trait NativeContext {
     /// third-party object whose class gets redefined under a fresh loader
     /// each time, such as ByteBuddy classes under
     /// `@CompileWithForkedClassLoader`).
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize>;
+    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str)
+        -> Option<usize>;
 
     /// Read `out.len()` bytes of native memory at `addr` into `out`.
     ///
