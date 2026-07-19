@@ -13152,6 +13152,8 @@ pub(crate) fn pbkdf2_derive_for(
     match prf {
         1 => pbkdf2_derive::<sha1::Sha1>(pw, salt, iters, dklen),
         224 => pbkdf2_derive::<sha2::Sha224>(pw, salt, iters, dklen),
+        384 => pbkdf2_derive::<sha2::Sha384>(pw, salt, iters, dklen),
+        512 => pbkdf2_derive::<sha2::Sha512>(pw, salt, iters, dklen),
         _ => pbkdf2_derive::<sha2::Sha256>(pw, salt, iters, dklen),
     }
 }
