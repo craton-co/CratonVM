@@ -2189,6 +2189,51 @@ tied to the `@CompileWithForkedClassLoader` fork-loader path used only by that A
 still open, not further investigated here; see §2's `TestContextAotGeneratorIntegrationTests`
 entry for the original finding.
 
+**2026-07-19 addendum (separate session) -- attempted to reproduce this residual and
+processAheadOfTimeWithBasicTests' QDox parser NPE together; BOTH remain unconfirmed, blocked
+before reaching either bug.** Set up a from-scratch `spring-orm`+`spring-test` real-JDK-25
+classpath and ran `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithXmlTests` and
+`.processAheadOfTimeWithBasicTests` directly. Both hung for 15-20+ minutes with zero stdout
+progress; gdb stack sampling (several samples per process, minutes apart, showing genuinely
+different call sites each time -- not a stuck/cyclic loop) traced this to Spring's own context
+bootstrap pulling in Hibernate Validator, whose `Validation.buildDefaultValidatorFactory()`
+constraint-metadata introspection is severely slow on CratonVM. Isolated with a minimal,
+Spring-free standalone repro (`HibernateValidatorProbe.java`: just
+`Validation.buildDefaultValidatorFactory()` + `validator.validate(bean)`, no AOT/fork-loader
+involved at all) -- HotSpot completes it in 545ms; CratonVM was still running after 6+ minutes.
+
+Found and fixed one real, independent contributing bug along the way: `native-builtins/src/lib.rs`'s
+`native_object_hash_code`/`native_object_equals`/`native_object_clone` (backing
+`Object`'s default hashCode()/equals()/clone()) each had an UNGUARDED
+`std::env::var_os("CRATONVM_DBG_*")` call directly on the hot path -- a global-lock syscall paid
+on every single call, not just when the flag is set. These are among the hottest natives in the
+VM (every default-identity `HashMap`/`HashSet` operation dispatches through them), and
+Hibernate Validator's own metadata caching is exactly this kind of Map-heavy code. Fixed with the
+same cached-`OnceLock<bool>` pattern this file already uses elsewhere (`route_ec_to_real`) --
+notably, `vm/src/runtime/env_cache.rs` already has a correctly-cached accessor for this exact
+`CRATONVM_DBG_VDISP` flag (`dbg_vdisp()`, whose own doc comment warns "must not call into the
+process environment on every dispatch") but `native-builtins` cannot depend on the `vm` crate,
+so this particular copy of the check was never migrated. Landed on `dev` at `e76f8ea21`.
+
+**This fix alone does NOT resolve the overall slowness.** Repeated gdb sampling after the fix
+still showed the `HibernateValidatorProbe` repro taking 6+ minutes and climbing, cycling through
+a wide variety of different interpreter-dispatch and `HashMap`-lookup call sites each sample --
+confirmed genuine, broadly-distributed interpreter throughput overhead on this reflection-heavy
+bootstrap workload, not a single discrete bug, matching the same "interpreter throughput, not a
+correctness bug" category already documented elsewhere in this doc (e.g.
+`BeanRegistrationsAotContributionTests`). Out of scope to fix comprehensively in this session.
+
+**Net result: neither the original `GroovySystem.<clinit>` `ArrayStoreException` (this entry)
+nor the QDox `Parser.yylex` NPE (`processAheadOfTimeWithBasicTests`, tracked in §2) was actually
+reached or tested this session** -- both remain exactly as open/unconfirmed as before this
+addendum. A future session needs either (a) much longer timeouts (an hour or more per test
+method may be required at current throughput), or (b) a way to bypass/short-circuit Hibernate
+Validator's bootstrap in the repro classpath (e.g. omit `hibernate-validator`/`jakarta.el` from
+the test classpath if the specific test method doesn't actually require JSR-303 validation, or
+target the Groovy/QDox code paths with a narrower, purpose-built repro that never touches
+`PersistenceAnnotationBeanPostProcessor`-style validator-bootstrapping infrastructure) to actually
+reach and test the Groovy- and QDox-specific code once past this bottleneck.
+
 **Real root cause (found via a from-scratch investigation, not the originally-hypothesized
 `ArrayStoreException`/`ATNConfig` leads -- both explicitly ruled out; see below):**
 `native-builtins/src/lib.rs` registered `java/util/ArrayList$ListItr`'s `set(Object)`,
