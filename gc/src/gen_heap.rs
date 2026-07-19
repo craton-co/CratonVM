@@ -2173,10 +2173,15 @@ impl GenerationalHeap {
                 }
             } // end rate-limited OOB-read diagnostics
             // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
-            // unconditional backtrace for the specific shape seen in the
-            // known-issues residual logs (index 4/5, zero-slot receiver) —
-            // rare enough that this doesn't need the OOB_DIAG_CAP treatment.
-            if num_slots == 0 && (index == 4 || index == 5) {
+            // unconditional backtrace for the zero-slot-receiver shape seen in
+            // the known-issues residual logs — confirmed (2026-07-19) to
+            // occur ONLY within the exact failing parameterization's test
+            // case in every repro sample checked (zero occurrences in the
+            // preceding passing cases of the same class), so this is NOT the
+            // benign high-frequency case (B) the OOB_DIAG_CAP above guards
+            // against — widened from the original index-4/5-only guess to
+            // any index once indices 0/1/3 were also observed correlating.
+            if num_slots == 0 {
                 let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
                     .map(|(n, _)| n)
                     .unwrap_or_else(|| "<unresolved>".to_string());
@@ -2402,7 +2407,7 @@ impl GenerationalHeap {
             }
             // RESID-DIAG (dohead residuals investigation, 20260718): see the
             // matching comment in get_field's OOB guard above.
-            if num_slots == 0 && (index == 4 || index == 5) {
+            if num_slots == 0 {
                 eprintln!(
                     "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
                     obj_ref.as_ptr(),
