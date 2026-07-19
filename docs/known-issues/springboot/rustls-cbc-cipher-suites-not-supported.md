@@ -76,3 +76,36 @@ elsewhere) rather than a bug to fix.
 Any other Spring Boot (or general) test that requests a CBC-only cipher list
 against CratonVM's rustls-backed TLS engine will hit the identical failure
 shape.
+
+## Feasibility re-assessment (2026-07-19, second pass)
+
+Re-checked whether this is worth implementing rather than accepting as a
+permanent gap, specifically whether rustls 0.23's pluggable
+`CryptoProvider`/custom-`SupportedCipherSuite` API could add a CBC suite
+*without* forking rustls itself (the crate's cipher-suite construction
+traits — `Tls12CipherSuite`, `MessageEncrypter`/`MessageDecrypter` — are
+public, so a from-scratch suite implementation registered into a custom
+provider is structurally possible).
+
+**Conclusion: not attempting it.** Two independent reasons, either one
+sufficient on its own:
+
+1. **Security risk, not just effort.** Implementing CBC-mode TLS record
+   encryption/decryption correctly requires a constant-time MAC-then-decrypt
+   verification to avoid a Lucky13-style padding-oracle timing side channel
+   — precisely the class of bug that is the documented reason rustls's
+   maintainers refuse to support CBC suites at all, in either of their
+   crypto providers (`ring`/`aws-lc-rs`). Writing this by hand risks
+   introducing a real, exploitable timing vulnerability, not a cosmetic
+   gap — this codebase's own guidance is to avoid introducing exactly this
+   category of defect, not trade a test failure for one.
+2. **Same-shape precedent already settled here.** [[reference_rustls_no_dhe_support]]
+   is the sibling gap (classic DHE key exchange, also permanently excluded
+   by rustls) and was already investigated and accepted as a permanent
+   limitation rather than worked around, for the same "would need a direct
+   OpenSSL binding as a new TLS backend, a substantial separate
+   undertaking" reason. Nothing about CBC changes that calculus — if
+   anything the security argument above makes it a stronger no than DHE's.
+
+Not pursued further without explicit user sign-off given the security
+tradeoff involved; flagged back rather than silently attempted.

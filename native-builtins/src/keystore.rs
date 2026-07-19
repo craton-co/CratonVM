@@ -617,6 +617,61 @@ fn decrypt_secret_pbes2(epk: &p12::EncryptedPrivateKeyInfo, password: &[u8]) -> 
     decrypt_pbes2_params(algorithm.params.as_deref()?, &epk.encrypted_data, password)
 }
 
+/// Extend a PKCS#12 key entry's cert chain past its leaf by X.509 issuer/
+/// subject matching: repeatedly take the last cert in `chain`, look for
+/// another loaded cert (in either `certs_by_local_id` or `orphan_certs`)
+/// whose subject DN equals that cert's issuer DN, and append it. Stops when
+/// no match is found, the last cert is self-signed (a root), or after a
+/// generous hop cap (real chains are a handful of certs deep; this only
+/// guards against a malformed/cyclic file spinning forever). Matched certs
+/// are removed from their source pool so they end up in exactly one chain,
+/// not also flushed later as a standalone `TrustedCert` alias.
+fn extend_chain_by_issuer(
+    chain: &mut Vec<Vec<u8>>,
+    certs_by_local_id: &mut IndexMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>>,
+    orphan_certs: &mut Vec<(Option<String>, Vec<u8>)>,
+) {
+    const MAX_HOPS: usize = 16;
+    for _ in 0..MAX_HOPS {
+        let Some(last) = chain.last() else { break };
+        let Ok(last_parsed) = crate::x509_manager::parse_certificate(last) else {
+            break;
+        };
+        if last_parsed.issuer_der == last_parsed.subject_der {
+            break; // self-signed root; nothing more to append.
+        }
+
+        // Search orphan_certs first (the common case: a shared/reused CA
+        // cert with no localKeyId of its own), then any remaining
+        // local-id-keyed groups.
+        let mut found: Option<Vec<u8>> = None;
+        if let Some(pos) = orphan_certs.iter().position(|(_, der)| {
+            crate::x509_manager::parse_certificate(der)
+                .map(|p| p.subject_der == last_parsed.issuer_der)
+                .unwrap_or(false)
+        }) {
+            found = Some(orphan_certs.remove(pos).1);
+        } else {
+            'outer: for group in certs_by_local_id.values_mut() {
+                if let Some(pos) = group.iter().position(|(_, der)| {
+                    crate::x509_manager::parse_certificate(der)
+                        .map(|p| p.subject_der == last_parsed.issuer_der)
+                        .unwrap_or(false)
+                }) {
+                    found = Some(group.remove(pos).1);
+                    break 'outer;
+                }
+            }
+        }
+
+        match found {
+            Some(der) => chain.push(der),
+            None => break,
+        }
+    }
+    certs_by_local_id.retain(|_, group| !group.is_empty());
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     load_pkcs12_ex(bytes, password, true)
 }
@@ -688,17 +743,34 @@ pub(crate) fn load_pkcs12_ex(
                 } else {
                     None
                 };
-                if let Some(key_der) = legacy.or(pbes2) {
-                    keys_by_local_id
-                        .entry(local_id.clone())
-                        .or_insert((friendly, key_der));
-                } else {
-                    // A PKCS#12 key bag may use a distinct entry password.
-                    // Loading the store with its integrity password must still
-                    // expose certificate/trust-store entries; SunPKCS12 only
-                    // asks for the entry password later through getKey().
-                    tracing::debug!(target: "keystore", "deferring separately protected PKCS#12 key bag");
-                }
+                // A PKCS#12 key bag may use a distinct entry password from the
+                // store's own load/integrity password (SunPKCS12 only asks for
+                // the entry password later, through `getKey()`). Real-JDK still
+                // structurally registers the entry as a `PrivateKeyEntry` with
+                // its full cert chain in that case -- `isKeyEntry()`/
+                // `getCertificateChain()` work without ever decrypting the key,
+                // and `getKey()` simply throws `UnrecoverableKeyException` later
+                // if the password is wrong. Losing that structure here (by
+                // dropping the bag out of `keys_by_local_id` entirely) broke
+                // `SslInfo`/`SslMeterBinder`'s chain enumeration: the leaf cert
+                // and its issuer chain fell through to the loose-cert-bags flush
+                // below and got split into one bogus alias per certificate
+                // instead of one `PrivateKeyEntry` alias with an N-cert chain.
+                // Mirror the JKS loader's `jks_recover_key(...).unwrap_or(enc_key)`
+                // pattern: keep the entry, just with the still-encrypted DER as
+                // a placeholder key_der (re-serialized via `EncryptedPrivateKeyInfo
+                // ::write`), so alias/chain pairing proceeds identically to a
+                // successful decrypt.
+                let key_der = legacy.or(pbes2).unwrap_or_else(|| {
+                    tracing::debug!(
+                        target: "keystore",
+                        "deferring separately protected PKCS#12 key bag (kept as encrypted placeholder)"
+                    );
+                    yasna::construct_der(|w| epk.write(w))
+                });
+                keys_by_local_id
+                    .entry(local_id.clone())
+                    .or_insert((friendly, key_der));
             }
             p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) => {
                 if local_id.is_empty() {
@@ -778,7 +850,16 @@ pub(crate) fn load_pkcs12_ex(
         );
     }
 
-    // Pair keys with their cert chains.
+    // Pair keys with their cert chains. Only the leaf cert typically shares
+    // the key's `localKeyId` -- SunPKCS12 builds the REST of the chain by
+    // repeatedly matching each cert's issuer DN against another loaded
+    // cert's subject DN (real X.509 chain-building), not by `localKeyId`.
+    // Without this, a multi-cert chain (leaf + intermediate + root) only
+    // ever surfaced its leaf here, and the unclaimed issuer certs fell
+    // through to the loose-cert-bag flush below as spurious standalone
+    // aliases (named by their subject DN, e.g. "CN=ca") instead of being
+    // part of this entry's chain -- see `SslMeterBinderTests`'s gauge-count
+    // residual (module/spring-boot-micrometer-metrics).
     for (local_id, (key_friendly, key_der)) in keys_by_local_id {
         let mut chain: Vec<Vec<u8>> = Vec::new();
         let mut chain_friendly: Option<String> = None;
@@ -790,6 +871,7 @@ pub(crate) fn load_pkcs12_ex(
                 chain.push(der);
             }
         }
+        extend_chain_by_issuer(&mut chain, &mut certs_by_local_id, &mut orphan_certs);
 
         let alias = key_friendly.or(chain_friendly).unwrap_or_else(|| {
             // Fallback: use the hex of the localKeyId, like keytool does
