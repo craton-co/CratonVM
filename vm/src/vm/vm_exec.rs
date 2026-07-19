@@ -6829,8 +6829,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // made from within a `synchronized` region never executes its
                 // `monitorexit` bytecode — sweep anything it still holds so no
                 // future locker waits forever (see
-                // `MonitorTable::release_monitors_held_by`).
-                shared_arc.monitors.release_monitors_held_by(tid);
+                // `MonitorTable::release_monitors_held_by`). Exclude
+                // `term_monitor`: this thread deliberately still owns it here
+                // so the notify below can wake `Thread.join()` waiters — the
+                // blanket sweep must not force-release it first, or the
+                // notify silently no-ops as `NotOwner` (lost-wakeup bug, see
+                // `release_monitors_held_by_except`'s doc comment).
+                shared_arc
+                    .monitors
+                    .release_monitors_held_by_except(tid, term_monitor.as_ref());
             });
 
             if let Some(monitor) = term_monitor {

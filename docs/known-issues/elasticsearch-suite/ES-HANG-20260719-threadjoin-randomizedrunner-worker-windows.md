@@ -1,6 +1,6 @@
 # ES HANG — `Thread.join()` never returns for a dead RandomizedRunner worker (Windows host)
 
-Status: OPEN
+Status: FIXED (2026-07-19, `vm/src/threading/monitor.rs` + `vm/src/vm/vm_exec.rs`, worktree `serene-lamarr-01d83a`; not yet merged to `dev`)
 
 Discovered 2026-07-19 while doing full end-to-end verification of the
 IVFKnn stale-precise-root-mirror fix (see
@@ -66,26 +66,82 @@ $CP  = Get-Content "$ES\..\..\server\build\craton-testcp.txt" -Raw
   cleanly: `OK (1 test)`, ~2.2s. This rules out the ES test fixture /
   checkout state — the hang is CratonVM-specific.
 
-## Not yet investigated
+## Root cause
 
-- The exact `Thread.join()` / thread-death-notification code path (likely
-  `vm/src/vm.rs`, `vm/src/threading/*`, `vm/src/native/jni.rs`'s foreign-thread
-  teardown, or wherever the worker's `alive` flag flips and the joiner is
-  notified).
-- Whether this is Windows-specific (untested on Linux this session — the
-  original doc's own verification history was Linux/Azure-only, so this
-  may simply never have been exercised on Windows before).
-- Whether this is specific to this JDK build (25.0.3.9-hotspot) or this
-  particular `com.carrotsearch.randomizedtesting` worker-thread naming/
-  lifecycle shape (`...-seed#[...]-worker`).
-- Whether recent `dev` commits (unrelated to this session) changed
-  `Thread.join()`/thread-registry code in a way that could explain this
-  newly-surfaced hang, or whether it is much older and simply never
-  exercised via a full ES `JUnitCore` run on Windows before.
+Confirmed via a minimal, fast, non-ES repro (a trivial `@RunWith(RandomizedRunner.class)`
+test class doing nothing but `Thread.sleep(10)`, compiled against the ES
+server test classpath) — this is a plain CratonVM logic bug, not anything
+IVFKnn/Lucene/ES-specific, GC-timing-specific, or JIT-specific:
 
-## Impact
+In `thread_start`'s spawn closure (`vm/src/vm/vm_exec.rs`), the terminating
+thread's death sequence is, in order:
 
-Blocks full end-to-end `JUnitCore`-based verification of ES test classes
+1. Acquire its own Java `Thread` mirror's monitor (`enter_inflated_or_contend`)
+   as `term_monitor` — held deliberately across the next step so the final
+   `notify_all()` below is safe (mirrors `synchronized(this) { alive=false; notifyAll(); }`).
+2. `term_blk.finish_after(|| { clear_tlab_addr; mark_dead; release_monitors_held_by(tid); })`.
+3. `term_monitor.notify_all(tid)` + `term_monitor.exit(tid)`.
+
+Step 2's `release_monitors_held_by(tid)` sweeps **every** inflated monitor
+currently owned by `tid` and force-releases it (`Monitor::force_release_if_owned_by`,
+setting `state.owner = None`) — a sweep intended to reclaim monitors a thread
+abandoned mid-native-call inside an ordinary `synchronized` block without
+executing its `monitorexit`. It does not distinguish those abandoned locks
+from `term_monitor`, which `tid` **still legitimately owns** at that exact
+point specifically for step 3. So step 2 force-releases `term_monitor` out
+from under step 3.
+
+Step 3's `monitor.notify_all(tid)` then checks `state.owner == Some(tid)`,
+finds `None` (just cleared), and returns `Err(MonitorError::NotOwner)` —
+**silently discarded** by the `let _ = monitor.notify_all(tid);` call site.
+`wait_condvar.notify_all()` is therefore never invoked, and any thread
+parked in `Object.wait()` inside `Thread.join()`'s `synchronized(this) {
+while (isAlive()) wait(millis); }` loop is never woken — a classic lost
+wakeup. `state.owner` is already `None` by the time `monitor.exit(tid)`
+runs next, so that call fails the same way and is equally silently ignored.
+
+This exactly matches the observed signature: worker `alive=false` (mark_dead
+ran fine), joiner permanently parked in `Thread.join()` (the wakeup that
+should have fired never did). No GC, JIT, or ES-suite dependency — the
+sweep runs unconditionally on every platform-thread death via this path, so
+the bug is present regardless of OS; this doc's original "Windows-specific"
+framing was a red herring (Windows just happened to be where an ES
+`JUnitCore` run was first exercised end-to-end this session).
+
+## Fix
+
+`vm/src/threading/monitor.rs`: added `MonitorTable::release_monitors_held_by_except(thread_id, except: Option<&Arc<Monitor>>)`,
+identical to `release_monitors_held_by` except it skips `except` even if
+owned by `thread_id`. The original `release_monitors_held_by` is now a thin
+wrapper (`except = None`) — all other call sites (`vm/src/native/jni.rs`'s
+foreign-thread teardown, `vm_exec.rs`'s `unregister_native_thread`) are
+unaffected.
+
+`vm/src/vm/vm_exec.rs`'s `thread_start` spawn closure: step 2 now calls
+`release_monitors_held_by_except(tid, term_monitor.as_ref())`, excluding the
+monitor step 3 is about to `notify_all`/`exit` on.
+
+## Verification
+
+- Minimal repro (trivial `Thread.sleep(10)` test under `RandomizedRunner`):
+  hung reliably pre-fix (`alive=false` / stuck `Thread.join()`, matching the
+  Symptom section); 5/5 clean `OK (1 test)` runs (~0.07s each) post-fix.
+- Real-world repro, `testSlicesSparseWithFilter` on
+  `DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests` (same command as
+  the Reproduction section): `OK (1 test)`, 85.957s, no watchdog abort —
+  previously hung indefinitely (aborted only by the `--stack-dump-on-timeout`
+  watchdog). Confirms the fix holds under the original real ES workload, not
+  just the synthetic isolation case.
+- `cargo test --release -p cratonvm-vm --lib threading::`: 287 passed, 0
+  failed — no regressions in the monitor/thread-registry test suite.
+
+Not yet merged to `dev`; not yet committed. Not yet re-run under `--nojit`
+or on Linux post-fix (pre-fix evidence already showed the hang was
+independent of both).
+
+## Impact (pre-fix)
+
+Blocked full end-to-end `JUnitCore`-based verification of ES test classes
 on this Windows host — including the final confirmation step for the
 IVFKnn stale-precise-root-mirror fix and any future ES suite work done
 here. The underlying GC/JIT correctness fixes in the sibling doc were
