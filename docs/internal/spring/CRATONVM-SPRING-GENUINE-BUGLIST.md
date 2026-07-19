@@ -1829,6 +1829,70 @@ the WRONG same-named copy. Eight fixes landed on
     fixed by this change; #1 remains attributed to an existing tracked residual,
     #2–#3 remain open exactly as characterized above.
 
+    **2026-07-18/19 addendum — a further, DIFFERENT bug in this same SPI area
+    found and FIXED (branch codex/fix-spring-genuine-sweep-20260717, merged to
+    dev 9c4e6e414).** Independently root-caused via a from-scratch standalone
+    repro (`ForkedHintProbeTest`, a minimal `@CompileWithForkedClassLoader`
+    JUnit5 test replicating exactly what `StandardTestRuntimeHints.registerHints`
+    does) that `TestContextAotGeneratorIntegrationTests.endToEndTests()` still
+    threw `AssertionError: [Reflection hint for SpanishActiveProfilesResolver
+    with category INVOKE_DECLARED_CONSTRUCTORS]` even after the two fixes
+    above landed — i.e. `StandardTestRuntimeHints` now resolves and casts
+    correctly (per item 4's fix), but the `RuntimeHints` entry it registers for
+    an `@ActiveProfiles(resolver = ...)` class never took effect.
+
+    Root cause: the native shim backing Spring's
+    `org.springframework.util.ClassUtils.forName(String, ClassLoader)`
+    (`spring_class_utils_for_name_impl`, `native-builtins/src/phases_late.rs`)
+    only applied loader-aware resolution (routing through `loader.loadClass`)
+    when the caller passed an explicit *non-null* `ClassLoader`. Real Spring's
+    `ClassUtils.forName` bytecode substitutes
+    `Thread.currentThread().getContextClassLoader()` for a `null` argument
+    *before* ever calling `Class.forName` — but this native intercepts the
+    call before that substitution runs. `SpringFactoriesLoader.instantiateFactory`
+    calls `ClassUtils.forName(implementationName, this.classLoader)`, and
+    `AotServices.factories()` deliberately constructs its `SpringFactoriesLoader`
+    with a permanently-`null` `classLoader` field (by design — the resource
+    *lookup* classloader and the factory-*instantiation* classloader are
+    handled as two separate concerns in Spring's own code). A `null` loader
+    therefore silently fell through to CratonVM's loader-blind global class
+    scanner instead of the caller's actual thread-context loader — under
+    `@CompileWithForkedClassLoader` this resolved every SPI implementation
+    (`StandardTestRuntimeHints` included) to the stale app-loaded copy instead
+    of the fork's own redefinition. Confirmed via `CRATONVM_INVOKESTATIC_LOADER_TRACE`
+    / `CRATONVM_FORNAME_TRACE` (both new, permanent env-gated diagnostics) that
+    the entire `SpringFactoriesLoader`/`FactoryInstantiator` invokestatic chain
+    correctly resolved via the fork loader (`UserDefined(3)`) right up to the
+    `ClassUtils.forName` call itself, which is where the loader identity was
+    lost.
+
+    **Independently found and fixed by a separate, concurrent session too**
+    (already on `origin/dev` by the time this session's fix was ready to
+    merge — the two fixes are functionally identical, differing only in how
+    the current thread's Java `Thread` object is obtained; the version already
+    on `dev` was kept during the merge). Fix: substitute the thread context
+    classloader for a null/absent loader argument before deciding whether to
+    route through the existing loader-aware path.
+
+    Verified (this session, independently): the standalone `ForkedHintProbeTest`
+    repro now resolves `StandardTestRuntimeHints` via
+    `CompileWithForkedClassLoaderClassLoader` instead of `AppClassLoader`, and
+    `TestContextAotGeneratorIntegrationTests.endToEndTests()` no longer throws
+    the `SpanishActiveProfilesResolver` `RuntimeHints` `AssertionError`
+    (progresses to a later, unrelated generated-source-file-list assertion,
+    not investigated further this session — likely genuine, needs its own
+    triage with a faithfully-rebuilt `spring-webmvc`/`spring-websocket`/
+    `spring-webflux`/`spring-context-support`/`spring-oxm` classpath rather
+    than this session's classes-dir substitutions for missing jars).
+    Regression-clean: `cratonvm-native-builtins --lib --release` (3031/2
+    failed — both pre-existing on `origin/dev` tip independent of this fix,
+    confirmed via a clean-worktree A/B: `jca::key_factory::tests::
+    keyfactory_unproducible_key_throws_not_dead_key` and `phases_late::
+    p57_win_path_tests::trailing_separator_is_removed_only_from_non_roots`);
+    `cratonvm-vm --lib --release` (2210/17 failed, all 17 match the documented
+    pre-existing `jit::skip_list`/`runtime::lock_order`/
+    `buffered_input_stream_real_jdk_uses_its_own_bytecode` baseline).
+
 ---
 
 ## 3. Untriaged Clusters & Per-Class Details
