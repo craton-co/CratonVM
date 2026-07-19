@@ -19792,7 +19792,7 @@ fn execute_invoke_kind(
                 }
             })
         })
-    } else if is_special && crate::runtime::env_cache::loader_aware_resolution() {
+    } else if is_special && should_use_loader_initiated_resolution(shared, current_class_id) {
         // invokespecial owner is the CP-resolved class NAME (`method_class_name`),
         // which `get_loaded_class_id` collapses to ONE copy per name. Super and
         // private calls from inside a loader-private enhanced class must reach
