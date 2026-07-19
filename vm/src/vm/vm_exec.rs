@@ -14370,6 +14370,28 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                // `URLClassLoader` declares its OWN
+                                // `getResourceAsStream` override (real OpenJDK
+                                // wraps the stream for `closeables` tracking),
+                                // unlike `getResource`/`getResources`/
+                                // `findResource` above, which it leaves to
+                                // `ClassLoader`/its own extension point. The
+                                // `java/lang/ClassLoader` entry elsewhere in
+                                // this list never matches such a call, so its
+                                // real bytecode ran unforced — same shimmed-`ucp`
+                                // problem as `findResource` above, but ALSO
+                                // missing the native bridge's parent-delegation,
+                                // so a `new URLClassLoader(urls, parent)` whose
+                                // own URL held only a generated resource index
+                                // (Spring Boot's `ServletComponentScanIntegrationTests
+                                // .indexedComponentsAreRegistered`) got `null`
+                                // for every `.class` resource that only the
+                                // PARENT classloader's classpath holds, despite
+                                // `getResource` resolving it fine moments
+                                // earlier. Keep in sync with
+                                // `force_native_over_real_jdk_bytecode`.
+                                || (method_name == "getResourceAsStream"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
@@ -14386,6 +14408,26 @@ fn invoke_on_class_shared_inner(
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
                         ) && method_name == "addURL"
                             && descriptor == "(Ljava/net/URL;)V")
+                        // `java.nio.file.Path` declares no `toString()` body of its
+                        // own (it's an interface); real dispatch resolves to
+                        // `java.lang.Object.toString()` instead of the registered
+                        // native (`register_phase57_nio_file`'s `Path.toString()`),
+                        // producing the garbage default-Object form
+                        // (`java.nio.file.Path@1a2b3c`) instead of the actual
+                        // jar-FS/host path. In-process `javac`'s
+                        // `JavacFileManager.inferBinaryName` native fast path calls
+                        // `path.toString()` on every `PathFileObject$JarFileObject`
+                        // classpath entry and mangled that garbage into the literal
+                        // binary name `java.nio.file` for every ordinary
+                        // (non-JRT/non-directory) classpath class, breaking
+                        // symbol resolution for any real in-process javac compile
+                        // referencing an application-classpath class (Spring's
+                        // `TestCompiler`/AOT test generation — e.g.
+                        // `ServletComponentScanRegistrarTests`). Keep in sync with
+                        // `force_native_over_real_jdk_bytecode`.
+                        || (class_name == "java/nio/file/Path"
+                            && method_name == "toString"
+                            && descriptor == "()Ljava/lang/String;")
                         // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
                         // of `Log4jLoggerFactory.getContext` calls
                         // `LogManager.getFactory().isClassLoaderDependent()`

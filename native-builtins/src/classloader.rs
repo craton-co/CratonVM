@@ -4418,11 +4418,32 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // ensures a custom loader that doesn't override `findResource` still finds
     // resources its parent serves (SerializationHelperTest/ProxyClassReuseTest).
     // The raw `find_resource` fast-path below is kept for builtin loaders.
+    //
+    // `object_extends(.., "java/net/URLClassLoader")` mirrors the identical
+    // gate `cl_get_resource` already applies just above ("URLClassLoader
+    // itself is parent-first too... restricting this to non-builtin names
+    // drops a parent's resource stream") — `is_builtin_loader_class` treats
+    // the bare `java/net/URLClassLoader` class as builtin (it's in the same
+    // match arm as `SecureClassLoader`/`jdk/internal/loader/*`), so a plain,
+    // user-instantiated `new URLClassLoader(urls, parent)` (e.g. Spring
+    // Boot's `ServletComponentScanIntegrationTests.indexedComponentsAreRegistered`,
+    // which wraps just a `@TempDir` holding a generated `META-INF/spring.components`
+    // index, parented to the real test classloader) fell into the raw
+    // `ctx.find_resource` fallback below instead of this delegation-aware
+    // path. That raw store doesn't see resources reachable only through the
+    // dynamically-registered global URL walk (`ctx.find_all_resource_urls`,
+    // used by both `getResource` and `ucl_find_resource`'s own fallback), so
+    // `getResourceAsStream` returned null for a `.class` file `getResource`
+    // resolved moments earlier — `ClassPathResource.getInputStream()` then
+    // threw `FileNotFoundException` reading an indexed component's class
+    // file that plainly exists on the parent's classpath.
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
         if is_classloader_instance(ctx, this_ref) {
             let class_id = ctx.class_id_of_object(this_ref);
             if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
+                if object_extends(ctx, this_ref, "java/net/URLClassLoader")
+                    || !is_builtin_loader_class(&class_name)
+                {
                     let pin = ctx.pin_native_root(this_ref);
                     let name_arg = Value::Object(Some(ctx.create_string(&name)));
                     let this_ref = ctx.read_native_pin(pin, this_ref);
