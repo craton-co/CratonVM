@@ -1365,7 +1365,14 @@ pub(crate) fn native_string_substring(
         }
     }
     let sub_text = String::from_utf16_lossy(&sub_utf16);
-    let result = ctx.create_string_uninterned(&sub_text);
+    // `_gc_safe`: `sub_text` is already Rust-owned; `this`/`arr` are not
+    // dereferenced again below, so a moving young GC here is safe. Without
+    // this, String.substring() -- unconditionally forced native, hot path
+    // for Response.toAbsolute()-style URI manipulation -- hard-aborts the
+    // whole process on young-gen exhaustion instead of collecting and
+    // continuing. See docs/known-issues/tomcat-08-07/
+    // silent-hang-no-signature-cluster.md.
+    let result = ctx.create_string_uninterned_gc_safe(&sub_text);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -2243,7 +2250,13 @@ pub(crate) fn native_sb_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     // Routing it through the interned pool made `==` wrongly report identity
     // (e.g. `sb.toString() == "literal"`), breaking identity-based symbol
     // comparisons such as xerces' `NamespaceSupport`.
-    let result = ctx.create_string_uninterned(&text);
+    // `_gc_safe`: `text` is already Rust-owned; `this`/`buf` are not
+    // dereferenced again below, so a moving young GC here is safe. Without
+    // this, a StringBuilder.toString()-heavy hot loop (e.g. Response.
+    // toAbsolute()) hard-aborts the whole process on young-gen exhaustion
+    // instead of collecting and continuing -- see docs/known-issues/
+    // tomcat-08-07/silent-hang-no-signature-cluster.md.
+    let result = ctx.create_string_uninterned_gc_safe(&text);
     Ok(Some(Value::Object(Some(result))))
 }
 

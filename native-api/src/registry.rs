@@ -1367,6 +1367,18 @@ pub trait NativeContext {
     /// without loading a class (for synthetic objects).
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef;
 
+    /// Fallible twin of [`alloc_object`](Self::alloc_object) for a native-call
+    /// safepoint where the caller holds no unpinned Java references (same
+    /// contract as `create_string_uninterned_gc_safe`). Returns `None`
+    /// instead of hard-aborting the process when the heap is exhausted, so
+    /// the caller can surface a catchable `java.lang.OutOfMemoryError`.
+    /// Defaults to the aborting `alloc_object` (wrapped in `Some`) for
+    /// mock/test contexts; the real VM implementation overrides this with
+    /// the actual fallible allocator.
+    fn try_alloc_object_gc_safe(&mut self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        Some(self.alloc_object(class_id, num_fields))
+    }
+
     /// Ensure a class is loaded and initialized. Returns the ClassId.
     fn ensure_class_initialized(
         &mut self,
