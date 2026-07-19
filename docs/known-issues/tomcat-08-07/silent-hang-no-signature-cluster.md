@@ -17,6 +17,18 @@ silent). **HotSpot:** PASS on all 3 (fresh-verified, prior checkpoint).
 is a hard floor, not a leak (`-Xmx2560m`+ runs clean) -- see that section
 below for the practical workaround (run at >=2.5g) and a new, separate,
 non-fatal "stale pointer" finding worth a dedicated pickup.
+**2026-07-19 deep-dive**: found the DEFINITIVE root cause of the relative-perf
+assertion -- `Response.toAbsolute()` permanently fails to JIT-compile
+(confirmed via `CRATONVM_DBG_JITC=1` trace) because of a real, deliberate,
+documented JIT limitation (`RBC.6`: no local-exception-handler dispatch in
+the codegen) triggered by its `try { ... } catch (IOException) { throw new
+IllegalArgumentException(...) }` shape. This is not a bug in the gate --
+compiling this method today would silently produce wrong exception
+semantics -- so it was NOT patched around; see that section for the full
+finding and why implementing the real fix (JIT support for local exception
+handlers) is a scoped compiler feature, not a same-session patch. This is
+the practical ceiling for a diagnostic pass on this residual; doc stays in
+known-issues pending that feature.
 
 ## 2026-07-19 update: real root cause found for the TestContextConfig/TestValidator hang
 
@@ -331,6 +343,150 @@ prior stale-ObjectRef findings or a new one.
    codebase's track record on this bug family.
 3. Heap-threshold question is closed (floor, not leak) — no further action
    needed on that specific question.
+
+## 2026-07-19 deep-dive: definitive root cause of the relative-perf gap found (RBC.6 JIT exception-handler gate)
+
+Picked the doc's last open item back up with the explicit goal of closing it
+completely (worktree `/data/wt-tomcat-trp-deepdive-20260719`, branch
+`codex/fix-tomcat-trp-deepdive-20260719`).
+
+### Two more optimization attempts, both empirically verified NOT to help (documented for the record, not landed)
+
+Before finding the real cause, two plausible-looking native-call-dispatch
+optimizations were tried against an isolated `String.getChars(II[CI)V`
+microbenchmark (the method `CharChunk.append(String,int,int)` calls
+internally) — a scalar-only bulk-array-write native rewrite, and extending
+the JIT's `jit_invoke_dispatch` per-callsite native-callback cache
+(`ObjectNativeKind`) to cover `String.getChars`. **Neither changed the
+microbenchmark's wall-clock at all** (~1.0-2.3ms/1000 calls, flat across
+attempts, `NativeMethodRegistry::find` staying at ~10-13% of profiled
+samples throughout). Both were reverted rather than landed, since "doesn't
+help and adds complexity" fails this session's own bar for shipping a fix.
+
+### The actual finding: `Response.toAbsolute()` never gets JIT-compiled
+
+Ran `TestResponsePerformance` under `CRATONVM_DBG_JITC=1` (the existing JIT
+compile-activity trace flag) against the real suite fixture. Every method
+`toAbsolute()` calls compiles successfully and even reaches C2
+(`CharChunk.append`, `.indexOf`, `.getBuffer`, `.endsWith`,
+`String.getChars`, `UEncoder.encodeURL`, ...) — but:
+
+```
+[cratonvm-jitc] bg-compile org/apache/catalina/connector/Response.toAbsolute(Ljava/lang/String;)Ljava/lang/String; tier=C1 optimized=false
+[cratonvm-jitc] compile-bail org/apache/catalina/connector/Response.toAbsolute(Ljava/lang/String;)Ljava/lang/String; backend_attempted=true
+```
+
+`toAbsolute()` itself — the method actually called 1,000,000 times by
+`doHomebrew()` — permanently bails and stays interpreted for the entire
+benchmark (the bail is marked permanent per the existing RBC.4 fix, so this
+isn't a retry-storm — it's a single, deliberate, correct refusal to compile,
+repeated identically every run).
+
+**Root cause, confirmed against `jit/src/lib.rs`'s own documented gate
+(`RBC.6`)**:
+
+```rust
+// RBC.6 — a method containing `athrow` compiles only when it has NO
+// local exception handlers: the athrow lowering stashes the exception
+// and returns the deopt sentinel, which cannot dispatch to an
+// in-method handler. Permanent for this bytecode -> bail-list it.
+if scan.has_athrow && !cached.exception_table.is_empty() {
+    *backend_attempted = true;
+    return None;
+}
+```
+
+`Response.toAbsolute()`'s real source (`org/apache/catalina/connector/
+Response.java`) wraps its hot path in exactly this shape, twice:
+
+```java
+try {
+    redirectURLCC.append(scheme, 0, scheme.length());
+    ...
+    normalize(redirectURLCC);
+} catch (IOException ioe) {
+    throw new IllegalArgumentException(location, ioe);
+}
+```
+
+A `try` block with a local `catch` whose body does `athrow` (rethrowing as
+a different exception type) is exactly the pattern `RBC.6` bails on — the
+JIT's exception-handling codegen has no way to dispatch control from a
+thrown exception to a handler bytecode offset *within the same compiled
+method*; it can only propagate outward (the "deopt sentinel"), which would
+silently skip the local `catch` and produce the wrong exception type if
+compiled anyway. **The gate is not a bug — compiling this method with the
+current codegen would be a real correctness hazard, not just a missed
+optimization.** This is a deliberate, sound, conservative refusal.
+
+This is genuinely the **complete explanation for the "CharChunk path is
+slower than URI path" mystery**: it isn't that `CharChunk`-style
+concatenation is innately slower than `URI` parsing on this interpreter —
+it's that `toAbsolute()`'s *own* driving bytecode (branching, the
+`leadingSlash`/`hasScheme` checks, the try/catch, the final `return
+redirectURLCC.toString()`) runs at full-interpreter speed for all
+1,000,000 iterations, while every individual callee it invokes IS
+JIT-compiled and fast. `doUri()`'s driving code (`URI.create(...)
+.resolve(...).toASCIIString()`, called directly from the benchmark's own
+`main`-adjacent loop) has no such try/catch-with-rethrow shape and compiles
+cleanly, so it runs at JIT speed end-to-end. The ~3x gap is (approximately)
+the ratio between "interpreted driver + JIT'd callees" and "JIT'd driver +
+JIT'd callees" for a method whose own body is a small fraction of total
+instructions but pays full per-call interpreter dispatch overhead for
+every one of its ~10 callee invocations per iteration.
+
+### Why this was not fixed this session (and what fixing it would require)
+
+Implementing correct JIT support for local exception handlers is a genuine,
+substantial compiler feature — not a bounded patch:
+- The compiled method needs to detect, when a callee throws (propagates an
+  exception up into the compiled frame), whether the current program point
+  falls within a `try`-range that has a local handler, and if so, transfer
+  control to that handler's bytecode offset with the correct locals/stack
+  state and the exception object bound to the catch variable — full
+  in-method exception dispatch, not just entry/exit handling.
+- Checked the codebase's own existing deopt machinery
+  (`vm/src/runtime/deopt_materialize.rs`, "real-frame-deopt") as a possible
+  foundation to reuse: it is for an **unrelated** purpose (re-materializing
+  scalar-replaced/escape-analyzed virtual objects after a *type-speculation*
+  guard fails, not exception dispatch) and is itself still
+  default-off/experimental ("Phases 1+2... reachable today only via the
+  acceptance tests"). There is no existing scaffolding to extend safely.
+- A narrower "detect provably-dead exception paths and compile anyway"
+  static analysis was considered and rejected: `CharChunk.append()` is real,
+  non-final, overridable bytecode, so "does this call ever actually throw
+  IOException" is not a small, local, sound question — it would require
+  either an unsound heuristic (risk: silent miscompilation the one time the
+  assumption is wrong) or real interprocedural analysis (same scope as the
+  general fix).
+- This codebase's own convention (RBC.4/RBC.6/NEW-1.x naming, the large
+  number of explicitly `Default-OFF` JIT features already visible in
+  `try_compile_inner`'s parameter list) treats JIT correctness/coverage gaps
+  as their own tracked, gradually-landed roadmap items, not same-session
+  patches — consistent with the caution this specific gate deserves.
+
+**Recommendation for whoever picks this up**: this is a well-scoped,
+precisely-diagnosed JIT feature request — "support compiling methods whose
+only local exception handlers end in an unconditional rethrow/return (no
+control flow re-enters the try region)" would cover this exact pattern
+(and is very likely the majority real-world shape: validate-or-wrap-and-
+rethrow) without needing full general handler-to-handler dispatch. That
+narrower version is still real compiler work (correct locals/stack
+reconstruction at the handler entry, correct exception-object binding) but
+meaningfully smaller than the fully general case, and would very plausibly
+close both `TestResponsePerformance`'s relative-perf assertion (removing
+the ~150x-vs-interpreted-driver tax) and any other method sharing this
+common idiom. Should get a `docs/feature-designs/` writeup and its own
+dedicated session(s), given the correctness stakes.
+
+### Doc disposition
+
+Left in `docs/known-issues/` (not fixed) with this root cause recorded in
+full. Given the actual remaining gap is now a scoped compiler *feature*
+request rather than an open-ended performance mystery, this is arguably the
+practical ceiling for a same-session diagnostic effort — closing the doc
+(making the assertion pass) requires the JIT feature above, which is out of
+scope to implement safely in this session.
 
 ## Summary (original 2026-07-13 finding, retained for history)
 
