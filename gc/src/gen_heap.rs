@@ -2172,6 +2172,20 @@ impl GenerationalHeap {
                     }
                 }
             } // end rate-limited OOB-read diagnostics
+            // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
+            // unconditional backtrace for the specific shape seen in the
+            // known-issues residual logs (index 4/5, zero-slot receiver) —
+            // rare enough that this doesn't need the OOB_DIAG_CAP treatment.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             return Value::Object(None);
         }
         // Compact reference-field layout: reference fields are 8-byte pointers
@@ -2384,6 +2398,15 @@ impl GenerationalHeap {
                      (caller used slot index past receiver's layout — \
                      class layout is correct; the bug is in the caller's \
                      slot computation)",
+                );
+            }
+            // RESID-DIAG (dohead residuals investigation, 20260718): see the
+            // matching comment in get_field's OOB guard above.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                eprintln!(
+                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
                 );
             }
             return;

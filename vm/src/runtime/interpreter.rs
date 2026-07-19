@@ -29180,6 +29180,43 @@ fn compile_osr_artifact(
             if scan.has_athrow {
                 return None;
             }
+            // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
+            // its own local exception handlers, even when it never directly
+            // `athrow`s. `compile_with_param_slots` below has no
+            // exception-table parameter, so an OSR artifact NEVER carries
+            // handler ranges: a callee exception unwinding into this
+            // OSR-compiled frame finds no catch and escapes uncaught, even
+            // though a `catch` block textually guards the call. This was
+            // masked while methods with `ldc` string constants were
+            // unconditionally OSR-denied (fixed in d6f642695); once that
+            // denial was lifted, any hot-loop method with a trailing
+            // try/catch around a throwing call (e.g. a servlet's
+            // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
+            // silently stopped catching. Permanent for this bytecode, like
+            // the sibling RBC bails above.
+            let has_exception_handlers = match shared.class_manager.read().get_class(class_id) {
+                Some(class) => class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .and_then(|m| {
+                        m.attributes.iter().find_map(|a| match a.as_decoded() {
+                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                Some(!ca.exception_table.is_empty())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or(false),
+                None => false,
+            };
+            if has_exception_handlers {
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                return None;
+            }
             // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.
             // init_gf256_mul_table` (a nested primitive-array allocation loop)
             // was observed to "resume with corrupt stack state for the next
