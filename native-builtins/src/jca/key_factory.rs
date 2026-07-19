@@ -3215,9 +3215,16 @@ mod tests {
         der: &[u8],
     ) -> Result<Option<Value>, MethodCallFailed> {
         let name = ctx.create_string(algo);
-        let kf = kf_get_instance(ctx, &[Value::Object(Some(name))])
-            .unwrap()
-            .unwrap();
+        // `?`, not `.unwrap()`: `kf_get_instance` now rejects an unrecognised
+        // algorithm name up front (`kf_get_instance`'s own doc comment), so
+        // `"Totally-Bogus"` fails here rather than at `kf_generate_public`/
+        // `kf_generate_private` below — still satisfies every caller's
+        // `expect_err(...)`, since they only care that *some*
+        // `MethodCallFailed` comes back, not which stage produced it.
+        let kf = match kf_get_instance(ctx, &[Value::Object(Some(name))])? {
+            Some(v) => v,
+            None => panic!("kf_get_instance returned no KeyFactory"),
+        };
         let kf_ref = match kf {
             Value::Object(Some(o)) => o,
             other => panic!("expected KeyFactory, got {other:?}"),
