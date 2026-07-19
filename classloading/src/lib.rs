@@ -38,6 +38,7 @@ pub use class::{
     find_field_recursive, find_method_recursive, ArrayInfo, Class, ClassId, ClassLoaderId,
     ClassState, ClassStore, CodeSource, RecordComponentInfo,
 };
+pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::{
     any_class_redefined,
     bump_jit_supersede_epoch,
@@ -71,7 +72,6 @@ pub use class_manager::{
     CLASS_INIT_UNINITIALIZED,
 };
 pub use class_path::{ClassPath, ManifestInfo};
-pub use class_manager::is_bootstrap_appended_class;
 // Round 5 audit fix (MED #10) / Round 7 audit fix (MED #11): expose the
 // reflective `(class, name, descriptor)` cache so VM-side reflective
 // resolvers (`Class.getMethod`, `MethodHandles.Lookup.findVirtual`,

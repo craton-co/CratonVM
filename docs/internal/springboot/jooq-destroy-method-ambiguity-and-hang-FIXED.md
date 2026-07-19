@@ -174,7 +174,7 @@ a live repro with a stack dump before assigning root cause.
 OOB-field-read warnings repeating forever, no test progress) recurs
 identically across **5 more HANG classes in 5 more modules** in this same
 rerun, none of which touch JAXB — see
-[`mockwebenvironmentservletcomponentscanintegrationtests-hang.md`](mockwebenvironmentservletcomponentscanintegrationtests-hang.md),
+[`MockWebEnvironmentServletComponentScanIntegrationTests` fixed closure](mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md),
 now generalized into a cross-module cluster covering
 `spring-boot-jdbc-test`, `spring-boot-flyway`, `spring-boot-batch-jdbc`,
 `spring-boot-micrometer-tracing`, and `spring-boot-hateoas`. The breadth

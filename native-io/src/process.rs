@@ -1895,13 +1895,19 @@ fn captured_string_stream(ctx: &mut dyn NativeContext, text: &str) -> Value {
     Value::Object(Some(stream))
 }
 
-fn legacy_captured_stream(ctx: &mut dyn NativeContext, args: &[Value], field: usize) -> Option<Value> {
+fn legacy_captured_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field: usize,
+) -> Option<Value> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return None,
     };
     match ctx.get_field(this, field) {
-        Value::Object(Some(s)) => ctx.read_string(s).map(|text| captured_string_stream(ctx, &text)),
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .map(|text| captured_string_stream(ctx, &text)),
         _ => None,
     }
 }

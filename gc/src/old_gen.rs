@@ -263,6 +263,10 @@ impl OldGen {
         // never less than 8 for alignment headroom) so an `alloc(0)`
         // can't alias an existing allocation.
         let size = size.max(HEADER_SIZE.max(8));
+        // Keep the reserved extent consistent with the young arena: compact
+        // bodies may be non-aligned, but the next object must not start after
+        // an unowned padding gap.
+        let size = size.checked_add(align - 1).map(|v| v & !(align - 1))?;
 
         let base = self.data.as_ptr() as usize;
         let start_bucket = min_satisfying_bucket(size + align - 1);
@@ -534,7 +538,7 @@ impl OldGen {
             if header.kind == ObjectKind::HumongousFiller {
                 break;
             }
-            let total_size = if header.kind == ObjectKind::Array {
+            let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
                     + array_data_size(header.array_length as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
@@ -548,6 +552,7 @@ impl OldGen {
                 // `scan_dirty_cards` (→ missed old→young roots → corruption).
                 HEADER_SIZE + cratonvm_types::object_body_size(header)
             };
+            let total_size = raw_size.checked_add(7).map(|size| size & !7).unwrap_or(0);
             if total_size < HEADER_SIZE || offset + total_size > end_offset {
                 break;
             }
@@ -580,7 +585,7 @@ impl OldGen {
             if header.kind == ObjectKind::HumongousFiller {
                 break;
             }
-            let total_size = if header.kind == ObjectKind::Array {
+            let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
                     + array_data_size(header.array_length as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
@@ -591,6 +596,7 @@ impl OldGen {
                 // note in `scan_region_filtered`.
                 HEADER_SIZE + cratonvm_types::object_body_size(header)
             };
+            let total_size = raw_size.checked_add(7).map(|size| size & !7).unwrap_or(0);
             // Sanity check: if total_size is 0 or too large, stop scanning
             if total_size < HEADER_SIZE || offset + total_size > end_offset {
                 break;
@@ -1011,6 +1017,18 @@ mod tests {
         let p2 = og.alloc(64, 8).unwrap();
         // p2 should be 8-byte aligned
         assert_eq!(p2 as usize % 8, 0);
+    }
+
+    #[test]
+    fn alloc_alignment_reserves_compact_object_padding() {
+        let mut og = OldGen::new(4096);
+        let first = og.alloc(44, 8).unwrap();
+        let second = og.alloc(8, 8).unwrap();
+
+        assert_eq!(second as usize - first as usize, 48);
+        // OldGen reserves at least one header for any request, so the second
+        // 8-byte request occupies 40 bytes after the 48-byte compact extent.
+        assert_eq!(og.used(), 88);
     }
 
     #[test]

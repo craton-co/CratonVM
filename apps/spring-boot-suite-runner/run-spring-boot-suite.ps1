@@ -582,6 +582,19 @@ function Get-EffectiveClassTimeoutSec {
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.MvcEndpointRequestIntegrationTests' = 700
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.reactive.EndpointRequestIntegrationTests' = 1000
     'module/spring-boot-micrometer-tracing-opentelemetry|org.springframework.boot.micrometer.tracing.opentelemetry.autoconfigure.OpenTelemetryTracingAutoConfigurationTests' = 1400
+    # SPRING-TESTCOMPILER.1 (2026-07-18): these processor tests repeatedly
+    # compile fixture sources in-process through the real JDK javac. They are
+    # CPU-bound and silent until JUnit has completed all fixture compilations;
+    # a 300-second shard limit therefore reports a false HANG. The representative
+    # 65-test annotation-processor class completed in 629.68s with JIT and
+    # 680.00s with --nojit. Keep enough headroom to report its actual result.
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.ConfigurationMetadataAnnotationProcessorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.ConstructorParameterPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.EndpointMetadataGenerationTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.JavaBeanPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.LombokPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.MergeMetadataGenerationTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.PropertyDescriptorResolverTests' = 1200
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {

@@ -335,7 +335,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// keeping `this` only in a native local across `init_classloader_common_fields`
 /// could make the following `ucp` initialization write through a forwarded
 /// reference, leaving the live loader with its default null field.
-fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+pub(crate) fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
     let this_pin = ctx.pin_native_root(this);
     let urls_pin = match urls {
         Value::Object(Some(urls)) => Some((ctx.pin_native_root(urls), urls)),
@@ -355,6 +355,28 @@ fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef,
     if let Some((pin, _)) = urls_pin {
         ctx.unpin_native_roots(pin);
     }
+    ctx.unpin_native_roots(this_pin);
+}
+
+pub(crate) fn init_urlclassloader_constructor_with_parent(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    urls: Value,
+    parent: Value,
+) {
+    ctx.set_field_by_name(this, "parent", parent);
+    init_urlclassloader_constructor(ctx, this, urls);
+}
+
+pub(crate) fn init_urlclassloader_constructor_with_default_parent(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    urls: Value,
+) {
+    let this_pin = ctx.pin_native_root(this);
+    let parent = get_or_create_system_cl(ctx);
+    let this = ctx.read_native_pin(this_pin, this);
+    init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent));
     ctx.unpin_native_roots(this_pin);
 }
 

@@ -2172,6 +2172,25 @@ impl GenerationalHeap {
                     }
                 }
             } // end rate-limited OOB-read diagnostics
+            // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
+            // unconditional backtrace for the zero-slot-receiver shape seen in
+            // the known-issues residual logs — confirmed (2026-07-19) to
+            // occur ONLY within the exact failing parameterization's test
+            // case in every repro sample checked (zero occurrences in the
+            // preceding passing cases of the same class), so this is NOT the
+            // benign high-frequency case (B) the OOB_DIAG_CAP above guards
+            // against — widened from the original index-4/5-only guess to
+            // any index once indices 0/1/3 were also observed correlating.
+            if num_slots == 0 {
+                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             return Value::Object(None);
         }
         // Compact reference-field layout: reference fields are 8-byte pointers
@@ -2384,6 +2403,15 @@ impl GenerationalHeap {
                      (caller used slot index past receiver's layout — \
                      class layout is correct; the bug is in the caller's \
                      slot computation)",
+                );
+            }
+            // RESID-DIAG (dohead residuals investigation, 20260718): see the
+            // matching comment in get_field's OOB guard above.
+            if num_slots == 0 {
+                eprintln!(
+                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
                 );
             }
             return;
@@ -3925,7 +3953,10 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && young_cursor + gap <= young_used
+                {
                     young_cursor += gap;
                     continue;
                 }
@@ -3940,7 +3971,11 @@ impl GenerationalHeap {
                 break;
             }
             let size = gen_object_total_size(header);
-            if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
+            if size < HEADER_SIZE
+                || young_cursor
+                    .checked_add(size)
+                    .is_none_or(|end| end > young_used)
+            {
                 tracing::warn!(
                     young_cursor,
                     young_used,
@@ -4987,7 +5022,6 @@ impl GenerationalHeap {
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
 
-
         // Build exact young-object bases before marking. The stack/JIT root
         // scan is conservative and can yield aligned interior words; treating
         // those as objects makes the side-mark channel retain the interior
@@ -5038,12 +5072,19 @@ impl GenerationalHeap {
             // walk above).
             if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
-                let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && exact_cursor + gap <= young_from.used() {
+                let gap =
+                    unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && exact_cursor + gap <= young_from.used()
+                {
                     exact_cursor += gap;
                     continue;
                 }
-                tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
+                tracing::warn!(
+                    exact_cursor,
+                    "GC: exact young-object walk found an implausible GAP-filler sentinel"
+                );
                 break;
             }
             let total = gen_object_total_size(header);
@@ -5052,12 +5093,20 @@ impl GenerationalHeap {
                     .checked_add(total)
                     .is_none_or(|end| end > young_from.used())
             {
-                tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
+                tracing::warn!(
+                    exact_cursor,
+                    used = young_from.used(),
+                    "GC: exact young-object walk stopped at an implausible extent"
+                );
                 break;
             }
             if let Some(&&(off, _)) = exact_free_iter.peek() {
                 if off > exact_cursor && off < exact_cursor + total {
-                    tracing::warn!(exact_cursor, off, "GC: exact young-object walk crossed a free/TLAB range");
+                    tracing::warn!(
+                        exact_cursor,
+                        off,
+                        "GC: exact young-object walk crossed a free/TLAB range"
+                    );
                     break;
                 }
             }
@@ -7173,19 +7222,28 @@ impl GenerationalHeap {
         // root scan cannot resurrect a stale header inside the hole) and
         // publish it to the free list. Per-object forensic records remain
         // available without forcing per-object arena publication.
-        for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
-            let obj_addr = from_base + off;
-            record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
-            crate::a2dbg::record_free(obj_addr);
-            bytes_swept += sz;
-            objects_swept += object_count;
-        }
-        for &(off, sz) in &reclaimed_regions {
-            let obj_addr = from_base + off;
-            // SAFETY: this is the union of adjacent/overlapping spans that the
-            // verified walk collected, all within the live from-space region.
-            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
-            young_from.add_free_block(off, sz);
+        let defer_reclamation = std::env::var_os("CRATONVM_DBG_NO_NONMOVING_RECLAIM").is_some();
+        if !defer_reclamation {
+            for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
+                let obj_addr = from_base + off;
+                record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
+                crate::a2dbg::record_free(obj_addr);
+                bytes_swept += sz;
+                objects_swept += object_count;
+            }
+            for &(off, sz) in &reclaimed_regions {
+                let obj_addr = from_base + off;
+                // SAFETY: this is the union of adjacent/overlapping spans that the
+                // verified walk collected, all within the live from-space region.
+                unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
+                young_from.add_free_block(off, sz);
+            }
+        } else if !dead_regions.is_empty() {
+            tracing::debug!(
+                spans = dead_regions.len(),
+                bytes = reclaimed_regions.iter().map(|(_, size)| *size).sum::<usize>(),
+                "GC: retaining dead young spans during non-moving reclamation probe"
+            );
         }
         report_phase("zero-and-publish");
 
@@ -8663,8 +8721,7 @@ impl GenerationalHeap {
     #[inline]
     fn full_old_rset_scan_enabled() -> bool {
         static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*CARD_TABLE_ONLY
-            .get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+        !*CARD_TABLE_ONLY.get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -9544,7 +9601,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
+    let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
@@ -9587,12 +9644,12 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.array_length != 0 {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
+                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
                  class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
                  so the walker can re-sync.",
-                header.array_length,
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.array_length,
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -9603,16 +9660,24 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.num_slots > (1 << 24) {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
                  treating as corrupt so the walker can re-sync.",
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
         }
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
-    }
+    };
+
+    // Arena allocations reserve an 8-byte-aligned footprint. Compact object
+    // bodies need not be naturally aligned, so their trailing padding belongs
+    // to the object for every linear collector walk.
+    raw_size
+        .checked_add(7)
+        .map(|size| size & !7)
+        .unwrap_or(0)
 }
 
 /// Compute a pointer to the slot at `index` within an object/array.
@@ -10893,11 +10958,7 @@ mod tests {
         }
 
         // Dead object's memory was reclaimed (zeroed + on the free list).
-        assert!(
-            result.stats.bytes_freed > 0,
-            "dead object must be reclaimed"
-        );
-        // The reclaimed region was zeroed by the sweep.
+        assert!(result.stats.bytes_freed > 0, "dead object must be reclaimed");
         // SAFETY: `dead_ptr` is inside the young arena; reading its
         // (now-freed, zeroed) header is a valid in-bounds read.
         let dead_header = unsafe { &*(dead_ptr as *const ObjectHeader) };
@@ -10907,15 +10968,9 @@ mod tests {
             "freed hole must be zeroed"
         );
 
-        // A fresh allocation must succeed and reuse the reclaimed hole
-        // (it lands at the dead object's old address since that's the
-        // first free block).
+        // A fresh allocation must succeed and reuse the reclaimed hole.
         let reused = heap.alloc_object(ClassId::new(7), 1);
-        assert_eq!(
-            reused.as_ptr(),
-            dead_ptr,
-            "new allocation should reuse the swept hole",
-        );
+        assert_eq!(reused.as_ptr(), dead_ptr, "new allocation should reuse the swept hole");
         heap.set_field(reused, 0, Value::Int(555));
         assert_eq!(heap.get_field(reused, 0).as_int(), Some(555));
 
