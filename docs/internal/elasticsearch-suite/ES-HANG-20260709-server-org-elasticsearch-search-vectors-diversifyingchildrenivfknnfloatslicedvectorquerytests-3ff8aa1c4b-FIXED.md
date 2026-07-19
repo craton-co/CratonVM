@@ -1,3 +1,13 @@
+Status: FIXED — archived 2026-07-19. Every hang/corruption/crash bug this
+doc tracked across its 2026-07-09 through 2026-07-19 history is now found
+and fixed (see the dated sections below for each one's own writeup). The
+one remaining open item, `testSlicesDense`'s raw interpreter throughput
+(genuinely slow, ~600s, never a hang or a correctness bug — characterized
+repeatedly throughout this doc's history), is split out to its own doc:
+[`ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`](../../known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md).
+
+---
+
 # 2026-07-18/19 continuation: stale-precise-root-mirror bug FOUND and FIXED (raw JIT-to-JIT call RBP-mirror race); JIT-throughput regression from the fix's interim safety defaults FOUND and FIXED; end-to-end `testSlicesDense` re-verification initially BLOCKED by a newly-discovered, separate, pre-existing `Thread.join()` lost-wakeup bug — that bug is now FOUND and FIXED too, and `testSlicesDense` has been re-verified to run to completion
 
 **Status update: took over `C:\craton\CratonVM-es-ivfknn-slicesdense-closure-20260717`

@@ -4,7 +4,7 @@ Status: FIXED (2026-07-19, `vm/src/threading/monitor.rs` + `vm/src/vm/vm_exec.rs
 
 Discovered 2026-07-19 while doing full end-to-end verification of the
 IVFKnn stale-precise-root-mirror fix (see
-[`ES-HANG-20260709-...-3ff8aa1c4b.md`](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md)).
+[`ES-HANG-20260709-...-3ff8aa1c4b-FIXED.md`](ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b-FIXED.md)).
 **Not caused by, or related to, that fix** — confirmed to reproduce
 identically on a clean, unmodified `origin/dev` build. This is a
 separate, pre-existing CratonVM defect, first observed on this Windows
