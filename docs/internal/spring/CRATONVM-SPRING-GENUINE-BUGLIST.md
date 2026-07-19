@@ -2189,6 +2189,51 @@ tied to the `@CompileWithForkedClassLoader` fork-loader path used only by that A
 still open, not further investigated here; see §2's `TestContextAotGeneratorIntegrationTests`
 entry for the original finding.
 
+**2026-07-19 addendum (separate session) -- attempted to reproduce this residual and
+processAheadOfTimeWithBasicTests' QDox parser NPE together; BOTH remain unconfirmed, blocked
+before reaching either bug.** Set up a from-scratch `spring-orm`+`spring-test` real-JDK-25
+classpath and ran `TestContextAotGeneratorIntegrationTests.processAheadOfTimeWithXmlTests` and
+`.processAheadOfTimeWithBasicTests` directly. Both hung for 15-20+ minutes with zero stdout
+progress; gdb stack sampling (several samples per process, minutes apart, showing genuinely
+different call sites each time -- not a stuck/cyclic loop) traced this to Spring's own context
+bootstrap pulling in Hibernate Validator, whose `Validation.buildDefaultValidatorFactory()`
+constraint-metadata introspection is severely slow on CratonVM. Isolated with a minimal,
+Spring-free standalone repro (`HibernateValidatorProbe.java`: just
+`Validation.buildDefaultValidatorFactory()` + `validator.validate(bean)`, no AOT/fork-loader
+involved at all) -- HotSpot completes it in 545ms; CratonVM was still running after 6+ minutes.
+
+Found and fixed one real, independent contributing bug along the way: `native-builtins/src/lib.rs`'s
+`native_object_hash_code`/`native_object_equals`/`native_object_clone` (backing
+`Object`'s default hashCode()/equals()/clone()) each had an UNGUARDED
+`std::env::var_os("CRATONVM_DBG_*")` call directly on the hot path -- a global-lock syscall paid
+on every single call, not just when the flag is set. These are among the hottest natives in the
+VM (every default-identity `HashMap`/`HashSet` operation dispatches through them), and
+Hibernate Validator's own metadata caching is exactly this kind of Map-heavy code. Fixed with the
+same cached-`OnceLock<bool>` pattern this file already uses elsewhere (`route_ec_to_real`) --
+notably, `vm/src/runtime/env_cache.rs` already has a correctly-cached accessor for this exact
+`CRATONVM_DBG_VDISP` flag (`dbg_vdisp()`, whose own doc comment warns "must not call into the
+process environment on every dispatch") but `native-builtins` cannot depend on the `vm` crate,
+so this particular copy of the check was never migrated. Landed on `dev` at `e76f8ea21`.
+
+**This fix alone does NOT resolve the overall slowness.** Repeated gdb sampling after the fix
+still showed the `HibernateValidatorProbe` repro taking 6+ minutes and climbing, cycling through
+a wide variety of different interpreter-dispatch and `HashMap`-lookup call sites each sample --
+confirmed genuine, broadly-distributed interpreter throughput overhead on this reflection-heavy
+bootstrap workload, not a single discrete bug, matching the same "interpreter throughput, not a
+correctness bug" category already documented elsewhere in this doc (e.g.
+`BeanRegistrationsAotContributionTests`). Out of scope to fix comprehensively in this session.
+
+**Net result: neither the original `GroovySystem.<clinit>` `ArrayStoreException` (this entry)
+nor the QDox `Parser.yylex` NPE (`processAheadOfTimeWithBasicTests`, tracked in §2) was actually
+reached or tested this session** -- both remain exactly as open/unconfirmed as before this
+addendum. A future session needs either (a) much longer timeouts (an hour or more per test
+method may be required at current throughput), or (b) a way to bypass/short-circuit Hibernate
+Validator's bootstrap in the repro classpath (e.g. omit `hibernate-validator`/`jakarta.el` from
+the test classpath if the specific test method doesn't actually require JSR-303 validation, or
+target the Groovy/QDox code paths with a narrower, purpose-built repro that never touches
+`PersistenceAnnotationBeanPostProcessor`-style validator-bootstrapping infrastructure) to actually
+reach and test the Groovy- and QDox-specific code once past this bottleneck.
+
 **Real root cause (found via a from-scratch investigation, not the originally-hypothesized
 `ArrayStoreException`/`ATNConfig` leads -- both explicitly ruled out; see below):**
 `native-builtins/src/lib.rs` registered `java/util/ArrayList$ListItr`'s `set(Object)`,
@@ -2455,7 +2500,7 @@ touch classloading).
 
 **Cluster #1 is now fully closed.**
 
-#### Cluster #2 (Spring bean-type-matching for Groovy "instance scripts") -- root cause narrowed, not yet fixed
+#### Cluster #2 (Spring bean-type-matching for Groovy "instance scripts") -- root cause narrowed here, FIXED 2026-07-19 session 3 (see below)
 
 Built a minimal standalone driver (`BeanTypeProbe.java`, `/data/tmp/` on the Azure host) loading
 `groovyContext.xml` directly and calling `getBeanNamesForType(Messenger.class)`,
@@ -2638,6 +2683,71 @@ implements Messenger`) and the rename-based confirmation (`class GroovyMessenger
 pass) as the fast pass/fail oracle. Check specifically whether that resolution path is scoped to
 the referencing class's own defining loader or falls through to a global/first-match lookup when
 multiple `UserDefined` loaders each hold a class of the exact same name.
+
+### Groovy cluster follow-up 2026-07-19 (session 3) -- cluster #2 CLOSED (fixed)
+
+Continuing the "concrete next step" from the previous session's writeup directly above: the
+`CONSTANT_Class` resolution path for `new GroovyMessenger()` (`resolve_class_loader_aware`,
+backing `Instruction::New`) was instrumented and RULED OUT as the site -- it resolves correctly
+and consistently to distinct, correct `ClassId`s for both scripts every time (traced via a
+temporary `CRATONVM_DBG_NEWRESOLVE` gate, since reverted). The generic invokedynamic bootstrap's
+`StaticArg::Class` resolution path was also traced and ruled out (zero hits for this scenario).
+
+**Actual root cause found**: `javap` on the real Groovy-5.0.7-compiled `Script` subclass shows
+that `new GroovyMessenger()` does NOT compile to bytecode `new` + `invokespecial` at all -- it
+compiles to `ldc GroovyMessenger.class` followed by `invokedynamic init:(Ljava/lang/Class;)
+Ljava/lang/Object;`, dispatched through Groovy's real `IndyInterface.bootstrap`. That indy call
+site's target ultimately resolves to a `java.lang.invoke.MethodHandle` built by
+`Lookup.findConstructor(Class, MethodType)` (`MH_KIND_CONSTRUCTOR` in
+`native-builtins/src/lang_invoke.rs`). Tracing every `mh_dispatch` call via the existing
+(pre-instrumented) `CRATONVM_DBG_MH_DISPATCH` gate showed the exact divergence: for the second
+script, dispatch reaches `class=.../GroovyMessenger name=<init> desc="()V" kind=3 bound=None
+argc=0` and then simply stops -- no nested `<init>` body execution, no `println` inside the
+constructor, straight to a `null` result. For the first script the identical `kind=3` dispatch is
+immediately followed by the constructor body actually running.
+
+The bug: `lookup_find_constructor` (`Lookup.findConstructor` native) received the caller's own
+resolved `Class` mirror (`class_obj`, unambiguous -- it came from a real object reference) but
+discarded that identity and stored only the class's binary NAME STRING on the constructor
+`MethodHandle`. `MH_KIND_CONSTRUCTOR` dispatch (`mh_dispatch`) then re-resolved that name via
+`ctx.ensure_class_initialized(&class)` -- the same loader-blind, "one class per name" global
+lookup already documented as the recurring failure shape in this doc (`find_class_by_name`,
+`get_loaded_class_id`). Once the SECOND `GroovyMessenger` (a distinct class under a distinct
+`GroovyClassLoader$InnerLoader`) is loaded, this name now maps ambiguously; `ensure_class_
+initialized` returns `Err`, and the dispatch arm swallows that as a silent `Ok(Object(None))` --
+matching the observed "no exception, constructor never runs, bean resolves to `NullBean`"
+signature exactly. `Lookup.unreflectConstructor` (used by `Constructor.newInstance`-style
+reflective construction) had the identical shape: it discards an already-known `class_id` down to
+a name string on the `MethodHandle` it builds.
+
+**Fix** (`native-builtins/src/lang_invoke.rs`, `vm/src/runtime/interpreter.rs`): `lookup_find_
+constructor` and `lookup_unreflect_constructor` now stash the ALREADY-RESOLVED `ClassId` (from
+`class_obj`/`class_id`, both unambiguous at that point) in the constructor `MethodHandle`'s
+otherwise-unused `MH_BOUND` slot. `MH_KIND_CONSTRUCTOR` dispatch prefers that stashed `ClassId`
+when present -- via the existing `ensure_class_initialized_with_class_id`/`invoke_by_class_id`
+trait methods (already used by reflection's `Method.invoke()` for the identical class of bug) --
+and only falls back to the name-based resolution when no `ClassId` was stashed. Also extended the
+`invokespecial` `dispatch_override` gate in `execute_invoke_kind` to fire for any
+`GroovyClassLoader`-defined referencing class (mirroring `should_use_loader_initiated_resolution`'s
+existing carve-out for `resolve_class_loader_aware`), not just the global
+`CRATONVM_LOADER_AWARE_RESOLUTION` flag -- a related but non-triggering gap found along the way
+(genuine `invokespecial` bytecode from a Groovy-defined class now gets the receiver-precise
+dispatch it already gets when the global gate is on).
+
+**Verified**: `GroovyScriptFactoryTests` 38/38 (was 34/38 before this fix -- the 4 residuals
+`staticScriptWithInstance`, `staticScriptWithInlineDefinedInstance`,
+`staticScriptWithInlineDefinedInstanceUsingJsr223`, `inlineJsr223FromTag` all now pass), plus
+`GroovyAspectTests` 4/4, `GroovyAspectIntegrationTests` 4/4, `GroovyClassLoadingTests` 1/1,
+`GroovyScriptEvaluatorTests` 8/8 -- all still passing (no regression from cluster #1's fix or the
+`invokespecial` gate widening). `cargo test -p cratonvm-native-builtins --lib --release`: 3031
+passed, 2 pre-existing unrelated failures (`jca::key_factory`, `phases_late` Windows-path test,
+neither touched by this change). `cargo test -p cratonvm-vm --lib --release`: 2210 passed, 17
+pre-existing unrelated failures (JIT skip-list eligibility gates and `lock_order` enforcement
+tests that require a debug build -- release-mode artifacts, unrelated to this change). Landed on
+`dev` at commit `5d30660eb` (merge `ff15c8bd8`).
+
+This closes the Groovy scripting cluster: both cluster #1 (2026-07-19 session 2) and cluster #2
+(this entry) are now fixed and merged.
 
 ### 6 found=0 ABEND cluster — reconciled
 
