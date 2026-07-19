@@ -562,16 +562,25 @@ regress:
    through the isolated loader.
 
 A full regression sweep across all ~29 classes in the "Affected classes"
-table below (post dev-drift-merge binary) confirmed every class that
-previously HUNG now completes; every class-level failure this doc's fix
-work directly investigated (the 3 residuals above, plus
+table below, run against the pre-drift-merge binary, confirmed every class
+that previously HUNG now completes, and surfaced 12 classes with one or more
+newly-exposed test failures (the 3 residuals above, plus
+`JerseySameManagementContextConfigurationTests`,
+`Log4J2MetricsWithLog4jLoggerContextAutoConfigurationTests`,
+`LogbackMetricsAutoConfigurationWithLog4j2AndLogbackTests`,
 `WebMvcEndpointManagementContextConfigurationTests`,
-`OAuth2AuthorizationServerAutoConfigurationTests`, and
-`ValidationAutoConfigurationWithHibernateValidatorMissingElImplTests`, which
-surfaced single-test failures mid-sweep before the drift merge) passed
-cleanly once re-run against the post-merge binary — consistent with the
-residuals above being resolved by the same unrelated upstream fixes, not
-independently re-verified one-by-one for these last 3.
+`OAuth2AuthorizationServerAutoConfigurationTests`,
+`ValidationAutoConfigurationWithHibernateValidatorMissingElImplTests`,
+`DataRedisAutoConfigurationJedisTests` (23/23),
+`DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+`DataRedisHealthContributorAutoConfigurationTests`). After merging ~106
+commits of `origin/dev` drift into the fix branch (pulling in unrelated
+fixes already landed by other concurrent sessions working this same repo)
+and rebuilding, **every one of these 12 classes was individually re-run and
+now passes with zero failures** — the entire affected-classes cluster is
+clean. None of these 9 beyond the original 3 residuals were independently
+root-caused; they're recorded here only as data points confirming the
+drift-merge resolution was thorough, not narrow.
 
 ## Affected classes
 
