@@ -495,8 +495,14 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // with the TLS, losing the marker's only record of overwritten
     // references. Cheap no-op when no marking cycle is active.
     shared.heap.flush_thread_satb();
-    // BUG-03 — stop publishing this thread's TLAB address before the box is
-    // dropped, so the collector can never read a dangling pointer.
+    // Retire the TLAB: install its tail filler and reset, so the unfilled tail
+    // is walkable BEFORE this thread stops publishing its tail.  Clearing the
+    // registry entry or marking it dead first lets a later non-moving sweep
+    // observe raw zeroed tail bytes with no owner from which to recover a skip
+    // span, desynchronizing the linear walk.
+    jt.tlab.retire();
+    // The tail is now a real walker-visible filler, so it is safe to remove
+    // the address before the boxed `JvmThread` is dropped.
     shared.thread_registry.clear_tlab_addr(tid);
     // Drop out of `alive_count` / STW `expected` before reclaiming the TLAB so a
     // subsequent `request_stw` no longer waits for this thread.
@@ -506,11 +512,6 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // release anything it still holds so no future locker waits forever
     // (see `MonitorTable::release_monitors_held_by`).
     shared.monitors.release_monitors_held_by(tid);
-    // Retire the TLAB: install its tail filler and reset, so the unfilled tail
-    // is walkable to the sweep and the freed buffer is never handed back out
-    // (the terminating-worker discipline — see jvm_thread/tlab). Dropping the
-    // box then frees frames/pools.
-    jt.tlab.retire();
     drop(jt);
     FOREIGN_CALL_DEPTH.with(|c| c.set(0));
     true
@@ -714,6 +715,11 @@ fn aio_dispatcher_main() {
     if let Some(shared) = process_vm() {
         if let Some(tid) = with_foreign_thread(|jt| jt.thread_id) {
             shared.gc_barrier.mark_blocked_region_leave_after(|| {
+                // Keep the retiring tail and the liveness transition in the
+                // barrier-serialized closure. A new STW must not observe this
+                // thread as dead before the tail has become walkable.
+                with_foreign_thread(|jt| jt.tlab.retire());
+                shared.thread_registry.clear_tlab_addr(tid);
                 shared.thread_registry.mark_dead(tid);
                 shared.monitors.release_monitors_held_by(tid);
             });
@@ -6518,18 +6524,21 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
         }
         if let Some(shared) = process_vm() {
             let tid = with_foreign_thread(|jt| jt.thread_id);
-            // Mark dead and leave the idle blocked region as one barrier
-            // transition, so request_stw_counted cannot observe this thread as
-            // dead while it is still included in the blocked count.
+            // Retire the tail, remove its published address, and mark dead in
+            // the same barrier-serialized transition. This prevents a new STW
+            // from seeing either an unwalkable tail or a dead thread that is
+            // still counted as blocked.
             if let Some(tid) = tid {
                 shared.gc_barrier.mark_blocked_region_leave_after(|| {
+                    with_foreign_thread(|jt| jt.tlab.retire());
+                    shared.thread_registry.clear_tlab_addr(tid);
                     shared.thread_registry.mark_dead(tid);
                     shared.monitors.release_monitors_held_by(tid);
                 });
             } else {
                 shared.gc_barrier.mark_blocked_region_leave();
             }
-            // Reclaim: mark_dead (idempotent) + retire the (empty) TLAB + drop.
+            // Reclaim the already-retired attachment.
             detach_foreign_thread(&shared);
         } else {
             // No live VM (process shutdown) — just drop our owned box.
@@ -6958,7 +6967,7 @@ mod tests {
         let message = CString::new("native provider unavailable").unwrap();
 
         set_jni_context(&vm.shared);
-        set_jni_thread(&mut vm.main_thread as *mut _);
+        set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
             jni_throw_new(get_jni_env(), class_id.as_u32() as JClass, message.as_ptr(),),
             JNI_OK

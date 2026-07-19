@@ -3646,6 +3646,13 @@ pub struct JitMICSlot {
 }
 
 impl JitMICSlot {
+    /// Temporary class-id value used while publishing a new cache entry.
+    ///
+    /// The generated code compares the receiver id before loading the target;
+    /// keeping the guard non-matching until *all* companion fields are ready
+    /// makes the publication atomic from its point of view. Class ids are
+    /// allocated densely from zero and never use this all-ones reservation.
+    const INSTALLING_CLASS_ID: u32 = u32::MAX;
     /// Byte offset of [`Self::cached_class_id`] from the start of the
     /// struct. JIT codegen uses this to emit
     /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
@@ -3679,31 +3686,73 @@ impl JitMICSlot {
 
     /// Update all cached fields after a cache miss.
     pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
-        // cceres2: on a RETARGET (cached class X -> new class Y) a reader that
-        // already matched the old class_id can pair the NEW entry_ptr with the
-        // OLD needs_context (or call a different method's entry under the old
-        // guard). Invalidate the guard first so in-flight readers miss to the
-        // helper instead. This narrows (does not fully close — a reader past
-        // its guard load can still tear; the marshalling choke points now
-        // re-derive the ABI flag from the entry's own CompiledMethod) the
-        // window; first-install (0 -> X) keeps the BUG-24 publish order below.
-        let prev = self
-            .cached_class_id
-            .load(std::sync::atomic::Ordering::Acquire);
-        if prev != 0 && prev != class_id {
-            self.cached_class_id
-                .store(0, std::sync::atomic::Ordering::Release);
+        use std::sync::atomic::Ordering;
+
+        // A raw inline MIC has no helper boundary between its guard load and
+        // indirect CALL. Retargeting a populated slot can therefore pair one
+        // receiver's class guard with another receiver's entry. Make the slot
+        // monomorphic for its lifetime: reserve an empty slot with CAS, publish
+        // its companion fields, then publish the class id last. A different
+        // receiver simply takes the ordinary helper path; this is slower only
+        // for polymorphic sites and cannot redirect native control flow.
+        //
+        // `prepopulate` seeds `cached_class_id` from profiling data with
+        // `cached_entry_ptr` still 0 (a guard hint, not an installed target).
+        // Treat that shape as an empty slot for THIS class id too — otherwise
+        // the very first `update` for the profiled-dominant receiver would
+        // match `id == class_id` and return before ever publishing an entry,
+        // permanently stranding the slot at "unresolved" for its whole
+        // lifetime.
+        loop {
+            let current = self.cached_class_id.load(Ordering::Acquire);
+            if current == class_id {
+                if self.cached_entry_ptr.load(Ordering::Acquire) != 0 {
+                    // Already fully installed for this class: idempotent no-op.
+                    return;
+                }
+                if self
+                    .cached_class_id
+                    .compare_exchange(
+                        class_id,
+                        Self::INSTALLING_CLASS_ID,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+                continue;
+            }
+            match current {
+                0 => {
+                    if self
+                        .cached_class_id
+                        .compare_exchange(
+                            0,
+                            Self::INSTALLING_CLASS_ID,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                Self::INSTALLING_CLASS_ID => std::hint::spin_loop(),
+                _ => return,
+            }
         }
-        // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
-        // (which checks class_id first, then loads entry_ptr) can never observe
-        // the new class id paired with a stale entry_ptr.
+        // Publish entry_ptr BEFORE class_id so the inline cache reader (which
+        // checks class_id first, then loads entry_ptr) never observes a class
+        // id paired with stale target metadata.
         self.cached_entry_ptr
-            .store(entry_ptr, std::sync::atomic::Ordering::Release);
+            .store(entry_ptr, Ordering::Release);
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
-            .store(needs_context, std::sync::atomic::Ordering::Relaxed);
+            .store(needs_context, Ordering::Relaxed);
         self.cached_class_id
-            .store(class_id, std::sync::atomic::Ordering::Release);
+            .store(class_id, Ordering::Release);
     }
 
     /// Drop only the compiled-entry half of the MIC.
@@ -5341,6 +5390,55 @@ pub fn jit_direct_call_requires_dispatch(
     jit_recursive_cycle_methods().read().contains(&key)
 }
 
+/// Enables raw, machine-code JIT-to-JIT direct calls to a compiled callee:
+/// eager callee-compile-and-direct-CALL in this function's caller
+/// (`try_compile_inner`) and the inline virtual MIC fast path (`x64.rs`).
+/// (`vm/src/jit/helpers.rs`'s OWN separate dispatch-helper direct-entry cache
+/// — `jit_invoke_dispatch`/`jit_invoke_virtual_mic`'s cached `entry_ptr` path
+/// — is a different, still-default-OFF gate,
+/// `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY`: it has its own separate,
+/// still-open target-resolution bug on top of the RBP-mirror race below, so
+/// it does not share this flag's default.) This includes calls this JIT's
+/// own self-recursion detection does not resolve to the dedicated
+/// `self_call_patches` fast path (e.g. `BenchSuite.make`/`check`'s tiered
+/// background-compile route) — the flag being off routed those through the
+/// full `jit_invoke_dispatch` helper on every call, a ~15x regression on
+/// bintrees16 (44s vs. 2.9s) that generalizes to any call-heavy recursive
+/// workload, not just the ES repro this flag was introduced for.
+///
+/// A raw JIT-to-JIT CALL updates the per-thread active-RBP mirror to the
+/// callee, while the interpreter-owned root-chain entry still describes the
+/// caller until the callee's own prologue runs — a GC landing in that window
+/// can select the caller's oop map for the callee's frame and lose live
+/// roots. This exact mechanism produced the IVFKnn stress-test
+/// stale-precise-root-mirror corruption (see
+/// docs/known-issues/elasticsearch-suite/
+/// ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md).
+/// Closed by two companion fixes that ship alongside this flag:
+/// [`Compiler::emit_post_call_rbp_republish`] (re-publishes the caller's RBP
+/// after every raw JIT-to-JIT return) and `JitEntryGuard::enter_with_compiled`
+/// always retaining precise frame metadata (`vm/src/jit/conservative_roots.rs`)
+/// so `scan_compiled_frame_bands` can bound each stacked raw-call frame
+/// exactly instead of one imprecise whole-band conservative sweep. Re-enabled
+/// default-ON (re-verified against `testSlicesSparseWithFilter` /
+/// `testRandomWithFilter` / the full `cratonvm-gc`/`cratonvm-jit`/
+/// `cratonvm-vm` --lib suites — see the ES-HANG doc above for results) to
+/// close the general-throughput regression; opt out with
+/// `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` if a new corruption is ever suspected
+/// here again (matches this codebase's established off-switch convention, see
+/// [`x64::guarded_inline_getfield_enabled`]).
+///
+/// NOT OnceLock-cached (mirrors [`x64::guarded_inline_getfield_enabled`]):
+/// this is checked at JIT-compile time, never on the runtime hot path within
+/// this crate, so re-reading the env var has no measurable cost — and caching
+/// would make the flag racy against whichever test/thread compiles first.
+pub fn direct_jit_callee_calls_enabled() -> bool {
+    match std::env::var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 fn clear_jit_recursive_cycle_methods_for_test() {
     jit_recursive_cycle_methods().write().clear();
@@ -6655,6 +6753,20 @@ fn try_compile_inner(
             // dump). Skip only the direct-call/intrinsic attempts, then fall
             // through to the info construction.
             let mut planned_inline = false;
+            // A raw JIT-to-JIT CALL has no interpreter transition to validate
+            // argument roots, ABI state, or the callee's active frame. The
+            // Elasticsearch IVFKnn stress test exposed a stale precise-root
+            // mirror after a raw JIT-to-JIT CALL. x64 now republishes the
+            // caller RBP after every such return, matching the normal Rust
+            // dispatch boundary, so compiled callee calls can remain enabled.
+            // A raw JIT-to-JIT call updates the per-thread active-RBP mirror
+            // to the callee, while the interpreter-owned root-chain entry
+            // still describes the caller.  Until that transition publishes
+            // callee metadata atomically as well, a GC in the callee can
+            // select the caller's oop map for the callee frame and lose live
+            // roots.  Route through the checked re-entrant bridge instead;
+            // it installs a distinct JitEntryGuard for the actual callee.
+            let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
             if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -6686,7 +6798,8 @@ fn try_compile_inner(
                     // pays the full helper round trip per call. `needs_context`
                     // routes vm_ptr as arg 0; the helper preserves the
                     // identity-cache and pending-return rooting contracts.
-                    if invoke_kind == 3
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
                         && class_name == "java/lang/Integer"
                         && method_name == "valueOf"
                         && descriptor == "(I)Ljava/lang/Integer;"
@@ -6708,7 +6821,8 @@ fn try_compile_inner(
                             continue;
                         }
                     }
-                    if let Some(compiler) = callee_compiler.as_ref() {
+                    if direct_jit_callee_calls_enabled {
+                        if let Some(compiler) = callee_compiler.as_ref() {
                         if let Some((entry, callee_needs_ctx)) =
                             compiler(&class_name, &method_name, &descriptor)
                         {
@@ -6735,6 +6849,7 @@ fn try_compile_inner(
                                 ));
                                 continue;
                             }
+                        }
                         }
                     }
                     needs_heap = true;
@@ -6828,7 +6943,8 @@ fn try_compile_inner(
                 // site declared against it is statically monomorphic — the
                 // plain guard-free virtual direct-call path is sound, and
                 // the helper handles the null-receiver NPE itself.
-                if invoke_kind == 0
+                if direct_jit_callee_calls_enabled
+                    && invoke_kind == 0
                     && class_name == "java/lang/Integer"
                     && method_name == "intValue"
                     && descriptor == "()I"
@@ -10645,6 +10761,13 @@ mod tests {
         use std::sync::Arc;
 
         clear_jit_recursive_cycle_methods_for_test();
+        // This test exercises the direct-callee-compile path (`callee_compiler`
+        // below), which is opt-in by default — see
+        // `direct_jit_callee_calls_enabled`. Not OnceLock-cached, so setting it
+        // here is observed immediately; no other jit test asserts on
+        // invoke-info/PIC/MIC-slot counts, so this is safe under parallel
+        // `cargo test`.
+        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
 
         let a_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(1),
@@ -10758,6 +10881,7 @@ mod tests {
         );
 
         clear_jit_recursive_cycle_methods_for_test();
+        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
     }
 
     #[test]
@@ -11100,22 +11224,76 @@ mod tests {
         assert!(mic.is_monomorphic());
     }
 
+    /// A raw inline MIC has no helper boundary between its guard load and
+    /// indirect CALL, so retargeting a populated slot risks pairing one
+    /// receiver's class guard with another receiver's entry. `update` is
+    /// therefore monomorphic for the slot's lifetime: the first class to
+    /// install wins, and a later `update` for a DIFFERENT class is a no-op
+    /// (that receiver simply takes the ordinary helper path instead).
     #[test]
-    fn s33_mic_slot_update_overwrites_previous() {
+    fn s33_mic_slot_update_first_install_wins_no_retarget() {
         let mic = JitMICSlot::new();
         mic.update(1, "A", 100, false);
         mic.update(2, "B", 200, true);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
-            2
+            1
         );
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("B"));
+        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("A"));
         assert_eq!(
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
-            200
+            100
         );
+        assert!(!mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A re-`update` for the SAME class as already installed must stay a
+    /// no-op (idempotent), not tear the entry/name/context triple.
+    #[test]
+    fn s33_mic_slot_update_same_class_is_idempotent() {
+        let mic = JitMICSlot::new();
+        mic.update(1, "A", 100, false);
+        mic.update(1, "A", 999, true);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            100
+        );
+        assert!(!mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// `prepopulate` seeds only `cached_class_id` (a profile-derived guard
+    /// hint) with `cached_entry_ptr` still 0. The first `update` for that
+    /// SAME class id must still publish a real entry — this is the shape
+    /// `mark_current_jit_compile_method_recursive_cycle`'s caller
+    /// (profile-guided MIC seeding, see `try_compile_inner`) relies on.
+    #[test]
+    fn s33_mic_slot_update_resolves_prepopulated_hint() {
+        let mic = JitMICSlot::new();
+        mic.prepopulate(7);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        mic.update(7, "Hinted", 0x4242, true);
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0x4242
+        );
+        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Hinted"));
         assert!(mic
             .cached_needs_context
             .load(std::sync::atomic::Ordering::Relaxed));
