@@ -2423,31 +2423,23 @@ fn loader_aware_reflect_assignable(
         return true;
     }
 
-    // A child loader can define an entry-point class while its resolved
-    // superclass comes from the application loader.  If reflection then
-    // resolves the target through the child namespace, the two
-    // `RegistrationBean` mirrors have different ClassIds even though the
-    // source hierarchy already contains the application-loader class of that
-    // exact name.  Walk the superclass chain by name before considering the
-    // interface graph so Class.isAssignableFrom keeps the same loader-aware
-    // contract as reflective descriptor resolution.
+    let mut queue = Vec::new();
     let mut current = Some(source_class_id);
     while let Some(class_id) = current {
+        // A class defined by a user loader can extend that loader's copy of a
+        // superclass while the reflective Method mirror still carries the
+        // global copy.  The ids legitimately differ, but the superclass edge
+        // is an exact loader-resolved relation.  Treat the matching binary
+        // name as assignable just as the same-name receiver case above does.
         if ctx.class_name_of_id(class_id).as_deref() == Some(target_class_name) {
             return true;
         }
+        queue.extend(ctx.class_interfaces(class_id));
         current = ctx.superclass_of(class_id);
     }
 
     if !ctx.is_interface_class(target_class_id) {
         return false;
-    }
-
-    let mut queue = Vec::new();
-    let mut current = Some(source_class_id);
-    while let Some(class_id) = current {
-        queue.extend(ctx.class_interfaces(class_id));
-        current = ctx.superclass_of(class_id);
     }
 
     let mut seen = Vec::new();
