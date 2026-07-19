@@ -7972,7 +7972,16 @@ const CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 /// is always large enough for the synthetic writes and so tests using
 /// the MockNativeContext (which returns 0 for `class_num_total_fields`)
 /// still have room.
-const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 6;
+/// Constructor mirrors share the same `mock_jdk_field_slot` synthetic
+/// slot map as Method (see `test_utils.rs`), which now runs up through
+/// slot 12 (`annotationDefault`) after the G2 additions
+/// (`exceptionTypes`/`annotations`/`parameterAnnotations`/`annotationDefault`)
+/// -- the floor must stay >= those slots so `constructor_extra_base`'s
+/// `CONSTRUCTOR_EXTRA_OFFSET_*` writes don't land on and clobber a
+/// still-in-use named field (e.g. floor 6 + `PARAM_COUNT` offset 1 = 7,
+/// which collided with `parameterTypes`'s own mock slot 7). Mirrors the
+/// identical `METHOD_NUM_FIELDS_LEGACY_FLOOR` fix.
+const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
 
 #[cfg(test)]
 const CONSTRUCTOR_NUM_FIELDS: usize = CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR;

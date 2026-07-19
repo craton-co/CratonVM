@@ -1647,12 +1647,29 @@ fn value_to_string(
                 // a third, distinct call site. Route through the same
                 // display-string helper the registered `Path.toString()` native
                 // itself uses, bypassing `invoke_virtual` entirely for this type.
+                //
+                // NOTE: must use the ClassId-based `is_subclass_of` (which walks
+                // both the superclass chain AND implemented interfaces), not
+                // `ClassManager::is_subclass_of_by_name` — that one is the
+                // exception-`catch_type` fallback and deliberately walks ONLY
+                // the superclass chain (interfaces are never a `catch_type`),
+                // so it can never match an interface like `Path` and this
+                // branch would silently never fire. (A concurrent dev commit
+                // added this same check using `is_subclass_of_by_name` — that
+                // version never actually fires; confirmed via a standalone
+                // `"file:" + Paths.get(...)` repro that still printed
+                // `file:java.nio.file.Path@<hash>` until switched to
+                // `is_subclass_of`.)
                 let obj_class_id = shared.heap.class_id_of(*obj_ref);
-                if shared
-                    .class_manager
-                    .read()
-                    .is_subclass_of_by_name(obj_class_id, "java/nio/file/Path")
-                {
+                let is_path = ctx
+                    .class_id_by_name("java/nio/file/Path")
+                    .is_some_and(|path_cid| {
+                        shared
+                            .class_manager
+                            .read()
+                            .is_subclass_of(obj_class_id, path_cid)
+                    });
+                if is_path {
                     return cratonvm_native_builtins::phases_late::p57_path_display_string(
                         &mut ctx, *obj_ref,
                     );
