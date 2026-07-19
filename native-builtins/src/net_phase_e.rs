@@ -1756,7 +1756,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -3855,8 +3855,18 @@ fn re2_bind_listener(
         TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
+    // A wildcard listener address (0.0.0.0 / ::) is a valid bind target but
+    // not a valid client connect destination on Windows (WSAEADDRNOTAVAIL /
+    // os error 10049) — publish the loopback address instead, mirroring
+    // `native-io/src/socket_channel.rs::advertised_listener_host` (same
+    // rationale, sibling crate, duplicated rather than shared per this
+    // module's existing cross-crate-table pattern above).
     let actual_host = local_addr
-        .map(|a| a.ip().to_string())
+        .map(|a| match a {
+            SocketAddr::V4(a) if a.ip().is_unspecified() => "127.0.0.1".to_string(),
+            SocketAddr::V6(a) if a.ip().is_unspecified() => "::1".to_string(),
+            _ => a.ip().to_string(),
+        })
         .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {
@@ -4507,6 +4517,23 @@ const HUC_BODY: usize = 6;
 const HUC_DO_INPUT: usize = 7;
 const HUC_DO_OUTPUT: usize = 8;
 const HUC_CONNECTED: usize = 9;
+// Field 10 caches the `java/util/jar/JarFile` returned by
+// `JarURLConnection.getJarFile()` so repeat calls see the SAME instance
+// (matching `sun.net.www.protocol.jar.JarURLConnection`, which opens the
+// JarFile once and caches it). Without this, each call minted a fresh
+// JarFile, so closing the jar via one reference never affected another —
+// Spring Boot's `StaticResourceJarsTests.closesJarFromNonCachedConnection`
+// expects `getJarFile().getComment()` to see the CLOSED state after
+// `StaticResourceJars` already closed the connection's jar.
+const HUC_JAR_FILE: usize = 10;
+// Tracks `URLConnection.useCaches` for the `java/net/JarURLConnection`
+// carrier (see the class-scoped `setUseCaches`/`getUseCaches` registrations
+// below `getJarFile`). Reuses HUC_CODE's slot: never read or written by any
+// JarURLConnection-specific native (HUC_CODE only matters for an HTTP
+// response code), and — unlike field 11, which was tried first and proved
+// to silently not persist across calls — sits inside the confirmed-safe
+// 0..=10 field range for this carrier.
+const HUC_USE_CACHES: usize = HUC_CODE;
 
 struct HttpResponse {
     status: i32,
@@ -5980,9 +6007,26 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // concrete HTTP connection without response state and returns EOF.
             if let Some(raw_path) = ext.strip_prefix("file:") {
                 let decoded = uri_percent_decode(raw_path);
-                let mut path = decoded.trim_start_matches('/').to_string();
+                // POSIX: the URL's decoded path (e.g. `/data/data/...`) IS
+                // the absolute filesystem path already -- keep it intact.
+                // Windows: strip the leading `/` and, for the MSYS/Cygwin-
+                // style `/c/...` form (no colon), reinject the drive-letter
+                // colon (`c/foo` -> `c:/foo`) so `new File(path)` resolves.
+                // A prior version unconditionally stripped every leading
+                // `/` before this cfg split existed, so on Linux a `file:`
+                // `URL.openConnection()` built a File from a now-RELATIVE
+                // path (resolved against the JVM's cwd instead of `/`) --
+                // silently breaking every real-bytecode `FileURLConnection`
+                // caller (Xerces DTD/schema entity resolution, WAR resource
+                // loading, ...) whenever the cwd wasn't the fixture root.
+                // `URL.openStream()`'s sibling fast path a few dozen lines
+                // up masked this by retrying with the untrimmed absolute
+                // path on failure; this constructor-based path had no such
+                // fallback. See docs/known-issues/tomcat-08-07/
+                // silent-hang-no-signature-cluster.md.
                 #[cfg(windows)]
-                {
+                let path = {
+                    let mut path = decoded.trim_start_matches('/').to_string();
                     let bytes = path.as_bytes();
                     if bytes.len() >= 2
                         && bytes[0].is_ascii_alphabetic()
@@ -5990,7 +6034,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     {
                         path.insert(1, ':');
                     }
-                }
+                    path
+                };
+                #[cfg(not(windows))]
+                let path = decoded.clone();
                 let file = match ctx.new_object("java/io/File")? {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),
@@ -6124,6 +6171,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/util/jar/JarFile;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Cached from a prior call — return the SAME instance so a
+            // caller that closes it (e.g. `StaticResourceJars` on a
+            // non-cached connection) observes the closed state on every
+            // later `getJarFile()` call, matching real-JDK's cached
+            // `sun.net.www.protocol.jar.JarURLConnection.jarFile` field.
+            if let Value::Object(Some(cached)) = ctx.get_field(this, HUC_JAR_FILE) {
+                return Ok(Some(Value::Object(Some(cached))));
+            }
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
@@ -6191,6 +6246,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
             )?;
+            ctx.set_field(this, HUC_JAR_FILE, Value::Object(Some(jar_file)));
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
@@ -6301,6 +6357,55 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
+    // JarURLConnection.setUseCaches(boolean) / getUseCaches() — class-scoped
+    // override (more specific than the base-class no-op above, so it wins
+    // in dispatch for actual JarURLConnection-carrier instances) giving
+    // real get/set semantics instead of the base no-op / real-bytecode
+    // fallback, which always answered `false` regardless of what a caller
+    // set. That made `StaticResourceJars.isResourcesJar(JarURLConnection)`'s
+    // `closeJarFile = !connection.getUseCaches()` unconditionally close a
+    // cached JarFile (see HUC_JAR_FILE, above) even on a `useCaches(true)`
+    // connection, breaking `StaticResourceJarsTests
+    // .doesNotCloseJarFromCachedConnection` once `getJarFile()` started
+    // returning the same instance across calls.
+    //
+    // Storage: reuses HUC_USE_CACHES (field 2, aka HUC_CODE — never read or
+    // written by any JarURLConnection-specific native; only meaningful for
+    // an HTTP response code). Field 11 was tried first and DISCARDED: this
+    // carrier's real backing class (`java/net/JarURLConnection`) apparently
+    // reports a real total-field count of 11 (fields 0..=10), so index 11
+    // silently failed to persist across calls — confirmed empirically with
+    // a probe (`set` landed, the very next `get` read back the unset
+    // default). Field 2 sits well inside the confirmed-persisting 0..=10
+    // range (field 10, HUC_JAR_FILE, is proven reliable elsewhere in this
+    // file), so this is the safe choice, not merely the convenient one.
+    r.register(
+        "java/net/JarURLConnection",
+        "setUseCaches",
+        "(Z)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let v = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
+            ctx.set_field(this, HUC_USE_CACHES, Value::Int(if v { 1 } else { 0 }));
+            Ok(None)
+        },
+    );
+    r.register(
+        "java/net/JarURLConnection",
+        "getUseCaches",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Unset (never called setUseCaches): real-JDK default is `true`
+            // for every protocol except `file:`, which this carrier never
+            // represents (file: uses the real FileURLConnection class).
+            let v = match ctx.get_field(this, HUC_USE_CACHES) {
+                Value::Int(n) => n != 0,
+                _ => true,
+            };
+            Ok(Some(Value::Int(if v { 1 } else { 0 })))
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "getContentLength",
@@ -8855,14 +8960,16 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let body =
                 alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            let bytes = match args.first().copied() {
-                Some(Value::Object(Some(arr))) => {
-                    String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
-                }
-                _ => String::new(),
-            };
-            let s = ctx.create_string(&bytes);
-            ctx.set_field(body, 0, Value::Object(Some(s)));
+            // A request body is binary data.  Keeping it as a String replaces
+            // every non-UTF-8 byte with U+FFFD, then re-encodes that character
+            // as EF BF BD when `re5_request_body_bytes` builds the wire body.
+            // This was invisible for textual HTTP requests but corrupted gzip,
+            // protobuf, and arbitrary binary `ofByteArray` payloads.
+            ctx.set_field(
+                body,
+                0,
+                args.first().copied().unwrap_or(Value::Object(None)),
+            );
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -12112,7 +12219,7 @@ mod tests {
     }
 
     #[test]
-    fn re5_body_publishers_of_byte_array_reads_static_arg_slot_zero() {
+    fn re5_body_publishers_of_byte_array_preserves_binary_static_arg_slot_zero() {
         let mut registry = NativeMethodRegistry::new();
         register_re5_http_client(&mut registry);
         let native = registry
@@ -12124,21 +12231,24 @@ mod tests {
             .expect("ofByteArray native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let bytes = ctx.new_array(ArrayElementType::Byte, 3);
-        ctx.set_array_element(bytes, 0, Value::Int(b'a' as i32));
-        ctx.set_array_element(bytes, 1, Value::Int(b'b' as i32));
-        ctx.set_array_element(bytes, 2, Value::Int(b'c' as i32));
+        let bytes = ctx.new_array(ArrayElementType::Byte, 4);
+        for (index, byte) in [0x1f_u8, 0x8b, b'a', 0xff].into_iter().enumerate() {
+            ctx.set_array_element(bytes, index, Value::Int(byte as i8 as i32));
+        }
 
         let publisher = match native(&mut ctx, &[Value::Object(Some(bytes))]).unwrap() {
             Some(Value::Object(Some(publisher))) => publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
         };
-        let body = match ctx.get_field(publisher, 0) {
-            Value::Object(Some(body)) => body,
-            other => panic!("expected publisher body string, got {other:?}"),
-        };
-
-        assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
+        assert!(matches!(
+            ctx.get_field(publisher, 0),
+            Value::Object(Some(body)) if body == bytes
+        ));
+        let stored = ctx.get_field(publisher, 0);
+        assert_eq!(
+            re5_request_body_bytes(&mut ctx, stored).unwrap(),
+            [0x1f, 0x8b, b'a', 0xff]
+        );
     }
 
     fn re5_test_byte_buffer(ctx: &mut MockNativeContext, bytes: &[u8]) -> ObjectRef {

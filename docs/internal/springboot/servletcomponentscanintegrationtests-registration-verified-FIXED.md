@@ -2,6 +2,14 @@
 
 **Status: FIXED — verified 2026-07-18**
 
+> **UPDATE 2026-07-18 (later same day):** `indexedComponentsAreRegistered()`
+> regressed again on later `dev` tip (a genuine `URLClassLoader.getResourceAsStream`
+> real-JDK-mode gap, unrelated to this doc's original AOT-index registration
+> finding) and was root-caused and fixed — see
+> [`urlclassloader-getresourceasstream-real-jdk-mode-dead-FIXED.md`](urlclassloader-getresourceasstream-real-jdk-mode-dead-FIXED.md).
+> The verification below is retained for its own evidence trail but is no
+> longer the current closure for this class.
+
 ## Original symptom
 
 The 2026-07-17 Spring Boot rerun reported that

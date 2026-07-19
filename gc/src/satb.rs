@@ -108,8 +108,7 @@ pub(crate) const SATB_DRAINING: u8 = 2;
 /// object can be freed mid-mark). Such buffers are parked in
 /// [`ORPHANED_SATB_BUFFERS`] by [`SatbBufferGuard::drop`] and drained/reaped
 /// by [`flush_all_thread_satb_buffers`] at the remark STW pause.
-static SATB_BUFFER_REGISTRY: Mutex<Vec<Weak<Mutex<ThreadSatbPartitions>>>> =
-    Mutex::new(Vec::new());
+static SATB_BUFFER_REGISTRY: Mutex<Vec<Weak<Mutex<ThreadSatbPartitions>>>> = Mutex::new(Vec::new());
 
 /// Buffers of exited threads that still hold undrained SATB entries (see the
 /// dying-thread note on [`SATB_BUFFER_REGISTRY`]). Strong `Arc`s: the owning
@@ -117,8 +116,7 @@ static SATB_BUFFER_REGISTRY: Mutex<Vec<Weak<Mutex<ThreadSatbPartitions>>>> =
 /// until [`flush_all_thread_satb_buffers`] folds them into their queues and
 /// reaps the emptied buffer (a dead thread can never log again, so an
 /// emptied orphan stays empty).
-static ORPHANED_SATB_BUFFERS: Mutex<Vec<Arc<Mutex<ThreadSatbPartitions>>>> =
-    Mutex::new(Vec::new());
+static ORPHANED_SATB_BUFFERS: Mutex<Vec<Arc<Mutex<ThreadSatbPartitions>>>> = Mutex::new(Vec::new());
 
 /// RAII wrapper stored in TLS so thread exit can decide the fate of the
 /// buffer: an EMPTY buffer just dies (its registry `Weak` stops upgrading and
@@ -1222,10 +1220,7 @@ mod tests {
             flush_all_thread_satb_buffers(&qa);
             let a = qa.drain();
             assert!(a.contains(&SA), "qa must receive its own entry, got {a:?}");
-            assert!(
-                !a.contains(&SB),
-                "qa stole qb's thread-local entry: {a:?}"
-            );
+            assert!(!a.contains(&SB), "qa stole qb's thread-local entry: {a:?}");
 
             // ...and qb's entry is still intact for qb's own remark.
             let b = qb.deactivate_and_drain();

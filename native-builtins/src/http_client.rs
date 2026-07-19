@@ -451,7 +451,11 @@ pub(crate) struct WireResponse {
 fn read_retry<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::Interrupted || e.raw_os_error() == Some(4) =>
+            {
+                continue
+            }
             result => return result,
         }
     }
@@ -539,8 +543,7 @@ fn read_http1_response<S: Read>(stream: &mut S) -> Result<WireResponse, String> 
     if let Some(target) = target {
         let target = target.min(MAX_RESPONSE_BODY);
         while body_buf.len() < target {
-            let n = read_retry(stream, &mut tmp)
-                .map_err(|e| format!("body read: {e}"))?;
+            let n = read_retry(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -550,8 +553,7 @@ fn read_http1_response<S: Read>(stream: &mut S) -> Result<WireResponse, String> 
     } else {
         // Read until close.
         loop {
-            let n = read_retry(stream, &mut tmp)
-                .map_err(|e| format!("body read: {e}"))?;
+            let n = read_retry(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -587,8 +589,7 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             if prefix.len() > MAX_CHUNK_LINE {
                 return Err("chunked: size line exceeds MAX_CHUNK_LINE".into());
             }
-            let n = read_retry(stream, &mut tmp)
-                .map_err(|e| format!("chunked size: {e}"))?;
+            let n = read_retry(stream, &mut tmp).map_err(|e| format!("chunked size: {e}"))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-header".into());
             }
@@ -618,8 +619,8 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
                 if prefix.len() > MAX_CHUNK_LINE {
                     return Err("chunked: trailer exceeds MAX_CHUNK_LINE".into());
                 }
-                let n = read_retry(stream, &mut tmp)
-                    .map_err(|e| format!("chunked trailer: {e}"))?;
+                let n =
+                    read_retry(stream, &mut tmp).map_err(|e| format!("chunked trailer: {e}"))?;
                 if n == 0 {
                     break;
                 }
@@ -635,8 +636,7 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
         }
         // Read `size` bytes of chunk data + trailing CRLF.
         while prefix.len() < size + 2 {
-            let n = read_retry(stream, &mut tmp)
-                .map_err(|e| format!("chunked body: {e}"))?;
+            let n = read_retry(stream, &mut tmp).map_err(|e| format!("chunked body: {e}"))?;
             if n == 0 {
                 return Err("chunked: socket closed mid-body".into());
             }
