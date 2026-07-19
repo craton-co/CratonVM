@@ -114,12 +114,24 @@ matching real JDK exactly (`sun.security.ec.XDHPrivateKeyImpl`,
 `sun.security.ec.ed.EdDSAPrivateKeyImpl`, `sun.security.rsa
 .RSAPrivateCrtKeyImpl`/`"RSASSA-PSS"`).
 
-Full `cratonvm-native-builtins` regression suite: 3032/3033 passing (the one
-failure, `p57_win_path_tests::trailing_separator_is_removed_only_from_non_roots`,
-is pre-existing and unrelated — a Windows-path-handling test asserting
-Windows semantics on this Linux build host). Zero regressions from this fix.
+Full `cratonvm-native-builtins` regression suite: 3039/3041 passing after
+merging `origin/dev`; the two failures
+(`p57_win_path_tests::trailing_separator_is_removed_only_from_non_roots`,
+`lang_class::get_constructors_returns_only_complete_public_constructor_mirrors`)
+are both pre-existing and unrelated (a Windows-path-semantics test on this
+Linux build host, and a reflection-metadata test from an unrelated concurrent
+`dev` commit) — confirmed by checking each file's own git history, neither
+touched by this fix. Zero regressions from this fix.
 
 The PKCS12 MAC/content-decryption sub-cluster this doc's "Corroborating
-evidence" section pointed at turned out to be the SAME bug as
-`webserversslbundletests-pkcs12-mac-verification-failure.md` — see that
-doc (also moved to `internal/`) for the PKCS12-specific root causes and fix.
+evidence" section pointed at (`keystore.pkcs12`) is the SAME bug as
+`webserversslbundletests-pkcs12-mac-verification-failure.md`, which a
+**concurrent session independently found and fixed** (`dev` commit
+`156ebfa4c`, merged before this branch — see that doc, also in `internal/`,
+for its root causes and fix). This branch's own PKCS12-keystore-level PBES2
+work was superseded by that commit during the `origin/dev` merge and
+dropped in favor of it (equivalent fix, already reviewed and landed); this
+doc's three root causes above (KeyFactory + the PEM-*private-key* PBES2
+`SecretKeyFactory`/`AlgorithmParameters` gap, a distinct JCA-layer mechanism
+from the PKCS12-*keystore* PBES2 decrypt the other commit addresses) remain
+this branch's own, non-overlapping contribution.

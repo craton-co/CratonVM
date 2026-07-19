@@ -277,13 +277,26 @@ const JKS_HMAC_SALT: &[u8] = b"Mighty Aphrodite";
 /// hands us as a `char[]`; both parsers receive the raw bytes the user typed
 /// (UTF-8 of those chars) so they can apply their per-format mixing.
 pub fn load_keystore(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
+    load_keystore_ex(bytes, password, true)
+}
+
+/// `verify_mac=false` mirrors real-JDK's `KeyStore.load(stream, null)`
+/// contract: a Java `null` password (as opposed to an empty `char[]`)
+/// disables PKCS#12 integrity checking entirely rather than checking against
+/// an empty password. Callers that can't distinguish "no password supplied"
+/// from "empty password supplied" should keep using [`load_keystore`].
+pub(crate) fn load_keystore_ex(
+    bytes: &[u8],
+    password: &[u8],
+    verify_mac: bool,
+) -> Result<LoadedKeyStore, KeyStoreError> {
     if bytes.len() < 4 {
         return Err(KeyStoreError::Truncated(0));
     }
     if u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == JKS_MAGIC {
         load_jks(bytes, password)
     } else if bytes[0] == 0x30 {
-        load_pkcs12(bytes, password)
+        load_pkcs12_ex(bytes, password, verify_mac)
     } else {
         Err(KeyStoreError::UnknownFormat)
     }
@@ -307,21 +320,13 @@ fn pkcs12_bmp_string(s: &str) -> Vec<u8> {
     bytes
 }
 
-/// A PKCS#12 `MacData` digest algorithm. The `p12` crate (v0.6.3) vendored
-/// here only ever computes an HMAC-**SHA-1** MAC — `MacData::verify_mac`
-/// hardcodes `HmacSha1`/`pbepkcs12sha1` and ignores the `digest_algorithm`
-/// field it parses from the file. SunPKCS12 has defaulted to **SHA-256**
-/// (`HmacPBESHA256`) since JDK 8u211 (2019), so `pfx.verify_mac(..)` fails
-/// closed — "MAC verification failed" — against essentially every keystore a
-/// current JDK actually writes, which is exactly the symptom in
-/// `PropertiesSslBundleTests.jksPropertiesAreMappedToSslBundle` and the
-/// sibling `SslConnectorCustomizerTests`/Jetty crash-cluster reports of the
-/// same message against unrelated fixture files (all real SHA-256-MAC
-/// PKCS#12 stores). We re-verify the MAC ourselves, generalized over
-/// whichever digest algorithm the file specifies, instead of trusting the
-/// crate's SHA-1-only check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pkcs12MacHash {
+/// The `p12` crate's built-in MAC verifier only implements SHA-1.  That was
+/// correct for the crate's own legacy fixtures, but current SunPKCS12 emits a
+/// SHA-256 `MacData` by default.  Keep the PKCS#12 KDF local so we can verify
+/// the digest recorded by the file rather than silently treating every MAC as
+/// SHA-1.
+#[derive(Clone, Copy)]
+enum Pkcs12MacDigest {
     Sha1,
     Sha224,
     Sha256,
@@ -329,50 +334,8 @@ enum Pkcs12MacHash {
     Sha512,
 }
 
-impl Pkcs12MacHash {
-    /// Resolve from the parsed `AlgorithmIdentifier` — the `Sha1` variant the
-    /// crate special-cases, or an `OtherAlg` OID for every other digest (the
-    /// crate has no named variant for SHA-224/256/384/512 at all).
-    fn from_algorithm_identifier(algid: &p12::AlgorithmIdentifier) -> Option<Self> {
-        match algid {
-            p12::AlgorithmIdentifier::Sha1 => Some(Self::Sha1),
-            p12::AlgorithmIdentifier::OtherAlg(other) => {
-                // NIST hash OIDs (2.16.840.1.101.3.4.2.*) — verified against
-                // the OIDs `openssl asn1parse` shows in real JDK-written
-                // PKCS#12 files (SHA-256 is `...2.1`).
-                if other.algorithm_type == yasna::models::ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 2, 4]) {
-                    Some(Self::Sha224)
-                } else if other.algorithm_type == yasna::models::ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 2, 1]) {
-                    Some(Self::Sha256)
-                } else if other.algorithm_type == yasna::models::ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 2, 2]) {
-                    Some(Self::Sha384)
-                } else if other.algorithm_type == yasna::models::ObjectIdentifier::from_slice(&[2, 16, 840, 1, 101, 3, 4, 2, 3]) {
-                    Some(Self::Sha512)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn digest(self, data: &[u8]) -> Vec<u8> {
-        use sha1::Sha1;
-        use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
-        match self {
-            Self::Sha1 => {
-                use sha1::Digest as _;
-                Sha1::digest(data).to_vec()
-            }
-            Self::Sha224 => Sha224::digest(data).to_vec(),
-            Self::Sha256 => Sha256::digest(data).to_vec(),
-            Self::Sha384 => Sha384::digest(data).to_vec(),
-            Self::Sha512 => Sha512::digest(data).to_vec(),
-        }
-    }
-
-    /// Digest OUTPUT size in bytes (`u` in RFC 7292 Appendix B.2).
-    fn output_size(self) -> usize {
+impl Pkcs12MacDigest {
+    fn output_len(self) -> usize {
         match self {
             Self::Sha1 => 20,
             Self::Sha224 => 28,
@@ -382,139 +345,130 @@ impl Pkcs12MacHash {
         }
     }
 
-    /// Hash BLOCK size in bytes (`v` in RFC 7292 Appendix B.2) — the block
-    /// size of the underlying compression function, NOT the digest output
-    /// size (SHA-384/512 use a 128-byte block despite a 48/64-byte digest).
-    fn block_size(self) -> usize {
+    fn block_len(self) -> usize {
         match self {
             Self::Sha1 | Self::Sha224 | Self::Sha256 => 64,
             Self::Sha384 | Self::Sha512 => 128,
         }
     }
 
-    /// Hand-rolled HMAC (RFC 2104) — mirrors `crypto_impl::Hmac` (which
-    /// covers SHA-256/384/512 only, for a different call site) rather than
-    /// pulling in the `hmac` crate as a new dependency just for this.
-    fn hmac(self, key: &[u8], data: &[u8]) -> Vec<u8> {
-        let block_size = self.block_size();
-        let mut k = if key.len() > block_size {
-            self.digest(key)
-        } else {
-            key.to_vec()
-        };
-        k.resize(block_size, 0);
-        let i_key_pad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-        let o_key_pad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-        let mut inner_input = i_key_pad;
-        inner_input.extend_from_slice(data);
-        let inner_hash = self.digest(&inner_input);
-        let mut outer_input = o_key_pad;
-        outer_input.extend_from_slice(&inner_hash);
-        self.digest(&outer_input)
+    fn hash(self, bytes: &[u8]) -> Vec<u8> {
+        use sha1::Digest as _;
+
+        match self {
+            Self::Sha1 => sha1::Sha1::digest(bytes).to_vec(),
+            Self::Sha224 => sha2::Sha224::digest(bytes).to_vec(),
+            Self::Sha256 => sha2::Sha256::digest(bytes).to_vec(),
+            Self::Sha384 => sha2::Sha384::digest(bytes).to_vec(),
+            Self::Sha512 => sha2::Sha512::digest(bytes).to_vec(),
+        }
     }
 }
 
-/// RFC 7292 Appendix B.2 password-based key derivation, generalized over the
-/// digest algorithm. Mirrors the `p12` crate's own `pbepkcs12sha1` (same
-/// `D`/`S`/`P`/`I`/`A`/`B` construction and the `Ij = (Ij + B + 1) mod 2^(v*8)`
-/// update), but parameterized on `hash` instead of hardcoding SHA-1, so it
-/// can derive the MAC key for a real SHA-256-MAC PKCS#12 file too. `id`: 1 =
-/// key material, 2 = IV, 3 = MAC key (Appendix B.3 purpose byte).
-#[allow(clippy::many_single_char_names)]
-fn pkcs12_pbe_derive(
-    hash: Pkcs12MacHash,
-    pass: &[u8],
+fn pkcs12_mac_digest(algorithm: &p12::AlgorithmIdentifier) -> Option<Pkcs12MacDigest> {
+    use p12::AlgorithmIdentifier::{OtherAlg, Sha1};
+
+    match algorithm {
+        Sha1 => Some(Pkcs12MacDigest::Sha1),
+        OtherAlg(other) => match other.algorithm_type.components().as_slice() {
+            // NIST SHA-2 digest OIDs, as used by JDK 8u191+ SunPKCS12.
+            [2, 16, 840, 1, 101, 3, 4, 2, 4] => Some(Pkcs12MacDigest::Sha224),
+            [2, 16, 840, 1, 101, 3, 4, 2, 1] => Some(Pkcs12MacDigest::Sha256),
+            [2, 16, 840, 1, 101, 3, 4, 2, 2] => Some(Pkcs12MacDigest::Sha384),
+            [2, 16, 840, 1, 101, 3, 4, 2, 3] => Some(Pkcs12MacDigest::Sha512),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn pkcs12_mac_kdf(
+    digest: Pkcs12MacDigest,
+    password: &[u8],
     salt: &[u8],
-    iterations: u64,
+    iterations: u32,
     id: u8,
-    size: u64,
+    output_len: usize,
 ) -> Vec<u8> {
-    let u = hash.output_size() as u64;
-    let v = hash.block_size() as u64;
-    let d = vec![id; v as usize];
-    fn get_len(s: usize, v: u64) -> usize {
-        let s = s as u64;
-        if s == 0 {
-            0
-        } else {
-            (v * s.div_ceil(v)) as usize
+    let v = digest.block_len();
+    let u = digest.output_len();
+    let repeat_to_block = |input: &[u8]| {
+        if input.is_empty() {
+            return Vec::new();
         }
-    }
-    let s: Vec<u8> = salt.iter().cycle().take(get_len(salt.len(), v)).cloned().collect();
-    let p: Vec<u8> = pass.iter().cycle().take(get_len(pass.len(), v)).cloned().collect();
-    let mut i: Vec<u8> = s.iter().chain(p.iter()).cloned().collect();
-    let c = size.div_ceil(u).max(1);
-    let mut a_out: Vec<u8> = Vec::new();
-    for _ in 0..c {
-        let mut ai: Vec<u8> = d.iter().chain(i.iter()).cloned().collect();
-        for _ in 0..iterations {
-            ai = hash.digest(&ai);
-        }
-        a_out.extend_from_slice(&ai);
+        let len = v * input.len().div_ceil(v);
+        input.iter().copied().cycle().take(len).collect::<Vec<_>>()
+    };
 
-        let b: Vec<u8> = ai.iter().cycle().take(v as usize).cloned().collect();
-        let b_iter = b.iter().rev().cycle().take(i.len());
-        let i_b_iter = i.iter_mut().rev().zip(b_iter);
-        let mut inc = 1u8;
-        for (i3, (ii, bi)) in i_b_iter.enumerate() {
-            if (i3 as u64) % v == 0 {
-                inc = 1;
-            }
-            let (ii2, inc2) = ii.overflowing_add(*bi);
-            let (ii3, inc3) = ii2.overflowing_add(inc);
-            inc = (inc2 || inc3) as u8;
-            *ii = ii3;
+    let mut i = repeat_to_block(salt);
+    i.extend(repeat_to_block(password));
+    let d = vec![id; v];
+    let mut out = Vec::with_capacity(output_len);
+
+    while out.len() < output_len {
+        let mut round = Vec::with_capacity(d.len() + i.len());
+        round.extend_from_slice(&d);
+        round.extend_from_slice(&i);
+        let mut a = digest.hash(&round);
+        for _ in 1..iterations.max(1) {
+            a = digest.hash(&a);
         }
+
+        let b = a.iter().copied().cycle().take(v).collect::<Vec<_>>();
+        for block in i.chunks_exact_mut(v) {
+            let mut carry = 1u16;
+            for (byte, addend) in block.iter_mut().rev().zip(b.iter().rev()) {
+                let sum = *byte as u16 + *addend as u16 + carry;
+                *byte = sum as u8;
+                carry = sum >> 8;
+            }
+        }
+        out.extend_from_slice(&a);
     }
-    a_out.truncate(size as usize);
-    a_out
+    out.truncate(output_len);
+    out
 }
 
-/// Re-verify a PKCS#12 `PFX`'s MAC ourselves (see `Pkcs12MacHash`'s doc
-/// comment for why `pfx.verify_mac` can't be trusted). Mirrors
-/// `p12::PFX::verify_mac`/`MacData::verify_mac` exactly, except the digest
-/// algorithm is read from the file instead of assumed to be SHA-1. Returns
-/// `false` (fail closed) for an unrecognised digest algorithm or a parse
-/// failure, matching `pfx.verify_mac`'s existing `None => false` behaviour.
-fn verify_pkcs12_mac(pfx: &p12::PFX, password_str: &str) -> bool {
+fn pkcs12_hmac(digest: Pkcs12MacDigest, key: &[u8], data: &[u8]) -> Vec<u8> {
+    let block_len = digest.block_len();
+    let mut padded_key = if key.len() > block_len {
+        digest.hash(key)
+    } else {
+        key.to_vec()
+    };
+    padded_key.resize(block_len, 0);
+
+    let mut inner = Vec::with_capacity(block_len + data.len());
+    inner.extend(padded_key.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(data);
+    let inner_hash = digest.hash(&inner);
+
+    let mut outer = Vec::with_capacity(block_len + inner_hash.len());
+    outer.extend(padded_key.iter().map(|byte| byte ^ 0x5c));
+    outer.extend_from_slice(&inner_hash);
+    digest.hash(&outer)
+}
+
+fn verify_pkcs12_mac(pfx: &p12::PFX, password: &str) -> bool {
     let Some(mac_data) = &pfx.mac_data else {
-        // No MAC present at all — nothing to verify (matches `p12::PFX::verify_mac`).
         return true;
     };
-    // Real `KeyStore.load(stream, null)` skips integrity checking entirely
-    // for a null password (`KeyStore.load`'s javadoc: "If a password is not
-    // given for integrity checking, then integrity checking is not
-    // performed") — confirmed against real JDK 25 with a MAC-bearing PKCS#12
-    // file. `engine_load`'s native boundary can't distinguish a literal Java
-    // `null` char[] from a zero-length one (both collapse to an empty byte
-    // Vec — see `read_password`), so, mirroring the same simplification
-    // `load_jks`'s HMAC check already makes for the identical JKS ambiguity,
-    // treat an empty password as "skip". Needed for
-    // `WebServerSslBundleTests.whenJksKeyStoreAndPemTrustStoreProperties`
-    // (sets only `keyPassword`, never `keyStorePassword`).
-    if password_str.is_empty() {
-        return true;
-    }
-    let Some(hash) = Pkcs12MacHash::from_algorithm_identifier(&mac_data.mac.digest_algorithm) else {
+    let Some(digest) = pkcs12_mac_digest(&mac_data.mac.digest_algorithm) else {
         return false;
     };
-    let bmp_password = pkcs12_bmp_string(password_str);
-    let Some(data) = pfx.auth_safe.data(&bmp_password) else {
+    let password = pkcs12_bmp_string(password);
+    let Some(auth_safe) = pfx.auth_safe.data(&password) else {
         return false;
     };
-    let key = pkcs12_pbe_derive(
-        hash,
-        &bmp_password,
+    let key = pkcs12_mac_kdf(
+        digest,
+        &password,
         &mac_data.salt,
-        mac_data.iterations as u64,
+        mac_data.iterations,
         3,
-        hash.output_size() as u64,
+        digest.output_len(),
     );
-    let computed = hash.hmac(&key, &data);
-    // Constant-time-ish compare (length-checked first); this mirrors the
-    // crate's own `Mac::verify_slice`, which is itself constant-time, but we
-    // no longer go through it — do the equivalent equality check here.
-    computed.len() == mac_data.mac.digest.len() && computed == mac_data.mac.digest
+    constant_time_eq(&pkcs12_hmac(digest, &key, &auth_safe), &mac_data.mac.digest)
 }
 
 /// BER-mode equivalent of `p12::PFX::bags`. Identical structure to the crate's
@@ -525,232 +479,163 @@ fn verify_pkcs12_mac(pfx: &p12::PFX, password_str: &str) -> bool {
 /// trustedKeyUsage attribute); SunJSSE accepts them and so must we. BER is a
 /// strict superset of DER — every field is still fully decoded and type-checked;
 /// only the DER-only canonical-ordering constraint is relaxed (kcfull #12).
-fn bags_ber(pfx: &p12::PFX, password_str: &str) -> Result<Vec<p12::SafeBag>, yasna::ASN1Error> {
+fn bags_ber(
+    pfx: &p12::PFX,
+    password_str: &str,
+    tolerate_undecryptable: bool,
+) -> Result<Vec<p12::SafeBag>, yasna::ASN1Error> {
     let password = pkcs12_bmp_string(password_str);
-    let plain_password = password_str.as_bytes();
-    let data = content_info_data(&pfx.auth_safe, &password, plain_password)
+    let data = pfx
+        .auth_safe
+        .data(&password)
         .ok_or_else(|| yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid))?;
     let contents = yasna::parse_ber(&data, |r| r.collect_sequence_of(p12::ContentInfo::parse))?;
-    let dbg = std::env::var_os("CRATONVM_DBG_PKCS12").is_some();
-    if dbg {
-        eprintln!("[dbg-pkcs12] bags_ber: {} top-level ContentInfo(s)", contents.len());
-    }
     let mut result = Vec::new();
-    for (i, content) in contents.iter().enumerate() {
-        if dbg {
-            let kind = match content {
-                p12::ContentInfo::Data(d) => format!("Data(len={})", d.len()),
-                p12::ContentInfo::EncryptedData(ed) => format!(
-                    "EncryptedData(algo={:?}, ciphertext_len={})",
-                    ed.encrypted_content_info.content_encryption_algorithm,
-                    ed.encrypted_content_info.encrypted_content.len()
-                ),
-                p12::ContentInfo::OtherContext(_) => "OtherContext".to_string(),
-            };
-            eprintln!("[dbg-pkcs12] content[{i}] = {kind}");
-        }
-        // A per-ContentInfo decrypt/parse failure is NOT fatal to the whole
-        // load: real `KeyStore.load(stream, null)` (or any password that
-        // doesn't match a PARTICULAR content's own protection — PKCS#12
-        // doesn't require every SafeContents to share one password) still
-        // succeeds, just without whatever bags live inside that one
-        // undecryptable content — mirrors the same real-JDK-observed
-        // "load succeeds, that content's entries are simply unavailable"
-        // behavior the `Pkcs8ShroudedKeyBag` fix above relies on. Needed for
-        // `WebServerSslBundleTests.whenJksKeyStoreAndPemTrustStoreProperties`
-        // (loads with no keystore password at all; this file's second,
-        // PBES2-`EncryptedData` SafeContents can't be decrypted without one).
-        let inner = match content_info_data(content, &password, plain_password) {
-            Some(d) => d,
-            None => {
-                if dbg {
-                    eprintln!("[dbg-pkcs12] content[{i}]: content_info_data returned None, skipping");
-                }
-                tracing::warn!(
-                    target: "keystore",
-                    "PKCS#12 SafeContents[{i}] decrypt failed (wrong/absent password for this \
-                     content?) — skipping its entries rather than failing the whole load"
-                );
+    for content in contents.iter() {
+        let inner = match content {
+            p12::ContentInfo::Data(data) => Some(data.clone()),
+            p12::ContentInfo::EncryptedData(encrypted) => encrypted
+                .data(&password)
+                // `p12` 0.6 only decrypts the legacy PKCS#12 PBE algorithms.
+                // Current SunPKCS12 encrypts certificate SafeContents with
+                // PBES2/PBKDF2/AES, so use the recorded PBES2 parameters when
+                // the crate deliberately returns None for that newer form.
+                .or_else(|| {
+                    decrypt_pbes2_content(
+                        &encrypted.encrypted_content_info,
+                        password_str.as_bytes(),
+                    )
+                    .or_else(|| decrypt_pbes2_content(&encrypted.encrypted_content_info, &password))
+                }),
+            p12::ContentInfo::OtherContext(_) => None,
+        };
+        let Some(inner) = inner else {
+            // Real-JDK's PKCS12KeyStore loads each top-level AuthenticatedSafe
+            // section independently and silently drops any section it can't
+            // decrypt with the password it was given — this is how
+            // `KeyStore.load(stream, null)` can still expose a keystore's
+            // PrivateKeyEntry (carried, undecrypted, in an unencrypted outer
+            // SafeContents; see the caller's `verify_mac=false` contract) even
+            // though a *different* AuthenticatedSafe section (e.g. the
+            // certificate SafeContents) is separately encrypted under the
+            // store password we don't have. Only tolerate this when we
+            // already know we lack a trustworthy password (`verify_mac` was
+            // false) — with a MAC-verified password a decrypt failure here is
+            // a real bug, not a missing-password situation, and must surface.
+            if tolerate_undecryptable {
                 continue;
             }
+            return Err(yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid));
         };
-        if dbg {
-            eprintln!(
-                "[dbg-pkcs12] content[{i}]: decrypted/extracted {} bytes, first 16={:02x?}",
-                inner.len(),
-                &inner[..inner.len().min(16)]
-            );
-        }
-        let safe_bags = match yasna::parse_ber(&inner, |r| r.collect_sequence_of(p12::SafeBag::parse)) {
-            Ok(b) => b,
-            Err(e) => {
-                if dbg {
-                    eprintln!("[dbg-pkcs12] content[{i}]: SafeBag::parse failed: {e:?}, skipping");
-                }
-                tracing::warn!(
-                    target: "keystore",
-                    "PKCS#12 SafeContents[{i}] parsed to undecodable bytes ({e:?}) — skipping \
-                     its entries rather than failing the whole load"
-                );
-                continue;
-            }
-        };
-        if dbg {
-            eprintln!("[dbg-pkcs12] content[{i}]: parsed {} SafeBag(s)", safe_bags.len());
-        }
+        let safe_bags = yasna::parse_ber(&inner, |r| r.collect_sequence_of(p12::SafeBag::parse))?;
         result.extend(safe_bags);
     }
     Ok(result)
 }
 
-/// `ContentInfo::data(password)`, with a PBES2/AES fallback for the
-/// `EncryptedData` case. Mirrors `Pkcs12MacHash`'s doc comment: the
-/// vendored `p12` crate's `AlgorithmIdentifier::decrypt_pbe` only
-/// implements the two LEGACY PKCS#12 PBE ciphers
-/// (`PbewithSHAAnd40BitRC2CBC`/`PbeWithSHAAnd3KeyTripleDESCBC`) — any other
-/// algorithm (including PBES2/AES, the SunPKCS12 default content-encryption
-/// cipher since JDK 8u+) falls into the `OtherAlg` branch, whose
-/// `decrypt_pbe` unconditionally returns `None`. A PKCS#12 keystore whose
-/// per-`SafeContents` `EncryptedData` wrapper uses PBES2 (common: most
-/// modern `keytool`/`openssl`-written stores wrap the key-bearing
-/// SafeContents in `EncryptedData` on top of the individual
-/// `PKCS8ShroudedKeyBag`'s own PBES2 protection) therefore failed to
-/// enumerate ANY bags at all — `bags(): ASN1Error { kind: Invalid }` —
-/// even after the MAC verification fix above let `load_pkcs12` get this
-/// far. Re-serializes the already-parsed `AlgorithmIdentifier` + ciphertext
-/// back into the DER shape `decrypt_secret_pbes2` (which already implements
-/// PBES2/PBKDF2/AES-CBC decryption for the sibling `SecretKeyEntry` case)
-/// expects, so this reuses that exact, already-tested decrypt path.
-///
-/// `password` is the BMPString (UTF-16BE + NUL) encoding the legacy PKCS#12
-/// Appendix B PBE ciphers require (passed straight through to
-/// `content.data()`); `plain_password` is the same password as plain bytes
-/// (one byte per `char`, i.e. `password_str.as_bytes()`), which is what
-/// PBES2/PBKDF2 (RFC 8018 — SunJCE's actual key derivation for this cipher)
-/// expects instead. Passing the BMPString encoding to PBKDF2 derives the
-/// WRONG key silently — no parse error, just an `UnpadError` from the AES-CBC
-/// step once the (wrong) key fails to produce valid PKCS#7 padding.
-fn content_info_data(
-    content: &p12::ContentInfo,
-    password: &[u8],
-    plain_password: &[u8],
-) -> Option<Vec<u8>> {
-    if let Some(data) = content.data(password) {
-        return Some(data);
-    }
-    let p12::ContentInfo::EncryptedData(encrypted) = content else {
-        return None;
-    };
-    let info = &encrypted.encrypted_content_info;
-    if !matches!(info.content_encryption_algorithm, p12::AlgorithmIdentifier::OtherAlg(_)) {
-        return None; // A legacy-PBE algorithm already failed via content.data() above (wrong password).
-    }
-    let epki_der = yasna::construct_der(|w| {
-        w.write_sequence(|w| {
-            info.content_encryption_algorithm.write(w.next());
-            w.next().write_bytes(&info.encrypted_content);
-        })
-    });
-    decrypt_secret_pbes2(&epki_der, plain_password)
-}
-
 /// Decrypt the PBES2/PBKDF2/AES records emitted by current SunPKCS12 for
 /// `SecretKeyEntry` values. `p12` itself supports only legacy PKCS#12 PBE.
-fn decrypt_secret_pbes2(epki_der: &[u8], password: &[u8]) -> Option<Vec<u8>> {
-    let dbg = std::env::var_os("CRATONVM_DBG_PKCS12").is_some();
-    let parsed = yasna::parse_ber(epki_der, |r| {
+fn decrypt_pbes2_params(params_der: &[u8], ciphertext: &[u8], password: &[u8]) -> Option<Vec<u8>> {
+    let (salt, iterations, key_len, prf, iv) = yasna::parse_ber(params_der, |r| {
         r.read_sequence(|r| {
-            let (salt, iterations, key_len, iv) = r.next().read_sequence(|r| {
-                let _pbes2_oid = r.next().read_oid()?;
+            let (salt, iterations, key_len, prf) = r.next().read_sequence(|r| {
+                let _pbkdf2_oid = r.next().read_oid()?;
                 r.next().read_sequence(|r| {
-                    let (salt, iterations, key_len) = r.next().read_sequence(|r| {
-                        let _pbkdf2_oid = r.next().read_oid()?;
-                        r.next().read_sequence(|r| {
-                            let salt = r.next().read_bytes()?;
-                            let iterations = r.next().read_u32()?;
-                            let key_len = r.next().read_u32()? as usize;
-                            r.read_optional(|r| {
-                                r.read_sequence(|r| {
-                                    let _prf_oid = r.next().read_oid()?;
-                                    r.read_optional(|r| r.read_null())?;
-                                    Ok(())
-                                })
-                            })?;
-                            Ok((salt, iterations, key_len))
+                    let salt = r.next().read_bytes()?;
+                    let iterations = r.next().read_u32()?;
+                    let key_len = r.read_optional(|r| r.read_u32())?.unwrap_or(32) as usize;
+                    let prf = r.read_optional(|r| {
+                        r.read_sequence(|r| {
+                            let prf_oid = r.next().read_oid()?;
+                            r.read_optional(|r| r.read_null())?;
+                            Ok(prf_oid)
                         })
                     })?;
-                    let iv = r.next().read_sequence(|r| {
-                        let _aes_oid = r.next().read_oid()?;
-                        r.next().read_bytes()
-                    })?;
-                    Ok((salt, iterations, key_len, iv))
+                    let prf = match prf.as_ref().map(|oid| oid.components().as_slice()) {
+                        Some([1, 2, 840, 113549, 2, 7]) | None => 1,
+                        Some([1, 2, 840, 113549, 2, 8]) => 224,
+                        Some([1, 2, 840, 113549, 2, 9]) => 256,
+                        Some([1, 2, 840, 113549, 2, 10]) => 384,
+                        Some([1, 2, 840, 113549, 2, 11]) => 512,
+                        _ => return Err(yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid)),
+                    };
+                    Ok((salt, iterations, key_len, prf))
                 })
             })?;
-            let ciphertext = r.next().read_bytes()?;
-            Ok((salt, iterations, key_len, iv, ciphertext))
+            let iv = r.next().read_sequence(|r| {
+                let _aes_oid = r.next().read_oid()?;
+                r.next().read_bytes()
+            })?;
+            Ok((salt, iterations, key_len, prf, iv))
         })
-    });
-    let (salt, iterations, key_len, iv, ciphertext) = match parsed {
-        Ok(v) => v,
-        Err(e) => {
-            if dbg {
-                eprintln!("[dbg-pkcs12] decrypt_secret_pbes2: ASN.1 parse failed: {e:?}");
-            }
-            return None;
-        }
-    };
-    if dbg {
-        eprintln!(
-            "[dbg-pkcs12] decrypt_secret_pbes2: salt_len={} iterations={} key_len={} iv_len={} ciphertext_len={} password_len={}",
-            salt.len(), iterations, key_len, iv.len(), ciphertext.len(), password.len()
-        );
-    }
+    })
+    .ok()?;
 
-    let key = crate::phases_early::pbkdf2_derive_for(256, password, &salt, iterations, key_len);
-    if dbg {
-        eprintln!("[dbg-pkcs12] decrypt_secret_pbes2: derived key_len={}", key.len());
-    }
+    let key = crate::phases_early::pbkdf2_derive_for(prf, password, &salt, iterations, key_len);
     use aes::cipher::block_padding::Pkcs7;
     use aes::cipher::generic_array::GenericArray;
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     let mut out = vec![0u8; ciphertext.len()];
-    let result = match key.len() {
+    let written = match key.len() {
         16 => cbc::Decryptor::<aes::Aes128>::new(
             GenericArray::from_slice(&key),
             GenericArray::from_slice(&iv),
         )
-        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out),
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
         24 => cbc::Decryptor::<aes::Aes192>::new(
             GenericArray::from_slice(&key),
             GenericArray::from_slice(&iv),
         )
-        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out),
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
         32 => cbc::Decryptor::<aes::Aes256>::new(
             GenericArray::from_slice(&key),
             GenericArray::from_slice(&iv),
         )
-        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out),
-        _ => {
-            if dbg {
-                eprintln!("[dbg-pkcs12] decrypt_secret_pbes2: unsupported key length {}", key.len());
-            }
-            return None;
-        }
-    };
-    let written = match result {
-        Ok(w) => w.len(),
-        Err(e) => {
-            if dbg {
-                eprintln!("[dbg-pkcs12] decrypt_secret_pbes2: AES-CBC/PKCS7 decrypt failed: {e:?}");
-            }
-            return None;
-        }
+        .decrypt_padded_b2b_mut::<Pkcs7>(&ciphertext, &mut out)
+        .ok()?
+        .len(),
+        _ => return None,
     };
     out.truncate(written);
     Some(out)
 }
 
+fn decrypt_pbes2_content(content: &p12::EncryptedContentInfo, password: &[u8]) -> Option<Vec<u8>> {
+    let p12::AlgorithmIdentifier::OtherAlg(algorithm) = &content.content_encryption_algorithm else {
+        return None;
+    };
+    decrypt_pbes2_params(algorithm.params.as_deref()?, &content.encrypted_content, password)
+}
+
+fn decrypt_secret_pbes2(epk: &p12::EncryptedPrivateKeyInfo, password: &[u8]) -> Option<Vec<u8>> {
+    let p12::AlgorithmIdentifier::OtherAlg(algorithm) = &epk.encryption_algorithm else {
+        return None;
+    };
+    decrypt_pbes2_params(algorithm.params.as_deref()?, &epk.encrypted_data, password)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
+    load_pkcs12_ex(bytes, password, true)
+}
+
+/// See [`load_keystore_ex`] — `verify_mac=false` is how a Java `null`
+/// password (`KeyStore.load(stream, null)`) reaches this parser. Real-JDK's
+/// `PKCS12KeyStore.engineLoad` skips MAC verification entirely in that case
+/// ("If a password is not given for integrity checking, then integrity
+/// checking is not performed"); treating null the same as an empty `char[]`
+/// would instead verify against an empty password and reject every
+/// legitimately-passworded store loaded without a keystore password (e.g. a
+/// PKCS#12 keystore opened only to read its key entries, whose password is
+/// supplied later through `getKey()`).
+pub(crate) fn load_pkcs12_ex(
+    bytes: &[u8],
+    password: &[u8],
+    verify_mac: bool,
+) -> Result<LoadedKeyStore, KeyStoreError> {
     let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
 
     // p12 takes the password as &str (it internally converts to UTF-16BE for
@@ -761,14 +646,12 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
     // a Java caller could possibly produce.
     let password_str = std::str::from_utf8(password)
         .map_err(|_| KeyStoreError::Pkcs12Parse("password not UTF-8".into()))?;
+    let password_bmp = pkcs12_bmp_string(password_str);
 
     // MAC verify (if a MAC is present) before we trust any decrypted bag.
     // Empty passwords MUST verify against an empty input the same way real
-    // PKCS12KeyStore does. Uses our own `verify_pkcs12_mac`, NOT
-    // `pfx.verify_mac` — see `Pkcs12MacHash`'s doc comment: the vendored
-    // crate only ever checks a SHA-1 MAC, which fails closed against every
-    // SHA-256-MAC (JDK 8u211+ default) PKCS#12 file.
-    if !verify_pkcs12_mac(&pfx, password_str) {
+    // PKCS12KeyStore does; a Java-null password skips the check altogether.
+    if verify_mac && !verify_pkcs12_mac(&pfx, password_str) {
         return Err(KeyStoreError::Pkcs12MacFailed);
     }
 
@@ -779,7 +662,7 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
     // reads it leniently, so we re-implement PFX::bags in BER mode, which
     // relaxes the SET-OF ordering check without skipping any structural
     // validation (kcfull #12).
-    let bags = bags_ber(&pfx, password_str)
+    let bags = bags_ber(&pfx, password_str, !verify_mac)
         .map_err(|e| KeyStoreError::Pkcs12Parse(format!("bags(): {e:?}")))?;
 
     // Index bags by `localKeyId` so we can pair a private-key bag with the
@@ -799,54 +682,23 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
 
         match &bag.bag {
             p12::SafeBagKind::Pkcs8ShroudedKeyBag(epk) => {
-                // `epk.decrypt` only implements the two legacy PKCS#12
-                // Appendix-B PBE ciphers (see `content_info_data`'s doc
-                // comment) — `AlgorithmIdentifier::OtherAlg`'s `decrypt_pbe`
-                // unconditionally returns `None`, so a PBES2-shrouded
-                // private key (the SunPKCS12 default since JDK 8u+) always
-                // failed here. Fall back to the same `decrypt_secret_pbes2`
-                // path `content_info_data` uses, re-serializing `epk` back
-                // into the `EncryptedPrivateKeyInfo` DER shape it already
-                // naturally has. `password` (not the BMPString form) is
-                // correct here too — see `content_info_data`'s doc comment.
-                let key_der = epk.decrypt(password.as_ref()).or_else(|| {
-                    let epki_der = yasna::construct_der(|w| epk.write(w));
-                    decrypt_secret_pbes2(&epki_der, password.as_ref())
-                });
-                match key_der {
-                    Some(key_der) => {
-                        keys_by_local_id
-                            .entry(local_id.clone())
-                            .or_insert((friendly, key_der));
-                    }
-                    // Real SunPKCS12 lets `engineLoad(stream, null)` succeed
-                    // even when a per-entry key needs a DIFFERENT password
-                    // than the (absent) load-time one — it defers the
-                    // mismatch to whichever later `engineGetKey(alias,
-                    // keyPassword)` call actually needs that key, rather
-                    // than failing the whole store load. Mirrors `load_jks`'s
-                    // existing "keep the raw/undecryptable entry, don't abort
-                    // the load" behavior (`jks_recover_key(..).unwrap_or(enc_key)`)
-                    // for the same real-world shape:
-                    // `WebServerSslBundleTests.whenJksKeyStoreAndPemTrustStoreProperties`
-                    // sets a `keyPassword` distinct from the (unset)
-                    // `keyStorePassword`, and never actually retrieves the
-                    // key in this test — only checks the `KeyStore` itself
-                    // is non-null. There is currently no PKCS#12 equivalent
-                    // of JKS's `keystore_unlock_private_keys` lazy re-decrypt,
-                    // so an entry that fails here stays permanently
-                    // unavailable rather than being retried with a
-                    // caller-supplied password later; skip it instead of
-                    // aborting the whole load, matching real JDK's "load
-                    // succeeds, only that key is later unrecoverable"
-                    // observable behavior more closely than a hard failure.
-                    None => {
-                        tracing::warn!(
-                            target: "keystore",
-                            "PKCS#12 key bag decrypt failed (wrong or absent load-time password?) — \
-                             keeping the entry unavailable rather than failing the whole load"
-                        );
-                    }
+                let legacy = epk.decrypt(&password_bmp);
+                let pbes2 = if legacy.is_none() {
+                    decrypt_secret_pbes2(epk, password.as_ref())
+                        .or_else(|| decrypt_secret_pbes2(epk, &password_bmp))
+                } else {
+                    None
+                };
+                if let Some(key_der) = legacy.or(pbes2) {
+                    keys_by_local_id
+                        .entry(local_id.clone())
+                        .or_insert((friendly, key_der));
+                } else {
+                    // A PKCS#12 key bag may use a distinct entry password.
+                    // Loading the store with its integrity password must still
+                    // expose certificate/trust-store entries; SunPKCS12 only
+                    // asks for the entry password later through getKey().
+                    tracing::debug!(target: "keystore", "deferring separately protected PKCS#12 key bag");
                 }
             }
             p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) => {
@@ -887,9 +739,9 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
                     .and_then(|epki_der| {
                         let encrypted =
                             yasna::parse_ber(epki_der, p12::EncryptedPrivateKeyInfo::parse).ok()?;
-                        let legacy = encrypted.decrypt(password.as_ref());
+                        let legacy = encrypted.decrypt(&password_bmp);
                         let pbes2 = if legacy.is_none() {
-                            decrypt_secret_pbes2(epki_der, password.as_ref())
+                            decrypt_secret_pbes2(&encrypted, password.as_ref())
                         } else {
                             None
                         };
@@ -1749,7 +1601,14 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         Some(Value::Object(Some(r))) => Some(*r),
         _ => None,
     };
-    let password = match args.get(2) {
+    // A Java `null` char[] (as opposed to a present-but-empty one) means "no
+    // password supplied" and must disable PKCS#12 MAC/integrity checking —
+    // see `load_pkcs12_ex`. Distinguish the two here, since `read_password`
+    // collapses both to an empty Vec (correct for the entry-decryption call
+    // sites that use it, which don't care about the distinction).
+    let password_arg = args.get(2);
+    let password_present = !matches!(password_arg, None | Some(Value::Object(None)));
+    let password = match password_arg {
         Some(v) => read_password(ctx, v),
         None => Vec::new(),
     };
@@ -1758,18 +1617,11 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         Some(s) => read_stream_to_end(ctx, s),
         None => Vec::new(),
     };
-    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
-        eprintln!(
-            "[dbg-tls-hs] engine_load: bytes_len={} password_len={}",
-            bytes.len(),
-            password.len()
-        );
-    }
 
     let store = if bytes.is_empty() {
         LoadedKeyStore::default()
     } else {
-        match load_keystore(&bytes, &password) {
+        match load_keystore_ex(&bytes, &password, password_present) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(target: "keystore", "engineLoad: parse failed: {e}");
@@ -1867,16 +1719,6 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         .get(2)
         .map(|v| read_password(ctx, v))
         .unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
-        let alias_dbg = args
-            .get(1)
-            .and_then(|v| read_string_arg(ctx, v))
-            .unwrap_or_default();
-        eprintln!(
-            "[dbg-tls-hs] engine_get_key: store_id={id} alias={alias_dbg:?} password_len={}",
-            password.len()
-        );
-    }
     // A JKS store may be loaded without its per-entry key password (Tomcat's
     // `Ssl` configuration supplies that password later through getKey). Unlock
     // the entry at the API boundary that actually receives it, so consumers
@@ -2816,34 +2658,92 @@ mod tests {
         ));
     }
 
-    /// Regression test for the SHA-256-MAC PKCS#12 fix: a REAL empty
-    /// truststore written by JDK 25's `SunPKCS12` (Spring Boot's own
-    /// `spring-boot-autoconfigure` test fixture,
-    /// `org/springframework/boot/autoconfigure/ssl/keystore.pkcs12`,
-    /// password `"secret"`) — `openssl asn1parse` confirms its `MacData`
-    /// digest algorithm OID is `2.16.840.1.101.3.4.2.1` (SHA-256), NOT SHA-1.
-    /// Before `verify_pkcs12_mac` replaced `pfx.verify_mac` (which hardcodes
-    /// HMAC-SHA-1 regardless of this field), this load failed closed with
-    /// `Pkcs12MacFailed` for every password, correct or not.
-    #[test]
-    fn pkcs12_sha256_mac_verifies() {
-        #[rustfmt::skip]
-        let fixture: &[u8] = &[
-            0x30, 0x65, 0x02, 0x01, 0x03, 0x30, 0x11, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01,
-            0x07, 0x01, 0xa0, 0x04, 0x04, 0x02, 0x30, 0x00, 0x30, 0x4d, 0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
-            0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20, 0xb2, 0x0f, 0x75,
-            0x5b, 0xfa, 0x48, 0x4c, 0x4b, 0x43, 0xa5, 0x0c, 0x05, 0x45, 0x7e, 0x02, 0x25, 0xa8, 0x03, 0x13,
-            0x18, 0x09, 0xb5, 0xa5, 0x51, 0x55, 0x88, 0xa2, 0xbc, 0x08, 0x77, 0xbe, 0xb0, 0x04, 0x14, 0x29,
-            0xbb, 0xf1, 0x0f, 0x82, 0xc7, 0x98, 0xad, 0xd4, 0xe9, 0xe7, 0xe7, 0x7c, 0x2b, 0x2a, 0x0f, 0xde,
-            0xf5, 0xb0, 0x69, 0x02, 0x02, 0x27, 0x10,
-        ];
-        let store = load_pkcs12(fixture, b"secret").expect("correct password must verify the SHA-256 MAC");
-        assert!(store.entries.is_empty(), "this fixture is an empty truststore");
+    fn synth_sha256_mac_pkcs12(password: &str) -> Vec<u8> {
+        let mut pfx = p12::PFX::new(b"\x30\x00", b"\x30\x00", None, password, "test")
+            .expect("test PFX generation");
+        let password_bmp = pkcs12_bmp_string(password);
+        let auth_safe = pfx
+            .auth_safe
+            .data(&password_bmp)
+            .expect("unencrypted AuthSafe");
+        let mac_data = pfx.mac_data.as_mut().expect("MAC data");
+        let digest = Pkcs12MacDigest::Sha256;
+        mac_data.mac.digest_algorithm =
+            p12::AlgorithmIdentifier::OtherAlg(p12::OtherAlgorithmIdentifier {
+                algorithm_type: yasna::models::ObjectIdentifier::from_slice(&[
+                    2, 16, 840, 1, 101, 3, 4, 2, 1,
+                ]),
+                params: Some(vec![0x05, 0x00]),
+            });
+        let key = pkcs12_mac_kdf(
+            digest,
+            &password_bmp,
+            &mac_data.salt,
+            mac_data.iterations,
+            3,
+            digest.output_len(),
+        );
+        mac_data.mac.digest = pkcs12_hmac(digest, &key, &auth_safe);
+        pfx.to_der()
+    }
 
-        // Wrong password must still fail closed (the fix must not have
-        // turned this into an always-true check).
-        let err = load_pkcs12(fixture, b"wrong").unwrap_err();
+    #[test]
+    fn pkcs12_sha256_mac_accepts_correct_password_and_rejects_wrong_one() {
+        // Since JDK 8u191, SunPKCS12 defaults to HmacPBESHA256.  `p12` 0.6
+        // parses that MAC but its verifier unconditionally derives a SHA-1
+        // key, producing a false "wrong password" result for Spring's .p12
+        // fixtures.  Exercise the exact newer-MAC shape independently of any
+        // workspace-local application fixture.
+        let bytes = synth_sha256_mac_pkcs12("secret");
+        let pfx = p12::PFX::parse(&bytes).expect("reparse generated PFX");
+        assert!(verify_pkcs12_mac(&pfx, "secret"));
+        load_pkcs12(&bytes, b"secret").expect("correct SHA-256 MAC password");
+        let err = load_pkcs12(&bytes, b"wrong").unwrap_err();
         assert!(matches!(err, KeyStoreError::Pkcs12MacFailed));
+    }
+
+    /// SunPKCS12 (`keytool`) leaves the top-level AuthenticatedSafe content
+    /// unencrypted (`ContentInfo::Data`) and relies solely on the outer MAC
+    /// for integrity — only individual `PrivateKeyEntry` bags get their own
+    /// PBES2 encryption under a possibly-different entry password. `p12`
+    /// crate's own `PFX::new` doesn't model this (it PBE-encrypts the whole
+    /// cert `SafeContents`), so build the realistic shape by hand.
+    fn synth_unencrypted_content_pkcs12(password: &str) -> Vec<u8> {
+        let cert_bag = p12::SafeBag {
+            bag: p12::SafeBagKind::CertBag(p12::CertBag::X509(vec![
+                0x30, 0x03, 0x02, 0x01, 0x00,
+            ])),
+            attributes: vec![],
+        };
+        let safe_contents =
+            yasna::construct_der(|w| w.write_sequence_of(|w| cert_bag.write(w.next())));
+        let inner_content_info = p12::ContentInfo::Data(safe_contents);
+        let auth_safe_bytes =
+            yasna::construct_der(|w| w.write_sequence_of(|w| inner_content_info.write(w.next())));
+        let password_bmp = pkcs12_bmp_string(password);
+        let mac_data = p12::MacData::new(&auth_safe_bytes, &password_bmp);
+        let pfx = p12::PFX {
+            version: 3,
+            auth_safe: p12::ContentInfo::Data(auth_safe_bytes),
+            mac_data: Some(mac_data),
+        };
+        pfx.to_der()
+    }
+
+    #[test]
+    fn pkcs12_null_password_skips_mac_verification() {
+        // `KeyStore.load(stream, null)` — a Java `null` char[], not an empty
+        // one — must skip PKCS#12 integrity checking entirely, matching
+        // real-JDK's PKCS12KeyStore. `WebServerSslBundleTests` relies on this:
+        // it opens a keystore's key entries without a keyStorePassword,
+        // supplying the entry password later through `getKey()`. Passing an
+        // empty password to `load_pkcs12` (its `verify_mac=true` form) must
+        // still fail, since that's a real empty-string password attempt, not
+        // a null one — only the explicit `verify_mac=false` path skips it.
+        let bytes = synth_unencrypted_content_pkcs12("secret");
+        let err = load_pkcs12(&bytes, b"").unwrap_err();
+        assert!(matches!(err, KeyStoreError::Pkcs12MacFailed));
+        load_pkcs12_ex(&bytes, b"", false).expect("null password skips MAC check");
     }
 
     #[test]
