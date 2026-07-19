@@ -104,15 +104,15 @@ pub enum EntryKind {
 
 /// One loaded keystore. The map keys are case-preserved aliases.
 ///
-/// Backed by `IndexMap` (not `HashMap`) so alias iteration
-/// (`KeyStore.aliases()`) preserves the order entries were parsed from the
-/// file (JKS/PKCS12) or inserted programmatically — matching real-JDK's
-/// `LinkedHashMap`-backed keystores. Callers that pick "the first key-bearing
-/// alias" when no alias is explicitly configured (e.g. Tomcat's
-/// `SSLUtilBase.getKeyManagers()`) depend on this order to select the same
-/// entry real HotSpot would; a `HashMap`'s unspecified order previously let
-/// them silently pick a different entry on a keystore with multiple private
-/// keys.
+/// `IndexMap`, NOT `HashMap` — real JDK's `JavaKeyStore`/`PKCS12KeyStore`
+/// both use a `LinkedHashMap` internally, so `KeyStore.aliases()` enumerates
+/// entries in the order they were read from the file/inserted, not an
+/// arbitrary hash order. Spring Boot's `SslInfo`
+/// (`SslInfoTests.trustStoreCertificatesShouldProvideSslInfo` et al.) asserts
+/// on that exact positional order (`getTrustStoreCertificateChains().get(0)`
+/// is the FIRST entry in the file, not the alphabetically-first one) —
+/// `std::collections::HashMap`'s randomized iteration order can't satisfy
+/// that.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedKeyStore {
     pub entries: IndexMap<String, KeyStoreEntry>,
@@ -230,8 +230,9 @@ pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec
 pub fn keystore_delete_entry(id: i32, alias: &str) {
     let mut g = registry().write();
     if let Some(store) = g.stores.get_mut(&id) {
-        // `shift_remove` (not `swap_remove`) to preserve the relative order
-        // of the remaining aliases — see `LoadedKeyStore::entries` doc comment.
+        // `shift_remove`, not `swap_remove`: preserves the remaining
+        // entries' relative order (matches a real `LinkedHashMap.remove`),
+        // consistent with `LoadedKeyStore::entries`'s doc comment.
         store.entries.shift_remove(alias);
     }
 }
@@ -665,8 +666,12 @@ pub(crate) fn load_pkcs12_ex(
 
     // Index bags by `localKeyId` so we can pair a private-key bag with the
     // matching cert chain. Real-JDK uses the same `localKeyId` attribute.
-    let mut keys_by_local_id: HashMap<Vec<u8>, (Option<String>, Vec<u8>)> = HashMap::new();
-    let mut certs_by_local_id: HashMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = HashMap::new();
+    // `IndexMap`, not `HashMap`: preserves the order bags were encountered in
+    // the file, which `entries`'s assembly below relies on to match real
+    // JDK's `LinkedHashMap`-backed alias enumeration order (see
+    // `LoadedKeyStore::entries`'s doc comment).
+    let mut keys_by_local_id: IndexMap<Vec<u8>, (Option<String>, Vec<u8>)> = IndexMap::new();
+    let mut certs_by_local_id: IndexMap<Vec<u8>, Vec<(Option<String>, Vec<u8>)>> = IndexMap::new();
     let mut orphan_certs: Vec<(Option<String>, Vec<u8>)> = Vec::new();
     let mut secret_keys: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -777,7 +782,7 @@ pub(crate) fn load_pkcs12_ex(
     for (local_id, (key_friendly, key_der)) in keys_by_local_id {
         let mut chain: Vec<Vec<u8>> = Vec::new();
         let mut chain_friendly: Option<String> = None;
-        if let Some(matched) = certs_by_local_id.remove(&local_id) {
+        if let Some(matched) = certs_by_local_id.shift_remove(&local_id) {
             for (fn_, der) in matched {
                 if chain_friendly.is_none() && fn_.is_some() {
                     chain_friendly = fn_;
@@ -1865,11 +1870,11 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let id = get_store_id(ctx, this);
 
     let store = keystore_lookup(id).unwrap_or_default();
-    // Preserve file/insertion order (see `LoadedKeyStore::entries` doc comment)
-    // rather than sorting alphabetically: callers like Tomcat's
-    // `SSLUtilBase.getKeyManagers()` pick the first key-bearing alias off this
-    // enumeration when none is explicitly configured, and must land on the
-    // same entry real-JDK's `LinkedHashMap`-backed keystore would.
+    // Insertion order (`entries` is an `IndexMap`), NOT alphabetical — real
+    // JDK's `KeyStore.aliases()` enumerates in the order entries were read
+    // from the file (`LinkedHashMap`-backed), and Spring Boot's `SslInfo`
+    // asserts on that exact positional order (see `LoadedKeyStore::entries`'s
+    // doc comment).
     let aliases: Vec<String> = store.entries.keys().cloned().collect();
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {

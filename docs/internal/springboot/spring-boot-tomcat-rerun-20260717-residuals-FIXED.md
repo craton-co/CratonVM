@@ -1,14 +1,14 @@
-# `module/spring-boot-tomcat` 2026-07-17 rerun: 3 unrelated FAILs + embedded-server throughput-wall HANGs
+# `module/spring-boot-tomcat` 2026-07-17 rerun: 3 unrelated FAILs + embedded-server throughput-wall HANGs — FIXED/CLOSED
 
-**Status: PARTIALLY OPEN — found 2026-07-17, re-triaged 2026-07-19.** Items 2
-and 3 below are now FIXED (on branch
-`codex/fix-springboot-tomcat-rerun-closure-20260718-019f7681`, not yet merged
-to `dev`). Item 1 remains OPEN with a narrower, corrected root-cause writeup —
-its original "JKS wrong password" framing was disproven by a real fix (alias
-enumeration order) that turned out not to be the actual cause of the test
-failure. Item 4 is an accepted non-bug limitation, unchanged. Doc stays in
-`known-issues/` per the "no fixed bugs stay in known-issues, but a doc with
-one still-open item stays" triage rule until item 1 lands.
+**Status: CLOSED 2026-07-19.** All 4 items now have a definitive answer: item
+2 (WAR classloader) and item 3 (Tomcat metrics) are fixed; item 1
+(`SslConnectorCustomizerTests`) is root-caused to a permanent environmental
+limitation (rustls never implements CBC-mode cipher suites) tracked in its
+own open doc, [`rustls-cbc-cipher-suites-not-supported.md`](rustls-cbc-cipher-suites-not-supported.md);
+item 4 (throughput wall) was never a bug. Moved to `docs/internal/` per the
+known-issues triage rule (a doc leaves known-issues once its primary defects
+are fixed, provided any residual is tracked by a separate open doc — which
+item 1's is).
 
 This module contributed 6 non-passing classes to this triage batch, splitting
 into several unrelated root causes: 3 single-class FAILs (each a distinct
@@ -23,9 +23,32 @@ cross-filed as corroborating evidence in
 — that cross-file stands as-is; today's session did not re-verify the PEM/PKCS12
 cluster itself, only `SslConnectorCustomizerTests`.
 
-## 1. `SslConnectorCustomizerTests` — 2/8 tests still fail; original "wrong password" framing was wrong
+## 1. `SslConnectorCustomizerTests` — root cause CONFIRMED: rustls has no CBC-mode cipher suites (environmental, not a bug)
 
-**Status: OPEN.** 2/8 tests still fail, same as 2026-07-17:
+**Status: CLOSED for this doc — root-caused, tracked separately.** 2/8 tests
+fail, same as 2026-07-17, but the actual cause is now known: rustls
+(CratonVM's TLS backend) never implements CBC-mode cipher suites, and both
+failing tests explicitly request `TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256`.
+Confirmed by a concurrent session the same day via a from-scratch
+reproduction of `Connector.initInternal()`'s exact adapter-setup sequence
+(bypassing Tomcat's own exception-swallowing `LifecycleBase`/JUL logging,
+which is why the doc's original 2026-07-17 symptom looked like a bare `null`
+with no real cause visible): the actual exception is
+`IllegalArgumentException: None of the [ciphers] specified are supported by
+the SSL engine`, thrown by `SSLUtilBase.getEnabled()`. This is a permanent,
+intentional rustls design decision (AEAD-only, no CBC) — not fixable without
+forking rustls or switching TLS backends — filed as its own doc,
+[`rustls-cbc-cipher-suites-not-supported.md`](rustls-cbc-cipher-suites-not-supported.md)
+(open, environmental limitation, not further actionable this round).
+
+**This session's own investigation (below, kept for the methodology and a
+real distinct bug it found) independently confirmed everything BUT the final
+cipher-suite answer** — reaching the same "it's not the JKS/JCA layer, it's
+somewhere in Tomcat's SSLUtilBase wiring" conclusion via a different,
+narrower repro (direct KeyStore/KeyManagerFactory/SSLContext/SSLEngine API
+calls, which don't exercise `SSLUtilBase.getEnabled()`'s cipher-suite
+intersection check at all — hence missing the actual answer). Original
+2026-07-17 symptom:
 
 ```
 JUnit Jupiter:SslConnectorCustomizerTests:sslEnabledProtocolsConfiguration()
@@ -75,18 +98,7 @@ whatever password `KeyStore.getKey()` receives later; see the `FIX
 (httpserver-pkcs12-20260706)` comment on `keystore_set_pending_km_identity_with_password`
 in the same file), not a symptom of the real defect.
 
-**Still not root-caused.** The failure reproduces only through Tomcat's own
-`SSLUtilBase`/`JSSEUtil`/`SSLHostConfig*` wiring (real, vendored Apache
-Tomcat sources under `apps/tomcat/java/org/apache/tomcat/util/net/`), not
-through any direct `KeyStore`/`KeyManagerFactory`/`SSLContext`/`SSLEngine`
-API sequence tried this session. Next step: instrument (or step through)
-`SSLHostConfigCertificate`/`SSLUtilBase.getSSLContext()` specifically for the
-`keyPassword`-without-`keyStorePassword` case to find where it diverges from
-the direct-API repro above — likely something Tomcat-internal (protocol/cipher
-negotiation setup, `SSLHostConfig` default-population order, or a second,
-not-yet-found keystore/key-manager code path) rather than the JCA layer
-itself. The dead-code note below is also worth clearing away first, in case
-it's hiding a second attempt at the same fix:
+**Dead-code trap found while investigating (still worth knowing about):**
 
 `native-builtins/src/x509_manager.rs`'s `kmf_engine_init` (registered on
 `sun/security/ssl/KeyManagerFactoryImpl$SunX509`) had an in-flight,
@@ -112,12 +124,12 @@ Full log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260717/sh
 (and matching `.out.log`).
 
 **Original 2026-07-17 root-cause note (superseded above, kept for history):**
-this class was filed in [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md)
+this class was filed in `ssl-pem-pkcs12-store-parse-failure-cluster.md`
+(now `docs/internal/springboot/ssl-pem-pkcs12-store-parse-failure-cluster-FIXED.md`)
 as a third module independently hitting `"JKS key integrity check failed"` —
-that cross-file is now known to be coincidental (the WARN is expected/
-harmless, per above), not evidence of one shared root cause. Not re-verified
-this session; that doc's own PEM/PKCS12 findings may still be valid on their
-own merits, just not for the reason this doc originally cited.
+confirmed coincidental: that WARN is expected/harmless (per above), and the
+real cause is the unrelated rustls-CBC gap, not the PEM/PKCS12 JCA bugs fixed
+in that other doc.
 
 ## 2. `TomcatEmbeddedWebappClassLoaderTests` — FIXED (functional); narrow URL-formatting residual remains
 
@@ -278,7 +290,7 @@ anywhere in either log.
 
 | Module | Class | Issue | Status |
 |---|---|---|---|
-| `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.SslConnectorCustomizerTests` | 1 (still 2/8 FAIL; "wrong password" framing disproven) | **OPEN** |
+| `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.SslConnectorCustomizerTests` | 1 — rustls has no CBC cipher suites | Root-caused; tracked in [`rustls-cbc-cipher-suites-not-supported.md`](rustls-cbc-cipher-suites-not-supported.md) (OPEN, environmental) |
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.TomcatEmbeddedWebappClassLoaderTests` | 2 (WAR resource resolution) | FIXED (functional); narrow URL-format residual |
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.autoconfigure.metrics.TomcatMetricsAutoConfigurationTests` | 3 (MBean metrics not bound) | FIXED (upstream `dev`) |
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.autoconfigure.TomcatWebServerFactoryCustomizerTests` | 4 (throughput wall) | Not a bug |
@@ -291,25 +303,30 @@ Continuing a prior agent's in-flight (uncommitted) work in
 `C:\craton\CratonVM-sb-tomcat-rerun-closure-20260718-019f7681`
 (branch `codex/fix-springboot-tomcat-rerun-closure-20260718-019f7681`):
 
-- Fast-forwarded the worktree onto `origin/dev` (78 commits behind → caught
-  up to `ff15c8bd8`) before continuing, per project convention — no conflicts
-  on the touched files, and this is what surfaced item 3 already being fixed
-  upstream.
+- Fast-forwarded the worktree onto `origin/dev` repeatedly as it kept moving
+  (78, then 36, then 9 more commits behind at various points) before
+  continuing, per project convention.
 - Landed a real fix for `KeyStore.aliases()` alias-enumeration order
   (`HashMap` → `indexmap::IndexMap` in `keystore.rs`, new `indexmap`
   dependency in `native-builtins/Cargo.toml`) — confirmed correct against
-  real JDK 25 via a standalone repro, but confirmed **not** the cause of
-  item 1's test failure (see item 1 above).
+  real JDK 25 via a standalone repro. A separate concurrent session
+  independently found and fixed the identical bug and landed it on `dev`
+  first; this branch's version was reconciled with theirs during the merge
+  (kept their comment wording, functionally identical).
 - Verified the prior agent's WAR/`.war`-classpath fix in `class_path.rs`
   (item 2) actually works: resource resolution went from total failure
   (`null`/`[]`) to correct resolution, with a narrow residual identified and
   documented (see item 2 above).
 - Verified item 3 now passes 5/5, fixed independently by concurrent `dev`
   work pulled in by the fast-forward above.
-- All keystore.rs (14) and class_path.rs (88) unit tests pass; no
-  regressions.
-- Not yet committed/merged to `dev` — code changes exist only in the
-  worktree above as of this writeup.
+- Item 1's actual root cause (rustls has no CBC cipher suites) was found by
+  the same concurrent session referenced above, not by this branch's own
+  investigation — merged in and cross-referenced here.
+- All keystore.rs and class_path.rs unit tests pass; no regressions.
+- Committed `73a50a1f6`, merged current `origin/dev` in (one real conflict
+  in `keystore.rs`, resolved by taking `dev`'s wording for the
+  independently-duplicated alias-order fix), and moved this doc to
+  `docs/internal/` since all 4 items now have a definitive resolution.
 
 Not covered here: `org.springframework.boot.tomcat.servlet.TomcatServletWebServerServletContextListenerTests`
 (HANG) — see
