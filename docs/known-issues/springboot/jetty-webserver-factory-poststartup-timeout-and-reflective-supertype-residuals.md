@@ -1,7 +1,13 @@
 # Jetty factory post-startup timeout and reflective-supertype residuals
 
-**Status: PARTIALLY FIXED - reflective-supertype residual and three real bugs
-fixed 2026-07-18; one factory-timeout mystery remains OPEN**
+**Status: MOSTLY FIXED - 2026-07-18. The reflective-supertype residual, four
+real bugs, and the `Deflater.end()` monitor hang (both factory classes) are
+fixed. `JettyReactiveWebServerFactoryTests` now completes cleanly (156s,
+22/35 passing — remaining failures are a missing `test.jks` test fixture,
+unrelated to CratonVM). `JettyServletWebServerFactoryTests` no longer hangs
+at its old stuck point either, but a newly-exposed, unrelated OPEN bug
+(blocking socket read ignoring its configured timeout) now blocks it later
+in the same class — see the bottom section.**
 
 ## Scope and separation
 
@@ -105,14 +111,13 @@ all three fixes below were confirmed via focused repros independent of Jetty.
    `deflate_after_finish_is_a_no_op_not_a_reentry`. The 8-thread repro no
    longer reproduces any corruption after this fix (20+ clean runs).
 
-## Remaining direction — OPEN mystery, not yet root-caused
+## Fixed: the `Deflater.end()` monitor hang (2026-07-18)
 
-With all three fixes above, `JettyServletWebServerServletContextListenerTests`
-passes and the `BindException`/`WSAEADDRNOTAVAIL` symptom is gone from
-`JettyReactiveWebServerFactoryTests`' logs, but the class still hits the full
-200s timeout (reproduces identically with `--nojit`). A
-`--stack-dump-on-timeout=150` capture is deterministic across at least 3
-separate runs (JIT on and off):
+With the three fixes above, `JettyServletWebServerServletContextListenerTests`
+passes and the `BindException`/`WSAEADDRNOTAVAIL` symptom is gone, but
+`JettyReactiveWebServerFactoryTests` still hit the full 200s timeout
+(reproduced identically with `--nojit`). A `--stack-dump-on-timeout=150`
+capture was deterministic across many separate runs (JIT on and off):
 
 ```
 tid=0 name="main" blocked=true top=java/util/zip/Deflater.end@6
@@ -120,45 +125,87 @@ tid=0 name="main" blocked=true top=java/util/zip/Deflater.end@6
   <- org/eclipse/jetty/util/compression/DeflaterPool.end@5
 ```
 
-`javap` on the real `jetty-util-12.1.8.jar`/JDK 25 `rt` classes confirms this
-is the intended call chain (`DeflaterPool.end(Object)` bridge → `end(Deflater)`
-→ `Deflater.end()`), and pc=6 is exactly the `monitorenter` on `Deflater`'s
-`zsRef` field — i.e. the main thread is blocked entering a per-instance
-monitor also used by `Deflater$DeflaterZStreamRef.run()` (the JDK Cleaner's
-synchronized cleanup action for the same field).
+`javap` on the real `jetty-util-12.1.8.jar`/JDK 25 `rt` classes confirmed
+this is the intended call chain (`DeflaterPool.end(Object)` bridge →
+`end(Deflater)` → `Deflater.end()`), and pc=6 is exactly the `monitorenter`
+on `Deflater`'s `zsRef` field — i.e. the main thread was blocked entering a
+per-instance monitor also used by `Deflater$DeflaterZStreamRef.run()` (the
+JDK Cleaner's synchronized cleanup action for the same field), yet no live
+thread — not the idle `Common-Cleaner`, not any Jetty worker — ever showed as
+holding it in any capture.
 
-Ruled out:
-- **Not the Cleaner holding it**: the `Common-Cleaner` thread is present and
-  alive in every capture, but its own top frame is
-  `ReferenceQueue.remove(60000)` (`CleanerImpl.run()` pc=45) — its normal idle
-  wait, not inside `PhantomCleanable.clean()`/`DeflaterZStreamRef.run()`.
-- **No other live thread holds any Deflater-related lock**: every Jetty
-  `QueuedThreadPool` worker is idle in `BlockingArrayQueue.poll`; the
-  `Scheduler`/`ReservedThreadExecutor` threads are in unrelated waits.
-- **Not JIT-compiler background activity**: `--nojit` shows the identical
-  hang and identical CPU profile.
-- **Not a monitor-implementation busy-spin**: read through
-  `vm/src/threading/monitor.rs`'s `enter`/`enter_or_contend`/`block_enter` and
-  `vm/src/vm/vm_exec.rs::monitor_enter_blocking` — the normal path uses a
-  proper condvar `wait`, not a poll loop, for both the interpreter's
-  `Monitorenter` opcode handler and the two call sites in `Deflater.end()`.
+**Root cause**: `ThreadRegistry::mark_dead` (called when a Java thread
+terminates) never released any monitor that thread might still hold. A
+thread torn down while blocked inside a native call made from within a
+`synchronized` region — exactly what happens when Jetty abandons the
+deliberately-stuck "in-flight request" test thread after its
+graceful-shutdown timeout — never executes its own `monitorexit` bytecode.
+Worse, a monitor that was still an *uncontended thin lock* (never inflated)
+at the moment its owner died couldn't be swept at death time at all: it only
+gets inflated later, by whichever thread next contends it, and that
+inflation pre-seeds the freshly-created `Monitor`'s owner straight from the
+stale thin-lock mark word — so even a general "sweep this dead thread's
+monitors" pass at death time misses it.
 
-Not yet explained: `Get-Process` CPU sampling during the hang (twice, 5s
-apart, both with JIT on and with `--nojit`) shows the whole process
-consuming **~96% of one core continuously**, not idle — which does not match
-a thread cleanly parked on a condvar. This was not resolved to a specific
-thread/line before time ran out on this session; per-thread CPU attribution
-would need OS-level profiling (ETW or similar) this box doesn't have set up.
-The busy core could be an unrelated background thread (e.g. periodic
-young-gen GC activity from the class's allocation churn) coincident with a
-genuine parked main thread, or it could be a real spin somewhere not yet
-located. **Next step: instrument or sample per-thread, not per-process, CPU
-to determine whether `tid=0` itself is spinning or truly parked; if truly
-parked, find what actually holds (or should release) the `zsRef` monitor
-that the dump does not attribute to any live thread.**
+**Fix** (`vm/src/threading/monitor.rs`, `vm/src/vm/vm_exec.rs`,
+`vm/src/native/jni.rs`): added `MonitorTable::release_monitors_held_by`
+(wired into every `mark_dead` call site) for the already-inflated case, and
+a dead-owner check in `monitor_enter_blocking` right after
+`enter_or_contend` inflates a contended monitor, for the thin-lock-inflated-
+later case. Regression tests:
+`dead_thread_owned_monitor_is_released_and_future_enters_succeed`,
+`contended_inflation_of_a_dead_threads_thin_lock_is_recoverable`.
 
-The `JettyServletWebServerFactoryTests` class shows the identical HANG at
-200s/200s (JIT and `--nojit`) and very likely shares this same root cause
-(same module, same `AbstractServletWebServerFactoryTests`/reactive sibling
-lineage, same `DeflaterPool` teardown path) but was not independently
-stack-dumped this session.
+**Verified**: `JettyReactiveWebServerFactoryTests` no longer hangs — it now
+completes in 156s (was: hangs forever at 200s+ every run). 22/35 pass; the
+13 failures are almost all `IllegalArgumentException: Package ... did not
+contain resources: [test.jks]` (a test-fixture/classpath-resource-listing
+issue, not this bug — HotSpot would need the same file) plus one
+`compressionOfResponseToGetRequest` timeout that did not reproduce again on
+a subsequent run, consistent with test-execution-order sensitivity rather
+than a deterministic hang.
+
+`JettyServletWebServerFactoryTests` (3x more tests) also no longer gets
+stuck at the old `DeflaterPool.end()` point — it now makes it through 14
+server start/stop cycles before hitting the *different*, unrelated bug
+documented below.
+
+## New OPEN bug found once the hang above stopped masking it: blocking-read timeout not enforced
+
+`JettyServletWebServerFactoryTests` still does not complete even at a 900s
+timeout (5x the original). A `--stack-dump-on-timeout` capture shows a
+completely different signature from the fixed bug above:
+
+```
+tid=0 name="main" blocked=true
+  top=sun/nio/ch/SocketDispatcher.read@4
+    <- sun/nio/ch/NioSocketImpl.tryRead@45
+    <- sun/nio/ch/NioSocketImpl.timedRead@11
+```
+
+This is a real OS-level blocking `read()` syscall that never returns — not a
+monitor wait, so the interpreter's dump mechanism can't get a live frame walk
+(the thread never reaches a Java-bytecode check-in point), only this cached
+3-frame summary. `timedRead` (as opposed to `tryRead`) is the JDK's
+bounded-timeout read path, used only when `SO_TIMEOUT` is set — so a
+`SocketTimeoutException` should have fired and didn't.
+
+CratonVM's design for this path (`native-io/src/net.rs`, `net_read0` /
+`IOUtil.configureBlocking`) relies on `NioSocketImpl.timedRead` first calling
+`configureBlocking(fd, false)` to flip the OS fd non-blocking, so `read0`
+hits `WouldBlock` → returns `IOStatus.UNAVAILABLE` (-2) → the Java-level loop
+in `timedRead` polls via `Net.poll` against the real deadline. If that
+fd ever ends up performing a genuinely *blocking* `read()` instead (fd not
+actually flipped non-blocking for this connection, or a stream handle that
+bypasses `configureBlocking` entirely), the read blocks until peer-close
+instead of the configured timeout — matching this hang exactly. Not yet
+isolated to a specific test method or root-caused past this point.
+
+**Next steps**: identify which specific test method this is (JUnit method
+order isn't logged directly by this run; correlate via elapsed test count —
+this was roughly the 15th test of ~115) and reproduce it in isolation;
+confirm whether `configureBlocking` is actually reached for that connection's
+fd (a `native_ring`/dispatch-trace capture, or a temporary `eprintln!` in
+`configureBlocking`/`net_read0`, would confirm quickly); check whether the
+connection is one CratonVM's registry doesn't recognize (`net_sockets()`
+lookup miss silently falling through to a real/uncontrolled blocking read).
