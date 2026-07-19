@@ -1275,6 +1275,10 @@ pub fn ucl_real_find_class(
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
     }
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+    }
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
         return Ok(Some(mirror));
     }

@@ -17218,6 +17218,37 @@ fn lookup_loader_initiated(
         .class_defined_by_loader_exact(name, loader)
 }
 
+fn is_isolated_url_loader_definition(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+) -> bool {
+    use cratonvm_native_api::NativeContext as _;
+    let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+        referencing_class_id.as_u32(),
+    ) else {
+        return false;
+    };
+    let ctx = crate::vm::NativeContextImpl { shared, thread };
+    cratonvm_native_builtins::classloader::url_classloader_isolated_from_app(&ctx, loader)
+}
+
+fn isolated_loader_class_not_found(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    name: &str,
+) -> MethodCallFailed {
+    use cratonvm_native_api::NativeContext as _;
+    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+    let exception = cratonvm_native_builtins::jboss_module_loader::alloc_single_message_exception(
+        &mut ctx,
+        "java/lang/NoClassDefFoundError",
+        1,
+        &name.replace('/', "."),
+    );
+    MethodCallFailed::ExceptionThrown(exception)
+}
+
 /// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
 /// `checkcast`/`instanceof`) in a *loader-faithful* way.
 ///
@@ -17270,6 +17301,9 @@ fn resolve_class_loader_aware(
         // semantics), then fall back to the global store.
         if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
             return Ok(id);
+        }
+        if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
+            return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         return shared
             .load_class_concurrent(name)

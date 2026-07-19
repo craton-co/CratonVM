@@ -4924,7 +4924,7 @@ pub(crate) fn is_platform_class_loader(ctx: &dyn NativeContext, loader: ObjectRe
             .is_some_and(|platform| platform.as_ptr() == loader.as_ptr())
 }
 
-pub(crate) fn url_classloader_isolated_from_app(
+pub fn url_classloader_isolated_from_app(
     ctx: &dyn NativeContext,
     loader: ObjectRef,
 ) -> bool {
@@ -5342,7 +5342,13 @@ pub(crate) fn ucl_try_define_local_class(
 
     let bytes = match bytes {
         Some(b) => b,
-        None if http_bases.is_empty() => return None,
+        None if http_bases.is_empty() => {
+            if url_classloader_isolated_from_app(ctx, loader) {
+                let exception = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, internal_name);
+                return Some(Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception)));
+            }
+            return None;
+        }
         None => {
             let exc = crate::jboss_module_loader::alloc_single_message_exception(
                 ctx,
@@ -5355,6 +5361,12 @@ pub(crate) fn ucl_try_define_local_class(
             ));
         }
     };
+
+    if url_classloader_isolated_from_app(ctx, loader) {
+        if let Err(error) = crate::lang_system::preload_isolated_loader_supertypes(ctx, loader, &bytes) {
+            return Some(Err(error));
+        }
+    }
 
     let loader_pin = ctx.pin_native_root(loader);
     let loader_live = ctx.read_native_pin(loader_pin, loader);

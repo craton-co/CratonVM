@@ -874,7 +874,7 @@ fn build_module_object(
 /// docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md).
 /// Centralized here instead of repeating the pin/read/unpin dance at each
 /// call site.
-pub(crate) fn alloc_single_message_exception(
+pub fn alloc_single_message_exception(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     num_fields: usize,
