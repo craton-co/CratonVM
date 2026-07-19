@@ -5,6 +5,16 @@
 re-run 5x clean after its fix, 32/32 tests each run). See "Resolution"
 section at the end of this doc for what fixed each of the 5 mechanisms.
 
+**Residual (found during post-fix repetition testing, 2026-07-19):**
+`reactive.HttpComponentsClientHttpConnectorBuilderTests` — while its
+documented mechanism #4 (mismatch not rejected) is genuinely fixed and
+`connectWithSslBundleAndOptionsMismatch` passes reliably, repeated runs
+(not just the single verification pass) surfaced that `connectWithSslBundle`
+itself (the success-path test) is separately flaky under the async/reactive
+IOReactor path, via two newly-found, unrelated mechanisms — not caused by
+any fix in this doc. Tracked openly in
+`docs/known-issues/springboot/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak.md`.
+
 ## Symptom
 
 All of these tests configure an `SslBundle` with a self-signed test
@@ -214,8 +224,12 @@ All 5 mechanisms fixed, in `native-builtins/src/{t27_tls,net_phase_e,phases_late
    (mismatch silently accepted) — fixed as a side effect of (2) and the
    `SSLHandshakeException` classification below: the underlying TLS connect
    failure now surfaces as a real `SSLHandshakeException` that the reactive
-   Apache HttpComponents 5 connector correctly propagates, rather than an
-   generic `IOException`/being swallowed.
+   Apache HttpComponents 5 connector correctly propagates, rather than a
+   generic `IOException`/being swallowed. (This mechanism specifically —
+   `connectWithSslBundleAndOptionsMismatch` — is confirmed fixed and passes
+   reliably. A *separate*, unrelated flakiness in this same test class's
+   success-path test was found afterward; see the Residual note at the top
+   of this doc.)
 
 5. **HANG (`ClientHttpRequestFactoryBuilderTests`)** — resolved as a side
    effect of the fixes above (no separate root cause needed); the class now

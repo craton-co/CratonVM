@@ -7389,6 +7389,14 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                             }
                         }
                     }
+                    if std::env::var_os("CRATONVM_DBG_TLS_CIPHERS").is_some() {
+                        eprintln!(
+                            "[dbg-tls-ciphers] thread={:?} setSSLParameters id={} suites={:?}",
+                            std::thread::current().id(),
+                            id,
+                            suites
+                        );
+                    }
                     with_engine(id, |s| s.enabled_ciphers = suites);
                 }
                 // Tomcat configures client-cert auth via
