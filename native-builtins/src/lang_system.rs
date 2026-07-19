@@ -3115,6 +3115,71 @@ fn preload_supertypes_via_loader(ctx: &mut dyn NativeContext, loader_obj: Object
     ctx.unpin_native_roots(p_loader);
 }
 
+/// Resolve direct hierarchy edges through an isolated URL loader before its
+/// class is handed to the backend linker. Unlike the generic best-effort
+/// helper above, a miss is authoritative: a platform-parented loader cannot
+/// fall back to the process application classpath.
+pub(crate) fn preload_isolated_loader_supertypes(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    bytes: &[u8],
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    let class_file = match cratonvm_reader::read_class(bytes) {
+        Ok(class_file) => class_file,
+        Err(_) => return Ok(()),
+    };
+    let mut names: Vec<String> = Vec::new();
+    if let Some(super_name) = &class_file.super_class {
+        if !super_name.is_empty() && &**super_name != "java/lang/Object" {
+            names.push(super_name.to_string());
+        }
+    }
+    names.extend(
+        class_file
+            .interfaces
+            .iter()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string()),
+    );
+    let loader_pin = ctx.pin_native_root(loader_obj);
+    let mut loader = loader_obj;
+    for internal_name in names {
+        loader = ctx.read_native_pin(loader_pin, loader);
+        let dotted_name = ctx.create_string(&internal_name.replace('/', "."));
+        let name_pin = ctx.pin_native_root(dotted_name);
+        loader = ctx.read_native_pin(loader_pin, loader);
+        let dotted_name = ctx.read_native_pin(name_pin, dotted_name);
+        let result = ctx.invoke_virtual(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(dotted_name))],
+        );
+        ctx.unpin_native_roots(name_pin);
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => {}
+            Err(error) => {
+                ctx.unpin_native_roots(loader_pin);
+                return Err(error);
+            }
+            _ => {
+                let exception = crate::jboss_module_loader::alloc_single_message_exception(
+                    ctx,
+                    "java/lang/ClassNotFoundException",
+                    1,
+                    &internal_name,
+                );
+                ctx.unpin_native_roots(loader_pin);
+                return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                    exception,
+                ));
+            }
+        }
+    }
+    ctx.unpin_native_roots(loader_pin);
+    Ok(())
+}
+
 fn same_loader_already_defined_mirror(
     ctx: &mut dyn NativeContext,
     loader_obj: ObjectRef,

@@ -17323,6 +17323,37 @@ fn lookup_loader_initiated(
         .class_defined_by_loader_exact(name, loader)
 }
 
+fn is_isolated_url_loader_definition(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+) -> bool {
+    use cratonvm_native_api::NativeContext as _;
+    let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+        referencing_class_id.as_u32(),
+    ) else {
+        return false;
+    };
+    let ctx = crate::vm::NativeContextImpl { shared, thread };
+    cratonvm_native_builtins::classloader::url_classloader_isolated_from_app(&ctx, loader)
+}
+
+fn isolated_loader_class_not_found(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    name: &str,
+) -> MethodCallFailed {
+    use cratonvm_native_api::NativeContext as _;
+    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+    let exception = cratonvm_native_builtins::jboss_module_loader::alloc_single_message_exception(
+        &mut ctx,
+        "java/lang/NoClassDefFoundError",
+        1,
+        &name.replace('/', "."),
+    );
+    MethodCallFailed::ExceptionThrown(exception)
+}
+
 /// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
 /// `checkcast`/`instanceof`) in a *loader-faithful* way.
 ///
@@ -17375,6 +17406,9 @@ fn resolve_class_loader_aware(
         // semantics), then fall back to the global store.
         if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
             return Ok(id);
+        }
+        if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
+            return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         return shared
             .load_class_concurrent(name)
@@ -22345,7 +22379,14 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
-                | ("forPrimitiveName", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("isArray", "()Z")
+                | ("getComponentType", "()Ljava/lang/Class;")
+                | ("componentType", "()Ljava/lang/Class;")
+                | ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+                | (
+                    "forPrimitiveName",
+                    "(Ljava/lang/String;)Ljava/lang/Class;"
+                )
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24242,6 +24283,34 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if class_name == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name == "isIn"
+        && method_descriptor
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        return true;
+    }
+    // JDK 25's public Class.getProtectionDomain() reads a VM-populated private
+    // mirror field directly. CratonVM's mirrors retain class provenance in the
+    // class store instead, so force the registered class-id-backed native.
+    if class_name == "java/lang/Class"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+                // JDK 25 implements isArray() as a direct read of the
+                // private componentType field. Array mirrors keep their
+                // identity in the class store, so that bytecode falsely
+                // reports `Class[]` as a non-array and Spring skips its
+                // Class[] -> String[] annotation adaptation.
+                | ("isArray", "()Z")
+                | ("getComponentType", "()Ljava/lang/Class;")
+                // Spring's annotation map adapter uses the package-private
+                // alias rather than the public accessor.
+                | ("componentType", "()Ljava/lang/Class;")
+        )
+    {
         return true;
     }
     if is_netty_event_executor_group_shutdown_native_override(
@@ -26362,8 +26431,7 @@ fn intercept_force_registered_native(
                 )
         )
     {
-        let cb =
-            shared
+        let cb = shared
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         return Some((|| {
@@ -26404,6 +26472,41 @@ fn intercept_force_registered_native(
             "getClassLoader",
             "()Ljava/lang/ClassLoader;",
         )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    // These concrete Class methods read VM-private mirror fields in JDK 25.
+    // Resolve by the receiver's runtime class so inherited or cached method
+    // references cannot bypass CratonVM's class-id-backed native methods.
+    if matches!(
+        (method_name, method_descriptor),
+        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+            | ("isArray", "()Z")
+            | ("getComponentType", "()Ljava/lang/Class;")
+            | ("componentType", "()Ljava/lang/Class;")
+    )
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared
+            .native_methods
+            .find("java/lang/Class", method_name, method_descriptor)?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
@@ -26512,8 +26615,7 @@ fn intercept_force_registered_native_cached(
                 )
         )
     {
-        let cb =
-            shared
+        let cb = shared
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         let ret_type = crate::jit::return_type(method_descriptor);
@@ -26524,6 +26626,38 @@ fn intercept_force_registered_native_cached(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
                 )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    if matches!(
+        (method_name, method_descriptor),
+        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+            | ("isArray", "()Z")
+            | ("getComponentType", "()Ljava/lang/Class;")
+            | ("componentType", "()Ljava/lang/Class;")
+    )
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared
+            .native_methods
+            .find("java/lang/Class", method_name, method_descriptor)?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
                 crate::vm::native_return_pushed_to_stack(shared, thread);
             }
             Ok(CachedCallResult::Handled)
@@ -37731,6 +37865,27 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_array_reflection_uses_class_id_backed_natives() {
+        for (name, descriptor) in [
+            ("isArray", "()Z"),
+            ("getComponentType", "()Ljava/lang/Class;"),
+            ("componentType", "()Ljava/lang/Class;"),
+            ("getProtectionDomain", "()Ljava/security/ProtectionDomain;"),
+        ] {
+            assert!(force_native_over_real_jdk_bytecode(
+                "java/lang/Class",
+                name,
+                descriptor,
+            ));
+            assert!(is_class_mirror_native_override(
+                "java/lang/Class",
+                name,
+                descriptor,
+            ));
+        }
+    }
 
     #[test]
     fn tomcat_scanner_uses_only_audited_native_bridges() {
