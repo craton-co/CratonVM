@@ -110,6 +110,7 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: self_guard as *const () as usize,
         region_bounds_addr: TEST_REGION_BOUNDS.as_ptr() as usize,
         native_stack_floor_fn: native_stack_floor as *const () as usize,
+        ldc_string: s,
     }
 }
 
@@ -141,6 +142,7 @@ fn cached(
         is_synchronized: false,
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     }
 }
 

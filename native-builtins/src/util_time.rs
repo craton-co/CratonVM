@@ -5163,9 +5163,12 @@ fn os_default_zone_id() -> String {
 /// JDBC bind path goes through `TimeZone.getDefault()` — two different
 /// notions of "default zone" that must agree).
 fn jvm_default_zone_id(ctx: &mut dyn NativeContext) -> String {
-    if let Ok(Some(Value::Object(Some(tz)))) =
-        ctx.invoke("java/util/TimeZone", "getDefault", "()Ljava/util/TimeZone;", &[])
-    {
+    if let Ok(Some(Value::Object(Some(tz)))) = ctx.invoke(
+        "java/util/TimeZone",
+        "getDefault",
+        "()Ljava/util/TimeZone;",
+        &[],
+    ) {
         if let Ok(Some(Value::Object(Some(id_str)))) = ctx.invoke(
             "java/util/TimeZone",
             "getID",

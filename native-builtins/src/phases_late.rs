@@ -79,6 +79,28 @@ fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usi
     }
 }
 
+#[cfg(test)]
+mod gzip_output_regression_tests {
+    use super::*;
+
+    #[test]
+    fn gzip_output_matches_hotspot_for_a_large_json_string() {
+        let mut body = Vec::with_capacity(10_002);
+        body.push(b'[');
+        body.extend(std::iter::repeat_n(b'a', 10_000));
+        body.push(b']');
+
+        let actual = p58_gzip_compress(&body).expect("gzip compression should succeed");
+        let expected = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xed, 0xc1, 0x31, 0x0d,
+            0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37, 0x51, 0x1f, 0x0d, 0x70,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x52, 0xc0, 0x19,
+            0x7d, 0xe0, 0x12, 0x27, 0x00, 0x00,
+        ];
+        assert_eq!(actual, expected);
+    }
+}
+
 fn read_pinned_object_value(
     ctx: &dyn NativeContext,
     pin: Option<(usize, ObjectRef)>,
@@ -5642,6 +5664,48 @@ fn native_quarkus_logging_handle_failed_start(
     result
 }
 
+/// Renders a synthetic `java/nio/file/Path` object's display string exactly
+/// as the `Path.toString()` native below does (jar-FS/jrt-FS entries with
+/// `/`, host paths with the OS separator). Extracted so callers that already
+/// hold a `NativeContext` and a `Path` `ObjectRef` — e.g. javac's
+/// `JavacFileManager.inferBinaryName` fast path in `lib.rs`, which used to
+/// call `ctx.invoke_virtual(path, "toString", ...)` — can get the same
+/// result WITHOUT going through `invoke_virtual`. That indirection doesn't
+/// consult `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+/// `check_override` allow-list the way the bytecode interpreter's own
+/// `invokevirtual` handling does, so it silently ran `Path`'s real
+/// (nonexistent — `Path` is an interface) bytecode, which resolves to
+/// `Object.toString()` and prints `java.nio.file.Path@<hash>`. That garbage
+/// string then got mangled by `javac_binary_name_from_relative_path` into
+/// the literal binary name `java.nio.file` for every ordinary classpath
+/// class file, breaking real in-process javac compiles (Spring's
+/// `TestCompiler`/AOT generation) referencing any application-classpath
+/// class.
+pub(crate) fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let p = p57_read_path(ctx, this);
+    match vfs_decode(&p) {
+        // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+        // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+        Some((_, _, e)) => {
+            if e.starts_with('/') {
+                e
+            } else {
+                format!("/{e}")
+            }
+        }
+        // A plain (non-encoded) relative path whose owning FileSystem is a
+        // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+        // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+        // a package name. Rendering the host '\' there would corrupt the key.
+        None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
+        // Host-FS path: render the OS-native separator. CratonVM stores
+        // paths with '/' internally, but HotSpot's WindowsPath.toString()
+        // renders '\'; convert at this display boundary on Windows
+        // (no-op on Unix). Matches `File.getPath()` below.
+        None => file_normalise_path(&p),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6249,28 +6313,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- Path.toString() → String ---
     r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        let display = match vfs_decode(&p) {
-            // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
-            // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
-            Some((_, _, e)) => {
-                if e.starts_with('/') {
-                    e
-                } else {
-                    format!("/{e}")
-                }
-            }
-            // A plain (non-encoded) relative path whose owning FileSystem is a
-            // virtual (jar/jrt) FS renders with '/' — e.g. the result of
-            // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
-            // a package name. Rendering the host '\' there would corrupt the key.
-            None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
-            // Host-FS path: render the OS-native separator. CratonVM stores
-            // paths with '/' internally, but HotSpot's WindowsPath.toString()
-            // renders '\'; convert at this display boundary on Windows
-            // (no-op on Unix). Matches `File.getPath()` below.
-            None => file_normalise_path(&p),
-        };
+        let display = p57_path_display_string(ctx, this);
         let s = ctx.create_string(&display);
         Ok(Some(Value::Object(Some(s))))
     });
@@ -16096,6 +16139,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .to_string();
             }
         }
+        // Decode percent-escapes (`%20` -> ` `, etc.) the way the real
+        // `URI.getPath()` accessor does — File(URI) calls that accessor, but
+        // both sources above (the by-name `path` field on a real-JDK URI,
+        // and the raw-text parse fallback) yield the RAW, still-encoded
+        // component. Without this, a jar/file path containing an encoded
+        // space or other reserved character never resolves to the real
+        // on-disk file (Spring Boot's `StaticResourceJars.toFile` silently
+        // treats the mis-decoded `File` as not found).
+        let path = crate::net_phase_e::uri_percent_decode(&path);
         // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
         let mut p = path;
         let chars: Vec<char> = p.chars().collect();
@@ -19444,13 +19496,19 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Finish compression if not already done (count >= 0 means not finished)
         let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
+        // `finish` invokes Java OutputStream methods, which may allocate and move
+        // the receiver. Keep it rooted across that call before using it again.
+        let this_pin = ctx.pin_native_root(this);
         if count >= 0 {
-            p58_gzip_out_finish(ctx, args)?;
+            let this_now = ctx.read_native_pin(this_pin, this);
+            p58_gzip_out_finish(ctx, &[Value::Object(Some(this_now))])?;
         }
         // Close underlying stream
-        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let this_now = ctx.read_native_pin(this_pin, this);
+        if let Value::Object(Some(underlying)) = ctx.get_field(this_now, 2) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -19987,10 +20045,15 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
-    ctx.set_field(this, 0, Value::Object(Some(arr)));
-    ctx.set_field(this, 1, Value::Int(0));
+    // Store the pre-existing Java argument before the allocation below; it is
+    // then reachable through `this` if a moving collection occurs.
     ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let this_pin = ctx.pin_native_root(this);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 0, Value::Object(Some(arr)));
+    ctx.set_field(this_now, 1, Value::Int(0));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -20023,22 +20086,34 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
     if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
         let cap = ctx.array_length(arr);
         let new_count = count + bytes.len();
-        // Grow if needed
-        let target = if new_count > cap {
+        if new_count > cap {
+            // The new byte[] can trigger a moving collection. Both `this`
+            // and the old buffer are used after that allocation, so raw
+            // ObjectRefs would write stale memory and corrupt the compressed
+            // payload (Zipkin's 10,002-byte JSON body became 11,034 bytes).
+            let this_pin = ctx.pin_native_root(this);
+            let arr_pin = ctx.pin_native_root(arr);
             let new_cap = (new_count * 2).max(1024);
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
             for i in 0..count {
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+                let arr_now = ctx.read_native_pin(arr_pin, arr);
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr_now, i));
             }
-            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
-            new_arr
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 0, Value::Object(Some(new_arr)));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(new_arr, count + i, Value::Int(b as i8 as i32));
+            }
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.set_field(this_now, 1, Value::Int(new_count as i32));
+            ctx.unpin_native_roots(arr_pin);
+            ctx.unpin_native_roots(this_pin);
         } else {
-            arr
-        };
-        for (i, &b) in bytes.iter().enumerate() {
-            ctx.set_array_element(target, count + i, Value::Int(b as i8 as i32));
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, count + i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(this, 1, Value::Int(new_count as i32));
         }
-        ctx.set_field(this, 1, Value::Int(new_count as i32));
     }
 }
 
@@ -20190,57 +20265,22 @@ fn p58_crc32(data: &[u8]) -> u32 {
     !c
 }
 
-#[cfg(unix)]
 fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
-    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    let mut z_len = bound as libz_sys::uLong;
+    let rc =
+        unsafe { libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
     if rc != 0 || z_len < 6 {
         return None;
     }
     z.truncate(z_len as usize);
     // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
     Some(z[2..z.len() - 4].to_vec())
-}
-
-#[cfg(not(unix))]
-fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
-    None
 }
 
 fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -20266,6 +20306,7 @@ fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
 fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
     let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
 
     // Read accumulated uncompressed data
@@ -20284,13 +20325,18 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
     // Write compressed bytes to underlying OutputStream
     if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
+        let underlying_pin = ctx.pin_native_root(underlying);
         for &b in &compressed {
-            let _ = ctx.invoke_virtual(underlying, "write", "(I)V", &[Value::Int(b as i32)]);
+            let underlying_now = ctx.read_native_pin(underlying_pin, underlying);
+            let _ = ctx.invoke_virtual(underlying_now, "write", "(I)V", &[Value::Int(b as i32)]);
         }
+        ctx.unpin_native_roots(underlying_pin);
     }
 
     // Mark as finished (set count to -1)
-    ctx.set_field(this, 1, Value::Int(-1));
+    let this_now = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this_now, 1, Value::Int(-1));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -21945,6 +21991,23 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 0, Value::Object(None));
         }
         Ok(None)
+    });
+    // JarFile.getComment() — inherited from ZipFile in real bytecode, whose
+    // `ensureOpen()` throws `IllegalStateException("zip file closed")` once
+    // `close()` has run. Our synthetic 2-field JarFile has no real ZipFile
+    // backing fields for that bytecode to check, so unregistered dispatch
+    // returned normally with no exception at all — Spring Boot's
+    // `StaticResourceJarsTests.closesJarFromNonCachedConnection` expects the
+    // throw. Mirror `close()`'s closed-marker (path field cleared to null).
+    r.register(jf, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if matches!(ctx.get_field(this, 0), Value::Object(None)) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "zip file closed".to_string(),
+            }
+            .into());
+        }
+        Ok(Some(Value::Object(None)))
     });
     r.register(jf, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -26711,14 +26774,19 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 6-field synthetic — WP1.9:
+    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
     //   slot 3: lineNumber (Int, -1/-2 sentinels)
     //   slot 4: byteCodeIndex (Int, -1 for unknown/native)
-    //   slot 5: declaringClassInternalName (String, '/'-form used to resolve
-    //           the Class mirror lazily in `getDeclaringClass()`)
+    //   slot 5: declaringClassInternalName (String, '/'-form; used only by
+    //           `toStackTraceElement()`'s formatting fallback)
+    //   slot 6: declaringClassMirror (Class or null) — resolved EAGERLY at
+    //           `populate_stack_frame` time from the entry's own ClassId
+    //           (see that function's doc comment for why: a fresh by-name
+    //           lookup performed later, from `getDeclaringClass()`, can fail
+    //           for a frame whose class is still running its own `<clinit>`)
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -26740,28 +26808,17 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
-    // StackFrame.getDeclaringClass() — resolve the Class mirror via the
-    // stored internal class name (slot 5). RETAIN_CLASS_REFERENCE option
-    // is not enforced here (we always resolve); bootstrap consumers that
-    // don't request the option simply ignore the returned Class.
+    // StackFrame.getDeclaringClass() — return the Class mirror eagerly
+    // resolved and stored at population time (slot 6). RETAIN_CLASS_REFERENCE
+    // option is not enforced here (we always resolve); bootstrap consumers
+    // that don't request the option simply ignore the returned Class.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let internal = match ctx.get_field(this, 5) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            if internal.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            if let Some(cid) = ctx.class_id_by_name(&internal) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
-            }
-            Ok(Some(Value::Object(None)))
+            Ok(Some(ctx.get_field(this, 6)))
         },
     );
     // StackFrame.getMethodType() — we don't yet wire real MethodType
@@ -26837,7 +26894,22 @@ fn populate_stack_frame(
     // (allocation-free) field writes. Holding the freshly-allocated `sf` and
     // strings in bare locals across the subsequent `create_string` calls is a
     // use-after-move/free under the moving collector.
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
+    // Slot 6: the declaring-class `Class` mirror, resolved EAGERLY here from
+    // `entry.class_id` when available. `entry.class_id` is captured directly
+    // off the live interpreter `Frame` (see `stackwalker::entry_from_frame`)
+    // and is therefore always valid for a real frame -- unlike a fresh
+    // by-name lookup (`class_id_by_name(&entry.class_name)`) performed LATER,
+    // from `getDeclaringClass()`, which can fail for a frame whose class is
+    // still executing its own `<clinit>` (observed: `SpringFactoriesLoader`/
+    // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from their
+    // own static initializers -- log4j-api's `StackLocator` walks back to
+    // that exact self-frame and NPEs when the by-name lookup comes back
+    // empty). Resolving from the guaranteed-valid ClassId at population time
+    // sidesteps that failure mode entirely; `class_id_by_name` remains a
+    // fallback for synthetic/no-frame entries (`entry.class_id.is_none()`).
+    let decl_cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
+
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
     let base = ctx.pin_native_root(sf);
     let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let h_cls = ctx.pin_native_root(cls_str);
@@ -26851,9 +26923,17 @@ fn populate_stack_frame(
         }
         None => (None, None),
     };
-    // Preserve the '/' form for declaring-class resolution via class_id_by_name.
+    // Preserve the '/' form too (used by toStackTraceElement()'s fallback).
     let mut decl_internal = ctx.create_string(&entry.class_name);
     let h_decl = ctx.pin_native_root(decl_internal);
+    let (mut decl_mirror, h_mirror) = match decl_cid {
+        Some(cid) => {
+            let m = ctx.get_class_mirror(cid);
+            let h = ctx.pin_native_root(m);
+            (Some(m), Some(h))
+        }
+        None => (None, None),
+    };
 
     sf = ctx.read_native_pin(base, sf);
     cls_str = ctx.read_native_pin(h_cls, cls_str);
@@ -26862,6 +26942,9 @@ fn populate_stack_frame(
         file_str = Some(ctx.read_native_pin(h, s));
     }
     decl_internal = ctx.read_native_pin(h_decl, decl_internal);
+    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
+        decl_mirror = Some(ctx.read_native_pin(h, m));
+    }
 
     ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
@@ -26873,6 +26956,11 @@ fn populate_stack_frame(
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
+    ctx.set_field(
+        sf,
+        6,
+        decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
+    );
     ctx.unpin_native_roots(base);
     sf
 }
@@ -66676,20 +66764,8 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // Introspector
+    // Introspector cache-management methods retain their bridge implementations.
     let intro = "java/beans/Introspector";
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
         // Introspector caches BeanInfo per Class. Our implementation doesn't cache
         // anything — each call walks the class freshly — so there's nothing to flush.
@@ -66987,6 +67063,20 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
+    // The two-argument overload is getBeanInfo(beanClass, stopClass). The
+    // native used to discard stopClass and always walked through Object, which
+    // made it expose inherited Object properties and methods despite the JDK
+    // contract. Spring's standard property resolver uses this overload.
+    let stop_class_id = match args.get(1) {
+        Some(Value::Object(Some(stop_mirror))) => {
+            let stop_pin = ctx.pin_native_root(*stop_mirror);
+            let id = crate::lang_class::mirror_class_id(ctx, *stop_mirror);
+            ctx.unpin_native_roots(stop_pin);
+            id
+        }
+        _ => None,
+    };
+
     // Discover properties from getters/setters across the class + superclasses,
     // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
     // JDK java.beans.Introspector property-merge rules that the Tomcat suite
@@ -67073,6 +67163,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
+        if Some(cid) == stop_class_id {
+            break;
+        }
         scan_cids.push(cid);
         sc = if ctx.is_interface_class(cid) {
             None
@@ -67335,7 +67428,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Object member) when introspecting a bare interface type — see the
     // `is_interface_class` gate on `scan_cids` above for the matching
     // rationale.
-    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
+    if stop_class_id.is_none()
+        && !ctx.is_interface_class(class_id)
+        && !properties.iter().any(|(n, ..)| n == "class")
+    {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             // Re-read from the pin: the discovery scan above (and the failed

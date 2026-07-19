@@ -1420,17 +1420,33 @@ use cratonvm_types::ObjectRef;
 /// `CRATONVM_EQE_SYNC_EXECUTE=1` reverts to the Round-69 sync-on-caller
 /// behaviour (escape hatch for Keycloak in case the deferral regresses it).
 ///
-/// GC note (gc-followups-20260706): KNOWN-UNSOUND across GCs — both the EQE
-/// key (raw address, stale after a move) and the queued Runnable refs
-/// (neither rooted nor remapped) survive across allocations between
-/// `execute` and the drain in `AsyncFutureTask.await()`. Tolerable only
-/// while the enqueue→drain window contains no moving GC. Follow-up: key by
-/// identity hash + store `(identity_key, ObjectRef)` var-handle-root pairs,
-/// or add a gc_scan/gc_update hook pair (entries here are transient, so a
-/// hook avoids permanently pinning drained Runnables).
-static EQE_PENDING: OnceLock<Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>>> = OnceLock::new();
+/// GC note (gc-followups-20260706, fixed 2026-07-19): was KNOWN-UNSOUND
+/// across GCs — the queued Runnable refs were neither rooted nor remapped,
+/// so a moving GC landing in the enqueue→drain window (`execute` to the
+/// drain in `AsyncFutureTask.await()`) left `drain_all_pending_runnables`
+/// calling `invoke_virtual` on a stale `ObjectRef`, dispatching into
+/// whatever the collector had since placed at that address. Under WildFly's
+/// highly concurrent `parallel-extension-add` boot step — every extension's
+/// activation goes through exactly this queue, with ~30 extensions
+/// allocating/classloading simultaneously — this is the live mechanism
+/// behind the `ClassCastException: java.lang.Object cannot be cast to X`
+/// family (X being whatever class the stale address's reused object
+/// happened to report): see
+/// `docs/known-issues/wildfly-remoting-classcastexception-parallel-extension-add.md`.
+/// Fixed by rooting each queued Runnable at enqueue time
+/// (`register_var_handle_root`, keyed by identity hash) and re-resolving to
+/// the current address at drain time (`read_var_handle_root`), the same
+/// pattern already used by `classloader_value_sidetable.rs`'s
+/// `rooted_entry`/`resolve_entry`. The EQE map *key* (`this`) is still a raw
+/// address and can go stale across a move too, but that only splits a given
+/// EQE's tasks across two map buckets after the object relocates — every
+/// bucket is still drained unconditionally by `drain_all_pending_runnables`,
+/// so no task is lost or misdispatched; left as a documented, lower-severity
+/// follow-up rather than folded into this fix.
+static EQE_PENDING: OnceLock<Mutex<HashMap<ObjectRef, VecDeque<(i32, ObjectRef)>>>> =
+    OnceLock::new();
 
-fn eqe_pending() -> &'static Mutex<HashMap<ObjectRef, VecDeque<ObjectRef>>> {
+fn eqe_pending() -> &'static Mutex<HashMap<ObjectRef, VecDeque<(i32, ObjectRef)>>> {
     EQE_PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1457,7 +1473,7 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let mut found: Option<ObjectRef> = None;
+            let mut found: Option<(i32, ObjectRef)> = None;
             let mut empty_keys: Vec<ObjectRef> = Vec::new();
             for (k, q) in map.iter_mut() {
                 if let Some(r) = q.pop_front() {
@@ -1476,7 +1492,18 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
             found
         };
         match next {
-            Some(r) => {
+            Some((identity_key, stale_ref)) => {
+                // Re-resolve to the CURRENT address: any GC between this
+                // Runnable's `execute()` enqueue and this drain may have
+                // moved it (see the GC note on `EQE_PENDING`). Falls back to
+                // the cached ref only if the root was never registered
+                // (identity_key == 0, i.e. malformed enqueue) or the
+                // registry lookup misses.
+                let r = if identity_key != 0 {
+                    ctx.read_var_handle_root(identity_key).unwrap_or(stale_ref)
+                } else {
+                    stale_ref
+                };
                 let _ = ctx.invoke_virtual(r, "run", "()V", &[]);
                 iterations += 1;
             }
@@ -1588,6 +1615,14 @@ fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 
     // Round 89: enqueue for later drain in AsyncFutureTask.await().
+    //
+    // Root the Runnable BEFORE releasing it into the queue: `execute()` can
+    // return well before the drain runs, and any GC in that window (highly
+    // likely under `parallel-extension-add`'s concurrent allocation load)
+    // would otherwise leave the queued `ObjectRef` dangling — see the GC
+    // note on `EQE_PENDING`.
+    ctx.register_var_handle_root(runnable_ref);
+    let identity_key = ctx.identity_hash_code(runnable_ref);
     {
         let mut map = match eqe_pending().lock() {
             Ok(g) => g,
@@ -1595,7 +1630,7 @@ fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         };
         map.entry(this)
             .or_insert_with(VecDeque::new)
-            .push_back(runnable_ref);
+            .push_back((identity_key, runnable_ref));
         if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
             eprintln!("[eqe] enqueue pool={} pending_keys={}", name, map.len());
         }

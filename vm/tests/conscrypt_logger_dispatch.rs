@@ -24,7 +24,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     ["release", "debug"]
         .into_iter()
         .map(|profile| workspace_root().join("target").join(profile).join(exe))
