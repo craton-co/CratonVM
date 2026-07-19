@@ -1922,6 +1922,37 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
+                // docs/known-issues/wildfly-remoting-classcastexception-
+                // parallel-extension-add.md): `mirror` -- the `Class` object
+                // `invoke_virtual` just handed back from recursively
+                // interpreting `loadClass`'s real bytecode -- is a bare Rust
+                // local at this point, not yet on any interpreter operand
+                // stack and not yet in `native_pending_return` (that only
+                // gets set by the OUTERMOST `safe_native_call` wrapper once
+                // this whole native call -- `Class.forName` -- finally
+                // returns). `ctx.initialize_class(cid)` below runs the
+                // class's `<clinit>`, arbitrary GC-capable bytecode, and the
+                // pre-clinit `mirror` was being returned unrefreshed
+                // afterward -- the classic Family-1 stale-ObjectRef shape.
+                // Live-captured via `EnhancedQueueExecutor$ThreadBody`
+                // worker threads racing this exact window during
+                // `parallel-extension-add`: `Class.asSubclass()` (jboss-
+                // logging's `Messages.doGetBundle`, loading a generated
+                // `*_$bundle` message-bundle impl class) read back a mirror
+                // with every field blank (`class_id_from_mirror`/field-0/
+                // field-1 all miss), producing `ClassCastException: class `
+                // (`this.toString()`'s name empty) -- reproduced identically
+                // under `CRATONVM_DISABLE_JIT=1`, ruling out a JIT-specific
+                // mechanism. Pin `mirror_ref` across `initialize_class` and
+                // refresh before every later use, including the final
+                // return.
+                let mut mirror = mirror;
+                let mirror_pin = if let Value::Object(Some(mirror_ref)) = mirror {
+                    Some(ctx.pin_native_root(mirror_ref))
+                } else {
+                    None
+                };
                 // HIB-CV-26 вЂ” honour the `initialize` flag (args[1]).
                 // `ClassLoader.loadClass` only loads + links the class; it does
                 // NOT run static initialisers. The JDK contract for
@@ -1957,7 +1988,11 @@ pub(crate) fn native_class_for_name(
                             // unrecoverable `VmError::Internal` here, which
                             // aborted the whole VM instead of letting Java
                             // code catch the exception.
-                            ctx.initialize_class(cid)?;
+                            let init_result = ctx.initialize_class(cid);
+                            if let Some(pin) = mirror_pin {
+                                mirror = Value::Object(Some(ctx.read_native_pin(pin, mirror_ref)));
+                            }
+                            init_result?;
                         }
                     }
                 }
@@ -1969,6 +2004,9 @@ pub(crate) fn native_class_for_name(
                             eprintln!("FORNAME-RET name={dotted_name} loader={loader_class_name_debug} cid={} enhanced={enh} (via-loader)", cid.as_u32());
                         }
                     }
+                }
+                if let Some(pin) = mirror_pin {
+                    ctx.unpin_native_roots(pin);
                 }
                 return Ok(Some(mirror));
             }
@@ -7934,7 +7972,16 @@ const CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 /// is always large enough for the synthetic writes and so tests using
 /// the MockNativeContext (which returns 0 for `class_num_total_fields`)
 /// still have room.
-const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 6;
+/// Constructor mirrors share the same `mock_jdk_field_slot` synthetic
+/// slot map as Method (see `test_utils.rs`), which now runs up through
+/// slot 12 (`annotationDefault`) after the G2 additions
+/// (`exceptionTypes`/`annotations`/`parameterAnnotations`/`annotationDefault`)
+/// -- the floor must stay >= those slots so `constructor_extra_base`'s
+/// `CONSTRUCTOR_EXTRA_OFFSET_*` writes don't land on and clobber a
+/// still-in-use named field (e.g. floor 6 + `PARAM_COUNT` offset 1 = 7,
+/// which collided with `parameterTypes`'s own mock slot 7). Mirrors the
+/// identical `METHOD_NUM_FIELDS_LEGACY_FLOOR` fix.
+const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
 
 #[cfg(test)]
 const CONSTRUCTOR_NUM_FIELDS: usize = CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR;
@@ -13549,7 +13596,9 @@ pub(crate) fn native_class_get_package_name(
 // ---------------------------------------------------------------------------
 
 /// Read a manifest attribute by name from the class's source jar, if any.
-/// Returns `None` for classes loaded from a directory or the boot path.
+/// Returns `None` for classes loaded from the boot path. For Spring Boot
+/// exploded archives, classes under `BOOT-INF/classes` and `WEB-INF/classes`
+/// inherit the enclosing archive root's manifest.
 ///
 /// Supports three CodeSource URL forms:
 ///   * `file:/C:/.../foo.jar`                              вЂ” plain jar
@@ -13637,10 +13686,57 @@ fn t19_h10_class_manifest_attr(
     } else {
         std::path::PathBuf::from(format!("/{}", path))
     };
-    if !path.is_file() {
+    if path.is_file() {
+        return plain_jar_manifest_attr(&path, package_path.as_deref(), attr);
+    }
+    spring_boot_exploded_manifest_attr(&path, package_path.as_deref(), attr)
+}
+
+/// Cache of parsed exploded-archive manifests keyed by the resolved
+/// `META-INF/MANIFEST.MF` path string, mirroring `plain_manifest_cache` /
+/// `nested_manifest_cache` above so repeated `Class.getPackage()` lookups
+/// (6 attributes per call) only read+parse the manifest once.
+fn exploded_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Spring Boot's exploded launcher gives its URLClassLoader
+/// `.../BOOT-INF/classes` (or `WEB-INF/classes`) as the class path entry, but
+/// package metadata is defined from the archive root's `META-INF/MANIFEST.MF`.
+/// A plain directory has no such inheritance, so restrict this lookup to the
+/// two Boot layouts rather than searching arbitrary parent directories.
+fn spring_boot_exploded_manifest_attr(
+    path: &std::path::Path,
+    package_path: Option<&str>,
+    attr: &str,
+) -> Option<String> {
+    if !path.is_dir() || path.file_name()?.to_string_lossy() != "classes" {
         return None;
     }
-    plain_jar_manifest_attr(&path, package_path.as_deref(), attr)
+    let layout_dir = path.parent()?;
+    let layout = layout_dir.file_name()?.to_string_lossy();
+    if layout != "BOOT-INF" && layout != "WEB-INF" {
+        return None;
+    }
+    let manifest = layout_dir.parent()?.join("META-INF").join("MANIFEST.MF");
+    let cache_key = manifest.display().to_string();
+
+    if let Ok(cache) = exploded_manifest_cache().lock() {
+        if let Some(map) = cache.get(&cache_key) {
+            return manifest_attr_for_package(map, package_path, attr);
+        }
+    }
+
+    let map = std::fs::read(&manifest)
+        .ok()
+        .map(|bytes| parse_package_manifest(&bytes))
+        .unwrap_or_default();
+    let result = manifest_attr_for_package(&map, package_path, attr);
+    if let Ok(mut cache) = exploded_manifest_cache().lock() {
+        cache.insert(cache_key, map);
+    }
+    result
 }
 
 /// Cache of parsed plain-jar manifests keyed by canonicalised path string.
@@ -14798,6 +14894,27 @@ pub(crate) fn native_class_as_subclass(
         let name = mirror_class_name(ctx, this)
             .unwrap_or_default()
             .replace('/', ".");
+        if std::env::var_os("CRATONVM_DBG_CCE_BT").is_some() {
+            let this_cid_map = ctx.class_id_from_mirror(this);
+            let this_field0 = ctx.get_field(this, 0);
+            let this_field1 = ctx.get_field(this, 1);
+            let target_cid_map = ctx.class_id_from_mirror(target);
+            let target_field0 = ctx.get_field(target, 0);
+            let target_name = mirror_class_name(ctx, target).unwrap_or_default();
+            eprintln!(
+                "CRATONVM_DBG_CCE_BT: site=asSubclass this=0x{:x} this_cid_from_mirror={:?} this_field0={:?} this_field1={:?} this_name={:?} | target=0x{:x} target_cid_from_mirror={:?} target_field0={:?} target_name={:?}\n{}",
+                this.as_ptr() as usize,
+                this_cid_map,
+                this_field0,
+                this_field1,
+                name,
+                target.as_ptr() as usize,
+                target_cid_map,
+                target_field0,
+                target_name,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         Err(cratonvm_types::error::RuntimeError::ClassCastException {
             message: format!("class {name}"),
         }
@@ -19487,14 +19604,14 @@ Implementation-Title: opensaml-core-api\r\n\
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "()V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "(Ljava/lang/String;II)V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },

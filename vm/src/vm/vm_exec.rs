@@ -14220,6 +14220,44 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own. The receiver-retargeting block above only substitutes the
+    // receiver's actual class for `class_id`/`class_name` when the ORIGINAL
+    // (CP-symbolic) class at the call site is itself an interface/abstract
+    // class (`this_is_iface_or_abs`). A call site whose declared parameter
+    // type is `Object` — e.g. `String.valueOf(Object obj)`'s internal
+    // `obj.toString()`, which is exactly what javac compiles `"literal:" +
+    // aPath` down to (a real `invokestatic String.valueOf` ahead of the
+    // `StringConcatFactory` indy call, not a direct `Path.toString()` call) —
+    // never retargets, so `class_name` here stays `java/lang/Object` and the
+    // `java/nio/file/Path` force-native entry deep in the `check_override`
+    // chain below (keyed on `class_name`) can never fire, even though the
+    // ACTUAL RECEIVER is one of our synthetic Path values. Check the
+    // receiver's real class directly, independent of the resolved
+    // `class_name`. Third distinct gap in the same family as
+    // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`
+    // (which covered the CP-symbolic-class-is-Path call shape).
+    if method_name == "toString" && descriptor == "()Ljava/lang/String;" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            let recv_cid = shared.heap.class_id_of(recv);
+            let is_path = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name("java/nio/file/Path")
+                    .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
+                    .unwrap_or(false)
+            };
+            if is_path {
+                if let Some(callback) = shared.native_methods.find(
+                    "java/nio/file/Path",
+                    "toString",
+                    "()Ljava/lang/String;",
+                ) {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     if class_name == "com/sun/tools/attach/VirtualMachine"
         && matches!(
             (method_name, descriptor),
@@ -15370,15 +15408,16 @@ fn invoke_on_class_shared_inner(
                                     | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
                                     | ("getEntries", "()Ljava/util/Map;")
                             ))
-                        // Spring Boot 3 fat-jar launcher: short-circuit
-                        // JarFileArchive.getClassPathUrls so our native
-                        // wins over the bytecode that walks
-                        // `JarFile.stream().map().filter().map().collect()` —
-                        // that pipeline depends on Stream operations our
-                        // synthetic Stream does not implement. The native
-                        // materialises the URL set directly from the
-                        // central directory.
-                        || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
+                        // Spring Boot 3 archives: use the native enumerators
+                        // for both jar and exploded layouts. The jar path
+                        // avoids the incomplete synthetic Stream pipeline;
+                        // the exploded path avoids the real-JDK
+                        // LinkedList.addAll(0, ...) route that loses every
+                        // descendant of an immediate directory.
+                        || (matches!(class_name,
+                            "org/springframework/boot/loader/launch/JarFileArchive"
+                                | "org/springframework/boot/loader/launch/ExplodedArchive"
+                        )
                             && method_name == "getClassPathUrls")
                         // Spring Boot 3.2+ `launch.ExecutableArchiveLauncher.createClassLoader`
                         // — same ClassCastException / typed-`toArray` hazard as SB2's iterator

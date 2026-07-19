@@ -29,6 +29,21 @@ finding and why implementing the real fix (JIT support for local exception
 handlers) is a scoped compiler feature, not a same-session patch. This is
 the practical ceiling for a diagnostic pass on this residual; doc stays in
 known-issues pending that feature.
+**2026-07-19 RBC.6 CLOSED**: the "no local-exception-handler dispatch"
+premise turned out to be stale (true when the gate landed, false the very
+next day once unrelated fixes built the missing dispatch generically) —
+see `docs/feature-designs/jit-local-exception-handlers.md` for the full
+finding, the fix (gate relaxation + a required new compile-time safety
+check that also closes a previously-latent, pre-existing wrong-result bug
+in already-shipped JIT code), and validation. `Response.toAbsolute()`'s
+exact shape (single try/catch, unconditional rethrow, no string-concat in
+the handler — matches Tomcat's real bytecode) now compiles and produces
+correct results, confirmed via a standalone repro run through the built
+binary. **Not yet re-run against the actual `TestResponsePerformance`
+JUnit test** (this session's environment could not reach the Linux Tomcat
+suite fixture) — the relative-performance assertion's disposition
+(`homebrewWin == winTarget`) is still open pending that re-run; see
+"Recommendation for continuing the residual" below, now updated.
 
 ## 2026-07-19 update: real root cause found for the TestContextConfig/TestValidator hang
 
@@ -479,6 +494,21 @@ the ~150x-vs-interpreted-driver tax) and any other method sharing this
 common idiom. Should get a `docs/feature-designs/` writeup and its own
 dedicated session(s), given the correctness stakes.
 
+**2026-07-19 session 2 update**: re-validated the RBC.6 fix against the
+real Tomcat suite fixture on the Azure Linux build host and found two MORE
+real bugs blocking `Response.toAbsolute()` specifically (a
+control-flow-insensitivity bug in the session-1 safety check, and a stale
+compile-time gate unrelated to RBC.6, "BUG-LQB-SCOPE") — both root-caused,
+fixed, and validated (including against the real method's own bytecode).
+`Response.toAbsolute()` now confirmed JIT-compiles. HOWEVER a newly
+-discovered, separate performance regression (the method gets recompiled
+80-90+ times during the benchmark and runs net SLOWER once "fixed" than it
+did fully interpreted) still blocks this test's actual pass/fail outcome —
+full investigation, evidence, and next-step handoff in
+`docs/feature-designs/jit-local-exception-handlers.md`'s "session 2"
+section. This doc's disposition is unchanged (stays open) pending that
+follow-up.
+
 ### Doc disposition
 
 Left in `docs/known-issues/` (not fixed) with this root cause recorded in
@@ -487,6 +517,23 @@ request rather than an open-ended performance mystery, this is arguably the
 practical ceiling for a same-session diagnostic effort — closing the doc
 (making the assertion pass) requires the JIT feature above, which is out of
 scope to implement safely in this session.
+
+**2026-07-19 update**: the JIT feature landed the same day (worktree
+`fix/jit-rbc6-local-exception-handlers-20260719`) — see
+`docs/feature-designs/jit-local-exception-handlers.md`. `Response
+.toAbsolute()` now compiles. This doc's disposition is now: **stays open**
+only pending a re-run of the actual `TestResponsePerformance` JUnit test
+(this fix could not be validated against the real Tomcat suite fixture from
+this session's environment — Windows-local, no access to the remote Linux
+build host the fixture lives on). Whoever picks this up next should: (1)
+rebuild `dev` with the merged fix, (2) re-run
+`org.apache.catalina.connector.TestResponsePerformance` at `-Xmx4g` per the
+existing reproduction command below, (3) if the relative-perf assertion now
+passes, close this doc entirely (all 3 original classes fixed); if it still
+fails, capture the new failure mode (a live-`toAbsolute()`-now-JIT'd
+`CharChunk` path may still be slower than `URI` for reasons unrelated to
+interpretation — the original interpreter-throughput hypothesis this doc's
+history already investigated and moved past).
 
 ## Summary (original 2026-07-13 finding, retained for history)
 

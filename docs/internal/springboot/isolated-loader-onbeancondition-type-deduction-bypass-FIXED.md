@@ -1,6 +1,19 @@
 # `@ClassPathExclusions`-excluded jar remains reachable during bytecode-level construction under an isolated loader — `OnBeanCondition` type-deduction test fails to observe the expected `NoClassDefFoundError`
 
-**Status: OPEN — found 2026-07-19, residual of [`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](../../internal/springboot/modifiedclasspath-aether-network-hang-cluster-FIXED.md)**
+**Status: FIXED — resolved 2026-07-19, same day as filed.** Residual of
+[`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](modifiedclasspath-aether-network-hang-cluster-FIXED.md).
+Filed as OPEN after observing the failure against a binary built before
+merging ~106 commits of `origin/dev` drift into the fix branch; after that
+merge (which pulled in unrelated, already-landed fixes from other concurrent
+sessions working the same repo) and a rebuild,
+`OnBeanConditionTypeDeductionFailureTests` passes **1/1** and
+`EhCache3CacheAutoConfigurationTests` (the "possibly related" class noted
+below) passes **2/2**. Not independently root-caused — resolved as a side
+effect of the drift merge, exact fixing commit not identified. Kept here
+(rather than deleted) as a record of the symptom, the standalone-probe
+narrowing (exclusion filtering itself works; the gap was specific to
+bytecode-level construction under the real Spring/JUnit path), and the
+hypothesis, in case it regresses.
 
 ## Symptom
 
@@ -110,7 +123,7 @@ the observed "no exception raised at all" result, so either:
   / `deducedBeanTypeForBeanMethod`). Worth checking together with this doc
   since both trace through `OnBeanCondition`'s reflective type-deduction
   path, but not confirmed to be the same bug.
-- See [`isolated-loader-objectprovider-generic-identity-mismatch.md`](isolated-loader-objectprovider-generic-identity-mismatch.md)
+- See [`isolated-loader-objectprovider-generic-identity-mismatch-FIXED.md`](isolated-loader-objectprovider-generic-identity-mismatch-FIXED.md)
   for a separate `ObjectProvider<X>` generic-identity residual in the same
   overall "isolated classloader + reflection" family — plausibly a sibling
   bug, not confirmed to share a single mechanism with this one.

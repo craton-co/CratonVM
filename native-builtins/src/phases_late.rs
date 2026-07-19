@@ -5681,7 +5681,13 @@ fn native_quarkus_logging_handle_failed_start(
 /// class file, breaking real in-process javac compiles (Spring's
 /// `TestCompiler`/AOT generation) referencing any application-classpath
 /// class.
-pub(crate) fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+///
+/// Also called (as `pub`, cross-crate) from `vm/src/runtime/invokedynamic.rs`'s
+/// `value_to_string` — the same dead-dispatch gap exists in the
+/// `invokedynamic`/`StringConcatFactory` bootstrap for `"literal" + aPath`
+/// string concatenation (a third call site bypassing the interpreter's
+/// force-native gates, distinct from the `javac` one above).
+pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     let p = p57_read_path(ctx, this);
     match vfs_decode(&p) {
         // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
@@ -12208,7 +12214,16 @@ mod p57_win_path_tests {
     //! internal form, so both spellings are exercised.
     use super::{p57_trim_windows_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
 
+    // `p57_trim_windows_path_trailing_separator` itself is gated on the
+    // real host OS (`cfg!(windows)`, not a synthetic guest-OS check --
+    // CratonVM's `java.io.File`/`java.nio.Path` follow the actual host's
+    // path semantics) and is a deliberate no-op elsewhere, so this test
+    // only holds on a real Windows build host. Mirrors the existing
+    // per-assertion `#[cfg(windows)]` in `relativize_backtracks_with_dotdot`
+    // below, just scoped to the whole test since every assertion here
+    // depends on the same host-gated behavior.
     #[test]
+    #[cfg(windows)]
     fn trailing_separator_is_removed_only_from_non_roots() {
         assert_eq!(
             p57_trim_windows_path_trailing_separator("C:/work/one/two/"),
@@ -22087,9 +22102,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
     // walks each entry via getName / isDirectory (for the include-filter)
-    // and getComment (only consulted when checking the UNPACK: marker on
-    // nested-JAR entries; we do not pack any UNPACK markers so null is
-    // the right answer). Register them on JarEntry directly so the
+    // and getComment (consulted when checking the UNPACK: marker on nested
+    // JAR entries). Register them on JarEntry directly so the
     // override-allow-list (which forces native-only dispatch on certain
     // jar/zip entry points) sees a non-null result.
     r.register(je, "isDirectory", "()Z", |ctx, args| {
@@ -22108,8 +22122,16 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
     });
-    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if je_is_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "comment")));
+        }
+        Ok(Some(if ctx.object_num_fields(this) > 4 {
+            ctx.get_field(this, 4)
+        } else {
+            Value::Object(None)
+        }))
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -22278,6 +22300,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "getClassPathUrls",
         "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
         p59_spring_boot_jar_archive_get_class_path_urls,
+    );
+    r.register(
+        "org/springframework/boot/loader/launch/ExplodedArchive",
+        "getClassPathUrls",
+        "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
+        p59_spring_boot_exploded_archive_get_class_path_urls,
     );
 
     // Spring Boot 3.2+ repackaged launcher: `ExecutableArchiveLauncher` overrides
@@ -22504,6 +22532,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22515,6 +22544,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
+            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+                return result;
+            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22526,6 +22558,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22537,6 +22570,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
+            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+                return result;
+            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22550,6 +22586,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22561,6 +22598,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
+            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+                return result;
+            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22572,6 +22612,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22583,6 +22624,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
+            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+                return result;
+            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22927,6 +22971,7 @@ pub(crate) struct JarEntryRec {
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
+    pub(crate) comment: Option<String>,
     pub(crate) times: JarEntryTimes,
     pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
@@ -23129,6 +23174,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         #[allow(deprecated)]
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let comment = (!entry.comment().is_empty()).then(|| entry.comment().to_string());
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
         let mut buf = Vec::with_capacity(entry.size() as usize);
@@ -23143,6 +23189,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 csize,
                 method,
                 crc,
+                comment,
                 times,
                 bytes: Arc::new(buf),
             },
@@ -23181,9 +23228,19 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc, times) =
-            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
-        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+        let (size, csize, method, crc, comment, times) = (
+            rec.size,
+            rec.csize,
+            rec.method,
+            rec.crc,
+            rec.comment.as_deref(),
+            rec.times,
+        );
+        // Slot 4 carries the optional central-directory comment on synthetic
+        // entries. `JarFileArchive` uses the UNPACK marker in precisely this
+        // field, so returning null for every entry changes its public URL
+        // contract rather than being a harmless metadata omission.
+        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
         let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
         let je = ctx.read_native_pin(je_pin, je);
@@ -23204,6 +23261,12 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
+        if let Some(comment) = comment {
+            let comment_s = ctx.create_string(comment);
+            let je = ctx.read_native_pin(je_pin, je);
+            ctx.set_field(je, 4, Value::Object(Some(comment_s)));
+            ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
+        }
         p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
@@ -23227,24 +23290,24 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
+    let (name, size, csize, method, crc, comment, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
             rec.size,
             rec.csize,
             rec.method,
             rec.crc,
+            rec.comment.clone(),
             rec.times,
         ),
         None => return Value::Object(None),
     };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh entry (native stale-local family).
     let je_pin = ctx.pin_native_root(je);
     let name_s = ctx.create_string(&name);
     let je = ctx.read_native_pin(je_pin, je);
-    ctx.unpin_native_roots(je_pin);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
@@ -23259,7 +23322,15 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
+    if let Some(comment) = comment {
+        let comment_s = ctx.create_string(&comment);
+        let je = ctx.read_native_pin(je_pin, je);
+        ctx.set_field(je, 4, Value::Object(Some(comment_s)));
+        ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
+    }
     p59_set_jar_entry_times(ctx, je, times);
+    let je = ctx.read_native_pin(je_pin, je);
+    ctx.unpin_native_roots(je_pin);
     Value::Object(Some(je))
 }
 
@@ -23284,8 +23355,11 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     )))))
 }
 
-/// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s
-/// (SB3 `JarFileArchive` / launcher classpath scan).
+/// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s.
+///
+/// This remains for the pre-SB3 launcher compatibility route. Newer SB3
+/// `JarFileArchive` callers must instead enumerate every entry and evaluate
+/// their supplied predicate (see `p59_spring_boot_jar_archive_get_class_path_urls`).
 fn p59_fat_jar_boot_inf_nested_url_values(
     ctx: &mut dyn NativeContext,
     jar_path: &str,
@@ -23327,22 +23401,20 @@ fn p59_fat_jar_boot_inf_nested_url_values(
     urls
 }
 
-/// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
-/// the central directory, build URL set for `BOOT-INF/classes/` (always
-/// included) plus every `BOOT-INF/lib/*.jar` entry.
+/// Spring Boot 3 `JarFileArchive.getClassPathUrls` without its synthetic
+/// Stream pipeline.
 ///
-/// Real-bytecode stream pipeline:
-///   `jarFile.stream().map(JarArchiveEntry::new).filter(p1).map(this::getNestedJarUrl).collect(toCollection(LinkedHashSet::new))`
-///
-/// Replacing it with a single native that materialises the URL set directly
-/// avoids the dependency on `Stream.map / Stream.filter / Stream.collect`
-/// (whose synthetic-Stream implementation does not support arbitrary
-/// `Function` / `Predicate` lambdas yet) and on `Collectors.toCollection`.
+/// The real implementation enumerates the central directory, wraps each
+/// `JarEntry` in its private `JarArchiveEntry`, evaluates the caller's include
+/// predicate, and delegates URL/unpack handling to `getNestedJarUrl`. Keep
+/// exactly that contract here: the archive may be a plain test jar, a BOOT-INF
+/// jar, or a WEB-INF war, and callers are entitled to arbitrary predicates.
 fn p59_spring_boot_jar_archive_get_class_path_urls(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let include_filter = obj_arg(args, 1)?;
     // JarFileArchive layout: field 0 = file (java.io.File), field 1 = jarFile.
     // Both `file_read_path` and JarFile field 0 store the path string, so
     // either route gets us the absolute path on disk.
@@ -23364,7 +23436,62 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
+    let jar_entries = p59_jar_collect_entries(ctx, &jar_path);
+    let this_pin = ctx.pin_native_root(this);
+    let include_filter_pin = ctx.pin_native_root(include_filter);
+    let mut urls = Vec::with_capacity(jar_entries.len());
+    let mut url_pins = Vec::with_capacity(jar_entries.len());
+
+    for jar_entry_value in jar_entries {
+        let Value::Object(Some(jar_entry)) = jar_entry_value else {
+            continue;
+        };
+        let jar_entry_pin = ctx.pin_native_root(jar_entry);
+        // The record has one component, `jarEntry`. Allocate against the real
+        // class when it is available, then mirror both its resolved field and
+        // the synthetic slot used by lightweight/classloading fallbacks.
+        let archive_entry = alloc_concurrent_synthetic(
+            ctx,
+            "org/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry",
+            1,
+        );
+        let archive_entry_pin = ctx.pin_native_root(archive_entry);
+        let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        ctx.set_field(archive_entry, 0, Value::Object(Some(jar_entry)));
+        ctx.set_field_by_name(archive_entry, "jarEntry", Value::Object(Some(jar_entry)));
+
+        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        let included = matches!(
+            ctx.invoke_virtual(
+                include_filter,
+                "test",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(archive_entry))],
+            )?,
+            Some(Value::Int(value)) if value != 0
+        );
+        if included {
+            let this = ctx.read_native_pin(this_pin, this);
+            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+            let url = ctx.invoke_special_bytecode_only(
+                "org/springframework/boot/loader/launch/JarFileArchive",
+                "getNestedJarUrl",
+                "(Lorg/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry;)Ljava/net/URL;",
+                &[
+                    Value::Object(Some(this)),
+                    Value::Object(Some(archive_entry)),
+                ],
+            )?;
+            if let Some(Value::Object(Some(url))) = url {
+                url_pins.push(ctx.pin_native_root(url));
+                urls.push(url);
+            }
+        }
+        ctx.unpin_native_roots(jar_entry_pin);
+        ctx.unpin_native_roots(archive_entry_pin);
+    }
 
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!(
@@ -23373,63 +23500,191 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
-    // declares `Set` as the return type but only ever calls
-    // `Collection.toArray(Object[])` on it, which is implemented by
-    // ArrayList via `native_collections`. Returning ArrayList sidesteps
-    // the synthetic-HashSet layout drift between `phases_early::Set.of`
-    // (3-field) and `native_collections::HashSet` (1-field).
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    // The real-JDK ArrayList iterator reads `[0]=modCount`,
+    // `[1]=elementData`, and `[2]=size`.  Use that full layout rather than the
+    // two-slot synthetic collection shape: callers immediately iterate this
+    // return value through the real Set/Collection interfaces.
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+    let list_pin = ctx.pin_native_root(list);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
-    for (i, v) in urls.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+    for (i, (url, pin)) in urls.iter().zip(&url_pins).enumerate() {
+        let url = ctx.read_native_pin(*pin, *url);
+        ctx.set_array_element(arr, i, Value::Object(Some(url)));
     }
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(urls.len() as i32));
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.set_field(list, 0, Value::Int(0));
+    ctx.set_field(list, 1, Value::Object(Some(arr)));
+    ctx.set_field(list, 2, Value::Int(urls.len() as i32));
+    for pin in url_pins {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(include_filter_pin);
+    ctx.unpin_native_roots(list_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
-/// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`:
-/// real bytecode does `urls.toArray(new URL[0])` and can `ClassCastException`
-/// when collection iteration / typed `toArray` does not match CratonVM's
-/// mixed real-JDK + synthetic collection layout. Rebuild the nested-jar
-/// `URL[]` from the fat-jar path (same scan as [`p59_fat_jar_boot_inf_nested_url_values`])
-/// and `invokespecial` the private `Launcher.createClassLoader(URL[])` on
-/// the real SB3 launcher type.
+/// Spring Boot 3 `ExplodedArchive.getClassPathUrls` without depending on the
+/// real-JDK `LinkedList.addAll(0, ...)` path. The latter was retaining the
+/// immediate directories but dropping every descendant under CratonVM, which
+/// made a directory archive silently omit manifests, nested files, and names
+/// requiring URI encoding.
+fn p59_spring_boot_exploded_archive_get_class_path_urls(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let include_filter = obj_arg(args, 1)?;
+    let directory_search_filter = obj_arg(args, 2)?;
+    let root_directory = match ctx.get_field(this, 0) {
+        Value::Object(Some(file)) => file_read_path(ctx, file),
+        _ => String::new(),
+    };
+    let root_path = std::path::PathBuf::from(&root_directory);
+    let mut pending = match std::fs::read_dir(&root_path) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    pending.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    pending.reverse();
+
+    let this_pin = ctx.pin_native_root(this);
+    let include_filter_pin = ctx.pin_native_root(include_filter);
+    let directory_search_filter_pin = ctx.pin_native_root(directory_search_filter);
+    let mut urls = Vec::new();
+    let mut url_pins = Vec::new();
+    while let Some(path) = pending.pop() {
+        let is_directory = path.is_dir();
+        let Ok(relative) = path.strip_prefix(&root_path) else {
+            continue;
+        };
+        let mut entry_name = relative.to_string_lossy().replace('\\', "/");
+        if is_directory {
+            entry_name.push('/');
+        }
+        let file = file_alloc(ctx, &path.to_string_lossy());
+        let file_pin = ctx.pin_native_root(file);
+        let archive_entry = alloc_concurrent_synthetic(
+            ctx,
+            "org/springframework/boot/loader/launch/ExplodedArchive$FileArchiveEntry",
+            2,
+        );
+        let archive_entry_pin = ctx.pin_native_root(archive_entry);
+        let name = ctx.create_string(&entry_name);
+        let file = ctx.read_native_pin(file_pin, file);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        ctx.set_field(archive_entry, 0, Value::Object(Some(name)));
+        ctx.set_field(archive_entry, 1, Value::Object(Some(file)));
+        ctx.set_field_by_name(archive_entry, "name", Value::Object(Some(name)));
+        ctx.set_field_by_name(archive_entry, "file", Value::Object(Some(file)));
+
+        if is_directory {
+            let directory_search_filter =
+                ctx.read_native_pin(directory_search_filter_pin, directory_search_filter);
+            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+            let search = matches!(
+                ctx.invoke_virtual(
+                    directory_search_filter,
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(archive_entry))],
+                )?,
+                Some(Value::Int(value)) if value != 0
+            );
+            if search {
+                let mut children = match std::fs::read_dir(&path) {
+                    Ok(entries) => entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                children.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+                children.reverse();
+                pending.extend(children);
+            }
+        }
+
+        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        let include = matches!(
+            ctx.invoke_virtual(
+                include_filter,
+                "test",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(archive_entry))],
+            )?,
+            Some(Value::Int(value)) if value != 0
+        );
+        if include {
+            let file = ctx.read_native_pin(file_pin, file);
+            let uri = ctx.invoke_virtual(file, "toURI", "()Ljava/net/URI;", &[])?;
+            if let Some(Value::Object(Some(uri))) = uri {
+                let uri_pin = ctx.pin_native_root(uri);
+                let url = ctx.invoke_virtual(uri, "toURL", "()Ljava/net/URL;", &[])?;
+                ctx.unpin_native_roots(uri_pin);
+                if let Some(Value::Object(Some(url))) = url {
+                    url_pins.push(ctx.pin_native_root(url));
+                    urls.push(url);
+                }
+            }
+        }
+        ctx.unpin_native_roots(file_pin);
+        ctx.unpin_native_roots(archive_entry_pin);
+    }
+
+    // See the JarFileArchive variant above: this return value is consumed by
+    // real-JDK collection iterators, so preserve the real three-slot layout.
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+    let list_pin = ctx.pin_native_root(list);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+    for (i, (url, pin)) in urls.iter().zip(&url_pins).enumerate() {
+        let url = ctx.read_native_pin(*pin, *url);
+        ctx.set_array_element(arr, i, Value::Object(Some(url)));
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.set_field(list, 0, Value::Int(0));
+    ctx.set_field(list, 1, Value::Object(Some(arr)));
+    ctx.set_field(list, 2, Value::Int(urls.len() as i32));
+    for pin in url_pins {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(include_filter_pin);
+    ctx.unpin_native_roots(directory_search_filter_pin);
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`.
+///
+/// The native registration re-enters this concrete method's bytecode without
+/// native dispatch, preserving its classpath-index merge and URL ordering.
 fn sb3_executable_archive_launcher_create_class_loader_collection(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let cid = ctx.class_id_of_object(this);
-    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-    let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
+    let urls = obj_arg(args, 1)?;
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+        let cid = ctx.class_id_of_object(this);
+        let cn = ctx.class_name_of_id(cid).unwrap_or_default();
         eprintln!(
-            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
-            cn, jar_path
+            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} preserving supplied URLs",
+            cn
         );
     }
     // Pin across the URL scan / array alloc below — a moving young GC there
-    // would relocate `this` and the collected URLs (native stale-local family).
-    let this_pin = ctx.pin_native_root(this);
-    let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
-    let pins = pin_object_values(ctx, &url_values);
-    let url_arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        url_values.len(),
-    );
-    for (i, (v, p)) in url_values.iter().zip(&pins).enumerate() {
-        let v = read_pinned_object_value(ctx, *p, *v);
-        ctx.set_array_element(url_arr, i, v);
-    }
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.invoke_special(
-        "org/springframework/boot/loader/launch/Launcher",
+    // The target bytecode preserves its classpath-index merge before it calls
+    // Launcher.createClassLoader(Collection).
+    ctx.invoke_special_bytecode_only(
+        "org/springframework/boot/loader/launch/ExecutableArchiveLauncher",
         "createClassLoader",
-        "([Ljava/net/URL;)Ljava/lang/ClassLoader;",
-        &[Value::Object(Some(this)), Value::Object(Some(url_arr))],
+        "(Ljava/util/Collection;)Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(this)), Value::Object(Some(urls))],
     )
 }
 
@@ -66938,7 +67193,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let trace = false;
+    let trace = std::env::var_os("CRATONVM_TRACE_BEANINFO").is_some();
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         other => {
@@ -66985,6 +67240,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
+        eprintln!("BI-TRACE: ==== entering getBeanInfo for {} ====", cn);
     }
 
     // The two-argument overload is getBeanInfo(beanClass, stopClass). The
@@ -67124,6 +67380,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Class.getMethods() entry, and Spring's ExtendedBeanInfo scans them for
     // non-standard write methods.
     let mut all_method_mirrors: Vec<(usize, ObjectRef)> = Vec::new();
+    let mut all_method_names: Vec<String> = Vec::new();
     for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
@@ -67156,6 +67413,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 );
                 let mm_all_pin = ctx.pin_native_root(mm_all);
                 all_method_mirrors.push((mm_all_pin, mm_all));
+                if trace {
+                    all_method_names.push(format!("{}{}", name, desc));
+                }
             }
             // JavaBeans properties come from PUBLIC INSTANCE methods only
             // (java.beans uses Class.getMethods(), which is public-only — a
@@ -67493,6 +67753,14 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // scan and the previous iterations' ctor invokes may have moved it
         // (native stale-local family).
         let m = ctx.read_native_pin(m_pin, m);
+        if trace {
+            eprintln!(
+                "BI-TRACE: MethodDescriptor ctor {}/{} -> {}",
+                i + 1,
+                all_method_mirrors.len(),
+                all_method_names.get(i).map(String::as_str).unwrap_or("?")
+            );
+        }
         let md = match ctx.new_object_initialized(
             "java/beans/MethodDescriptor",
             "(Ljava/lang/reflect/Method;)V",

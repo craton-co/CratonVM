@@ -75,6 +75,39 @@ const ALGO_ED448: i32 = 10;
 // path (`algo_idx("DSA")` was unmapped, returning -1) and failed with
 // `InvalidKeySpecException: cannot generate a usable Unknown public key`.
 const ALGO_DSA: i32 = 11;
+const ALGO_X25519: i32 = 9;
+const ALGO_X448: i32 = 12;
+// Sentinel algo indices for the GENERIC `KeyFactory` names `"XDH"` and
+// `"EdDSA"` — unlike `ALGO_X25519`/`ALGO_X448`/`ALGO_ED25519`/`ALGO_ED448`
+// (curve pinned by the requested algorithm string itself), these carry no
+// curve information: the real JDK's non-nested `sun.security.ec.XDHKeyFactory`
+// / `sun.security.ec.ed.EdDSAKeyFactory` determine X25519-vs-X448 /
+// Ed25519-vs-Ed448 by sniffing the `AlgorithmIdentifier` OID embedded in the
+// spec's own encoded bytes at `generatePublic`/`generatePrivate` time (see
+// `resolve_curve_algo`). `PemPrivateKeyParser` (Spring Boot's PEM SSL bundle
+// loader) always requests the generic names — never the curve-specific ones —
+// so without this sentinel + sniff, `KeyFactory.getInstance("XDH"/"EdDSA")`
+// fell through unmapped (XDH) or was silently misrouted to Ed25519 regardless
+// of the key's real curve (EdDSA), breaking Ed448/X448/X25519 PEM
+// private-key parsing. Used only by `kf_algo_idx` (KeyFactory) — the shared
+// `algo_idx` (also used by `KeyPairGenerator`, which has no such generic
+// name to resolve) is untouched.
+const ALGO_XDH_GENERIC: i32 = 13;
+const ALGO_EDDSA_GENERIC: i32 = 14;
+// `KeyFactory.getInstance("RSASSA-PSS")` is a DISTINCT, STRICTER real SPI
+// (`sun.security.rsa.RSAKeyFactory$PSS`) from the permissive `"RSA"` /
+// `RSAKeyFactory$Legacy` that `ALGO_RSA` already drives: `$Legacy` REJECTS a
+// PKCS#8 key whose `AlgorithmIdentifier` OID is `id-RSASSA-PSS`
+// (`InvalidKeyException: Expected a RSA key, but got RSASSA-PSS`, verified
+// against real JDK 25), while `$PSS` requires exactly that OID.
+// `PemPrivateKeyParser`'s per-algorithm fallback loop retries with the
+// literal name `"RSASSA-PSS"` after the `"RSA"`-named attempt throws (see
+// `PemPrivateKeyParser.PemParser.parse`); routing that through the shared,
+// KeyPairGenerator-facing `algo_idx` (which deliberately collapses
+// `"RSASSA-PSS"` onto `ALGO_RSA` — the PSS choice belongs to `Signature`, not
+// key generation) would hit the exact same `$Legacy` rejection twice and
+// never reach a working factory, so this is `kf_algo_idx`-only too.
+const ALGO_RSASSA_PSS: i32 = 15;
 
 // ---------------------------------------------------------------------------
 // Real-JDK class instance-field counts (number of slots used by the real
@@ -384,6 +417,163 @@ fn drive_real_eddsa_keyfactory(
     drive_keyspec_spi(ctx, spi_class, spec, engine, ret_desc)
 }
 
+/// Return the curve-specific JDK XDH `KeyFactorySpi` implementation for an
+/// X25519 or X448 factory. Mirrors `eddsa_keyfactory_spi_class`: these
+/// nested classes fix the curve in their (package-private, but CratonVM's
+/// `new_object_initialized` constructs via direct VM-level `<init>`
+/// invocation rather than `java.lang.reflect.Constructor`, so Java-level
+/// accessibility never gates it — verified against real JDK 25, whose own
+/// `Provider$Service.newInstance` reflection would otherwise reject this
+/// exact ctor) no-argument constructor.
+fn xdh_keyfactory_spi_class(algo: i32) -> Option<&'static str> {
+    match algo {
+        ALGO_X25519 => Some("sun/security/ec/XDHKeyFactory$X25519"),
+        ALGO_X448 => Some("sun/security/ec/XDHKeyFactory$X448"),
+        _ => None,
+    }
+}
+
+/// Number of bytes occupied by a DER definite-length field starting at
+/// `der[len_pos]`, INCLUDING the leading length-of-length byte for the
+/// long form. Shared with `der_len_size`'s sibling `der_read_len` below —
+/// kept separate because most callers here need "how far to skip" while
+/// `is_pkcs1_rsa_private`/`rsa_pkcs1_to_pkcs8` only ever needed the former.
+fn der_read_len(der: &[u8], len_pos: usize) -> Option<usize> {
+    let b = *der.get(len_pos)?;
+    if b < 0x80 {
+        Some(b as usize)
+    } else {
+        let n = (b & 0x7f) as usize;
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | (*der.get(len_pos + 1 + i)? as usize);
+        }
+        Some(len)
+    }
+}
+
+/// Position immediately after the DER TLV element whose tag byte is at
+/// `pos` (i.e. `pos` + 1 tag byte + length-field bytes + content bytes).
+fn der_skip_element(der: &[u8], pos: usize) -> Option<usize> {
+    let len_pos = pos + 1;
+    let len_size = der_len_size(der, len_pos);
+    let content_len = der_read_len(der, len_pos)?;
+    Some(len_pos + len_size + content_len)
+}
+
+/// 1.3.101.110 — id-X25519.
+const OID_X25519: &[u8] = &[0x2b, 0x65, 0x6e];
+/// 1.3.101.111 — id-X448.
+const OID_X448: &[u8] = &[0x2b, 0x65, 0x6f];
+/// 1.3.101.112 — id-Ed25519.
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+/// 1.3.101.113 — id-Ed448.
+const OID_ED448: &[u8] = &[0x2b, 0x65, 0x71];
+
+/// Extract the raw `AlgorithmIdentifier` OID bytes from a DER-encoded
+/// `PKCS8EncodedKeySpec` (`is_private = true`: `SEQUENCE { INTEGER version,
+/// AlgorithmIdentifier, OCTET STRING, ... }`) or `X509EncodedKeySpec`
+/// (`is_private = false`: `SEQUENCE { AlgorithmIdentifier, BIT STRING }`),
+/// without needing a full ASN.1 parser. This is how the generic `"XDH"` /
+/// `"EdDSA"` `KeyFactory` names recover the true curve (X25519-vs-X448,
+/// Ed25519-vs-Ed448): those algorithm strings carry no curve of their own,
+/// so — exactly like real JDK's non-nested `sun.security.ec.XDHKeyFactory` /
+/// `sun.security.ec.ed.EdDSAKeyFactory` — the curve has to come from the
+/// spec's own embedded OID.
+fn der_spec_algorithm_oid(der: &[u8], is_private: bool) -> Option<Vec<u8>> {
+    if der.first() != Some(&0x30) {
+        return None;
+    }
+    let mut pos = 1 + der_len_size(der, 1);
+    if is_private {
+        // INTEGER version — skip it to reach the AlgorithmIdentifier.
+        if der.get(pos) != Some(&0x02) {
+            return None;
+        }
+        pos = der_skip_element(der, pos)?;
+    }
+    // AlgorithmIdentifier ::= SEQUENCE { OID algorithm, ANY parameters OPTIONAL }
+    if der.get(pos) != Some(&0x30) {
+        return None;
+    }
+    let algid_content = pos + 1 + der_len_size(der, pos + 1);
+    if der.get(algid_content) != Some(&0x06) {
+        return None;
+    }
+    let oid_len_pos = algid_content + 1;
+    let oid_len = der_read_len(der, oid_len_pos)?;
+    let oid_start = oid_len_pos + der_len_size(der, oid_len_pos);
+    der.get(oid_start..oid_start + oid_len).map(|s| s.to_vec())
+}
+
+/// Resolve a generic `ALGO_XDH_GENERIC`/`ALGO_EDDSA_GENERIC` `KeyFactory`
+/// index down to the concrete curve (`ALGO_X25519`/`ALGO_X448`/
+/// `ALGO_ED25519`/`ALGO_ED448`) by sniffing `spec`'s own encoded DER (field 0
+/// of both `PKCS8EncodedKeySpec` and `X509EncodedKeySpec` — real JDK classes
+/// with that field layout, already relied on elsewhere in this file, e.g.
+/// the PKCS#1-vs-PKCS#8 RSA sniff in `kf_generate_private`). A concrete algo
+/// (or an unrecognised/unparseable spec) passes through unchanged.
+fn resolve_curve_algo(ctx: &mut dyn NativeContext, algo: i32, spec: ObjectRef, is_private: bool) -> i32 {
+    if algo != ALGO_XDH_GENERIC && algo != ALGO_EDDSA_GENERIC {
+        return algo;
+    }
+    let der = match ctx.get_field(spec, 0) {
+        Value::Object(Some(arr)) => read_byte_array(ctx, arr),
+        _ => return algo,
+    };
+    let oid = match der_spec_algorithm_oid(&der, is_private) {
+        Some(o) => o,
+        None => return algo,
+    };
+    if algo == ALGO_XDH_GENERIC {
+        if oid.as_slice() == OID_X25519 {
+            return ALGO_X25519;
+        }
+        if oid.as_slice() == OID_X448 {
+            return ALGO_X448;
+        }
+    } else if algo == ALGO_EDDSA_GENERIC {
+        if oid.as_slice() == OID_ED25519 {
+            return ALGO_ED25519;
+        }
+        if oid.as_slice() == OID_ED448 {
+            return ALGO_ED448;
+        }
+    }
+    algo
+}
+
+/// Drive the real curve-specific JDK EdDSA/XDH `KeyFactorySpi`
+/// (`engineGeneratePublic`/`engineGeneratePrivate`) for `algo`, which may
+/// already be a concrete curve or one of the generic sentinels
+/// (`ALGO_XDH_GENERIC`/`ALGO_EDDSA_GENERIC` — resolved against `spec`'s own
+/// embedded OID via `resolve_curve_algo` first). Returns `None` when `algo`
+/// isn't an EdDSA/XDH algorithm at all, so callers fall through to their
+/// other branches unchanged.
+fn drive_eddsa_or_xdh_keyfactory(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> Option<MethodCallResult> {
+    if !matches!(
+        algo,
+        ALGO_ED25519
+            | ALGO_ED448
+            | ALGO_X25519
+            | ALGO_X448
+            | ALGO_XDH_GENERIC
+            | ALGO_EDDSA_GENERIC
+    ) {
+        return None;
+    }
+    let is_private = engine == "engineGeneratePrivate";
+    let resolved = resolve_curve_algo(ctx, algo, spec, is_private);
+    let spi = eddsa_keyfactory_spi_class(resolved).or_else(|| xdh_keyfactory_spi_class(resolved))?;
+    Some(drive_keyspec_spi(ctx, spi, spec, engine, ret_desc))
+}
+
 /// Drive a real JDK `KeyPairGenerator`, honouring the stored key size and an
 /// optional `AlgorithmParameterSpec`, then returning a real `KeyPair`.
 ///
@@ -583,6 +773,41 @@ fn drive_real_rsa_keyfactory(
             _ => {
                 return Err(RuntimeError::NotImplemented {
                     feature: "sun.security.rsa.RSAKeyFactory$Legacy".into(),
+                }
+                .into())
+            }
+        };
+        let spec = ctx.read_native_pin(pin, spec);
+        let desc = format!("(Ljava/security/spec/KeySpec;){ret_desc}");
+        ctx.invoke_virtual(kf, engine, &desc, &[Value::Object(Some(spec))])
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
+/// Drive the real SunRsaSign `RSAKeyFactory$PSS` SPI — like
+/// `drive_real_rsa_keyfactory`, but for `KeyFactory.getInstance("RSASSA-PSS")`
+/// (`ALGO_RSASSA_PSS`), which is a STRICTER, distinct real SPI from the
+/// permissive `$Legacy` that "RSA" drives: `$PSS` requires the PKCS#8/X.509
+/// `AlgorithmIdentifier` OID to be exactly `id-RSASSA-PSS`, whereas `$Legacy`
+/// REJECTS that OID outright (`InvalidKeyException: Expected a RSA key, but
+/// got RSASSA-PSS`, verified against real JDK 25). See `ALGO_RSASSA_PSS`'s
+/// doc comment for why `PemPrivateKeyParser`'s "RSA"-then-"RSASSA-PSS"
+/// fallback loop needs this distinct route to succeed on its second try.
+fn drive_real_rsa_pss_keyfactory(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    let pin = ctx.pin_native_root(spec);
+    let result = (|| {
+        let kf = match ctx.new_object_initialized("sun/security/rsa/RSAKeyFactory$PSS", "()V", &[])?
+        {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: "sun.security.rsa.RSAKeyFactory$PSS".into(),
                 }
                 .into())
             }
@@ -1113,7 +1338,7 @@ fn algo_idx(name: &str) -> i32 {
         "EC" | "ECDSA" => ALGO_EC,
         "ED25519" | "EDDSA" => ALGO_ED25519,
         "ED448" => ALGO_ED448,
-        "X25519" => 9,
+        "X25519" => ALGO_X25519,
         "DSA" | "DSS" => ALGO_DSA,
         _ => -1,
     }
@@ -1131,9 +1356,31 @@ fn algo_name(idx: i32) -> &'static str {
         ALGO_EC => "EC",
         ALGO_ED25519 => "Ed25519",
         ALGO_ED448 => "Ed448",
-        9 => "X25519",
+        ALGO_X25519 => "X25519",
+        ALGO_X448 => "X448",
+        ALGO_XDH_GENERIC => "XDH",
+        ALGO_EDDSA_GENERIC => "EdDSA",
+        ALGO_RSASSA_PSS => "RSASSA-PSS",
         ALGO_DSA => "DSA",
         _ => "Unknown",
+    }
+}
+
+/// `KeyFactory`-specific algorithm resolution. Delegates to the shared
+/// `algo_idx` (also used by `KeyPairGenerator`) for every name whose
+/// `KeyFactory` behaviour matches its `KeyPairGenerator` behaviour, except
+/// for the handful whose real-JDK `KeyFactory` SPI genuinely differs — see
+/// the `ALGO_XDH_GENERIC` / `ALGO_EDDSA_GENERIC` / `ALGO_RSASSA_PSS` doc
+/// comments for why each of these needs its own index rather than collapsing
+/// onto the `KeyPairGenerator`-facing mapping.
+fn kf_algo_idx(name: &str) -> i32 {
+    match name.to_ascii_uppercase().as_str() {
+        "RSASSA-PSS" => ALGO_RSASSA_PSS,
+        "XDH" => ALGO_XDH_GENERIC,
+        "EDDSA" => ALGO_EDDSA_GENERIC,
+        "X25519" => ALGO_X25519,
+        "X448" => ALGO_X448,
+        _ => algo_idx(name),
     }
 }
 
@@ -1630,7 +1877,7 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
-    let idx = algo_idx(&alg);
+    let idx = kf_algo_idx(&alg);
     // `KeyFactory.getInstance` must reject an unrecognised name. In
     // particular, `X509Key.buildX509Key` deliberately catches
     // `NoSuchAlgorithmException` and falls back to a generic `X509Key` for
@@ -1666,25 +1913,44 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(i) => i,
         _ => -1,
     });
-    // EdDSA: reconstruct concrete SunEC Ed25519/Ed448 keys from the standard
-    // EdECPublicKeySpec. Keycloak builds this spec while importing OKP JWKs;
-    // leaving it on the synthetic path made both curves throw
-    // InvalidKeySpecException despite working key-pair generation.
+    // EdDSA / XDH: reconstruct concrete SunEC Ed25519/Ed448/X25519/X448 keys
+    // from the standard EdECPublicKeySpec/XECPublicKeySpec/X509EncodedKeySpec.
+    // Keycloak builds an EdECPublicKeySpec while importing OKP JWKs; Spring
+    // Boot's PemPrivateKeyParser always requests the GENERIC "EdDSA"/"XDH"
+    // names (curve sniffed from the spec's own OID — see
+    // `drive_eddsa_or_xdh_keyfactory`). Leaving this on the synthetic path
+    // made every curve throw InvalidKeySpecException despite working
+    // key-pair generation.
     if let Some(Value::Object(Some(spec))) = args.get(1) {
-        if eddsa_keyfactory_spi_class(algo).is_some() {
-            match drive_real_eddsa_keyfactory(
-                ctx,
-                algo,
-                *spec,
-                "engineGeneratePublic",
-                "Ljava/security/PublicKey;",
-            ) {
+        if let Some(result) = drive_eddsa_or_xdh_keyfactory(
+            ctx,
+            algo,
+            *spec,
+            "engineGeneratePublic",
+            "Ljava/security/PublicKey;",
+        ) {
+            match result {
                 Ok(Some(key)) => return Ok(Some(key)),
                 // A context that cannot execute the real SPI must not turn
                 // that absence into a null/dead public key. Fall through to
                 // the declared InvalidKeySpecException below.
                 Ok(None) => {}
                 Err(err) => return Err(err),
+            }
+        }
+    }
+    // RSASSA-PSS: a distinct, stricter real SPI than the permissive "RSA" /
+    // RSAKeyFactory$Legacy driven below — see ALGO_RSASSA_PSS's doc comment.
+    if algo == ALGO_RSASSA_PSS && crate::route_rsa_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            if let Ok(Some(Value::Object(Some(key)))) = drive_real_rsa_pss_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            ) {
+                register_rsa_pub_verify_material(ctx, key);
+                return Ok(Some(Value::Object(Some(key))));
             }
         }
     }
@@ -1887,6 +2153,45 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(i) => i,
         _ => -1,
     });
+    // EdDSA / XDH: mirrors `kf_generate_public`'s route (curve-specific or
+    // generic "EdDSA"/"XDH", curve sniffed from the spec's own OID when
+    // generic). This is the private-key half of the PemPrivateKeyParser fix
+    // — PKCS8 EdDSA/XDH import previously had NO route here at all (unlike
+    // generatePublic's pre-existing EdECPublicKeySpec support), so every
+    // Ed25519/Ed448/X25519/X448 PEM private key fell straight through to the
+    // InvalidKeySpecException below.
+    if let Some(Value::Object(Some(spec))) = args.get(1) {
+        if let Some(result) = drive_eddsa_or_xdh_keyfactory(
+            ctx,
+            algo,
+            *spec,
+            "engineGeneratePrivate",
+            "Ljava/security/PrivateKey;",
+        ) {
+            match result {
+                Ok(Some(key)) => return Ok(Some(key)),
+                Ok(None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    // RSASSA-PSS: see ALGO_RSASSA_PSS's doc comment — a distinct, stricter
+    // real SPI than the permissive "RSA" driven below.
+    if algo == ALGO_RSASSA_PSS {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            if let Ok(r) = drive_real_rsa_pss_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            ) {
+                if let Some(Value::Object(Some(key))) = r {
+                    register_rsa_priv_sign_material(ctx, key);
+                    return Ok(Some(Value::Object(Some(key))));
+                }
+            }
+        }
+    }
     // DSA: drive the real sun.security.provider.DSAKeyFactory SPI. See
     // ALGO_DSA's doc comment / `kf_generate_public` for the root-cause story.
     if algo == ALGO_DSA && crate::route_dsa_to_real() {
@@ -2650,6 +2955,97 @@ mod tests {
         assert_eq!(algo_name(ALGO_ED448), "Ed448");
         assert_eq!(algo_name(ALGO_DSA), "DSA");
         assert_eq!(algo_name(-1), "Unknown");
+        assert_eq!(algo_name(ALGO_X25519), "X25519");
+        assert_eq!(algo_name(ALGO_X448), "X448");
+        assert_eq!(algo_name(ALGO_XDH_GENERIC), "XDH");
+        assert_eq!(algo_name(ALGO_EDDSA_GENERIC), "EdDSA");
+        assert_eq!(algo_name(ALGO_RSASSA_PSS), "RSASSA-PSS");
+    }
+
+    /// `KeyFactory`'s algorithm resolution deliberately diverges from the
+    /// shared (KeyPairGenerator-facing) `algo_idx` for exactly the names
+    /// whose real-JDK KeyFactory SPI differs — see `kf_algo_idx`'s doc
+    /// comment. `PemPrivateKeyParser` (the Spring Boot SSL PEM bundle loader)
+    /// is the concrete caller that needs every one of these.
+    #[test]
+    fn kf_algo_idx_diverges_from_shared_algo_idx_where_needed() {
+        assert_eq!(kf_algo_idx("RSASSA-PSS"), ALGO_RSASSA_PSS);
+        assert_ne!(kf_algo_idx("RSASSA-PSS"), algo_idx("RSASSA-PSS"));
+        assert_eq!(kf_algo_idx("XDH"), ALGO_XDH_GENERIC);
+        assert_eq!(kf_algo_idx("EdDSA"), ALGO_EDDSA_GENERIC);
+        assert_ne!(kf_algo_idx("EdDSA"), algo_idx("EdDSA"));
+        assert_eq!(kf_algo_idx("X25519"), ALGO_X25519);
+        assert_eq!(kf_algo_idx("X448"), ALGO_X448);
+        assert_eq!(kf_algo_idx("Ed25519"), ALGO_ED25519);
+        assert_eq!(kf_algo_idx("Ed448"), ALGO_ED448);
+        // Everything else still falls through to the shared table unchanged.
+        assert_eq!(kf_algo_idx("RSA"), ALGO_RSA);
+        assert_eq!(kf_algo_idx("EC"), ALGO_EC);
+        assert_eq!(kf_algo_idx("Garbage"), -1);
+    }
+
+    #[test]
+    fn xdh_keyfactory_spi_classes_are_curve_specific() {
+        assert_eq!(
+            xdh_keyfactory_spi_class(ALGO_X25519),
+            Some("sun/security/ec/XDHKeyFactory$X25519")
+        );
+        assert_eq!(
+            xdh_keyfactory_spi_class(ALGO_X448),
+            Some("sun/security/ec/XDHKeyFactory$X448")
+        );
+        assert_eq!(xdh_keyfactory_spi_class(ALGO_EC), None);
+        assert_eq!(xdh_keyfactory_spi_class(ALGO_XDH_GENERIC), None);
+    }
+
+    /// The generic-name curve sniff: given a minimal PKCS#8 `PrivateKeyInfo`
+    /// carrying each OID, `resolve_curve_algo` must recover the concrete
+    /// curve, and pass concrete algos through untouched.
+    #[test]
+    fn resolve_curve_algo_sniffs_oid_from_pkcs8_spec() {
+        fn pkcs8_stub(oid: &[u8]) -> Vec<u8> {
+            // SEQUENCE { INTEGER 0, SEQUENCE { OID }, OCTET STRING { 0x04 00 } }
+            let mut algid = vec![0x06, oid.len() as u8];
+            algid.extend_from_slice(oid);
+            let mut algid_seq = vec![0x30, algid.len() as u8];
+            algid_seq.extend_from_slice(&algid);
+            let octet = [0x04, 0x00];
+            let mut inner = vec![0x02, 0x01, 0x00];
+            inner.extend_from_slice(&algid_seq);
+            inner.extend_from_slice(&octet);
+            let mut out = vec![0x30, inner.len() as u8];
+            out.extend_from_slice(&inner);
+            out
+        }
+        for (oid, expected) in [
+            (OID_X25519, ALGO_X25519),
+            (OID_X448, ALGO_X448),
+            (OID_ED25519, ALGO_ED25519),
+            (OID_ED448, ALGO_ED448),
+        ] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let der = pkcs8_stub(oid);
+            let arr = alloc_byte_array(&mut ctx, &der);
+            let spec = alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+            ctx.set_field(spec, 0, Value::Object(Some(arr)));
+            let generic = if expected == ALGO_X25519 || expected == ALGO_X448 {
+                ALGO_XDH_GENERIC
+            } else {
+                ALGO_EDDSA_GENERIC
+            };
+            assert_eq!(
+                resolve_curve_algo(&mut ctx, generic, spec, true),
+                expected,
+                "OID {oid:02x?} should resolve to algo {expected}"
+            );
+        }
+        // Concrete algos pass through unchanged regardless of the spec.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let arr = alloc_byte_array(&mut ctx, &[]);
+        let spec = alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+        ctx.set_field(spec, 0, Value::Object(Some(arr)));
+        assert_eq!(resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true), ALGO_ED25519);
+        assert_eq!(resolve_curve_algo(&mut ctx, ALGO_RSA, spec, true), ALGO_RSA);
     }
 
     #[test]
@@ -2819,9 +3215,16 @@ mod tests {
         der: &[u8],
     ) -> Result<Option<Value>, MethodCallFailed> {
         let name = ctx.create_string(algo);
-        let kf = kf_get_instance(ctx, &[Value::Object(Some(name))])
-            .unwrap()
-            .unwrap();
+        // `?`, not `.unwrap()`: `kf_get_instance` now rejects an unrecognised
+        // algorithm name up front (`kf_get_instance`'s own doc comment), so
+        // `"Totally-Bogus"` fails here rather than at `kf_generate_public`/
+        // `kf_generate_private` below — still satisfies every caller's
+        // `expect_err(...)`, since they only care that *some*
+        // `MethodCallFailed` comes back, not which stage produced it.
+        let kf = match kf_get_instance(ctx, &[Value::Object(Some(name))])? {
+            Some(v) => v,
+            None => panic!("kf_get_instance returned no KeyFactory"),
+        };
         let kf_ref = match kf {
             Value::Object(Some(o)) => o,
             other => panic!("expected KeyFactory, got {other:?}"),

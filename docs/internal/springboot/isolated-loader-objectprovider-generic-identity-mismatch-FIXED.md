@@ -1,6 +1,20 @@
 # `ObjectProvider<X>` injection points fail to resolve under an isolated `ModifiedClassPathClassLoader`, even though a matching bean of type `X` exists
 
-**Status: OPEN — found 2026-07-19, residual of [`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](../../internal/springboot/modifiedclasspath-aether-network-hang-cluster-FIXED.md)**
+**Status: FIXED — resolved 2026-07-19, same day as filed.** Residual of
+[`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](modifiedclasspath-aether-network-hang-cluster-FIXED.md).
+Filed as OPEN after observing the failures against a binary built before
+merging ~106 commits of `origin/dev` drift into the fix branch; after that
+merge (which pulled in unrelated, already-landed fixes from other concurrent
+sessions working the same repo) and a rebuild, all 4 classes pass:
+`JerseyChildManagementContextConfigurationTests` **6/6**,
+`SecurityFilterAutoConfigurationEarlyInitializationTests` **1/1**,
+`ManagementWebSecurityAutoConfigurationTests` **10/10**,
+`ReactiveManagementWebSecurityAutoConfigurationTests` **9/9**, and the related
+`Liquibase423AutoConfigurationTests` annotation-presence failure noted below
+also now passes **1/1**. Not independently root-caused — resolved as a side
+effect of the drift merge, exact fixing commit(s) not identified. Kept here
+(rather than deleted) as a record of the symptom and hypothesis in case it
+regresses.
 
 ## Symptom
 
@@ -53,9 +67,9 @@ through a different resolution path or timing) may not be the *same* `Class`
 object for `ManagementContextResourceConfigCustomizer` even though both have
 the same binary name — the same general failure family as the `@Nested`
 outer-instance mismatch in
-[`connectionfactoryunwrappertests-nested-outer-instance-identity.md`](connectionfactoryunwrappertests-nested-outer-instance-identity.md)
+[`connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md`](connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md)
 and possibly the `OnBeanCondition` deduction gap in
-[`isolated-loader-onbeancondition-type-deduction-bypass.md`](isolated-loader-onbeancondition-type-deduction-bypass.md) —
+[`isolated-loader-onbeancondition-type-deduction-bypass-FIXED.md`](isolated-loader-onbeancondition-type-deduction-bypass-FIXED.md) —
 all three surfaced only after the now-fixed recursion bug stopped masking
 every isolated-loader test with an infinite hang, and all three are
 consistent with resolution-path inconsistencies specific to isolated
