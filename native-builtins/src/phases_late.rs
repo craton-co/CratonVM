@@ -12214,7 +12214,16 @@ mod p57_win_path_tests {
     //! internal form, so both spellings are exercised.
     use super::{p57_trim_windows_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
 
+    // `p57_trim_windows_path_trailing_separator` itself is gated on the
+    // real host OS (`cfg!(windows)`, not a synthetic guest-OS check --
+    // CratonVM's `java.io.File`/`java.nio.Path` follow the actual host's
+    // path semantics) and is a deliberate no-op elsewhere, so this test
+    // only holds on a real Windows build host. Mirrors the existing
+    // per-assertion `#[cfg(windows)]` in `relativize_backtracks_with_dotdot`
+    // below, just scoped to the whole test since every assertion here
+    // depends on the same host-gated behavior.
     #[test]
+    #[cfg(windows)]
     fn trailing_separator_is_removed_only_from_non_roots() {
         assert_eq!(
             p57_trim_windows_path_trailing_separator("C:/work/one/two/"),

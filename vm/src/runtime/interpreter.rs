@@ -10462,6 +10462,16 @@ fn route_jit_exception_through_method(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            cached.exception_table.len(),
+        );
+    }
     // Fast path: no exception table at all — propagate.
     if cached.exception_table.is_empty() {
         return Err(MethodCallFailed::ExceptionThrown(exc));
@@ -10543,6 +10553,18 @@ fn route_jit_exception_through_method(
         }
     }
     drop(cm_guard);
+
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method RESULT {}.{}{} throw_pc={} handler_pc={:?} incoming_args_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            handler_pc,
+            incoming_args.len(),
+        );
+    }
 
     let Some(handler_pc) = handler_pc else {
         // No matching handler — propagate to caller.
@@ -34039,14 +34061,25 @@ fn execute_jit_call(
         // Check for pending Java exception from JIT dispatch callbacks.
         // The JIT-executed method has its own exception table; we must try
         // to route the exception through it before propagating to the caller.
-        // The JIT ran the entire method, so we do not know the exact throw-
-        // site PC inside the JIT'd method (it has no live bytecode frame
-        // and `JIT_PENDING_EXCEPTION` does not carry a PC). Pass
-        // `usize::MAX` as the sentinel for "PC unknown" — the routing
-        // function will then skip catch-all (`finally`) entries so they
-        // cannot spuriously swallow exceptions thrown outside their
-        // protected region, while still allowing typed handlers to match
-        // by exception class.
+        // The JIT ran the entire method, so in general we do not know the
+        // exact throw-site PC inside the JIT'd method (it has no live
+        // bytecode frame). RBC.6 correctness fix: the ONE case where the pc
+        // IS known is a local `athrow` — the x64 codegen bakes its own bci
+        // into the call to `jit_throw_exception`, stashed as
+        // `sig.athrow_bci` (see `JitSignals::athrow_bci`). When present, use
+        // it; otherwise fall back to the `usize::MAX` "PC unknown" sentinel
+        // as before (a callee-propagated exception genuinely has no known pc
+        // from this method's perspective). Without this, a method with 2+
+        // exception-table entries whose catch types are in a subtype
+        // relationship (e.g. one entry catches `RuntimeException`, a later,
+        // unrelated entry catches `IllegalStateException`) could route ANY
+        // matching-by-type exception to the FIRST declared entry regardless
+        // of which try-region actually threw — confirmed via a differential
+        // repro (`AthrowCountBisect.twoThrowsSequential`,
+        // `vm/tests/jit_local_exception_handler_tests.rs`) before this fix.
+        // The routing function still skips catch-all (`finally`) entries
+        // when the pc is unknown, so they cannot spuriously swallow
+        // exceptions thrown outside their protected region.
         let mut sig = crate::jit::helpers::take_all_jit_signals();
         if let Some(exc) = sig.exception.take() {
             // The exception consumes the deopt — the one-shot drain above
@@ -34055,12 +34088,17 @@ fn execute_jit_call(
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+            let throw_pc = if sig.athrow_bci >= 0 {
+                sig.athrow_bci as usize
+            } else {
+                usize::MAX
+            };
             return route_jit_exception_through_method(
                 shared,
                 thread,
                 frame_idx,
                 cached,
-                usize::MAX,
+                throw_pc,
                 exc,
                 &exc_locals,
             );
@@ -34511,12 +34549,20 @@ fn execute_jit_call_decoded(
             // (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the next
             // JIT call — the exception consumes the deopt. Mirrors
             // `execute_jit_call`.
+            // RBC.6 correctness fix — see the identical comment at
+            // `execute_jit_call`'s sibling call site: use the athrow's own
+            // known bci when available instead of always `usize::MAX`.
+            let throw_pc = if sig.athrow_bci >= 0 {
+                sig.athrow_bci as usize
+            } else {
+                usize::MAX
+            };
             return route_jit_exception_through_method(
                 shared,
                 thread,
                 frame_idx,
                 cached,
-                usize::MAX,
+                throw_pc,
                 exc,
                 args_slice,
             )
