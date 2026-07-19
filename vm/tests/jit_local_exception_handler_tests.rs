@@ -145,3 +145,46 @@ fn test_jit_two_sequential_try_catch_blocks_same_method() {
         other => panic!("twoThrowsChecksum returned unexpected value: {other:?}"),
     }
 }
+
+
+fn liquibase_scope_bisect_class_files_available() -> bool {
+    let dir = test_resources_dir();
+    std::path::Path::new(&format!("{dir}/cratonvm/LiquibaseScopeBisect.class")).exists()
+}
+
+#[test]
+fn test_jit_indy_after_side_effect_no_double_execution() {
+    // BUG-LQB-SCOPE regression (see docs/feature-designs/jit-local-exception-handlers.md,
+    // "session 2"): a static counter mutation immediately followed by a
+    // string-concat `invokedynamic`, mirroring the original Liquibase
+    // `Scope.enter()` corruption shape as closely as possible. Before the
+    // BUG-LQB-SCOPE gate relaxation this method could not have hit the bug
+    // (RBC.6 blocked compilation of anything with a local exception
+    // handler, and this method has none — it never needed RBC.6 at all).
+    // It IS, however, exactly the shape the original `752796a0a` fix
+    // targeted: `jit_scan`'s `0xba` arm used to refuse to compile ANY
+    // method with an `invokedynamic` preceded by a committing side effect
+    // in raw pc order, believing the trap's fallback re-ran the whole
+    // method from entry (double-executing the counter increment). That
+    // premise died the same day a concurrent fix made the trap's
+    // precise-resume routing unconditional — this test's counter must be
+    // exactly 3,000,000 after 3,000,000 calls, not ~6,000,000.
+    if !liquibase_scope_bisect_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    let mut vm = test_vm();
+    let result = vm.invoke("cratonvm/LiquibaseScopeBisect", "checksum", "()I", &[]);
+    match result {
+        Ok(Some(Value::Int(_))) => {}
+        other => panic!("checksum returned unexpected value: {other:?}"),
+    }
+    let counter_after = vm.invoke("cratonvm/LiquibaseScopeBisect", "counterValue", "()I", &[]);
+    match counter_after {
+        Ok(Some(Value::Int(v))) => assert_eq!(
+            v, 3_000_000,
+            "counter after 3,000,000 calls diverged from 3,000,000 — the JIT double-executed              the side effect preceding the invokedynamic trap (the exact BUG-LQB-SCOPE shape)"
+        ),
+        other => panic!("counterValue returned unexpected value: {other:?}"),
+    }
+}

@@ -1,13 +1,21 @@
 # JIT support for local exception handlers (RBC.6)
 
-Status: **FIXED, validated, ready to merge** (2026-07-19). The original
-problem statement (written earlier the same day, kept at the bottom for
-history) assumed the JIT had *no* mechanism to dispatch a thrown exception
-to an in-method handler and scoped a substantial new compiler feature
-(Option A/B) to build one. That assumption was **wrong by the time it was
-written** — the actual fix is a compile-time gate relaxation plus a new
-compile-time *safety* check that closes a real, demonstrated correctness
-gap the relaxation would otherwise expose. No new codegen, no CFG changes.
+Status: **Compile-time correctness FIXED and validated end-to-end against
+the real Tomcat suite fixture** (2026-07-19, two sessions). `Response
+.toAbsolute()` — the doc's own motivating case — now JIT-compiles and
+produces correct results, confirmed directly, not inferred. **Still OPEN**:
+a newly-discovered, separate performance regression (repeated
+recompilation + net slowdown) keeps `TestResponsePerformance`'s
+relative-perf assertion failing — see "session 2" below for the full
+investigation and handoff. The original problem statement (written
+session 1, kept at the bottom for history) assumed the JIT had *no*
+mechanism to dispatch a thrown exception to an in-method handler and
+scoped a substantial new compiler feature (Option A/B) to build one. That
+assumption was wrong by the time it was written — the actual fix is a
+compile-time gate relaxation plus new compile-time *safety* checks that
+close real, demonstrated correctness gaps the relaxation would otherwise
+expose. No new codegen, no CFG changes to the compiled machine code
+itself — only scan-time/dataflow analysis.
 
 ## What actually happened
 
@@ -269,6 +277,182 @@ separate investigation, not bundled into this fix).
   `CRATONVM_DBG_JITC=1`; see the known-issues doc for the
   `TestResponsePerformance` re-run once merged and the Tomcat suite fixture
   is reachable.
+
+## 2026-07-19 session 2 (Linux build host, real Tomcat fixture validation)
+
+Picked this back up per an explicit "fix all issues related to this doc and
+their residuals completely" directive, with SSH access to the Azure Linux
+build host (`/data/data/cratonvm` main checkout, `/data/data/apps/tomcat`
+suite fixture — same host referenced throughout this codebase's other
+known-issues docs). Worktree: `/data/wt-rbc6-linux-validate-20260719`,
+branch `validate/rbc6-linux-perf-20260719`, branched from `origin/dev`
+(which already had session 1's merge, `dfc03eb68`/`c4252a6c1`).
+
+### Re-running `TestResponsePerformance` found TWO more real, blocking bugs
+
+Session 1 validated correctness thoroughly but could not reach the actual
+Tomcat suite fixture (Windows-local environment, no access to the remote
+host). Doing so now immediately surfaced that `Response.toAbsolute()`
+**still did not compile** — the session-1 fix was necessary but not
+sufficient for the doc's own motivating case:
+
+**Bug 1 — `local_handler_reads_unsafe_local` was itself over-conservative.**
+The session-1 safety check scanned linearly from each handler's
+`handler_pc` all the way to the END OF THE METHOD, never stopping at the
+handler's own `athrow`/`return` terminator. `Response.toAbsolute()`'s real
+bytecode has a short first handler (`catch (IOException) { throw new
+IllegalArgumentException(location, ioe); }`, ending in `athrow` at pc 94)
+followed immediately by *unrelated* code belonging to a completely
+different branch of the method (checking `leadingSlash` at pc 95, a local
+never touched by this handler). The scan kept going past the handler's own
+terminator into that unrelated code, found a load of a non-param local
+there, and rejected the whole method — confirmed via
+`CRATONVM_DBG_RBC6=1` tracing (`UNSAFE handler_pc=82 at_pc=95
+unsafe_slot=2`) run directly against the suite fixture.
+
+This also exposed a second, latent, never-triggered soundness gap in the
+SAME check: the raw-pc-order "is there some store to this slot at a lower
+pc" test is not path-sensitive — `if (c) { x = ...; } else { read x; }`
+inside a handler would have javac emit the store (true branch) at a lower
+pc than the read (false branch) regardless of which branch actually runs,
+so the old check could have wrongly ACCEPTED an unsafe method with that
+shape (never observed in practice, but a real gap).
+
+**Fix**: replaced the raw-pc-order approximation with a real, CFG-based,
+dominance-respecting forward "definitely assigned" dataflow —
+`regalloc::handler_has_unsafe_local_read` (`jit/src/regalloc.rs`), reusing
+that module's own already-trusted `bc_len`/`branch_target`/
+`is_unconditional`/`switch_targets` bytecode-CFG helpers (the exact ones
+`build_cfg` itself uses for register allocation) so the new check can never
+diverge from the backend's own understanding of the method's control flow.
+Standard worklist dataflow: a slot is safe at a program point only if every
+predecessor's propagated safe-set says so (intersection at merges,
+monotonically shrinking, guaranteed to terminate). `local_handler_reads_
+unsafe_local` (`jit/src/lib.rs`) now just seeds this with `this` + declared
+params per handler and delegates. Both bugs above are fixed by
+construction — a load is now judged only against what's dominance-reachable
+by a store, not "anything scanned so far, or ever."
+
+**Bug 2 — `BUG-LQB-SCOPE`'s premise, like RBC.6's, was stale.**
+Even with Bug 1 fixed, `toAbsolute()` still bailed — this time at the
+`jit_scan` level, in the unrelated "BUG-LQB-SCOPE" gate
+(`jit/src/x64.rs`'s `0xba`/`invokedynamic` scan arm), which refuses to
+compile a method containing `invokedynamic` (used for `int`-to-`String`
+concatenation — `toAbsolute()`'s port-number formatting, `":" + port`) if a
+"committing side effect" (any `invoke*`/`putfield`/`putstatic`/array-store)
+occurred earlier in raw bytecode-pc order — believing the trap's fallback
+was an imprecise whole-method re-run that could double-execute that earlier
+side effect (the real, once-confirmed Liquibase `Scope` corruption this
+gate was written to fix, `752796a0a`, 2026-07-07).
+
+Git archaeology showed this premise died the same day it was born: a
+**concurrent** fix on a different branch, merged the same day
+(`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`),
+closed four separate bugs in the reason-8 (`UnreachedCode`) trap's
+UNCONDITIONAL precise-resume machinery (`emit_osr_exit_map_at_reason`,
+`emit_deopt_stubs`'s reason-8 routing — not gated behind
+`deopt_real_enabled()`) — including, as its own "FOURTH bug", the *exact*
+nested-compiled-callee identity-mismatch scenario BUG-LQB-SCOPE's own
+author was worried about (`try_resume_trapped_callee` + baked `method_key`
+identity checks, a dedicated repro going from 30000/30000 corrupted calls
+to 0/30000). Two independently-authored fixes for the same underlying
+problem, from two different angles, landed hours apart, and nobody
+reconciled them — the compile-time gate became pure redundant
+over-caution once the runtime got precise.
+
+**Fix**: removed the `first_committing_side_effect_pc` tracking and its
+one consumer in the `0xba` scan arm. **Validated empirically**, not just
+by re-reading the git history: a differential repro mirroring the ORIGINAL
+Liquibase `Scope.enter()` shape as closely as possible
+(`LiquibaseScopeBisect.java` — `counter++` immediately followed by a
+string-concat `invokedynamic`, 3,000,000 calls, both a direct-caller and a
+nested-JIT-compiled-caller variant) produced `counterAfter=3000000`
+(exactly once per call, matching real-JDK ground truth) on the fixed
+binary, with the method confirmed actually JIT-compiled and the trap site
+confirmed actually reachable during the run.
+
+### Result: `Response.toAbsolute()` now compiles — but a NEW, separate performance regression blocks the doc's original assertion
+
+With both bugs fixed, `CRATONVM_DBG_JITC=1` against the real suite fixture
+confirms `Response.toAbsolute()` now reaches `full-compile` (verified
+directly, not inferred). All 9 differential-suite checksums (session 1) and
+the Liquibase bisect continue to match real-JDK golden values on this
+build — the correctness work is solid and thoroughly validated end-to-end,
+against the doc's own real target method, not just synthetic repros.
+
+However, `TestResponsePerformance`'s relative-performance assertion (the
+doc's actual acceptance target) still fails, and for a surprising reason:
+home-brew (`toAbsolute()`) time got WORSE, not better — ~450-490
+SECONDS per round (vs. the pre-fix, fully-interpreted baseline of ~63-72
+SECONDS documented earlier this same day). Root cause is NOT yet found.
+What's confirmed:
+
+- `Response.toAbsolute()` is being **repeatedly recompiled** during the
+  benchmark — 86-94 distinct `full-compile` events for a single method in
+  one run (`len=15451` each — a genuinely large compiled artifact), vs. a
+  handful of recompiles total for every OTHER hot method in the same run
+  combined. This is NOT going through the normal warmup/retry-stride path
+  (`tiered-enqueue`, `invoc_count=...`) — zero such lines appear for
+  `toAbsolute()` — it's being triggered some OTHER way, back-to-back, with
+  no other trace output interleaved between an event and the next.
+- Ruled out: `CRATONVM_DBG_DEOPT=1` shows only compile-time "OSR-exit map
+  emitted" snapshot recording (expected, once per compile) — no actual
+  runtime deopt/eviction/despeculation events were captured in the sampled
+  window, though the sampling was necessarily partial (a live process,
+  bounded observation time).
+- Investigated and ruled out as *the* cause (though kept as a real,
+  independently-justified fix — see below): `mic_callee_has_exception_table`
+  excludes ANY callee declaring a local exception table from FOUR separate
+  MIC/PIC/direct-call caching fast paths in `vm/src/jit/helpers.rs`. THREE
+  of those four are genuinely necessary — their own doc comments correctly
+  explain that the INLINE machine-code MIC/PIC cascade (`jit/src/x64.rs`)
+  `CALL`s a cached raw entry pointer directly from compiled code, bypassing
+  Rust-level exception routing entirely, so publishing an exception-table
+  bearing callee's raw entry there really would skip its own `catch`. The
+  FOURTH (`direct_virtual_compiled_callee_entry_enabled`'s
+  `VIRTUAL_DISPATCH_CACHE`, ~`vm/src/jit/helpers.rs:5261`) is different: it
+  is a plain Rust `HashMap` consulted from INSIDE the same Rust dispatch
+  helper, and a cache hit still calls `route_implicit_exc_through_callee`
+  afterward exactly as a miss would — so excluding exception-table callees
+  bought no correctness there. Relaxed it (kept the other three exactly as
+  they are). `cargo test -p cratonvm-jit` and the full differential suite
+  stayed green, but this did NOT move `TestResponsePerformance`'s numbers
+  (still ~330-490s/round, recompile count still 94) — so it was not, or not
+  solely, the bottleneck. Kept anyway: it's independently correct and
+  should help SOME other exception-table-bearing virtual-dispatch callee
+  even though it didn't explain this one.
+
+### Recommendation for whoever picks this up next
+
+The compile-time correctness work (this doc's original subject) is DONE
+and thoroughly validated. What remains is a genuinely new, separate
+investigation: **why does a large (15KB compiled), twice-exception-table,
+now-JIT-compiled method get recompiled 80+ times during a
+million-iteration benchmark, and why is its steady-state (or repeatedly-
+reset) execution so much slower than plain interpretation?** Concrete next
+steps:
+1. Find what's actually TRIGGERING each recompile, since it demonstrably
+   isn't the normal `tiered-enqueue`/invocation-count warmup path. Likely
+   candidates to check next: whether `toAbsolute()`'s artifact is being
+   evicted by a class-manager epoch bump unrelated to itself (every OTHER
+   method's own tier-up/supersede event was observed immediately
+   preceding several of the recompiles in the trace — worth checking
+   whether there's a shared "supersede epoch" that spuriously invalidates
+   unrelated compiled methods), or whether `has_dispatch`/`can_deopt_resume`
+   interact with something specific to a 2-entry exception table.
+2. Once recompiles stop, re-measure the STEADY-STATE per-call cost
+   directly (e.g. a tight micro-loop calling only `toAbsolute()` after
+   letting it settle) to separate "compile-time cost paid repeatedly" from
+   "genuinely slow generated code" as two different possible root causes —
+   they need different fixes.
+3. Given the recompile pattern correlates temporally with OTHER small
+   methods `toAbsolute()` calls getting C1→C2 "supersede" events, check
+   whether there's an (probably unintended) inlining-invalidation cascade:
+   does the single-pass C1 backend inline any of `toAbsolute()`'s trivial
+   callees (`getScheme`/`getServerName`/`getServerPort` are prime
+   candidates), and if a callee's own tier-up invalidates callers that
+   inlined it, does that invalidation logic correctly distinguish "this
+   caller genuinely needs invalidating" from "false positive"?
 
 ## Remaining follow-ups (not blockers for this fix)
 

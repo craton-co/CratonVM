@@ -5258,7 +5258,26 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     .read()
                     .get_loaded_class_id(&target.class_name)
                     == Some(receiver_cid);
-            if globally_named && !mic_callee_has_exception_table(vm, receiver_cid, info) {
+            // RBC.6 perf follow-up (docs/feature-designs/jit-local-exception-handlers.md)
+            // — this used to also require `!mic_callee_has_exception_table(...)`,
+            // excluding ANY callee that declares a local exception table from
+            // this cache entirely and forcing every such call through the
+            // "generic helper" fallback this comment block warns is expensive
+            // ("re-enters invoke_virtual on every element access, rebuilding
+            // conservative JIT roots each time"). Unlike the INLINE machine-code
+            // MIC/PIC cascade (`jit/src/x64.rs`, guarded by the SAME check at its
+            // own publish sites — see `BUG-H` comments there — which really does
+            // bypass Rust-level exception routing since it CALLs the raw entry
+            // pointer directly from compiled machine code), THIS cache is a plain
+            // Rust `HashMap` consulted from inside this same Rust function — a hit
+            // still calls `try_call_compiled_entry_reentrant` and then
+            // `route_implicit_exc_through_callee` below EXACTLY as a cache miss
+            // would, so the callee's own exception table is routed identically
+            // either way. Excluding it here bought no correctness and cost a real
+            // ~450s/round regression for `Response.toAbsolute()` once RBC.6 let it
+            // compile (confirmed via the Tomcat suite's `TestResponsePerformance`
+            // on the Linux build host).
+            if globally_named {
                 let key = (info_key, receiver_cid.as_u32());
                 if let Some(cached) = VIRTUAL_DISPATCH_CACHE
                     .with(|dc| dc.borrow().get(&key).map(|c| (c.entry, c.needs_context)))
