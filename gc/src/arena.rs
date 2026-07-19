@@ -194,6 +194,12 @@ impl Arena {
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
 
+        // Reserve the allocation's aligned footprint, not merely an aligned
+        // start. Compact object bodies can end 1..7 bytes before the next
+        // object boundary; leaving that tail outside the allocation makes
+        // linear heap walks see a phantom region between valid objects.
+        let alloc_size = size.checked_add(align - 1).map(|v| v & !(align - 1))?;
+
         // Free-list fast path: if a prior non-moving sweep reclaimed any
         // holes, satisfy the request from the first block large enough to
         // hold `size` plus the alignment padding. The leftover (head
@@ -206,7 +212,7 @@ impl Arena {
         // block is smaller than `size`, no block can satisfy the request —
         // skip the scans entirely and go straight to the bump path.
         if (!self.free_small.is_empty() || !self.free_large.is_empty())
-            && size <= self.max_free_upper
+            && alloc_size <= self.max_free_upper
         {
             let base = self.data.as_ptr() as usize;
             // Tier selection: a request whose worst-case need (size + max
@@ -215,25 +221,25 @@ impl Arena {
             // entirely. Smaller requests try the small tier first: its
             // blocks are object-sized holes, so a same-shaped request
             // first-fits at ~index 0.
-            let worst_need = size.saturating_add(align - 1);
+            let worst_need = alloc_size.saturating_add(align - 1);
             let hit = if worst_need < LARGE_BLOCK_MIN {
                 Self::first_fit(
                     &mut self.free_small,
                     base,
-                    size,
+                    alloc_size,
                     align,
                     SMALL_TIER_SCAN_BUDGET,
                 )
-                .or_else(|| Self::first_fit(&mut self.free_large, base, size, align, usize::MAX))
+                .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX))
             } else {
-                Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
+                Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX)
             };
             if let Some((alloc_offset, remainders)) = hit {
                 self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
-                // SAFETY: `alloc_offset + size` lies within the consumed
+                // SAFETY: `alloc_offset + alloc_size` lies within the consumed
                 // block, which came from a region inside the buffer.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
@@ -256,7 +262,7 @@ impl Arena {
         // Bump-allocation path: align the cursor up (checked to prevent
         // overflow near usize::MAX).
         let aligned = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1));
-        let end = aligned.and_then(|a| a.checked_add(size));
+        let end = aligned.and_then(|a| a.checked_add(alloc_size));
         let aligned = aligned?;
         let end = end?;
         if end > self.data.len() {
@@ -608,6 +614,17 @@ mod tests {
         let mut arena = Arena::new(64);
         assert!(arena.alloc(64, 8).is_some());
         assert!(arena.alloc(1, 1).is_none());
+    }
+
+    #[test]
+    fn arena_alignment_reserves_trailing_padding() {
+        let mut arena = Arena::new(64);
+        let first = arena.alloc(44, 8).unwrap();
+        let second = arena.alloc(8, 8).unwrap();
+
+        assert_eq!(unsafe { first.offset_from(arena.base_ptr_mut()) }, 0);
+        assert_eq!(unsafe { second.offset_from(arena.base_ptr_mut()) }, 48);
+        assert_eq!(arena.used(), 56);
     }
 
     #[test]

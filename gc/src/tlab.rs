@@ -214,14 +214,39 @@ impl Tlab {
     /// owning thread, so the pressure counters need no synchronization.
     #[inline(always)]
     pub fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        self.alloc_initialized(size, align, |_| {})
+    }
+
+    /// Bump-allocate a region, initialize it, then publish the new cursor.
+    ///
+    /// The publication order matters when a compiled frame is forcibly
+    /// suspended for a non-moving collection: the collector uses `cursor` as
+    /// the boundary of the walkable TLAB prefix.  Publishing it before the
+    /// caller writes an object header lets the walk treat an all-zero
+    /// in-flight object as a 40-byte object and later create a free-list hole
+    /// in its body.  The initializer therefore runs while the reservation is
+    /// still private; only a fully walker-coherent object is made visible.
+    #[inline(always)]
+    pub fn alloc_initialized<F>(&mut self, size: usize, align: usize, init: F) -> Option<*mut u8>
+    where
+        F: FnOnce(*mut u8),
+    {
         debug_assert!(align.is_power_of_two());
         let cursor = self.cursor as usize;
         let aligned = (cursor + align - 1) & !(align - 1);
-        let new_cursor = aligned + size;
+        // Compact object bodies can be non-aligned. Reserve their complete
+        // aligned footprint so the next object and the published reserved
+        // tail never begin inside the prior object's collector-visible span.
+        let footprint = size.checked_add(align - 1)? & !(align - 1);
+        let new_cursor = aligned.checked_add(footprint)?;
         if new_cursor > self.end as usize {
             return None;
         }
         let ptr = aligned as *mut u8;
+        init(ptr);
+        // Commit last: a cross-thread root scan may publish the remaining
+        // `[cursor, end)` tail while this thread is suspended in JIT code.
+        // Once this store is visible, `ptr` must already hold a valid header.
         self.cursor = new_cursor as *mut u8;
         // Inlined `pressure.record_allocation(size)` — direct field
         // updates so the bump path is a pure pointer-bump + bounds-check
@@ -686,6 +711,22 @@ mod tests {
     }
 
     #[test]
+    fn tlab_initialized_alloc_installs_object_before_publishing_tail() {
+        let mut buf = vec![0u8; 128];
+        let base = buf.as_mut_ptr() as usize;
+        let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), 128) };
+
+        let object = tlab
+            .alloc_initialized(40, 8, |ptr| unsafe {
+                std::ptr::write(ptr as *mut u32, 0xC0DE_CAFE);
+            })
+            .expect("TLAB has room for one header-sized object");
+
+        assert_eq!(unsafe { std::ptr::read(object as *const u32) }, 0xC0DE_CAFE);
+        assert_eq!(tlab.reserved_tail(), Some((base + 40, base + 128)));
+    }
+
+    #[test]
     fn tlab_alignment() {
         let mut buf = vec![0u8; 256];
         let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), 256) };
@@ -695,6 +736,17 @@ mod tests {
         // Next alloc with align=8 should skip to alignment boundary
         let p2 = tlab.alloc(8, 8).unwrap();
         assert_eq!((p2 as usize) % 8, 0);
+    }
+
+    #[test]
+    fn tlab_alignment_reserves_compact_object_padding() {
+        let mut buf = vec![0u8; 128];
+        let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), 128) };
+        let first = tlab.alloc(44, 8).unwrap();
+        let second = tlab.alloc(8, 8).unwrap();
+
+        assert_eq!(second as usize - first as usize, 48);
+        assert_eq!(tlab.remaining(), 72);
     }
 
     #[test]

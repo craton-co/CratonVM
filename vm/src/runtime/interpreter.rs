@@ -2177,7 +2177,7 @@ fn tlab_alloc_object_inner(
     // Fast path: bump-allocate from the current TLAB without taking
     // any lock. This is the steady-state path for ~99% of allocations
     // once the adaptive sizer has settled.
-    if let Some(ptr) = thread.tlab.alloc(total_size, 8) {
+    if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
         // H1: mint a fresh non-zero identity hash at allocation time so
         // the object header is never all-zero. This matches the slow-path
         // allocators (`alloc_object`/`alloc_array`) and prevents the
@@ -2185,6 +2185,7 @@ fn tlab_alloc_object_inner(
         // legitimate `new Object()` instances as stale memory.
         let hash = shared.heap.next_identity_hash();
         init_object_header(ptr, class_id, num_fields, hash);
+    }) {
         shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
         // platforms; on 32-bit the upper bound (usize::MAX ≈ 4 GiB) still
@@ -2271,10 +2272,11 @@ fn tlab_alloc_object_inner(
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
-        if let Some(ptr) = thread.tlab.alloc(total_size, 8) {
+        if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
             // H1: see fast-path comment above.
             let hash = shared.heap.next_identity_hash();
             init_object_header(ptr, class_id, num_fields, hash);
+        }) {
             shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .bytes_allocated_total
@@ -4092,17 +4094,20 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
 }
 
 /// Conservative estimate of how many bytes of native stack a single
-/// re-entrant JIT *dispatch* level can consume. Unlike the interpreter's
-/// `execute` level (≈8 KiB), a JIT→JIT recursion level stacks a much larger
-/// Rust frame: `jit_invoke_dispatch` / `jit_invoke_virtual_mic` hold sizeable
-/// locals (arg-decode `Vec`s, `JitInvokeInfo` views, MIC/PIC handling, the
-/// SATB flush, the transmuted compiled-entry trampoline) AND the compiled Java
-/// frame itself runs on the native stack between dispatch calls. We budget a
-/// deliberately pessimistic 32 KiB/level so the JIT-dispatch ceiling trips with
-/// generous head-room before the OS guard page — the JIT path has no cheap way
-/// to query remaining stack, and overshooting here is an uncatchable process
-/// abort whereas undershooting merely throws SOE slightly early.
-const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 32 * 1024;
+/// re-entrant JIT *dispatch* level can consume. The helper contains argument
+/// decoding, MIC/PIC handling, a SATB flush, and a compiled-Java frame. Its
+/// release footprint is nevertheless within the interpreter's proven 8 KiB
+/// per-level budget; the counter is also an active call-chain depth rather
+/// than a recursion counter. We therefore budget a
+/// The counter tracks every active JIT-to-JIT dispatch, not only recursive
+/// calls.  Production Lucene vector search legitimately keeps more than 128
+/// such calls live on an 8 MiB worker carrier, so the former 32 KiB estimate
+/// converted an ordinary call chain into a spurious `StackOverflowError`.
+/// Reserve 8 KiB per level, matching the interpreter's proven conservative
+/// frame budget: an 8 MiB carrier still retains half its stack as head-room
+/// and the guard continues to turn pathological recursion into a catchable
+/// Java exception before the native guard page.
+const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 8 * 1024;
 
 /// Absolute floor for the derived JIT-dispatch ceiling. Distinct from (and
 /// lower than) [`MIN_EXEC_DEPTH_CEILING`] because the JIT per-level budget is
@@ -38293,6 +38298,18 @@ mod tests {
         assert_eq!(worker, 512);
         // 128 MiB / 2 / 8 KiB = 8192 levels.
         assert_eq!(main, 8192);
+    }
+
+    /// JIT dispatch depth is also a call-chain depth, not a recursion count.
+    /// An 8 MiB Java worker must therefore admit normal deep framework calls
+    /// while retaining half of the native stack as an overflow reserve.
+    #[test]
+    fn jit_dispatch_depth_ceiling_for_8mib_allows_normal_call_chains() {
+        assert_eq!(
+            derive_jit_dispatch_depth_ceiling(8 * 1024 * 1024),
+            512,
+            "8 MiB / 2 safety reserve / 8 KiB per JIT-dispatch level"
+        );
     }
 
     /// The old hard-coded 10_000 ceiling overflowed an 8 MiB native stack

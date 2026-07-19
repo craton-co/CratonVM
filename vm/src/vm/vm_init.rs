@@ -5111,8 +5111,10 @@ pub struct Vm {
     /// Shared VM state (thread-safe, can be cloned via Arc).
     pub shared: Arc<SharedVm>,
 
-    /// Per-thread state for the main thread.
-    pub main_thread: JvmThread,
+    /// Per-thread state for the main thread. This is boxed because the thread
+    /// registry publishes its TLAB address to a cross-thread GC; moving the
+    /// containing `Vm` must not invalidate that address.
+    pub main_thread: Box<JvmThread>,
 }
 
 impl Vm {
@@ -5205,7 +5207,7 @@ impl Vm {
         }
 
         // Register the main thread (id 0) in the thread registry.
-        let main_thread = JvmThread::new(ThreadId(0), "main");
+        let main_thread = Box::new(JvmThread::new(ThreadId(0), "main"));
         shared.thread_registry.register(ThreadId(0), "main", None);
         // Share the interrupted flag so cross-thread interrupt works on the main thread
         shared
@@ -5232,6 +5234,14 @@ impl Vm {
         shared
             .thread_registry
             .set_gc_block_state(ThreadId(0), main_thread.gc_block_state.clone());
+        // A worker-initiated non-moving GC can forcibly stop the primordial
+        // thread in JIT code. Publish its reserved TLAB tail just as we do for
+        // workers and JNI-attached threads. The Box keeps this pointee stable
+        // across the return/moves of `Vm::new`.
+        shared.thread_registry.set_tlab_addr(
+            ThreadId(0),
+            &main_thread.tlab as *const cratonvm_gc::Tlab as usize,
+        );
         // Publish the primordial thread's OS id too. A worker can initiate a
         // multi-threaded STW while the main thread is running JIT code; without
         // this id the takeover backend can freeze and scan main but cannot prove
@@ -6348,6 +6358,24 @@ mod tests {
         assert_eq!(vm.main_thread.thread_id, ThreadId(0));
         assert_eq!(vm.main_thread.name, "main");
         assert!(vm.main_thread.printed.is_empty());
+    }
+
+    #[test]
+    fn vm_main_thread_publishes_stable_tlab_tail() {
+        let mut vm = Vm::new(VmConfig::default());
+        let mut backing = vec![0u64; 16];
+        let base = backing.as_mut_ptr() as *mut u8;
+        let size = backing.len() * std::mem::size_of::<u64>();
+        vm.main_thread.tlab = unsafe { cratonvm_gc::Tlab::new(base, size) };
+        vm.main_thread.tlab.alloc(32, 8).unwrap();
+
+        // Moving `Vm` must not change the address observed by the registry:
+        // the `JvmThread` lives in its dedicated Box.
+        let vm = vm;
+        assert_eq!(
+            vm.shared.thread_registry.collect_reserved_tlab_tails(),
+            vec![(base as usize + 32, base as usize + size)],
+        );
     }
 
     #[test]

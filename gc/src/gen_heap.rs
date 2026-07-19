@@ -4880,6 +4880,7 @@ impl GenerationalHeap {
         let exact_skips = merge_skips(young_from.free_blocks_sorted());
         let mut exact_free_iter = exact_skips.iter().peekable();
         let mut exact_cursor = 0usize;
+        let mut exact_walk_complete = true;
         while exact_cursor < young_from.used() {
             if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
                 continue;
@@ -4901,6 +4902,7 @@ impl GenerationalHeap {
                     continue;
                 }
                 tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
+                exact_walk_complete = false;
                 break;
             }
             let total = gen_object_total_size(header);
@@ -4909,17 +4911,135 @@ impl GenerationalHeap {
                     .checked_add(total)
                     .is_none_or(|end| end > young_from.used())
             {
+                if crate::a2dbg::enabled() {
+                    eprintln!(
+                        "[A2] exact-walk invalid @{} class_id={} kind={} elem={} array_len={} num_slots={} total={} used={}",
+                        exact_cursor,
+                        header.class_id.as_u32(),
+                        header.kind as u8,
+                        header.element_type as u8,
+                        header.array_length,
+                        header.num_slots,
+                        total,
+                        young_from.used(),
+                    );
+                    match crate::a2dbg::lookup_covering(from_base + exact_cursor) {
+                        Some(r) => {
+                            eprintln!(
+                                "[A2] exact-walk allocation start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={} offset={}",
+                                r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots,
+                                r.size, r.seq, from_base + exact_cursor - r.addr,
+                            );
+                            if r.addr > from_base {
+                                match crate::a2dbg::lookup_covering(r.addr - 8) {
+                                    Some(prev) => eprintln!(
+                                        "[A2] exact-walk predecessor start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={} predecessor_end={:#x}",
+                                        prev.addr, prev.class_id, prev.kind, prev.element_type,
+                                        prev.array_length, prev.num_slots, prev.size, prev.seq,
+                                        prev.addr + prev.size,
+                                    ),
+                                    None => eprintln!("[A2] exact-walk predecessor has no allocation breadcrumb"),
+                                }
+                            }
+                        }
+                        None => eprintln!("[A2] exact-walk no allocation breadcrumb"),
+                    }
+                    for back in (0..=160usize).step_by(8) {
+                        let probe = from_base + exact_cursor.saturating_sub(back);
+                        if let Some(r) = crate::a2dbg::lookup_at(probe) {
+                            eprintln!(
+                                "[A2] exact-walk preceding alloc back={} start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={}",
+                                back, r.addr, r.class_id, r.kind, r.element_type, r.array_length,
+                                r.num_slots, r.size, r.seq,
+                            );
+                        }
+                    }
+                }
                 tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
+                exact_walk_complete = false;
                 break;
             }
             if let Some(&&(off, _)) = exact_free_iter.peek() {
                 if off > exact_cursor && off < exact_cursor + total {
-                    tracing::warn!(exact_cursor, off, "GC: exact young-object walk crossed a free/TLAB range");
+                    // Keep the failure report actionable: a range here can be
+                    // either a reclaimed arena hole or the reserved tail of a
+                    // forcibly-stopped mutator. The fixes are disjoint, and
+                    // the raw offsets alone do not say which writer supplied
+                    // the boundary.
+                    let range_source = if jit_skips.iter().any(|&(skip_off, _)| skip_off == off) {
+                        "published-tlab-tail"
+                    } else {
+                        "free-list"
+                    };
+                    // This is an allocator ownership failure, not a normal
+                    // collection outcome.  Keep its forensic output bounded:
+                    // once a mutator reaches the same malformed span every
+                    // allocation immediately retries the collection, and an
+                    // unbounded warning stream can otherwise hide the first
+                    // useful evidence and consume the process's disk budget.
+                    static CROSSING_REPORTS: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let report_no = CROSSING_REPORTS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if crate::a2dbg::enabled() && report_no == 0 {
+                        for probe in [
+                            exact_cursor,
+                            exact_cursor.saturating_add(8),
+                            exact_cursor.saturating_add(16),
+                            off.saturating_sub(8),
+                            off,
+                        ] {
+                            let history = crate::a2dbg::history_at(from_base + probe, 8);
+                            eprintln!(
+                                "[A2] exact-crossing probe_off={} history={:?}",
+                                probe, history
+                            );
+                        }
+                    }
+                    if report_no < 8 {
+                        tracing::warn!(
+                            exact_cursor,
+                            off,
+                            total,
+                            range_source,
+                            class_id = header.class_id.as_u32(),
+                            kind = ?header.kind,
+                            array_length = header.array_length,
+                            num_slots = header.num_slots,
+                            "GC: exact young-object walk crossed a free/TLAB range"
+                        );
+                    }
+                    exact_walk_complete = false;
                     break;
                 }
             }
             young_object_ranges.push((ptr as usize, ptr as usize + total));
             exact_cursor += total;
+        }
+        // A partial exact-range map is not a conservative approximation: the
+        // marker resolves every root through this map, so continuing after the
+        // first unparseable span silently drops all later live objects and the
+        // subsequent sweep reclaims them.  This is the same safety boundary as
+        // the moving collector's object-start prepass below.  Nothing has been
+        // mutated yet apart from idempotent card-buffer maintenance, therefore
+        // skipping one collection is safe; a later trigger retries after the
+        // transient TLAB/free-list layout has settled.
+        if !exact_walk_complete {
+            tracing::warn!(
+                "GC: exact young-object walk incomplete — skipping this non-moving \
+                 young collection (over-retain; retried next cycle)"
+            );
+            return (
+                GcResult {
+                    stats: crate::gc::GcStats {
+                        objects_copied: 0,
+                        bytes_copied: 0,
+                        bytes_freed: 0,
+                    },
+                    pointer_map: HashMap::new(),
+                },
+                Vec::new(),
+            );
         }
 
         // ----- Mark phase -------------------------------------------------
@@ -6284,6 +6404,11 @@ impl GenerationalHeap {
         let mut objects_live: usize = 0;
 
         let mut cursor: usize = 0;
+        // The mark phase already built this exact, allocator-validated object
+        // map under the same STW. Keep the reclamation walk in lockstep with
+        // it: a second independently-decoded walk must never publish a hole
+        // unless it names precisely the object the marker validated.
+        let mut exact_range_cursor = 0usize;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
         // xt-hardening (2026-07-03): lockstep iterator over the side mark
@@ -6678,6 +6803,24 @@ impl GenerationalHeap {
                 }
             }
 
+            let expected_range = young_object_ranges.get(exact_range_cursor).copied();
+            let actual_range = (obj_ptr as usize, obj_ptr as usize + total_size);
+            if expected_range != Some(actual_range) {
+                // This is a disagreement between two collector views taken
+                // under the same STW, not a recoverable object. Retain the
+                // unverified suffix rather than publishing a free block that
+                // could begin inside a live object.
+                tracing::warn!(
+                    cursor,
+                    ?expected_range,
+                    ?actual_range,
+                    "non-moving sweep diverged from the exact young-object map; retaining suffix"
+                );
+                dead_regions.truncate(dead_watermark);
+                break;
+            }
+            exact_range_cursor += 1;
+
             walked_count += 1;
             if retain_full_walk {
                 walked.push_back((
@@ -6945,19 +7088,28 @@ impl GenerationalHeap {
         // root scan cannot resurrect a stale header inside the hole) and
         // publish it to the free list. Per-object forensic records remain
         // available without forcing per-object arena publication.
-        for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
-            let obj_addr = from_base + off;
-            record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
-            crate::a2dbg::record_free(obj_addr);
-            bytes_swept += sz;
-            objects_swept += object_count;
-        }
-        for &(off, sz) in &reclaimed_regions {
-            let obj_addr = from_base + off;
-            // SAFETY: this is the union of adjacent/overlapping spans that the
-            // verified walk collected, all within the live from-space region.
-            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
-            young_from.add_free_block(off, sz);
+        let defer_reclamation = std::env::var_os("CRATONVM_DBG_NO_NONMOVING_RECLAIM").is_some();
+        if !defer_reclamation {
+            for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
+                let obj_addr = from_base + off;
+                record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
+                crate::a2dbg::record_free(obj_addr);
+                bytes_swept += sz;
+                objects_swept += object_count;
+            }
+            for &(off, sz) in &reclaimed_regions {
+                let obj_addr = from_base + off;
+                // SAFETY: this is the union of adjacent/overlapping spans that the
+                // verified walk collected, all within the live from-space region.
+                unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
+                young_from.add_free_block(off, sz);
+            }
+        } else if !dead_regions.is_empty() {
+            tracing::debug!(
+                spans = dead_regions.len(),
+                bytes = reclaimed_regions.iter().map(|(_, size)| *size).sum::<usize>(),
+                "GC: retaining dead young spans during non-moving reclamation probe"
+            );
         }
         report_phase("zero-and-publish");
 
@@ -9293,7 +9445,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
+    let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
@@ -9361,7 +9513,15 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
             return 0;
         }
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
-    }
+    };
+
+    // Arena allocations reserve an 8-byte-aligned footprint. Compact object
+    // bodies need not be naturally aligned, so their trailing padding belongs
+    // to the object for every linear collector walk.
+    raw_size
+        .checked_add(7)
+        .map(|size| size & !7)
+        .unwrap_or(0)
 }
 
 /// Compute a pointer to the slot at `index` within an object/array.
@@ -10607,11 +10767,7 @@ mod tests {
         }
 
         // Dead object's memory was reclaimed (zeroed + on the free list).
-        assert!(
-            result.stats.bytes_freed > 0,
-            "dead object must be reclaimed"
-        );
-        // The reclaimed region was zeroed by the sweep.
+        assert!(result.stats.bytes_freed > 0, "dead object must be reclaimed");
         // SAFETY: `dead_ptr` is inside the young arena; reading its
         // (now-freed, zeroed) header is a valid in-bounds read.
         let dead_header = unsafe { &*(dead_ptr as *const ObjectHeader) };
@@ -10621,15 +10777,9 @@ mod tests {
             "freed hole must be zeroed"
         );
 
-        // A fresh allocation must succeed and reuse the reclaimed hole
-        // (it lands at the dead object's old address since that's the
-        // first free block).
+        // A fresh allocation must succeed and reuse the reclaimed hole.
         let reused = heap.alloc_object(ClassId::new(7), 1);
-        assert_eq!(
-            reused.as_ptr(),
-            dead_ptr,
-            "new allocation should reuse the swept hole",
-        );
+        assert_eq!(reused.as_ptr(), dead_ptr, "new allocation should reuse the swept hole");
         heap.set_field(reused, 0, Value::Int(555));
         assert_eq!(heap.get_field(reused, 0).as_int(), Some(555));
 
