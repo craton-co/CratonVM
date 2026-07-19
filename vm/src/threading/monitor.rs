@@ -1607,8 +1607,33 @@ impl MonitorTable {
     /// a separate, rarer gap (nothing else was contending it, so nothing
     /// else is blocked on it either).
     pub fn release_monitors_held_by(&self, thread_id: ThreadId) {
+        self.release_monitors_held_by_except(thread_id, None);
+    }
+
+    /// Same as [`Self::release_monitors_held_by`], but leaves `except` alone
+    /// even if `thread_id` currently owns it.
+    ///
+    /// Used by the `Thread.join()` termination-notify sequence (WP4.1,
+    /// `vm_exec.rs`'s `thread_start` spawn closure): the terminating thread
+    /// deliberately acquires and holds its own Java `Thread` mirror's monitor
+    /// across `mark_dead`/this sweep so it can safely `notify_all()` any
+    /// `Thread.join()` waiters afterward. Without this exclusion, the blanket
+    /// sweep force-releases that monitor too (it IS owned by `thread_id` at
+    /// this point) — `state.owner` goes back to `None` — so the subsequent
+    /// `Monitor::notify_all`/`exit` calls both fail `NotOwner` (silently
+    /// discarded by the `let _ =` caller) and `wait_condvar.notify_all()` is
+    /// never invoked. Every joiner parked in `Object.wait()` then hangs
+    /// forever even though the joined thread's `alive` flag is already false
+    /// (the exact "worker alive=false, joiner stuck in `Thread.join()`"
+    /// lost-wakeup signature).
+    pub fn release_monitors_held_by_except(&self, thread_id: ThreadId, except: Option<&Arc<Monitor>>) {
         let monitors = self.monitors.lock().expect("monitors registry poisoned");
         for monitor in monitors.values() {
+            if let Some(exc) = except {
+                if Arc::ptr_eq(monitor, exc) {
+                    continue;
+                }
+            }
             monitor.force_release_if_owned_by(thread_id);
         }
     }
