@@ -67029,7 +67029,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let trace = false;
+    let trace = std::env::var_os("CRATONVM_TRACE_BEANINFO").is_some();
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         other => {
@@ -67076,6 +67076,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
+        eprintln!("BI-TRACE: ==== entering getBeanInfo for {} ====", cn);
     }
 
     // The two-argument overload is getBeanInfo(beanClass, stopClass). The
@@ -67215,6 +67216,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Class.getMethods() entry, and Spring's ExtendedBeanInfo scans them for
     // non-standard write methods.
     let mut all_method_mirrors: Vec<(usize, ObjectRef)> = Vec::new();
+    let mut all_method_names: Vec<String> = Vec::new();
     for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
@@ -67247,6 +67249,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 );
                 let mm_all_pin = ctx.pin_native_root(mm_all);
                 all_method_mirrors.push((mm_all_pin, mm_all));
+                if trace {
+                    all_method_names.push(format!("{}{}", name, desc));
+                }
             }
             // JavaBeans properties come from PUBLIC INSTANCE methods only
             // (java.beans uses Class.getMethods(), which is public-only — a
@@ -67584,6 +67589,14 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // scan and the previous iterations' ctor invokes may have moved it
         // (native stale-local family).
         let m = ctx.read_native_pin(m_pin, m);
+        if trace {
+            eprintln!(
+                "BI-TRACE: MethodDescriptor ctor {}/{} -> {}",
+                i + 1,
+                all_method_mirrors.len(),
+                all_method_names.get(i).map(String::as_str).unwrap_or("?")
+            );
+        }
         let md = match ctx.new_object_initialized(
             "java/beans/MethodDescriptor",
             "(Ljava/lang/reflect/Method;)V",

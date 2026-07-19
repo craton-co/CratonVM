@@ -1607,6 +1607,47 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
     }
 }
 
+/// Resolve the field slot used to link a `java.lang.ref.Reference` (or
+/// subclass instance) onto its `ReferenceQueue`'s linked list when the GC
+/// auto-enqueues it -- the `next` field as declared on `java/lang/ref/Reference`
+/// itself (referent, queue, next, discovered — real-JDK layout).
+///
+/// MUST be resolved BY NAME against `Reference`'s own declaring class, not
+/// by a field-count heuristic on the receiver's most-derived class: a
+/// `java.util.WeakHashMap$Entry` (itself a `WeakReference` subclass) also
+/// declares its OWN field named `next` (used for its hash-BUCKET chain, a
+/// completely different linked list). The old heuristic ("index 2 if the
+/// object has more than 2 fields") cannot tell these apart — for a
+/// `WeakHashMap$Entry` specifically it can land on the wrong `next` slot,
+/// so a GC-driven auto-enqueue (a live-application-scale WeakHashMap
+/// *will* eventually have a stale entry to expunge) splices the
+/// ReferenceQueue's link over the bucket-chain link, corrupting whatever
+/// hash bucket that entry lived in — a later `WeakHashMap.get()`/
+/// `expungeStaleEntries()` walking that bucket's `Entry.next` chain then
+/// loops forever (observed: `com.sun.beans.TypeResolver`'s internal
+/// `WeakCache`'s `WeakHashMap.get()` permanently stuck inside
+/// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
+/// `createLayoutFromConfigClass` test). See
+/// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
+fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
+    if shared.heap.num_fields(ref_obj) <= 2 {
+        return 0; // legacy synthetic 2-field shape: referent, queue only
+    }
+    let cm = shared.class_manager.read();
+    cm.find_class_by_name("java/lang/ref/Reference")
+        .and_then(|reference_cid| {
+            crate::vm::vm_exec::resolve_field_index_in_hierarchy(
+                reference_cid,
+                "next",
+                cm.class_store(),
+            )
+        })
+        // `java/lang/ref/Reference` should always be loaded by the time any
+        // Reference object exists to enqueue; this fallback only guards
+        // against that invariant somehow not holding.
+        .unwrap_or(2)
+}
+
 /// Process weak/soft references after a GC cycle.
 /// Calls the ReferenceProcessor, nulls referent fields of cleared references,
 /// and relocates ref processor addresses using the pointer map.
@@ -1840,11 +1881,7 @@ fn process_references_after_gc(
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        let next_slot = if shared.heap.num_fields(ref_obj) > 2 {
-            2
-        } else {
-            0
-        };
+        let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
         let size = match shared.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
@@ -4067,11 +4104,7 @@ fn g1_remark_process_references(
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj)));
-        let next_slot = if shared.heap.num_fields(ref_obj) > 2 {
-            2
-        } else {
-            0
-        };
+        let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.heap.set_field(ref_obj, next_slot, old_head);
         let size = match shared.heap.get_field(q_obj, 1) {
             Value::Int(v) => v,
