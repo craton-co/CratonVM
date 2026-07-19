@@ -369,7 +369,10 @@ fn push_read_completion(c: ReadCompletion) {
 
 /// Park a Future-form completion and wake the VM-attached dispatcher.
 fn push_future_completion(c: FutureCompletion) {
-    dbg_aio!("      push  future_gref={} queued for delivery", c.future_gref);
+    dbg_aio!(
+        "      push  future_gref={} queued for delivery",
+        c.future_gref
+    );
     let (q, cv) = read_completion_state();
     q.lock().push_back(DispatcherCompletion::Future(c));
     cv.notify_one();
@@ -414,12 +417,15 @@ fn deliver_read_completion(ctx: &mut dyn NativeContext, c: ReadCompletion) {
         buffer_gref,
         outcome,
     } = c;
-    dbg_aio!("HREAD  deliver handler_gref={handler_gref} outcome={}", match &outcome {
-        ReadOutcome::Bytes(b) => format!("Bytes(len={})", b.len()),
-        ReadOutcome::Eof => "Eof".to_string(),
-        ReadOutcome::Count(n) => format!("Count({n})"),
-        ReadOutcome::Error(m) => format!("Error({m})"),
-    });
+    dbg_aio!(
+        "HREAD  deliver handler_gref={handler_gref} outcome={}",
+        match &outcome {
+            ReadOutcome::Bytes(b) => format!("Bytes(len={})", b.len()),
+            ReadOutcome::Eof => "Eof".to_string(),
+            ReadOutcome::Count(n) => format!("Count({n})"),
+            ReadOutcome::Error(m) => format!("Error({m})"),
+        }
+    );
     // Nothing to deliver to if the handler root is gone; just release.
     if ctx.resolve_global_root(handler_gref).is_none() {
         dbg_aio!("HREAD  deliver handler_gref={handler_gref} — handler root GONE, dropping completion silently");
@@ -453,13 +459,22 @@ fn deliver_future_completion(ctx: &mut dyn NativeContext, c: FutureCompletion) {
         buffer_gref,
         outcome,
     } = c;
-    dbg_aio!("      deliver future_gref={future_gref} outcome={}", match &outcome {
-        FutureOutcome::Bytes(b) => format!("Bytes(len={} hex={})", b.len(),
-            b.iter().take(32).map(|x| format!("{x:02x}")).collect::<String>()),
-        FutureOutcome::Count(n) => format!("Count({n})"),
-        FutureOutcome::Eof => "Eof".to_string(),
-        FutureOutcome::Error(m) => format!("Error({m})"),
-    });
+    dbg_aio!(
+        "      deliver future_gref={future_gref} outcome={}",
+        match &outcome {
+            FutureOutcome::Bytes(b) => format!(
+                "Bytes(len={} hex={})",
+                b.len(),
+                b.iter()
+                    .take(32)
+                    .map(|x| format!("{x:02x}"))
+                    .collect::<String>()
+            ),
+            FutureOutcome::Count(n) => format!("Count({n})"),
+            FutureOutcome::Eof => "Eof".to_string(),
+            FutureOutcome::Error(m) => format!("Error({m})"),
+        }
+    );
     let completion = match outcome {
         FutureOutcome::Bytes(bytes) => {
             let n = ctx
@@ -1117,16 +1132,24 @@ fn handle_job(job: Job) -> Result<(), String> {
             // Blocking read on the cloned handle. The clone is private to this
             // worker, so we hold its lock for the duration without blocking the
             // application's writes (which go through the original fd entry).
-            dbg_aio!("HREAD  worker start  handler_gref={handler_gref} requested_len={len} thread={:?}", std::thread::current().id());
+            dbg_aio!(
+                "HREAD  worker start  handler_gref={handler_gref} requested_len={len} thread={:?}",
+                std::thread::current().id()
+            );
             let mut buf = vec![0u8; len.max(1)];
             let read_res = {
                 let s = stream.lock();
                 let mut r = &*s;
                 r.read(&mut buf)
             };
-            dbg_aio!("HREAD  worker result handler_gref={handler_gref} result={:?} thread={:?}",
-                match &read_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
-                std::thread::current().id());
+            dbg_aio!(
+                "HREAD  worker result handler_gref={handler_gref} result={:?} thread={:?}",
+                match &read_res {
+                    Ok(n) => format!("Ok({n})"),
+                    Err(e) => format!("Err({e})"),
+                },
+                std::thread::current().id()
+            );
             let outcome = match read_res {
                 // 0 bytes from a blocking read == peer closed == EOF. Delivered
                 // to the handler as `completed(-1)` (JDK contract).
@@ -1150,16 +1173,24 @@ fn handle_job(job: Job) -> Result<(), String> {
             future_gref,
             buffer_gref,
         } => {
-            dbg_aio!("READ  worker start  future_gref={future_gref} requested_len={len} thread={:?}", std::thread::current().id());
+            dbg_aio!(
+                "READ  worker start  future_gref={future_gref} requested_len={len} thread={:?}",
+                std::thread::current().id()
+            );
             let mut buf = vec![0u8; len.max(1)];
             let read_res = {
                 let s = stream.lock();
                 let mut r = &*s;
                 r.read(&mut buf)
             };
-            dbg_aio!("READ  worker result future_gref={future_gref} result={:?} thread={:?}",
-                match &read_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
-                std::thread::current().id());
+            dbg_aio!(
+                "READ  worker result future_gref={future_gref} result={:?} thread={:?}",
+                match &read_res {
+                    Ok(n) => format!("Ok({n})"),
+                    Err(e) => format!("Err({e})"),
+                },
+                std::thread::current().id()
+            );
             let outcome = match read_res {
                 Ok(0) => FutureOutcome::Eof,
                 Ok(n) => {
@@ -1180,7 +1211,11 @@ fn handle_job(job: Job) -> Result<(), String> {
             future_gref,
             buffer_gref,
         } => {
-            dbg_aio!("WRITE worker start  future_gref={future_gref} data_len={} thread={:?}", data.len(), std::thread::current().id());
+            dbg_aio!(
+                "WRITE worker start  future_gref={future_gref} data_len={} thread={:?}",
+                data.len(),
+                std::thread::current().id()
+            );
             let total = data.len();
             let mut written = 0;
             let write_res = {
@@ -1203,9 +1238,14 @@ fn handle_job(job: Job) -> Result<(), String> {
                 }
                 failure.map_or(Ok(written), Err)
             };
-            dbg_aio!("WRITE worker result future_gref={future_gref} result={:?} thread={:?}",
-                match &write_res { Ok(n) => format!("Ok({n})"), Err(e) => format!("Err({e})") },
-                std::thread::current().id());
+            dbg_aio!(
+                "WRITE worker result future_gref={future_gref} result={:?} thread={:?}",
+                match &write_res {
+                    Ok(n) => format!("Ok({n})"),
+                    Err(e) => format!("Err({e})"),
+                },
+                std::thread::current().id()
+            );
             let outcome = match write_res {
                 Ok(n) => FutureOutcome::Count(n as i32),
                 Err(e) => FutureOutcome::Error(format!("write failed: {e}")),
@@ -1552,7 +1592,9 @@ fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             ctx.set_field(this, F_CONNECTED, Value::Int(0));
         }
         if let Some(id) = read_aio_id(ctx, this) {
-            dbg_aio!("CLOSE aio id={id} — shutting down socket to unblock any in-flight clone reads");
+            dbg_aio!(
+                "CLOSE aio id={id} — shutting down socket to unblock any in-flight clone reads"
+            );
             if (id as i64) < AIO_REG_BASE {
                 // fd_table-backed channel (Future-form connect path).
                 aio_shutdown_fd_table_stream(ctx, id as u32);
@@ -1813,8 +1855,14 @@ fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return post(FutureOutcome::Error("write: not connected".to_string())),
     };
     let data = read_buffer_bytes(ctx, bb);
-    dbg_aio!("WRITE dispatch fd={fd} data_len={} future_gref={future_gref} hex={}",
-        data.len(), data.iter().take(32).map(|b| format!("{b:02x}")).collect::<String>());
+    dbg_aio!(
+        "WRITE dispatch fd={fd} data_len={} future_gref={future_gref} hex={}",
+        data.len(),
+        data.iter()
+            .take(32)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     if data.is_empty() {
         return post(FutureOutcome::Count(0));
     }
@@ -1864,7 +1912,10 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         // separate native registered elsewhere).
         None => return Ok(Some(Value::Object(None))),
     };
-    dbg_aio!("HREAD dispatch (handler-form) this_fields={}", ctx.object_num_fields(this));
+    dbg_aio!(
+        "HREAD dispatch (handler-form) this_fields={}",
+        ctx.object_num_fields(this)
+    );
 
     // Start the dispatcher on first use so parked completions get delivered.
     ensure_dispatcher();

@@ -1230,7 +1230,9 @@ fn notify_source_readable_with_delays(
             (ch.dispatching
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok())
-            .then(|| DispatchGuard { flag: &ch.dispatching })
+            .then(|| DispatchGuard {
+                flag: &ch.dispatching,
+            })
         });
         if channel.is_some() && guard.is_none() {
             xnio_tcp_dbg!("notify_source id={id} skipped_reentrant_dispatch");

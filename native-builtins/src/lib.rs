@@ -36594,8 +36594,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // in 1916 against real HotSpot.
             "CET" | "Europe/Berlin" | "Europe/Rome" | "Europe/Oslo" | "Europe/Amsterdam"
             | "Europe/Brussels" | "Europe/Vienna" | "Europe/Copenhagen" | "Europe/Stockholm"
-            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London"
-            | "GB" => Some(1916),
+            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB" => {
+                Some(1916)
+            }
             // Spain: real HotSpot's legacy path shows an earlier (1901)
             // Madrid-Mean-Time -> WET rawOffset switch that is NOT a DST
             // split (winter == summer that year); the first genuine
@@ -53329,7 +53330,9 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
         // performance concern motivated the original "com"/"com.example"
         // short-circuit -- it was never measured against this on-disk-fixture
         // case, only against in-memory-only generated classes.
-        if location_name == "CLASS_PATH" && (package_name == "java" || package_name.starts_with("java.")) {
+        if location_name == "CLASS_PATH"
+            && (package_name == "java" || package_name.starts_with("java."))
+        {
             return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
         }
         if let Some(module_name) = location_name
@@ -53528,13 +53531,26 @@ fn native_javac_file_manager_infer_binary_name(
             relative_path.map(|path| javac_binary_name_from_relative_path(&path))
         }
         "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
+            // Read the display string directly via the same logic
+            // `Path.toString()`'s native uses (`p57_path_display_string`),
+            // rather than `ctx.invoke_virtual(path, "toString", ...)`. The
+            // latter doesn't consult `force_native_over_real_jdk_bytecode`/
+            // the `vm_exec.rs` `check_override` allow-list the way the
+            // bytecode interpreter's own `invokevirtual` handling does, so
+            // it silently ran `Path`'s (nonexistent — `Path` is an
+            // interface) real bytecode, which resolves to
+            // `Object.toString()` and returns `java.nio.file.Path@<hash>` —
+            // mangled by `javac_binary_name_from_relative_path` below into
+            // the literal binary name `java.nio.file` for every ordinary
+            // classpath class file (`ServletComponentScanRegistrarTests
+            // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`
+            // and any other real in-process javac compile — Spring's
+            // `TestCompiler`/AOT generation — referencing an
+            // application-classpath class).
             let path = match ctx.get_field_by_name(file, "path") {
-                Value::Object(Some(path)) => ctx
-                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
-                    .and_then(|value| match value {
-                        Value::Object(Some(path)) => ctx.read_string(path),
-                        _ => None,
-                    }),
+                Value::Object(Some(path)) => {
+                    Some(crate::phases_late::p57_path_display_string(ctx, path))
+                }
                 _ => None,
             };
             path.map(|path| javac_binary_name_from_relative_path(&path))
@@ -67951,31 +67967,29 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         };
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-        let task_count = match cratonvm_native_collections::native_al_size(
-            ctx,
-            &[Value::Object(Some(coll))],
-        )? {
-            Some(Value::Int(size)) => size,
-            _ => 0,
-        };
+        let task_count =
+            match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(coll))])? {
+                Some(Value::Int(size)) => size,
+                _ => 0,
+            };
         for index in 0..task_count {
-                let callable_val = cratonvm_native_collections::native_al_get(
-                    ctx,
-                    &[Value::Object(Some(coll)), Value::Int(index)],
-                )?
-                .unwrap_or(Value::Object(None));
-                let future = if let Value::Object(Some(c)) = callable_val {
-                    match ctx.invoke_virtual(c, "call", "()Ljava/lang/Object;", &[]) {
-                        Ok(r) => completed_executor_future(ctx, r.unwrap_or(Value::Object(None)))?,
-                        Err(e) => failed_executor_future(ctx, &e)?,
-                    }
-                } else {
-                    completed_executor_future(ctx, Value::Object(None))?
-                };
-                cratonvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(list)), Value::Object(Some(future))],
-                )?;
+            let callable_val = cratonvm_native_collections::native_al_get(
+                ctx,
+                &[Value::Object(Some(coll)), Value::Int(index)],
+            )?
+            .unwrap_or(Value::Object(None));
+            let future = if let Value::Object(Some(c)) = callable_val {
+                match ctx.invoke_virtual(c, "call", "()Ljava/lang/Object;", &[]) {
+                    Ok(r) => completed_executor_future(ctx, r.unwrap_or(Value::Object(None)))?,
+                    Err(e) => failed_executor_future(ctx, &e)?,
+                }
+            } else {
+                completed_executor_future(ctx, Value::Object(None))?
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(list)), Value::Object(Some(future))],
+            )?;
         }
         Ok(Some(Value::Object(Some(list))))
     };
@@ -68051,21 +68065,17 @@ fn completed_executor_future(
     ctx: &mut dyn NativeContext,
     result: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-        Some(Value::Object(Some(future))) => future,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "could not allocate executor completion future".to_string(),
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "could not allocate executor completion future".to_string(),
+                }
+                .into())
             }
-            .into())
-        }
-    };
-    ctx.invoke_virtual(
-        future,
-        "complete",
-        "(Ljava/lang/Object;)Z",
-        &[result],
-    )?;
+        };
+    ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result])?;
     Ok(future)
 }
 
@@ -68073,15 +68083,16 @@ fn failed_executor_future(
     ctx: &mut dyn NativeContext,
     error: &MethodCallFailed,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-        Some(Value::Object(Some(future))) => future,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "could not allocate executor completion future".to_string(),
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "could not allocate executor completion future".to_string(),
+                }
+                .into())
             }
-            .into())
-        }
-    };
+        };
     let message = ctx.create_string(&format!("{error}"));
     let throwable = match ctx.new_object_initialized(
         "java/lang/RuntimeException",
@@ -68167,7 +68178,9 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
     let mut result = Value::Object(None);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
-        result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?.unwrap_or(Value::Object(None));
+        result = ctx
+            .invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
     }
     let future = completed_executor_future(ctx, result)?;
     Ok(Some(Value::Object(Some(future))))
@@ -71981,11 +71994,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
             {
-                if let Some(Value::Object(Some(context))) = ctx.new_object_initialized(
-                    "ch/qos/logback/classic/LoggerContext",
-                    "()V",
-                    &[],
-                )? {
+                if let Some(Value::Object(Some(context))) =
+                    ctx.new_object_initialized("ch/qos/logback/classic/LoggerContext", "()V", &[])?
+                {
                     return Ok(Some(Value::Object(Some(context))));
                 }
             }
@@ -73093,11 +73104,7 @@ mod logback_construction_registration_tests {
         register_slf4j_natives(&mut registry);
 
         for (class_name, method_name, descriptor) in [
-            (
-                "ch/qos/logback/classic/LoggerContext",
-                "<init>",
-                "()V",
-            ),
+            ("ch/qos/logback/classic/LoggerContext", "<init>", "()V"),
             (
                 "ch/qos/logback/core/ContextBase",
                 "getObject",
@@ -77318,7 +77325,10 @@ fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
     if let Some(slot) = expected_slot {
-        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        let mod_count = ctx
+            .get_field_by_name(list, "modCount")
+            .as_int()
+            .unwrap_or(0);
         set_field_if_present(ctx, this, slot, Value::Int(mod_count));
     }
     Ok(None)
@@ -77328,7 +77338,10 @@ fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// returned by `next()`/`previous()`. See `native_arraylist_list_itr_set`
 /// for the root-cause narrative; mirrors real-JDK `ArrayList$Itr.remove`'s
 /// cursor rewind (`cursor = lastRet`) and `lastRet` reset.
-fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_arraylist_list_itr_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
     let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
@@ -77349,7 +77362,10 @@ fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value])
     ctx.set_field(this, cursor_slot, Value::Int(last_ret));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
     if let Some(slot) = expected_slot {
-        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        let mod_count = ctx
+            .get_field_by_name(list, "modCount")
+            .as_int()
+            .unwrap_or(0);
         set_field_if_present(ctx, this, slot, Value::Int(mod_count));
     }
     Ok(None)

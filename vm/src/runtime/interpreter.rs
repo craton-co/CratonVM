@@ -13586,6 +13586,23 @@ fn execute_instruction(
             let b = thread.frames[frame_idx].stack.pop()?;
             let a = thread.frames[frame_idx].stack.pop()?;
             let eq = refs_equal(&a, &b);
+            if std::env::var_os("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE").is_some() {
+                let class_name = |value: &Value| match value {
+                    Value::Object(Some(mirror)) => crate::vm::class_id_from_mirror(shared, *mirror)
+                        .and_then(|cid| shared.class_manager.read().get_class(cid)
+                            .map(|c| c.name.to_string()))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let an = class_name(&a);
+                let bn = class_name(&b);
+                if an.contains("ActiveProfilesResolver") || bn.contains("ActiveProfilesResolver") {
+                    eprintln!(
+                        "[ACTIVE-PROFILES-IDENTITY] acmpne a={} b={} equal={}",
+                        an, bn, eq
+                    );
+                }
+            }
             if !eq {
                 thread.frames[frame_idx].pc = branch_target(saved_pc, *offset);
             }
@@ -17184,7 +17201,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
     name.starts_with("java/")
         || name.starts_with("javax/")
         || name.starts_with("jdk/")
-        || name.starts_with("sun/")
+        || (name.starts_with("sun/") && name != "sun/reflect/misc/Trampoline")
         || name.starts_with("com/sun/")
 }
 
@@ -17580,14 +17597,17 @@ fn resolve_field_ref_loader_aware(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first — identical fast path to `resolve_field_ref`.
-    if let Some(cached) = shared
+    // A field cache entry may have been populated by a loader-blind helper
+    // (verification, JIT metadata, or an earlier legacy path) before this
+    // opcode reaches its loader-aware resolver. Do not trust such an entry
+    // blindly for a user-loader caller: first resolve the symbolic owner in
+    // the caller's initiating-loader namespace, then validate that the cached
+    // declaring class is that owner or one of its actual ancestors.
+    let cached = shared
         .resolution_cache
         .read()
         .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
+        .cloned();
 
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
@@ -17627,6 +17647,16 @@ fn resolve_field_ref_loader_aware(
 
     let field_class_id =
         resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+    if let Some(cached) = cached {
+        let cache_matches_owner = {
+            let cm = shared.class_manager.read();
+            cached.declaring_class_id == field_class_id
+                || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
+        };
+        if cache_matches_owner {
+            return Ok(cached);
+        }
+    }
 
     resolve_field_in_class(
         shared,
@@ -20778,10 +20808,7 @@ pub(crate) fn lambda_impl_dispatch_override(
         .read()
         .get(&call_site.proxy_class_id)?;
     let name = &call_site.impl_handle.class_name;
-    lookup_loader_initiated(shared, host, name).filter(|cid| {
-        *cid != ClassId::new(0)
-            && shared.class_manager.read().get_loaded_class_id(name) != Some(*cid)
-    })
+    lookup_loader_initiated(shared, host, name).filter(|cid| *cid != ClassId::new(0))
 }
 
 /// Resolve a lambda implementation that is private in its declaring class.
@@ -24865,6 +24892,41 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own (nor `equals`/`hashCode`, but those aren't implicated here) —
+    // real method resolution for `someSyntheticPathObj.toString()` walks up to
+    // `java.lang.Object`, the only class in the chain that actually declares
+    // `toString()` with a Code attribute. Without an entry here keyed on
+    // `java/nio/file/Path` itself, that resolved declaring class
+    // (`java/lang/Object`) is what gets checked against this gate — never
+    // matches — so real `Object.toString()` runs (`getClass().getName() + "@"
+    // + hashCode`) instead of the registered native
+    // (`native-builtins::phases_late::register_phase57_nio_file`'s
+    // `Path.toString()`, which correctly renders the jar-FS/host path).
+    // `redefine_immune_path_native` below already anticipated this exact
+    // (class, method) pair for the Mockito-redefine-immunity check, but the
+    // actual force-native entry that makes it relevant was never added —
+    // this closes that gap. Concretely this broke real javac's in-process
+    // `JavacFileManager.inferBinaryName` for every `PathFileObject$JarFileObject`
+    // classpath entry: its native fast path (`native_javac_file_manager_infer_binary_name`)
+    // calls `path.toString()` expecting the in-jar relative path (e.g.
+    // `/org/springframework/beans/factory/config/BeanDefinition.class`) but
+    // got the garbage `Object.toString()` form (`java.nio.file.Path@1a2b3c`)
+    // instead, which `javac_binary_name_from_relative_path` then mangled into
+    // the literal binary name `java.nio.file` for EVERY application-classpath
+    // class file — so `TestCompiler`/any real in-process `javac` compile of
+    // source referencing an ordinary (non-JRT) classpath class failed with
+    // "cannot find symbol", even for basic classes like
+    // `org.springframework.beans.factory.support.RootBeanDefinition`
+    // (`ServletComponentScanRegistrarTests
+    // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`).
+    if class_name == "java/nio/file/Path"
+        && method_name == "toString"
+        && method_descriptor == "()Ljava/lang/String;"
+    {
+        return true;
+    }
+
     // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
@@ -27879,6 +27941,19 @@ fn execute_invokestatic(
         }
     });
 
+    if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+        && (method_class_name.contains("SpringFactoriesLoader")
+            || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
+            || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
+    {
+        let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let resolved_loader = static_dispatch_class_id
+            .and_then(|id| shared.class_manager.read().get_loader_id(id));
+        eprintln!(
+            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?}",
+            method_class_name, method_name, current_class_id, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader
+        );
+    }
     if !is_native {
         let target_class_id = if let Some(id) = static_dispatch_class_id {
             id
@@ -29206,6 +29281,43 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
+            // its own local exception handlers, even when it never directly
+            // `athrow`s. `compile_with_param_slots` below has no
+            // exception-table parameter, so an OSR artifact NEVER carries
+            // handler ranges: a callee exception unwinding into this
+            // OSR-compiled frame finds no catch and escapes uncaught, even
+            // though a `catch` block textually guards the call. This was
+            // masked while methods with `ldc` string constants were
+            // unconditionally OSR-denied (fixed in d6f642695); once that
+            // denial was lifted, any hot-loop method with a trailing
+            // try/catch around a throwing call (e.g. a servlet's
+            // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
+            // silently stopped catching. Permanent for this bytecode, like
+            // the sibling RBC bails above.
+            let has_exception_handlers = match shared.class_manager.read().get_class(class_id) {
+                Some(class) => class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .and_then(|m| {
+                        m.attributes.iter().find_map(|a| match a.as_decoded() {
+                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                Some(!ca.exception_table.is_empty())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or(false),
+                None => false,
+            };
+            if has_exception_handlers {
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
                 return None;
             }
             // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.

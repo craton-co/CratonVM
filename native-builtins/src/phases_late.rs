@@ -5664,6 +5664,48 @@ fn native_quarkus_logging_handle_failed_start(
     result
 }
 
+/// Renders a synthetic `java/nio/file/Path` object's display string exactly
+/// as the `Path.toString()` native below does (jar-FS/jrt-FS entries with
+/// `/`, host paths with the OS separator). Extracted so callers that already
+/// hold a `NativeContext` and a `Path` `ObjectRef` — e.g. javac's
+/// `JavacFileManager.inferBinaryName` fast path in `lib.rs`, which used to
+/// call `ctx.invoke_virtual(path, "toString", ...)` — can get the same
+/// result WITHOUT going through `invoke_virtual`. That indirection doesn't
+/// consult `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+/// `check_override` allow-list the way the bytecode interpreter's own
+/// `invokevirtual` handling does, so it silently ran `Path`'s real
+/// (nonexistent — `Path` is an interface) bytecode, which resolves to
+/// `Object.toString()` and prints `java.nio.file.Path@<hash>`. That garbage
+/// string then got mangled by `javac_binary_name_from_relative_path` into
+/// the literal binary name `java.nio.file` for every ordinary classpath
+/// class file, breaking real in-process javac compiles (Spring's
+/// `TestCompiler`/AOT generation) referencing any application-classpath
+/// class.
+pub(crate) fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let p = p57_read_path(ctx, this);
+    match vfs_decode(&p) {
+        // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+        // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+        Some((_, _, e)) => {
+            if e.starts_with('/') {
+                e
+            } else {
+                format!("/{e}")
+            }
+        }
+        // A plain (non-encoded) relative path whose owning FileSystem is a
+        // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+        // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+        // a package name. Rendering the host '\' there would corrupt the key.
+        None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
+        // Host-FS path: render the OS-native separator. CratonVM stores
+        // paths with '/' internally, but HotSpot's WindowsPath.toString()
+        // renders '\'; convert at this display boundary on Windows
+        // (no-op on Unix). Matches `File.getPath()` below.
+        None => file_normalise_path(&p),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6271,28 +6313,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- Path.toString() → String ---
     r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        let display = match vfs_decode(&p) {
-            // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
-            // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
-            Some((_, _, e)) => {
-                if e.starts_with('/') {
-                    e
-                } else {
-                    format!("/{e}")
-                }
-            }
-            // A plain (non-encoded) relative path whose owning FileSystem is a
-            // virtual (jar/jrt) FS renders with '/' — e.g. the result of
-            // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
-            // a package name. Rendering the host '\' there would corrupt the key.
-            None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
-            // Host-FS path: render the OS-native separator. CratonVM stores
-            // paths with '/' internally, but HotSpot's WindowsPath.toString()
-            // renders '\'; convert at this display boundary on Windows
-            // (no-op on Unix). Matches `File.getPath()` below.
-            None => file_normalise_path(&p),
-        };
+        let display = p57_path_display_string(ctx, this);
         let s = ctx.create_string(&display);
         Ok(Some(Value::Object(Some(s))))
     });
@@ -66478,20 +66499,8 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // Introspector
+    // Introspector cache-management methods retain their bridge implementations.
     let intro = "java/beans/Introspector";
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
-    r.register(
-        intro,
-        "getBeanInfo",
-        "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/beans/BeanInfo;",
-        introspector_get_bean_info,
-    );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
         // Introspector caches BeanInfo per Class. Our implementation doesn't cache
         // anything — each call walks the class freshly — so there's nothing to flush.
@@ -66789,6 +66798,20 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
+    // The two-argument overload is getBeanInfo(beanClass, stopClass). The
+    // native used to discard stopClass and always walked through Object, which
+    // made it expose inherited Object properties and methods despite the JDK
+    // contract. Spring's standard property resolver uses this overload.
+    let stop_class_id = match args.get(1) {
+        Some(Value::Object(Some(stop_mirror))) => {
+            let stop_pin = ctx.pin_native_root(*stop_mirror);
+            let id = crate::lang_class::mirror_class_id(ctx, *stop_mirror);
+            ctx.unpin_native_roots(stop_pin);
+            id
+        }
+        _ => None,
+    };
+
     // Discover properties from getters/setters across the class + superclasses,
     // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
     // JDK java.beans.Introspector property-merge rules that the Tomcat suite
@@ -66875,6 +66898,9 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
+        if Some(cid) == stop_class_id {
+            break;
+        }
         scan_cids.push(cid);
         sc = if ctx.is_interface_class(cid) {
             None
@@ -67137,7 +67163,10 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Object member) when introspecting a bare interface type — see the
     // `is_interface_class` gate on `scan_cids` above for the matching
     // rationale.
-    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
+    if stop_class_id.is_none()
+        && !ctx.is_interface_class(class_id)
+        && !properties.iter().any(|(n, ..)| n == "class")
+    {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             // Re-read from the pin: the discovery scan above (and the failed

@@ -3855,8 +3855,18 @@ fn re2_bind_listener(
         TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
+    // A wildcard listener address (0.0.0.0 / ::) is a valid bind target but
+    // not a valid client connect destination on Windows (WSAEADDRNOTAVAIL /
+    // os error 10049) — publish the loopback address instead, mirroring
+    // `native-io/src/socket_channel.rs::advertised_listener_host` (same
+    // rationale, sibling crate, duplicated rather than shared per this
+    // module's existing cross-crate-table pattern above).
     let actual_host = local_addr
-        .map(|a| a.ip().to_string())
+        .map(|a| match a {
+            SocketAddr::V4(a) if a.ip().is_unspecified() => "127.0.0.1".to_string(),
+            SocketAddr::V6(a) if a.ip().is_unspecified() => "::1".to_string(),
+            _ => a.ip().to_string(),
+        })
         .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {

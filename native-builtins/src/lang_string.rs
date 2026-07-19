@@ -1534,9 +1534,9 @@ pub(crate) fn sb_append_chars(
     let (current_buf, current_count) = sb_state(ctx, this);
     let current_cap = current_buf.map_or(0, |buf| ctx.array_length(buf));
     let current_count = (current_count.max(0) as usize).min(current_cap);
-    let (this, buf, count) = if let Some(buf) = current_buf.filter(|_| {
-        current_count.saturating_add(chars.len()) <= current_cap
-    }) {
+    let (this, buf, count) = if let Some(buf) =
+        current_buf.filter(|_| current_count.saturating_add(chars.len()) <= current_cap)
+    {
         (this, buf, current_count)
     } else {
         let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
@@ -2103,7 +2103,8 @@ fn invoke_to_string_opt(
     let result = ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]);
     match result {
         Ok(Some(Value::Object(Some(str_ref)))) => Ok(Some(
-            ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string()),
+            ctx.read_string(str_ref)
+                .unwrap_or_else(|| "null".to_string()),
         )),
         // toString() legitimately returned null (e.g. TestJspWriterImpl's
         // bug54241b: an anonymous class whose toString() explicitly `return

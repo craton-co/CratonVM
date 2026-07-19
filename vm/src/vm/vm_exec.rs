@@ -10583,8 +10583,18 @@ pub fn invoke_or_native(
     // class) is unaffected.
     if effective_class == "java/lang/annotation/AnnotationProxy" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            note_annotation_proxy_cid(shared.heap.class_id_of(recv).as_u32());
-            return annotation_proxy_invoke_shared(shared, thread, recv, method_name, &args[1..]);
+            // A generated JDK `$ProxyN` can inherit an inline-cache target
+            // resolved for its AnnotationProxy invocation handler. The handler
+            // layout has four fields while the real proxy has only its single
+            // `InvocationHandler h` field; dispatching based on the resolved
+            // target alone therefore reads handler slots from the real proxy
+            // (notably getClass() -> slot 1), producing nulls and corrupting
+            // Spring MergedAnnotation adaptation. The receiver is authoritative
+            // for this synthetic-only fast path.
+            if class_name_is(shared, recv, "java/lang/annotation/AnnotationProxy") {
+                note_annotation_proxy_cid(shared.heap.class_id_of(recv).as_u32());
+                return annotation_proxy_invoke_shared(shared, thread, recv, method_name, &args[1..]);
+            }
         }
     }
 
@@ -11978,6 +11988,39 @@ fn proxy_annotation_handler_invoke(
     annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
 }
 
+/// Shared-interpreter dispatch for a real generated annotation proxy. Equal
+/// annotations created by this VM are unwrapped to their synthetic handlers;
+/// a foreign synthesized annotation must instead use the higher-level shared
+/// path so its member-wise equality implementation can be invoked.
+fn proxy_annotation_handler_invoke_shared(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    handler_ref: ObjectRef,
+    method_name: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    if method_name == "equals" {
+        if let Some(Value::Object(Some(other))) = args.first().copied() {
+            if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
+                if class_name_is(
+                    shared,
+                    other_handler,
+                    "java/lang/annotation/AnnotationProxy",
+                ) {
+                    let routed = [Value::Object(Some(other_handler))];
+                    return annotation_proxy_dispatch_impl(
+                        shared,
+                        handler_ref,
+                        method_name,
+                        &routed,
+                    );
+                }
+            }
+        }
+    }
+    annotation_proxy_invoke_shared(shared, thread, handler_ref, method_name, args)
+}
+
 pub(crate) fn proxy_invoke_handler_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -12005,7 +12048,13 @@ pub(crate) fn proxy_invoke_handler_shared(
         return proxy_unbox_primitive_return(
             shared,
             descriptor,
-            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke_shared(
+                shared,
+                thread,
+                handler_ref,
+                method_name,
+                args,
+            ),
         );
     }
 
@@ -13529,6 +13578,30 @@ pub(crate) fn annotation_proxy_dispatch_impl(
                                 return Err(MethodCallFailed::ExceptionThrown(obj));
                             }
                         }
+                        if std::env::var_os("CRATONVM_ANN_ACTIVE_PROFILES_TRACE").is_some()
+                            && method_name == "resolver"
+                        {
+                            let type_desc = match shared.heap.get_field(proxy, 0) {
+                                Value::Object(Some(s)) =>
+                                    super::read_java_string(&shared.heap, s).unwrap_or_default(),
+                                _ => String::new(),
+                            };
+                            if type_desc == "Lorg/springframework/test/context/ActiveProfiles;" {
+                                let resolved = match val {
+                                    Value::Object(Some(mirror)) => {
+                                        super::class_id_from_mirror(shared, mirror)
+                                            .and_then(|cid| shared.class_manager.read()
+                                                .get_class(cid)
+                                                .map(|c| c.name.to_string()))
+                                            .unwrap_or_else(|| "<not-a-class-mirror>".to_string())
+                                    }
+                                    _ => "<non-object>".to_string(),
+                                };
+                                eprintln!(
+                                    "[ANN-ACTIVE-PROFILES] resolver accessor -> {resolved}"
+                                );
+                            }
+                        }
                         return Ok(Some(val));
                     }
                 }
@@ -14391,25 +14464,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/lang/reflect/RecordComponent"
                             && method_name == "getGenericType"
                             && descriptor == "()Ljava/lang/reflect/Type;")
-                        // SPB.10 / Spring `BeanWrapperImpl`: the real-JDK
-                        // `java.beans.Introspector.getBeanInfo` walks
-                        // `com.sun.beans.introspect.*` reflection — that
-                        // path is on the JIT skip-list (Round 34: SPB.9d)
-                        // and the interpreter walk produces an empty
-                        // `BeanInfo` for ordinary POJOs (`pds.length == 0`),
-                        // which surfaces as
-                        //   `NotWritablePropertyException: Bean property 'X'
-                        //    is not writable or has an invalid setter method`
-                        // on Spring's `ConfigurationClassPostProcessor`
-                        // (the `metadataReaderFactory` setter is real but
-                        // invisible). Force our native (registered above
-                        // as `introspector_get_bean_info`) to win — it
-                        // walks the class + superclasses via
-                        // `ctx.declared_methods` and builds real
-                        // `java.lang.reflect.Method` mirrors for the
-                        // discovered getter/setter pairs.
-                        || (class_name == "java/beans/Introspector"
-                            && method_name == "getBeanInfo")
                         // SPB.10 (cont.): our `Introspector.getBeanInfo` returns
                         // synthetic `PropertyDescriptor`s whose readMethod/writeMethod
                         // live in slots 1/2. The real-JDK `PropertyDescriptor` bytecode
@@ -14665,6 +14719,26 @@ fn invoke_on_class_shared_inner(
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
                         ) && method_name == "addURL"
                             && descriptor == "(Ljava/net/URL;)V")
+                        // `java.nio.file.Path` declares no `toString()` body of its
+                        // own (it's an interface); real dispatch resolves to
+                        // `java.lang.Object.toString()` instead of the registered
+                        // native (`register_phase57_nio_file`'s `Path.toString()`),
+                        // producing the garbage default-Object form
+                        // (`java.nio.file.Path@1a2b3c`) instead of the actual
+                        // jar-FS/host path. In-process `javac`'s
+                        // `JavacFileManager.inferBinaryName` native fast path calls
+                        // `path.toString()` on every `PathFileObject$JarFileObject`
+                        // classpath entry and mangled that garbage into the literal
+                        // binary name `java.nio.file` for every ordinary
+                        // (non-JRT/non-directory) classpath class, breaking
+                        // symbol resolution for any real in-process javac compile
+                        // referencing an application-classpath class (Spring's
+                        // `TestCompiler`/AOT test generation — e.g.
+                        // `ServletComponentScanRegistrarTests`). Keep in sync with
+                        // `force_native_over_real_jdk_bytecode`.
+                        || (class_name == "java/nio/file/Path"
+                            && method_name == "toString"
+                            && descriptor == "()Ljava/lang/String;")
                         // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
                         // of `Log4jLoggerFactory.getContext` calls
                         // `LogManager.getFactory().isClassLoaderDependent()`
