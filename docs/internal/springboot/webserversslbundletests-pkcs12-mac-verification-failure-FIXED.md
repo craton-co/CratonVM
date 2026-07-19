@@ -1,6 +1,56 @@
 # `WebServerSslBundleTests`/`SslMeterBinderTests` — PKCS#12 MAC verification failure against the correct password
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-19**, dev commit `156ebfa4c` (branch
+`codex/fix-springboot-pkcs12-mac-closure-20260718-019f768e`). Both
+hypotheses in the original "Root cause" section below were wrong — the
+defect wasn't fixture corruption (#2) or a generic HMAC bug (#1), but two
+specific, narrow gaps in the PKCS#12 loader:
+
+1. **Wrong MAC digest.** The `p12` crate's `verify_mac` unconditionally
+   derives its HMAC key assuming SHA-1, but SunPKCS12 has defaulted to
+   `HmacPBESHA256` since JDK 8u191 (2018). Every `.p12` fixture across all
+   five modules below used the modern SHA-256 MAC, so the crate always
+   computed the wrong key and rejected the correct password. Fixed by
+   reimplementing PKCS#12 MAC verification locally (PKCS#12 KDF + HMAC,
+   parameterized over SHA-1/224/256/384/512 from the MacData's recorded
+   digest OID) instead of delegating to the crate. Modern SunPKCS12 also
+   uses PBES2/PBKDF2/AES (not the crate's only-supported legacy PBE) for
+   both `SafeContents`-level `EncryptedData` and per-key
+   `Pkcs8ShroudedKeyBag`/`EncryptedPrivateKeyInfo`; both now decrypt via a
+   shared PBES2 helper thin enough to reuse for either.
+2. **Null-password integrity check.** `KeyStore.load(stream, null)` — a
+   Java `null` char[], distinct from a present-but-empty one — must skip
+   PKCS#12 integrity checking entirely per real-JDK semantics, not verify
+   against an empty password. This was the residual behind
+   `WebServerSslBundleTests.whenJksKeyStoreAndPemTrustStoreProperties`,
+   which opens `test.p12` without a keystore password (the entry password
+   arrives later via `getKey()`). `engine_load` now distinguishes a Java
+   `null` password argument from an empty one and threads that through to
+   `load_pkcs12_ex`'s `verify_mac` flag. A null password also can't
+   decrypt whichever `AuthenticatedSafe` section is separately encrypted
+   under the real store password (e.g. the certificate `SafeContents` in
+   `test.p12`, while its `PrivateKeyEntry` lives in an unencrypted outer
+   section) — `bags_ber` now tolerates undecryptable sections only in that
+   case, matching real-JDK's per-section leniency, while still surfacing
+   decrypt failures as real errors whenever the password was actually
+   MAC-verified.
+
+**Verification:** rebuilt `cratonvm` and reran all four affected classes
+via `run-spring-boot-suite.ps1`. `WebServerSslBundleTests` now passes
+8/8 (was 3/8 failing). `SslMeterBinderTests`, `SslInfoTests`, and
+`JksSslStoreBundleTests` no longer show the `PKCS#12 MAC verification
+failed`/`Could not load store` signature anywhere in their logs; their
+remaining failures (gauge-count assertions, error-message-text
+mismatches) are unrelated pre-existing bugs, not this defect. New unit
+tests: `pkcs12_sha256_mac_accepts_correct_password_and_rejects_wrong_one`,
+`pkcs12_null_password_skips_mac_verification` in
+`native-builtins/src/keystore.rs`.
+
+The sibling
+[`ssl-pem-pkcs12-store-parse-failure-cluster.md`](../../known-issues/springboot/ssl-pem-pkcs12-store-parse-failure-cluster.md)
+doc (a different `.p12` fixture, `keystore.pkcs12`) was **not**
+re-verified against this fix and stays OPEN — its symptom looked the
+same but wasn't re-run through the fixed binary this session.
 
 ## Update 2026-07-17 (same-day, second module)
 

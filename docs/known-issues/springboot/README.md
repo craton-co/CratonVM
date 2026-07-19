@@ -16,6 +16,11 @@ smaller/individual differences not yet clustered.
 > [`docs/internal/springboot`](../../internal/springboot/); the legacy index
 > links below are retained as redirects.
 
+> Closure update (2026-07-19): the `Archive`/`Launcher` classpath URL
+> enumeration cluster is fixed (`JarFileArchive`/`ExplodedArchive`/
+> `ExecutableArchiveLauncher`). One pre-existing residual remains, tracked
+> by `propertieslauncher-loader-path-ignored-wrong-app-launched.md`.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -81,7 +86,7 @@ explain a large fraction of the 429:
 - The `Class.getMethods()` override-shadowing cluster is **FIXED 2026-07-17**: [`../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md`](../../internal/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md) records the implementation and validation. The related disposable-bean, JDBC embedded-data-source, and task-scheduling records moved alongside it. [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) remains listed only for its separate unresolved hang (its destroy-method Cluster A is fixed).
 - [`modifiedclasspath-aether-network-hang-cluster.md`](modifiedclasspath-aether-network-hang-cluster.md) — classes using `@ClassPathExclusions`/`@ClassPathOverrides` hang instead of crashing, likely because a same-day sibling fix (`wrong-receiver-virtual-dispatch-corruption-cluster-FIXED.md`) let a previously-crashing Aether/HTTPS artifact-resolution path actually attempt real (now-blocked) network I/O. Explicitly **not** the whole explanation for the livelock cluster above — the two were confused early in triage and later separated with source evidence.
 - `CapturedOutput`/`OutputCaptureExtension` sees empty or stale output across ~20 classes in a dozen+ modules — **root-caused and FIXED 2026-07-18**: `ch/qos/logback/classic/Logger`/`LoggerContext.getLogger` and `org/apache/commons/logging/LogFactory`/`Log` were natively stubbed to throwaway objects that never reached `System.out`/`System.err`. See `docs/internal/springboot/conditionevaluationreport-capturedoutput-empty-cluster-FIXED.md` and `docs/internal/springboot/docker-compose-lifecycle-capturedoutput-log-gap-FIXED.md`. [`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md) stays OPEN — most of its classes now pass, but a `core/spring-boot`-concentrated residual remains (multiple distinct new shapes, not yet root-caused). Two new narrower residuals filed: [`oncondition-report-window-isolation-residual.md`](oncondition-report-window-isolation-residual.md), [`propertiesmigration-logfactory-oom-residual.md`](propertiesmigration-logfactory-oom-residual.md).
-- [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) / [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) — PKCS12/PEM keystore parsing fails against demonstrably-correct passwords/keys, confirmed across 5 independent modules/fixture files — strong evidence of a genuine CratonVM JCA-layer defect, not per-fixture corruption.
+- [`ssl-pem-pkcs12-store-parse-failure-cluster.md`](ssl-pem-pkcs12-store-parse-failure-cluster.md) — PKCS12/PEM keystore parsing fails against demonstrably-correct passwords/keys. The `WebServerSslBundleTests`/`SslMeterBinderTests`/`SslInfoTests`/`JksSslStoreBundleTests` portion of this cluster is **FIXED 2026-07-19**: `../../internal/springboot/webserversslbundletests-pkcs12-mac-verification-failure-FIXED.md` records the SHA-256 MAC + null-password-integrity-skip root causes and fix. This doc's own `keystore.pkcs12` fixture symptom was not re-verified against that fix and stays OPEN.
 
 Full per-doc index (98 docs from this round; status strings truncated —
 open each doc for the full picture):
@@ -171,7 +176,7 @@ open each doc for the full picture):
 | [`spring-boot-configuration-processor-testcompiler-hang-cluster.md`](spring-boot-configuration-processor-testcompiler-hang-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-devtools-residual-fails-cluster.md`](spring-boot-devtools-residual-fails-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-health-rerun-20260717.md`](spring-boot-health-rerun-20260717.md) | OPEN — found 2026-07-17 |
-| [`spring-boot-loader-classpath-url-enumeration-empty-cluster.md`](spring-boot-loader-classpath-url-enumeration-empty-cluster.md) | OPEN — found 2026-07-17 |
+| `Archive`/`Launcher` classpath URL enumeration empty/wrong | **FIXED 2026-07-19** — verified 10/10 `JarFileArchiveTests`, 4/4 `WarLauncherTests`, 7/7 `ExplodedArchiveTests`, 5/5 `JarLauncherTests`; moved to [`../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md`](../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md). Residual: `propertieslauncher-loader-path-ignored-wrong-app-launched.md` (8 of its original 11 fixed as a side effect, 4 remain, still OPEN) |
 | [`spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md`](spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-restclient-residuals.md`](spring-boot-restclient-residuals.md) | OPEN — found 2026-07-17 |
 | Spring proxy layout-probe livelock blocking broad HttpClient consumers | **FIXED 2026-07-18** — JUnit adapter receiver admission now prevents the unrelated field probe; verified in JIT and `--nojit`; moved to [`../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md`](../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md) |
@@ -188,6 +193,9 @@ open each doc for the full picture):
 | [`webmvc-error-forward-and-multiboot-timeout-cluster.md`](webmvc-error-forward-and-multiboot-timeout-cluster.md) | OPEN — found 2026-07-17 |
 | [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) | OPEN — found 2026-07-17 |
 | [`zipkin-realsocket-retry-spin-hang-FIXED.md`](../../internal/springboot/zipkin-realsocket-retry-spin-hang-FIXED.md) | FIXED 2026-07-18 — Zipkin binary request-body preservation and exact gzip/DEFLATE fidelity. |
+| [`webmvc-test-anonymous-tostring-override-not-dispatched.md`](webmvc-test-anonymous-tostring-override-not-dispatched.md) | OPEN — found 2026-07-17 (hypothesis for the dispatch gap; the format |
+| [`WebServerSslBundleTests`/`SslMeterBinderTests` PKCS#12 MAC verification failure](../../internal/springboot/webserversslbundletests-pkcs12-mac-verification-failure-FIXED.md) | FIXED — 2026-07-19 |
+| [`zipkin-realsocket-retry-spin-hang.md`](zipkin-realsocket-retry-spin-hang.md) | OPEN — found 2026-07-17. Hypothesis only, not root-caused. |
 ## 2026-07-16 rerun of non-passed classes (post-dev-sync, 764 classes, 8 shards)
 
 Merged `origin/dev` into `feat/spring-boot-crashfail-20260714` (which had just

@@ -7934,7 +7934,16 @@ const CONSTRUCTOR_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
 /// is always large enough for the synthetic writes and so tests using
 /// the MockNativeContext (which returns 0 for `class_num_total_fields`)
 /// still have room.
-const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 6;
+/// Constructor mirrors share the same `mock_jdk_field_slot` synthetic
+/// slot map as Method (see `test_utils.rs`), which now runs up through
+/// slot 12 (`annotationDefault`) after the G2 additions
+/// (`exceptionTypes`/`annotations`/`parameterAnnotations`/`annotationDefault`)
+/// -- the floor must stay >= those slots so `constructor_extra_base`'s
+/// `CONSTRUCTOR_EXTRA_OFFSET_*` writes don't land on and clobber a
+/// still-in-use named field (e.g. floor 6 + `PARAM_COUNT` offset 1 = 7,
+/// which collided with `parameterTypes`'s own mock slot 7). Mirrors the
+/// identical `METHOD_NUM_FIELDS_LEGACY_FLOOR` fix.
+const CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
 
 #[cfg(test)]
 const CONSTRUCTOR_NUM_FIELDS: usize = CONSTRUCTOR_NUM_FIELDS_LEGACY_FLOOR;
@@ -13549,7 +13558,9 @@ pub(crate) fn native_class_get_package_name(
 // ---------------------------------------------------------------------------
 
 /// Read a manifest attribute by name from the class's source jar, if any.
-/// Returns `None` for classes loaded from a directory or the boot path.
+/// Returns `None` for classes loaded from the boot path. For Spring Boot
+/// exploded archives, classes under `BOOT-INF/classes` and `WEB-INF/classes`
+/// inherit the enclosing archive root's manifest.
 ///
 /// Supports three CodeSource URL forms:
 ///   * `file:/C:/.../foo.jar`                              вЂ” plain jar
@@ -13637,10 +13648,57 @@ fn t19_h10_class_manifest_attr(
     } else {
         std::path::PathBuf::from(format!("/{}", path))
     };
-    if !path.is_file() {
+    if path.is_file() {
+        return plain_jar_manifest_attr(&path, package_path.as_deref(), attr);
+    }
+    spring_boot_exploded_manifest_attr(&path, package_path.as_deref(), attr)
+}
+
+/// Cache of parsed exploded-archive manifests keyed by the resolved
+/// `META-INF/MANIFEST.MF` path string, mirroring `plain_manifest_cache` /
+/// `nested_manifest_cache` above so repeated `Class.getPackage()` lookups
+/// (6 attributes per call) only read+parse the manifest once.
+fn exploded_manifest_cache() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Spring Boot's exploded launcher gives its URLClassLoader
+/// `.../BOOT-INF/classes` (or `WEB-INF/classes`) as the class path entry, but
+/// package metadata is defined from the archive root's `META-INF/MANIFEST.MF`.
+/// A plain directory has no such inheritance, so restrict this lookup to the
+/// two Boot layouts rather than searching arbitrary parent directories.
+fn spring_boot_exploded_manifest_attr(
+    path: &std::path::Path,
+    package_path: Option<&str>,
+    attr: &str,
+) -> Option<String> {
+    if !path.is_dir() || path.file_name()?.to_string_lossy() != "classes" {
         return None;
     }
-    plain_jar_manifest_attr(&path, package_path.as_deref(), attr)
+    let layout_dir = path.parent()?;
+    let layout = layout_dir.file_name()?.to_string_lossy();
+    if layout != "BOOT-INF" && layout != "WEB-INF" {
+        return None;
+    }
+    let manifest = layout_dir.parent()?.join("META-INF").join("MANIFEST.MF");
+    let cache_key = manifest.display().to_string();
+
+    if let Ok(cache) = exploded_manifest_cache().lock() {
+        if let Some(map) = cache.get(&cache_key) {
+            return manifest_attr_for_package(map, package_path, attr);
+        }
+    }
+
+    let map = std::fs::read(&manifest)
+        .ok()
+        .map(|bytes| parse_package_manifest(&bytes))
+        .unwrap_or_default();
+    let result = manifest_attr_for_package(&map, package_path, attr);
+    if let Ok(mut cache) = exploded_manifest_cache().lock() {
+        cache.insert(cache_key, map);
+    }
+    result
 }
 
 /// Cache of parsed plain-jar manifests keyed by canonicalised path string.
@@ -19487,14 +19545,14 @@ Implementation-Title: opensaml-core-api\r\n\
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "()V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "(Ljava/lang/String;II)V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },

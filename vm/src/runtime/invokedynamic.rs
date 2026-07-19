@@ -1654,7 +1654,12 @@ fn value_to_string(
                 // exception-`catch_type` fallback and deliberately walks ONLY
                 // the superclass chain (interfaces are never a `catch_type`),
                 // so it can never match an interface like `Path` and this
-                // branch would silently never fire.
+                // branch would silently never fire. (A concurrent dev commit
+                // added this same check using `is_subclass_of_by_name` — that
+                // version never actually fires; confirmed via a standalone
+                // `"file:" + Paths.get(...)` repro that still printed
+                // `file:java.nio.file.Path@<hash>` until switched to
+                // `is_subclass_of`.)
                 let obj_class_id = shared.heap.class_id_of(*obj_ref);
                 let is_path = ctx
                     .class_id_by_name("java/nio/file/Path")
