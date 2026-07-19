@@ -5341,6 +5341,263 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         self.shared.heap.alloc_object(class_id, slots)
     }
+    /// Fallible twin of [`alloc_object`](NativeContext::alloc_object) for a
+    /// native-call safepoint where the caller holds no unpinned Java
+    /// references (mirrors `create_string_uninterned_gc_safe`'s contract).
+    /// Walks the identical ClassId(0)-substitution / field-count-clamp /
+    /// TLAB / old-gen-batch fast paths as `alloc_object`, but returns `None`
+    /// instead of hard-aborting the process when both generations are
+    /// exhausted, so the caller can surface a catchable
+    /// `java.lang.OutOfMemoryError`. Added because `alloc_concurrent_synthetic`
+    /// (shared by `java.net.URI`/`HttpURLConnection`/many other synthetic
+    /// native allocators) routed through the aborting path -- confirmed via
+    /// gdb backtrace to be exactly what TestResponsePerformance's doUri()
+    /// hot loop (`new URI(...)` x1,000,000) hit. See docs/known-issues/
+    /// tomcat-08-07/silent-hang-no-signature-cluster.md.
+    fn try_alloc_object_gc_safe(&mut self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        // Proactively collect BEFORE attempting allocation, matching
+        // `create_string_uninterned_gc_safe`'s contract: the caller has
+        // already extracted any data it needs from live Java references
+        // at this native-call safepoint, so a moving young GC here is
+        // safe. Without this, a tight native-allocation loop (e.g.
+        // `new URI(...)` via `alloc_concurrent_synthetic`) never gets a
+        // chance to reclaim the young generation's dead churn between
+        // calls and can exhaust both generations even though most of
+        // that space is garbage. See docs/known-issues/tomcat-08-07/
+        // silent-hang-no-signature-cluster.md.
+        const OBJECT_ALLOCATION_HEADROOM: usize = 256;
+        if !self.shared.heap.young_bump_headroom(OBJECT_ALLOCATION_HEADROOM)
+            && !self.shared.heap.young_has_free_block(OBJECT_ALLOCATION_HEADROOM)
+        {
+            self.shared
+                .gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
+        }
+        // Defense-in-depth: a native caller must never allocate an object
+        // with `ClassId::new(0)` (`java/lang/Object`, which declares zero
+        // instance fields) yet a non-zero slot count. Such an object has an
+        // "undersized layout" — its class says it has 0 fields but the
+        // header reserves `num_fields` slots — and the GC's `get_field`
+        // bounds guard then rejects (drops) every `getfield` on it, which is
+        // exactly the `class_name=java/lang/Object class_id=ClassId(0)
+        // real_field_count=Some(0)` failure WildFly's controller boot hit.
+        //
+        // Several native allocators still pass `ClassId::new(0)` on their
+        // class-resolution-failed fallback path. Rather than let a broken
+        // object reach the heap, substitute a synthetic class that declares
+        // `num_fields` instance fields so the header's `class_id` agrees
+        // with its slot count. Field-less Object allocations (`new Object()`
+        // and array-element class hints) are unaffected.
+        let class_id = if class_id == ClassId::new(0) && num_fields > 0 {
+            // One synthetic class per distinct field count, shared across
+            // all callers — keeps the class store from growing unbounded.
+            //
+            // Hot path (every HashMap/LinkedHashMap node, view backing, …):
+            // the resolved `AnonymousObject$N` ClassId is cached lock-free in
+            // `shared.anon_class_cache`, so repeat allocations skip the name
+            // `format!`, the `class_manager` write-lock, and the synthetic-class
+            // hash probe. The stub declares exactly `num_fields` fields, so the
+            // slot-count clamp below is provably a no-op and is skipped too —
+            // we allocate directly. Env verdict is read once (OnceLock); when
+            // `CRATONVM_DBG_ANONALLOC` is set we force the slow path so the
+            // per-allocation stack dump still fires every time.
+            let dbg = {
+                static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *DBG.get_or_init(|| std::env::var("CRATONVM_DBG_ANONALLOC").is_ok())
+            };
+            if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
+                let cached = self.shared.anon_class_cache[num_fields]
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if cached != 0 {
+                    return Some(self
+                        .shared
+                        .heap
+                        .alloc_object(ClassId::new(cached), num_fields));
+                }
+            }
+            let name = format!("cratonvm/synthetic/AnonymousObject${num_fields}");
+            if dbg {
+                let stack: Vec<String> = self
+                    .thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(12)
+                    .map(|f| {
+                        format!(
+                            "    at {}.{}{}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor()
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "[ANONALLOC] alloc_object ClassId(0) num_fields={num_fields} -> {name}\n{}",
+                    stack.join("\n")
+                );
+            }
+            let cid = self
+                .shared
+                .class_manager
+                .write()
+                .ensure_synthetic_class(&name, num_fields);
+            // Cache for the lock-free fast path above. Races are benign:
+            // `ensure_synthetic_class` is idempotent, so any racing thread
+            // stores the same id.
+            if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
+                self.shared.anon_class_cache[num_fields]
+                    .store(cid.as_u32(), std::sync::atomic::Ordering::Relaxed);
+            }
+            cid
+        } else {
+            class_id
+        };
+        // Layout-mismatch guard: many native allocators hard-code a
+        // synthetic field count (e.g. `HashSet` => 1) that is SMALLER
+        // than the real JDK class layout. When real-JDK bytecode later
+        // executes `getfield`/`putfield` at the declared (inherited)
+        // field indices, the access runs past the undersized object —
+        // `gen_heap::get_field` then drops the read and the object's
+        // state silently corrupts (observed as Kafka 3.7 boot failures:
+        // `java/util/HashSet` allocated with num_slots=1 but
+        // real_field_count=3).
+        //
+        // Clamp the requested slot count UP to the resolved class's real
+        // declared instance-field count. This is the single, general fix
+        // point: every native allocator routes through this trait method,
+        // so individual call sites no longer need to remember to
+        // `.max(class_num_total_fields(cid))` themselves. Synthetic
+        // ClassIds not in the class manager report 0 here, so the
+        // requested count is used unchanged for those.
+        //
+        // Hot path: this clamp runs on EVERY native allocation (notably each
+        // out-of-cache autoboxed wrapper — ~19% of the 1M-put/get HashMap
+        // probe sat in alloc_object, a large share of it in this RwLock
+        // acquire + class-store lookup). A registered class's
+        // `num_total_fields` is immutable for its ClassId except through
+        // class redefinition, which bumps the global layout generation — the
+        // same validation contract `gen_heap::compact_field_slot`'s cache
+        // already relies on. Keep a tiny per-thread working set keyed by
+        // (vm, class_id) and validated against that generation. Unregistered
+        // ids (`get_class` → None) are deliberately NOT cached: a class id
+        // observed mid-registration could otherwise pin a stale 0 clamp.
+        struct TotalFieldsCache {
+            // (vm_key, class_id, layout_generation, num_total_fields);
+            // vm_key == 0 marks an empty slot.
+            entries: [(usize, u32, u64, u32); 8],
+            next: usize,
+        }
+        thread_local! {
+            static TOTAL_FIELDS_CACHE: std::cell::RefCell<TotalFieldsCache> =
+                const {
+                    std::cell::RefCell::new(TotalFieldsCache {
+                        entries: [(0, 0, 0, 0); 8],
+                        next: 0,
+                    })
+                };
+        }
+        let vm_key = self.shared as *const SharedVm as usize;
+        let cid_u32 = class_id.as_u32();
+        let layout_gen = cratonvm_types::layout_generation();
+        let cached_fields = TOTAL_FIELDS_CACHE.with(|cell| {
+            let cache = cell.borrow();
+            cache.entries.iter().find_map(|&(vk, cid, gen, fields)| {
+                (vk == vm_key && cid == cid_u32 && gen == layout_gen).then_some(fields)
+            })
+        });
+        let real_fields = match cached_fields {
+            Some(fields) => fields as usize,
+            None => {
+                let resolved = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.num_total_fields);
+                if let Some(fields) = resolved {
+                    // Cast: field counts are far below u32::MAX.
+                    let fields_u32 = fields as u32;
+                    TOTAL_FIELDS_CACHE.with(|cell| {
+                        let mut cache = cell.borrow_mut();
+                        let slot = cache.next;
+                        cache.entries[slot] = (vm_key, cid_u32, layout_gen, fields_u32);
+                        cache.next = (slot + 1) % cache.entries.len();
+                    });
+                }
+                resolved.unwrap_or(0)
+            }
+        };
+        let slots = num_fields.max(real_fields);
+        if self.thread.native_alloc_pool_layout == Some((class_id, slots)) {
+            if let Some(obj) = self.thread.native_alloc_pool.pop() {
+                if self.thread.native_alloc_pool.is_empty() {
+                    self.thread.native_alloc_pool_layout = None;
+                }
+                return Some(obj);
+            }
+            self.thread.native_alloc_pool_layout = None;
+        }
+        // Native callbacks execute on the mutator's own `JvmThread`, so small
+        // objects can use the same lock-free TLAB path as interpreted/JIT
+        // `new`. Historically this method went straight to `GenHeap`, taking
+        // the shared young-arena lock until young filled and then the old-gen
+        // lock for every allocation. Autobox-heavy code (notably
+        // HashMap<Integer, Integer>) therefore serialized millions of tiny
+        // wrapper allocations through global locks despite an available TLAB.
+        //
+        // This path deliberately does not initiate GC from inside the native
+        // callback: `tlab_alloc_object` only bumps/refills young space and
+        // returns `None` when it cannot. The existing `heap.alloc_object`
+        // fallback retains the previous spill/OOM behavior and native rooting
+        // contract. Instead of collecting here, a TLAB failure flags
+        // `young_spill_pressure` so the NEXT `safe_native_call` boundary —
+        // where every argument is pinned and remappable — runs the
+        // orchestrated GC this method cannot (see `safe_native_call_impl`).
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let requested_size = HEADER_SIZE + slots.saturating_mul(SLOT_SIZE);
+        if requested_size <= cratonvm_gc::tlab::tlab_max_alloc() {
+            if let Some(obj) = crate::runtime::interpreter::tlab_alloc_object(
+                self.thread,
+                self.shared,
+                class_id,
+                slots,
+                requested_size,
+            ) {
+                return Some(obj);
+            }
+            // Young could not supply another TLAB chunk: every allocation
+            // below lands in old gen. The old-batch refill / heap spill arms
+            // below signal the native-call boundary GC (`note_young_spill_
+            // pressure` — advisability-gated, needs the old-gen lock those
+            // slow paths already pay for; calling it here would add an
+            // old-gen lock acquisition per allocation in spill mode).
+        }
+        // Once young space cannot provide another TLAB, amortize the
+        // non-moving old-generation lock and free-list work across a chunk of
+        // same-layout native objects. Unused entries remain rooted and are
+        // remapped with their owning thread; the object popped here cannot be
+        // moved before `safe_native_call` publishes its return root because a
+        // native callback never initiates collection on this path.
+        if self.thread.native_alloc_pool.is_empty() {
+            let mut batch = self
+                .shared
+                .heap
+                .try_alloc_objects_old_batch(class_id, slots, 2048);
+            if let Some(obj) = batch.pop() {
+                self.thread.native_alloc_pool = batch;
+                self.thread.native_alloc_pool_layout = if self.thread.native_alloc_pool.is_empty() {
+                    None
+                } else {
+                    Some((class_id, slots))
+                };
+                return Some(obj);
+            }
+        }
+        self.shared.heap.try_alloc_object_full(class_id, slots)
+        }
+
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
         let class_id = self.shared.load_class_concurrent(name)?;
