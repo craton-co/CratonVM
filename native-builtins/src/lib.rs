@@ -53531,13 +53531,26 @@ fn native_javac_file_manager_infer_binary_name(
             relative_path.map(|path| javac_binary_name_from_relative_path(&path))
         }
         "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
+            // Read the display string directly via the same logic
+            // `Path.toString()`'s native uses (`p57_path_display_string`),
+            // rather than `ctx.invoke_virtual(path, "toString", ...)`. The
+            // latter doesn't consult `force_native_over_real_jdk_bytecode`/
+            // the `vm_exec.rs` `check_override` allow-list the way the
+            // bytecode interpreter's own `invokevirtual` handling does, so
+            // it silently ran `Path`'s (nonexistent — `Path` is an
+            // interface) real bytecode, which resolves to
+            // `Object.toString()` and returns `java.nio.file.Path@<hash>` —
+            // mangled by `javac_binary_name_from_relative_path` below into
+            // the literal binary name `java.nio.file` for every ordinary
+            // classpath class file (`ServletComponentScanRegistrarTests
+            // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`
+            // and any other real in-process javac compile — Spring's
+            // `TestCompiler`/AOT generation — referencing an
+            // application-classpath class).
             let path = match ctx.get_field_by_name(file, "path") {
-                Value::Object(Some(path)) => ctx
-                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
-                    .and_then(|value| match value {
-                        Value::Object(Some(path)) => ctx.read_string(path),
-                        _ => None,
-                    }),
+                Value::Object(Some(path)) => {
+                    Some(crate::phases_late::p57_path_display_string(ctx, path))
+                }
                 _ => None,
             };
             path.map(|path| javac_binary_name_from_relative_path(&path))

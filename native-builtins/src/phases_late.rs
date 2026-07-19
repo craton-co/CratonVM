@@ -5664,6 +5664,48 @@ fn native_quarkus_logging_handle_failed_start(
     result
 }
 
+/// Renders a synthetic `java/nio/file/Path` object's display string exactly
+/// as the `Path.toString()` native below does (jar-FS/jrt-FS entries with
+/// `/`, host paths with the OS separator). Extracted so callers that already
+/// hold a `NativeContext` and a `Path` `ObjectRef` — e.g. javac's
+/// `JavacFileManager.inferBinaryName` fast path in `lib.rs`, which used to
+/// call `ctx.invoke_virtual(path, "toString", ...)` — can get the same
+/// result WITHOUT going through `invoke_virtual`. That indirection doesn't
+/// consult `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+/// `check_override` allow-list the way the bytecode interpreter's own
+/// `invokevirtual` handling does, so it silently ran `Path`'s real
+/// (nonexistent — `Path` is an interface) bytecode, which resolves to
+/// `Object.toString()` and prints `java.nio.file.Path@<hash>`. That garbage
+/// string then got mangled by `javac_binary_name_from_relative_path` into
+/// the literal binary name `java.nio.file` for every ordinary classpath
+/// class file, breaking real in-process javac compiles (Spring's
+/// `TestCompiler`/AOT generation) referencing any application-classpath
+/// class.
+pub(crate) fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let p = p57_read_path(ctx, this);
+    match vfs_decode(&p) {
+        // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+        // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+        Some((_, _, e)) => {
+            if e.starts_with('/') {
+                e
+            } else {
+                format!("/{e}")
+            }
+        }
+        // A plain (non-encoded) relative path whose owning FileSystem is a
+        // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+        // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+        // a package name. Rendering the host '\' there would corrupt the key.
+        None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
+        // Host-FS path: render the OS-native separator. CratonVM stores
+        // paths with '/' internally, but HotSpot's WindowsPath.toString()
+        // renders '\'; convert at this display boundary on Windows
+        // (no-op on Unix). Matches `File.getPath()` below.
+        None => file_normalise_path(&p),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6271,28 +6313,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- Path.toString() → String ---
     r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = p57_read_path(ctx, this);
-        let display = match vfs_decode(&p) {
-            // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
-            // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
-            Some((_, _, e)) => {
-                if e.starts_with('/') {
-                    e
-                } else {
-                    format!("/{e}")
-                }
-            }
-            // A plain (non-encoded) relative path whose owning FileSystem is a
-            // virtual (jar/jrt) FS renders with '/' — e.g. the result of
-            // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
-            // a package name. Rendering the host '\' there would corrupt the key.
-            None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
-            // Host-FS path: render the OS-native separator. CratonVM stores
-            // paths with '/' internally, but HotSpot's WindowsPath.toString()
-            // renders '\'; convert at this display boundary on Windows
-            // (no-op on Unix). Matches `File.getPath()` below.
-            None => file_normalise_path(&p),
-        };
+        let display = p57_path_display_string(ctx, this);
         let s = ctx.create_string(&display);
         Ok(Some(Value::Object(Some(s))))
     });
