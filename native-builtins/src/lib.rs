@@ -56832,7 +56832,20 @@ pub(crate) fn alloc_concurrent_synthetic(
             // isn't loaded yet — keep the caller's requested size.
             let real = ctx.class_num_total_fields(cid);
             let n = num_fields.max(real);
-            ctx.alloc_object(cid, n)
+            // `try_alloc_object_gc_safe` first (proactively collects, then
+            // walks young -> old gen without aborting): this is the shared
+            // allocator behind `java.net.URI`, `HttpURLConnection`, and many
+            // other synthetic native objects -- a gdb backtrace confirmed
+            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
+            // 1,000,000) hard-aborted the whole process here on young-gen
+            // exhaustion. Falling back to the aborting `alloc_object` only
+            // if the GC-safe path still reports genuine exhaustion (both
+            // generations full even after a fresh collection) preserves
+            // today's behavior for that now much narrower case, with no
+            // signature change for this function's many other callers. See
+            // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+            ctx.try_alloc_object_gc_safe(cid, n)
+                .unwrap_or_else(|| ctx.alloc_object(cid, n))
         }
         Err(_) => {
             // The real `.class` file could not be loaded. Allocating with
