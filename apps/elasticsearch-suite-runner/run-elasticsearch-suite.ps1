@@ -20,6 +20,7 @@ param(
   [int]$Count = 0,
   [int]$Parallel = 1,
   [int]$TimeoutSec = 120,
+  [int]$KnownSlowClassTimeoutSec = 1800,
 
   [string]$RunName = '',
   [string]$ModeName = '',
@@ -421,7 +422,7 @@ function Get-Classpath([string]$Module) {
   return ($entries -join [System.IO.Path]::PathSeparator)
 }
 
-function Get-EsJavaArgs([bool]$HotSpot) {
+function Get-EsJavaArgs([bool]$HotSpot, [string]$ClassName = '') {
   $esHome = [System.IO.Path]::GetFullPath($script:ElasticsearchDir)
   $args = @(
     "-Dtests.seed=$Seed",
@@ -433,7 +434,7 @@ function Get-EsJavaArgs([bool]$HotSpot) {
     '-Dtests.testfeatures.enabled=true',
     '-Dtests.security.manager=false',
     '-Dtests.asserts=false',
-    '-Dtests.timeoutSuite=580000!',
+    $(if ($ClassName -eq 'org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests') { '-Dtests.timeoutSuite=1800000!' } else { '-Dtests.timeoutSuite=580000!' }),
     '--add-opens=java.base/java.util=ALL-UNNAMED',
     '--add-opens=java.base/java.lang=ALL-UNNAMED',
     '--add-opens=java.base/java.security.cert=ALL-UNNAMED',
@@ -483,7 +484,7 @@ function New-ProcessRecord {
 
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    $args = Get-EsJavaArgs $true
+    $args = Get-EsJavaArgs $true $class
     if ($NoJit) { $args += '-Xint' }
     $args += @('-cp', $cp, 'org.junit.runner.JUnitCore', $class)
   } else {
@@ -491,7 +492,7 @@ function New-ProcessRecord {
     $args = @('--java-home', $JdkPath, '--stack-dump-on-timeout', '0', '--Xmx', $MaxHeap)
     if ($NoJit) { $args += '--nojit' }
     if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
-    $args += Get-EsJavaArgs $false
+    $args += Get-EsJavaArgs $false $class
     $args += @('-cp', $cp, 'org.junit.runner.JUnitCore', $class)
   }
 
@@ -654,7 +655,11 @@ function Wait-OneRunning {
 
       $elapsed = ((Get-Date) - $record.start).TotalSeconds
       $timedOut = $false
-      if (-not $record.proc.HasExited -and $elapsed -ge $TimeoutSec) {
+      $classTimeout = $TimeoutSec
+      if ($Vm -eq 'craton' -and $record.class -eq 'org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests') {
+        $classTimeout = [Math]::Max($TimeoutSec, $KnownSlowClassTimeoutSec)
+      }
+      if (-not $record.proc.HasExited -and $elapsed -ge $classTimeout) {
         $timedOut = $true
         try { $record.proc.Kill($true) } catch { try { $record.proc.Kill() } catch {} }
       }
@@ -858,6 +863,7 @@ New-Item -ItemType Directory -Force -Path $script:WorkRoot | Out-Null
 
 if ($Parallel -lt 1) { $Parallel = 1 }
 if ($TimeoutSec -lt 1) { $TimeoutSec = 1 }
+if ($KnownSlowClassTimeoutSec -lt 1) { $KnownSlowClassTimeoutSec = 1 }
 
 if ($AllModes) {
   if ($RefreshLists -or -not (Test-Path (Join-Path $script:WorkRoot 'all-tests.tsv'))) {

@@ -2298,7 +2298,7 @@ fn tlab_alloc_object_inner(
     // Fast path: bump-allocate from the current TLAB without taking
     // any lock. This is the steady-state path for ~99% of allocations
     // once the adaptive sizer has settled.
-    if let Some(ptr) = thread.tlab.alloc(total_size, 8) {
+    if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
         // H1: mint a fresh non-zero identity hash at allocation time so
         // the object header is never all-zero. This matches the slow-path
         // allocators (`alloc_object`/`alloc_array`) and prevents the
@@ -2306,6 +2306,7 @@ fn tlab_alloc_object_inner(
         // legitimate `new Object()` instances as stale memory.
         let hash = shared.heap.next_identity_hash();
         init_object_header(ptr, class_id, num_fields, hash);
+    }) {
         shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
         // platforms; on 32-bit the upper bound (usize::MAX ≈ 4 GiB) still
@@ -2464,10 +2465,11 @@ fn tlab_alloc_object_inner(
         // Start the new refill-window timer so `next_refill_size`
         // measures this TLAB's lifetime from the moment we installed it.
         thread.tlab.begin_refill(size);
-        if let Some(ptr) = thread.tlab.alloc(total_size, 8) {
+        if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
             // H1: see fast-path comment above.
             let hash = shared.heap.next_identity_hash();
             init_object_header(ptr, class_id, num_fields, hash);
+        }) {
             shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
                 .bytes_allocated_total
@@ -4285,17 +4287,20 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
 }
 
 /// Conservative estimate of how many bytes of native stack a single
-/// re-entrant JIT *dispatch* level can consume. Unlike the interpreter's
-/// `execute` level (≈8 KiB), a JIT→JIT recursion level stacks a much larger
-/// Rust frame: `jit_invoke_dispatch` / `jit_invoke_virtual_mic` hold sizeable
-/// locals (arg-decode `Vec`s, `JitInvokeInfo` views, MIC/PIC handling, the
-/// SATB flush, the transmuted compiled-entry trampoline) AND the compiled Java
-/// frame itself runs on the native stack between dispatch calls. We budget a
-/// deliberately pessimistic 32 KiB/level so the JIT-dispatch ceiling trips with
-/// generous head-room before the OS guard page — the JIT path has no cheap way
-/// to query remaining stack, and overshooting here is an uncatchable process
-/// abort whereas undershooting merely throws SOE slightly early.
-const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 32 * 1024;
+/// re-entrant JIT *dispatch* level can consume. The helper contains argument
+/// decoding, MIC/PIC handling, a SATB flush, and a compiled-Java frame. Its
+/// release footprint is nevertheless within the interpreter's proven 8 KiB
+/// per-level budget; the counter is also an active call-chain depth rather
+/// than a recursion counter. We therefore budget a
+/// The counter tracks every active JIT-to-JIT dispatch, not only recursive
+/// calls.  Production Lucene vector search legitimately keeps more than 128
+/// such calls live on an 8 MiB worker carrier, so the former 32 KiB estimate
+/// converted an ordinary call chain into a spurious `StackOverflowError`.
+/// Reserve 8 KiB per level, matching the interpreter's proven conservative
+/// frame budget: an 8 MiB carrier still retains half its stack as head-room
+/// and the guard continues to turn pathological recursion into a catchable
+/// Java exception before the native guard page.
+const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 8 * 1024;
 
 /// Absolute floor for the derived JIT-dispatch ceiling. Distinct from (and
 /// lower than) [`MIN_EXEC_DEPTH_CEILING`] because the JIT per-level budget is
@@ -11662,6 +11667,7 @@ mod deopt_step3_tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -11682,6 +11688,7 @@ mod deopt_step3_tests {
             is_synchronized: true,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -12177,6 +12184,7 @@ mod deopt_step3_tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -21065,6 +21073,7 @@ fn try_invoke_cached_lambda_impl(
                 is_synchronized: false,
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -26545,9 +26554,17 @@ fn intercept_force_registered_native_cached(
     {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find(class_name, method_name, method_descriptor)?;
+    // Perf (2026-07-19, TestResponsePerformance residual): memoize the
+    // resolved callback per invoke-cache entry, same shape as
+    // `force_native_cache` above -- native registration is immutable after
+    // boot, so this triple always resolves to the same callback. Confirmed
+    // via `perf` that `NativeMethodRegistry::find` was the #2 hottest
+    // symbol (~7% of samples) on this exact benchmark before this fix.
+    let cb = (*cached.native_callback_cache.get_or_init(|| {
+        shared
+            .native_methods
+            .find(class_name, method_name, method_descriptor)
+    }))?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
@@ -28572,6 +28589,7 @@ fn populate_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -31437,6 +31455,7 @@ fn try_jit_upgrade_with_gate(
                 is_synchronized: method.is_synchronized(),
                 is_static: method.is_static(),
                 force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
             };
             drop(cm);
 
@@ -32261,6 +32280,7 @@ fn try_jit_compile_callee_slow(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
     drop(cm);
 
@@ -36744,6 +36764,7 @@ fn populate_virtual_invoke_cache(
         is_synchronized: method.is_synchronized(),
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
+        native_callback_cache: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -39491,6 +39512,18 @@ mod tests {
         assert_eq!(main, 8192);
     }
 
+    /// JIT dispatch depth is also a call-chain depth, not a recursion count.
+    /// An 8 MiB Java worker must therefore admit normal deep framework calls
+    /// while retaining half of the native stack as an overflow reserve.
+    #[test]
+    fn jit_dispatch_depth_ceiling_for_8mib_allows_normal_call_chains() {
+        assert_eq!(
+            derive_jit_dispatch_depth_ceiling(8 * 1024 * 1024),
+            512,
+            "8 MiB / 2 safety reserve / 8 KiB per JIT-dispatch level"
+        );
+    }
+
     /// The old hard-coded 10_000 ceiling overflowed an 8 MiB native stack
     /// before tripping. The derived 8 MiB ceiling must be strictly below
     /// that old constant so the guard now fires first.
@@ -40820,6 +40853,7 @@ mod tests {
             is_synchronized: false,
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(

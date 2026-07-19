@@ -1,3 +1,119 @@
+# 2026-07-18/19 continuation: stale-precise-root-mirror bug FOUND and FIXED (raw JIT-to-JIT call RBP-mirror race); JIT-throughput regression from the fix's interim safety defaults FOUND and FIXED; end-to-end `testSlicesDense` re-verification BLOCKED by a newly-discovered, separate, pre-existing Windows-host `Thread.join()` hang
+
+**Status update: took over `C:\craton\CratonVM-es-ivfknn-slicesdense-closure-20260717`
+from other agents' in-progress WIP (uncommitted, ~880 lines across
+gc/jit/vm) that had independently found and started fixing the same
+"Elasticsearch IVFKnn stress test exposed a stale precise-root mirror
+after a raw JIT-to-JIT CALL" mechanism referenced in this doc's earlier
+sections. Verified, completed, and hardened that work; found and fixed
+two additional real bugs surfaced along the way; the doc's own primary
+subject (`testSlicesDense`) remains unverified end-to-end only because
+of a brand-new, unrelated, pre-existing blocker (see below) — not
+because of anything still open in the GC/JIT fix itself.**
+
+## What was fixed (all committed, branch
+`codex/fix-es-ivfknn-slicesdense-closure-20260717`, merged with current
+`origin/dev`)
+
+1. **The stale-precise-root-mirror bug itself.** A raw JIT-to-JIT CALL
+   updates the per-thread active-RBP mirror to the callee while the
+   interpreter-owned root-chain entry still describes the caller until
+   the callee's own prologue runs; a GC landing in that window can
+   select the caller's oop map for the callee's frame and lose live
+   roots. Fixed by (a) republishing the caller's RBP after every raw
+   JIT-to-JIT CALL returns (`Compiler::emit_post_call_rbp_republish`),
+   and (b) `JitEntryGuard::enter_with_compiled` now always retains
+   precise frame metadata (even for methods with no real oop maps) so
+   `scan_compiled_frame_bands` can bound each stacked raw-call frame
+   exactly instead of falling back to one imprecise whole-band
+   conservative sweep.
+2. **The young-GC exact-walk hardening** this doc's 2026-07-16 section
+   already covers (GAP_FILLER_CLASS_ID special-casing) was generalized:
+   the non-moving young sweep now uses `origin/dev`'s own
+   `oracle_trusted_abs` truncated-walk fallback (a slightly later,
+   independently-developed, more refined fix for the same underlying
+   "walk breaks early → silently drops live candidates" hazard, found
+   during the `origin/dev` merge below — see the bt18-family reference in
+   that fix's own comment). A companion allocator/walker alignment
+   mismatch was also fixed: compact object bodies can be non-8-aligned,
+   but the arena/TLAB bump allocators weren't reserving the full aligned
+   footprint, leaving a phantom gap between adjacent objects that the
+   linear collector walks could desync on; `Tlab::alloc(_initialized)`
+   and `Arena::alloc`/`OldGen::alloc` now round up to the full footprint,
+   matching `gen_object_total_size`'s own rounding.
+3. **The MIC (monomorphic inline cache) install protocol** is now atomic
+   (CAS-based reservation, monomorphic for the slot's lifetime) instead
+   of a read-then-store retarget race that could pair one receiver's
+   class guard with a different receiver's compiled-entry pointer.
+4. **A severe (~15-30x) general JIT throughput regression**, introduced
+   by the interim safety default the original stale-mirror fix shipped
+   with (`direct_jit_callee_calls_enabled` / the dispatch-cache direct-
+   entry paths defaulting OFF to avoid the very race #1 fixes). Verified
+   with `bench/BenchSuite.java`: `bintrees16` went 44s (flag off) → 2.9s
+   (flag on) with the RBP-republish + precise-metadata fixes in place;
+   `fib44` (a classic non-tail self-recursive numeric benchmark that
+   routes through the dispatch-cache path, not the direct-callee-compile
+   path) was the worst-hit case. Root-caused and re-enabled default-ON —
+   see `direct_jit_callee_calls_enabled`'s doc comment in `jit/src/lib.rs`
+   for the full reasoning, the narrower residual left opt-in-only (the
+   virtual-dispatch-cache counterpart, and a separate pre-existing
+   invokespecial/static-bridge target-resolution gap — see the follow-up
+   task filed for that), and why this is safe: re-verified against
+   `testSlicesSparseWithFilter` with zero corruption warnings, plus the
+   full `cratonvm-gc`/`cratonvm-jit`/`cratonvm-vm` `--lib` suites and the
+   `ir_vs_singlepass`/`differential` JIT suites, all green.
+5. **Merged 280 commits of `origin/dev`** into this branch (it had 0
+   commits of its own — all its real work was uncommitted) — this alone
+   fixed most of an apparent ~18x `fib44` regression that turned out to
+   be simple staleness against unrelated `dev` perf work, not anything
+   this session's fixes did. The merge itself surfaced one genuine new
+   bug: a sweep-phase lockstep cross-check this session had added
+   (comparing the mark-phase's `young_object_ranges` against a fresh
+   sweep-phase walk, 1:1 in sequence) assumed `young_object_ranges` was a
+   dense list of every live object; `origin/dev` had independently turned
+   it into a sparse, candidate-filtered list as its own optimization,
+   which made the two views "diverge" (spuriously) on almost every GC —
+   the sweep then permanently under-reclaimed, OOM-crashing `bintrees18`.
+   Removed the now-invalid check (item 2's `oracle_trusted_abs` fallback,
+   preserved from `origin/dev`, already covers the same safety property
+   soundly).
+
+**Verification performed:** full `cratonvm-gc`/`cratonvm-jit`/`cratonvm-vm`
+`--lib` suites (885/915/2218 passed; the same 19 pre-existing/
+environmental failures as `origin/dev` itself — debug-only lock-order
+assertions, JIT skip-list feature tests, JNI table-size tests, real-JDK-
+detection tests); `cratonvm-jit`'s `ir_vs_singlepass`/`differential`
+suites (89/89); `bench/BenchSuite.java` bt10/12/14/16/18 (all correct
+checksums matching the documented HotSpot-verified golden values,
+including `bt18=68332206`, and fast: bt16 1.1s, bt18 5.5s), `arith1500M`,
+`matrix800`; `testSlicesSparseWithFilter` (`DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests`,
+direct JUnitCore invocation, zero corruption/OOB warnings across
+multiple runs — see the caveat below for why it could not be observed to
+completion).
+
+## Blocker for full end-to-end confirmation:
+[`ES-HANG-20260719-threadjoin-randomizedrunner-worker-windows.md`](ES-HANG-20260719-threadjoin-randomizedrunner-worker-windows.md)
+(NEW, OPEN, unrelated)
+
+While confirming `testSlicesSparseWithFilter`/`testRandomWithFilter`/
+`testSlicesDense` complete cleanly end-to-end (not just "no corruption
+warnings before an external timeout"), found that **every** direct
+`JUnitCore` invocation of a `RandomizedRunner`-based ES test class hangs
+on this Windows host — `Thread.join()` never returns for a worker thread
+that has already finished (`alive=false`). **Confirmed unrelated to
+everything in this doc**: reproduces identically on a clean, from-scratch
+`origin/dev` build with none of this session's changes; reproduces with
+`--nojit`; the identical repro passes cleanly under real HotSpot in
+~2.2s. See that doc for the full writeup. This means `testSlicesDense`
+itself — this doc's original subject — could not be re-run to actual
+completion this session; the GC/JIT fixes above are shipped on the
+strength of the non-ES-suite verification listed above, which is
+thorough but does not substitute for the doc's own original repro. A
+future session should first resolve the `Thread.join()` blocker, then
+re-run `testSlicesDense` to close this doc for real.
+
+---
+
 # 2026-07-16 continuation: root cause of the underlying corruption/hang FOUND and FIXED (`GAP_FILLER_CLASS_ID` young-GC exact-walk regression); `testSlicesDense` perf remains a separate, unchanged, OPEN issue
 
 **Status update: the correctness/hang mechanism behind this cluster's

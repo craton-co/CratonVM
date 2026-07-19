@@ -451,3 +451,119 @@ across the full class list (matching how it was originally found) rather
 than a targeted single-class rerun. Do not move this record out of
 `docs/known-issues` until a full 64-class two-process matrix completes with
 zero residuals of any kind, followed by a `--nojit` control.
+
+## 2026-07-19 C39-C42 — header-count residual root-caused and fixed
+
+**Status: OPEN**, but the previously-open sporadic header-count residual
+(item 3 in the original 2026-07-15 catalogue, chased without full closure
+across many rounds since) is now believed CLOSED. A 3-pass full-64-class
+pressure run on the OSR-fixed binary (`cvm-dohead-c39-postmerge2-20260718`,
+2 processes, 240s/class timeout) reproduced 7 failures across ~192
+class-runs, all either the historical header-count off-by-one assertion or
+the historical `IOException: End of input stream with [9] bytes left`
+singleton — confirming the family this document tracks was still live after
+the OSR fix, as expected (that fix was unrelated).
+
+**Root cause found via the widened `gen_heap.rs` diagnostic** (from the
+previous checkpoint — broadened from "index 4/5 only" to "any index" once
+indices 0/1/3 were also observed): re-checked correlation properly this
+time by tracking each guard hit against the JUnit test-case index it
+occurred in, across 4 independent repro samples. In every sample, the
+zero-slot `java/lang/Object` OOB hits occurred **exclusively** within the
+exact parameterization that went on to fail its header-count assertion —
+zero hits in any of the preceding passing cases of the same class. (The
+opposite conclusion drawn in the previous checkpoint — that this shape was
+routine per-test-case bootstrap noise — was an error: that check only
+verified the shape recurred across classes, not that it was absent from
+passing cases within the same class.)
+
+A captured backtrace (`native_map_remove_pinned` →
+`node_matches_inner` → `map_keys_equal` → `get_field`) pinpointed
+`native_map_remove_pinned` in `native-collections/src/lib.rs`: its
+bucket-chain walk (`head`/`prev`/`curr`/`buckets`) uses plain, unpinned
+`ObjectRef` Rust locals across `node_matches_inner`, which invokes the
+key's real `equals()` — arbitrary Java bytecode that can allocate and
+trigger a GC. Being invisible to GC root-scanning, these locals go stale if
+a GC lands mid-`equals()`; the next `get_field`/`set_field` through the
+stale address lands on whatever now-live object occupies that slot
+(observed as a genuine, unrelated, freshly-allocated zero-field
+`java/lang/Object`), silently corrupting the map.
+
+This exact hazard was already fixed for `native_map_put`,
+`native_hashmap_get_exact`, and `native_map_contains_key` (documented
+inline as stemming from an earlier WildFly parallel-extension-add
+investigation) — `native_map_remove_pinned` was the one sibling that never
+got the equivalent treatment. The DoHead test explicitly calls
+`Map.remove("date")` (and conditionally other optional headers) on the
+response header maps immediately before comparing `getHeaders.size()` to
+`headHeaders.size()`, which is exactly the code path that exercises this
+function.
+
+**Fix** (`955031d30`, merged to `dev` as `bb266fb8e`): pin `buckets` and
+each `head`/`prev`/`curr` across `node_matches_inner`, refreshing all of
+them from their pins afterward, mirroring `native_map_put`'s established
+pattern exactly (including unpinning per-iteration to avoid growing the pin
+stack across a long chain walk).
+
+**Verified:**
+- Targeted repro of the classes that had shown this failure
+  (`TestHttpServletDoHeadInvalidWrite511ValidWrite1024`,
+  `513ValidWrite511`, `0ValidWrite1024`, `0ValidWrite513`), 8 passes × 2
+  processes = 32 class-runs: **32/32 PASS**, vs. 1 hit out of 24 in the
+  same repro shape on the pre-fix widened-diagnostic binary.
+- Full 64-class matrix, 2 passes × 2 processes = 128 class-runs:
+  **125 PASS**, 3 residuals — 1 `TIMEOUT` and 2 failures
+  (`SocketException: Connection reset: Broken pipe` and the historical
+  `End of input stream with [9] bytes left`). None were the header-count
+  assertion. These match the environmental/transport flake family this
+  document has independently tracked since 2026-07-15 (item 1, "WinSock
+  10053 connection abort... present at the same rate in every historical
+  sweep") rather than a map-layout correctness bug, and the host was under
+  heavy concurrent load from other sessions throughout this round.
+- Re-verified both this fix and the OSR fix together after merging ~35
+  unrelated commits from other concurrent sessions across two rounds
+  (rebuild + isolated repro clean each time).
+
+**Remaining for full closure:** confirm the 3 residual transport/timeout
+failures are genuinely load-related and not a live bug — rerun the full
+64-class matrix on a quieter host, or with `--nojit` as a control, before
+moving this record out of `docs/known-issues`.
+
+## 2026-07-19 closure-gate runs — both root-caused bugs confirmed fixed;
+## residual is the pre-existing environmental flake family, doc stays OPEN
+
+Four independent full-64-class two-process matrix runs on the post-C41-fix
+binary (`cvm-dohead-c42-postmerge3-20260718`), spanning both a busy host
+(load ~6-7) and a quiet one (load ~1.8-3.6):
+
+| Run | Config | Result |
+| --- | --- | --- |
+| C41 verify | 2 passes, busy host | 125/128 — 1 TIMEOUT, 2 FAIL |
+| Quiet-host attempt 1 | 1 pass, quiet host | 63/64 — 1 TIMEOUT (non-reproducing: 3/3 clean isolated rerun) |
+| `--nojit` control | 1 pass, quiet host | **64/64 clean** |
+| Quiet-host attempt 2 | 1 pass, quiet host | 62/64 — 1 FAIL (`Connection reset: Broken pipe`), 1 TIMEOUT |
+
+Across all four runs (≈320 class-runs total): **zero recurrences of the
+header-count assertion** (the bug C41 fixed) and **zero recurrences of the
+OSR uncaught-exception failure** (the bug fixed earlier this session). Every
+residual was one of: `SocketException: Connection reset: Broken pipe`,
+`IOException: End of input stream with [9] bytes left`, or a `TIMEOUT` that
+did not reproduce on an immediate isolated 3-pass rerun. This is exactly the
+"WinSock 10053 connection abort... present at the same rate in every
+historical sweep, incl. pre-regression baselines" family this document
+identified as environmental back on 2026-07-15 — not a CratonVM-side
+correctness bug, and not affected by either of this session's two fixes
+(both are pushed to `dev`: `eda677f45` OSR exception-table bailout,
+`955031d30` HashMap.remove GC-safety).
+
+**Per the project's known-issues triage rule, this document stays OPEN
+in `docs/known-issues`**: its residual (the environmental transport-flake
+family) is not tracked by a separate distinct open doc, so the "fixed →
+internal" archival criterion is not met even though the two bugs this
+session diagnosed and root-caused are both confirmed fixed. What would
+justify moving this record: either (a) a fully clean 64-class matrix with
+zero residuals of any kind on a quiet host (not yet achieved — the
+environmental flake rate appears to be roughly 1-2% per class-run
+regardless of the fixes above), or (b) splitting out the environmental
+flake family into its own dedicated known-issues doc and archiving this one
+as closed for its originally-documented defects.

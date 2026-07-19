@@ -2173,10 +2173,15 @@ impl GenerationalHeap {
                 }
             } // end rate-limited OOB-read diagnostics
             // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
-            // unconditional backtrace for the specific shape seen in the
-            // known-issues residual logs (index 4/5, zero-slot receiver) —
-            // rare enough that this doesn't need the OOB_DIAG_CAP treatment.
-            if num_slots == 0 && (index == 4 || index == 5) {
+            // unconditional backtrace for the zero-slot-receiver shape seen in
+            // the known-issues residual logs — confirmed (2026-07-19) to
+            // occur ONLY within the exact failing parameterization's test
+            // case in every repro sample checked (zero occurrences in the
+            // preceding passing cases of the same class), so this is NOT the
+            // benign high-frequency case (B) the OOB_DIAG_CAP above guards
+            // against — widened from the original index-4/5-only guess to
+            // any index once indices 0/1/3 were also observed correlating.
+            if num_slots == 0 {
                 let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
                     .map(|(n, _)| n)
                     .unwrap_or_else(|| "<unresolved>".to_string());
@@ -2402,7 +2407,7 @@ impl GenerationalHeap {
             }
             // RESID-DIAG (dohead residuals investigation, 20260718): see the
             // matching comment in get_field's OOB guard above.
-            if num_slots == 0 && (index == 4 || index == 5) {
+            if num_slots == 0 {
                 eprintln!(
                     "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
                     obj_ref.as_ptr(),
@@ -7217,19 +7222,28 @@ impl GenerationalHeap {
         // root scan cannot resurrect a stale header inside the hole) and
         // publish it to the free list. Per-object forensic records remain
         // available without forcing per-object arena publication.
-        for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
-            let obj_addr = from_base + off;
-            record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
-            crate::a2dbg::record_free(obj_addr);
-            bytes_swept += sz;
-            objects_swept += object_count;
-        }
-        for &(off, sz) in &reclaimed_regions {
-            let obj_addr = from_base + off;
-            // SAFETY: this is the union of adjacent/overlapping spans that the
-            // verified walk collected, all within the live from-space region.
-            unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
-            young_from.add_free_block(off, sz);
+        let defer_reclamation = std::env::var_os("CRATONVM_DBG_NO_NONMOVING_RECLAIM").is_some();
+        if !defer_reclamation {
+            for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
+                let obj_addr = from_base + off;
+                record_swept(obj_addr, class_id, kind_byte, sweep_zero_cycle);
+                crate::a2dbg::record_free(obj_addr);
+                bytes_swept += sz;
+                objects_swept += object_count;
+            }
+            for &(off, sz) in &reclaimed_regions {
+                let obj_addr = from_base + off;
+                // SAFETY: this is the union of adjacent/overlapping spans that the
+                // verified walk collected, all within the live from-space region.
+                unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
+                young_from.add_free_block(off, sz);
+            }
+        } else if !dead_regions.is_empty() {
+            tracing::debug!(
+                spans = dead_regions.len(),
+                bytes = reclaimed_regions.iter().map(|(_, size)| *size).sum::<usize>(),
+                "GC: retaining dead young spans during non-moving reclamation probe"
+            );
         }
         report_phase("zero-and-publish");
 
@@ -9587,7 +9601,7 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
+    let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
@@ -9655,7 +9669,15 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
             return 0;
         }
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
-    }
+    };
+
+    // Arena allocations reserve an 8-byte-aligned footprint. Compact object
+    // bodies need not be naturally aligned, so their trailing padding belongs
+    // to the object for every linear collector walk.
+    raw_size
+        .checked_add(7)
+        .map(|size| size & !7)
+        .unwrap_or(0)
 }
 
 /// Compute a pointer to the slot at `index` within an object/array.
@@ -10936,11 +10958,7 @@ mod tests {
         }
 
         // Dead object's memory was reclaimed (zeroed + on the free list).
-        assert!(
-            result.stats.bytes_freed > 0,
-            "dead object must be reclaimed"
-        );
-        // The reclaimed region was zeroed by the sweep.
+        assert!(result.stats.bytes_freed > 0, "dead object must be reclaimed");
         // SAFETY: `dead_ptr` is inside the young arena; reading its
         // (now-freed, zeroed) header is a valid in-bounds read.
         let dead_header = unsafe { &*(dead_ptr as *const ObjectHeader) };
@@ -10950,15 +10968,9 @@ mod tests {
             "freed hole must be zeroed"
         );
 
-        // A fresh allocation must succeed and reuse the reclaimed hole
-        // (it lands at the dead object's old address since that's the
-        // first free block).
+        // A fresh allocation must succeed and reuse the reclaimed hole.
         let reused = heap.alloc_object(ClassId::new(7), 1);
-        assert_eq!(
-            reused.as_ptr(),
-            dead_ptr,
-            "new allocation should reuse the swept hole",
-        );
+        assert_eq!(reused.as_ptr(), dead_ptr, "new allocation should reuse the swept hole");
         heap.set_field(reused, 0, Value::Int(555));
         assert_eq!(heap.get_field(reused, 0).as_int(), Some(555));
 
