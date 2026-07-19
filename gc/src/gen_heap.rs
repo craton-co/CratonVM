@@ -6556,11 +6556,6 @@ impl GenerationalHeap {
         let mut objects_live: usize = 0;
 
         let mut cursor: usize = 0;
-        // The mark phase already built this exact, allocator-validated object
-        // map under the same STW. Keep the reclamation walk in lockstep with
-        // it: a second independently-decoded walk must never publish a hole
-        // unless it names precisely the object the marker validated.
-        let mut exact_range_cursor = 0usize;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
         // xt-hardening (2026-07-03): lockstep iterator over the side mark
@@ -6954,24 +6949,6 @@ impl GenerationalHeap {
                     continue;
                 }
             }
-
-            let expected_range = young_object_ranges.get(exact_range_cursor).copied();
-            let actual_range = (obj_ptr as usize, obj_ptr as usize + total_size);
-            if expected_range != Some(actual_range) {
-                // This is a disagreement between two collector views taken
-                // under the same STW, not a recoverable object. Retain the
-                // unverified suffix rather than publishing a free block that
-                // could begin inside a live object.
-                tracing::warn!(
-                    cursor,
-                    ?expected_range,
-                    ?actual_range,
-                    "non-moving sweep diverged from the exact young-object map; retaining suffix"
-                );
-                dead_regions.truncate(dead_watermark);
-                break;
-            }
-            exact_range_cursor += 1;
 
             walked_count += 1;
             if retain_full_walk {

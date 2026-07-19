@@ -6967,7 +6967,7 @@ mod tests {
         let message = CString::new("native provider unavailable").unwrap();
 
         set_jni_context(&vm.shared);
-        set_jni_thread(&mut vm.main_thread as *mut _);
+        set_jni_thread(vm.main_thread.as_mut() as *mut _);
         assert_eq!(
             jni_throw_new(get_jni_env(), class_id.as_u32() as JClass, message.as_ptr(),),
             JNI_OK
