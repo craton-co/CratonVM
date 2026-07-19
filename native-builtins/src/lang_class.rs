@@ -19473,6 +19473,67 @@ Implementation-Title: opensaml-core-api\r\n\
     }
 
     #[test]
+    fn get_constructors_returns_only_complete_public_constructor_mirrors() {
+        // Groovy's MetaClass constructor matching starts from this public-only
+        // surface. Keep all public overloads (including their parameterTypes)
+        // and exclude the private constructor just as HotSpot does.
+        let mut ctx = mock_ctx();
+        let cid = ctx
+            .ensure_class_initialized("example/LayoutProcessor")
+            .expect("mock ensure_class_initialized must succeed");
+        ctx.set_declared_methods(
+            cid,
+            vec![
+                MethodMetadata {
+                    name: "<init>".to_string(),
+                    descriptor: "()V".to_string(),
+                    access_flags: ACC_PUBLIC,
+                    declaring_class_id: cid,
+                    exceptions: Vec::new(),
+                },
+                MethodMetadata {
+                    name: "<init>".to_string(),
+                    descriptor: "(Ljava/lang/String;II)V".to_string(),
+                    access_flags: ACC_PUBLIC,
+                    declaring_class_id: cid,
+                    exceptions: Vec::new(),
+                },
+                MethodMetadata {
+                    name: "<init>".to_string(),
+                    descriptor: "(I)V".to_string(),
+                    access_flags: 0,
+                    declaring_class_id: cid,
+                    exceptions: Vec::new(),
+                },
+            ],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "example/LayoutProcessor");
+        let result = native_class_get_constructors(&mut ctx, &[Value::Object(Some(mirror))])
+            .expect("Class.getConstructors must not fail");
+        let array = match result {
+            Some(Value::Object(Some(array))) => array,
+            other => panic!("expected Constructor[] result, got {other:?}"),
+        };
+        assert_eq!(ctx.array_length(array), 2, "only public constructors belong in getConstructors()");
+
+        let mut arities = Vec::new();
+        for i in 0..ctx.array_length(array) {
+            let ctor = match ctx.get_array_element(array, i) {
+                Value::Object(Some(ctor)) => ctor,
+                other => panic!("expected Constructor at index {i}, got {other:?}"),
+            };
+            assert_eq!(ctx.get_field_by_name(ctor, "modifiers"), Value::Int(ACC_PUBLIC as i32));
+            let params = match ctx.get_field_by_name(ctor, "parameterTypes") {
+                Value::Object(Some(params)) => params,
+                other => panic!("Constructor.parameterTypes must be non-null, got {other:?}"),
+            };
+            arities.push(ctx.array_length(params));
+        }
+        arities.sort_unstable();
+        assert_eq!(arities, vec![0, 3]);
+    }
+
+    #[test]
     fn g2_create_method_object_populates_exception_types_non_null() {
         // The real JDK Method constructor initializes `exceptionTypes`
         // to a non-null array; we mirror that invariant. ByteBuddy and

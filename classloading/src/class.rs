@@ -1273,6 +1273,70 @@ pub fn find_method_recursive<'a>(
     abstract_fallback
 }
 
+/// JVMS §6.5 `invokespecial` — the "actual method selection" step. Resolving
+/// an `invokespecial` constant-pool entry (JVMS §5.4.3.3, what
+/// [`find_method_recursive`] performs when handed the CP-referenced class)
+/// is NOT the same as selecting the method to invoke: for a genuine
+/// `super.m(...)` call, selection restarts the search at a DIFFERENT class
+/// than the one named in the constant pool.
+///
+/// Per spec: if the resolved method is not an instance-initialization
+/// method, the symbolic reference names a class (not an interface) that is
+/// a superclass of the CALLING class, and the calling class file has
+/// `ACC_SUPER` set (true for every class compiled since JDK 1.0.2), the
+/// search for the method to invoke begins at the calling class's own DIRECT
+/// SUPERCLASS — not at the class named by the constant-pool reference.
+///
+/// This matters whenever the constant pool reference names an ANCESTOR
+/// further up the hierarchy than the caller's immediate superclass (common
+/// for a compiler-generated bridge, or any multi-level `super` chain): a
+/// class sitting BETWEEN the caller and that ancestor may override the
+/// method, and only starting the walk at the caller's own superclass will
+/// find it. Starting the walk at the CP-referenced class directly (what a
+/// plain `find_method_recursive(cp_class_id, ...)` call does) walks straight
+/// past that override and can land on a much-less-specific declaration
+/// higher up the chain (in the worst case, `java/lang/Object`, if the
+/// erased name/descriptor happens to coincide there too).
+///
+/// Returns `cp_class_id` unchanged (the plain, non-redirected resolution
+/// start) for `<init>`, for interface references, or whenever the redirect
+/// condition does not hold — i.e. it is always safe to feed the result
+/// straight into [`find_method_recursive`] in place of `cp_class_id`.
+pub fn invokespecial_selection_start(
+    caller_class_id: ClassId,
+    cp_class_id: ClassId,
+    cp_reference_is_interface: bool,
+    method_name: &str,
+    store: &ClassStore,
+) -> ClassId {
+    if cp_reference_is_interface || method_name == "<init>" {
+        return cp_class_id;
+    }
+    let Some(caller) = store.get(caller_class_id) else {
+        return cp_class_id;
+    };
+    if !caller.access_flags.contains(ClassAccessFlags::SUPER) {
+        return cp_class_id;
+    }
+    // `cp_class_id` must be a genuine (proper) superclass of the caller —
+    // walk the caller's own superclass chain looking for it.
+    let mut cur = caller.superclass;
+    let mut is_superclass = false;
+    while let Some(id) = cur {
+        if id == cp_class_id {
+            is_superclass = true;
+            break;
+        }
+        cur = store.get(id).and_then(|c| c.superclass);
+    }
+    if !is_superclass {
+        return cp_class_id;
+    }
+    // `caller.superclass` is guaranteed `Some` here: the loop above only
+    // sets `is_superclass` after having entered it at least once.
+    caller.superclass.unwrap_or(cp_class_id)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1733,6 +1797,183 @@ mod tests {
 
         // "bar" not found
         assert!(find_method_recursive(foo_id, "bar", "()V", &store).is_none());
+    }
+
+    /// `invokespecial_selection_start` — the JVMS §6.5 super-call redirect.
+    /// `Grandparent` <- `Parent` (overrides `m`) <- `Child`. `Child`'s
+    /// bytecode does `invokespecial Grandparent.m()V` (the CP entry names
+    /// the ancestor, not the direct superclass — the shape a synthetic
+    /// bridge or a multi-level `super` chain produces). Naive resolution
+    /// starting at `Grandparent` would find `Grandparent.m`, skipping
+    /// `Parent`'s override entirely; the JVMS-correct answer starts the
+    /// search at `Child`'s own direct superclass (`Parent`) and finds
+    /// `Parent.m`.
+    #[test]
+    fn invokespecial_selection_start_redirects_to_callers_direct_superclass() {
+        let mut store = ClassStore::new();
+
+        let grandparent_id = store.next_id();
+        store.add(make_class(
+            grandparent_id,
+            "Grandparent",
+            None,
+            vec![],
+            vec![],
+            vec![make_method("m", "()V")],
+            0,
+            0,
+        ));
+
+        let parent_id = store.next_id();
+        store.add(make_class(
+            parent_id,
+            "Parent",
+            Some(grandparent_id),
+            vec![],
+            vec![],
+            vec![make_method("m", "()V")],
+            0,
+            0,
+        ));
+
+        let child_id = store.next_id();
+        store.add(make_class(
+            child_id,
+            "Child",
+            Some(parent_id),
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        // The CP entry names Grandparent directly.
+        let start =
+            invokespecial_selection_start(child_id, grandparent_id, false, "m", &store);
+        assert_eq!(start, parent_id, "must redirect to the caller's direct superclass");
+
+        let (method, declaring) = find_method_recursive(start, "m", "()V", &store).unwrap();
+        assert_eq!(&*method.name, "m");
+        assert_eq!(declaring, parent_id, "must land on Parent's override, not Grandparent's");
+    }
+
+    /// No redirect for `<init>` — constructors are never subject to the
+    /// super-call selection rule.
+    #[test]
+    fn invokespecial_selection_start_never_redirects_init() {
+        let mut store = ClassStore::new();
+        let object_id = store.next_id();
+        store.add(make_class(
+            object_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![make_method("<init>", "()V")],
+            0,
+            0,
+        ));
+        let child_id = store.next_id();
+        store.add(make_class(
+            child_id,
+            "Child",
+            Some(object_id),
+            vec![],
+            vec![],
+            vec![make_method("<init>", "()V")],
+            0,
+            0,
+        ));
+        let start = invokespecial_selection_start(child_id, object_id, false, "<init>", &store);
+        assert_eq!(start, object_id);
+    }
+
+    /// No redirect for a genuinely ordinary (non-super, e.g. private-method
+    /// or same-class) `invokespecial`: when the CP-referenced class is NOT
+    /// an ancestor of the caller, the plain CP-referenced class is returned
+    /// unchanged.
+    #[test]
+    fn invokespecial_selection_start_no_redirect_when_not_a_superclass() {
+        let mut store = ClassStore::new();
+        let object_id = store.next_id();
+        store.add(make_class(
+            object_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let unrelated_id = store.next_id();
+        store.add(make_class(
+            unrelated_id,
+            "Unrelated",
+            Some(object_id),
+            vec![],
+            vec![],
+            vec![make_method("m", "()V")],
+            0,
+            0,
+        ));
+        let caller_id = store.next_id();
+        store.add(make_class(
+            caller_id,
+            "Caller",
+            Some(object_id),
+            vec![],
+            vec![],
+            vec![make_method("m", "()V")],
+            0,
+            0,
+        ));
+        // `Unrelated` is not a superclass of `Caller` — no redirect.
+        let start = invokespecial_selection_start(caller_id, unrelated_id, false, "m", &store);
+        assert_eq!(start, unrelated_id);
+    }
+
+    /// No redirect for an interface-method reference — JVMS §6.5's redirect
+    /// only applies when the symbolic reference names a class.
+    #[test]
+    fn invokespecial_selection_start_no_redirect_for_interface_reference() {
+        let mut store = ClassStore::new();
+        let object_id = store.next_id();
+        store.add(make_class(
+            object_id,
+            "java/lang/Object",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let iface_id = store.next_id();
+        store.add(make_class(
+            iface_id,
+            "Iface",
+            None,
+            vec![],
+            vec![],
+            vec![make_method("m", "()V")],
+            0,
+            0,
+        ));
+        let child_id = store.next_id();
+        store.add(make_class(
+            child_id,
+            "Child",
+            Some(object_id),
+            vec![iface_id],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        let start = invokespecial_selection_start(child_id, iface_id, true, "m", &store);
+        assert_eq!(start, iface_id);
     }
 
     /// Regression test for the Infinispan `GlobalConfiguration` /

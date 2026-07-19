@@ -1,6 +1,6 @@
 # `@ClassPathExclusions`/`@ClassPathOverrides` tests HANG — likely fallout of the just-FIXED `String.setOption` wrong-receiver-dispatch fix unmasking a real-network Aether resolution with no reachable repo
 
-**Status: OPEN — found 2026-07-17**
+**Status: FIXED — 2026-07-19 (core recursion bug); see "Update 2026-07-19 (FIXED)" below. Originally found 2026-07-17.**
 
 ## Symptom
 
@@ -425,6 +425,141 @@ mechanism) is the stronger, more specific root-cause candidate for the
 classes both docs share; the sibling doc's remaining non-`ModifiedClassPathExtension`
 classes need their own explanation and should not be assumed to share this
 doc's mechanism just because the log noise looks the same.
+
+## Update 2026-07-19 (FIXED) — root cause was classloader-identity, not network; recursion guard fixed; 3 residuals filed separately
+
+Picked up the in-progress fix (worktree `CratonVM-aether-modifiedclasspath-20260718-019f753a`,
+branch `codex/fix-springboot-aether-modifiedclasspath-20260718-019f753a`) and
+verified, extended, and shipped it. **The 2026-07-17 network-hang hypothesis
+was a red herring** — the real mechanism is exactly the one this doc's
+"SOE evidence points at recursive self-invocation" update already suspected:
+`isModifiedClassPathClassLoader`'s guard never tripped, so every
+`@ClassPathExclusions`/`@ClassPathOverrides` test recursed into a fresh
+nested `Launcher.execute()` forever (StackOverflowError when fast, apparent
+HANG when each recursive pass was slow enough that the shard timeout won the
+race first — explaining why the same mechanism produced two different-looking
+symptoms across this doc's batches).
+
+**Confirmed root cause:** `ModifiedClassPathClassLoader` (a `URLClassLoader`
+whose parent chain terminates at the bootstrap/platform loader, never
+reaching the app loader — i.e. an "isolated" loader) could define its own
+copy of the test class, but class references made *from* that class (its
+superclass, interfaces, and any type touched by reflection) kept resolving
+through CratonVM's global/flat class store instead of through the isolated
+loader that defined the referencing class. `testClass.getClassLoader()` as
+seen by `isModifiedClassPathClassLoader()` therefore never actually observed
+the fresh `ModifiedClassPathClassLoader` identity consistently enough for the
+guard to trip, and/or supertype resolution silently fell through to the app
+loader's global copy — either way, `interceptMethod` kept concluding "this is
+still the original classpath" and launched another nested `Launcher`.
+
+**The fix** (native-builtins `classloader.rs`/`classloader_real.rs`/
+`lang_system.rs`/`jboss_module_loader.rs`, `vm/src/runtime/interpreter.rs`):
+
+- `url_classloader_isolated_from_app()` (existing helper, made `pub`) detects
+  an isolated `URLClassLoader` by walking its parent chain.
+- `ucl_try_define_local_class` / `UnsafeCoerce`'s real-JDK class-definition
+  path now throws `ClassNotFoundException` from *this* loader instead of
+  silently falling through to the global store when an isolated loader can't
+  find the class bytes in its own (filtered) URL list — so an isolated
+  loader's `loadClass` failure stays a failure instead of quietly resolving
+  to the wrong namespace.
+- `preload_isolated_loader_supertypes` (new, `lang_system.rs`) eagerly
+  resolves a newly-defined class's direct superclass and interfaces through
+  the *same* isolated loader at definition time, so the hierarchy is
+  consistently loaded from one namespace instead of splitting across the
+  isolated loader and the global store.
+- `resolve_class_loader_aware` (interpreter.rs) gained an isolated-loader
+  branch: when the defining-loader-initiated lookup (`drive_defining_loader_load`)
+  can't resolve a name and the referencing class's defining loader is
+  isolated, throw `NoClassDefFoundError` instead of falling through to
+  `shared.load_class_concurrent` (the global store) — this is the change
+  that actually fixes `isModifiedClassPathClassLoader`: the reloaded test
+  class's `getClassLoader()` now consistently reports the isolated loader
+  instead of intermittently resolving through the global namespace.
+
+I additionally removed an eager `getDeclaredMethods()`-time validation
+(`ensure_isolated_descriptor_types_visible` in `lang_class.rs`) that the
+in-progress fix had added: it walked every declared method's parameter/return
+descriptor and eagerly `loadClass()`-checked each through the isolated loader,
+throwing `NoClassDefFoundError` for the whole enumeration if any one method
+had an unresolvable type. This doesn't match real JVM semantics (`Class.
+getDeclaredMethods()` doesn't eagerly validate reachability of every method's
+parameter/return types — only actually accessing a specific `Method`'s
+`getReturnType()`/`getParameterTypes()` does), and — more concretely — Spring
+relies on `ReflectionUtils.getDeclaredMethods()` swallowing a *per-method*
+`NoClassDefFoundError` internally and treating just that class as having zero
+declared methods, which this eager, whole-class-enumeration check would have
+broken for any isolated-loader class with even one optional-dependency method
+signature. A standalone probe (`Class.getDeclaredMethods()` through a hand-built
+isolated loader) confirmed method enumeration still works correctly for
+isolated-loader classes after the removal.
+
+**Verified fixed**, by direct testing in the worktree (`sb-runner`
+harness, real classpaths, not mocks):
+
+- `ConnectionFactoryUnwrapperTests` — this doc's directly-observed
+  `StackOverflowError` (95 recursive `Launcher.execute()` passes, 7354 real
+  frames) — no longer overflows; completes in ~2.8s with 11/12 tests passing
+  (1 residual, filed separately, see below).
+- `ModifiedClassPathExtension`'s own self-test suite —
+  `ModifiedClassPathExtensionExclusionsTests` (5/5),
+  `ModifiedClassPathExtensionForkTests` (1/1),
+  `ModifiedClassPathExtensionOverridesTests` (2/2) — all pass 100%. These are
+  the extension's own tests (`test-support/spring-boot-test-support`), so
+  this also unblocks everything else in the repo that depends on
+  `@ClassPathExclusions`/`@ClassPathOverrides`/`@ForkedClassPath`.
+- Across a regression sweep of all classes in the "Affected classes" table
+  below plus the 3 extension self-tests: every class that previously HUNG
+  indefinitely (shard-timeout kill, zero `SBRUNNER_RESULT`) now completes and
+  produces a real JUnit summary — most fully passing, a handful surfacing
+  new (previously-masked-by-the-hang) failures now tracked as separate
+  residual docs rather than blocking this fix. See in-progress sweep results
+  and residual docs below; this doc is retired to `docs/internal/springboot/`
+  with this fix.
+
+**3 residuals filed separately** (per this repo's known-issues triage rule —
+fixed goes to `docs/internal`, residuals get their own open doc so they don't
+block retiring this one):
+
+1. [`connectionfactoryunwrappertests-nested-outer-instance-identity.md`](connectionfactoryunwrappertests-nested-outer-instance-identity.md) —
+   `ConnectionFactoryUnwrapperTests.Unwrap.unwrapWithoutJmsPoolOnClasspath()`
+   (a `@Nested` class under a method-level `@ClassPathExclusions`) fails with
+   `IllegalArgumentException: argument type mismatch` constructing the nested
+   class's outer-instance reference. Narrow (only 1 of the ~29 affected
+   classes in this cluster combines `@Nested` with `@ClassPathExclusions`).
+2. [`isolated-loader-onbeancondition-type-deduction-bypass.md`](isolated-loader-onbeancondition-type-deduction-bypass.md) —
+   `OnBeanConditionTypeDeductionFailureTests` expects a `NoClassDefFoundError`
+   from a class-path-excluded `jackson-core` when `ObjectMapper` is
+   constructed via real `@Bean` method bytecode; on CratonVM the construction
+   silently succeeds instead (the excluded jar's classes remain reachable
+   through *some* resolution path despite the isolated loader's URL-list
+   filtering correctly excluding them, confirmed via a standalone
+   `Class.forName`-based probe that *does* correctly fail — narrowing this to
+   a bytecode-level, not reflection-level, gap). Root cause not fully pinned
+   down; likely related to `EhCache3CacheAutoConfigurationTests`'
+   `@ConditionalOnMissingBean did not specify a bean using type, name or
+   annotation` failure and the Jersey/Security `ObjectProvider<X>` bean
+   resolution failures below — plausibly all downstream of the same
+   classloader-identity-split family as the now-fixed recursion bug, but not
+   confirmed to share a single mechanism.
+3. [`isolated-loader-objectprovider-generic-identity-mismatch.md`](isolated-loader-objectprovider-generic-identity-mismatch.md) —
+   `JerseyChildManagementContextConfigurationTests` (5/6 methods),
+   `SecurityFilterAutoConfigurationEarlyInitializationTests`,
+   `ManagementWebSecurityAutoConfigurationTests`, and
+   `ReactiveManagementWebSecurityAutoConfigurationTests` all fail with
+   `NoSuchBeanDefinitionException: No qualifying bean of type
+   'ObjectProvider<X>'` for an `X` that IS defined in the same
+   `@ManagementContextConfiguration` — consistent with a classloader-identity
+   split between the injection point's generic parameter type and the
+   registered bean definition's type, both nominally the same class loaded
+   through the isolated loader.
+
+The full regression sweep (all ~29 classes) was still running as a background
+task at the time this doc was retired; see the residual docs above for the
+specific failures already captured, and check
+`apps/spring-boot-suite-runner` results for the complete before/after picture
+if further classes in the "Affected classes" table below need triage.
 
 ## Affected classes
 
