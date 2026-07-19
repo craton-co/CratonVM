@@ -14408,6 +14408,26 @@ fn invoke_on_class_shared_inner(
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
                         ) && method_name == "addURL"
                             && descriptor == "(Ljava/net/URL;)V")
+                        // `java.nio.file.Path` declares no `toString()` body of its
+                        // own (it's an interface); real dispatch resolves to
+                        // `java.lang.Object.toString()` instead of the registered
+                        // native (`register_phase57_nio_file`'s `Path.toString()`),
+                        // producing the garbage default-Object form
+                        // (`java.nio.file.Path@1a2b3c`) instead of the actual
+                        // jar-FS/host path. In-process `javac`'s
+                        // `JavacFileManager.inferBinaryName` native fast path calls
+                        // `path.toString()` on every `PathFileObject$JarFileObject`
+                        // classpath entry and mangled that garbage into the literal
+                        // binary name `java.nio.file` for every ordinary
+                        // (non-JRT/non-directory) classpath class, breaking
+                        // symbol resolution for any real in-process javac compile
+                        // referencing an application-classpath class (Spring's
+                        // `TestCompiler`/AOT test generation — e.g.
+                        // `ServletComponentScanRegistrarTests`). Keep in sync with
+                        // `force_native_over_real_jdk_bytecode`.
+                        || (class_name == "java/nio/file/Path"
+                            && method_name == "toString"
+                            && descriptor == "()Ljava/lang/String;")
                         // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
                         // of `Log4jLoggerFactory.getContext` calls
                         // `LogManager.getFactory().isClassLoaderDependent()`

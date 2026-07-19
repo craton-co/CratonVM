@@ -24865,6 +24865,41 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own (nor `equals`/`hashCode`, but those aren't implicated here) —
+    // real method resolution for `someSyntheticPathObj.toString()` walks up to
+    // `java.lang.Object`, the only class in the chain that actually declares
+    // `toString()` with a Code attribute. Without an entry here keyed on
+    // `java/nio/file/Path` itself, that resolved declaring class
+    // (`java/lang/Object`) is what gets checked against this gate — never
+    // matches — so real `Object.toString()` runs (`getClass().getName() + "@"
+    // + hashCode`) instead of the registered native
+    // (`native-builtins::phases_late::register_phase57_nio_file`'s
+    // `Path.toString()`, which correctly renders the jar-FS/host path).
+    // `redefine_immune_path_native` below already anticipated this exact
+    // (class, method) pair for the Mockito-redefine-immunity check, but the
+    // actual force-native entry that makes it relevant was never added —
+    // this closes that gap. Concretely this broke real javac's in-process
+    // `JavacFileManager.inferBinaryName` for every `PathFileObject$JarFileObject`
+    // classpath entry: its native fast path (`native_javac_file_manager_infer_binary_name`)
+    // calls `path.toString()` expecting the in-jar relative path (e.g.
+    // `/org/springframework/beans/factory/config/BeanDefinition.class`) but
+    // got the garbage `Object.toString()` form (`java.nio.file.Path@1a2b3c`)
+    // instead, which `javac_binary_name_from_relative_path` then mangled into
+    // the literal binary name `java.nio.file` for EVERY application-classpath
+    // class file — so `TestCompiler`/any real in-process `javac` compile of
+    // source referencing an ordinary (non-JRT) classpath class failed with
+    // "cannot find symbol", even for basic classes like
+    // `org.springframework.beans.factory.support.RootBeanDefinition`
+    // (`ServletComponentScanRegistrarTests
+    // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`).
+    if class_name == "java/nio/file/Path"
+        && method_name == "toString"
+        && method_descriptor == "()Ljava/lang/String;"
+    {
+        return true;
+    }
+
     // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
@@ -29206,6 +29241,43 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
+            // its own local exception handlers, even when it never directly
+            // `athrow`s. `compile_with_param_slots` below has no
+            // exception-table parameter, so an OSR artifact NEVER carries
+            // handler ranges: a callee exception unwinding into this
+            // OSR-compiled frame finds no catch and escapes uncaught, even
+            // though a `catch` block textually guards the call. This was
+            // masked while methods with `ldc` string constants were
+            // unconditionally OSR-denied (fixed in d6f642695); once that
+            // denial was lifted, any hot-loop method with a trailing
+            // try/catch around a throwing call (e.g. a servlet's
+            // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
+            // silently stopped catching. Permanent for this bytecode, like
+            // the sibling RBC bails above.
+            let has_exception_handlers = match shared.class_manager.read().get_class(class_id) {
+                Some(class) => class
+                    .methods
+                    .iter()
+                    .find(|m| {
+                        &*m.name == method_name_check
+                            && &*m.descriptor == method_descriptor.as_str()
+                    })
+                    .and_then(|m| {
+                        m.attributes.iter().find_map(|a| match a.as_decoded() {
+                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                Some(!ca.exception_table.is_empty())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or(false),
+                None => false,
+            };
+            if has_exception_handlers {
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
                 return None;
             }
             // 2026-07-10 BC-crypto session: OSR of `GOST3412_2015Engine.
