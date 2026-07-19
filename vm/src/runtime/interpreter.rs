@@ -24865,6 +24865,41 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
 
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own (nor `equals`/`hashCode`, but those aren't implicated here) —
+    // real method resolution for `someSyntheticPathObj.toString()` walks up to
+    // `java.lang.Object`, the only class in the chain that actually declares
+    // `toString()` with a Code attribute. Without an entry here keyed on
+    // `java/nio/file/Path` itself, that resolved declaring class
+    // (`java/lang/Object`) is what gets checked against this gate — never
+    // matches — so real `Object.toString()` runs (`getClass().getName() + "@"
+    // + hashCode`) instead of the registered native
+    // (`native-builtins::phases_late::register_phase57_nio_file`'s
+    // `Path.toString()`, which correctly renders the jar-FS/host path).
+    // `redefine_immune_path_native` below already anticipated this exact
+    // (class, method) pair for the Mockito-redefine-immunity check, but the
+    // actual force-native entry that makes it relevant was never added —
+    // this closes that gap. Concretely this broke real javac's in-process
+    // `JavacFileManager.inferBinaryName` for every `PathFileObject$JarFileObject`
+    // classpath entry: its native fast path (`native_javac_file_manager_infer_binary_name`)
+    // calls `path.toString()` expecting the in-jar relative path (e.g.
+    // `/org/springframework/beans/factory/config/BeanDefinition.class`) but
+    // got the garbage `Object.toString()` form (`java.nio.file.Path@1a2b3c`)
+    // instead, which `javac_binary_name_from_relative_path` then mangled into
+    // the literal binary name `java.nio.file` for EVERY application-classpath
+    // class file — so `TestCompiler`/any real in-process `javac` compile of
+    // source referencing an ordinary (non-JRT) classpath class failed with
+    // "cannot find symbol", even for basic classes like
+    // `org.springframework.beans.factory.support.RootBeanDefinition`
+    // (`ServletComponentScanRegistrarTests
+    // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`).
+    if class_name == "java/nio/file/Path"
+        && method_name == "toString"
+        && method_descriptor == "()Ljava/lang/String;"
+    {
+        return true;
+    }
+
     // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
