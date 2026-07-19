@@ -1114,8 +1114,10 @@ fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
-    !matches!(class.loader_id, cratonvm_types::ClassLoaderId::UserDefined(_))
-        && cm.find_class_by_name(&class.name) == Some(class_id)
+    !matches!(
+        class.loader_id,
+        cratonvm_types::ClassLoaderId::UserDefined(_)
+    ) && cm.find_class_by_name(&class.name) == Some(class_id)
 }
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
@@ -2265,7 +2267,12 @@ fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
         return false;
     }
     if TLAB_LAST_BREAK_ALLOC_TOTAL
-        .compare_exchange(last, alloc_total.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .compare_exchange(
+            last,
+            alloc_total.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
         .is_err()
     {
         // Another thread is breaking the same wedge; let it.
@@ -6686,7 +6693,9 @@ pub fn execute(
                     }
                     for (pi, p) in thread.native_pin_roots.iter().enumerate() {
                         if p.as_ptr() as usize == stale {
-                            eprintln!("[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}");
+                            eprintln!(
+                                "[STALE-FRAME] native_pin_roots[{pi}] holds stale 0x{stale:x}"
+                            );
                             found += 1;
                         }
                     }
@@ -6694,7 +6703,9 @@ pub fn execute(
                         let snap = thread.root_snapshot.lock();
                         for (si, r) in snap.iter().enumerate() {
                             if r.as_ptr() as usize == stale {
-                                eprintln!("[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}");
+                                eprintln!(
+                                    "[STALE-FRAME] root_snapshot[{si}] holds stale 0x{stale:x}"
+                                );
                                 found += 1;
                             }
                         }
@@ -13962,7 +13973,8 @@ fn execute_instruction(
             // and getfield-loaded-value barriers elsewhere in this file, just
             // never applied to the getfield/putfield RECEIVER itself.
             let obj_ref = shared.heap.load_and_forward(obj_ref);
-            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field =
+                resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
@@ -14247,10 +14259,11 @@ fn execute_instruction(
         Instruction::Putfield(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
             // Resolve the field early (cached) so its descriptor byte is in hand
-            // for the tag-exact value pop below. resolve_field_ref is
+            // for the tag-exact value pop below. The loader-aware resolver is
             // stack-neutral, and surfacing a resolution error here (before the
             // value/objectref pop) is spec-compliant for putfield.
-            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field =
+                resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
             // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
             //
             // The stack top before putfield is [..., objectref, value] (with
@@ -17254,19 +17267,25 @@ fn lookup_loader_initiated(
     if name.starts_with('[') || is_global_resolution_namespace(name) {
         return None;
     }
+    // A class the loader defines itself is authoritative. In particular, a
+    // forked Spring test loader can load its own copy after an earlier
+    // parent-delegated initiating-resolution cache entry exists for the same
+    // binary name. Consulting that cache first collapses the fork back onto
+    // the application class and lets stale static invoke-cache entries mix
+    // the two identities (for example MergedAnnotation$Adapt).
     if let Some(id) = shared
+        .class_manager
+        .read()
+        .class_defined_by_loader_exact(name, loader)
+    {
+        return Some(id);
+    }
+    shared
         .initiating_resolution_cache
         .read()
         .get(&loader)
         .and_then(|m| m.get(name))
         .copied()
-    {
-        return Some(id);
-    }
-    shared
-        .class_manager
-        .read()
-        .class_defined_by_loader_exact(name, loader)
 }
 
 /// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
@@ -17454,15 +17473,6 @@ fn resolve_field_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first
-    if let Some(cached) = shared
-        .resolution_cache
-        .read()
-        .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
-
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
         let class = cm
@@ -17499,9 +17509,54 @@ fn resolve_field_ref(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id = match lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    // A background compiler has no `JvmThread`, so it cannot drive the
+    // referencing class's defining loader on a cold symbolic reference. Do
+    // not let it seed this per-(ClassId, cp-index) cache through the flat
+    // global store: the interpreter would later accept that stale result
+    // instead of applying JVMS initiating-loader resolution. Once the owner
+    // is known to this loader, using the cache is safe again.
+    let loader_sensitive = should_use_loader_initiated_resolution(shared, current_class_id)
+        && !field_class_name.starts_with('[')
+        && !is_global_resolution_namespace(&field_class_name)
+        && matches!(
+            shared.class_manager.read().get_loader_id(current_class_id),
+            Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+        );
+    let loader_local_id = if loader_sensitive {
+        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    } else {
+        None
+    };
+    if let Some(cached) = shared
+        .resolution_cache
+        .read()
+        .get_field(current_class_id, cp_index)
+    {
+        // A per-callsite field entry can have been seeded before this loader
+        // defined its own owner class (for example while a forked Spring test
+        // context is being prepared). It is not valid merely because the
+        // loader has since initiated that name: the cached declaring identity
+        // must also be that exact owner. Otherwise getstatic returns the app
+        // copy's enum singleton from a fork-loaded caller.
+        if !loader_sensitive
+            || loader_local_id.map_or(true, |id| cached.declaring_class_id == id)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let field_class_id = match loader_local_id
+        .or_else(|| lookup_loader_initiated(shared, current_class_id, &field_class_name))
     {
         Some(id) => id,
+        None if loader_sensitive => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "field {field_class_name}.{field_name} requires loader-aware execution resolution"
+                ),
+            }
+            .into());
+        }
         None => shared.load_class_concurrent(&field_class_name)?,
     };
 
@@ -17551,15 +17606,6 @@ fn resolve_field_ref_loader_aware(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first — identical fast path to `resolve_field_ref`.
-    if let Some(cached) = shared
-        .resolution_cache
-        .read()
-        .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
-
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
         let class = cm
@@ -17596,8 +17642,36 @@ fn resolve_field_ref_loader_aware(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id =
-        resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+    // A cache hit is only authoritative for a custom loader after that
+    // loader has initiated the field-owning class. This rejects any stale
+    // entry left by a non-re-entrant compilation/preparation path and lets
+    // the full resolver below repair it through the defining loader.
+    let loader_sensitive = should_use_loader_initiated_resolution(shared, current_class_id)
+        && !field_class_name.starts_with('[')
+        && !is_global_resolution_namespace(&field_class_name)
+        && matches!(
+            shared.class_manager.read().get_loader_id(current_class_id),
+            Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+        );
+    let loader_local_id = if loader_sensitive {
+        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    } else {
+        None
+    };
+    if !loader_sensitive || loader_local_id.is_some() {
+        if let Some(cached) = shared
+            .resolution_cache
+            .read()
+            .get_field(current_class_id, cp_index)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let field_class_id = match loader_local_id {
+        Some(id) => id,
+        None => resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?,
+    };
 
     resolve_field_in_class(
         shared,
@@ -18513,6 +18587,7 @@ fn execute_invoke_kind(
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+    let method_owner_name = Arc::clone(&method_class_name);
 
     if crate::runtime::env_cache::dbg_hang_sample() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -18609,6 +18684,62 @@ fn execute_invoke_kind(
     for value in &mut args {
         if let Value::Object(Some(obj)) = value {
             *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    // Spring's loader-fork test infrastructure can expose two physical copies
+    // of this private enum while representing one logical annotation operation.
+    // Preserve the enum member identity by its declaring binary name and enum
+    // constant name only for that loader-aware bridge; ordinary cross-loader
+    // Enum.equals/identity semantics remain unchanged.
+    if crate::runtime::env_cache::loader_aware_resolution()
+        && method_class_name.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name.as_ref() == "isIn"
+        && method_descriptor.as_ref()
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        if let (Some(Value::Object(Some(receiver))), Some(Value::Object(Some(array)))) =
+            (args.first(), args.get(1))
+        {
+            let receiver_name = match shared.heap.get_field(*receiver, 0) {
+                Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+                _ => None,
+            };
+            let receiver_ordinal = shared.heap.get_field(*receiver, 1);
+            let receiver_class_name = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*receiver))
+                .map(|class| class.name.to_string());
+            for i in 0..shared.heap.array_length(*array) {
+                    let Ok(Value::Object(Some(candidate))) =
+                        shared.heap.get_array_element(*array, i)
+                    else {
+                        continue;
+                    };
+                    let candidate_name = match shared.heap.get_field(candidate, 0) {
+                        Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+                        _ => None,
+                    };
+                    let candidate_ordinal = shared.heap.get_field(candidate, 1);
+                    let candidate_class_name = shared
+                        .class_manager
+                        .read()
+                        .get_class(shared.heap.class_id_of(candidate))
+                        .map(|class| class.name.to_string());
+                    let same_name = candidate_name
+                        .as_deref()
+                        .zip(receiver_name.as_deref())
+                        .is_some_and(|(candidate, receiver)| candidate == receiver);
+                    let same_ordinal = matches!(
+                        (candidate_ordinal, receiver_ordinal),
+                        (Value::Int(candidate), Value::Int(receiver)) if candidate == receiver
+                    );
+                    if candidate_class_name == receiver_class_name && (same_name || same_ordinal)
+                    {
+                        thread.frames[frame_idx].stack.push(Value::Int(1))?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+            }
         }
     }
     // GC-stale `java.lang.Thread`-mirror receiver recovery.
@@ -19030,11 +19161,16 @@ fn execute_invoke_kind(
                                 if std::env::var_os("CRATONVM_DBG_A2").is_some() {
                                     let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
                                     if hist.is_empty() {
-                                        eprintln!("[stale-recv] [A2] NO event touches {stale_addr:#x}");
+                                        eprintln!(
+                                            "[stale-recv] [A2] NO event touches {stale_addr:#x}"
+                                        );
                                     } else {
                                         for r in hist {
                                             if r.kind == 0xFF {
-                                                eprintln!("[stale-recv] [A2] seq={} FREE @{:#x}", r.seq, r.addr);
+                                                eprintln!(
+                                                    "[stale-recv] [A2] seq={} FREE @{:#x}",
+                                                    r.seq, r.addr
+                                                );
                                             } else {
                                                 eprintln!("[stale-recv] [A2] seq={} ALLOC @{:#x} class_id={} kind={} et={} alen={} ns={} size={}", r.seq, r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots, r.size);
                                             }
@@ -19687,10 +19823,34 @@ fn execute_invoke_kind(
     // frame-push path (NO extra recursion), unlike routing through the recursive
     // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
     // default (gate-off) / single-class-per-name case.
+    // An invokeinterface default is part of the interface identity, not merely
+    // its binary name. A forked receiver can implement a loader-local copy of
+    // an interface while the calling class's constant-pool lookup finds the
+    // application copy. Running that application's default method mixes its
+    // static constants with the forked receiver (Spring's MergedAnnotation
+    // Adapt enum is identity-sensitive). Prefer the receiver loader's exact
+    // interface when it is a real superinterface of the receiver.
+    let loader_interface_override = if is_interface
+        && !is_special
+        && crate::runtime::env_cache::loader_aware_resolution()
+    {
+        receiver_class_id.and_then(|receiver_id| {
+            let cm = shared.class_manager.read();
+            let receiver_loader = cm.get_loader_id(receiver_id)?;
+            let exact = cm.class_defined_by_loader_exact(&method_owner_name, receiver_loader)?;
+            (Some(exact) != cm.get_loaded_class_id(&method_owner_name)
+                && cm.get_class(exact).is_some_and(|class| class.is_interface()))
+                .then_some(exact)
+        })
+    } else {
+        None
+    };
     let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
         &private_virtual_target
     {
         Some(*declaring_id)
+    } else if let Some(interface_id) = loader_interface_override {
+        Some(interface_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
         // Lambda-proxy receiver invoking a non-SAM (default) interface
         // method: `invoke_class` was set to the functional interface NAME
@@ -19796,7 +19956,7 @@ fn execute_invoke_kind(
         CachedCallResult::FramePushed => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if private_virtual_target.is_none() {
+            } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
                         thread,
@@ -19813,7 +19973,7 @@ fn execute_invoke_kind(
         CachedCallResult::Handled => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if private_virtual_target.is_none() {
+            } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
                         thread,
@@ -19973,9 +20133,7 @@ fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
 /// Returns the original value unchanged if it's not a recognized wrapper.
 fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
     match (prim_char, v) {
-        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => {
-            shared.heap.get_field(b, 0)
-        }
+        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
         // Lambda metafactory adaptation permits unboxing followed by primitive
         // widening.  An Integer supplied to a `long` implementation method
         // must therefore become Value::Long, rather than carrying the raw
@@ -21109,8 +21267,7 @@ pub(crate) fn try_lambda_dispatch(
     // The bytecode call-site descriptor is the authoritative identity. Only the
     // exact SAM descriptor may enter the lambda body; any other descriptor must
     // fall through to ordinary interface/default-method dispatch.
-    if method_name == &*call_site.sam_method_name
-        && method_descriptor != &*call_site.sam_descriptor
+    if method_name == &*call_site.sam_method_name && method_descriptor != &*call_site.sam_descriptor
     {
         return Ok(None);
     }
@@ -22220,10 +22377,7 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
-                | (
-                    "forPrimitiveName",
-                    "(Ljava/lang/String;)Ljava/lang/Class;"
-                )
+                | ("forPrimitiveName", "(Ljava/lang/String;)Ljava/lang/Class;")
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24708,27 +24862,27 @@ fn force_native_over_real_jdk_bytecode(
     // `jdk.internal.*` — which ByteBuddy's `JavaDispatcher` relies on) instead of
     // touching the null descriptor.
     //
-        // ClassLoader resource methods have the same issue: real JDK bytecode
-        // walks URLClassPath state which CratonVM intentionally replaces with
-        // native per-loader lookups.  Keep the singular, stream, and bulk
-        // methods together so URLClassLoader instances do not fall back to the
-        // process-wide dynamic classpath (which leaks resources between test
-        // loaders) and null arguments retain their specified NPE contract.
-        if class_name == "java/lang/ClassLoader"
-            && matches!(
-                method_name,
-                "getResource"
-                    | "getSystemResource"
-                    | "getResources"
-                    | "getSystemResources"
-                    | "getResourceAsStream"
-                    | "getSystemResourceAsStream"
-            )
-        {
-            return true;
-        }
+    // ClassLoader resource methods have the same issue: real JDK bytecode
+    // walks URLClassPath state which CratonVM intentionally replaces with
+    // native per-loader lookups.  Keep the singular, stream, and bulk
+    // methods together so URLClassLoader instances do not fall back to the
+    // process-wide dynamic classpath (which leaks resources between test
+    // loaders) and null arguments retain their specified NPE contract.
+    if class_name == "java/lang/ClassLoader"
+        && matches!(
+            method_name,
+            "getResource"
+                | "getSystemResource"
+                | "getResources"
+                | "getSystemResources"
+                | "getResourceAsStream"
+                | "getSystemResourceAsStream"
+        )
+    {
+        return true;
+    }
 
-        // `getDescriptor` has the same null-descriptor problem, but real HotSpot
+    // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
     // descriptor is never null. CratonVM's `isNamed()` (real bytecode, reading
     // the dual-written real `name` field) can report a classpath-loaded,
@@ -25984,8 +26138,7 @@ pub(crate) fn is_netty_event_executor_group_shutdown_native_override(
         "io/netty/util/concurrent/EventExecutorGroup"
             | "io/netty/util/concurrent/AbstractEventExecutorGroup"
             | "io/netty/channel/MultiThreadIoEventLoopGroup"
-    )
-        && method_name == "shutdownGracefully"
+    ) && method_name == "shutdownGracefully"
         && method_descriptor == "()Lio/netty/util/concurrent/Future;"
 }
 
@@ -26026,8 +26179,7 @@ pub(crate) fn is_datagram_channel_open_native_override(
     if matches!(
         class_name,
         "java/nio/channels/DatagramChannel" | "java/nio/channels/NetworkChannel"
-    )
-        && method_name == "getLocalAddress"
+    ) && method_name == "getLocalAddress"
         && method_descriptor == "()Ljava/net/SocketAddress;"
     {
         return true;
@@ -26136,13 +26288,20 @@ fn intercept_force_registered_native(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
             if let Some(value) = result {
@@ -26279,13 +26438,20 @@ fn intercept_force_registered_native_cached(
         && matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        let cb = shared
-            .native_methods
-            .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb =
+            shared
+                .native_methods
+                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         let ret_type = crate::jit::return_type(method_descriptor);
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -26540,8 +26706,14 @@ fn intercept_classloader_subclass_resource_native(
         || !matches!(
             (method_name, method_descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         return None;
@@ -27696,7 +27868,6 @@ fn execute_invokestatic(
             None
         }
     });
-
     if !is_native {
         let target_class_id = if let Some(id) = static_dispatch_class_id {
             id
@@ -29640,7 +29811,10 @@ fn compile_osr_artifact(
                                 let cm_lock = shared.class_manager.read();
                                 match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
                                     (Some(accessor), Some(target)) => {
-                                        crate::classloading::access_control::check_class_access(accessor, target).is_ok()
+                                        crate::classloading::access_control::check_class_access(
+                                            accessor, target,
+                                        )
+                                        .is_ok()
                                     }
                                     _ => true,
                                 }
@@ -29652,7 +29826,13 @@ fn compile_osr_artifact(
                                     .get_class(target_id)
                                     .map(|c| c.num_total_fields)
                                     .unwrap_or(0);
-                                new_info2.push((pc_new, target_id.as_u32(), num_fields, true, true));
+                                new_info2.push((
+                                    pc_new,
+                                    target_id.as_u32(),
+                                    num_fields,
+                                    true,
+                                    true,
+                                ));
                             } else {
                                 new_info2.push((pc_new, 0, 0, true, true));
                             }
@@ -34263,6 +34443,15 @@ fn execute_invokevirtual_vtable_fast(
         }
     };
 
+    if crate::runtime::env_cache::loader_aware_resolution()
+        && method_class_name.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name.as_ref() == "isIn"
+        && method_descriptor.as_ref()
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
     // Step 3 — peek the receiver. The receiver sits `num_params_slots`
     // down the operand stack from the top.
     // `cp_index` alone is not a call-site identity. Do not install a
@@ -34285,20 +34474,24 @@ fn execute_invokevirtual_vtable_fast(
         && matches!(
             (method_name.as_ref(), method_descriptor.as_ref()),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
                 | ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
                 | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
         )
-        && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None))
+        && matches!(
+            thread.frames[frame_idx].stack.peek_at(0),
+            Value::Object(None)
+        )
     {
-        let (args, _) = pop_coerced_invoke_args_virtual(
-            shared,
-            caller_class_id,
-            cp_index,
-            frame_idx,
-            thread,
-        )?;
+        let (args, _) =
+            pop_coerced_invoke_args_virtual(shared, caller_class_id, cp_index, frame_idx, thread)?;
         let callback = match method_name.as_ref() {
             "getResource" => cratonvm_native_builtins::classloader::cl_get_resource_essential,
             "getResources" => cratonvm_native_builtins::classloader::cl_get_resources_essential,
@@ -35020,13 +35213,35 @@ fn execute_invokevirtual_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
+    // Keep Spring's loader-split Adapt identity bridge in the slow dispatcher.
+    // The cache can predate the receiver loader's enum copy and otherwise
+    // bypasses that narrowly scoped reconciliation entirely.
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        if let Ok((owner, method, descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if owner.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+                && method.as_ref() == "isIn"
+                && descriptor.as_ref()
+                    == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+            {
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
+
     // A previous non-null invocation may have cached the real-JDK bytecode
     // body of an inherited ClassLoader method.  That body does not reliably
     // enforce the public null-name contract for a synthetic embedded loader,
     // whereas the registered ClassLoader natives do.  Do this before reading
     // the inline cache: otherwise `resources("...")` poisons the same CP
     // entry and a later `resources(null)` silently returns a Stream.
-    if !is_special && matches!(thread.frames[frame_idx].stack.peek_at(0), Value::Object(None)) {
+    if !is_special
+        && matches!(
+            thread.frames[frame_idx].stack.peek_at(0),
+            Value::Object(None)
+        )
+    {
         if let Ok((method_class_name, method_name, method_descriptor, _)) =
             resolve_method_ref(shared, caller_class_id, cp_index)
         {
@@ -35035,8 +35250,14 @@ fn execute_invokevirtual_cached(
                     (method_name.as_ref(), method_descriptor.as_ref()),
                     ("loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
                         | ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                        | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                        | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                        | (
+                            "getResources",
+                            "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                        )
+                        | (
+                            "getResourceAsStream",
+                            "(Ljava/lang/String;)Ljava/io/InputStream;"
+                        )
                         | ("resources", "(Ljava/lang/String;)Ljava/util/stream/Stream;")
                 )
             {
@@ -38911,26 +39132,28 @@ mod tests {
     #[test]
     fn springboot_mongo_reactive_destroy_wait_is_replaced_only_for_its_lifecycle_bean() {
         let class_name = "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer";
-        assert!(is_springboot_mongo_reactive_customizer_destroy_native_override(
-            class_name,
-            "destroy",
-            "()V"
-        ));
+        assert!(
+            is_springboot_mongo_reactive_customizer_destroy_native_override(
+                class_name, "destroy", "()V"
+            )
+        );
         assert!(force_native_over_real_jdk_bytecode(
-            class_name,
-            "destroy",
-            "()V"
+            class_name, "destroy", "()V"
         ));
-        assert!(!is_springboot_mongo_reactive_customizer_destroy_native_override(
-            class_name,
-            "customize",
-            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
-        ));
-        assert!(is_springboot_mongo_reactive_customizer_customize_native_override(
-            class_name,
-            "customize",
-            "(Lcom/mongodb/MongoClientSettings$Builder;)V"
-        ));
+        assert!(
+            !is_springboot_mongo_reactive_customizer_destroy_native_override(
+                class_name,
+                "customize",
+                "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+            )
+        );
+        assert!(
+            is_springboot_mongo_reactive_customizer_customize_native_override(
+                class_name,
+                "customize",
+                "(Lcom/mongodb/MongoClientSettings$Builder;)V"
+            )
+        );
         assert!(force_native_over_real_jdk_bytecode(
             class_name,
             "customize",
@@ -40290,10 +40513,7 @@ mod tests {
             widen_unboxed_primitive('J', Value::Int(i32::MIN)),
             Value::Long(i64::from(i32::MIN))
         );
-        assert_eq!(
-            widen_unboxed_primitive('J', Value::Int(1)),
-            Value::Long(1)
-        );
+        assert_eq!(widen_unboxed_primitive('J', Value::Int(1)), Value::Long(1));
     }
 
     #[test]

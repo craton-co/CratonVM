@@ -10634,8 +10634,14 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
     r.register(isa, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let port = args[1].as_int().unwrap_or(0);
-        let host = Value::Object(Some(ctx.create_string("0.0.0.0")));
-        p52_isa_set(ctx, this, host, Value::Object(None), port);
+        // `new InetSocketAddress(port)` delegates to the `(InetAddress, int)`
+        // constructor with a null address. The JDK substitutes the resolved
+        // wildcard address rather than creating an unresolved socket address.
+        // Keeping this null made `getAddress()` return null and caused
+        // RecordableServerHttpRequestTests.getRemoteAddress() to NPE.
+        let addr = crate::net_phase_e::alloc_inet_address_external(ctx, "0.0.0.0", "0.0.0.0");
+        let host = p52_isa_host_from_addr(ctx, addr);
+        p52_isa_set(ctx, this, host, Value::Object(Some(addr)), port);
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
