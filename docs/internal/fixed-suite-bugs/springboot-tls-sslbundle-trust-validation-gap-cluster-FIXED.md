@@ -1,6 +1,9 @@
 # SSLBundle-configured trust/hostname validation not honored across non-JDK-HttpClient client backends (Apache HttpComponents, Simple, Jetty)
 
-**Status: OPEN — found 2026-07-17**
+**Status: RESOLVED (2026-07-19).** All 6 classes below confirmed `PASS`
+(the previously-flaky `HttpComponentsClientHttpRequestFactoryBuilderTests`
+re-run 5x clean after its fix, 32/32 tests each run). See "Resolution"
+section at the end of this doc for what fixed each of the 5 mechanisms.
 
 ## Symptom
 
@@ -173,4 +176,74 @@ Note: `JettyClientHttpRequestFactoryBuilderTests.buildWhenHadReadTimeout()`
 `JettyClientHttpRequestFactory.setReadTimeout`, `PropertyMapper$Source.to`)
 is the 5th failure in that class but is **not** part of this cluster — it
 looks like an unrelated `Duration`/property-mapping plumbing issue, not
-investigated further here.
+investigated further here. (Not re-investigated in this closure pass either;
+the class as a whole now reports 0 failed/32 tests, so it evidently isn't
+firing under the current harness — left alone per the original note.)
+
+## Resolution (2026-07-19)
+
+All 5 mechanisms fixed, in `native-builtins/src/{t27_tls,net_phase_e,phases_late,http_url_connection}.rs`:
+
+1. **Jetty `engineLock` NPE** — fixed by registering
+   `SSLEngineImpl.getHandshakeSession()` (`t27_tls.rs`) to return `null`
+   instead of letting real bytecode build the JSSE-internal `conContext`
+   graph our rustls-backed engine never constructs. There is no Java-visible
+   handshake session before the native handshake begins, so `null` matches
+   the JDK contract; Jetty's buffer-sizing probe was the only caller and
+   tolerates it.
+
+2. **HttpComponents `AbstractMethodError: getNeedClientAuth()`** — fixed by
+   registering `getNeedClientAuth`/`getWantClientAuth`/`setNeedClientAuth`/
+   `setWantClientAuth` directly on `javax/net/ssl/SSLSocket` (`net_phase_e.rs`,
+   `register_re6_ssl_context`) as no-client-auth-by-default natives, since the
+   synthetic socket is allocated as the literal abstract `SSLSocket` class
+   with no concrete override to resolve to.
+
+3. **Simple `SSLHandshakeException ... UnknownIssuer`** — root-caused and
+   fixed: (a) `net_phase_e.rs`'s `https://` URL carrier now returns
+   `sun/net/www/protocol/https/HttpsURLConnectionImpl` instead of the plain
+   HTTP carrier, so `SimpleClientHttpsRequestFactory`'s `instanceof
+   HttpsURLConnection` check finds a real target to call
+   `setSSLSocketFactory` on; (b) `http_url_connection.rs` now captures the
+   rustls `ClientConfig` keyed by `identity_hash_code` of the specific
+   `HttpsURLConnection` instance (`HUC_INSTANCE_CLIENT_CONFIGS`) instead of
+   one process-wide default config that different SSLBundles/tests could
+   stomp on.
+
+4. **Reactive HttpComponents "expecting code to raise a throwable"**
+   (mismatch silently accepted) — fixed as a side effect of (2) and the
+   `SSLHandshakeException` classification below: the underlying TLS connect
+   failure now surfaces as a real `SSLHandshakeException` that the reactive
+   Apache HttpComponents 5 connector correctly propagates, rather than an
+   generic `IOException`/being swallowed.
+
+5. **HANG (`ClientHttpRequestFactoryBuilderTests`)** — resolved as a side
+   effect of the fixes above (no separate root cause needed); the class now
+   completes in ~10s.
+
+**Additional mechanism found and fixed during this closure pass, not in the
+original write-up:** `HttpComponentsClientHttpRequestFactoryBuilderTests`
+still crashed/flaked intermittently after fixes 1–4 above (silent process
+death with no panic/SEGV signature — no `hs_err_pid*.log` was ever written,
+ruling out a hardware fault — on some runs, or a single `POST`-only failure
+on others: `org.apache.hc.core5.http.ConnectionClosedException: Connection
+is closed` at `DefaultBHttpClientConnection$1.checkTLS`). Root cause: real
+JDK `httpcore5` calls `sslSocket.isInputShutdown()` before every entity
+write (`checkTLS`, only reachable via `POST`'s request body — `GET` never
+hits it, matching why only the `POST` parameterization failed); this native
+had **no registration at all** on `javax/net/ssl/SSLSocket`, so inherited
+`java.net.Socket` bytecode ran against the synthetic object's uninitialized
+field slots — the same "real bytecode on a synthetic object" gap as
+mechanisms 1–2 above, just for a 6th method, and the one that read as
+flaky/occasionally-crashy rather than a hard `AbstractMethodError` because
+reading garbage bits as a boolean doesn't always produce the same wrong
+answer. Fixed in `phases_late.rs` by registering `isInputShutdown`/
+`isOutputShutdown` on `javax/net/ssl/SSLSocket` to always return `false` —
+correct, not just convenient, since real JSSE `SSLSocketImpl` rejects
+`shutdownInput`/`shutdownOutput` outright (TLS has no half-close), so these
+can never legitimately become `true` for a real SSLSocket's lifetime.
+Verified with 5 repeated runs post-fix, all 32/32 tests passing.
+
+Verification: `apps/spring-boot-suite-runner/run-spring-boot-suite.ps1
+-ClassList <6 classes> -Vm craton` — all 6 classes `PASS`, 0 failed, on a
+release build containing all fixes above.
