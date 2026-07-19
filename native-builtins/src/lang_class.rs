@@ -19487,14 +19487,14 @@ Implementation-Title: opensaml-core-api\r\n\
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "()V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
                     descriptor: "(Ljava/lang/String;II)V".to_string(),
-                    access_flags: ACC_PUBLIC,
+                    access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
                 },
