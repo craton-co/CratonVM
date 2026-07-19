@@ -54,6 +54,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -102,9 +103,19 @@ pub enum EntryKind {
 }
 
 /// One loaded keystore. The map keys are case-preserved aliases.
+///
+/// Backed by `IndexMap` (not `HashMap`) so alias iteration
+/// (`KeyStore.aliases()`) preserves the order entries were parsed from the
+/// file (JKS/PKCS12) or inserted programmatically — matching real-JDK's
+/// `LinkedHashMap`-backed keystores. Callers that pick "the first key-bearing
+/// alias" when no alias is explicitly configured (e.g. Tomcat's
+/// `SSLUtilBase.getKeyManagers()`) depend on this order to select the same
+/// entry real HotSpot would; a `HashMap`'s unspecified order previously let
+/// them silently pick a different entry on a keystore with multiple private
+/// keys.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedKeyStore {
-    pub entries: HashMap<String, KeyStoreEntry>,
+    pub entries: IndexMap<String, KeyStoreEntry>,
 }
 
 /// Errors produced by the keystore parsers.
@@ -219,7 +230,9 @@ pub fn keystore_set_key_entry(id: i32, alias: &str, key_der: Vec<u8>, chain: Vec
 pub fn keystore_delete_entry(id: i32, alias: &str) {
     let mut g = registry().write();
     if let Some(store) = g.stores.get_mut(&id) {
-        store.entries.remove(alias);
+        // `shift_remove` (not `swap_remove`) to preserve the relative order
+        // of the remaining aliases — see `LoadedKeyStore::entries` doc comment.
+        store.entries.shift_remove(alias);
     }
 }
 
@@ -502,7 +515,7 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
         }
     }
 
-    let mut entries: HashMap<String, KeyStoreEntry> = HashMap::new();
+    let mut entries: IndexMap<String, KeyStoreEntry> = IndexMap::new();
 
     for (alias, key_bytes) in secret_keys {
         entries.insert(
@@ -635,7 +648,7 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
     }
     let entry_count = r.u32_be()? as usize;
 
-    let mut entries: HashMap<String, KeyStoreEntry> = HashMap::new();
+    let mut entries: IndexMap<String, KeyStoreEntry> = IndexMap::new();
 
     for _ in 0..entry_count {
         let tag = r.u32_be()?;
@@ -1457,7 +1470,6 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         .get(1)
         .and_then(|v| read_string_arg(ctx, v))
         .unwrap_or_default();
-
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
     };
@@ -1601,8 +1613,12 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let id = get_store_id(ctx, this);
 
     let store = keystore_lookup(id).unwrap_or_default();
-    let mut aliases: Vec<String> = store.entries.keys().cloned().collect();
-    aliases.sort_unstable();
+    // Preserve file/insertion order (see `LoadedKeyStore::entries` doc comment)
+    // rather than sorting alphabetically: callers like Tomcat's
+    // `SSLUtilBase.getKeyManagers()` pick the first key-bearing alias off this
+    // enumeration when none is explicitly configured, and must land on the
+    // same entry real-JDK's `LinkedHashMap`-backed keystore would.
+    let aliases: Vec<String> = store.entries.keys().cloned().collect();
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(c) => c,
@@ -1620,11 +1636,31 @@ fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(en))))
 }
 
+/// Public `KeyStore.aliases()` is intercepted by the early security shim in
+/// real-JDK mode. Route that wrapper through the provider SPI's registry-backed
+/// implementation rather than returning the legacy synthetic empty view.
+pub(crate) fn keystore_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let spi = unwrap_keystore_spi(ctx, this);
+    let mut engine_args = args.to_vec();
+    engine_args[0] = Value::Object(Some(spi));
+    engine_aliases(ctx, &engine_args)
+}
+
 fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let n = keystore_lookup(id).map(|s| s.entries.len()).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// Registry-backed counterpart for the public `KeyStore.size()` shim.
+pub(crate) fn keystore_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let spi = unwrap_keystore_spi(ctx, this);
+    let mut engine_args = args.to_vec();
+    engine_args[0] = Value::Object(Some(spi));
+    engine_size(ctx, &engine_args)
 }
 
 fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
