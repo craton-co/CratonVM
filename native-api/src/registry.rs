@@ -3287,6 +3287,20 @@ pub struct StackTraceEntry {
     /// Bytecode index of the last-executed instruction in the frame's method.
     /// `-1` for unknown / native. Used by `StackFrame.getByteCodeIndex()`.
     pub byte_code_index: i32,
+    /// The frame's own `ClassId`, when captured directly from a live
+    /// interpreter frame (`Frame::class_id`) rather than synthesized.
+    /// `StackFrame.getDeclaringClass()`/`declaringClass()` implementations
+    /// MUST prefer this over re-resolving `class_name` through a global
+    /// name-keyed lookup (`class_id_by_name`/`find_class_by_name`): a class
+    /// executing its OWN `<clinit>` is guaranteed loaded (this ClassId is
+    /// live proof of that) but is not reliably found by a fresh by-name
+    /// lookup made from deep inside that same `<clinit>` -- observed via
+    /// `SpringFactoriesLoader`/`EntityManagerFactoryUtils` invoking
+    /// `LogFactory.getLog()` from their own static initializers, which
+    /// walks the stack (log4j-api's `StackLocator`) back to that exact
+    /// self-frame and NPEs when `getDeclaringClass()` falls back to null.
+    /// `None` only for synthetic entries with no backing interpreter frame.
+    pub class_id: Option<ClassId>,
 }
 
 /// Callback signature for native method implementations.
@@ -4815,6 +4829,7 @@ mod tests {
             source_file: Some(Arc::from("Object.java")),
             line_number: 42,
             byte_code_index: 17,
+            class_id: None,
         };
         let cloned = entry.clone();
         assert_eq!(&*cloned.class_name, "java/lang/Object");
@@ -4831,6 +4846,7 @@ mod tests {
             source_file: None,
             line_number: -2, // native method
             byte_code_index: -1,
+            class_id: None,
         };
         assert_eq!(entry.line_number, -2);
         assert!(entry.source_file.is_none());
