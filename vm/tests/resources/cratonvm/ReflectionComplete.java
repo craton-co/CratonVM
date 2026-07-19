@@ -7,6 +7,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Proxy;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Modifier;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Session 17: Reflection Completeness.
@@ -20,6 +21,7 @@ public class ReflectionComplete {
     protected String protectedField = "secret";
     public static int counter = 0;
     public final double PI = 3.14;
+    private final AtomicReference<Integer> privateFinalReference = new AtomicReference<Integer>(42);
 
     private static int privateStaticMethod(int x) { return x * x; }
     public int instanceMethod(int a, int b) { return a + b; }
@@ -76,6 +78,15 @@ public class ReflectionComplete {
         }
         f.setAccessible(true);
         return (Integer) f.get(obj); // 42
+    }
+
+    // A declaring class may reflectively read its own private-final field
+    // without setAccessible(true). HikariConfig.copyStateTo uses this shape
+    // for its private-final AtomicReference credentials field.
+    public int testFieldGetOwnPrivateFinalReferenceWithoutSetAccessible() throws Exception {
+        Field f = ReflectionComplete.class.getDeclaredField("privateFinalReference");
+        AtomicReference<?> value = (AtomicReference<?>) f.get(this);
+        return (Integer) value.get();
     }
 
     public static int testFieldSetPrivate() throws Exception {

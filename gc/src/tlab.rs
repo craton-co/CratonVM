@@ -28,6 +28,25 @@ const DEFAULT_TLAB_SIZE: usize = 256 * 1024;
 /// T5.5.1 — minimum TLAB size under low allocation pressure.
 const MIN_TLAB_SIZE: usize = 8 * 1024;
 
+/// Fragmentation-mode TLAB floor (perf/halfgap-20260717, the second
+/// TLAB-remnant wedge): the smallest reclaimed span still worth serving as
+/// a mini-TLAB when nothing `MIN_TLAB_SIZE`-big exists.
+///
+/// The first wedge (see `refill_tlab`'s fragmentation fallback) was a free
+/// list made entirely of just-under-`requested` remnants. Fixing that by
+/// probing for `MIN_TLAB_SIZE` blocks merely moved the wedge one level
+/// down: steady-state splitting converges on remnants just UNDER the new
+/// floor (observed live on BinTreesClassic d=18: 33 MB of free list, every
+/// block exactly 4080 bytes = 8 KiB split minus header slack, gate floor
+/// 8192 → 10.5 million consecutive guarded-refill failures, every
+/// allocation crawling through the per-object helper slow path at a ~3x
+/// whole-benchmark cost). Any bump-allocated span ≥ this floor beats the
+/// per-object slow path by orders of magnitude (a 4080-byte span serves
+/// ~100 small objects at bump speed), so the floor is deliberately tiny;
+/// it exists only to keep degenerate slivers (< a few objects' worth) from
+/// churning the refill machinery.
+const FRAG_TLAB_FLOOR: usize = 256;
+
 /// T5.5.1 — maximum TLAB size under high allocation pressure.
 ///
 /// T19.3.G1: raised from 256 KB to 1 MB so the adaptive sizer can
@@ -490,6 +509,11 @@ pub fn initial_refill_size() -> usize {
 /// T19.3.G1 — floor on TLAB refill sizes (bytes).
 pub fn min_tlab_size() -> usize {
     MIN_TLAB_SIZE
+}
+
+/// Fragmentation-mode TLAB floor — see [`FRAG_TLAB_FLOOR`].
+pub fn frag_tlab_floor() -> usize {
+    FRAG_TLAB_FLOOR
 }
 
 /// T19.3.G1 — cap on TLAB refill sizes (bytes).

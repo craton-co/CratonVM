@@ -317,9 +317,7 @@ impl VmHeap {
         count: usize,
     ) -> Vec<ObjectRef> {
         match self {
-            VmHeap::Generational(h) => {
-                h.try_alloc_objects_old_batch(class_id, num_fields, count)
-            }
+            VmHeap::Generational(h) => h.try_alloc_objects_old_batch(class_id, num_fields, count),
             VmHeap::G1(_) => Vec::new(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => Vec::new(),
@@ -517,6 +515,15 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.debug_forwarded_target(addr),
             _ => None,
+        }
+    }
+
+    /// DIAGNOSTIC-ONLY (cce0079): minor-GC epoch for the `[SETFIELD-GC]`
+    /// assertion. Zero on non-Generational backends.
+    pub fn debug_minor_gc_count(&self) -> u64 {
+        match self {
+            VmHeap::Generational(h) => h.debug_minor_gc_count(),
+            _ => 0,
         }
     }
 
@@ -943,6 +950,17 @@ impl VmHeap {
         }
     }
 
+    /// GC trigger queried from a JIT allocation/refill helper while the
+    /// compiled caller remains discoverable on the native stack.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.needs_gc_for_jit_allocation(),
+            VmHeap::G1(h) => h.needs_gc(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(h) => h.needs_gc(),
+        }
+    }
+
     /// Native-wrapper young-exhaustion signal, consumed at the
     /// `safe_native_call` boundary to run the GC the wrappers themselves
     /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the
@@ -1104,13 +1122,11 @@ impl VmHeap {
     #[inline]
     pub fn write_barrier_keep_alive(&self, referent: ObjectRef) {
         match self {
-            VmHeap::Generational(h) => {
-                <GenerationalHeap as GarbageCollector>::write_barrier_pre(
-                    h,
-                    std::ptr::null_mut(),
-                    referent,
-                )
-            }
+            VmHeap::Generational(h) => <GenerationalHeap as GarbageCollector>::write_barrier_pre(
+                h,
+                std::ptr::null_mut(),
+                referent,
+            ),
             VmHeap::G1(h) => <G1Collector as GarbageCollector>::write_barrier_pre(
                 h,
                 std::ptr::null_mut(),

@@ -537,6 +537,10 @@ pub(crate) struct MockNativeContext {
     class_names: HashMap<u32, String>,
     /// class_name -> class_id mapping
     name_to_id: HashMap<String, u32>,
+    /// Synthetic lambda class id -> defining host internal name. Tests use
+    /// this to exercise reflection contracts that hidden lambda classes share
+    /// with their host, without registering the lambda in the class store.
+    lambda_proxy_hosts_override: UnsafeCell<HashMap<u32, String>>,
     next_class_id: u32,
     next_ptr: usize,
     properties: HashMap<String, String>,
@@ -737,6 +741,7 @@ impl MockNativeContext {
             ptr_to_index: UnsafeCell::new(HashMap::new()),
             class_names: HashMap::new(),
             name_to_id: HashMap::new(),
+            lambda_proxy_hosts_override: UnsafeCell::new(HashMap::new()),
             next_class_id: seed.next_class_id,
             // Base is 8 + seq*PTR_STRIDE, so the first pointer stays
             // 8-byte aligned and non-null; subsequent objects still += 8.
@@ -805,6 +810,15 @@ impl MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe {
             *self.frame_class_ids_override.get() = frame_class_ids;
+        }
+    }
+
+    /// Script the defining host reported for a synthetic lambda class.
+    #[allow(dead_code)]
+    pub(crate) fn set_lambda_proxy_host(&self, class_id: ClassId, host: &str) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_proxy_hosts_override.get()).insert(class_id.as_u32(), host.to_string());
         }
     }
 
@@ -1252,7 +1266,7 @@ impl NativeContext for MockNativeContext {
         Vec::new()
     }
 
-    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<&[StackTraceEntry]> {
+    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
         None
     }
 
@@ -1340,7 +1354,11 @@ impl NativeContext for MockNativeContext {
         mock_undertow_exchange_field_slot(Some(class_name), field_name)
     }
 
-    fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
     }
 
@@ -1716,7 +1734,10 @@ impl NativeContext for MockNativeContext {
     fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
         // SAFETY: single-threaded test code.
         let overrides = unsafe { &*self.inner_classes_override.get() };
-        overrides.get(&class_id.as_u32()).cloned().unwrap_or_default()
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
@@ -2086,6 +2107,15 @@ impl NativeContext for MockNativeContext {
 
     fn module_name_of_class(&self, _class_id: ClassId) -> Option<String> {
         None
+    }
+
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_proxy_hosts_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
     }
 
     fn find_resource(&self, name: &str) -> Option<Vec<u8>> {

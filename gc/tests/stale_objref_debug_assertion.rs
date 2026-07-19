@@ -57,7 +57,10 @@ fn stale_native_objref_is_caught_after_evacuation() {
 
     let mut roots = vec![stale];
     let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
-    assert_eq!(result.stats.objects_copied, 1, "the object must survive the GC");
+    assert_eq!(
+        result.stats.objects_copied, 1,
+        "the object must survive the GC"
+    );
     let fresh = roots[0];
     assert_ne!(
         fresh.as_ptr(),
@@ -77,12 +80,9 @@ fn stale_native_objref_is_caught_after_evacuation() {
     // caught deterministically now, instead of silently reading back
     // whatever the evacuated memory looks like.
     let stale_ptr = stale.as_ptr() as usize;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        heap.get_header(stale)
-    }));
-    let err = result.expect_err(
-        "get_header on a stale, evacuated-but-still-quarantined ObjectRef must panic",
-    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| heap.get_header(stale)));
+    let err = result
+        .expect_err("get_header on a stale, evacuated-but-still-quarantined ObjectRef must panic");
     let msg = err
         .downcast_ref::<String>()
         .cloned()

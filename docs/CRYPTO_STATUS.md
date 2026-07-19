@@ -119,7 +119,7 @@ below.**
 | `SHA256withECDSA`               | Implemented   | `crypto_impl::ecdsa_*_sha256` (P-256) |
 | `SHA384withECDSA`               | Implemented   | `crypto_impl::ecdsa_*` (P-384)       |
 | `Ed25519` / `EdDSA`             | Implemented   | `ed25519_dalek`                      |
-| `SHA256withDSA`                 | Recognised, not backed | Mapped to an index but no DSA backend; verify fails |
+| `SHA1withDSA` / `SHA256withDSA` | Implemented   | Routed to the real JDK 25 SUN DSA SPIs |
 | `SHA224withRSA`                 | Not supported | Not mapped by `algo_idx`             |
 | `RSASSA-PSS`                    | Not supported | Not mapped by `algo_idx` (PKCS#1 v1.5 only) |
 | `NONEwithRSA`                   | Not supported | Not mapped by `algo_idx`             |
@@ -131,7 +131,7 @@ below.**
 |----------------------|---------------|------------------------------------------------|
 | `RSA`                | Implemented   | PKCS#8 / X.509 encoding via `rsa` + `pkcs8`    |
 | `EC`                 | Implemented   | P-256 / P-384 via `jca::key_factory` (`EC` / `ECDSA`) |
-| `DSA`                | Not supported | —                                              |
+| `DSA`                | Implemented   | KeyPairGenerator and KeyFactory route to JDK 25 SUN DSA SPIs |
 | `DH`                 | Not supported | —                                              |
 | `X25519` / `X448`    | Not supported | —                                              |
 

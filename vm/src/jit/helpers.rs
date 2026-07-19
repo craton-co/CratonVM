@@ -2310,9 +2310,8 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
                     set_jit_pending_exception(exc);
                 }
                 MethodCallFailed::InternalError(vm_err) => {
-                    let msg = format!(
-                        "JIT new class_id {class_id_raw} failed to initialize: {vm_err}"
-                    );
+                    let msg =
+                        format!("JIT new class_id {class_id_raw} failed to initialize: {vm_err}");
                     if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                         vm,
                         thread,
@@ -4350,8 +4349,14 @@ pub unsafe extern "C" fn jit_instanceof(
 /// terminate the process instead of unwinding to the `catch_unwind` in the
 /// interpreter.  Using a thread-local flag sidesteps this platform limitation.
 // SAFETY: Called from JIT-compiled code when an array bounds check fails.
-// Only stores two i64 values in a thread-local; no pointer dereferences.
-pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i64) -> i64 {
+// Only stores two i64 values in a thread-local. The raw pointer is read solely
+// by the explicitly-enabled diagnostic block below.
+pub unsafe extern "C" fn jit_throw_aioobe(
+    index: i64,
+    length: i64,
+    array_ptr: i64,
+    bytecode_pc: i64,
+) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
     crate::jit::conservative_roots::note_jit_boundary();
@@ -4379,14 +4384,14 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64, array_ptr: i6
             let gc_flags = std::ptr::read_unaligned(base.add(22) as *const u8);
             let fwd_ptr = std::ptr::read_unaligned(base.add(24) as *const usize);
             eprintln!(
-                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
+                "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
 header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
 array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags={gc_flags} \
 forwarding_ptr={fwd_ptr:#x}"
             );
         } else {
             eprintln!(
-                "[AIOOBE3-DIAG] jit-reported index={index} length={length} array_ptr=NULL"
+                "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr=NULL"
             );
         }
     }
@@ -4480,6 +4485,11 @@ struct NativeDispatchCache {
 enum ObjectNativeKind {
     HashMap,
     Matcher,
+    /// Registered `java/lang/StringBuilder` natives (the `append(I)/(C)/
+    /// (String)` family + `toString`/`length`). Exact-receiver-guarded like
+    /// the other kinds; resolution consults the native registry ONCE at
+    /// cache-fill time instead of a 3-string hash per call.
+    StringBuilder,
 }
 
 #[derive(Clone, Copy)]
@@ -4989,8 +4999,14 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -5354,7 +5370,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // every iteration.
     let object_native_kind = hashmap_native_arg_count(info)
         .map(|_| ObjectNativeKind::HashMap)
-        .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher));
+        .or_else(|| matcher_native_arg_count(info).map(|_| ObjectNativeKind::Matcher))
+        .or_else(|| stringbuilder_native_arg_count(info).map(|_| ObjectNativeKind::StringBuilder));
     if matches!(info.invoke_kind, 0 | 2)
         && !crate::classloading::any_class_redefined()
         && object_native_kind.is_some()
@@ -5382,6 +5399,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     let expected_class = match kind {
                         ObjectNativeKind::HashMap => "java/util/HashMap",
                         ObjectNativeKind::Matcher => "java/util/regex/Matcher",
+                        ObjectNativeKind::StringBuilder => "java/lang/StringBuilder",
                     };
                     let is_exact_receiver = {
                         let classes = vm.class_manager.read();
@@ -5394,6 +5412,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         let callback = match kind {
                             ObjectNativeKind::HashMap => hashmap_native_callback(info),
                             ObjectNativeKind::Matcher => matcher_native_callback(info),
+                            ObjectNativeKind::StringBuilder => {
+                                stringbuilder_native_callback(vm, info)
+                            }
                         };
                         if let Some(callback) = callback {
                             let entry = NativeDispatchCache {
@@ -5726,23 +5747,40 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 } else {
                     None
                 };
-                let object = match tlab_object {
-                    Some(object) => object,
-                    None => {
-                        use cratonvm_native_api::NativeContext as _;
-                        // Reborrow: `thread` is used again after this arm for
-                        // the pending-return publication.
-                        let mut ctx = crate::vm::NativeContextImpl {
-                            shared: vm,
-                            thread: &mut *thread,
-                        };
-                        ctx.alloc_object(class_id, 1)
+                if let Some(object) = tlab_object {
+                    // Raw primitive-cell write: this arm JUST allocated
+                    // `object` through the legacy TLAB path
+                    // (`init_object_header`, zeroed 16-byte Value cells), so
+                    // field 0 is the Value cell at HEADER_SIZE — the exact
+                    // bytes `set_field_as(.., b'I')` would store, minus that
+                    // path's per-call header read + layout dispatch. A
+                    // primitive store takes no write barrier.
+                    // SAFETY: `object` is a live legacy-layout allocation
+                    // with >= 1 slot (`slots.max(1)` above); the cell is
+                    // exclusively ours until published below.
+                    unsafe {
+                        std::ptr::write(
+                            object.as_ptr().add(cratonvm_gc::heap::HEADER_SIZE) as *mut Value,
+                            Value::Int(value),
+                        );
                     }
+                    // Object-return handoff root (see `call_integer_native_raw`).
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                use cratonvm_native_api::NativeContext as _;
+                let object = {
+                    // Reborrow: `thread` is used again after this arm for
+                    // the pending-return publication.
+                    let mut ctx = crate::vm::NativeContextImpl {
+                        shared: vm,
+                        thread: &mut *thread,
+                    };
+                    ctx.alloc_object(class_id, 1)
                 };
-                // Direct descriptor-typed write: `Integer.value` is declared
-                // `int` (field 0, descriptor `I`) — skip `ctx.set_field`'s
-                // per-call `class_id_of` + descriptor resolution and hand the
-                // heap the same normalized store it would have produced.
+                // Descriptor-typed write (`Integer.value`, field 0, `I`) —
+                // this cold arm's allocator may pick a non-legacy layout, so
+                // keep the layout-aware store.
                 vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
                 thread.native_pending_return = Some(object);
@@ -5837,6 +5875,220 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     )
 }
 
+/// Synthetic call-site infos for the exact-HashMap thin direct-call helpers'
+/// fallback/dispatch paths (perf/halfgap-20260717).
+static HASHMAP_PUT_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/util/HashMap",
+    method_name: "put",
+    descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+    num_jit_args: 3,
+    return_type: b'L',
+    invoke_kind: 0,
+};
+static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/util/HashMap",
+    method_name: "get",
+    descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+    num_jit_args: 2,
+    return_type: b'L',
+    invoke_kind: 0,
+};
+
+thread_local! {
+    /// `(vm_key, class_id)` of the EXACT `java/util/HashMap` class, learned
+    /// on the first direct-call fallback resolution — same pattern as
+    /// `MATCHER_CLASS_CACHE`/`INTEGER_WRAPPER_CLASS_CACHE`.
+    static HASHMAP_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shared receiver/key screening for the two HashMap thin helpers. Returns
+/// the validated `(thread-independent)` pieces or `None` → caller falls back
+/// to the full dispatcher. The receiver must be EXACTLY `java/util/HashMap`
+/// (a LinkedHashMap receiver at a HashMap-declared site takes the fallback,
+/// which performs real virtual dispatch), and no class redefine may be in
+/// flight (the overlay + class-id cache assume stable identity).
+///
+/// SAFETY: `receiver` must be non-null and 8-aligned below 2^48 (checked by
+/// callers before the raw header read).
+unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
+    let cid = std::ptr::read(receiver as usize as *const u32);
+    let vm_key = vm as *const SharedVm as usize;
+    if HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
+        return !crate::classloading::any_class_redefined();
+    }
+    let is_exact = vm
+        .class_manager
+        .read()
+        .get_class(ClassId::new(cid))
+        .map(|class| class.name.as_ref() == "java/util/HashMap")
+        .unwrap_or(false);
+    if is_exact {
+        HASHMAP_CLASS_CACHE.with(|c| c.set(Some((vm_key, cid))));
+        return !crate::classloading::any_class_redefined();
+    }
+    false
+}
+
+/// Thin direct-call target for JIT `invokevirtual HashMap.get(Object)` sites
+/// whose constant-pool class is exactly `java/util/HashMap` (recognition in
+/// `jit::try_compile`; registered via `set_hashmap_get_direct_fn`).
+///
+/// Fast path: the Integer-keyed overlay probe (`jit_overlay_hashmap_get`) —
+/// no Java-heap allocation, no Java dispatch, no `safe_native_call` wrapper
+/// (same contract as `jit_integer_int_value_direct`). Everything else —
+/// subclass receiver, non-Integer key, materialized map, redefine window —
+/// falls back to the full generic dispatcher, byte-for-byte the semantics
+/// the non-direct site had.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    'fast: {
+        let rraw = receiver as u64;
+        if (rraw & 0x7) != 0 || rraw >= (1u64 << 48) {
+            break 'fast;
+        }
+        if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        let key_val = if key == 0 {
+            Value::Object(None)
+        } else {
+            let kraw = key as u64;
+            if (kraw & 0x7) != 0 || kraw >= (1u64 << 48) {
+                break 'fast;
+            }
+            match vm.heap.is_object_address(key as usize) {
+                Some(object) => Value::Object(Some(object)),
+                None => break 'fast,
+            }
+        };
+        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let probe = {
+            let ctx = crate::vm::NativeContextImpl {
+                shared: vm,
+                thread: &mut *thread,
+            };
+            cratonvm_native_collections::jit_overlay_hashmap_get(&ctx, recv_obj, key_val)
+        };
+        match probe {
+            Some(Ok(Some(Value::Object(Some(object))))) => {
+                // Object-return handoff root (see `jit_integer_value_of_direct`).
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
+            // The overlay stores whatever Value was put; an object-typed map
+            // returning a non-object Value is out-of-contract — take the
+            // full dispatcher rather than guessing an encoding.
+            Some(Ok(Some(_))) => break 'fast,
+            Some(Err(error)) => {
+                return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_GET_DIRECT_INFO)
+            }
+            None => break 'fast,
+        }
+    }
+    let args = [receiver, key];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
+}
+
+/// PUT sibling of [`jit_hashmap_get_direct`] — see its doc for the contract.
+/// The overlay insert writes only the Rust-side table (GC-scanned as roots),
+/// so the wrapper-free path holds; any non-overlay case (materialization,
+/// resize, non-Integer key) falls back to full dispatch.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
+pub unsafe extern "C" fn jit_hashmap_put_direct(
+    vm_ptr: i64,
+    receiver: i64,
+    key: i64,
+    value: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if receiver == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    'fast: {
+        let rraw = receiver as u64;
+        if (rraw & 0x7) != 0 || rraw >= (1u64 << 48) {
+            break 'fast;
+        }
+        if !jit_hashmap_receiver_is_exact(vm, receiver) {
+            break 'fast;
+        }
+        let mut vals = [Value::Object(None); 2];
+        for (slot, raw) in [(0usize, key), (1usize, value)] {
+            if raw == 0 {
+                continue;
+            }
+            let bits = raw as u64;
+            if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+                break 'fast;
+            }
+            match vm.heap.is_object_address(raw as usize) {
+                Some(object) => vals[slot] = Value::Object(Some(object)),
+                None => break 'fast,
+            }
+        }
+        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+            break 'fast;
+        };
+        let Some((thread, _guard)) = jit_thread_mut() else {
+            break 'fast;
+        };
+        let probe = {
+            let mut ctx = crate::vm::NativeContextImpl {
+                shared: vm,
+                thread: &mut *thread,
+            };
+            cratonvm_native_collections::jit_overlay_hashmap_put(
+                &mut ctx, recv_obj, vals[0], vals[1],
+            )
+        };
+        match probe {
+            Some(Ok(Some(Value::Object(Some(object))))) => {
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            Some(Ok(Some(Value::Object(None)))) | Some(Ok(None)) => return 0,
+            Some(Ok(Some(_))) => break 'fast,
+            Some(Err(error)) => {
+                return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_PUT_DIRECT_INFO)
+            }
+            None => break 'fast,
+        }
+    }
+    let args = [receiver, key, value];
+    jit_invoke_dispatch(
+        vm_ptr,
+        &HASHMAP_PUT_DIRECT_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        3,
+    )
+}
+
 #[inline]
 fn call_integer_native_raw(
     vm: &SharedVm,
@@ -5869,7 +6121,7 @@ fn call_integer_native_raw(
                 // old gen until `alloc_young_initialized` hard-aborts.
                 if vm.heap.young_spill_pressure() {
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.heap.needs_gc()
+                        && vm.heap.needs_gc_for_jit_allocation()
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
@@ -5982,6 +6234,87 @@ fn matcher_native_callback(info: &JitInvokeInfo) -> Option<cratonvm_native_api::
 }
 
 #[inline]
+fn stringbuilder_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
+    match (info.method_name, info.descriptor) {
+        ("append", "(I)Ljava/lang/StringBuilder;")
+        | ("append", "(C)Ljava/lang/StringBuilder;")
+        | ("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;") => Some(2),
+        ("toString", "()Ljava/lang/String;") | ("length", "()I") => Some(1),
+        _ => None,
+    }
+}
+
+/// Resolve the registered StringBuilder native for this site ONCE (the
+/// registry's 3-string hash) — cached per callsite afterwards, exactly like
+/// the HashMap/Matcher kinds. Returns `None` (no caching, generic dispatch)
+/// when no native is registered for the triple.
+#[inline]
+fn stringbuilder_native_callback(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<cratonvm_native_api::NativeCallback> {
+    vm.native_methods
+        .find("java/lang/StringBuilder", info.method_name, info.descriptor)
+}
+
+/// Invoke a cached StringBuilder native from raw JIT argument slots.
+#[inline]
+fn call_stringbuilder_native_raw(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_ref: ObjectRef,
+    args_slice: &[i64],
+    callback: cratonvm_native_api::NativeCallback,
+) -> Option<i64> {
+    let expected_len = stringbuilder_native_arg_count(info)?;
+    if args_slice.len() != expected_len {
+        return None;
+    }
+    let mut values = [Value::Object(None); 2];
+    values[0] = Value::Object(Some(receiver_ref));
+    if expected_len == 2 {
+        match info.descriptor.as_bytes().get(1) {
+            // int / char parameter — the natives take Value::Int for both.
+            Some(b'I') | Some(b'C') => values[1] = Value::Int(args_slice[1] as i32),
+            Some(b'L') => {
+                let raw = args_slice[1];
+                // `append((String) null)` must append "null" — the generic
+                // path (appendNull routing) owns that; don't serve it here.
+                if raw == 0 {
+                    return None;
+                }
+                let bits = raw as u64;
+                if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+                    return None;
+                }
+                let object = vm.heap.is_object_address(bits as usize)?;
+                values[1] = Value::Object(Some(object));
+            }
+            _ => return None,
+        }
+    }
+    let result = match crate::vm::safe_native_call_prevalidated_objects(
+        vm,
+        thread,
+        callback,
+        &values[..expected_len],
+    ) {
+        Ok(value) => value,
+        Err(error) => return Some(handle_jit_dispatch_error(vm, thread, error, info)),
+    };
+    Some(match result {
+        Some(Value::Int(value)) => value as i64,
+        Some(Value::Long(value)) => value,
+        Some(Value::Float(value)) => value.to_bits() as i64,
+        Some(Value::Double(value)) => value.to_bits() as i64,
+        Some(Value::Object(Some(object))) => object.as_ptr() as i64,
+        Some(Value::Object(None)) | None => 0,
+        _ => 0,
+    })
+}
+
+#[inline]
 fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
     let vm_key = vm as *const SharedVm as usize;
     let raw_class_id = class_id.as_u32();
@@ -6017,6 +6350,14 @@ fn call_object_native_raw(
         ObjectNativeKind::Matcher => {
             call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, entry.callback)
         }
+        ObjectNativeKind::StringBuilder => call_stringbuilder_native_raw(
+            vm,
+            thread,
+            info,
+            receiver_ref,
+            args_slice,
+            entry.callback,
+        ),
     }
 }
 
@@ -6364,8 +6705,14 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
         set_jit_pending_npe();
@@ -6471,15 +6818,20 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         && matches!(
             (info.method_name, info.descriptor),
             ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
-                | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
+                | (
+                    "getResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
+                )
+                | (
+                    "getResourceAsStream",
+                    "(Ljava/lang/String;)Ljava/io/InputStream;"
+                )
         )
     {
-        if let Some(callback) = vm.native_methods.find(
-            "java/lang/ClassLoader",
-            info.method_name,
-            info.descriptor,
-        ) {
+        if let Some(callback) =
+            vm.native_methods
+                .find("java/lang/ClassLoader", info.method_name, info.descriptor)
+        {
             let values = decode_values();
             return match crate::vm::safe_native_call(vm, thread, callback, &values) {
                 Ok(Some(Value::Int(v))) => v as i64,
@@ -6576,6 +6928,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_ref,
             receiver_class_id,
             info.method_name,
+            info.descriptor,
             &rest,
         ) {
             Ok(Some(result)) => {
@@ -7624,7 +7977,7 @@ mod tests {
         let _ = take_jit_deopt_pending();
         let _ = take_jit_pending_aioobe();
         // SAFETY: only stores into thread-locals; no pointer dereference.
-        let r = unsafe { jit_throw_aioobe(5, 3, 0) };
+        let r = unsafe { jit_throw_aioobe(5, 3, 0, 17) };
         assert_eq!(r, i64::MIN);
         assert!(
             take_jit_deopt_pending(),
@@ -8696,6 +9049,8 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::set_integer_int_value_direct_fn(
         jit_integer_int_value_direct as *const () as usize,
     );
+    cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
+    cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
 
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,

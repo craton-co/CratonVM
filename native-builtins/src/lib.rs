@@ -8033,59 +8033,21 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    let application_context =
-        match spring_extension_get_application_context(ctx, extension_context)? {
-            Some(Value::Object(Some(application_context))) => application_context,
-            other => return Ok(other),
-        };
-
-    let parameter_type =
-        match ctx.invoke_virtual(parameter, "getType", "()Ljava/lang/Class;", &[])? {
-            Some(Value::Object(Some(parameter_type))) => parameter_type,
-            _ => return Ok(Some(Value::Object(Some(application_context)))),
-        };
-    if spring_java_class_name(ctx, parameter_type).as_deref()
-        == Some("org.springframework.context.ApplicationContext")
-    {
-        return Ok(Some(Value::Object(Some(application_context))));
-    }
-
-    let is_bean_override = ctx
-        .invoke_special(
-            "org/springframework/test/context/junit/jupiter/SpringExtension",
-            "isBeanOverride",
-            "(Ljava/lang/reflect/Parameter;)Z",
-            &[Value::Object(Some(parameter))],
-        )?
-        .and_then(|v| v.as_int())
-        .unwrap_or(0)
-        != 0;
-    if is_bean_override {
-        if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
-            "org/springframework/test/context/bean/override/BeanOverrideUtils",
-            "resolveHandlerForParameter",
-            "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
-            &[Value::Object(Some(parameter)), Value::Object(Some(test_class))],
-        ) {
-            if let Ok(Some(Value::Object(Some(bean_name)))) =
-                ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
-            {
-                return ctx.invoke_virtual(
-                    application_context,
-                    "getBean",
-                    "(Ljava/lang/String;)Ljava/lang/Object;",
-                    &[Value::Object(Some(bean_name))],
-                );
-            }
-        }
-    }
-
-    let bean_factory = match ctx.invoke_virtual(
-        application_context,
-        "getAutowireCapableBeanFactory",
-        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-        &[],
-    )? {
+    // Spring Framework 7.0.7 delegates every parameter shape directly to
+    // ParameterResolutionDelegate. Keep this native mirror deliberately
+    // narrow: the former ApplicationContext / BeanOverride branches drifted
+    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    let application_context = spring_extension_get_application_context(ctx, extension_context)?;
+    let bean_factory_result = match application_context {
+        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
+            application_context,
+            "getAutowireCapableBeanFactory",
+            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+            &[],
+        )?,
+        other => return Ok(other),
+    };
+    let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -8559,6 +8521,7 @@ pub mod charset;
 pub mod classloader_value_sidetable;
 #[cfg(feature = "experimental-jmx")]
 pub mod jmx;
+pub mod jfr;
 pub mod panama;
 pub mod panama_libffi;
 pub mod properties_sidetable;
@@ -9056,6 +9019,25 @@ mod context_class_loader_tests {
         let got = native_thread_get_context_class_loader(&mut ctx, &[Value::Object(Some(thread))])
             .expect("getContextClassLoader should not throw");
         assert_eq!(got, Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn essential_registers_netty_event_executor_shutdown_bridge() {
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        for class_name in [
+            "io/netty/util/concurrent/EventExecutorGroup",
+            "io/netty/util/concurrent/AbstractEventExecutorGroup",
+            "io/netty/channel/MultiThreadIoEventLoopGroup",
+        ] {
+            assert!(registry
+                .find(
+                    class_name,
+                    "shutdownGracefully",
+                    "()Lio/netty/util/concurrent/Future;"
+                )
+                .is_some());
+        }
     }
 
     #[test]
@@ -25171,6 +25153,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
     register_test_harness_natives(registry);
+    crate::jfr::register_jfr_natives(registry);
+    crate::tls::register_conscrypt_native_bridges(registry);
     register_ecj_problem_overrides(registry);
     registry.register(
         "org/apache/jasper/servlet/JspServlet",
@@ -28485,46 +28469,62 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_cdl_await_timeout,
     );
     registry.register(surefire_cdl, "getCount", "()J", native_cdl_get_count);
-    let surefire_sem = "java/util/concurrent/Semaphore";
-    registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
-    registry.register(surefire_sem, "<init>", "(IZ)V", native_sem_init_fair);
-    registry.register(surefire_sem, "acquire", "()V", native_sem_acquire);
-    registry.register(surefire_sem, "acquire", "(I)V", native_sem_acquire_n);
-    registry.register(
-        surefire_sem,
-        "acquireUninterruptibly",
-        "()V",
-        native_sem_acquire,
-    );
-    registry.register(surefire_sem, "release", "()V", native_sem_release);
-    registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
-    registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
-    registry.register(surefire_sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-    registry.register(
-        surefire_sem,
-        "tryAcquire",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        native_sem_try_acquire_timeout,
-    );
-    registry.register(
-        surefire_sem,
-        "availablePermits",
-        "()I",
-        native_sem_available_permits,
-    );
-    registry.register(
-        surefire_sem,
-        "drainPermits",
-        "()I",
-        native_sem_drain_permits,
-    );
-    registry.register(surefire_sem, "isFair", "()Z", native_sem_is_fair);
-    registry.register(
-        surefire_sem,
-        "toString",
-        "()Ljava/lang/String;",
-        native_sem_to_string,
-    );
+    // Keep Semaphore's real JDK constructor and methods when real AQS is in
+    // use.  The synthetic representation stores its permit state in an int[]
+    // in Semaphore.sync, which is safe only while every Semaphore operation is
+    // intercepted.  Libraries such as Oracle UCP call the inherited protected
+    // Sync.reducePermits() directly; with a synthetic holder that method sees
+    // an int[] instead of Semaphore$Sync and retries its CAS forever.
+    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
+        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
+    if synthetic_aqs {
+        let surefire_sem = "java/util/concurrent/Semaphore";
+        registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
+        registry.register(surefire_sem, "<init>", "(IZ)V", native_sem_init_fair);
+        registry.register(surefire_sem, "acquire", "()V", native_sem_acquire);
+        registry.register(surefire_sem, "acquire", "(I)V", native_sem_acquire_n);
+        registry.register(
+            surefire_sem,
+            "acquireUninterruptibly",
+            "()V",
+            native_sem_acquire,
+        );
+        registry.register(
+            surefire_sem,
+            "acquireUninterruptibly",
+            "(I)V",
+            native_sem_acquire_n,
+        );
+        registry.register(surefire_sem, "release", "()V", native_sem_release);
+        registry.register(surefire_sem, "release", "(I)V", native_sem_release_n);
+        registry.register(surefire_sem, "tryAcquire", "()Z", native_sem_try_acquire);
+        registry.register(surefire_sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+        registry.register(
+            surefire_sem,
+            "tryAcquire",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_sem_try_acquire_timeout,
+        );
+        registry.register(
+            surefire_sem,
+            "availablePermits",
+            "()I",
+            native_sem_available_permits,
+        );
+        registry.register(
+            surefire_sem,
+            "drainPermits",
+            "()I",
+            native_sem_drain_permits,
+        );
+        registry.register(surefire_sem, "isFair", "()Z", native_sem_is_fair);
+        registry.register(
+            surefire_sem,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sem_to_string,
+        );
+    }
     // Keep CyclicBarrier constructors available this early too; surefire and
     // plugin ecosystems may switch between latch/semaphore/barrier patterns.
     let surefire_cb = "java/util/concurrent/CyclicBarrier";
@@ -30359,6 +30359,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         lang_class::native_class_get_name,
     );
+    registry.register(
+        "java/lang/Class",
+        "forPrimitiveName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        lang_class::native_class_get_primitive_class,
+    );
     // Synthetic bootstrap may still stub `java/lang/Class` when no real JDK
     // classfile is available. Keep the public name accessors declared by the
     // stub wired to the same native implementations used elsewhere.
@@ -30790,12 +30796,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
-                // Reverse-lookup the backing ClassId from the mirror via the
-                // VM's class_mirrors_reverse map (the real-JDK Class layout
-                // doesn't store our class_id in any Java-visible field).
-                ctx.class_id_from_mirror(*mirror)
-                    .and_then(|cid| ctx.class_name_of_id(cid))
-                    .and_then(|name| ctx.find_class_source_path(&name))
+                // The code source belongs to a class *identity*, not merely a
+                // binary name. `find_class_source_path(name)` is intentionally
+                // loader-blind and reports the application copy when an
+                // isolated URLClassLoader defines its own same-named class.
+                // Prefer the CodeSource saved on this mirror's exact ClassId;
+                // retain the old path lookup only for legacy mirrors that have
+                // no CodeSource metadata.
+                ctx.class_id_from_mirror(*mirror).and_then(|cid| {
+                    ctx.class_code_base(cid).or_else(|| {
+                        ctx.class_name_of_id(cid)
+                            .and_then(|name| ctx.find_class_source_path(&name))
+                    })
+                })
             } else {
                 None
             };
@@ -30830,11 +30843,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 // single-segment Path whose `getParent()` is null — exactly the
                 // QuarkusEntryPoint.doRun:67 NPE.  Canonicalize so the URL is
                 // always absolute (`file:/C:/.../lib/quarkus-run.jar`).
-                let abs_path = std::fs::canonicalize(&raw_path)
+                // `class_code_base` is already a URL (`file:/...` or
+                // `jar:file:/...`), while the legacy fallback above returns a
+                // filesystem path. Normalize both before canonicalizing and
+                // constructing the URL object below.
+                let raw_path = raw_path
+                    .strip_prefix("jar:file:")
+                    .or_else(|| raw_path.strip_prefix("file:"))
+                    .unwrap_or(&raw_path);
+                let abs_path = std::fs::canonicalize(raw_path)
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
                     .map(|s| s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-                    .unwrap_or(raw_path);
+                    .unwrap_or_else(|| raw_path.to_string());
                 // Normalise backslashes to forward slashes so Path/File code
                 // further up the stack works the same on every platform.
                 let fwd = abs_path.replace('\\', "/");
@@ -34817,8 +34838,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            let dest_len = ctx.array_length(dest) as i64;
+            if off < 0 || len < 0 || (off as i64) + (len as i64) > dest_len {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: if off < 0 { off } else { off.wrapping_add(len) },
+                }
+                .into());
+            }
             let pos_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "pos")
                 .unwrap_or(1);
@@ -34828,8 +34856,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let buf_idx = ctx
                 .resolve_field_index("java/io/ByteArrayInputStream", "buf")
                 .unwrap_or(0);
-            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0) as usize;
-            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0) as usize;
+            let pos = ctx.get_field(this, pos_idx).as_int().unwrap_or(0);
+            let count = ctx.get_field(this, count_idx).as_int().unwrap_or(0);
+            if len == 0 {
+                return Ok(Some(Value::Int(0)));
+            }
             if pos >= count {
                 return Ok(Some(Value::Int(-1)));
             }
@@ -34837,14 +34868,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(arr)) => arr,
                 _ => return Ok(Some(Value::Int(-1))),
             };
-            let avail = count - pos;
-            let to_read = len.min(avail);
+            let avail = (count - pos) as usize;
+            let to_read = (len as usize).min(avail);
             let mut bytes = vec![0u8; to_read];
-            let copied = ctx.read_byte_array_into(buf, pos, &mut bytes);
+            let copied = ctx.read_byte_array_into(buf, pos as usize, &mut bytes);
             if copied > 0 {
-                ctx.write_byte_array_from(dest, off, &bytes[..copied]);
+                ctx.write_byte_array_from(dest, off as usize, &bytes[..copied]);
             }
-            ctx.set_field(this, pos_idx, Value::Int((pos + copied) as i32));
+            ctx.set_field(this, pos_idx, Value::Int(pos + copied as i32));
             Ok(Some(Value::Int(copied as i32)))
         },
     );
@@ -34981,6 +35012,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // WP5.1 — SSLEngine RFC 8446 wrapping rustls 0.23 (TLS 1.3 + 1.2 fallback,
     //         mTLS, session resumption). Engine-handle registry pattern.
     t27_tls::register_sslengine_real(registry);
+    // T2.7 server-side TLS bridges. The real-JDK CLI also needs
+    // SSLServerSocketFactory/SSLServerSocket registrations: without this
+    // complete phase, a configured SSL server factory falls through to the
+    // plaintext ServerSocketFactory overloads (notably UnboundID LDAPS).
+    t27_tls::register_t27_natives(registry);
     // WP5.2 — real PKCS12 + JKS parser via the `p12` crate + hand-rolled JKS.
     keystore::register_keystore_real(registry);
     // WP5.3 — X509KeyManager + X509TrustManager with EKU-aware alias selection
@@ -35194,6 +35230,39 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             classloader::cl_get_resource_as_stream_essential,
         );
     }
+    // `java.net.URLClassLoader` declares its OWN `getResourceAsStream`
+    // override in real bytecode (unlike `getResource`/`getResources`/
+    // `findResource`, left to `ClassLoader`/its own extension point), so the
+    // `java/lang/ClassLoader` registration above never gets consulted for a
+    // URLClassLoader-typed receiver — dispatch resolves the declaring class
+    // to `java/net/URLClassLoader` itself. The equivalent registration for
+    // this exact class previously lived ONLY in
+    // `classloader::register_classloader_natives`/`servlet::register_s1_classloading`,
+    // both nested inside `register_synthetic_overrides` — a no-op stub in
+    // the default real-JDK `cratonvm-cli` build (`vm/src/native/builtins.rs`,
+    // `#[cfg(feature = "synthetic-jdk")]`-gated) — so this override was
+    // effectively dead in real-JDK mode despite `force_native_over_real_jdk_bytecode`
+    // (vm/src/runtime/interpreter.rs) and the `check_override` allow-list
+    // (vm/src/vm/vm_exec.rs) both correctly forcing native dispatch: the
+    // force-check passed but the registry lookup then found nothing to call,
+    // silently falling through to real (broken, unpopulated-`ucp`-backed,
+    // non-parent-delegating) bytecode. Concretely this broke Spring Boot's
+    // `StaticResourceJarsTests`-adjacent `ServletComponentScanIntegrationTests
+    // .indexedComponentsAreRegistered` / `MockWebEnvironmentServletComponentScanIntegrationTests`:
+    // a `new URLClassLoader(urls, parent)` wrapping only a `@TempDir`-generated
+    // `META-INF/spring.components` index (parented to the real test
+    // classloader) resolved `.class` resources fine via `getResource` but got
+    // `null` from `getResourceAsStream` for every one the PARENT actually
+    // holds, so `ClassPathResource.getInputStream()` threw
+    // `FileNotFoundException` reading an indexed component that plainly
+    // exists. Register the always-real-JDK-mode-active essential native here
+    // instead.
+    registry.register(
+        "java/net/URLClassLoader",
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::cl_get_resource_as_stream_essential,
+    );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
     // resolves the `.kotlin_builtins` protobuf resources via
@@ -35742,86 +35811,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "<init>",
         "(Ljava/lang/String;)V",
         native_uri_init,
-    );
-
-    // S111r17: `Package.getImplementationVersion()` and friends. The
-    // `native_class_get_package` builder writes `implVersion` and
-    // friends into Package's slots 1..=6 directly, bypassing the JDK's
-    // `versionInfo: VersionInfo` indirection. The JDK Java body for
-    // `Package.getImplementationVersion()` reads `versionInfo.implVersion`
-    // — but `versionInfo` is null on our synthetic Package, NPE.
-    // Override the field-reader methods to return slot N directly.
-    // Slot layout (must match `native_class_get_package`):
-    //   0=name, 1=specTitle, 2=specVersion, 3=specVendor,
-    //   4=implTitle, 5=implVersion, 6=implVendor.
-    let pkg_cls = "java/lang/Package";
-    fn pkg_obj_arg(
-        args: &[Value],
-    ) -> Result<cratonvm_types::ObjectRef, cratonvm_types::error::RuntimeError> {
-        match args.first() {
-            Some(Value::Object(Some(o))) => Ok(*o),
-            _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Package method called on null".to_string()),
-            }),
-        }
-    }
-    registry.register(pkg_cls, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = pkg_obj_arg(args)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    registry.register(
-        pkg_cls,
-        "getSpecificationTitle",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 1)))
-        },
-    );
-    registry.register(
-        pkg_cls,
-        "getSpecificationVersion",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 2)))
-        },
-    );
-    registry.register(
-        pkg_cls,
-        "getSpecificationVendor",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 3)))
-        },
-    );
-    registry.register(
-        pkg_cls,
-        "getImplementationTitle",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 4)))
-        },
-    );
-    registry.register(
-        pkg_cls,
-        "getImplementationVersion",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 5)))
-        },
-    );
-    registry.register(
-        pkg_cls,
-        "getImplementationVendor",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = pkg_obj_arg(args)?;
-            Ok(Some(ctx.get_field(this, 6)))
-        },
     );
 
     // WP6.2 follow-up — `java.util.HexFormat.formatHex(byte[])` /
@@ -36605,8 +36594,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // in 1916 against real HotSpot.
             "CET" | "Europe/Berlin" | "Europe/Rome" | "Europe/Oslo" | "Europe/Amsterdam"
             | "Europe/Brussels" | "Europe/Vienna" | "Europe/Copenhagen" | "Europe/Stockholm"
-            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London"
-            | "GB" => Some(1916),
+            | "Europe/Warsaw" | "Europe/Prague" | "Europe/Budapest" | "Europe/London" | "GB" => {
+                Some(1916)
+            }
             // Spain: real HotSpot's legacy path shows an earlier (1901)
             // Madrid-Mean-Time -> WET rawOffset switch that is NOT a DST
             // split (winter == summer that year); the first genuine
@@ -37403,31 +37393,117 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `NoClassDefFoundError: io/netty/resolver/dns/DnsServerAddressStreamProviders$DefaultProviderHolder`
     // for every later reference, breaking Reactor-Netty-based HTTP client
     // tests entirely. We don't surface real OS DNS config (no IP Helper API
-    // integration), so leave `os_searchlist`/`os_nameservers` as their
-    // default null — `loadConfig()`'s `stringToList`/`addressesToList` treat
-    // a null input as "empty", giving an empty search list. Netty's own
-    // resolver falls back to platform-default nameservers when this
-    // courtesy list is empty, so plain loopback/localhost resolution (all
-    // this suite needs) is unaffected. `notifyAddrChange0()` (address-change
-    // notification handle) is only consulted by an optional network-change
-    // listener our tests don't exercise; 0 is a harmless placeholder.
+    // integration), so publish empty *strings* for both OS-provided values.
+    // This is deliberately not null: the real JDK's `loadConfig()` calls
+    // `stringToList(os_nameservers)` unconditionally, and its implementation
+    // calls `String.split` without a null guard. An empty string preserves the
+    // intended empty-config semantics for Netty while also allowing the
+    // MongoDB driver's JNDI TXT resolver to reach its ordinary no-nameserver
+    // path instead of failing during resolver initialization.
+    // `notifyAddrChange0()` (address-change notification handle) is only
+    // consulted by an optional network-change listener our tests don't
+    // exercise; 0 is a harmless placeholder.
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "init0",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, _args| {
+            let searchlist = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_searchlist",
+                Value::Object(Some(searchlist)),
+            );
+            let nameservers = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_nameservers",
+                Value::Object(Some(nameservers)),
+            );
+            Ok(None)
+        },
     );
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "loadDNSconfig0",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, _args| {
+            let searchlist = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_searchlist",
+                Value::Object(Some(searchlist)),
+            );
+            let nameservers = ctx.create_string("");
+            ctx.set_static_field_by_name(
+                "sun/net/dns/ResolverConfigurationImpl",
+                "os_nameservers",
+                Value::Object(Some(nameservers)),
+            );
+            Ok(None)
+        },
     );
     registry.register(
         "sun/net/dns/ResolverConfigurationImpl",
         "notifyAddrChange0",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // JNDI DNS uses PortConfig to select a UDP source port. These are native
+    // JDK methods (not Java fallbacks), so real-JDK mode otherwise stops at an
+    // UnsatisfiedLinkError before the TXT query can be issued.
+    registry.register(
+        "sun/net/PortConfig",
+        "getLower0",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().0))),
+    );
+    registry.register(
+        "sun/net/PortConfig",
+        "getUpper0",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().1))),
+    );
+
+    // MongoDB Reactive Streams 5.7 uses Netty 4.2's
+    // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
+    // client has closed, a monitor callback can keep re-enqueuing work in
+    // CratonVM's event-loop implementation, so Netty's ordinary two-second
+    // quiet period never becomes quiet and Spring's context destroy callback
+    // waits indefinitely. Restrict the bridge to that concrete Netty 4.2
+    // group: it invokes Netty's own three-argument shutdown bytecode with a
+    // zero quiet period. Other EventExecutorGroup implementations retain
+    // their original no-argument bytecode unchanged.
+    registry.register(
+        "io/netty/util/concurrent/EventExecutorGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "io/netty/util/concurrent/AbstractEventExecutorGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "shutdownGracefully",
+        "()Lio/netty/util/concurrent/Future;",
+        native_netty_event_executor_group_shutdown_gracefully,
+    );
+    registry.register(
+        "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+        "customize",
+        "(Lcom/mongodb/MongoClientSettings$Builder;)V",
+        native_springboot_mongo_reactive_customizer_customize,
+    );
+    registry.register(
+        "org/springframework/boot/mongodb/autoconfigure/MongoReactiveAutoConfiguration$NettyDriverMongoClientSettingsBuilderCustomizer",
+        "destroy",
+        "()V",
+        native_springboot_mongo_reactive_customizer_destroy,
     );
 
     // `sun/nio/ch/NativeThread.supportPendingSignals0()Z` — a Linux-only
@@ -38535,8 +38611,8 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     register_synchronized_collection_wrapper_natives(registry);
     register_function_identity_natives(registry);
     // WildFly can load java.time.Instant through a bootstrap synthetic stub even
-    // in real-JDK mode. The interpreter already force-routes the hot Instant
-    // factories to native dispatch; make the bridge available in essentials too.
+    // in real-JDK mode. Keep its SyntheticStub bridge available in essentials;
+    // a loaded real-JDK Instant remains on its own bytecode path.
     register_synthetic_instant_stub_natives(registry);
     // Real-JDK boot can still resolve `java/util/Objects` through a synthetic
     // fallback when java.base stubs are partial. Install the existing spec
@@ -38775,131 +38851,69 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Apache commons-logging — Spring Boot 2.7 `SpringApplicationShutdownHook`
-    // static `Log logger = LogFactory.getLog(...)`. Real-JDK bytecode can NPE
-    // inside discovery; `vm_exec` forces these natives when registered.
-    let acl = "org/apache/commons/logging/LogFactory";
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // `org/apache/commons/logging/LogFactory.getLog`/`Log.info/debug/warn/
+    // error/etc.` used to be natively overridden here (as a `Bridge`, so
+    // `CRATONVM_NO_STUBS` could not drop it) to fabricate a throwaway 1-field
+    // synthetic `Log` whose `info`/`warn`/`error`/`fatal` routed through
+    // `ctx.record_printed_line` with a fake `"[ACL] "` prefix (bypassing
+    // System.out/err entirely) and whose `debug`/`trace` were pure no-ops.
+    // Every Spring Boot production class using the conventional
+    // `private final Log logger = LogFactory.getLog(getClass());` pattern
+    // (`ConditionEvaluationReportLogger`, `DockerComposeLifecycleManager`,
+    // `EndpointId`, `FreeMarkerAutoConfiguration`, the `Health*Indicator`
+    // family, …) got this fake `Log` — so its output could never reach a
+    // real Logback `ConsoleAppender`/`OutputStreamAppender`, and Spring
+    // Boot's `CapturedOutput` (which hooks `System.out`/`System.err`) always
+    // saw the empty string. This bridge predates, and was never revisited
+    // after, the `ch/qos/logback/classic/Logger`/`LoggerContext.getLogger`
+    // fix directly above — same overlay/real-class-layout mismatch family
+    // (see the note above that fix). Real `commons-logging` 1.3.x's own
+    // `LogFactory.getLog()` bytecode does its own SLF4J-bridge discovery at
+    // runtime and, with the `ch/qos/logback/classic/Logger` fix above in
+    // place, correctly hands back a real SLF4J-backed `Log` that reaches
+    // real Logback. This native override is dropped so that discovery runs
+    // for real. The original motivating case (`SpringApplicationShutdownHook`'s
+    // static `Log logger = LogFactory.getLog(...)`, which real-JDK bytecode
+    // was said to NPE inside) needs re-verification against a
+    // `SpringApplication.run()`-driving test (`SimpleMainTests`/
+    // `BannerTests`) after this change — see the doc for the verification
+    // run this was checked against.
+    //
+    // A concurrent session (`e21d80307`, "fix spring boot captured output
+    // logging") independently patched this SAME symptom with a different,
+    // lower-risk approach: keep the synthetic `Log`/`Logger` stubs but route
+    // their formatted text through `emit_framework_log`/`stream_writeln` so
+    // it reaches whatever `System.out`/`System.err` currently is. That
+    // patch is superseded here — it doesn't fix per-logger dynamic level
+    // control (`((LoggerContext) LoggerFactory.getILoggerFactory())
+    // .getLogger(X).setLevel(Level.DEBUG)`, which several of this doc's own
+    // tests rely on) since the stub's `isDebugEnabled`/`Logger.setLevel`
+    // stay hardcoded, and it doesn't use real Logback pattern/appender
+    // formatting — so it wasn't a complete fix for this doc's affected
+    // classes. Its one genuinely orthogonal addition,
+    // `org/springframework/core/log/LogMessage.toString()`, is kept below —
+    // real Logback message formatting can call it on a lazy `LogMessage`
+    // argument regardless of which Log/Logger path produced it.
     registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
+        "org/springframework/core/log/LogMessage",
+        "toString",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(this))) => *this,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(result)) = ctx.get_field_by_name(this, "result") {
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            let result = ctx.invoke_virtual(this, "buildString", "()Ljava/lang/String;", &[])?;
+            if let Some(Value::Object(Some(result))) = result {
+                ctx.set_field_by_name(this, "result", Value::Object(Some(result)));
+                return Ok(Some(Value::Object(Some(result))));
+            }
+            Ok(Some(Value::Object(None)))
         },
-    );
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    let acl_log = "org/apache/commons/logging/Log";
-    registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL WARN] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "warn",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
-    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
-    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
-    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL FATAL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "fatal",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "info",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "error",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
     );
 
     // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
@@ -42916,6 +42930,222 @@ pub(crate) fn platform_lib_name(name: &str) -> String {
     }
 }
 
+fn native_netty_event_executor_group_shutdown_gracefully(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+    if class_name.as_deref() != Some("io/netty/channel/MultiThreadIoEventLoopGroup") {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "shutdownGracefully",
+            "()Lio/netty/util/concurrent/Future;",
+            &[],
+        );
+    }
+
+    let time_unit = ctx.ensure_class_initialized("java/util/concurrent/TimeUnit")?;
+    let milliseconds_field = ctx
+        .static_field_index_by_name(time_unit, "MILLISECONDS")
+        .ok_or_else(|| {
+            MethodCallFailed::InternalError(VmError::Internal {
+                message: "java/util/concurrent/TimeUnit.MILLISECONDS static field not found"
+                    .to_string(),
+            })
+        })?;
+    let milliseconds = ctx.get_static_field(time_unit, milliseconds_field);
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "shutdownGracefully",
+        "(JJLjava/util/concurrent/TimeUnit;)Lio/netty/util/concurrent/Future;",
+        &[Value::Long(0), Value::Long(0), milliseconds],
+    )
+}
+
+fn native_springboot_mongo_reactive_customizer_destroy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Spring Boot 4.0's customizer blocks here in
+    // `shutdownGracefully().awaitUninterruptibly()`. In this runtime Netty's
+    // worker threads can already have exited while its promise remains
+    // incomplete, leaving application-context destruction stuck forever.
+    // Request the ordinary zero-quiet-period graceful shutdown, but do not
+    // await its stale termination promise. The matching `customize` bridge
+    // creates this one lifecycle-owned group with daemon workers, so those
+    // workers cannot retain the VM after the Spring context has returned.
+    if let Value::Object(Some(event_loop_group)) = ctx.get_field_by_name(this, "eventLoopGroup") {
+        native_netty_event_executor_group_shutdown_gracefully(
+            ctx,
+            &[Value::Object(Some(event_loop_group))],
+        )?;
+        ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(None));
+    }
+    Ok(None)
+}
+
+fn native_springboot_mongo_reactive_customizer_customize(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let builder = match args.get(1).copied() {
+        Some(Value::Object(Some(builder))) => builder,
+        _ => return Ok(None),
+    };
+
+    // Preserve Spring Boot's opt-out for user-provided transport settings.
+    if let Value::Object(Some(provider)) = ctx.get_field_by_name(this, "settings") {
+        if let Some(Value::Object(Some(settings))) =
+            ctx.invoke_virtual(provider, "getIfAvailable", "()Ljava/lang/Object;", &[])?
+        {
+            if matches!(
+                ctx.invoke_virtual(
+                    settings,
+                    "getTransportSettings",
+                    "()Lcom/mongodb/connection/TransportSettings;",
+                    &[],
+                )?,
+                Some(Value::Object(Some(_)))
+            ) {
+                return Ok(None);
+            }
+        }
+    }
+
+    // A TLS-enabled Mongo client can still be completing its asynchronous
+    // bootstrap when Spring destroys this bean. Netty's termination promise is
+    // then left incomplete by CratonVM even after all useful work is done. Use
+    // a daemon factory only for this Spring-owned client group, preserving the
+    // normal non-daemon policy for application-managed Netty groups.
+    let thread_factory = match ctx.new_object("io/netty/util/concurrent/DefaultThreadFactory")? {
+        Some(Value::Object(Some(factory))) => factory,
+        _ => return Ok(None),
+    };
+    let factory_pin = ctx.pin_native_root(thread_factory);
+    let pool_name = ctx.create_string("cratonvm-mongo-reactive");
+    let pool_name_pin = ctx.pin_native_root(pool_name);
+    let factory = ctx.read_native_pin(factory_pin, thread_factory);
+    let pool_name = ctx.read_native_pin(pool_name_pin, pool_name);
+    ctx.invoke(
+        "io/netty/util/concurrent/DefaultThreadFactory",
+        "<init>",
+        "(Ljava/lang/String;ZI)V",
+        &[
+            Value::Object(Some(factory)),
+            Value::Object(Some(pool_name)),
+            Value::Int(1),
+            Value::Int(5),
+        ],
+    )?;
+    ctx.unpin_native_roots(pool_name_pin);
+
+    let handler_factory = match ctx.invoke(
+        "io/netty/channel/nio/NioIoHandler",
+        "newFactory",
+        "()Lio/netty/channel/IoHandlerFactory;",
+        &[],
+    )? {
+        Some(Value::Object(Some(handler_factory))) => handler_factory,
+        _ => {
+            ctx.unpin_native_roots(factory_pin);
+            return Ok(None);
+        }
+    };
+    let handler_pin = ctx.pin_native_root(handler_factory);
+    let event_loop_group = match ctx.new_object("io/netty/channel/MultiThreadIoEventLoopGroup")? {
+        Some(Value::Object(Some(group))) => group,
+        _ => {
+            ctx.unpin_native_roots(handler_pin);
+            ctx.unpin_native_roots(factory_pin);
+            return Ok(None);
+        }
+    };
+    let group_pin = ctx.pin_native_root(event_loop_group);
+    let event_loop_group = ctx.read_native_pin(group_pin, event_loop_group);
+    let thread_factory = ctx.read_native_pin(factory_pin, thread_factory);
+    let handler_factory = ctx.read_native_pin(handler_pin, handler_factory);
+    ctx.invoke(
+        "io/netty/channel/MultiThreadIoEventLoopGroup",
+        "<init>",
+        "(Ljava/util/concurrent/ThreadFactory;Lio/netty/channel/IoHandlerFactory;)V",
+        &[
+            Value::Object(Some(event_loop_group)),
+            Value::Object(Some(thread_factory)),
+            Value::Object(Some(handler_factory)),
+        ],
+    )?;
+    let event_loop_group = ctx.read_native_pin(group_pin, event_loop_group);
+    ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(Some(event_loop_group)));
+    ctx.unpin_native_roots(group_pin);
+    ctx.unpin_native_roots(handler_pin);
+    ctx.unpin_native_roots(factory_pin);
+
+    let transport_builder = match ctx.invoke(
+        "com/mongodb/connection/TransportSettings",
+        "nettyBuilder",
+        "()Lcom/mongodb/connection/NettyTransportSettings$Builder;",
+        &[],
+    )? {
+        Some(Value::Object(Some(transport_builder))) => transport_builder,
+        _ => return Ok(None),
+    };
+    let transport_builder_pin = ctx.pin_native_root(transport_builder);
+    let event_loop_group = match ctx.get_field_by_name(this, "eventLoopGroup") {
+        Value::Object(Some(group)) => group,
+        _ => {
+            ctx.unpin_native_roots(transport_builder_pin);
+            return Ok(None);
+        }
+    };
+    let transport_builder = ctx.read_native_pin(transport_builder_pin, transport_builder);
+    ctx.invoke_virtual(
+        transport_builder,
+        "eventLoopGroup",
+        "(Lio/netty/channel/EventLoopGroup;)Lcom/mongodb/connection/NettyTransportSettings$Builder;",
+        &[Value::Object(Some(event_loop_group))],
+    )?;
+    let transport_builder = ctx.read_native_pin(transport_builder_pin, transport_builder);
+    let transport_settings = match ctx.invoke_virtual(
+        transport_builder,
+        "build",
+        "()Lcom/mongodb/connection/NettyTransportSettings;",
+        &[],
+    )? {
+        Some(Value::Object(Some(transport_settings))) => transport_settings,
+        _ => {
+            ctx.unpin_native_roots(transport_builder_pin);
+            return Ok(None);
+        }
+    };
+    let transport_settings_pin = ctx.pin_native_root(transport_settings);
+    let transport_settings = ctx.read_native_pin(transport_settings_pin, transport_settings);
+    ctx.invoke_virtual(
+        builder,
+        "transportSettings",
+        "(Lcom/mongodb/connection/TransportSettings;)Lcom/mongodb/MongoClientSettings$Builder;",
+        &[Value::Object(Some(transport_settings))],
+    )?;
+    ctx.unpin_native_roots(transport_settings_pin);
+    ctx.unpin_native_roots(transport_builder_pin);
+    Ok(None)
+}
+
+fn system_ephemeral_port_range() -> (i32, i32) {
+    std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| {
+            let mut ports = range.split_whitespace().filter_map(|port| port.parse::<i32>().ok());
+            Some((ports.next()?, ports.next()?))
+        })
+        .filter(|(lower, upper)| (0..=*upper).contains(lower) && *upper <= 65_535)
+        // IANA's dynamic/private range is the portable fallback when the host
+        // has no Linux procfs port-range setting (for example on Windows).
+        .unwrap_or((49_152, 65_535))
+}
+
 pub(crate) fn obj_arg(
     args: &[Value],
     idx: usize,
@@ -44165,6 +44395,76 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
             let _ = ctx.fd_table().write_string(fd, &sep);
         }
     });
+}
+
+/// Emit a framework log record through the live Java-level console stream.
+///
+/// Native logging fallbacks must not merely add entries to `printed_lines`:
+/// Spring Boot's `OutputCaptureExtension` observes the `PrintStream` installed
+/// by `System.setOut`, so bypassing that stream loses the record to tests (and
+/// to any other Java-level redirection).  Routing through `stream_writeln`
+/// preserves the canonical fd fast path for the original stream while calling
+/// a capture stream's real `OutputStream.write` override after redirection.
+fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
+    ctx.record_printed_line(text.to_string());
+    // `NativeContext::get_system_stream` is the process's canonical fd-backed
+    // stream. `System.setOut` intentionally leaves that canonical stream in
+    // place and records the Java-level replacement in the override table, so
+    // native-originated logs must prefer the override just as GETSTATIC does.
+    if let Some(out) = system_overridden_stream("out").or_else(|| ctx.get_system_stream("out")) {
+        stream_writeln(ctx, &[Value::Object(Some(out))], text);
+    }
+}
+
+/// Include the Throwable's Java representation for overloads whose contract
+/// carries an exception.  Calling `printStackTrace` here would bypass the
+/// capture stream on some JDK paths; `toString` is sufficient for framework
+/// diagnostics and remains part of the same captured record.
+fn emit_framework_log_with_throwable(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: &str,
+    throwable: Option<&Value>,
+) {
+    let throwable = match throwable {
+        Some(Value::Object(Some(throwable))) => {
+            match native_throwable_to_string(ctx, &[Value::Object(Some(*throwable))]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let text = match throwable {
+        Some(throwable) if !throwable.is_empty() => format!("{level} {message}\n{throwable}"),
+        _ => format!("{level} {message}"),
+    };
+    emit_framework_log(ctx, &text);
+}
+
+/// Commons Logging accepts arbitrary objects. Spring uses `LogMessage` for
+/// lazy formatting, so only reading `String` receivers loses those records.
+fn emit_framework_log_object(
+    ctx: &mut dyn NativeContext,
+    level: &str,
+    message: ObjectRef,
+    throwable: Option<&Value>,
+) {
+    let message = ctx
+        .read_string(message)
+        .or_else(|| {
+            match ctx.invoke_virtual(message, "toString", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                _ => None,
+            }
+        })
+        .or_else(|| match ctx.get_field_by_name(message, "format") {
+            Value::Object(Some(format)) => ctx.read_string(format),
+            _ => None,
+        });
+    if let Some(message) = message {
+        emit_framework_log_with_throwable(ctx, level, &message, throwable);
+    }
 }
 
 fn native_println_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -53030,7 +53330,9 @@ fn native_javac_file_manager_list(ctx: &mut dyn NativeContext, args: &[Value]) -
         // performance concern motivated the original "com"/"com.example"
         // short-circuit -- it was never measured against this on-disk-fixture
         // case, only against in-memory-only generated classes.
-        if location_name == "CLASS_PATH" && (package_name == "java" || package_name.starts_with("java.")) {
+        if location_name == "CLASS_PATH"
+            && (package_name == "java" || package_name.starts_with("java."))
+        {
             return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
         }
         if let Some(module_name) = location_name
@@ -53229,13 +53531,26 @@ fn native_javac_file_manager_infer_binary_name(
             relative_path.map(|path| javac_binary_name_from_relative_path(&path))
         }
         "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
+            // Read the display string directly via the same logic
+            // `Path.toString()`'s native uses (`p57_path_display_string`),
+            // rather than `ctx.invoke_virtual(path, "toString", ...)`. The
+            // latter doesn't consult `force_native_over_real_jdk_bytecode`/
+            // the `vm_exec.rs` `check_override` allow-list the way the
+            // bytecode interpreter's own `invokevirtual` handling does, so
+            // it silently ran `Path`'s (nonexistent — `Path` is an
+            // interface) real bytecode, which resolves to
+            // `Object.toString()` and returns `java.nio.file.Path@<hash>` —
+            // mangled by `javac_binary_name_from_relative_path` below into
+            // the literal binary name `java.nio.file` for every ordinary
+            // classpath class file (`ServletComponentScanRegistrarTests
+            // #processAheadOfTimeDoesNotRegisterServletComponentRegisteringPostProcessor`
+            // and any other real in-process javac compile — Spring's
+            // `TestCompiler`/AOT generation — referencing an
+            // application-classpath class).
             let path = match ctx.get_field_by_name(file, "path") {
-                Value::Object(Some(path)) => ctx
-                    .invoke_virtual(path, "toString", "()Ljava/lang/String;", &[])?
-                    .and_then(|value| match value {
-                        Value::Object(Some(path)) => ctx.read_string(path),
-                        _ => None,
-                    }),
+                Value::Object(Some(path)) => {
+                    Some(crate::phases_late::p57_path_display_string(ctx, path))
+                }
                 _ => None,
             };
             path.map(|path| javac_binary_name_from_relative_path(&path))
@@ -56533,7 +56848,20 @@ pub(crate) fn alloc_concurrent_synthetic(
             // isn't loaded yet — keep the caller's requested size.
             let real = ctx.class_num_total_fields(cid);
             let n = num_fields.max(real);
-            ctx.alloc_object(cid, n)
+            // `try_alloc_object_gc_safe` first (proactively collects, then
+            // walks young -> old gen without aborting): this is the shared
+            // allocator behind `java.net.URI`, `HttpURLConnection`, and many
+            // other synthetic native objects -- a gdb backtrace confirmed
+            // TestResponsePerformance's doUri() hot loop (`new URI(...)` x
+            // 1,000,000) hard-aborted the whole process here on young-gen
+            // exhaustion. Falling back to the aborting `alloc_object` only
+            // if the GC-safe path still reports genuine exhaustion (both
+            // generations full even after a fresh collection) preserves
+            // today's behavior for that now much narrower case, with no
+            // signature change for this function's many other callers. See
+            // docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+            ctx.try_alloc_object_gc_safe(cid, n)
+                .unwrap_or_else(|| ctx.alloc_object(cid, n))
         }
         Err(_) => {
             // The real `.class` file could not be loaded. Allocating with
@@ -58067,7 +58395,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // unpark, all of which CratonVM implements; with it the full
     // ByteSizeValueTests suite reaches HotSpot parity (42/42, clean exit).
     // Opt OUT with CRATONVM_SYNTHETIC_AQS=1 (legacy synthetic lock/condition).
-    // CountDownLatch/CyclicBarrier/Semaphore natives below are unaffected.
+    // CountDownLatch/CyclicBarrier synthetic natives below are unaffected.
     let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
         || std::env::var_os("CRATONVM_REAL_AQS").is_some();
     if !real_aqs {
@@ -58155,31 +58483,39 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- Semaphore ---
-    let sem = "java/util/concurrent/Semaphore";
-    registry.register(sem, "<init>", "(I)V", native_sem_init);
-    registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
-    registry.register(sem, "acquire", "()V", native_sem_acquire);
-    registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
-    registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
-    registry.register(sem, "release", "()V", native_sem_release);
-    registry.register(sem, "release", "(I)V", native_sem_release_n);
-    registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
-    registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
-    registry.register(
-        sem,
-        "tryAcquire",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        native_sem_try_acquire_timeout,
-    );
-    registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
-    registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
-    registry.register(sem, "isFair", "()Z", native_sem_is_fair);
-    registry.register(
-        sem,
-        "toString",
-        "()Ljava/lang/String;",
-        native_sem_to_string,
-    );
+    // See the matching early-registration guard above.  In the default real
+    // AQS mode, Semaphore must keep its real `sync: Semaphore$Sync` field so
+    // protected AQS operations invoked by third-party subclasses remain sound.
+    if !real_aqs {
+        let sem = "java/util/concurrent/Semaphore";
+        registry.register(sem, "<init>", "(I)V", native_sem_init);
+        registry.register(sem, "<init>", "(IZ)V", native_sem_init_fair);
+        registry.register(sem, "acquire", "()V", native_sem_acquire);
+        registry.register(sem, "acquire", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "acquireUninterruptibly", "()V", native_sem_acquire);
+        // HikariCP's SuspendResumeLock may acquire all 10,000 permits at
+        // once; retain this synthetic-mode overload.
+        registry.register(sem, "acquireUninterruptibly", "(I)V", native_sem_acquire_n);
+        registry.register(sem, "release", "()V", native_sem_release);
+        registry.register(sem, "release", "(I)V", native_sem_release_n);
+        registry.register(sem, "tryAcquire", "()Z", native_sem_try_acquire);
+        registry.register(sem, "tryAcquire", "(I)Z", native_sem_try_acquire_n);
+        registry.register(
+            sem,
+            "tryAcquire",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_sem_try_acquire_timeout,
+        );
+        registry.register(sem, "availablePermits", "()I", native_sem_available_permits);
+        registry.register(sem, "drainPermits", "()I", native_sem_drain_permits);
+        registry.register(sem, "isFair", "()Z", native_sem_is_fair);
+        registry.register(
+            sem,
+            "toString",
+            "()Ljava/lang/String;",
+            native_sem_to_string,
+        );
+    }
 
     // --- CyclicBarrier ---
     let cb = "java/util/concurrent/CyclicBarrier";
@@ -67631,31 +67967,29 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         };
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-        let task_count = match cratonvm_native_collections::native_al_size(
-            ctx,
-            &[Value::Object(Some(coll))],
-        )? {
-            Some(Value::Int(size)) => size,
-            _ => 0,
-        };
+        let task_count =
+            match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(coll))])? {
+                Some(Value::Int(size)) => size,
+                _ => 0,
+            };
         for index in 0..task_count {
-                let callable_val = cratonvm_native_collections::native_al_get(
-                    ctx,
-                    &[Value::Object(Some(coll)), Value::Int(index)],
-                )?
-                .unwrap_or(Value::Object(None));
-                let future = if let Value::Object(Some(c)) = callable_val {
-                    match ctx.invoke_virtual(c, "call", "()Ljava/lang/Object;", &[]) {
-                        Ok(r) => completed_executor_future(ctx, r.unwrap_or(Value::Object(None)))?,
-                        Err(e) => failed_executor_future(ctx, &e)?,
-                    }
-                } else {
-                    completed_executor_future(ctx, Value::Object(None))?
-                };
-                cratonvm_native_collections::native_al_add(
-                    ctx,
-                    &[Value::Object(Some(list)), Value::Object(Some(future))],
-                )?;
+            let callable_val = cratonvm_native_collections::native_al_get(
+                ctx,
+                &[Value::Object(Some(coll)), Value::Int(index)],
+            )?
+            .unwrap_or(Value::Object(None));
+            let future = if let Value::Object(Some(c)) = callable_val {
+                match ctx.invoke_virtual(c, "call", "()Ljava/lang/Object;", &[]) {
+                    Ok(r) => completed_executor_future(ctx, r.unwrap_or(Value::Object(None)))?,
+                    Err(e) => failed_executor_future(ctx, &e)?,
+                }
+            } else {
+                completed_executor_future(ctx, Value::Object(None))?
+            };
+            cratonvm_native_collections::native_al_add(
+                ctx,
+                &[Value::Object(Some(list)), Value::Object(Some(future))],
+            )?;
         }
         Ok(Some(Value::Object(Some(list))))
     };
@@ -67731,21 +68065,17 @@ fn completed_executor_future(
     ctx: &mut dyn NativeContext,
     result: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-        Some(Value::Object(Some(future))) => future,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "could not allocate executor completion future".to_string(),
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "could not allocate executor completion future".to_string(),
+                }
+                .into())
             }
-            .into())
-        }
-    };
-    ctx.invoke_virtual(
-        future,
-        "complete",
-        "(Ljava/lang/Object;)Z",
-        &[result],
-    )?;
+        };
+    ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result])?;
     Ok(future)
 }
 
@@ -67753,15 +68083,16 @@ fn failed_executor_future(
     ctx: &mut dyn NativeContext,
     error: &MethodCallFailed,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future = match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-        Some(Value::Object(Some(future))) => future,
-        _ => {
-            return Err(RuntimeError::IllegalStateException {
-                message: "could not allocate executor completion future".to_string(),
+    let future =
+        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "could not allocate executor completion future".to_string(),
+                }
+                .into())
             }
-            .into())
-        }
-    };
+        };
     let message = ctx.create_string(&format!("{error}"));
     let throwable = match ctx.new_object_initialized(
         "java/lang/RuntimeException",
@@ -67847,7 +68178,9 @@ fn native_es_submit_callable(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
     let mut result = Value::Object(None);
     if let Some(Value::Object(Some(callable))) = args.get(1) {
-        result = ctx.invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?.unwrap_or(Value::Object(None));
+        result = ctx
+            .invoke_virtual(*callable, "call", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
     }
     let future = completed_executor_future(ctx, result)?;
     Ok(Some(Value::Object(Some(future))))
@@ -70778,20 +71111,34 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Attributes is a Map and therefore accepts null values. In particular,
+    // Spring Boot writes its version attribute from Package metadata, which is
+    // null for an exploded classes directory; HotSpot retains that mapping and
+    // serializes it as the literal text "null". Do not turn that legal put
+    // into a silent no-op.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
     let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
     let result = cratonvm_native_collections::native_map_put_pub(
@@ -70799,12 +71146,14 @@ fn native_attrs_put_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         &[
             Value::Object(Some(map)),
             Value::Object(Some(map_key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     ctx.unpin_native_roots(map_key_pin);
     result
@@ -70843,30 +71192,42 @@ fn native_attrs_put_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(key))) => *key,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(value))) => *value,
-        _ => return Ok(Some(Value::Object(None))),
-    };
+    // Map.put(Object, Object) has the same null-value contract as putValue.
+    let value = args.get(2).copied().unwrap_or(Value::Object(None));
     let this_pin = ctx.pin_native_root(this);
     let key_pin = ctx.pin_native_root(key);
-    let value_pin = ctx.pin_native_root(value);
+    let value_pin = match value {
+        Value::Object(Some(value)) => Some(ctx.pin_native_root(value)),
+        _ => None,
+    };
     let this = ctx.read_native_pin(this_pin, this);
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let value = ctx.read_native_pin(value_pin, value);
+    let value = match value_pin {
+        Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
+            value_pin,
+            match value {
+                Value::Object(Some(value)) => value,
+                _ => unreachable!("only non-null references are pinned"),
+            },
+        ))),
+        None => value,
+    };
     let map = ctx.read_native_pin(map_pin, map);
     let result = cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
             Value::Object(Some(map)),
             Value::Object(Some(key)),
-            Value::Object(Some(value)),
+            value,
         ],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);
-    ctx.unpin_native_roots(value_pin);
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
     ctx.unpin_native_roots(map_pin);
     result
 }
@@ -71633,11 +71994,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
             {
-                if let Some(Value::Object(Some(context))) = ctx.new_object_initialized(
-                    "ch/qos/logback/classic/LoggerContext",
-                    "()V",
-                    &[],
-                )? {
+                if let Some(Value::Object(Some(context))) =
+                    ctx.new_object_initialized("ch/qos/logback/classic/LoggerContext", "()V", &[])?
+                {
                     return Ok(Some(Value::Object(Some(context))));
                 }
             }
@@ -71821,19 +72180,21 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // Level checks — return false so log call sites short-circuit. The
-    // synthetic-jdk path overrides these with level-aware versions,
-    // which is fine because the registration order in
-    // `register_slf4j_natives` is binder-LAST and we only get called
-    // there if no level-aware override has been registered yet.
+    // Retain trace/debug suppression, but keep the production log levels
+    // live. Spring's commons-logging and SLF4J adapters guard their warning
+    // paths with these checks; returning false here silently erased records
+    // instead of delivering them to the Java console stream.
     fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(0)))
     }
+    fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(1)))
+    }
     registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
     // Marker-aware variants: SLF4J `Logger` interface declares
     // `is{Trace,Debug,Info,Warn,Error}Enabled(Marker)`. Kafka (kafka.Kafka via
     // Scala) routes log calls through these overloads on first startup; the
@@ -71856,19 +72217,19 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isInfoEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isWarnEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
     registry.register(
         "org/slf4j/Logger",
         "isErrorEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_enabled,
     );
 
     // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
@@ -71903,12 +72264,10 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // accumulation recurs it must be fixed at its source (the map/collection
     // layer), not by skipping this method.
 
-    // No-op log methods (covers the most common arities that JCL /
-    // commons-logging / direct-SLF4J callers use). The synthetic-jdk
-    // `register_slf4j_natives` overrides several of these with
-    // dispatched-to-stdout versions; that override is harmless because
-    // the binder helper runs last in synthetic mode, but here in
-    // real-JDK mode we want pure no-ops.
+    // Preserve lightweight native fallback logging without discarding its
+    // observable console output. The full Logback pipeline is not available
+    // on every supported classpath, but Spring's OutputCaptureExtension must
+    // see INFO/WARN/ERROR records exactly as it sees direct System.out writes.
     fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
     }
@@ -71922,9 +72281,9 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(lg, "trace", sig, slf4j_noop);
         registry.register(lg, "debug", sig, slf4j_noop);
-        registry.register(lg, "info", sig, slf4j_noop);
-        registry.register(lg, "warn", sig, slf4j_noop);
-        registry.register(lg, "error", sig, slf4j_noop);
+        registry.register(lg, "info", sig, slf4j_log_msg);
+        registry.register(lg, "warn", sig, slf4j_log_msg);
+        registry.register(lg, "error", sig, slf4j_log_msg);
     }
 
     // Logback LoggerContext bridge — paired with the
@@ -71933,38 +72292,37 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `LoggerContext` instance so Spring Boot's
     // `LoggingSystemFactory.LogbackLoggingSystem.beforeInitialize()`
     // class check passes. The instance is initialized through Logback's real
-    // constructor; `getLogger(String)` remains a lightweight logging bridge.
+    // constructor; `getLogger(String)` is now left to Logback's real
+    // bytecode (see below) instead of a native override.
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // `LoggerContext.getLogger(String)`/`getLogger(Class)` used to be
+    // natively overridden to fabricate a throwaway 2-field synthetic
+    // `ch.qos.logback.classic.Logger` (name + level only), completely
+    // bypassing the real object the caller's `LoggerContext` already
+    // constructed (its real `root` Logger, its real `loggerCache`, its real
+    // parent-chain walk). This ran unconditionally in real-JDK mode even
+    // when `ch/qos/logback/classic/LoggerContext` was fully real (per the
+    // `StaticLoggerBinder.getLoggerFactory` fix below, which already
+    // prefers `ctx.new_object_initialized` when the real class is
+    // loadable) — an overlay/real-class-layout mismatch in the same family
+    // as the already-fixed `loggerContextListenerList` corruption (see
+    // docs/internal/springboot/logback-loggercontext-listenerlist-final-field-corruption-FIXED.md).
+    // Every `ch/qos/logback/classic/Logger` instance method below
+    // (`addAppender`, `info`/`warn`/`error`/etc., `filterAndLog_*`) was
+    // ALSO natively stubbed to a no-op, so even a caller holding a real
+    // `LoggerContext.root` reference could never attach a `ConsoleAppender`
+    // or have a log record actually reach one: `BasicConfigurator.configure()`
+    // would call `context.getLogger("ROOT")`, get a disposable synthetic
+    // Logger back, call `addAppender` on it (a no-op), and the REAL root
+    // logger inside `LoggerContext` never received the appender — so
+    // `OutputCaptureExtension`'s `CapturedOutput` (and every other consumer
+    // of Logback-routed log output) always saw the empty string, regardless
+    // of `System.out`/`System.err` redirection state. Removed the
+    // `getLogger` overrides here and every `ch/qos/logback/classic/Logger`
+    // no-op below so real Logback bytecode drives logger creation,
+    // appender attachment, and the whole `filterAndLog` → appender chain.
     let lb_ctx = "ch/qos/logback/classic/LoggerContext";
-    registry.register(
-        lb_ctx,
-        "getLogger",
-        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field_by_name(logger, "name", name);
-            ctx.set_field(logger, 0, name);
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
-    registry.register(
-        lb_ctx,
-        "getLogger",
-        "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name_val = match args.get(1) {
-                Some(Value::Object(Some(class_mirror))) => match ctx.get_field(*class_mirror, 0) {
-                    Value::Object(Some(n)) => Value::Object(Some(n)),
-                    _ => Value::Object(Some(ctx.create_string("unknown"))),
-                },
-                _ => Value::Object(Some(ctx.create_string("unknown"))),
-            };
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field_by_name(logger, "name", name_val);
-            ctx.set_field(logger, 0, name_val);
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
     registry.register(lb_ctx, "getName", "()Ljava/lang/String;", |ctx, _| {
         Ok(Some(Value::Object(Some(ctx.create_string("default")))))
     });
@@ -71974,194 +72332,15 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
     registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
 
-    /* Historical rationale for the removed construction-bypass shims.
-     * LoggerContext now runs its real constructor, so Java owns ContextBase,
-     * BasicStatusManager, and TurboFilterList state again. Do not restore the
-     * old overrides below.
-     *
-    // ContextBase is the parent class of LoggerContext. Its real
-    // bytecode `getObject(String)` / `putObject(String, Object)` /
-    // `getCopyOfPropertyMap` reads a `HashMap` field that is null
-    // because we bypass the real `<init>` chain. Spring Boot's
-    // `LogbackLoggingSystem.beforeInitialize()` calls `getObject`
-    // (via `isAlreadyInitialized`) on the LoggerContext we hand out,
-    // so we need these accessor natives to short-circuit before the
-    // null-map dereference. Returning null from getObject is the
-    // documented "not present" contract; putObject becomes a no-op.
-
-    // ContextBase.getStatusManager / LoggerContext.getStatusManager — the
-    // real bytecode reads a `BasicStatusManager` field set in <init>,
-    // which is null because we bypass real construction. Spring Boot's
-    // LogbackLoggingSystem.beforeInitialize routes through
-    // `ContextInitializer.statusOnResourceSearch` which calls
-    // `getStatusManager().add(InfoStatus)` — NPE on null. Hand back a
-    // synthetic BasicStatusManager whose interface methods (add/clear/
-    // getCount/getCopyOfStatusList/etc.) are wired to safe no-ops below.
-
-    // BasicStatusManager surface — interface dispatch resolves to the
-    // receiver's runtime class. Provide no-op natives so any caller
-    // (Spring Boot, Joran, logback internals) that obtains the manager
-    // via getStatusManager() can invoke its methods without NPE.
-
-    // LoggerContext.getTurboFilterList — Spring Boot's
-    // LogbackLoggingSystem.beforeInitialize line 123 does
-    // `loggerContext.getTurboFilterList().add(FILTER)`. The real field
-    // is null because we bypass logback's <init>. Return a synthetic
-    // TurboFilterList with `add(Object)` no-op so Spring's filter
-    // registration succeeds silently.
-
-    // Logback Logger surface — paired with the LoggerContext.getLogger
-    // native above. Mirrors the SLF4J Logger no-ops registered higher
-    // in this fn but on the concrete `ch.qos.logback.classic.Logger`
-    // class so direct logback-typed callers (Spring Boot's
-    // LogAdapter$Slf4jAdapter takes the SLF4J Logger interface so it
-    // already routes through the SLF4J no-ops; user code that casts
-    // to logback's Logger needs these).
-     */
-    let lb_lg = "ch/qos/logback/classic/Logger";
-    registry.register(lb_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Object(None))),
-        };
-        let v = match ctx.get_field_by_name(this, "name") {
-            Value::Object(Some(s)) => Value::Object(Some(s)),
-            _ => match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string(""))),
-            },
-        };
-        Ok(Some(v))
-    });
-    registry.register(lb_lg, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isTraceEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isDebugEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "isInfoEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isWarnEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_lg, "isErrorEnabled", "(Lorg/slf4j/Marker;)Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        lb_lg,
-        "setLevel",
-        "(Lch/qos/logback/classic/Level;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        lb_lg,
-        "getLevel",
-        "()Lch/qos/logback/classic/Level;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        lb_lg,
-        "getEffectiveLevel",
-        "()Lch/qos/logback/classic/Level;",
-        |_, _| Ok(Some(Value::Object(None))),
-    );
-    // Plain (String,...) and Marker-variant overloads. Spring Boot's
-    // LogAdapter and direct logback-typed callers dispatch through any
-    // of these; all are routed to a no-op so we never enter logback's
-    // internal filterAndLog path (where filter/appender lists are null
-    // because we bypass logback's <init>).
-    for sig in [
-        "(Ljava/lang/String;)V",
-        "(Ljava/lang/String;Ljava/lang/Object;)V",
-        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;[Ljava/lang/Object;)V",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;Ljava/lang/Throwable;)V",
-    ] {
-        registry.register(lb_lg, "trace", sig, slf4j_noop);
-        registry.register(lb_lg, "debug", sig, slf4j_noop);
-        registry.register(lb_lg, "info", sig, slf4j_noop);
-        registry.register(lb_lg, "warn", sig, slf4j_noop);
-        registry.register(lb_lg, "error", sig, slf4j_noop);
-    }
-    // LocationAwareLogger.log(Marker, fqcn, level, msg, args, t). Spring
-    // Boot's slf4j adapter routes here, which then internally calls
-    // filterAndLog_0_Or3Plus → NPE on our synthetic Logger (filter/
-    // appender lists are null). Stub to no-op so we never enter that
-    // path.
-    registry.register(
-        lb_lg,
-        "log",
-        "(Lorg/slf4j/Marker;Ljava/lang/String;ILjava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    // Private filterAndLog_* helpers. Registered as belt-and-suspenders:
-    // if any other Logger entry point we missed reaches into filterAndLog
-    // directly, this short-circuits before touching the null filter/
-    // appender lists on our synthetic Logger.
-    registry.register(
-        lb_lg,
-        "filterAndLog_0_Or3Plus",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;[Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    registry.register(
-        lb_lg,
-        "filterAndLog_1",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    registry.register(
-        lb_lg,
-        "filterAndLog_2",
-        "(Ljava/lang/String;Lorg/slf4j/Marker;Lch/qos/logback/classic/Level;Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        slf4j_noop,
-    );
-    // AppenderAttachableImpl-style methods that Spring Boot's
-    // LoggingSystem may invoke during bootstrap. Return safe defaults
-    // so callers that walk appenders see an empty list.
-    registry.register(
-        lb_lg,
-        "addAppender",
-        "(Lch/qos/logback/core/Appender;)V",
-        |_, _| Ok(None),
-    );
-    registry.register(
-        lb_lg,
-        "detachAppender",
-        "(Lch/qos/logback/core/Appender;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
-    registry.register(lb_lg, "detachAppender", "(Ljava/lang/String;)Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(lb_lg, "detachAndStopAllAppenders", "()V", |_, _| Ok(None));
-    registry.register(
-        lb_lg,
-        "isAttached",
-        "(Lch/qos/logback/core/Appender;)Z",
-        |_, _| Ok(Some(Value::Int(0))),
-    );
+    // `ch/qos/logback/classic/Logger` (getLogger, addAppender, info/warn/
+    // error/etc., filterAndLog_*) is intentionally NOT natively overridden
+    // here anymore — see the FIXED note above the `getLogger` removal. A
+    // concurrent session's alternative fix (keep the stub, route info/warn/
+    // error through `emit_framework_log`, `setLevel`/`isDebugEnabled` still
+    // hardcoded) is superseded here for the reasons noted above the
+    // `LogMessage.toString()` native. Real Logback bytecode now owns logger
+    // creation, appender attachment, and the filterAndLog → appender
+    // dispatch chain.
 }
 
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
@@ -72768,125 +72947,12 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     );
 
     // --- Apache Commons Logging ---
-    let acl = "org/apache/commons/logging/LogFactory";
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1)); // enabled
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    registry.register(
-        acl,
-        "getLog",
-        "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
-        |ctx, _| {
-            let log = alloc_concurrent_synthetic(ctx, "org/apache/commons/logging/Log", 1);
-            ctx.set_field(log, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(log))))
-        },
-    );
-    let acl_log = "org/apache/commons/logging/Log";
-    registry.register(acl_log, "info", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    // Commons-Logging debug — instance method, below default threshold
-    // so we discard arguments. NEW-6.
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    registry.register(acl_log, "warn", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL WARN] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "error", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL ERROR] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(acl_log, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
-    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
-    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
-    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
-    });
-    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "trace",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
-        if let Some(Value::Object(Some(msg))) = args.get(1) {
-            if let Some(s) = ctx.read_string(*msg) {
-                ctx.record_printed_line(format!("[ACL FATAL] {}", s));
-            }
-        }
-        Ok(None)
-    });
-    registry.register(
-        acl_log,
-        "fatal",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "info",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "debug",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
-    registry.register(
-        acl_log,
-        "error",
-        "(Ljava/lang/Object;Ljava/lang/Throwable;)V",
-        crate::native_noop_with_this,
-    );
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // this duplicated (and, per the registry's last-write-wins semantics,
+    // was shadowed by) `register_essential_natives`'s now-removed
+    // `LogFactory.getLog`/`Log.*` overrides — see the longer note there.
+    // Removed here too so nothing re-registers the fake `Log`.
 
     // --- Log4j2 (org.apache.logging.log4j) ---
     let log4j_lm = "org/apache/logging/log4j/LogManager";
@@ -73011,72 +73077,20 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     });
 
     // --- Logback (ch.qos.logback) ---
-    let lb_factory = "ch/qos/logback/classic/LoggerContext";
-    /* Historical rationale for the removed constructor/context-state shims.
-     * LoggerContext now uses its bytecode constructor in every registration
-     * mode, so ContextBase owns its real maps and status manager.
-     *
-    // LoggerContext constructor — no fields to initialize. NEW-6.
-    // ContextBase.removeObject/putObject/getObject — the LoggerContext
-    // constructor override above leaves the `objectMap`/`propertyMap` fields
-    // null. Spring Boot's `LogbackLoggingSystem.cleanUp` invokes
-    // `ContextBase.removeObject("...")` on every environment-prepared event,
-    // which dereferences the null `objectMap` and NPEs as
-    // `Cannot invoke remove on null`. The NPE is fatal (crashes
-    // SimpleApplicationEventMulticaster), so override these accessors with
-    // no-ops since our synthetic Logback Logger doesn't track per-context
-    // properties anyway.
-    // Same overrides on the concrete subclass — invokevirtual resolution
-    // may not see ContextBase methods when the receiver class declares
-    // overrides; register on LoggerContext as well. Also stub the helper
-    // accessors LogbackLoggingSystem.cleanUp() chains through so the
-    // null `objectMap`/`propertyMap` fields are never dereferenced.
-     */
-    // Keep only the lightweight Logger bridge; do not override LoggerContext
-    // construction or its ContextBase state.
-    registry.register(
-        lb_factory,
-        "getLogger",
-        "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
-        |ctx, args| {
-            let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "ch/qos/logback/classic/Logger", 2);
-            ctx.set_field(logger, 0, name);
-            ctx.set_field(logger, 1, Value::Int(1)); // DEBUG
-            Ok(Some(Value::Object(Some(logger))))
-        },
-    );
-
-    let lb_logger = "ch/qos/logback/classic/Logger";
-    registry.register(lb_logger, "debug", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "info", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "warn", "(Ljava/lang/String;)V", slf4j_log_msg);
-    registry.register(lb_logger, "error", "(Ljava/lang/String;)V", slf4j_log_msg);
-    // Logback trace — below default threshold, discard args. NEW-6.
-    registry.register(
-        lb_logger,
-        "trace",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
-    registry.register(lb_logger, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    // setLevel — instance setter; our synthetic logger doesn't track
-    // per-instance level beyond its initial value. NEW-6.
-    registry.register(
-        lb_logger,
-        "setLevel",
-        "(Lch/qos/logback/classic/Level;)V",
-        native_noop_with_this,
-    );
-    registry.register(lb_logger, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
-    registry.register(lb_logger, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
-    });
+    //
+    // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+    // this used to duplicate (and conflict with) `register_slf4j_binder_stubs_pub`'s
+    // now-removed `LoggerContext.getLogger`/`ch/qos/logback/classic/Logger`
+    // overrides with a SECOND, differently-shaped 2-field synthetic Logger
+    // (name + level) whose `debug`/`info`/`warn`/`error` routed through
+    // `slf4j_log_msg` (a fake "[LOG] name - message" formatter) instead of
+    // real Logback `filterAndLog` → appender dispatch. Neither synthetic
+    // Logger ever actually reached a `ConsoleAppender`/`OutputStreamAppender`,
+    // so any log line asserted on via Spring Boot's `CapturedOutput` (or any
+    // other real-appender consumer) was silently lost. See the longer note
+    // above `register_slf4j_binder_stubs_pub`'s (removed) `getLogger`
+    // overrides. Real Logback bytecode now owns `LoggerContext.getLogger`
+    // and every `ch/qos/logback/classic/Logger` instance method.
 }
 
 #[cfg(test)]
@@ -73090,11 +73104,7 @@ mod logback_construction_registration_tests {
         register_slf4j_natives(&mut registry);
 
         for (class_name, method_name, descriptor) in [
-            (
-                "ch/qos/logback/classic/LoggerContext",
-                "<init>",
-                "()V",
-            ),
+            ("ch/qos/logback/classic/LoggerContext", "<init>", "()V"),
             (
                 "ch/qos/logback/core/ContextBase",
                 "getObject",
@@ -73115,12 +73125,64 @@ mod logback_construction_registration_tests {
                 "getTurboFilterList",
                 "()Lch/qos/logback/classic/spi/TurboFilterList;",
             ),
+            // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
+            // LoggerContext.getLogger used to fabricate a throwaway synthetic
+            // Logger, and every Logger/Log instance method below was a
+            // native no-op — so log output never reached a real
+            // ConsoleAppender/System.out, and Spring Boot's CapturedOutput
+            // always saw the empty string. Guard against reintroducing any
+            // of these.
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getLogger",
+                "(Ljava/lang/String;)Lch/qos/logback/classic/Logger;",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getLogger",
+                "(Ljava/lang/Class;)Lch/qos/logback/classic/Logger;",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "addAppender",
+                "(Lch/qos/logback/core/Appender;)V",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "info",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "ch/qos/logback/classic/Logger",
+                "debug",
+                "(Ljava/lang/String;)V",
+            ),
+            (
+                "org/apache/commons/logging/LogFactory",
+                "getLog",
+                "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;",
+            ),
+            (
+                "org/apache/commons/logging/LogFactory",
+                "getLog",
+                "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;",
+            ),
+            (
+                "org/apache/commons/logging/Log",
+                "info",
+                "(Ljava/lang/Object;)V",
+            ),
+            (
+                "org/apache/commons/logging/Log",
+                "debug",
+                "(Ljava/lang/Object;)V",
+            ),
         ] {
             assert!(
                 registry
                     .find(class_name, method_name, descriptor)
                     .is_none(),
-                "{class_name}.{method_name}{descriptor} must use real Logback bytecode"
+                "{class_name}.{method_name}{descriptor} must use real Logback/commons-logging bytecode"
             );
         }
     }
@@ -73163,7 +73225,7 @@ fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Format as: [LEVEL] logger - message
     let short_name = logger_name.rsplit('.').next().unwrap_or(&logger_name);
     let formatted = format!("[LOG] {} - {}", short_name, result);
-    ctx.record_printed_line(formatted);
+    emit_framework_log(ctx, &formatted);
     Ok(None)
 }
 
@@ -73604,21 +73666,46 @@ fn native_md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // behaviour of NoSuchAlgorithmException being surfaced lazily.
     }
     let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2);
+    // GC-safety: `md` is a bare Rust local held across two further
+    // allocating calls (`create_string`, `new_array`) below. Either can
+    // trigger a moving GC that relocates `md`; without re-reading through a
+    // pin, the subsequent `set_field` writes land on `md`'s abandoned
+    // from-space copy and are silently lost, leaving the live instance's
+    // `algorithm`/`data` fields unset -- same unread-pin anti-pattern fixed
+    // in `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
+    let md_handle = ctx.pin_native_root(md);
     let algo_str = ctx.create_string(&algo);
+    let md = ctx.read_native_pin(md_handle, md);
     ctx.set_field(md, MD_FIELD_ALGO, Value::Object(Some(algo_str)));
     let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    let md = ctx.read_native_pin(md_handle, md);
     ctx.set_field(md, MD_FIELD_DATA, Value::Object(Some(data)));
+    ctx.unpin_native_roots(md_handle);
     Ok(Some(Value::Object(Some(md))))
 }
 
 fn md_append_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+    let this_handle = ctx.pin_native_root(this);
     let old_data = match ctx.get_field(this, MD_FIELD_DATA) {
         Value::Object(Some(o)) => o,
-        _ => return,
+        _ => {
+            ctx.unpin_native_roots(this_handle);
+            return;
+        }
     };
+    let old_data_handle = ctx.pin_native_root(old_data);
     let old_len = ctx.array_length(old_data);
     let new_len = old_len + bytes.len();
     let new_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
+    // GC-safety re-read (mirrors `populate_real_thread_holder`'s
+    // GCBARRIER-CDLWAIT-FIX, 2026-07-17): the `new_array` call above can
+    // trigger a moving GC, relocating `this`/`old_data`, both captured as
+    // bare locals before this allocation. Without this re-read, the copy
+    // loop below reads through a stale `old_data` and the final `set_field`
+    // writes `this.data` on an abandoned from-space copy -- a silently lost
+    // update (this MessageDigest's accumulator never actually grows).
+    let old_data = ctx.read_native_pin(old_data_handle, old_data);
+    let this = ctx.read_native_pin(this_handle, this);
     for i in 0..old_len {
         let v = ctx.get_array_element(old_data, i);
         ctx.set_array_element(new_data, i, v);
@@ -73627,6 +73714,7 @@ fn md_append_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
         ctx.set_array_element(new_data, old_len + i, Value::Int(b as i8 as i32));
     }
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(new_data)));
+    ctx.unpin_native_roots(this_handle);
 }
 
 fn native_md_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -74412,13 +74500,25 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
     }
     let digest = compute_digest(&algo, &data);
+    // GC-safety: `this` is a bare Rust local (from `args.first()`) held
+    // across two further allocating calls below (`new_array` x2). Either
+    // can trigger a moving GC that relocates `this`; the final "reset"
+    // `set_field` must re-read through a pin or it silently lands on an
+    // abandoned from-space copy, leaving the live instance's accumulator
+    // un-reset -- same unread-pin anti-pattern fixed in
+    // `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
+    let this_handle = ctx.pin_native_root(this);
     let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
+    let result_handle = ctx.pin_native_root(result);
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
     }
     // Reset
     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    let this = ctx.read_native_pin(this_handle, this);
+    let result = ctx.read_native_pin(result_handle, result);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
+    ctx.unpin_native_roots(this_handle);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -74735,6 +74835,25 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // ===========================================================================
 
 fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
+    // Real AQS is the default (and is explicitly enabled by the Spring Boot
+    // runner).  Its `ReentrantReadWriteLock` constructor creates real
+    // ReadLock/WriteLock views whose `sync` field points at the real nested
+    // `Sync`.  The legacy callbacks below instead manufacture a one-field
+    // synthetic view with its parent RWL in slot zero.  That happens to work
+    // for the callbacks they replace, but not for any unoverridden real-JDK
+    // method: `WriteLock.newCondition()` reads that slot as `Sync` and then
+    // tries to invoke `Sync.newCondition()` on the outer RWL, yielding the
+    // misleading `ReentrantReadWriteLock.newCondition` NoSuchMethodError.
+    // Keep the complete RWL family on real bytecode in this mode; the JIT
+    // skip list already protects the AQS family.  StampedLock remains an
+    // independent native implementation and must stay registered.
+    let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
+        || std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    if real_aqs {
+        register_stamped_lock_natives(registry);
+        return;
+    }
+
     let rwl = "java/util/concurrent/locks/ReentrantReadWriteLock";
     let rl = "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock";
     let wl = "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock";
@@ -77206,7 +77325,10 @@ fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_field(this, cursor_slot, Value::Int(cursor + 1));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
     if let Some(slot) = expected_slot {
-        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        let mod_count = ctx
+            .get_field_by_name(list, "modCount")
+            .as_int()
+            .unwrap_or(0);
         set_field_if_present(ctx, this, slot, Value::Int(mod_count));
     }
     Ok(None)
@@ -77216,7 +77338,10 @@ fn native_arraylist_list_itr_add(ctx: &mut dyn NativeContext, args: &[Value]) ->
 /// returned by `next()`/`previous()`. See `native_arraylist_list_itr_set`
 /// for the root-cause narrative; mirrors real-JDK `ArrayList$Itr.remove`'s
 /// cursor rewind (`cursor = lastRet`) and `lastRet` reset.
-fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn native_arraylist_list_itr_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let (cursor_slot, last_ret_slot, expected_slot, _, _) = native_arraylist_list_itr_slots(ctx);
     let last_ret = ctx.get_field(this, last_ret_slot).as_int().unwrap_or(-1);
@@ -77237,7 +77362,10 @@ fn native_arraylist_list_itr_remove(ctx: &mut dyn NativeContext, args: &[Value])
     ctx.set_field(this, cursor_slot, Value::Int(last_ret));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
     if let Some(slot) = expected_slot {
-        let mod_count = ctx.get_field_by_name(list, "modCount").as_int().unwrap_or(0);
+        let mod_count = ctx
+            .get_field_by_name(list, "modCount")
+            .as_int()
+            .unwrap_or(0);
         set_field_if_present(ctx, this, slot, Value::Int(mod_count));
     }
     Ok(None)
@@ -81569,7 +81697,7 @@ fn simple_java_format(ctx: &mut dyn NativeContext, fmt: &str, args: &[Value]) ->
                     arg_idx += 1;
                 }
                 'n' => {
-                    result.push('\n');
+                    result.push_str(if cfg!(windows) { "\r\n" } else { "\n" });
                 }
                 '%' => {
                     result.push('%');
@@ -84522,6 +84650,35 @@ mod concurrency_tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[test]
+    fn default_real_aqs_does_not_override_semaphore() {
+        // This test deliberately leaves the process environment untouched:
+        // production's default is real AQS. Synthetic-AQS test runs exercise
+        // the legacy registration surface instead.
+        if std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
+            && std::env::var_os("CRATONVM_REAL_AQS").is_none()
+        {
+            return;
+        }
+
+        let mut registry = NativeMethodRegistry::new();
+        register_essential_natives(&mut registry);
+        register_concurrent_natives(&mut registry);
+        let sem = "java/util/concurrent/Semaphore";
+        for (name, descriptor) in [
+            ("<init>", "(I)V"),
+            ("<init>", "(IZ)V"),
+            ("acquire", "()V"),
+            ("release", "()V"),
+            ("availablePermits", "()I"),
+        ] {
+            assert!(
+                registry.find(sem, name, descriptor).is_none(),
+                "real AQS must execute Semaphore.{name}{descriptor} bytecode"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // ReentrantLock
     // -----------------------------------------------------------------------
@@ -84715,6 +84872,16 @@ mod concurrency_tests {
 
         native_sem_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
         assert_eq!(sem_permits(&mut ctx, sem), 2);
+    }
+
+    #[test]
+    fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
+        let mut ctx = make_ctx();
+        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+
+        native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
+        assert_eq!(sem_permits(&mut ctx, sem), 0);
     }
 
     #[test]

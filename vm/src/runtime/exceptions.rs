@@ -7,6 +7,7 @@
 //! 1. Create a Java exception object on the heap (load class, allocate, call `<init>`)
 //! 2. Convert `RuntimeError` variants into proper `MethodCallFailed::ExceptionThrown`
 
+use crate::classloading::ClassId;
 use crate::error::{ClassFileError, LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
@@ -853,8 +854,23 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
     let class_id = shared.heap.class_id_of(obj);
     let cm = shared.class_manager.read();
     let mut walk = Some(class_id);
+    // Real-JDK bootstrap metadata intentionally represents a few core fields
+    // as `_fN`.  Throwable's first two instance slots nevertheless retain the
+    // JDK layout: `backtrace`, then `detailMessage`.  Keep this narrowly
+    // scoped fallback for that opaque representation only.
+    let mut opaque_throwable_detail_message = None;
     while let Some(cid) = walk {
         let Some(cls) = cm.get_class(cid) else { break };
+        if &*cls.name == "java/lang/Throwable"
+            && cls.fields.len() >= 2
+            && cls
+                .fields
+                .iter()
+                .take(2)
+                .all(|field| field.name.starts_with("_f"))
+        {
+            opaque_throwable_detail_message = Some(cls.first_field_index + 1);
+        }
         let mut inst = 0usize;
         for f in &cls.fields {
             if f.is_static() {
@@ -871,6 +887,12 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
             inst += 1;
         }
         walk = cls.superclass;
+    }
+    if let Some(idx) = opaque_throwable_detail_message {
+        drop(cm);
+        shared
+            .heap
+            .set_field(obj, idx, Value::Object(Some(string_ref)));
     }
 }
 
@@ -939,6 +961,31 @@ pub fn create_exception_object(
                 message: format!("failed to load exception class {class_name}: {e}"),
             })
         })?;
+
+    create_exception_object_for_class(shared, thread, class_id, class_name, message)
+}
+
+/// Create a Java exception object for an already-resolved exception class.
+///
+/// JNI `ThrowNew` receives a `jclass`, whose defining loader is part of the
+/// class identity.  Re-resolving only its name could select a different class
+/// from another loader; this entry point preserves the exact class supplied by
+/// the native library.
+#[cold]
+pub fn create_exception_object_for_class(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+    class_name: &str,
+    message: Option<&str>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // The caller may have received a stale/bogus `jclass`; reject it before
+    // allocating an object with an unknown layout.
+    if shared.class_manager.read().get_class(class_id).is_none() {
+        return Err(MethodCallFailed::InternalError(VmError::Internal {
+            message: format!("exception class {class_name} is not loaded"),
+        }));
+    }
 
     // 2. Allocate the exception object
     let num_fields = shared
@@ -1021,7 +1068,15 @@ pub fn create_exception_object(
         );
 
         match &init_result {
-            Ok(_) => { /* Constructor succeeded — message is set */ }
+            // Keep the direct field write even after a successful constructor.
+            // Core real-JDK exception constructors can be partially emulated
+            // during bootstrap; JNI ThrowNew must still retain the caller's
+            // message exactly as the JNI contract requires.
+            Ok(_) => {
+                let obj_ref = thread.native_pin_roots[pin_base];
+                let string_ref = thread.native_pin_roots[string_pin];
+                set_detail_message_by_name(shared, obj_ref, string_ref);
+            }
             Err(MethodCallFailed::InternalError(_)) => {
                 // String-arg constructor not found — fall back to ()V and
                 // manually set detailMessage. Resolve by name so we hit the

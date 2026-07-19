@@ -232,6 +232,76 @@ fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 // Also stash the env on `SpringApplication.environment` so the field-read
 // fast path (`if (environment != null) return environment;`) finds it on
 // subsequent invocations.
+/// Build the `WebApplicationType`-specific environment
+/// (`ApplicationServletEnvironment` / `ApplicationReactiveWebEnvironment` /
+/// `ApplicationEnvironment`) via the real `ApplicationContextFactory
+/// .createEnvironment` SPI path, mirroring `SpringApplication
+/// .getOrCreateEnvironment()`'s real bytecode
+/// (`this.applicationContextFactory.createEnvironment(webApplicationType)`).
+///
+/// Without this, `spring_app_get_or_create_environment` below always built a
+/// generic `StandardEnvironment` regardless of web application type. The
+/// LATER `EnvironmentConverter.convertEnvironmentIfNecessary` pass (run from
+/// `SpringApplication.prepareEnvironment` after property binding) papers
+/// over this for callers that only observe the environment after `run()`
+/// returns — but an `ApplicationEnvironmentPreparedEvent` listener observes
+/// the environment BEFORE that conversion pass runs, and sees the wrong
+/// (generic) type. See `SpringApplicationWebServerTests
+/// .webApplicationSwitchedOffInListener`, which asserts the listener's
+/// environment ends with "ApplicationServletEnvironment".
+///
+/// Returns `None` (caller falls back to the generic environment) if the
+/// `properties`/`applicationContextFactory` fields aren't found or the
+/// factory returns null for this web application type (e.g. `NONE`, where
+/// Spring Boot itself falls through to a plain `ApplicationEnvironment` —
+/// handled by the caller's existing fallback).
+fn create_web_application_environment(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<ObjectRef> {
+    // GC-safety: the invoke_virtual calls below can allocate/collect and
+    // relocate `this`; pin across the helper and re-read before the second
+    // field access.
+    let this_pin = ctx.pin_native_root(this);
+
+    let properties = match ctx.get_field_by_name(this, "properties") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+    let web_app_type = match ctx.invoke_virtual(
+        properties,
+        "getWebApplicationType",
+        "()Lorg/springframework/boot/WebApplicationType;",
+        &[],
+    ) {
+        Ok(Some(v @ Value::Object(_))) => v,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let factory = match ctx.get_field_by_name(this, "applicationContextFactory") {
+        Value::Object(Some(o)) => o,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return None;
+        }
+    };
+
+    const DESC: &str = "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/core/env/ConfigurableEnvironment;";
+    let result = match ctx.invoke_virtual(factory, "createEnvironment", DESC, &[web_app_type]) {
+        Ok(Some(Value::Object(Some(env)))) => Some(env),
+        _ => None,
+    };
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn spring_app_get_or_create_environment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -243,6 +313,16 @@ fn spring_app_get_or_create_environment(
     // get_environment above).
     if let Some(Value::Object(Some(this))) = args.first() {
         if let Value::Object(Some(env)) = ctx.get_field_by_name(*this, "environment") {
+            return Ok(Some(Value::Object(Some(env))));
+        }
+        // Prefer the WebApplicationType-specific environment over the
+        // generic StandardEnvironment fallback below — see
+        // create_web_application_environment's doc comment.
+        if let Some(env) = create_web_application_environment(ctx, *this) {
+            let this_pin = ctx.pin_native_root(*this);
+            let this = ctx.read_native_pin(this_pin, *this);
+            ctx.set_field_by_name(this, "environment", Value::Object(Some(env)));
+            ctx.unpin_native_roots(this_pin);
             return Ok(Some(Value::Object(Some(env))));
         }
         // GC-safety: `construct_real_standard_environment` below allocates
@@ -536,44 +616,7 @@ fn dlbf_register_bean_definition(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// StandardConfigDataLocationResolver.resolve — null-safe shim.
-//
-// Spring Boot 4.x `StandardConfigDataLocationResolver.resolve(ctx, location)`
-// calls `location.split()` which returns a `ConfigDataLocation[]`.  Each
-// element is passed to `getReferences(ctx, loc)` which dereferences `loc`
-// via `loc.getResourceLocation(...)`.
-//
-// In CratonVM's partial bootstrap, one of the array entries ends up null
-// (likely because `StringUtils.delimitedListToStringArray` or `Properties`
-// returns a null mid-array).  The result is:
-//
-//     NullPointerException: Cannot invoke getResourceLocation on null
-//
-// Without application.yml/properties on the demo classpath, the correct
-// behaviour is to load no config-data resources.  We override the public
-// `resolve(ConfigDataLocationResolverContext, ConfigDataLocation)` to return
-// an empty `ArrayList` — Spring proceeds without any config-data overrides
-// from the standard locations.
 // ──────────────────────────────────────────────────────────────────────────────
-
-fn empty_arraylist(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let list = match ctx.new_object("java/util/ArrayList").ok().flatten() {
-        Some(Value::Object(Some(o))) => o,
-        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 8),
-    };
-    // GC-safety: the `<init>` invocation below can itself allocate; pin
-    // `list` and re-read the forwarded reference before returning it.
-    let list_pin = ctx.pin_native_root(list);
-    let _ = ctx.invoke(
-        "java/util/ArrayList",
-        "<init>",
-        "()V",
-        &[Value::Object(Some(list))],
-    );
-    let list = ctx.read_native_pin(list_pin, list);
-    ctx.unpin_native_roots(list_pin);
-    Ok(Some(Value::Object(Some(list))))
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Spring Cloud AbstractEnvironmentDecrypt.decrypt — null-safe shim.
@@ -612,17 +655,6 @@ fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
 
 fn abstract_env_decrypt(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     empty_hashmap(ctx)
-}
-
-fn standard_config_data_resolve(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    empty_arraylist(ctx)
-}
-
-fn standard_config_data_resolve_profile_specific(
-    ctx: &mut dyn NativeContext,
-    _args: &[Value],
-) -> MethodCallResult {
-    empty_arraylist(ctx)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1130,16 +1162,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // override restores relaxed binding; any genuine null-getPropertyNames
     // source is a separate real bug to fix at its source, not to mask here.
 
-    // ── StandardConfigDataLocationResolver null-safe shim ──
-    // See comment block above standard_config_data_resolve for rationale.
-    const STD_CFG_RES: &str =
-        "org/springframework/boot/context/config/StandardConfigDataLocationResolver";
-    registry.register(
-        STD_CFG_RES,
-        "resolve",
-        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
-        standard_config_data_resolve,
-    );
     // ── Spring Cloud AbstractEnvironmentDecrypt null-safe shim ──
     // Override decrypt(TextEncryptor, PropertySources) to return an empty Map,
     // sidestepping the arraylength-on-null NPE from synthetic property sources
@@ -1151,13 +1173,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "decrypt",
         "(Lorg/springframework/security/crypto/encrypt/TextEncryptor;Lorg/springframework/core/env/PropertySources;)Ljava/util/Map;",
         abstract_env_decrypt,
-    );
-
-    registry.register(
-        STD_CFG_RES,
-        "resolveProfileSpecific",
-        "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
-        standard_config_data_resolve_profile_specific,
     );
 
     // ── Hibernate Validator preinitialization shim ─────────────────────────
@@ -2998,15 +3013,11 @@ fn throw_cannot_load_bean_class_exception(
             let class_name_val = Value::Object(Some(ctx.create_string(bean_class_name)));
             let exc = ctx.read_native_pin(exc_pin, exc);
             let resource_val = match (resource_val, resource_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => resource_val,
             };
             let name_val = match (name_val, name_val_pin) {
-                (Value::Object(Some(o)), Some(p)) => {
-                    Value::Object(Some(ctx.read_native_pin(p, o)))
-                }
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => name_val,
             };
             let cause = ctx.read_native_pin(cause_pin, cause);
@@ -3737,6 +3748,27 @@ mod tests {
         let mut r = NativeMethodRegistry::new();
         register(&mut r);
         r
+    }
+
+    #[test]
+    fn standard_config_data_resolver_uses_real_bytecode() {
+        let r = build_registry();
+        const CLASS: &str =
+            "org/springframework/boot/context/config/StandardConfigDataLocationResolver";
+        assert!(r
+            .find(
+                CLASS,
+                "resolve",
+                "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;)Ljava/util/List;",
+            )
+            .is_none());
+        assert!(r
+            .find(
+                CLASS,
+                "resolveProfileSpecific",
+                "(Lorg/springframework/boot/context/config/ConfigDataLocationResolverContext;Lorg/springframework/boot/context/config/ConfigDataLocation;Lorg/springframework/boot/context/config/Profiles;)Ljava/util/List;",
+            )
+            .is_none());
     }
 
     #[test]

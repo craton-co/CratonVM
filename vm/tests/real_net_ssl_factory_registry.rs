@@ -22,7 +22,11 @@ fn cratonvm_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    let exe = if cfg!(windows) {
+        "cratonvm.exe"
+    } else {
+        "cratonvm"
+    };
     ["release", "debug"]
         .into_iter()
         .map(|profile| workspace_root().join("target").join(profile).join(exe))
@@ -66,14 +70,46 @@ fn real_net_sockets_keep_ssl_factory_bridge_without_synthetic_stubs() {
         .iter()
         .filter(|entry| entry["class"] == "javax/net/ssl/SSLSocketFactory")
         .collect();
-    assert!(!entries.is_empty(), "SSLSocketFactory has no registered bridge methods");
+    assert!(
+        !entries.is_empty(),
+        "SSLSocketFactory has no registered bridge methods"
+    );
     assert!(
         entries.iter().all(|entry| entry["kind"] == "bridge"),
         "real-network SSLSocketFactory registry retained a non-bridge native: {entries:?}"
     );
-    assert!(
-        entries.iter().any(|entry| entry["name"] == "createSocket"),
-        "real-network SSLSocketFactory registry lost its createSocket bridge: {entries:?}"
-    );
+    for descriptor in [
+        "(Ljava/lang/String;I)Ljava/net/Socket;",
+        "(Ljava/net/InetAddress;I)Ljava/net/Socket;",
+        "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
+        "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
+    ] {
+        assert!(
+            entries.iter().any(|entry| {
+                entry["name"] == "createSocket" && entry["descriptor"] == descriptor
+            }),
+            "real-network SSLSocketFactory registry lost the createSocket{descriptor} bridge: {entries:?}"
+        );
+    }
+
+    let server_entries: Vec<&serde_json::Value> = census["natives"]
+        .as_array()
+        .expect("native registry census has no natives array")
+        .iter()
+        .filter(|entry| entry["class"] == "javax/net/ssl/SSLServerSocketFactory")
+        .collect();
+    for descriptor in [
+        "(I)Ljava/net/ServerSocket;",
+        "(II)Ljava/net/ServerSocket;",
+        "(IILjava/net/InetAddress;)Ljava/net/ServerSocket;",
+    ] {
+        assert!(
+            server_entries.iter().any(|entry| {
+                entry["name"] == "createServerSocket" && entry["descriptor"] == descriptor
+            }),
+            "real-network SSLServerSocketFactory registry lost the createServerSocket{descriptor} bridge: {server_entries:?}"
+        );
+    }
     fs::remove_file(dump).expect("failed to remove native registry census");
 }

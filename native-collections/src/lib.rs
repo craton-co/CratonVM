@@ -627,6 +627,36 @@ fn materialize_hm_int_fast(
     Ok(current)
 }
 
+/// JIT direct-call probe for the exact-HashMap integer-overlay GET fast path
+/// (perf/halfgap-20260717). `None` = not servable by the overlay (non-Integer
+/// key, or the map has materialized real nodes) — the caller must fall back
+/// to the full dispatch path. Never allocates on the Java heap and never
+/// dispatches Java code, so the VM-side thin helper may call it without the
+/// full `safe_native_call` wrapper (same contract as the wrapper-free
+/// `Integer.intValue` direct helper).
+pub fn jit_overlay_hashmap_get(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    key: Value,
+) -> Option<MethodCallResult> {
+    try_hm_int_fast_get(ctx, this, key)
+}
+
+/// PUT sibling of [`jit_overlay_hashmap_get`]. The overlay insert only
+/// touches the Rust-side table (whose entries the GC scans as roots via
+/// `gc_overlay_roots_for_collection`), so the no-Java-heap-allocation /
+/// no-Java-dispatch contract holds here too; a `None` (first put on a map
+/// with existing real nodes, non-Integer key, serialization put, ...) must
+/// fall back to full dispatch, which handles materialization.
+pub fn jit_overlay_hashmap_put(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: Value,
+    value: Value,
+) -> Option<MethodCallResult> {
+    try_hm_int_fast_put(ctx, this, key, value)
+}
+
 // ---------------------------------------------------------------------------
 // Cached debug-flag probes.
 //
@@ -4290,7 +4320,8 @@ fn map_alloc_node(
     let key_pin = ctx.pin_native_root(key);
     let value_pin = pin_value(ctx, value);
     let next_pin = next.map(|n| ctx.pin_native_root(n));
-    let node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
+    // Use a concrete node class: Object now correctly has zero writable fields.
+    let node = alloc_synthetic(ctx, "java/util/HashMap$Node", NODE_NUM_FIELDS);
     let key = ctx.read_native_pin(key_pin, key);
     let value = read_pinned_elem(ctx, value_pin, value);
     let next = next.map(|n| ctx.read_native_pin(next_pin.unwrap(), n));
@@ -5689,6 +5720,12 @@ fn native_map_put_evict_pinned(
         Some(b) => b,
         None => return Ok(Some(Value::Object(None))),
     };
+    // `map_keys_equal` below can run arbitrary Java code before `buckets` is
+    // used again to link a newly allocated node. Root the array now, while the
+    // address read from the refreshed map is still current. Pinning it only
+    // after the chain walk merely preserved an already-forwarded from-space
+    // address (the repaired WildFly canary caught exactly that ordering).
+    let buckets_pin = ctx.pin_native_root(buckets);
 
     let idx = map_bucket_index(hash, cap);
     let mut node_val = ctx.get_array_element(buckets, idx);
@@ -5737,6 +5774,10 @@ fn native_map_put_evict_pinned(
             // Looking for a null-key node
             if matches!(node_key_field, Value::Object(None)) {
                 let old_value = get_node_value(ctx, node);
+                // `map_resize` above may have collected after the initial
+                // value read even though null-key lookup itself has no
+                // `equals` callback.
+                let value = read_pinned_elem(ctx, value_pin, value);
                 // Update value in-place using the detected layout
                 match ctx.get_field(node, 0) {
                     Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
@@ -5773,6 +5814,11 @@ fn native_map_put_evict_pinned(
             }
             if eq {
                 let old_value = get_node_value(ctx, node);
+                // `map_keys_equal` above can run arbitrary Java code. Refresh
+                // the caller-pinned replacement immediately before updating
+                // the existing node; the earlier pre-walk copy is stale after
+                // any GC completed inside `equals`.
+                let value = read_pinned_elem(ctx, value_pin, value);
                 match ctx.get_field(node, 0) {
                     Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
                     _ => ctx.set_field(node, 2, value), // JDK value slot 2 (our nodes)
@@ -5825,12 +5871,9 @@ fn native_map_put_evict_pinned(
     // `set_map_size` writes below stores into the object's OLD (now
     // freed-and-reused) address, landing misaligned in whatever now occupies
     // it — the observed `{raw ptr, 0}` corrupt Value cells in a neighboring
-    // live object (Fork6Hard$StrTask / Thread mirror). Pin the three
-    // cross-allocation roots and re-read them after the alloc. (`key_val`/
-    // `value` are consumed into `new_node` immediately, before any further
-    // allocation, so they need no pin.)
+    // live object (Fork6Hard$StrTask / Thread mirror). Pin the cross-allocation
+    // roots and re-read them after the allocation.
     let this_pin = ctx.pin_native_root(this);
-    let buckets_pin = ctx.pin_native_root(buckets);
     let tail_pin = tail_node.map(|t| ctx.pin_native_root(t));
     // `key_val`/`value` are also consumed AFTER the alloc (into new_node's
     // slots); the bare local copies would go stale even though the natives
@@ -5844,16 +5887,23 @@ fn native_map_put_evict_pinned(
     let value_pin = pin_value(ctx, value);
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
-    // Re-read the pinned roots at their post-GC addresses.
-    let this = ctx.read_native_pin(this_pin, this);
-    let buckets = ctx.read_native_pin(buckets_pin, buckets);
-    let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
+    // Keep the node and both object values rooted through population and
+    // refresh every reference immediately before its store. The later
+    // `[SETFIELD-GC]` epoch probe established that a plain ref store does not
+    // itself complete a moving GC; these refreshes are retained as explicit
+    // post-allocation provenance and defensive store-boundary discipline.
+    let node_pin = ctx.pin_native_root(new_node);
     let key_val = read_pinned_elem(ctx, key_pin, key_val);
-    let value = read_pinned_elem(ctx, value_pin, value);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
+    let new_node = ctx.read_native_pin(node_pin, new_node);
+    let value = read_pinned_elem(ctx, value_pin, value);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
+    let new_node = ctx.read_native_pin(node_pin, new_node);
     ctx.set_field(new_node, NODE_FIELD_NEXT, Value::Object(None));
+    let new_node = ctx.read_native_pin(node_pin, new_node);
+    let buckets = ctx.read_native_pin(buckets_pin, buckets);
+    let tail_node = tail_node.map(|t| ctx.read_native_pin(tail_pin.unwrap(), t));
     match tail_node {
         // Non-empty chain: link after the last node walked above.
         Some(t) => ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(new_node))),
@@ -7488,8 +7538,9 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             // entries already allocated by earlier iterations — pin all of
             // them and hand back only refreshed addresses (canary-caught
             // live via `native_hs_iterator` during WildFly domain boot).
-            let entries = collect_entries_any(ctx, source);
             let src_pin = ctx.pin_native_root(source);
+            let entries = collect_entries_any(ctx, source);
+            let source = ctx.read_native_pin(src_pin, source);
             let (keys, vals): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
             let (_, kh) = pin_value_slice(ctx, &keys);
             let (_, vh) = pin_value_slice(ctx, &vals);
@@ -11240,10 +11291,26 @@ fn alloc_live_entry(
     value: Value,
     source: ObjectRef,
 ) -> ObjectRef {
+    // Entry allocation can trigger a moving collection. The caller often
+    // obtained these values from a source-map snapshot held only in Rust, so
+    // keeping them as bare ObjectRefs here can write pre-move addresses into
+    // the freshly allocated entry. That manifests much later as a dropped
+    // entry while Java walks entrySet() (for example, a sporadically missing
+    // HTTP response header). Root all three inputs and reload after the
+    // allocation before publishing the entry fields.
+    let key_pin = pin_value(ctx, key);
+    let value_pin = pin_value(ctx, value);
+    let source_pin = ctx.pin_native_root(source);
     let entry = alloc_synthetic(ctx, class, 3);
+    let key = read_pinned_elem(ctx, key_pin, key);
+    let value = read_pinned_elem(ctx, value_pin, value);
+    let source = ctx.read_native_pin(source_pin, source);
     ctx.set_field(entry, 0, key);
     ctx.set_field(entry, 1, value);
     ctx.set_field(entry, ENTRY_FIELD_SOURCE, Value::Object(Some(source)));
+    ctx.unpin_native_roots(source_pin);
+    ctx.unpin_native_roots(value_pin);
+    ctx.unpin_native_roots(key_pin);
     entry
 }
 
@@ -14109,6 +14176,17 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
         native_stream_reduce_identity,
     );
+    // `Stream.reduce(U, BiFunction<U, ? super T, U>, BinaryOperator<U>)` is
+    // distinct from the same-typed identity overload above.  Spring HATEOAS
+    // uses it to fold stream elements into a HAL Forms builder, so omitting
+    // this descriptor resolves the abstract Stream declaration and produces
+    // `AbstractMethodError: ... has no Code attribute`.
+    r.register(
+        c,
+        "reduce",
+        "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+        native_stream_reduce_general,
+    );
     r.register(
         c,
         "reduce",
@@ -15467,6 +15545,11 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    // The terminal consumer remains live across stream materialisation, which
+    // can invoke arbitrary Java code and move it. Root it before choosing or
+    // executing either stream path; taking this pin after `stream_elements`
+    // is too late and was the dominant synthetic-lambda PIN-STALE firing.
+    let con_pin = ctx.pin_native_root(consumer);
     // Lazy path: a stream straight from `StreamSupport.stream(realSpliterator,
     // false)` (no intervening op materialised it) drives its source spliterator
     // one element at a time, so a side-effecting consumer observes per-element
@@ -15493,7 +15576,6 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
         let this_pin = ctx.pin_native_root(this);
         let spl_pin = ctx.pin_native_root(spl);
-        let con_pin = ctx.pin_native_root(consumer);
         const SAFETY_CAP: usize = 1_000_000;
         let mut n = 0usize;
         let result = loop {
@@ -15516,8 +15598,8 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             }
         };
         let this = ctx.read_native_pin(this_pin, this);
-        ctx.unpin_native_roots(this_pin);
-        ctx.unpin_native_roots(spl_pin);
+        // `con_pin` is the first pin owned by this native; one truncate clears
+        // it and the later `this`/`spl` pins without violating stack order.
         ctx.unpin_native_roots(con_pin);
         // Mark consumed so a (illegal) second terminal sees an empty stream.
         ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
@@ -15528,7 +15610,6 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
     // relocates the consumer and the materialized elements; pin them and re-read
     // each from its handle before the (allocating) dispatch.
-    let con_pin = ctx.pin_native_root(consumer);
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
     // GC-SAFETY (register-invisible-root closeable gap — see
     // `NativeContext::refresh_root_snapshot`'s doc comment): the pins above
@@ -15993,6 +16074,63 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
     let acc = read_pinned_elem(ctx, acc_handle, acc);
     ctx.unpin_native_roots(op_pin);
+    Ok(Some(acc))
+}
+
+/// Sequential implementation of `Stream.reduce(U, BiFunction, BinaryOperator)`.
+///
+/// CratonVM executes object streams sequentially, so the combiner is required
+/// by the Java API but is not invoked.  Every object that remains live across a
+/// user-supplied `BiFunction.apply` is pinned: the callback can allocate and
+/// therefore move the young generation.
+fn native_stream_reduce_general(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(args.get(1).copied()),
+    };
+    let mut acc = args.get(1).copied().unwrap_or(Value::Object(None));
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(acc)),
+    };
+
+    // Keep one batch of pins and release it as a unit.  Each accumulator result
+    // gets a new pin before the next callback, so it cannot go stale even when
+    // the callback triggers a moving collection.
+    let pin_base = ctx.pin_native_root(this);
+    let mut acc_pin = pin_value(ctx, acc);
+    let accumulator_pin = ctx.pin_native_root(accumulator);
+    let elements = match stream_elements(ctx, this) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(e);
+        }
+    };
+    let (_, elem_pins) = pin_value_slice(ctx, &elements);
+
+    for (index, element) in elements.iter().enumerate() {
+        let accumulator = ctx.read_native_pin(accumulator_pin, accumulator);
+        let acc_arg = read_pinned_elem(ctx, acc_pin, acc);
+        let element = read_pinned_elem(ctx, elem_pins[index], *element);
+        let result = match ctx.invoke_virtual(
+            accumulator,
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[acc_arg, element],
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
+        acc = result.unwrap_or(Value::Object(None));
+        acc_pin = pin_value(ctx, acc);
+    }
+
+    let acc = read_pinned_elem(ctx, acc_pin, acc);
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(acc))
 }
 
@@ -30661,28 +30799,75 @@ fn tm_insert_at(
     key: Value,
     value: Value,
 ) {
+    // cce0079 tree-key-tail fix: a reference-typed store can itself
+    // cooperate with a GC (canary-proven in the sibling
+    // `native_map_put_evict_pinned` node-population sequence: value CURRENT
+    // at refresh, STALE one ref-store later). Every ref crossing a store
+    // here — `data`, the shifted `k`/`v` snapshots, and the final
+    // `key`/`value` — must be refreshed through a pin immediately before
+    // its own store.
+    let data_pin = ctx.pin_native_root(data);
+    let kh = pin_value(ctx, key);
+    let vh = pin_value(ctx, value);
+    let mut data = data;
     let s = size as usize;
     for i in (pos..s).rev() {
         let k = ctx.get_array_element(data, i * 2);
         let v = ctx.get_array_element(data, i * 2 + 1);
+        let ke = pin_value(ctx, k);
+        let ve = pin_value(ctx, v);
+        data = ctx.read_native_pin(data_pin, data);
+        let k = read_pinned_elem(ctx, ke, k);
         ctx.set_array_element(data, (i + 1) * 2, k);
+        data = ctx.read_native_pin(data_pin, data);
+        let v = read_pinned_elem(ctx, ve, v);
         ctx.set_array_element(data, (i + 1) * 2 + 1, v);
+        data = ctx.read_native_pin(data_pin, data);
+        // Truncate this iteration's two element pins (LIFO: ke is the
+        // lowest handle pushed this iteration).
+        if ke != usize::MAX {
+            ctx.unpin_native_roots(ke);
+        } else if ve != usize::MAX {
+            ctx.unpin_native_roots(ve);
+        }
     }
+    let key = read_pinned_elem(ctx, kh, key);
     ctx.set_array_element(data, pos * 2, key);
+    data = ctx.read_native_pin(data_pin, data);
+    let value = read_pinned_elem(ctx, vh, value);
     ctx.set_array_element(data, pos * 2 + 1, value);
+    ctx.unpin_native_roots(data_pin);
 }
 
 // Remove entry at position, shifting elements left
 fn tm_remove_at(ctx: &mut dyn NativeContext, data: ObjectRef, size: i32, pos: usize) {
+    // cce0079 tree-key-tail fix: same per-store refresh discipline as
+    // `tm_insert_at`.
+    let data_pin = ctx.pin_native_root(data);
+    let mut data = data;
     let s = size as usize;
     for i in pos..(s - 1) {
         let k = ctx.get_array_element(data, (i + 1) * 2);
         let v = ctx.get_array_element(data, (i + 1) * 2 + 1);
+        let ke = pin_value(ctx, k);
+        let ve = pin_value(ctx, v);
+        data = ctx.read_native_pin(data_pin, data);
+        let k = read_pinned_elem(ctx, ke, k);
         ctx.set_array_element(data, i * 2, k);
+        data = ctx.read_native_pin(data_pin, data);
+        let v = read_pinned_elem(ctx, ve, v);
         ctx.set_array_element(data, i * 2 + 1, v);
+        data = ctx.read_native_pin(data_pin, data);
+        if ke != usize::MAX {
+            ctx.unpin_native_roots(ke);
+        } else if ve != usize::MAX {
+            ctx.unpin_native_roots(ve);
+        }
     }
     ctx.set_array_element(data, (s - 1) * 2, Value::Object(None));
+    data = ctx.read_native_pin(data_pin, data);
     ctx.set_array_element(data, (s - 1) * 2 + 1, Value::Object(None));
+    ctx.unpin_native_roots(data_pin);
 }
 
 // ----- TreeSet helpers -----
@@ -38886,10 +39071,10 @@ fn native_collections_empty_iterator(
 
 fn native_collections_singleton(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let elem = args.first().cloned().unwrap_or(Value::Object(None));
-    // Keep Set singleton native-backed. WildFly's PathManagerService iterates
-    // this object during Host Controller bootstrap, and the real
-    // Collections$SingletonSet path currently depends on iterator internals
-    // that are not stable this early in the boot graph.
+    if let Some(set) = alloc_real_jdk(ctx, "java/util/Collections$SingletonSet") {
+        ctx.set_field_by_name(set, "element", elem);
+        return Ok(Some(Value::Object(Some(set))));
+    }
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
@@ -38908,9 +39093,11 @@ fn native_collections_singleton_map(
 ) -> MethodCallResult {
     let key = args.first().cloned().unwrap_or(Value::Object(None));
     let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-    // Keep singletonMap native-backed for the same bootstrap reason as
-    // singleton Set: WildFly calls simple Map methods before the real
-    // Collections$SingletonMap wrapper's method surface is fully bridged.
+    if let Some(map) = alloc_real_jdk(ctx, "java/util/Collections$SingletonMap") {
+        ctx.set_field_by_name(map, "k", key);
+        ctx.set_field_by_name(map, "v", val);
+        return Ok(Some(Value::Object(Some(map))));
+    }
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     native_map_put(ctx, &[Value::Object(Some(map)), key, val])?;
@@ -39166,9 +39353,18 @@ fn native_collections_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Every `Collection.add` dispatch can execute arbitrary Java code and
+    // collect. Root both the destination and the source array before the first
+    // callback, then refresh them for every iteration. Keeping the array as a
+    // raw entry-argument copy made the second element read dereference
+    // from-space during WildFly's parallel subsystem boot.
+    let pin_base = ctx.pin_native_root(coll);
+    let elements_pin = ctx.pin_native_root(elements);
+    let elements = ctx.read_native_pin(elements_pin, elements);
     let len = ctx.array_length(elements);
     let mut modified = false;
     for i in 0..len {
+        let elements = ctx.read_native_pin(elements_pin, elements);
         let elem = ctx.get_array_element(elements, i);
         // Dispatch to the target collection's real `add` instead of
         // hard-coding `native_al_add` (the ArrayList `elementData`/`size`
@@ -39177,12 +39373,17 @@ fn native_collections_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // ArrayList, so `native_al_add` would write the wrong fields and
         // silently drop every element. JVMS/JDK spec is `result |=
         // c.add(element)`; honour that via virtual dispatch.
-        if let Some(Value::Int(1)) =
-            ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem])?
-        {
-            modified = true;
+        let coll = ctx.read_native_pin(pin_base, coll);
+        match ctx.invoke_virtual(coll, "add", "(Ljava/lang/Object;)Z", &[elem]) {
+            Ok(Some(Value::Int(1))) => modified = true,
+            Ok(_) => {}
+            Err(error) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(error);
+            }
         }
     }
+    ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -44071,6 +44272,21 @@ mod tests {
         assert_eq!(dbg_hmput(), expected);
     }
 
+    #[test]
+    fn stream_reduce_generic_accumulator_is_registered() {
+        let registry = build_registry();
+        assert!(
+            registry
+                .find(
+                    "java/util/stream/Stream",
+                    "reduce",
+                    "(Ljava/lang/Object;Ljava/util/function/BiFunction;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
+                )
+                .is_some(),
+            "generic Stream.reduce must not fall through to the abstract interface declaration"
+        );
+    }
+
     // Fix item 4: Java shortest-round-trip Float/Double formatting helpers.
     #[test]
     fn java_double_to_string_matches_java_spec() {
@@ -45899,7 +46115,7 @@ mod tests {
             fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
                 Vec::new()
             }
-            fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> {
+            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
                 None
             }
             fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {

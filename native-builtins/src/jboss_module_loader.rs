@@ -2341,8 +2341,12 @@ pub(crate) fn native_module_load_class(
     match ctx.load_class(&internal) {
         Ok(Some(mirror)) => Ok(Some(mirror)),
         _ => {
-            let exc =
-                alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+            let exc = alloc_single_message_exception(
+                ctx,
+                "java/lang/ClassNotFoundException",
+                1,
+                &class_name,
+            );
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2479,8 +2483,12 @@ pub(crate) fn native_module_classloader_load_class(
                 if dbg {
                     eprintln!("[mcl.loadClass] jdk-internal: load_class miss");
                 }
-                let exc =
-                    alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+                let exc = alloc_single_message_exception(
+                    ctx,
+                    "java/lang/ClassNotFoundException",
+                    1,
+                    &class_name,
+                );
                 Err(MethodCallFailed::ExceptionThrown(exc))
             }
         };
@@ -2556,8 +2564,12 @@ pub(crate) fn native_module_classloader_load_class(
             if dbg {
                 eprintln!("[mcl.loadClass] load_class miss after visible: {other:?}");
             }
-            let exc =
-                alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+            let exc = alloc_single_message_exception(
+                ctx,
+                "java/lang/ClassNotFoundException",
+                1,
+                &class_name,
+            );
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2608,7 +2620,8 @@ pub(crate) fn native_module_classloader_find_class(
         }
     }
 
-    let exc = alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+    let exc =
+        alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
     Err(MethodCallFailed::ExceptionThrown(exc))
 }
 
@@ -3108,7 +3121,10 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
         "java/util/ServiceLoader",
         "load",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-        &[Value::Object(Some(service)), Value::Object(Some(class_loader))],
+        &[
+            Value::Object(Some(service)),
+            Value::Object(Some(class_loader)),
+        ],
     )
 }
 

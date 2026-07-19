@@ -25,7 +25,7 @@ TIMEOUT="${TIMEOUT:-120}"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect RJitGc}"
+CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc}"
 
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }

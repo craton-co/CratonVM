@@ -100,6 +100,14 @@ pub enum SkipReason {
     /// Method is being invoked from an unnamed thread (typically a test
     /// harness in early init), where thread-local JIT state may not be set up.
     UnnamedThread,
+    /// `MutableBigInteger` divide/normalization arithmetic has a confirmed
+    /// JIT-only array-index corruption residual. Keep the implementation
+    /// interpreted until the lowering defect is identified.
+    BigIntegerArithmetic,
+    /// Javac's `JavacTool.getTask` loses the compiler file-manager context
+    /// after tiered compilation. Keep this cold compiler setup method
+    /// interpreted until its JIT lowering is understood.
+    JavacToolContext,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -343,6 +351,20 @@ fn should_skip_jit_internal(
         return Some(SkipReason::JavaUtilCollection);
     }
 
+    // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
+    // in-process javac invocation per fixture. Once the real JDK's
+    // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
+    // fileManager)` state does not survive into `ClassReader`: JDK 25 then
+    // aborts compilation with `AssertionError: FileManager initialization
+    // error`. The identical 65-test class passes under --nojit and under JIT
+    // when this method alone is excluded. This setup path is cold relative to
+    // application execution; keep it interpreted until the JIT producer is
+    // root-caused. The guard is deliberately unconditional: allowing a broad
+    // javac package experiment must not re-enable this known corrupting method.
+    if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
+        return Some(SkipReason::JavacToolContext);
+    }
+
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
     // comma-separated list of `Class.method` entries (slash-separated
     // class names, e.g. `java/util/Locale.hashCode`). Any listed method
@@ -412,6 +434,25 @@ fn should_skip_jit_internal(
     }
     if !current_thread_named {
         return Some(SkipReason::UnnamedThread);
+    }
+
+    // HIB-BIGINTEGER-AIOOBE.1 (2026-07-17) — the real-JDK
+    // `MutableBigInteger` divide/normalization implementation is the only
+    // confirmed JIT-only surface behind Hibernate's intermittent
+    // `BigInteger.smallToString` AIOOBE ("Index 2 out of bounds for length
+    // 2").  The interpreter and `--nojit` execute the exact same bytecode
+    // correctly, while multiple live failures have shown a self-consistent
+    // bounds check against a two-element array after this class was JITed.
+    //
+    // This deliberately covers the whole implementation class rather than a
+    // guessed leaf such as `mulsub`: the reported frame is several calls
+    // above the corrupting write and the historical reproducer is bimodal.
+    // A class-local, unconditional fail-closed guard preserves JIT coverage
+    // for `BigInteger` callers and all application code, and cannot be lifted
+    // by `CRATONVM_JIT_ALLOW_PACKAGES` until the underlying x64 lowering bug
+    // has a deterministic regression reproducer.
+    if class_name == "java/math/MutableBigInteger" {
+        return Some(SkipReason::BigIntegerArithmetic);
     }
 
     // ANTLR-COLDPATH.1 — the Groovy-shaded ANTLR runtime blanket ban is
@@ -496,7 +537,6 @@ fn should_skip_jit_internal(
     {
         return Some(SkipReason::RustJvmTestFixture);
     }
-
 
     // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
     // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
@@ -709,6 +749,21 @@ fn should_skip_jit_internal(
         // the package reproduces the no-JIT result.  Keep this scoped guard
         // liftable for bisection.
         if let Some(prefix) = jaxb_mapping_residual_skip_prefix(class_name) {
+            if !package_allowed(prefix, allow_packages) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
+
+        // SPRING-HAZELCAST-XERCES-JIT.1 (2026-07-18): Hazelcast's schema
+        // validation passes the complete server suite interpreted, but JIT
+        // compilation of the JDK-internal Xerces graph corrupts
+        // `SchemaGrammar`'s SymbolHash state and raises an NPE in
+        // `getGlobalTypeDecl`. The focused Spring Boot Hazelcast client/server
+        // pair passes again when only this package is interpreted. Keep the
+        // standard-library parser package out of JIT until that compiler bug is
+        // root-caused; explicit package allowance remains available for
+        // diagnosis.
+        if let Some(prefix) = xerces_schema_jit_deny_prefix(class_name) {
             if !package_allowed(prefix, allow_packages) {
                 return Some(SkipReason::RustJvmTestFixture);
             }
@@ -1677,6 +1732,16 @@ fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static 
 fn jaxb_mapping_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
     const DOT_PREFIX: &str = "org.glassfish.jaxb.";
+    if class_name.starts_with(SLASH_PREFIX) {
+        Some(SLASH_PREFIX)
+    } else {
+        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
+    }
+}
+
+fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
+    const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
+    const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
     if class_name.starts_with(SLASH_PREFIX) {
         Some(SLASH_PREFIX)
     } else {
@@ -3004,6 +3069,46 @@ mod tests {
     }
 
     #[test]
+    fn hibernate_biginteger_divide_cluster_is_always_interpreted() {
+        // HIB-BIGINTEGER-AIOOBE.1: do not let a package-allow override or the
+        // aggressive policy re-enable the known-corrupting arithmetic class.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            for method in [
+                "divideMagnitude",
+                "divideKnuth",
+                "mulsub",
+                "primitiveLeftShift",
+            ] {
+                assert_eq!(
+                    check_with(
+                        "java/math/MutableBigInteger",
+                        method,
+                        false,
+                        true,
+                        policy,
+                        &["java/math/"],
+                    ),
+                    Some(SkipReason::BigIntegerArithmetic),
+                    "{method} must remain interpreted under {policy:?}",
+                );
+            }
+        }
+
+        // Keep the quarantine scoped to the implementation class. Public
+        // callers such as BigInteger itself remain eligible for JIT.
+        assert_eq!(
+            check(
+                "java/math/BigInteger",
+                "smallToString",
+                false,
+                true,
+                SkipPolicy::Aggressive,
+            ),
+            None,
+        );
+    }
+
+    #[test]
     fn java_util_regalloc_family_lifted_under_safe_default() {
         // The targeted table still records the historical NEW-1.3 member, but
         // x64 no longer uses callee-saved GPR local homes by default, so the
@@ -3215,6 +3320,31 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
                 &["org/glassfish/jaxb/"],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn xerces_schema_package_skipped_conservatively_and_lifts_for_bisection() {
+        for cls in [
+            "com/sun/org/apache/xerces/internal/util/SymbolHash",
+            "com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar",
+        ] {
+            assert_eq!(
+                check(cls, "get", false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{cls} should stay interpreted under the Xerces schema guard"
+            );
+        }
+        assert_eq!(
+            check_with(
+                "com/sun/org/apache/xerces/internal/util/SymbolHash",
+                "get",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["com/sun/org/apache/xerces/internal/"],
             ),
             None
         );
@@ -4295,5 +4425,22 @@ mod tests {
             ),
             Some(SkipReason::RustJvmTestFixture)
         );
+    }
+
+    #[test]
+    fn javac_tool_get_task_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/api/JavacTool",
+                    "getTask",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::JavacToolContext),
+                "JavacTool.getTask must remain excluded under every policy",
+            );
+        }
     }
 }

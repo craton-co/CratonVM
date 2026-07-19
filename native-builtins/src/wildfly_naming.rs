@@ -721,11 +721,12 @@ fn java_url_context(
 /// any value already present in `incoming`). Returns `incoming` unchanged when
 /// the property is unset (plain WildFly / Keycloak) or on any allocation error,
 /// so the caller's `getURLContext` then returns `null` and the flat store wins.
-fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
-    let pkgs = match ctx.get_system_property("java.naming.factory.url.pkgs") {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => return incoming,
-    };
+fn environment_with_property(
+    ctx: &mut dyn NativeContext,
+    incoming: Value,
+    property: &str,
+    value: &str,
+) -> Value {
     let ht = match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return incoming,
@@ -735,9 +736,9 @@ fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
     // call -- both are moving-GC hazards. Pin as each is produced and
     // re-read before each subsequent use.
     let ht_pin = ctx.pin_native_root(ht);
-    let key = ctx.create_string("java.naming.factory.url.pkgs");
+    let key = ctx.create_string(property);
     let key_pin = ctx.pin_native_root(key);
-    let val = ctx.create_string(&pkgs);
+    let val = ctx.create_string(value);
     let ht = ctx.read_native_pin(ht_pin, ht);
     let key = ctx.read_native_pin(key_pin, key);
     if ctx
@@ -755,6 +756,46 @@ fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
     let ht = ctx.read_native_pin(ht_pin, ht);
     ctx.unpin_native_roots(ht_pin);
     Value::Object(Some(ht))
+}
+
+/// The T3 fallback registered `getEnvironment` against a two-slot synthetic
+/// layout. In real-JDK mode that registration reads a boolean/private JDK
+/// field as a Hashtable, so Spring's `JndiLocatorDelegate` treats a configured
+/// JNDI environment as unavailable. Materialise the system-configured initial
+/// factory property exactly as InitialContext's constructor would have copied
+/// it into `myProps`; without a provider, retain the JDK's
+/// NoInitialContextException contract.
+fn native_initial_context_get_environment(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let factory = match ctx.get_system_property("java.naming.factory.initial") {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => {
+            return Err(throw_no_initial_context(
+                ctx,
+                "Need to specify class name in environment or system property: java.naming.factory.initial",
+            ))
+        }
+    };
+    let incoming = initial_context_env(ctx, this);
+    let env = environment_with_property(
+        ctx,
+        incoming,
+        "java.naming.factory.initial",
+        &factory,
+    );
+    Ok(Some(env))
+}
+
+fn url_pkgs_env(ctx: &mut dyn NativeContext, incoming: Value) -> Value {
+    match ctx.get_system_property("java.naming.factory.url.pkgs") {
+        Some(pkgs) if !pkgs.trim().is_empty() => {
+            environment_with_property(ctx, incoming, "java.naming.factory.url.pkgs", &pkgs)
+        }
+        _ => incoming,
+    }
 }
 
 /// Read the `InitialContext` environment table to forward to
@@ -818,6 +859,44 @@ fn builder_initial_context(
         return Ok(None);
     }
     let env = initial_context_env(ctx, this);
+    match ctx.invoke(
+        "javax/naming/spi/NamingManager",
+        "getInitialContext",
+        "(Ljava/util/Hashtable;)Ljavax/naming/Context;",
+        &[env],
+    )? {
+        Some(Value::Object(Some(c))) => Ok(Some(c)),
+        _ => Ok(None),
+    }
+}
+
+/// Resolve a configured JNDI initial-context provider when no explicit
+/// `InitialContextFactoryBuilder` is installed. Spring's test JNDI fixtures
+/// use `Context.INITIAL_CONTEXT_FACTORY` / `java.naming.factory.initial`, not
+/// a builder, so their bindings were previously bypassed by our native
+/// `InitialContext.lookup` interception and incorrectly fell through to the
+/// WildFly flat store. This is the normal `InitialContext.getDefaultInitCtx()`
+/// path; the returned provider context owns the namespace and does not recurse
+/// through this `InitialContext` native.
+fn configured_initial_context(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let factory = match ctx.get_system_property("java.naming.factory.initial") {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    // The native InitialContext constructor does not execute the JDK body that
+    // copies system JNDI properties into `myProps`. Give NamingManager the
+    // equivalent explicit environment so it can instantiate the configured
+    // factory instead of throwing NoInitialContextException.
+    let incoming = initial_context_env(ctx, this);
+    let env = environment_with_property(
+        ctx,
+        incoming,
+        "java.naming.factory.initial",
+        &factory,
+    );
     match ctx.invoke(
         "javax/naming/spi/NamingManager",
         "getInitialContext",
@@ -985,6 +1064,20 @@ fn do_context_lookup(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str) -
                 &[Value::Object(Some(name_obj))],
             );
         }
+    }
+
+    // A `java.naming.factory.initial` provider is the standard fallback once
+    // URL-context handling has had its chance. This covers Spring's
+    // TestableInitialContextFactory (and user providers generally), whose
+    // process-wide bindings must be visible to every native InitialContext.
+    if let Some(deleg) = configured_initial_context(ctx, this)? {
+        let name_obj = ctx.create_string(name);
+        return ctx.invoke_virtual(
+            deleg,
+            "lookup",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(Some(name_obj))],
+        );
     }
 
     match lookup_value(name) {
@@ -1482,6 +1575,12 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
     // --- javax.naming.InitialContext ---
     let ic = "javax/naming/InitialContext";
     r.register(ic, "<init>", "()V", native_initial_context_init);
+    r.register(
+        ic,
+        "getEnvironment",
+        "()Ljava/util/Hashtable;",
+        native_initial_context_get_environment,
+    );
     r.register(
         ic,
         "lookup",

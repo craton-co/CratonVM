@@ -74,6 +74,43 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
+/// The default non-moving young collector does not need Cheney-copy headroom:
+/// it reclaims dead spans in place and falls back to allocation-failure GC for
+/// fragmentation.  Let transient allocation fill most of the active semi-space
+/// before paying the O(heap) mark/sweep cost.  The moving-young opt-in retains
+/// the conservative 50% trigger above so the to-space can hold all survivors.
+/// Keeping a 10% reserve also leaves room for TLAB refill granularity and avoids
+/// turning every near-capacity refill into an allocation-failure collection.
+const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
+
+#[inline]
+const fn young_gc_trigger_bytes(
+    capacity: usize,
+    moving_threshold: usize,
+    non_moving_young: bool,
+) -> usize {
+    if non_moving_young {
+        capacity * NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT / 100
+    } else {
+        moving_threshold
+    }
+}
+
+#[inline]
+const fn next_young_gc_is_guaranteed_non_moving(
+    jit_active: bool,
+    unregistered_jit_frame: bool,
+    jit_allocation_frame: bool,
+    moving_young_requested: bool,
+    allow_moving_young: bool,
+    force_moving: bool,
+) -> bool {
+    !force_moving
+        && ((jit_active && !allow_moving_young)
+            || ((jit_active || unregistered_jit_frame || jit_allocation_frame)
+                && !moving_young_requested))
+}
+
 /// "Humongous" object threshold as a percentage of the young semi-space
 /// capacity.  Allocations whose total in-memory footprint
 /// (`HEADER_SIZE + array_data_size`) exceeds this fraction of one young
@@ -1531,6 +1568,12 @@ impl GenerationalHeap {
         objects
     }
 
+    /// DIAGNOSTIC-ONLY (cce0079 tree-key tail): current minor-GC count, for
+    /// the `[SETFIELD-GC]` epoch assertion in the VM's `set_field` wrapper.
+    pub fn debug_minor_gc_count(&self) -> u64 {
+        self.stats.minor_gc_count.load(Ordering::Relaxed)
+    }
+
     // ----- Header access -----------------------------------------------------
 
     /// Read the object header from a heap reference.
@@ -1914,13 +1957,29 @@ impl GenerationalHeap {
     /// deref of garbage.
     /// DIAGNOSTIC-ONLY (cceres3): see `VmHeap::debug_forwarded_target`.
     pub fn debug_forwarded_target(&self, addr: usize) -> Option<usize> {
-        if !crate::stale_objref_debug::enabled() || addr % 8 != 0 {
+        if !crate::stale_objref_debug::enabled() || addr == 0 || addr % 8 != 0 {
             return None;
         }
-        self.is_heap_addr(addr)?;
-        // SAFETY: `is_heap_addr` confirmed containment in a mapped arena; the
-        // quarantine ring keeps evacuated from-space readable while the
-        // canary flag is on.
+        // PROBE FIX (cce0079 tree-key tail): `is_heap_addr` covers only the
+        // LIVE arenas — but a stale (evacuated) address lives in the
+        // quarantine RING, which is deliberately unpublished. Gating on
+        // `is_heap_addr` alone made this probe (and both PIN canaries built
+        // on it) structurally blind to exactly the addresses it exists to
+        // catch. Also accept addresses inside any ring arena.
+        let in_live = self.is_heap_addr(addr).is_some();
+        if !in_live {
+            let in_ring = self
+                .quarantine
+                .lock()
+                .iter()
+                .any(|a| a.contains(addr as *const u8));
+            if !in_ring {
+                return None;
+            }
+        }
+        // SAFETY: containment in a mapped (live or quarantined) arena was
+        // just confirmed; the quarantine ring keeps evacuated from-space
+        // readable while the canary flag is on.
         let header = unsafe { &*(addr as *const ObjectHeader) };
         if header.is_forwarded() {
             let fwd = header.forwarding_address() as usize;
@@ -2113,6 +2172,20 @@ impl GenerationalHeap {
                     }
                 }
             } // end rate-limited OOB-read diagnostics
+            // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
+            // unconditional backtrace for the specific shape seen in the
+            // known-issues residual logs (index 4/5, zero-slot receiver) —
+            // rare enough that this doesn't need the OOB_DIAG_CAP treatment.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                    .map(|(n, _)| n)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                eprintln!(
+                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
             return Value::Object(None);
         }
         // Compact reference-field layout: reference fields are 8-byte pointers
@@ -2190,6 +2263,21 @@ impl GenerationalHeap {
         // the equivalent check in `set_array_element`).
         if crate::stale_objref_debug::enabled() {
             if let Value::Object(Some(v)) = value {
+                // Operand attribution (cce0079 tree-key tail): peek the
+                // header word first so the imminent canary panic can be
+                // attributed to the STORED VALUE (vs the receiver, whose
+                // own get_header follows below).
+                let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
+                if peek.is_forwarded() {
+                    eprintln!(
+                        "[storechk] set_field: STALE stored VALUE 0x{:x} \
+                         (receiver 0x{:x} slot {index}) thread={} cycle={} — canary panic follows",
+                        v.as_ptr() as usize,
+                        obj_ref.as_ptr() as usize,
+                        std::thread::current().name().unwrap_or("?"),
+                        self.stats.minor_gc_count.load(Ordering::Relaxed),
+                    );
+                }
                 let _ = self.get_header(v);
             }
         }
@@ -2310,6 +2398,15 @@ impl GenerationalHeap {
                      (caller used slot index past receiver's layout — \
                      class layout is correct; the bug is in the caller's \
                      slot computation)",
+                );
+            }
+            // RESID-DIAG (dohead residuals investigation, 20260718): see the
+            // matching comment in get_field's OOB guard above.
+            if num_slots == 0 && (index == 4 || index == 5) {
+                eprintln!(
+                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                    obj_ref.as_ptr(),
+                    std::backtrace::Backtrace::force_capture()
                 );
             }
             return;
@@ -2674,6 +2771,17 @@ impl GenerationalHeap {
         // header panic (producer-side attribution).
         if crate::stale_objref_debug::enabled() {
             if let Value::Object(Some(v)) = value {
+                // Operand attribution — see the matching peek in `set_field`.
+                let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
+                if peek.is_forwarded() {
+                    eprintln!(
+                        "[storechk] set_array_element: STALE stored VALUE 0x{:x} \
+                         (array 0x{:x} index {index}) thread={} — canary panic follows",
+                        v.as_ptr() as usize,
+                        obj_ref.as_ptr() as usize,
+                        std::thread::current().name().unwrap_or("?"),
+                    );
+                }
                 let _ = self.get_header(v);
             }
         }
@@ -2993,6 +3101,19 @@ impl GenerationalHeap {
 
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(false)
+    }
+
+    /// The JIT allocation/refill helper calls this while its compiled caller
+    /// is still on the native stack. Even when that caller is the unregistered
+    /// compiled entry point, root gathering will detect it and select the
+    /// non-moving young collector, so that path may safely use its larger
+    /// occupancy trigger.
+    pub fn needs_gc_for_jit_allocation(&self) -> bool {
+        self.needs_gc_with_jit_allocation_frame(true)
+    }
+
+    fn needs_gc_with_jit_allocation_frame(&self, jit_allocation_frame: bool) -> bool {
         let from = self.young_from.lock();
         let used = from.used();
         // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
@@ -3019,7 +3140,26 @@ impl GenerationalHeap {
         // itself, so this is a no-op there. The alloc-failure→GC-and-retry path
         // remains the hard backstop against fragmentation under-collection.
         let live = used.saturating_sub(from.free_list_bytes());
-        live >= *self.young_gc_threshold.lock()
+        // Cheney copying needs the unused half as worst-case survivor
+        // headroom. The default non-moving collector instead sweeps in place,
+        // so it can safely use the active semi-space almost to capacity.
+        // Only select the larger threshold when the next normal young cycle is
+        // guaranteed to take that path. In particular, `--nojit` collections
+        // remain moving even though `CRATONVM_MOVING_YOUNG` is unset.
+        let non_moving_young = next_young_gc_is_guaranteed_non_moving(
+            crate::gc_quiescence::is_active(),
+            crate::gc_quiescence::unregistered_jit_frame_on_stack(),
+            jit_allocation_frame,
+            crate::gc_quiescence::moving_young_enabled(),
+            std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_some(),
+            std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some(),
+        );
+        let threshold = young_gc_trigger_bytes(
+            from.capacity(),
+            *self.young_gc_threshold.lock(),
+            non_moving_young,
+        );
+        live >= threshold
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -3808,7 +3948,10 @@ impl GenerationalHeap {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
                 let gap =
                     unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && young_cursor + gap <= young_used {
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && young_cursor + gap <= young_used
+                {
                     young_cursor += gap;
                     continue;
                 }
@@ -3823,7 +3966,11 @@ impl GenerationalHeap {
                 break;
             }
             let size = gen_object_total_size(header);
-            if size < HEADER_SIZE || young_cursor.checked_add(size).is_none_or(|end| end > young_used) {
+            if size < HEADER_SIZE
+                || young_cursor
+                    .checked_add(size)
+                    .is_none_or(|end| end > young_used)
+            {
                 tracing::warn!(
                     young_cursor,
                     young_used,
@@ -4870,18 +5017,42 @@ impl GenerationalHeap {
         let in_young =
             |addr: usize| -> bool { addr >= from_base && addr < from_end && (addr & 0x7) == 0 };
 
-
         // Build exact young-object bases before marking. The stack/JIT root
         // scan is conservative and can yield aligned interior words; treating
         // those as objects makes the side-mark channel retain the interior
         // address rather than its containing object, so the later sweep can
         // reclaim the real object.
+        // PERF (perf/halfgap-20260717): the exact-base oracle exists for
+        // CONSERVATIVE candidates only — the aligned interior words the
+        // stack/register/pin scans produce (`roots`, `finalizer_addrs`).
+        // Precise heap edges (the BFS `for_each_ref_slot` values, dirty-card
+        // slot reads, overlay/loader/mirror side channels) hold object BASES
+        // by construction and never needed interior-pointer mapping — they
+        // take `mark_young_precise` below, exactly the pre-oracle behavior.
+        //
+        // That containment makes the oracle cheap to build: only ranges
+        // covering an actual candidate are materialized (a handful per
+        // cycle), and the builder walk EARLY-EXITS past the last candidate.
+        // The previous shape materialized a `(start, end)` pair for EVERY
+        // young object and routed every BFS edge through a binary search of
+        // that Vec — on a 2 GiB young gen that is a ~50M-entry, ~800 MB Vec
+        // rebuilt per collection plus a cache-hostile log2(50M) probe per
+        // edge, which dominated the whole mark phase.
+        let mut conservative_candidates: Vec<usize> = roots
+            .iter()
+            .map(|r| r.as_ptr() as usize)
+            .chain(finalizer_addrs.iter().copied())
+            .filter(|&a| in_young(a))
+            .collect();
+        conservative_candidates.sort_unstable();
+        conservative_candidates.dedup();
+
         let mut young_object_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut cand_idx = 0usize;
         let exact_skips = merge_skips(young_from.free_blocks_sorted());
         let mut exact_free_iter = exact_skips.iter().peekable();
         let mut exact_cursor = 0usize;
-        let mut exact_walk_complete = true;
-        while exact_cursor < young_from.used() {
+        while exact_cursor < young_from.used() && cand_idx < conservative_candidates.len() {
             if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
                 continue;
             }
@@ -4896,13 +5067,19 @@ impl GenerationalHeap {
             // walk above).
             if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
                 // SAFETY: offset 4 lies within the >=8-byte gap.
-                let gap = unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && exact_cursor + gap <= young_from.used() {
+                let gap =
+                    unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                if (8..HEADER_SIZE).contains(&gap)
+                    && gap & 7 == 0
+                    && exact_cursor + gap <= young_from.used()
+                {
                     exact_cursor += gap;
                     continue;
                 }
-                tracing::warn!(exact_cursor, "GC: exact young-object walk found an implausible GAP-filler sentinel");
-                exact_walk_complete = false;
+                tracing::warn!(
+                    exact_cursor,
+                    "GC: exact young-object walk found an implausible GAP-filler sentinel"
+                );
                 break;
             }
             let total = gen_object_total_size(header);
@@ -4911,136 +5088,56 @@ impl GenerationalHeap {
                     .checked_add(total)
                     .is_none_or(|end| end > young_from.used())
             {
-                if crate::a2dbg::enabled() {
-                    eprintln!(
-                        "[A2] exact-walk invalid @{} class_id={} kind={} elem={} array_len={} num_slots={} total={} used={}",
-                        exact_cursor,
-                        header.class_id.as_u32(),
-                        header.kind as u8,
-                        header.element_type as u8,
-                        header.array_length,
-                        header.num_slots,
-                        total,
-                        young_from.used(),
-                    );
-                    match crate::a2dbg::lookup_covering(from_base + exact_cursor) {
-                        Some(r) => {
-                            eprintln!(
-                                "[A2] exact-walk allocation start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={} offset={}",
-                                r.addr, r.class_id, r.kind, r.element_type, r.array_length, r.num_slots,
-                                r.size, r.seq, from_base + exact_cursor - r.addr,
-                            );
-                            if r.addr > from_base {
-                                match crate::a2dbg::lookup_covering(r.addr - 8) {
-                                    Some(prev) => eprintln!(
-                                        "[A2] exact-walk predecessor start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={} predecessor_end={:#x}",
-                                        prev.addr, prev.class_id, prev.kind, prev.element_type,
-                                        prev.array_length, prev.num_slots, prev.size, prev.seq,
-                                        prev.addr + prev.size,
-                                    ),
-                                    None => eprintln!("[A2] exact-walk predecessor has no allocation breadcrumb"),
-                                }
-                            }
-                        }
-                        None => eprintln!("[A2] exact-walk no allocation breadcrumb"),
-                    }
-                    for back in (0..=160usize).step_by(8) {
-                        let probe = from_base + exact_cursor.saturating_sub(back);
-                        if let Some(r) = crate::a2dbg::lookup_at(probe) {
-                            eprintln!(
-                                "[A2] exact-walk preceding alloc back={} start={:#x} class_id={} kind={} et={} alen={} ns={} size={} seq={}",
-                                back, r.addr, r.class_id, r.kind, r.element_type, r.array_length,
-                                r.num_slots, r.size, r.seq,
-                            );
-                        }
-                    }
-                }
-                tracing::warn!(exact_cursor, used = young_from.used(), "GC: exact young-object walk stopped at an implausible extent");
-                exact_walk_complete = false;
+                tracing::warn!(
+                    exact_cursor,
+                    used = young_from.used(),
+                    "GC: exact young-object walk stopped at an implausible extent"
+                );
                 break;
             }
             if let Some(&&(off, _)) = exact_free_iter.peek() {
                 if off > exact_cursor && off < exact_cursor + total {
-                    // Keep the failure report actionable: a range here can be
-                    // either a reclaimed arena hole or the reserved tail of a
-                    // forcibly-stopped mutator. The fixes are disjoint, and
-                    // the raw offsets alone do not say which writer supplied
-                    // the boundary.
-                    let range_source = if jit_skips.iter().any(|&(skip_off, _)| skip_off == off) {
-                        "published-tlab-tail"
-                    } else {
-                        "free-list"
-                    };
-                    // This is an allocator ownership failure, not a normal
-                    // collection outcome.  Keep its forensic output bounded:
-                    // once a mutator reaches the same malformed span every
-                    // allocation immediately retries the collection, and an
-                    // unbounded warning stream can otherwise hide the first
-                    // useful evidence and consume the process's disk budget.
-                    static CROSSING_REPORTS: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let report_no = CROSSING_REPORTS
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if crate::a2dbg::enabled() && report_no == 0 {
-                        for probe in [
-                            exact_cursor,
-                            exact_cursor.saturating_add(8),
-                            exact_cursor.saturating_add(16),
-                            off.saturating_sub(8),
-                            off,
-                        ] {
-                            let history = crate::a2dbg::history_at(from_base + probe, 8);
-                            eprintln!(
-                                "[A2] exact-crossing probe_off={} history={:?}",
-                                probe, history
-                            );
-                        }
-                    }
-                    if report_no < 8 {
-                        tracing::warn!(
-                            exact_cursor,
-                            off,
-                            total,
-                            range_source,
-                            class_id = header.class_id.as_u32(),
-                            kind = ?header.kind,
-                            array_length = header.array_length,
-                            num_slots = header.num_slots,
-                            "GC: exact young-object walk crossed a free/TLAB range"
-                        );
-                    }
-                    exact_walk_complete = false;
+                    tracing::warn!(
+                        exact_cursor,
+                        off,
+                        "GC: exact young-object walk crossed a free/TLAB range"
+                    );
                     break;
                 }
             }
-            young_object_ranges.push((ptr as usize, ptr as usize + total));
+            // Record this object's range only if it covers (or could still
+            // cover) a conservative candidate; skip candidates that fell
+            // into free/gap space below it (they resolve to "not an object"
+            // in the oracle — identical to the full-walk behavior, where a
+            // non-covered address failed the range probe and was dropped).
+            let start_addr = ptr as usize;
+            let end_addr = start_addr + total;
+            while cand_idx < conservative_candidates.len()
+                && conservative_candidates[cand_idx] < start_addr
+            {
+                cand_idx += 1;
+            }
+            if cand_idx < conservative_candidates.len()
+                && conservative_candidates[cand_idx] < end_addr
+            {
+                young_object_ranges.push((start_addr, end_addr));
+                while cand_idx < conservative_candidates.len()
+                    && conservative_candidates[cand_idx] < end_addr
+                {
+                    cand_idx += 1;
+                }
+            }
             exact_cursor += total;
         }
-        // A partial exact-range map is not a conservative approximation: the
-        // marker resolves every root through this map, so continuing after the
-        // first unparseable span silently drops all later live objects and the
-        // subsequent sweep reclaims them.  This is the same safety boundary as
-        // the moving collector's object-start prepass below.  Nothing has been
-        // mutated yet apart from idempotent card-buffer maintenance, therefore
-        // skipping one collection is safe; a later trigger retries after the
-        // transient TLAB/free-list layout has settled.
-        if !exact_walk_complete {
-            tracing::warn!(
-                "GC: exact young-object walk incomplete — skipping this non-moving \
-                 young collection (over-retain; retried next cycle)"
-            );
-            return (
-                GcResult {
-                    stats: crate::gc::GcStats {
-                        objects_copied: 0,
-                        bytes_copied: 0,
-                        bytes_freed: 0,
-                    },
-                    pointer_map: HashMap::new(),
-                },
-                Vec::new(),
-            );
-        }
+        // Truncated-oracle fail-safe (2026-07-18): everything the exact-base
+        // walk verified lies BELOW this frontier. A walk that broke early on a
+        // grid anomaly used to silently drop every conservative candidate
+        // above the break (no covering range -> `mark_young` returned -> the
+        // root's whole subtree got swept: the trigger-ON bt18 676xxxxx
+        // under-count family). Candidates above the frontier now fall back to
+        // direct validation of the candidate address (the pre-oracle
+        // behavior) — over-retention-safe, never a header write.
+        let oracle_trusted_abs = from_base + exact_cursor;
 
         // ----- Mark phase -------------------------------------------------
         //
@@ -5081,17 +5178,20 @@ impl GenerationalHeap {
                 return;
             }
             let insertion = young_object_ranges.partition_point(|(start, _)| *start <= addr);
-            let Some(&(base, end)) = insertion
+            let covering = insertion
                 .checked_sub(1)
                 .and_then(|idx| young_object_ranges.get(idx))
-            else {
-                return;
+                .filter(|&&(_, end)| addr < end);
+            let (addr, ptr) = match covering {
+                Some(&(base, _end)) => (base, base as *mut u8),
+                // Below the oracle's trusted frontier the walk was verified:
+                // an uncovered candidate is free/gap space — not an object.
+                None if addr < oracle_trusted_abs => return,
+                // Above the frontier the walk broke early — fall back to
+                // validating the candidate address directly (see the
+                // `oracle_trusted_abs` note above).
+                None => (addr, ptr),
             };
-            if addr >= end {
-                return;
-            }
-            let addr = base;
-            let ptr = base as *mut u8;
             // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
             // address inside the live from-space region, so reading an
             // ObjectHeader there is valid.
@@ -5260,6 +5360,56 @@ impl GenerationalHeap {
             }
         };
 
+        // Precise-edge marker (perf/halfgap-20260717): for values read out of
+        // actual reference slots — BFS `for_each_ref_slot` referents,
+        // dirty-card slot reads, overlay/loader/mirror side channels. These
+        // are object BASES by construction (a store wrote a real reference
+        // there), so the conservative interior-pointer oracle above is a
+        // semantic no-op for them and its per-edge range probe was pure
+        // overhead. Keeps the same header-plausibility rejection and the
+        // same never-write-through side-mark channel as `mark_young`; the
+        // only difference is skipping base resolution. This also restores
+        // the pre-oracle robustness property that a truncated oracle walk
+        // (corrupt header mid-arena) cannot silently unroot every precise
+        // edge above the truncation point.
+        let mut mark_young_precise = |ptr: *mut u8,
+                                      worklist: &mut Vec<*mut u8>,
+                                      side_marks: &mut FxHashSet<usize>| {
+            let addr = ptr as usize;
+            if !in_young(addr) {
+                return;
+            }
+            // SAFETY: `in_young` confirmed an 8-aligned address inside the
+            // live from-space region; reading an ObjectHeader there is valid.
+            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+            let kind_byte = header.kind as u8;
+            let is_array = header.kind == ObjectKind::Array;
+            if kind_byte > 1
+                || (!is_array && header.num_slots > (1 << 24))
+                || (is_array && header.array_length > i32::MAX as u32)
+            {
+                return;
+            }
+            let total = gen_object_total_size(header);
+            if total < HEADER_SIZE || addr + total > from_end {
+                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
+                    tracing::warn!(
+                        "mark_young_precise: ignoring edge referent at {:#x} with implausible extent {} (kind={}, array_len={}, num_slots={}); safe reject",
+                        addr,
+                        total,
+                        kind_byte,
+                        header.array_length,
+                        header.num_slots,
+                    );
+                }
+                return;
+            }
+            if side_marks.insert(addr) {
+                worklist.push(ptr);
+            }
+        };
+
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
             mark_young(root.as_ptr(), &mut worklist, &mut side_marks);
@@ -5284,7 +5434,7 @@ impl GenerationalHeap {
                 // SAFETY: `optr`/`oh` form a valid live object.
                 unsafe {
                     for_each_ref_slot(optr, oh, |raw, _slot| {
-                        mark_young(raw, &mut worklist, &mut side_marks);
+                        mark_young_precise(raw, &mut worklist, &mut side_marks);
                     });
                 }
             }
@@ -5320,7 +5470,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
+                    mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -5329,7 +5479,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
-                    mark_young(raw as usize as *mut u8, &mut worklist, &mut side_marks);
+                    mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -5337,7 +5487,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid Value-sized slot.
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
-                    mark_young(ref_obj.as_ptr(), &mut worklist, &mut side_marks);
+                    mark_young_precise(ref_obj.as_ptr(), &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -5357,7 +5507,7 @@ impl GenerationalHeap {
                 old_gen.contains(owner_addr as *mut u8)
             })
         {
-            mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+            mark_young_precise(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
         }
 
         // DBG (CRATONVM_DBG_SEED_ALL_OLD): decisive test for the sweep-edges
@@ -5372,7 +5522,9 @@ impl GenerationalHeap {
                 let oh = unsafe { &*(op as *const ObjectHeader) };
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
-                    for_each_ref_slot(op, oh, |r, _| mark_young(r, &mut worklist, &mut side_marks));
+                    for_each_ref_slot(op, oh, |r, _| {
+                        mark_young_precise(r, &mut worklist, &mut side_marks)
+                    });
                 }
             }
         }
@@ -5390,7 +5542,7 @@ impl GenerationalHeap {
             // SAFETY: `obj_ptr`/`header` are a validated young object.
             unsafe {
                 for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    mark_young(ref_ptr, &mut worklist, &mut side_marks);
+                    mark_young_precise(ref_ptr, &mut worklist, &mut side_marks);
                 });
             }
             // Collection-overlay liveness pin: an overlay is an out-of-heap
@@ -5402,7 +5554,7 @@ impl GenerationalHeap {
             for overlay_ref in
                 cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
             {
-                mark_young(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+                mark_young_precise(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
             }
             // HIB-CV-24: also mark this object's defining ClassLoader so a live
             // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
@@ -5410,7 +5562,7 @@ impl GenerationalHeap {
                 if let Some(loader_addr) =
                     cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
                 {
-                    mark_young(loader_addr as *mut u8, &mut worklist, &mut side_marks);
+                    mark_young_precise(loader_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
             // Class-mirror liveness pin (mirror_pin, companion to loader_pin
@@ -5426,7 +5578,7 @@ impl GenerationalHeap {
                 cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
             {
                 for mirror_addr in mirror_addrs {
-                    mark_young(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
+                    mark_young_precise(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -8005,7 +8157,19 @@ impl GenerationalHeap {
         if available < 256 {
             return None; // Not enough for a useful TLAB
         }
-        let actual_size = requested_size.min(available);
+        // Alignment invariant (perf/halfgap residuals, 2026-07-18): a TLAB's
+        // size must be a multiple of 8. `available` can carry a mod-8 dreg
+        // (unaligned free-list dust, or the historical unaligned-capacity bump
+        // tail), and an unaligned TLAB both mints an off-grid free-list split
+        // remnant AND gets its end rounded DOWN by `Tlab::new`'s release
+        // safety net — leaving an untracked zeroed sliver between the TLAB's
+        // filler and the next region that derails the non-moving walk (the
+        // trigger-ON bt18 corruption; see
+        // docs/known-issues/tlab-trigger-gc-young-walk-corruption.md).
+        let actual_size = requested_size.min(available) & !7;
+        if actual_size == 0 {
+            return None;
+        }
         if let Some(ptr) = from.alloc(actual_size, 8) {
             // Zero the TLAB region
             // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
@@ -8030,9 +8194,20 @@ impl GenerationalHeap {
         // O(free-list) largest-block scan — is paid once per served TLAB,
         // not per object.
         let largest = from.largest_free_block();
-        let floor = crate::tlab::min_tlab_size().max(256);
+        // Second-wedge fix (perf/halfgap-20260717): the floor here must match
+        // the guarded-refill gate's fragmentation floor, and both must sit
+        // BELOW the sizes steady-state splitting converges on. With the old
+        // `min_tlab_size().max(256)` (= 8192) floor, a free list that had
+        // degraded to 4080-byte remnants (8 KiB splits minus header slack)
+        // wedged BOTH this fallback and the gate shut — see
+        // `tlab::FRAG_TLAB_FLOOR` for the live BinTrees capture. A ~4 KB
+        // mini-TLAB still serves ~100 small objects at bump speed, vastly
+        // outperforming the per-object slow path this None would otherwise
+        // condemn every allocation to.
+        let floor = crate::tlab::frag_tlab_floor();
         if largest >= floor {
-            let take = largest.min(actual_size);
+            // `& !7`: same TLAB-size alignment invariant as the main path.
+            let take = largest.min(actual_size) & !7;
             if let Some(ptr) = from.alloc(take, 8) {
                 // SAFETY: `ptr` was just allocated from the arena with `take` bytes; zeroing is within bounds.
                 unsafe { std::ptr::write_bytes(ptr, 0, take) };
@@ -8564,8 +8739,7 @@ impl GenerationalHeap {
     #[inline]
     fn full_old_rset_scan_enabled() -> bool {
         static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*CARD_TABLE_ONLY
-            .get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+        !*CARD_TABLE_ONLY.get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -9488,12 +9662,12 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.array_length != 0 {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
+                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
                  class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
                  so the walker can re-sync.",
-                header.array_length,
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.array_length,
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -9504,10 +9678,10 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         if header.num_slots > (1 << 24) {
             if crate::a2dbg::enabled() {
                 tracing::warn!(
-                "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
                  treating as corrupt so the walker can re-sync.",
-                header.num_slots,
-                header.class_id.as_u32(),
+                    header.num_slots,
+                    header.class_id.as_u32(),
                 );
             }
             return 0;
@@ -10360,6 +10534,41 @@ mod tests {
         assert!(
             h_1k.young_semi_capacity() >= 1024,
             "tiny heap must still produce a non-trivial arena (>= 1 KiB)",
+        );
+    }
+
+    #[test]
+    fn young_gc_trigger_preserves_moving_headroom_but_fills_non_moving_space() {
+        let capacity = 1000;
+        let moving_threshold = 500;
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, false),
+            500,
+            "moving young must retain its configured Cheney-copy headroom",
+        );
+        assert_eq!(
+            young_gc_trigger_bytes(capacity, moving_threshold, true),
+            900,
+            "non-moving young should defer the O(heap) sweep until 90% occupancy",
+        );
+        let ordinary_cycle =
+            next_young_gc_is_guaranteed_non_moving(false, false, false, false, false, false);
+        assert!(!ordinary_cycle, "JIT-quiescent collection is moving by default");
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(true, false, false, false, false, false),
+            "live JIT frames require the default non-moving collector",
+        );
+        assert!(
+            next_young_gc_is_guaranteed_non_moving(false, false, true, false, false, false),
+            "a JIT allocation helper has a compiled frame for root scanning",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, true, false),
+            "explicitly allowed moving-young must preserve copy headroom",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, false, false, true),
+            "the diagnostic forced-moving path must preserve copy headroom",
         );
     }
 

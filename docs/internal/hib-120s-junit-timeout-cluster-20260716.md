@@ -37,7 +37,7 @@ itself* reports having exceeded a 120-second internal watchdog).
 (`org.hibernate.orm.test.jpa.lock.LockTest` has a related but distinct
 symptom — `AssertionFailedError: execution exceeded timeout of 5000ms by
 2180ms` on a much tighter 5-second internal timeout — tracked separately in
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) since it may
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md) since it may
 be a different, more timing-sensitive class of issue.)
 
 ## Working hypothesis
@@ -110,7 +110,7 @@ heavily shared host's load, not flakiness in the fix).
 **Root cause: already fixed by commit `db047d38`**, landed a few commits
 ahead of the `dcb24161` baseline (found by an unrelated `DefaultCatalogAndSchemaTest`
 investigation session, see
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md)). That
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md)). That
 commit closed unrooted-`ObjectRef` GC-safety gaps in
 `native-builtins/src/lang_class.rs`'s `collect_public_fields`/
 `collect_public_methods` (`Class.getFields()`/`getMethods()`),
@@ -170,7 +170,7 @@ were suspected same-family but not fully confirmed.
 `fix/hib-reflection-gc-sweep-20260716` (this session's `generics.rs` GC-safety
 sweep, merged with a concurrent session's `gen_heap.rs` young-object-start-walk
 fix — see
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md)'s
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md)'s
 `DefaultCatalogAndSchemaTest` entry for the full root-cause writeup, which
 applies identically here):
 
@@ -208,7 +208,7 @@ load-only residual is fully closed, no longer open in any form.
 Session scope: the task doc handed off three suspected-generic-gap cases --
 `InsertOrderingRCATest#testBatching` and `LiteralRenderingTest#testIdVersionFunctions`
 from this cluster, plus `LockTest` (tracked in
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md), see that
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md), see that
 file's update below). Built fresh at `dev@33df5d3c` (worktree
 `wt-hib-throughput-profile-20260716`; this doc-update commit itself is from a
 second worktree, `wt-hib-throughput-docs-20260717`, at the later tip
@@ -328,7 +328,7 @@ target; no code change made.
 ## Related finding (2026-07-16): CriteriaBuilderNonStandardFunctionsTest joins this shape, root cause narrowed to JIT compile-time tax
 
 Investigated as a separately-filed "real constraint violation" residual
-(see [hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md)'s
+(see [hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md)'s
 CriteriaBuilderNonStandardFunctionsTest entry for the full writeup). Same
 symptom shape as this cluster (prepareData(...) TimeoutException after
 120s, ok = found - 1). Bisected via --nojit (3/3 clean) and via
@@ -352,7 +352,7 @@ could be run against the other 7 classes here before deeper profiling.
 `jit/src/tiered.rs`'s `CompilationPolicy` defaults from
 `c1_threshold=200/c2_threshold=5000` to `c1_threshold=1500/c2_threshold=20000`
 -- see the `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` entries in
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) for the
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md) for the
 full validation writeup. Short version: it's a real, safe, validated
 mitigation (no steady-state throughput regression on a `fib(32)` A/B or the
 `vm/benches/vm_benchmarks.rs` suite) but it did **not** reliably fix either
@@ -395,7 +395,7 @@ inferring it from pass/fail alone.
 The `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` "JIT compile-time
 tax" mechanism referenced throughout this doc has been root-caused precisely
 and **fixed** — see the `LockTest` entry in
-[hib-misc-residuals-20260716.md](hib-misc-residuals-20260716.md) for the
+[hib-misc-residuals-20260716.md](fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md) for the
 full writeup. Short version: the actual cost was never compilation itself
 (the background compiler thread measured ~0 CPU); it was
 `vm/src/jit/conservative_roots.rs`'s `scan_active_jit_frames` conservative

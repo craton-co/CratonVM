@@ -8,7 +8,7 @@ program had made. This reduced `ZonedDateTimeTest`'s failure count from
 63/608 to 20/608 (verified stable across 4 solo reruns); the remaining 20
 are a distinct, narrower, pre-1911 `Europe/Paris` Local-Mean-Time
 precision gap — see the "Residual" section below and
-`docs/known-issues/hibernate/hib-misc-residuals-20260716.md`.
+`docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md`.
 
 ## Background
 
@@ -166,6 +166,6 @@ Fixed binary, real-JDK mode, real `/home/victor/jdk25`, solo runs:
 - `docs/internal/fixed-suite-bugs/hib-aqs-threadpoolexecutor-relocation-livelock-FIXED.md`
   — the GC-relocation livelock that was masking this bug entirely until
   fixed earlier the same day.
-- `docs/known-issues/hibernate/hib-misc-residuals-20260716.md` —
+- `docs/internal/fixed-suite-bugs/hib-misc-residuals-20260716-FIXED.md` —
   `ZonedDateTimeTest` entry updated with this fix and the new, narrower,
   still-OPEN pre-1911 Paris LMT-offset residual.

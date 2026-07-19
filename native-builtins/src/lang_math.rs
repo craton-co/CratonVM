@@ -3006,6 +3006,10 @@ pub(crate) fn native_wrapper_long_value(
     let val = ctx.get_field(this, 0);
     match val {
         Value::Long(_) => Ok(Some(val)),
+        // Reflection can legally widen an int-valued raw field slot while
+        // constructing a Long wrapper. Preserve that JVM numeric conversion
+        // instead of exposing the compact Int tag bits to a `()J` caller.
+        Value::Int(v) => Ok(Some(Value::Long(v as i64))),
         _ => Ok(Some(Value::Long(0))),
     }
 }

@@ -27,7 +27,7 @@ use crate::memory::vm_heap::{G1ConfigOverrides, GcBackend, VmHeap};
 use crate::native::io::FileDescriptorTable;
 use crate::native::register_essential_natives;
 use crate::native::register_io_natives;
-use crate::native::registry::NativeMethodRegistry;
+use crate::native::registry::{NativeMethodRegistry, StackTraceEntry};
 use crate::native::{register_builtins, register_collections_natives};
 use crate::threading::gc_barrier::GcBarrier;
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
@@ -306,6 +306,18 @@ pub enum MainThreadGroupInit {
     },
 }
 
+/// A captured Throwable trace and the non-owning object handle it belongs to.
+///
+/// The registry is deliberately VM-wide: Java permits a Throwable constructed
+/// on one thread to be inspected after that thread has terminated. `throwable`
+/// is *not* scanned as a GC root; `remap_and_sweep_throwable_stack_traces`
+/// forwards it after a move and drops the trace once its Throwable dies.
+#[derive(Debug, Clone)]
+struct ThrowableStackTrace {
+    throwable: ObjectRef,
+    frames: Vec<StackTraceEntry>,
+}
+
 pub struct SharedVm {
     /// Process-unique identity for this VM/heap lifetime.
     ///
@@ -388,6 +400,15 @@ pub struct SharedVm {
 
     /// Cache of resolved symbolic references (fields and methods).
     pub resolution_cache: RwLock<ResolutionCache>,
+
+    /// Captured Throwable backtraces, shared by every Java thread in this VM.
+    ///
+    /// Java exposes a Throwable's stack trace independently of the thread that
+    /// filled it in. Keeping this in `SharedVm` also lets the registry survive
+    /// the producer thread's teardown. Entries are non-owning and swept after
+    /// each collection, so completed exception-heavy workloads do not retain
+    /// stale frame vectors indefinitely.
+    throwable_stacks: RwLock<FxHashMap<i32, ThrowableStackTrace>>,
 
     /// Round 8 audit fix (CRIT #2): the reflective `(class, name,
     /// descriptor)` cache. Previously built (`LinkResolver::new()`) but
@@ -882,6 +903,41 @@ pub struct SharedVm {
 }
 
 impl SharedVm {
+    /// Retain a captured Throwable trace independently of the producing Java
+    /// thread. The entry is non-owning and is swept by the GC remap hook.
+    pub fn store_throwable_stack_trace(&self, throwable: ObjectRef, frames: Vec<StackTraceEntry>) {
+        let hash = self.heap.identity_hash_code(throwable);
+        self.throwable_stacks
+            .write()
+            .insert(hash, ThrowableStackTrace { throwable, frames });
+    }
+
+    /// Return an owned snapshot so readers never borrow through the shared
+    /// registry lock while another thread refreshes a Throwable's trace.
+    pub fn throwable_stack_trace(&self, hash: i32) -> Option<Vec<StackTraceEntry>> {
+        self.throwable_stacks
+            .read()
+            .get(&hash)
+            .map(|trace| trace.frames.clone())
+    }
+
+    /// Forward live registry handles after a relocating collection and discard
+    /// entries whose Throwable was collected. The registry deliberately does
+    /// not keep its key object alive; `is_object_address` is the collector's
+    /// stable post-collection liveness probe.
+    pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &HashMap<usize, usize>) {
+        let mut traces = self.throwable_stacks.write();
+        traces.retain(|_, trace| {
+            let old_addr = trace.throwable.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                trace.throwable = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                true
+            } else {
+                self.heap.is_object_address(old_addr).is_some()
+            }
+        });
+    }
+
     /// Create a new SharedVm from a VmConfig.
     pub fn new(mut config: VmConfig) -> Self {
         apply_container_default_heap(&mut config);
@@ -2713,6 +2769,7 @@ impl SharedVm {
             ),
             statics: RwLock::new(FxHashMap::default()),
             resolution_cache: RwLock::new(ResolutionCache::new()),
+            throwable_stacks: RwLock::new(FxHashMap::default()),
             // Round 8 audit fix (CRIT #2): reflective lookup cache.
             link_resolver: LinkResolver::new(),
             vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
@@ -5574,24 +5631,10 @@ impl Vm {
             .is_subclass_of(child_id, parent_id)
     }
 
-    // ----- Throwable stack-trace accessor (CLI unhandled-exception renderer) ----
-    //
-    // `Throwable.fillInStackTrace` in this VM stashes captured frames in the
-    // per-thread `JvmThread::throwable_stacks` map keyed by identity hash of
-    // the throwable — it does NOT populate the heap-side `stackTrace` /
-    // `backtrace` field. The Java-side field is only populated lazily when
-    // `Throwable.getStackTrace()` runs, which has typically not happened for
-    // an exception that escapes `main()`. The CLI renderer falls back to
-    // this accessor so unhandled exceptions still get a `\tat ...` listing.
-    //
-    // Returns frames from the main thread's `throwable_stacks` only; other
-    // threads' `throwable_stacks` are not aggregated here, but unhandled
-    // escapes from `main()` always landed on the main thread by definition.
-
     /// Display-friendly snapshot of one frame in a captured Throwable trace.
     pub fn throwable_stack_for(&self, throwable: ObjectRef) -> Option<Vec<StackTraceFrame>> {
         let h = self.shared.heap.identity_hash_code(throwable);
-        let frames = self.main_thread.throwable_stacks.get(&h)?;
+        let frames = self.shared.throwable_stack_trace(h)?;
         Some(
             frames
                 .iter()

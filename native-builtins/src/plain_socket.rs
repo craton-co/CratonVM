@@ -86,6 +86,19 @@ fn ioex<S: Into<String>>(msg: S) -> MethodCallFailed {
     .into()
 }
 
+/// Preserve the concrete `java.net` exception type that callers use for
+/// blocking socket-connect recovery.  This mirrors the public `Socket`
+/// bridge in `net_phase_e`: a text-only `IOException` makes
+/// `catch (ConnectException)` and `catch (SocketTimeoutException)` ineffective.
+fn connectex(addr: SocketAddr, error: std::io::Error) -> MethodCallFailed {
+    let message = format!("{}: {error}", addr);
+    match error.kind() {
+        std::io::ErrorKind::ConnectionRefused => RuntimeError::ConnectException { message }.into(),
+        std::io::ErrorKind::TimedOut => RuntimeError::SocketTimeoutException { message }.into(),
+        _ => ioex(format!("socketConnect: {message}")),
+    }
+}
+
 /// Temporary diagnostic: `CRATONVM_DBG_NET=1` prints each PlainSocketImpl native
 /// as it fires, to confirm whether the blocking socket path uses the legacy
 /// PlainSocketImpl surface vs the NioSocketImpl→sun/nio/ch/Net path.
@@ -327,6 +340,14 @@ fn socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let ip = read_inet_addr(ctx, addr_obj)
         .ok_or_else(|| ioex("socketConnect: cannot resolve address"))?;
+    // Wildcard connect targets aren't a valid OS destination on Windows
+    // (WSAEADDRNOTAVAIL) — see the matching substitution and rationale in
+    // `native-io/src/socket_channel.rs::sc_connect_inner`.
+    let ip = match ip {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    };
     let sa = SocketAddr::new(ip, port as u16);
     let fd = read_fd(ctx, this);
     let sock_addr = SockAddr::from(sa);
@@ -365,7 +386,7 @@ fn socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         cloned.connect(&sock_addr)
     };
     ctx.end_blocking_region();
-    result.map_err(|e| ioex(format!("socketConnect: {e}")))?;
+    result.map_err(|e| connectex(sa, e))?;
     with_socket(fd, |s| {
         s.socket = cloned;
         s.is_connected = true;

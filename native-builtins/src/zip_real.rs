@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
-use flate2::{Decompress, FlushDecompress};
+use flate2::{Compress, Decompress, FlushCompress, FlushDecompress};
 
 // ---------------------------------------------------------------------------
 // Handle tables
@@ -46,10 +46,17 @@ struct InflaterState {
 }
 
 struct DeflaterState {
-    level: i32,
+    compress: Compress,
+    // zlib_header: tracked so `reset(long)`/level changes can recreate the
+    // stream in the same mode, mirroring InflaterState.
     zlib_header: bool,
-    pending_input: Vec<u8>,
-    pending_output: Vec<u8>,
+    // Real JDK `Deflater.deflate()` is idempotent once FINISH has produced
+    // `Z_STREAM_END`: further calls are a documented no-op (0 bytes
+    // consumed/produced, finished stays true) until `reset()`. Calling
+    // `Compress::compress` again on an already-finished zlib stream is
+    // undefined by zlib's own contract (typically `Z_STREAM_ERROR`, but not
+    // guaranteed) — track completion explicitly and short-circuit instead
+    // of re-entering zlib once finished.
     finished: bool,
 }
 
@@ -139,52 +146,25 @@ fn defl_effective_level(level_raw: i32) -> i32 {
     }
 }
 
-#[cfg(unix)]
+// Only used by the golden-byte-vector test below now that
+// `defl_deflate_bytes_bytes` streams through `Compress` directly instead of
+// buffering the whole body for a single one-shot compress at FINISH.
+#[cfg(test)]
 fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<u8>> {
-    use std::ffi::c_void;
-    use std::os::raw::{c_char, c_int, c_ulong};
-
-    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
-    type Compress2 =
-        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
-
-    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
-        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(std::mem::transmute_copy(&ptr))
-        }
-    }
-
-    let mut handle = std::ptr::null_mut();
-    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
-        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            break;
-        }
-    }
-    if handle.is_null() {
-        return None;
-    }
-
-    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
-    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
-
-    let source_len = data.len() as c_ulong;
-    let mut bound = unsafe { compress_bound(source_len) } as usize;
+    let source_len = data.len() as libz_sys::uLong;
+    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as c_ulong;
+    let mut z_len = bound as libz_sys::uLong;
     let rc = unsafe {
-        compress2(
+        libz_sys::compress2(
             z.as_mut_ptr(),
             &mut z_len,
             data.as_ptr(),
             source_len,
-            defl_effective_level(level) as c_int,
+            defl_effective_level(level),
         )
     };
     if rc != 0 || z_len < 6 {
@@ -198,11 +178,7 @@ fn defl_zlib_compress(data: &[u8], level: i32, zlib_header: bool) -> Option<Vec<
     }
 }
 
-#[cfg(not(unix))]
-fn defl_zlib_compress(_data: &[u8], _level: i32, _zlib_header: bool) -> Option<Vec<u8>> {
-    None
-}
-
+#[cfg(test)]
 fn defl_compress_finished(data: &[u8], level: i32, zlib_header: bool) -> std::io::Result<Vec<u8>> {
     if let Some(out) = defl_zlib_compress(data, level, zlib_header) {
         return Ok(out);
@@ -448,11 +424,11 @@ fn defl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let level_raw = arg_int(args, 0);
     let _strategy = arg_int(args, 1);
     let nowrap = arg_bool(args, 2);
+    let zlib_header = !nowrap;
+    let level = flate2::Compression::new(defl_effective_level(level_raw) as u32);
     let state = DeflaterState {
-        level: defl_effective_level(level_raw),
-        zlib_header: !nowrap,
-        pending_input: Vec::new(),
-        pending_output: Vec::new(),
+        compress: Compress::new(level, zlib_header),
+        zlib_header,
         finished: false,
     };
     let handle = next_handle();
@@ -490,51 +466,66 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(a) => read_byte_array(ctx, a, in_off, in_len),
         None => Vec::new(),
     };
+    let mut output_buf = vec![0u8; out_len];
 
-    let (input_consumed, output_bytes, finished) = {
+    // JDK `Deflater` flush codes: 0=NO_FLUSH, 1=SYNC_FLUSH, 2=FULL_FLUSH,
+    // 4=FINISH (see java.util.zip.Deflater.{NO,SYNC,FULL}_FLUSH constants).
+    // Real streaming producers (e.g. Jetty's GzipHttpOutputInterceptor)
+    // depend on SYNC_FLUSH/FULL_FLUSH actually producing output mid-stream —
+    // previously this native only ever emitted bytes on FINISH, buffering
+    // the whole body and never satisfying a caller that blocks waiting for
+    // a flush to make progress before it hands over more input.
+    let flush = match flush_code {
+        1 => FlushCompress::Sync,
+        2 => FlushCompress::Full,
+        4 => FlushCompress::Finish,
+        _ => FlushCompress::None,
+    };
+
+    let (input_consumed, output_consumed, finished) = {
         let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
         let st = match tbl.get_mut(&addr) {
             Some(s) => s,
             None => return Ok(Some(Value::Long(0))),
         };
 
-        if params != 0 {
-            // JDK packs params as: bit0=set, bits1..2=strategy, bits3..=level.
-            st.level = defl_effective_level(params >> 3);
-        }
-
-        if !input_data.is_empty() {
-            st.pending_input.extend_from_slice(&input_data);
-        }
-
-        if flush_code == 4 && !st.finished && st.pending_output.is_empty() {
-            st.pending_output = defl_compress_finished(&st.pending_input, st.level, st.zlib_header)
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("Deflater compression failed: {}", e),
-                })?;
-            st.pending_input.clear();
-            st.finished = true;
-        }
-
-        let take = out_len.min(st.pending_output.len());
-        let output = if take == 0 {
-            Vec::new()
+        if st.finished {
+            // Matches real JDK: once finished, deflate() is a no-op until reset().
+            (0u32, 0u32, true)
         } else {
-            st.pending_output.drain(..take).collect::<Vec<u8>>()
-        };
-        let finished = st.finished && st.pending_output.is_empty();
-        (input_data.len() as u32, output, finished)
+            if params != 0 {
+                // JDK packs params as: bit0=set, bits1..2=strategy, bits3..=level.
+                let level = flate2::Compression::new(defl_effective_level(params >> 3) as u32);
+                let _ = st.compress.set_level(level);
+            }
+
+            let total_in_before = st.compress.total_in();
+            let total_out_before = st.compress.total_out();
+            let status = st
+                .compress
+                .compress(&input_data, &mut output_buf, flush)
+                .map_err(|e| RuntimeError::IOException {
+                    message: format!("Deflater compression failed: {:?}", e),
+                })?;
+            let input_consumed = (st.compress.total_in() - total_in_before) as u32;
+            let output_consumed = (st.compress.total_out() - total_out_before) as u32;
+            let finished = matches!(status, flate2::Status::StreamEnd);
+            if finished {
+                st.finished = true;
+            }
+            (input_consumed, output_consumed, finished)
+        }
     };
 
     if let Some(a) = output_arr {
-        if !output_bytes.is_empty() {
-            write_byte_array(ctx, a, out_off, &output_bytes);
+        if output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
         }
     }
 
     Ok(Some(Value::Long(pack_deflate_result(
         input_consumed,
-        output_bytes.len() as u32,
+        output_consumed,
         finished,
     ))))
 }
@@ -574,8 +565,7 @@ fn defl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let addr = arg_long(args, 0);
     let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = tbl.get_mut(&addr) {
-        st.pending_input.clear();
-        st.pending_output.clear();
+        st.compress.reset();
         st.finished = false;
     }
     Ok(None)
@@ -777,6 +767,11 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
     // and any app reading JARs trips `updateBytes0` during entry verification.
     let crc = "java/util/zip/CRC32";
     r.register(crc, "update", "(II)I", crc32_update);
+    // `updateBytes` is concrete real-JDK bytecode that only checks its range
+    // then delegates to updateBytes0. Force its registered implementation in
+    // real-JDK mode so archive writers never compile a second, incompatible
+    // CRC-state transition around the native boundary.
+    r.register(crc, "updateBytes", "(I[BII)I", crc32_update_bytes_0);
     r.register(crc, "updateBytes0", "(I[BII)I", crc32_update_bytes_0);
     r.register(
         crc,
@@ -895,5 +890,188 @@ mod tests {
         assert_eq!((p2 >> 31) & 0x7FFF_FFFF, 0x7FFF_FFFF);
         assert_eq!((p2 >> 62) & 1, 0);
         assert_eq!((p2 >> 63) & 1, 1);
+    }
+
+    #[test]
+    fn deflater_matches_hotspot_for_a_large_json_string() {
+        let mut body = Vec::with_capacity(10_002);
+        body.push(b'[');
+        body.extend(std::iter::repeat_n(b'a', 10_000));
+        body.push(b']');
+
+        let actual = defl_compress_finished(&body, 6, false)
+            .expect("raw deflate compression should succeed");
+        let expected = [
+            0xed, 0xc1, 0x31, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37,
+            0x51, 0x1f, 0x0d, 0x70, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 0x52,
+        ];
+        assert_eq!(actual, expected);
+    }
+
+    /// Regression guard for the Jetty `compressionOfResponseToGetRequest`
+    /// hang (`jetty-webserver-factory-poststartup-timeout-and-reflective-
+    /// supertype-residuals.md`): a mid-stream `SYNC_FLUSH` (JDK flush code
+    /// 1) must produce real compressed bytes immediately instead of being
+    /// silently buffered until `FINISH`. A streaming gzip writer that waits
+    /// for a flush to make progress before handing over more input would
+    /// hang forever against the old buffer-until-FINISH implementation.
+    #[test]
+    fn deflate_sync_flush_produces_output_without_finish() {
+        let mut ctx = mock_ctx();
+
+        // nowrap=true (raw deflate, no zlib header) to match `Decompress::new(false)` below.
+        let addr = match defl_init(&mut ctx, &[Value::Int(6), Value::Int(0), Value::Int(1)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+
+        let original = b"hello hello hello hello hello world world world";
+        let input_arr = ctx.new_array(ArrayElementType::Byte, original.len());
+        for (i, b) in original.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i32));
+        }
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 1024);
+
+        let packed = match defl_deflate_bytes_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(original.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(1024),
+                Value::Int(1), // SYNC_FLUSH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p as u64,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let input_consumed = (packed & 0x7FFF_FFFF) as usize;
+        let output_consumed = ((packed >> 31) & 0x7FFF_FFFF) as usize;
+        assert_eq!(input_consumed, original.len());
+        assert!(
+            output_consumed > 0,
+            "SYNC_FLUSH must flush compressed bytes immediately, not defer to FINISH"
+        );
+
+        let mut compressed = Vec::new();
+        for i in 0..output_consumed {
+            match ctx.get_array_element(output_arr, i) {
+                Value::Int(v) => compressed.push(v as u8),
+                other => panic!("expected byte, got {other:?}"),
+            }
+        }
+
+        // Finish the stream with no further input and collect the tail.
+        let empty_arr = ctx.new_array(ArrayElementType::Byte, 0);
+        let output_arr2 = ctx.new_array(ArrayElementType::Byte, 1024);
+        let packed2 = match defl_deflate_bytes_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(empty_arr)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(Some(output_arr2)),
+                Value::Int(0),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p as u64,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let output_consumed2 = ((packed2 >> 31) & 0x7FFF_FFFF) as usize;
+        let finished2 = (packed2 >> 62) & 1 == 1;
+        assert!(finished2, "FINISH flush must report stream completion");
+        for i in 0..output_consumed2 {
+            match ctx.get_array_element(output_arr2, i) {
+                Value::Int(v) => compressed.push(v as u8),
+                other => panic!("expected byte, got {other:?}"),
+            }
+        }
+
+        let mut decomp = Decompress::new(false);
+        let mut out = vec![0u8; 1024];
+        let status = decomp
+            .decompress(&compressed, &mut out, FlushDecompress::Finish)
+            .expect("decompress ok");
+        let produced = decomp.total_out() as usize;
+        assert_eq!(&out[..produced], &original[..]);
+        assert!(matches!(status, flate2::Status::StreamEnd));
+    }
+
+    /// Real `Deflater.deflate()` is documented as a no-op once FINISH has
+    /// produced `Z_STREAM_END`: callers may call it again before `reset()`
+    /// and must see 0 bytes consumed/produced with `finished` still true.
+    /// Re-entering zlib past `Z_STREAM_END` is not part of its contract;
+    /// guard against it explicitly rather than relying on the backend's
+    /// behavior for an out-of-contract call.
+    #[test]
+    fn deflate_after_finish_is_a_no_op_not_a_reentry() {
+        let mut ctx = mock_ctx();
+        let addr = match defl_init(&mut ctx, &[Value::Int(6), Value::Int(0), Value::Int(1)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+
+        let input_arr = ctx.new_array(ArrayElementType::Byte, 0);
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 64);
+        let finish_args = |input, output| {
+            vec![
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input)),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Object(Some(output)),
+                Value::Int(0),
+                Value::Int(64),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ]
+        };
+
+        let first = match defl_deflate_bytes_bytes(&mut ctx, &finish_args(input_arr, output_arr))
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(p) => p as u64,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        assert_eq!((first >> 62) & 1, 1, "first FINISH call must report finished");
+
+        // Calling deflate() again after finished must stay a clean no-op —
+        // not an error, not a re-entry into zlib.
+        let output_arr2 = ctx.new_array(ArrayElementType::Byte, 64);
+        let second = match defl_deflate_bytes_bytes(&mut ctx, &finish_args(input_arr, output_arr2))
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(p) => p as u64,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        assert_eq!(second & 0x7FFF_FFFF, 0, "post-finish call must consume no input");
+        assert_eq!((second >> 31) & 0x7FFF_FFFF, 0, "post-finish call must produce no output");
+        assert_eq!((second >> 62) & 1, 1, "post-finish call must still report finished");
     }
 }

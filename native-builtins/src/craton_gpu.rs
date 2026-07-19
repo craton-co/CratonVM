@@ -1839,7 +1839,8 @@ mod tests {
     fn future_is_done_done_is_true() {
         let h = state::with(|s| {
             let h = s.fresh_handle();
-            s.futures.insert(h, state::FutureState::Done { result_obj: None });
+            s.futures
+                .insert(h, state::FutureState::Done { result_obj: None });
             h
         });
         let mut ctx = MockNativeContext::new();
@@ -1877,7 +1878,8 @@ mod tests {
     fn record_done_scalar(value: Value) -> u64 {
         state::with(|s| {
             let h = s.fresh_handle();
-            s.futures.insert(h, state::FutureState::DoneScalar { value });
+            s.futures
+                .insert(h, state::FutureState::DoneScalar { value });
             h
         })
     }
@@ -1941,7 +1943,8 @@ mod tests {
         // from before this file's scalar-boxing addition.
         let h = state::with(|s| {
             let h = s.fresh_handle();
-            s.futures.insert(h, state::FutureState::Done { result_obj: None });
+            s.futures
+                .insert(h, state::FutureState::Done { result_obj: None });
             h
         });
         let mut ctx = MockNativeContext::new();
@@ -2094,18 +2097,9 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let exec = fresh_test_handle();
         ctx.set_gpu_stream_create_result(Some(777));
-        assert_eq!(
-            resolve_or_create_default_stream(&mut ctx, exec),
-            Some(777)
-        );
-        assert_eq!(
-            resolve_or_create_default_stream(&mut ctx, exec),
-            Some(777)
-        );
-        assert_eq!(
-            resolve_or_create_default_stream(&mut ctx, exec),
-            Some(777)
-        );
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), Some(777));
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), Some(777));
+        assert_eq!(resolve_or_create_default_stream(&mut ctx, exec), Some(777));
         assert_eq!(
             ctx.gpu_stream_create_call_count(),
             1,
@@ -2154,8 +2148,7 @@ mod tests {
         // The executor's cache entry is gone too, so a hypothetical
         // reuse of the same numeric handle after release would create
         // a fresh stream rather than resurrecting the released one.
-        let still_cached =
-            state::with(|s| s.executor_default_stream.get(&exec).copied());
+        let still_cached = state::with(|s| s.executor_default_stream.get(&exec).copied());
         assert_eq!(still_cached, None);
     }
 
