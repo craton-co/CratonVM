@@ -3252,8 +3252,10 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "setSSLSocketFactory",
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
         |ctx, args| {
-            if let Some(Value::Object(Some(f))) = args.get(1) {
-                capture_huc_client_identity(ctx, *f);
+            if let (Some(Value::Object(Some(connection))), Some(Value::Object(Some(f)))) =
+                (args.first(), args.get(1))
+            {
+                crate::http_url_connection::capture_huc_instance_ssl_factory(ctx, *connection, *f);
             }
             Ok(None)
         },
@@ -4354,6 +4356,9 @@ mod tests {
         assert!(r.find(cls, "closeInbound", "()V").is_some());
         assert!(r.find(cls, "isInboundDone", "()Z").is_some());
         assert!(r.find(cls, "isOutboundDone", "()Z").is_some());
+        assert!(r
+            .find(cls, "getHandshakeSession", "()Ljavax/net/ssl/SSLSession;")
+            .is_some());
         assert!(r
             .find(cls, "getSession", "()Ljavax/net/ssl/SSLSession;")
             .is_some());
@@ -5578,12 +5583,13 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     .identity_override
                     .as_ref()
                     .map(|(cert, key)| (cert.as_str(), key.as_str()));
-                build_client_config_ex(
+                build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
                     ClientAuthMode::Fixed(client_auth),
                     revocation,
                     use_java_trust_manager,
+                    cipher_provider_for(&state.enabled_ciphers),
                 )?
             }
         };
@@ -6449,6 +6455,19 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let v = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
+
+    // `SSLEngineImpl.getHandshakeSession()` is real JDK bytecode that reads
+    // its private `conContext` field. Our rustls-backed implementation does
+    // not construct that JSSE-internal graph, so allowing the bytecode to run
+    // turns a harmless pre-handshake capability probe (Jetty's buffer sizing)
+    // into an NPE. There is no Java-visible handshake session before the
+    // native handshake begins; return null, as the JDK contract permits.
+    r.register(
+        cls_impl,
+        "getHandshakeSession",
+        "()Ljavax/net/ssl/SSLSession;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
 
     // getSession() — synthetic SSLSession with negotiated cipher/protocol/alpn.
     r.register(
@@ -7355,6 +7374,30 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     with_engine(id, |s| {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();
                     });
+                }
+                // Jetty propagates its configured suites through
+                // `SSLParameters`, not necessarily through the engine's direct
+                // setter. Keep them with this engine so `beginHandshake`
+                // constrains rustls's ClientHello instead of merely echoing a
+                // policy back to Java.
+                if let Value::Object(Some(ciphers)) = ctx.get_field_by_name(*p, "cipherSuites") {
+                    let mut suites = Vec::new();
+                    for index in 0..ctx.array_length(ciphers) {
+                        if let Value::Object(Some(cipher)) = ctx.get_array_element(ciphers, index) {
+                            if let Some(name) = ctx.read_string(cipher) {
+                                suites.push(name);
+                            }
+                        }
+                    }
+                    if std::env::var_os("CRATONVM_DBG_TLS_CIPHERS").is_some() {
+                        eprintln!(
+                            "[dbg-tls-ciphers] thread={:?} setSSLParameters id={} suites={:?}",
+                            std::thread::current().id(),
+                            id,
+                            suites
+                        );
+                    }
+                    with_engine(id, |s| s.enabled_ciphers = suites);
                 }
                 // Tomcat configures client-cert auth via
                 // `SSLParameters.setNeed/WantClientAuth` + `engine.setSSLParameters`,
