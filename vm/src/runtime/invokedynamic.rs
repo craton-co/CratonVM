@@ -1635,6 +1635,46 @@ fn value_to_string(
             if let Some(t) = thread {
                 let mut ctx = NativeContextImpl { shared, thread: t };
                 use cratonvm_native_api::NativeContext;
+
+                // `java.nio.file.Path` is a genuine interface with no `toString()`
+                // body of its own; `ctx.invoke_virtual` below doesn't consult
+                // `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+                // `check_override` allow-list the way the bytecode interpreter's
+                // own `invokevirtual` handling does, so it silently resolves to
+                // `Object.toString()` here too (`java.nio.file.Path@<hash>`) for
+                // `"literal" + aPath` string concatenation. Same family as
+                // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+                // a third, distinct call site. Route through the same
+                // display-string helper the registered `Path.toString()` native
+                // itself uses, bypassing `invoke_virtual` entirely for this type.
+                //
+                // NOTE: must use the ClassId-based `is_subclass_of` (which walks
+                // both the superclass chain AND implemented interfaces), not
+                // `ClassManager::is_subclass_of_by_name` — that one is the
+                // exception-`catch_type` fallback and deliberately walks ONLY
+                // the superclass chain (interfaces are never a `catch_type`),
+                // so it can never match an interface like `Path` and this
+                // branch would silently never fire. (A concurrent dev commit
+                // added this same check using `is_subclass_of_by_name` — that
+                // version never actually fires; confirmed via a standalone
+                // `"file:" + Paths.get(...)` repro that still printed
+                // `file:java.nio.file.Path@<hash>` until switched to
+                // `is_subclass_of`.)
+                let obj_class_id = shared.heap.class_id_of(*obj_ref);
+                let is_path = ctx
+                    .class_id_by_name("java/nio/file/Path")
+                    .is_some_and(|path_cid| {
+                        shared
+                            .class_manager
+                            .read()
+                            .is_subclass_of(obj_class_id, path_cid)
+                    });
+                if is_path {
+                    return cratonvm_native_builtins::phases_late::p57_path_display_string(
+                        &mut ctx, *obj_ref,
+                    );
+                }
+
                 match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(str_ref)))) => {
                         return ctx

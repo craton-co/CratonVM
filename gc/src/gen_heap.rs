@@ -3336,6 +3336,26 @@ impl GenerationalHeap {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
+        // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
+        // across cycles to find where reclaimed bytes stop coming back as
+        // usable free space. Gated so normal runs pay nothing.
+        if std::env::var_os("CRATONVM_DBG_HEAP_TRACE").is_some() {
+            static CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (used, free_bytes, cap) = {
+                let from = self.young_from.lock();
+                (from.used(), from.free_list_bytes(), from.capacity())
+            };
+            let (old_used, old_cap) = {
+                let og = self.old_gen.lock();
+                (og.used(), og.capacity())
+            };
+            eprintln!(
+                "[HEAP-TRACE] cycle={n} young_used={used} young_free_list={free_bytes} \
+                 young_cap={cap} old_used={old_used} old_cap={old_cap} bytes_freed={} objects_copied={}",
+                result.0.stats.bytes_freed, result.0.stats.objects_copied,
+            );
+        }
         // The JIT-active path cannot use the ordinary old-gen compactor:
         // conservative JIT stack/register roots cannot be rewritten when an
         // old object moves.  Previously this early return therefore skipped

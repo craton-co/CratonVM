@@ -35,8 +35,8 @@ pub mod verify_insn;
 pub mod vtype;
 
 pub use class::{
-    find_field_recursive, find_method_recursive, ArrayInfo, Class, ClassId, ClassLoaderId,
-    ClassState, ClassStore, CodeSource, RecordComponentInfo,
+    find_field_recursive, find_method_recursive, invokespecial_selection_start, ArrayInfo, Class,
+    ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, RecordComponentInfo,
 };
 pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::{

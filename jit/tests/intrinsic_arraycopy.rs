@@ -162,6 +162,7 @@ fn helpers() -> JitRuntimeHelpers {
         self_call_stack_guard: 0,
         region_bounds_addr: 0,
         native_stack_floor_fn: 0,
+        ldc_string: s,
     }
 }
 
@@ -388,6 +389,7 @@ fn compile_despec_arraycopy_with_dispatch(
         Vec::new(), // mic_slots
         Vec::new(), // pic_slots
         Vec::new(), // ldc_info
+        Vec::new(), // ldc_string_info
         Vec::new(), // ldc2w_info
         HashMap::new(),
         HashMap::new(),
@@ -400,7 +402,7 @@ fn compile_despec_arraycopy_with_dispatch(
         0,
         Vec::new(),
         method_key,
-        Vec::new(),
+        Vec::new(), // indy_info
     )
     .expect("JIT compilation of the despecialized arraycopy wrapper failed")
 }

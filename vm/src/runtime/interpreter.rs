@@ -1607,6 +1607,47 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
     }
 }
 
+/// Resolve the field slot used to link a `java.lang.ref.Reference` (or
+/// subclass instance) onto its `ReferenceQueue`'s linked list when the GC
+/// auto-enqueues it -- the `next` field as declared on `java/lang/ref/Reference`
+/// itself (referent, queue, next, discovered — real-JDK layout).
+///
+/// MUST be resolved BY NAME against `Reference`'s own declaring class, not
+/// by a field-count heuristic on the receiver's most-derived class: a
+/// `java.util.WeakHashMap$Entry` (itself a `WeakReference` subclass) also
+/// declares its OWN field named `next` (used for its hash-BUCKET chain, a
+/// completely different linked list). The old heuristic ("index 2 if the
+/// object has more than 2 fields") cannot tell these apart — for a
+/// `WeakHashMap$Entry` specifically it can land on the wrong `next` slot,
+/// so a GC-driven auto-enqueue (a live-application-scale WeakHashMap
+/// *will* eventually have a stale entry to expunge) splices the
+/// ReferenceQueue's link over the bucket-chain link, corrupting whatever
+/// hash bucket that entry lived in — a later `WeakHashMap.get()`/
+/// `expungeStaleEntries()` walking that bucket's `Entry.next` chain then
+/// loops forever (observed: `com.sun.beans.TypeResolver`'s internal
+/// `WeakCache`'s `WeakHashMap.get()` permanently stuck inside
+/// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
+/// `createLayoutFromConfigClass` test). See
+/// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
+fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
+    if shared.heap.num_fields(ref_obj) <= 2 {
+        return 0; // legacy synthetic 2-field shape: referent, queue only
+    }
+    let cm = shared.class_manager.read();
+    cm.find_class_by_name("java/lang/ref/Reference")
+        .and_then(|reference_cid| {
+            crate::vm::vm_exec::resolve_field_index_in_hierarchy(
+                reference_cid,
+                "next",
+                cm.class_store(),
+            )
+        })
+        // `java/lang/ref/Reference` should always be loaded by the time any
+        // Reference object exists to enqueue; this fallback only guards
+        // against that invariant somehow not holding.
+        .unwrap_or(2)
+}
+
 /// Process weak/soft references after a GC cycle.
 /// Calls the ReferenceProcessor, nulls referent fields of cleared references,
 /// and relocates ref processor addresses using the pointer map.
@@ -1840,11 +1881,7 @@ fn process_references_after_gc(
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        let next_slot = if shared.heap.num_fields(ref_obj) > 2 {
-            2
-        } else {
-            0
-        };
+        let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
         let size = match shared.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
@@ -4067,11 +4104,7 @@ fn g1_remark_process_references(
         shared
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj)));
-        let next_slot = if shared.heap.num_fields(ref_obj) > 2 {
-            2
-        } else {
-            0
-        };
+        let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.heap.set_field(ref_obj, next_slot, old_head);
         let size = match shared.heap.get_field(q_obj, 1) {
             Value::Int(v) => v,
@@ -10462,6 +10495,16 @@ fn route_jit_exception_through_method(
     exc: ObjectRef,
     incoming_args: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            cached.exception_table.len(),
+        );
+    }
     // Fast path: no exception table at all — propagate.
     if cached.exception_table.is_empty() {
         return Err(MethodCallFailed::ExceptionThrown(exc));
@@ -10543,6 +10586,18 @@ fn route_jit_exception_through_method(
         }
     }
     drop(cm_guard);
+
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method RESULT {}.{}{} throw_pc={} handler_pc={:?} incoming_args_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            handler_pc,
+            incoming_args.len(),
+        );
+    }
 
     let Some(handler_pc) = handler_pc else {
         // No matching handler — propagate to caller.
@@ -14011,7 +14066,8 @@ fn execute_instruction(
             // and getfield-loaded-value barriers elsewhere in this file, just
             // never applied to the getfield/putfield RECEIVER itself.
             let obj_ref = shared.heap.load_and_forward(obj_ref);
-            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field =
+                resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
@@ -14296,10 +14352,11 @@ fn execute_instruction(
         Instruction::Putfield(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
             // Resolve the field early (cached) so its descriptor byte is in hand
-            // for the tag-exact value pop below. resolve_field_ref is
+            // for the tag-exact value pop below. The loader-aware resolver is
             // stack-neutral, and surfacing a resolution error here (before the
             // value/objectref pop) is spec-compliant for putfield.
-            let mut field = resolve_field_ref(shared, current_class_id, *index)?;
+            let mut field =
+                resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
             // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
             //
             // The stack top before putfield is [..., objectref, value] (with
@@ -17308,19 +17365,56 @@ fn lookup_loader_initiated(
     if name.starts_with('[') || is_global_resolution_namespace(name) {
         return None;
     }
+    // A class the loader defines itself is authoritative. In particular, a
+    // forked Spring test loader can load its own copy after an earlier
+    // parent-delegated initiating-resolution cache entry exists for the same
+    // binary name. Consulting that cache first collapses the fork back onto
+    // the application class and lets stale static invoke-cache entries mix
+    // the two identities (for example MergedAnnotation$Adapt).
     if let Some(id) = shared
+        .class_manager
+        .read()
+        .class_defined_by_loader_exact(name, loader)
+    {
+        return Some(id);
+    }
+    shared
         .initiating_resolution_cache
         .read()
         .get(&loader)
         .and_then(|m| m.get(name))
         .copied()
-    {
-        return Some(id);
-    }
-    shared
-        .class_manager
-        .read()
-        .class_defined_by_loader_exact(name, loader)
+}
+
+fn is_isolated_url_loader_definition(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    referencing_class_id: ClassId,
+) -> bool {
+    use cratonvm_native_api::NativeContext as _;
+    let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+        referencing_class_id.as_u32(),
+    ) else {
+        return false;
+    };
+    let ctx = crate::vm::NativeContextImpl { shared, thread };
+    cratonvm_native_builtins::classloader::url_classloader_isolated_from_app(&ctx, loader)
+}
+
+fn isolated_loader_class_not_found(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    name: &str,
+) -> MethodCallFailed {
+    use cratonvm_native_api::NativeContext as _;
+    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+    let exception = cratonvm_native_builtins::jboss_module_loader::alloc_single_message_exception(
+        &mut ctx,
+        "java/lang/NoClassDefFoundError",
+        1,
+        &name.replace('/', "."),
+    );
+    MethodCallFailed::ExceptionThrown(exception)
 }
 
 /// Resolve a `CONSTANT_Class` reference (`ldc X.class`, `new`/`anewarray`,
@@ -17375,6 +17469,9 @@ fn resolve_class_loader_aware(
         // semantics), then fall back to the global store.
         if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
             return Ok(id);
+        }
+        if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
+            return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         return shared
             .load_class_concurrent(name)
@@ -17508,15 +17605,6 @@ fn resolve_field_ref(
     current_class_id: ClassId,
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
-    // Check cache first
-    if let Some(cached) = shared
-        .resolution_cache
-        .read()
-        .get_field(current_class_id, cp_index)
-    {
-        return Ok(cached.clone());
-    }
-
     let (field_class_name, field_name) = {
         let cm = shared.class_manager.read();
         let class = cm
@@ -17553,9 +17641,54 @@ fn resolve_field_ref(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id = match lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    // A background compiler has no `JvmThread`, so it cannot drive the
+    // referencing class's defining loader on a cold symbolic reference. Do
+    // not let it seed this per-(ClassId, cp-index) cache through the flat
+    // global store: the interpreter would later accept that stale result
+    // instead of applying JVMS initiating-loader resolution. Once the owner
+    // is known to this loader, using the cache is safe again.
+    let loader_sensitive = should_use_loader_initiated_resolution(shared, current_class_id)
+        && !field_class_name.starts_with('[')
+        && !is_global_resolution_namespace(&field_class_name)
+        && matches!(
+            shared.class_manager.read().get_loader_id(current_class_id),
+            Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+        );
+    let loader_local_id = if loader_sensitive {
+        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    } else {
+        None
+    };
+    if let Some(cached) = shared
+        .resolution_cache
+        .read()
+        .get_field(current_class_id, cp_index)
+    {
+        // A per-callsite field entry can have been seeded before this loader
+        // defined its own owner class (for example while a forked Spring test
+        // context is being prepared). It is not valid merely because the
+        // loader has since initiated that name: the cached declaring identity
+        // must also be that exact owner. Otherwise getstatic returns the app
+        // copy's enum singleton from a fork-loaded caller.
+        if !loader_sensitive
+            || loader_local_id.map_or(true, |id| cached.declaring_class_id == id)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
+    let field_class_id = match loader_local_id
+        .or_else(|| lookup_loader_initiated(shared, current_class_id, &field_class_name))
     {
         Some(id) => id,
+        None if loader_sensitive => {
+            return Err(VmError::Internal {
+                message: format!(
+                    "field {field_class_name}.{field_name} requires loader-aware execution resolution"
+                ),
+            }
+            .into());
+        }
         None => shared.load_class_concurrent(&field_class_name)?,
     };
 
@@ -17653,8 +17786,28 @@ fn resolve_field_ref_loader_aware(
         (class_name, field_name.to_string())
     };
 
-    let field_class_id =
-        resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?;
+    // A loader-local cache lookup (no re-entrant loadClass) may already know
+    // the field-owning class for a custom-loader caller; skip the expensive
+    // re-entrant resolver in that case, matching resolve_field_ref's fast
+    // path. Only when it doesn't (or the caller isn't loader-sensitive) do
+    // we pay for the full resolve_class_loader_aware call below.
+    let loader_sensitive = should_use_loader_initiated_resolution(shared, current_class_id)
+        && !field_class_name.starts_with('[')
+        && !is_global_resolution_namespace(&field_class_name)
+        && matches!(
+            shared.class_manager.read().get_loader_id(current_class_id),
+            Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+        );
+    let loader_local_id = if loader_sensitive {
+        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+    } else {
+        None
+    };
+
+    let field_class_id = match loader_local_id {
+        Some(id) => id,
+        None => resolve_class_loader_aware(shared, thread, current_class_id, &field_class_name)?,
+    };
     if let Some(cached) = cached {
         let cache_matches_owner = {
             let cm = shared.class_manager.read();
@@ -18580,6 +18733,7 @@ fn execute_invoke_kind(
 
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
+    let method_owner_name = Arc::clone(&method_class_name);
 
     if crate::runtime::env_cache::dbg_hang_sample() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -18676,6 +18830,73 @@ fn execute_invoke_kind(
     for value in &mut args {
         if let Value::Object(Some(obj)) = value {
             *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+    // Spring's loader-fork test infrastructure can expose two physical copies
+    // of this private enum while representing one logical annotation operation.
+    // Preserve the enum member identity by its declaring binary name and enum
+    // constant name only for that loader-aware bridge; ordinary cross-loader
+    // Enum.equals/identity semantics remain unchanged.
+    //
+    // This is NOT redundant with the registered `MergedAnnotation$Adapt.isIn`
+    // native override + `force_native_over_real_jdk_bytecode` gate elsewhere
+    // in this file: empirically (2026-07-19 merge with origin/dev, which
+    // shipped that native override independently), removing this inline
+    // bridge and relying on the native override alone reintroduced the
+    // WebFluxManagementChildContextConfigurationIntegrationTests hang (stuck
+    // within seconds of the first sub-test, host load LOW at the time — not
+    // a contention artifact). Keep both: this bridge covers whatever
+    // dispatch path reaches `isIn` without going through the native-override
+    // gate for this specific loader-forked scenario.
+    if crate::runtime::env_cache::loader_aware_resolution()
+        && method_class_name.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name.as_ref() == "isIn"
+        && method_descriptor.as_ref()
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        if let (Some(Value::Object(Some(receiver))), Some(Value::Object(Some(array)))) =
+            (args.first(), args.get(1))
+        {
+            let receiver_name = match shared.heap.get_field(*receiver, 0) {
+                Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+                _ => None,
+            };
+            let receiver_ordinal = shared.heap.get_field(*receiver, 1);
+            let receiver_class_name = shared
+                .class_manager
+                .read()
+                .get_class(shared.heap.class_id_of(*receiver))
+                .map(|class| class.name.to_string());
+            for i in 0..shared.heap.array_length(*array) {
+                    let Ok(Value::Object(Some(candidate))) =
+                        shared.heap.get_array_element(*array, i)
+                    else {
+                        continue;
+                    };
+                    let candidate_name = match shared.heap.get_field(candidate, 0) {
+                        Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+                        _ => None,
+                    };
+                    let candidate_ordinal = shared.heap.get_field(candidate, 1);
+                    let candidate_class_name = shared
+                        .class_manager
+                        .read()
+                        .get_class(shared.heap.class_id_of(candidate))
+                        .map(|class| class.name.to_string());
+                    let same_name = candidate_name
+                        .as_deref()
+                        .zip(receiver_name.as_deref())
+                        .is_some_and(|(candidate, receiver)| candidate == receiver);
+                    let same_ordinal = matches!(
+                        (candidate_ordinal, receiver_ordinal),
+                        (Value::Int(candidate), Value::Int(receiver)) if candidate == receiver
+                    );
+                    if candidate_class_name == receiver_class_name && (same_name || same_ordinal)
+                    {
+                        thread.frames[frame_idx].stack.push(Value::Int(1))?;
+                        return Ok(CachedCallResult::Handled);
+                    }
+            }
         }
     }
     // GC-stale `java.lang.Thread`-mirror receiver recovery.
@@ -18858,7 +19079,17 @@ fn execute_invoke_kind(
     // Determine the class to invoke on.
     // invoke_class: Arc<str> — cheap clone, derefs to &str for all downstream calls.
     let invoke_class: Arc<str> = if is_special {
-        method_class_name
+        // JVMS §6.5 super-call redirect — see `invokespecial_owner_class_name`.
+        // A no-op for constructors, private-method calls, and any call whose
+        // CP-referenced class is not a genuine superclass of this frame's
+        // own class; `method_class_name` passes straight through those.
+        invokespecial_owner_class_name(
+            shared,
+            current_class_id,
+            cp_index,
+            &method_class_name,
+            &method_name,
+        )
     } else if let Some((_declaring_id, declaring_name)) = &private_virtual_target {
         Arc::clone(declaring_name)
     } else {
@@ -19759,10 +19990,34 @@ fn execute_invoke_kind(
     // frame-push path (NO extra recursion), unlike routing through the recursive
     // `invoke_on_class_shared`. Gated + divergence-only → byte-identical in the
     // default (gate-off) / single-class-per-name case.
+    // An invokeinterface default is part of the interface identity, not merely
+    // its binary name. A forked receiver can implement a loader-local copy of
+    // an interface while the calling class's constant-pool lookup finds the
+    // application copy. Running that application's default method mixes its
+    // static constants with the forked receiver (Spring's MergedAnnotation
+    // Adapt enum is identity-sensitive). Prefer the receiver loader's exact
+    // interface when it is a real superinterface of the receiver.
+    let loader_interface_override = if is_interface
+        && !is_special
+        && crate::runtime::env_cache::loader_aware_resolution()
+    {
+        receiver_class_id.and_then(|receiver_id| {
+            let cm = shared.class_manager.read();
+            let receiver_loader = cm.get_loader_id(receiver_id)?;
+            let exact = cm.class_defined_by_loader_exact(&method_owner_name, receiver_loader)?;
+            (Some(exact) != cm.get_loaded_class_id(&method_owner_name)
+                && cm.get_class(exact).is_some_and(|class| class.is_interface()))
+                .then_some(exact)
+        })
+    } else {
+        None
+    };
     let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
         &private_virtual_target
     {
         Some(*declaring_id)
+    } else if let Some(interface_id) = loader_interface_override {
+        Some(interface_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
         // Lambda-proxy receiver invoking a non-SAM (default) interface
         // method: `invoke_class` was set to the functional interface NAME
@@ -19869,7 +20124,7 @@ fn execute_invoke_kind(
         CachedCallResult::FramePushed => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if private_virtual_target.is_none() {
+            } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
                         thread,
@@ -19886,7 +20141,7 @@ fn execute_invoke_kind(
         CachedCallResult::Handled => {
             if is_special {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
-            } else if private_virtual_target.is_none() {
+            } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
                     populate_virtual_invoke_cache(
                         thread,
@@ -22335,7 +22590,14 @@ pub(crate) fn is_class_mirror_native_override(
         && matches!(
             (method_name, descriptor),
             ("getName", "()Ljava/lang/String;")
-                | ("forPrimitiveName", "(Ljava/lang/String;)Ljava/lang/Class;")
+                | ("isArray", "()Z")
+                | ("getComponentType", "()Ljava/lang/Class;")
+                | ("componentType", "()Ljava/lang/Class;")
+                | ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+                | (
+                    "forPrimitiveName",
+                    "(Ljava/lang/String;)Ljava/lang/Class;"
+                )
                 | ("getAnnotations", "()[Ljava/lang/annotation/Annotation;")
                 | (
                     "getDeclaredAnnotations",
@@ -24232,6 +24494,34 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if class_name == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name == "isIn"
+        && method_descriptor
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        return true;
+    }
+    // JDK 25's public Class.getProtectionDomain() reads a VM-populated private
+    // mirror field directly. CratonVM's mirrors retain class provenance in the
+    // class store instead, so force the registered class-id-backed native.
+    if class_name == "java/lang/Class"
+        && matches!(
+            (method_name, method_descriptor),
+            ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+                // JDK 25 implements isArray() as a direct read of the
+                // private componentType field. Array mirrors keep their
+                // identity in the class store, so that bytecode falsely
+                // reports `Class[]` as a non-array and Spring skips its
+                // Class[] -> String[] annotation adaptation.
+                | ("isArray", "()Z")
+                | ("getComponentType", "()Ljava/lang/Class;")
+                // Spring's annotation map adapter uses the package-private
+                // alias rather than the public accessor.
+                | ("componentType", "()Ljava/lang/Class;")
+        )
+    {
         return true;
     }
     if is_netty_event_executor_group_shutdown_native_override(
@@ -26352,8 +26642,7 @@ fn intercept_force_registered_native(
                 )
         )
     {
-        let cb =
-            shared
+        let cb = shared
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         return Some((|| {
@@ -26394,6 +26683,41 @@ fn intercept_force_registered_native(
             "getClassLoader",
             "()Ljava/lang/ClassLoader;",
         )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    // These concrete Class methods read VM-private mirror fields in JDK 25.
+    // Resolve by the receiver's runtime class so inherited or cached method
+    // references cannot bypass CratonVM's class-id-backed native methods.
+    if matches!(
+        (method_name, method_descriptor),
+        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+            | ("isArray", "()Z")
+            | ("getComponentType", "()Ljava/lang/Class;")
+            | ("componentType", "()Ljava/lang/Class;")
+    )
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared
+            .native_methods
+            .find("java/lang/Class", method_name, method_descriptor)?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
@@ -26502,8 +26826,7 @@ fn intercept_force_registered_native_cached(
                 )
         )
     {
-        let cb =
-            shared
+        let cb = shared
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, method_descriptor)?;
         let ret_type = crate::jit::return_type(method_descriptor);
@@ -26514,6 +26837,38 @@ fn intercept_force_registered_native_cached(
                     &mut thread.frames[frame_idx].stack,
                     coerce_value_for_return(value, ret_type),
                 )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
+    if matches!(
+        (method_name, method_descriptor),
+        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+            | ("isArray", "()Z")
+            | ("getComponentType", "()Ljava/lang/Class;")
+            | ("componentType", "()Ljava/lang/Class;")
+    )
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver))) if {
+                let receiver_cid = shared.heap.class_id_of(*receiver);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(receiver_cid)
+                    .map(|class| &*class.name == "java/lang/Class")
+                    .unwrap_or(false)
+            }
+        )
+    {
+        let callback = shared
+            .native_methods
+            .find("java/lang/Class", method_name, method_descriptor)?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
                 crate::vm::native_return_pushed_to_stack(shared, thread);
             }
             Ok(CachedCallResult::Handled)
@@ -28334,6 +28689,19 @@ fn populate_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+    // JVMS §6.5 super-call redirect (see `invokespecial_owner_class_name`) —
+    // this is the PRIMARY invokespecial resolution path (the stackless
+    // `thread.invoke_cache`/`shared_resolution` builder consulted by every
+    // `execute_invokevirtual_cached(is_special=true)` probe); `execute_invoke_kind`
+    // only serves the rare exotic fallback. Must run before EVERY downstream
+    // use of `class_name` below (native lookup, loader-owner override,
+    // `target_class_id` resolution, the promoted-cache key), so a
+    // super-call bridge's cache entry is never built from the wrong class.
+    let class_name = if is_special {
+        invokespecial_owner_class_name(shared, caller_class_id, cp_index, &class_name, &method_name)
+    } else {
+        class_name
+    };
 
     // A ConstantPool Methodref is not a call-site identity: the same
     // `Object.equals(Object)` entry can be used by several bytecode offsets
@@ -31193,6 +31561,41 @@ fn try_jit_upgrade_with_gate(
             descriptor.to_string(),
         ))
     };
+    // JVMS §6.5 `invokespecial` super-call redirect — see `try_compile`'s
+    // doc comment on `cp_invokespecial_owner_resolver`. `class_id` here is
+    // the class whose bytecode is being compiled, i.e. the CALLING class for
+    // every invoke site scanned below — exactly the identity the redirect
+    // rule needs. Returns `None` (no override) whenever the redirect does
+    // not apply, which is the overwhelming majority of `invokespecial` sites
+    // (constructors, private methods, ordinary direct-superclass supers).
+    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, true),
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let store = cm.class_store();
+        let start = crate::classloading::invokespecial_selection_start(
+            class_id, cp_class_id, is_iface, method_name, store,
+        );
+        if start == cp_class_id {
+            return None;
+        }
+        store.get(start).map(|c| c.name.to_string())
+    };
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // just its target descriptor (no bootstrap/CallSite resolution needed —
     // the codegen only needs the call site's arg/return stack effect).
@@ -31589,6 +31992,39 @@ fn try_jit_upgrade_with_gate(
                     descriptor.to_string(),
                 ))
             };
+            // JVMS §6.5 `invokespecial` super-call redirect for the callee's
+            // own constant pool — see `invokespecial_owner_resolver` above /
+            // `try_compile`'s doc comment. `callee_cid` is the class whose
+            // bytecode is being compiled here (the eagerly-compiled callee),
+            // i.e. the calling class for every invoke site in ITS bytecode.
+            let c_invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(callee_cid)?;
+                let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index, false),
+                    Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                        ..
+                    }) => (*class_index, *name_and_type_index, true),
+                    _ => return None,
+                };
+                let target_class = class.constant_pool.get_class_name(class_idx)?;
+                let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                let cp_class_id = cm.find_class_by_name(target_class)?;
+                let store = cm.class_store();
+                let start = crate::classloading::invokespecial_selection_start(
+                    callee_cid, cp_class_id, is_iface, method_name, store,
+                );
+                if start == cp_class_id {
+                    return None;
+                }
+                store.get(start).map(|c| c.name.to_string())
+            };
             // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
             // index to its target descriptor for the callee's constant pool.
             let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
@@ -31687,12 +32123,13 @@ fn try_jit_upgrade_with_gate(
                 shared,
                 callee_cached.declaring_class_id,
             ));
-            let mut compiled = crate::jit::try_compile(
+            let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
                 &callee_cached,
                 Some(&c_resolver),
                 Some(&c_field_resolver),
                 Some(&c_static_field_resolver),
                 Some(&c_invoke_resolver),
+                Some(&c_invokespecial_owner_resolver),
                 None, // no recursive inlining
                 Some(&c_new_resolver),
                 Some(&c_ldc_resolver),
@@ -31831,12 +32268,13 @@ fn try_jit_upgrade_with_gate(
         shared,
         cached.declaring_class_id,
     ));
-    let mut compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         cached,
         Some(&resolver),
         Some(&field_resolver),
         Some(&static_field_resolver),
         Some(&invoke_resolver),
+        Some(&invokespecial_owner_resolver),
         Some(&callee_compiler),
         Some(&new_resolver),
         Some(&ldc_resolver),
@@ -32416,6 +32854,38 @@ fn try_jit_compile_callee_slow(
             descriptor.to_string(),
         ))
     };
+    // JVMS §6.5 `invokespecial` super-call redirect — see
+    // `invokespecial_owner_resolver` above / `try_compile`'s doc comment.
+    // `cid` is this callee's own declaring class, i.e. the calling class for
+    // every invoke site scanned in its bytecode.
+    let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(cid)?;
+        let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+                ..
+            }) => (*class_index, *name_and_type_index, true),
+            _ => return None,
+        };
+        let target_class = class.constant_pool.get_class_name(class_idx)?;
+        let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let store = cm.class_store();
+        let start = crate::classloading::invokespecial_selection_start(
+            cid, cp_class_id, is_iface, method_name, store,
+        );
+        if start == cp_class_id {
+            return None;
+        }
+        store.get(start).map(|c| c.name.to_string())
+    };
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor (no bootstrap/CallSite resolution needed).
     let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
@@ -32527,12 +32997,13 @@ fn try_jit_compile_callee_slow(
         shared,
         cached.declaring_class_id,
     ));
-    let mut compiled = crate::jit::try_compile(
+    let mut compiled = crate::jit::try_compile_with_invokespecial_resolver(
         &cached,
         Some(&resolver),
         Some(&field_resolver),
         Some(&static_field_resolver),
         Some(&invoke_resolver),
+        Some(&invokespecial_owner_resolver),
         None, // no recursive callee compilation
         Some(&new_resolver),
         Some(&ldc_resolver),
@@ -33779,14 +34250,25 @@ fn execute_jit_call(
         // Check for pending Java exception from JIT dispatch callbacks.
         // The JIT-executed method has its own exception table; we must try
         // to route the exception through it before propagating to the caller.
-        // The JIT ran the entire method, so we do not know the exact throw-
-        // site PC inside the JIT'd method (it has no live bytecode frame
-        // and `JIT_PENDING_EXCEPTION` does not carry a PC). Pass
-        // `usize::MAX` as the sentinel for "PC unknown" — the routing
-        // function will then skip catch-all (`finally`) entries so they
-        // cannot spuriously swallow exceptions thrown outside their
-        // protected region, while still allowing typed handlers to match
-        // by exception class.
+        // The JIT ran the entire method, so in general we do not know the
+        // exact throw-site PC inside the JIT'd method (it has no live
+        // bytecode frame). RBC.6 correctness fix: the ONE case where the pc
+        // IS known is a local `athrow` — the x64 codegen bakes its own bci
+        // into the call to `jit_throw_exception`, stashed as
+        // `sig.athrow_bci` (see `JitSignals::athrow_bci`). When present, use
+        // it; otherwise fall back to the `usize::MAX` "PC unknown" sentinel
+        // as before (a callee-propagated exception genuinely has no known pc
+        // from this method's perspective). Without this, a method with 2+
+        // exception-table entries whose catch types are in a subtype
+        // relationship (e.g. one entry catches `RuntimeException`, a later,
+        // unrelated entry catches `IllegalStateException`) could route ANY
+        // matching-by-type exception to the FIRST declared entry regardless
+        // of which try-region actually threw — confirmed via a differential
+        // repro (`AthrowCountBisect.twoThrowsSequential`,
+        // `vm/tests/jit_local_exception_handler_tests.rs`) before this fix.
+        // The routing function still skips catch-all (`finally`) entries
+        // when the pc is unknown, so they cannot spuriously swallow
+        // exceptions thrown outside their protected region.
         let mut sig = crate::jit::helpers::take_all_jit_signals();
         if let Some(exc) = sig.exception.take() {
             // The exception consumes the deopt — the one-shot drain above
@@ -33795,12 +34277,17 @@ fn execute_jit_call(
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+            let throw_pc = if sig.athrow_bci >= 0 {
+                sig.athrow_bci as usize
+            } else {
+                usize::MAX
+            };
             return route_jit_exception_through_method(
                 shared,
                 thread,
                 frame_idx,
                 cached,
-                usize::MAX,
+                throw_pc,
                 exc,
                 &exc_locals,
             );
@@ -34251,12 +34738,20 @@ fn execute_jit_call_decoded(
             // (MEDIUM `i64::MIN`-collision fix) so it cannot leak to the next
             // JIT call — the exception consumes the deopt. Mirrors
             // `execute_jit_call`.
+            // RBC.6 correctness fix — see the identical comment at
+            // `execute_jit_call`'s sibling call site: use the athrow's own
+            // known bci when available instead of always `usize::MAX`.
+            let throw_pc = if sig.athrow_bci >= 0 {
+                sig.athrow_bci as usize
+            } else {
+                usize::MAX
+            };
             return route_jit_exception_through_method(
                 shared,
                 thread,
                 frame_idx,
                 cached,
-                usize::MAX,
+                throw_pc,
                 exc,
                 args_slice,
             )
@@ -34586,6 +35081,20 @@ fn execute_invokevirtual_vtable_fast(
             None => return Ok(CachedCallResult::CacheMiss),
         }
     };
+
+    // Force this call site through the slow dispatcher (see the matching
+    // comment in `execute_invoke_kind`) rather than a fast-path vtable/cache
+    // hit — empirically required to keep
+    // WebFluxManagementChildContextConfigurationIntegrationTests from
+    // hanging even with the registered native override in place.
+    if crate::runtime::env_cache::loader_aware_resolution()
+        && method_class_name.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+        && method_name.as_ref() == "isIn"
+        && method_descriptor.as_ref()
+            == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+    {
+        return Ok(CachedCallResult::CacheMiss);
+    }
 
     // Step 3 — peek the receiver. The receiver sits `num_params_slots`
     // down the operand stack from the top.
@@ -35347,6 +35856,23 @@ fn execute_invokevirtual_cached(
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+
+    // Keep Spring's loader-split Adapt identity bridge in the slow dispatcher.
+    // The cache can predate the receiver loader's enum copy and otherwise
+    // bypasses that narrowly scoped reconciliation entirely.
+    if crate::runtime::env_cache::loader_aware_resolution() {
+        if let Ok((owner, method, descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
+            if owner.as_ref() == "org/springframework/core/annotation/MergedAnnotation$Adapt"
+                && method.as_ref() == "isIn"
+                && descriptor.as_ref()
+                    == "([Lorg/springframework/core/annotation/MergedAnnotation$Adapt;)Z"
+            {
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+    }
 
     // A previous non-null invocation may have cached the real-JDK bytecode
     // body of an inherited ClassLoader method.  That body does not reliably
@@ -36889,6 +37415,66 @@ fn resolve_method_ref(
     Ok((class_name, method_name, method_descriptor, num_params))
 }
 
+/// JVMS §6.5 `invokespecial` — apply the super-call "selection" redirect
+/// (see `classloading::invokespecial_selection_start`'s doc comment for the
+/// full rule) to the class named by an `invokespecial` constant-pool
+/// reference, so dispatch starts the method search at the CALLING class's
+/// own direct superclass rather than blindly at the CP-referenced ancestor
+/// whenever that redirect applies. `resolve_method_ref` (which produced
+/// `method_class_name`) returns the bare CP text and has no notion of the
+/// calling class, so this is a separate, deliberately narrow lookup.
+///
+/// A class between the caller and the CP-referenced ancestor may override
+/// the method (a compiler-generated bridge, or an ordinary override) —
+/// resolving from the CP-referenced class directly walks straight past it.
+/// Shared by both the interpreter's own `invokespecial` dispatch (here) and
+/// the JIT compiler's call-site resolution (`try_jit_compile_callee`'s
+/// `invoke_resolver` closures in this file), so the two execution modes
+/// never disagree on the target.
+///
+/// Returns `method_class_name` unchanged whenever the redirect does not
+/// apply (constructors, interface references, non-superclass references, a
+/// caller class file without `ACC_SUPER`, or any resolution miss) — always
+/// safe to substitute directly for `method_class_name` at the `is_special`
+/// call site.
+fn invokespecial_owner_class_name(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+    method_class_name: &Arc<str>,
+    method_name: &str,
+) -> Arc<str> {
+    if method_name == "<init>" {
+        return Arc::clone(method_class_name);
+    }
+    let cm = shared.class_manager.read();
+    let Some(class) = cm.get_class(current_class_id) else {
+        return Arc::clone(method_class_name);
+    };
+    let is_interface_ref = matches!(
+        class.constant_pool.get(cp_index),
+        Some(ConstantPoolEntry::InterfaceMethodReference { .. })
+    );
+    let Some(cp_class_id) = cm.find_class_by_name(method_class_name) else {
+        return Arc::clone(method_class_name);
+    };
+    let store = cm.class_store();
+    let start = crate::classloading::invokespecial_selection_start(
+        current_class_id,
+        cp_class_id,
+        is_interface_ref,
+        method_name,
+        store,
+    );
+    if start == cp_class_id {
+        return Arc::clone(method_class_name);
+    }
+    match store.get(start) {
+        Some(c) => Arc::from(&*c.name),
+        None => Arc::clone(method_class_name),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
@@ -37545,6 +38131,27 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn class_array_reflection_uses_class_id_backed_natives() {
+        for (name, descriptor) in [
+            ("isArray", "()Z"),
+            ("getComponentType", "()Ljava/lang/Class;"),
+            ("componentType", "()Ljava/lang/Class;"),
+            ("getProtectionDomain", "()Ljava/security/ProtectionDomain;"),
+        ] {
+            assert!(force_native_over_real_jdk_bytecode(
+                "java/lang/Class",
+                name,
+                descriptor,
+            ));
+            assert!(is_class_mirror_native_override(
+                "java/lang/Class",
+                name,
+                descriptor,
+            ));
+        }
+    }
 
     #[test]
     fn tomcat_scanner_uses_only_audited_native_bridges() {
