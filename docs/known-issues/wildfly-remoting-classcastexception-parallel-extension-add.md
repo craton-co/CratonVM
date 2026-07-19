@@ -1,8 +1,10 @@
 # WildFly boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.AttributeDefinition` initializing `org.jboss.as.remoting` during parallel-extension-add
 
-Status: **PARTIALLY FIXED 2026-07-19** — see "2026-07-19 session: one real producer found and fixed
-(EnhancedQueueExecutor deferred-runnable queue), one residual manifestation confirmed still OPEN" at the
-bottom. `08f8190da` (merged to dev as part of `59a3f38c5`) closes a confirmed-live, previously
+Status: **PARTIALLY FIXED, MULTI-PRODUCER FAMILY — see "2026-07-19 session (continued once more): a fourth
+producer found and fixed (`Class.forName` mirror stale across `initialize_class`), the doc's own
+originally-named root cause #2 (`compare_via_compare_to`/Comparable) and a fifth, new producer
+(`Object`→`String` MSC service-start CCE) both confirmed still live post-fix** near the bottom for the
+latest status. `08f8190da` (merged to dev as part of `59a3f38c5`) closes a confirmed-live, previously
 self-documented-but-unfixed stale-`ObjectRef` producer and measurably drops the live reproduction rate
 against the exact known-crashing class set (~2-3% pre-fix → 0.87%, 2/229, post-fix). It does **not**
 close the family: a second, structurally different producer (native-collections `compare_via_compare_to`,
@@ -625,3 +627,125 @@ is simply a longer/higher-volume batch of live repro attempts (ideally on a quie
 producer mechanism this doc's own "Root cause #2" section already scoped: is it JIT-frame-root-visibility
 (test `--nojit`/`CRATONVM_DISABLE_JIT=1` first, per that section's own suggested next step) or one more
 unpinned native store reachable from `InfinispanSubsystemResourceDefinition.register`.
+
+## 2026-07-19 session (continued once more): a fourth producer found and FIXED (`Class.forName` mirror
+## stale across `initialize_class`); the doc's own originally-named root cause #2 and a fifth, new
+## producer both confirmed still live post-fix — family remains open
+
+Worktree `/data/wt-remoting-cce-rc2-20260719`, branch `fix/wildfly-remoting-cce-rc2-20260719`, forked
+from `origin/dev`. Fix commit `4bdae388f`. Picked up this doc with the explicit goal of driving the whole
+family to closure. Cleaned up ~100 fully-merged stale worktrees on the Azure build host first (disk was at
+96%/97%, blocking any build) — all confirmed `git merge-base --is-ancestor <head> origin/dev` before
+removal, so nothing in-flight was lost; freed `/data` from 15G to 60G available.
+
+### Methodology: isolated `standalone.sh` now reproduces the family directly, no Maven harness needed
+
+Contrary to the prior session's "isolated repro is near-zero probability" conclusion (which was measured
+*before* that session's own three boot-blocker fixes landed, so those 124 attempts never got a fair shot
+at the actual race window) — with `6d037508d`'s fixes now on `dev`, bare isolated `standalone.sh` boots
+reliably reach past `parallel-extension-add` into real service startup, and a `xargs -P 20` parallel batch
+driver (fresh copy of the frozen WildFly dist per concurrent slot, `standalone/data`/`log`/`tmp` reset
+between reuses — the first version of this script reused slots without resetting them and silently
+produced 96 fast, meaningless `Permission denied`/stale-lock failures before this was caught) gets ~20
+genuine boot attempts every ~150s. `CRATONVM_DBG_CCE_BT=1` (already-existing instrumentation in both
+`vm/src/runtime/interpreter.rs`'s checkcast handler and `native-collections/src/lib.rs`'s
+`compare_via_compare_to`) prints the failing receiver's class identity, address, and a Rust backtrace at
+the exact moment a CCE is constructed — essential for telling the family's several distinct producers
+apart live rather than guessing from a Java stack trace alone.
+
+### Fourth producer (FIXED, commit `4bdae388f`): `Class.forName`'s mirror held raw across `initialize_class`
+
+A first batch of ~700 isolated attempts (mixed `CRATONVM_DISABLE_JIT=0/1`) surfaced a **new, previously
+undocumented** manifestation of this family, distinct from both the `AttributeDefinition`/`AttributeAccess`
+checkcast shape and the `compare_via_compare_to` shape: `java.lang.ClassCastException: class ` — literally
+the word `class` followed by a **space and nothing else**, no target type, confirmed via `cat -A` to be a
+genuine truncated message, not a display artifact. Always via `EnhancedQueueExecutor$ThreadBody.run` (real
+bytecode, no native shim — the same worker-thread family the doc's own root cause #2 already implicated),
+always reaching `org.jboss.logging.Messages.doGetBundle` (jboss-logging's generic i18n message-bundle
+loader — `com.arjuna.ats.arjuna.recovery.RecoveryModule`/`org.jboss.jca.core.CoreBundle` were the two
+target interfaces hit), always inside `SimpleMetadataRepository.<clinit>`/`ArjunaRecoveryManagerService`.
+
+**Root cause.** `javap -p -c` on the real `org.jboss.logging:jboss-logging-3.5.3.Final` jar's
+`Messages.class` (extracted from the target WildFly's own module tree) confirmed `doGetBundle`'s exception
+table catches only `ClassNotFoundException` around each `Class.forName(...).asSubclass(type)` attempt — a
+`ClassCastException` from `asSubclass` propagates completely uncaught, exactly matching the crash. Real
+HotSpot's `Class.asSubclass()` throws `new ClassCastException(this.toString())` on a mismatch, and
+`Class.toString()` is `"class " + getName()` — so the empty-after-"class " message meant `this`'s name
+resolved to the empty string. `native_class_as_subclass` (`native-builtins/src/lang_class.rs`) was
+instrumented (also gated on `CRATONVM_DBG_CCE_BT`, same convention) to dump every one of
+`mirror_class_name`'s three lookup strategies for the failing receiver: **all three missed** —
+`class_id_from_mirror` (reverse map) `None`, and critically `field 0` (which `get_or_create_class_mirror`,
+`vm/src/vm/vm_object.rs`, *unconditionally* writes as `Value::Int(class_id)` under its own write-lock,
+regardless of real-vs-synthetic mode — "a VM-internal convention, not a JDK field") also read back
+`Object(None)`, i.e. blank/never-written, not merely "not yet remapped." A legitimately-created mirror
+should never read back this way — this is the classic Family-1 "stale `ObjectRef` reused across a
+GC-triggering call, then read again" shape, just one hop further out than any of this project's prior
+stale-`ObjectRef` sweeps (which scoped to a single native call's own body) had looked.
+
+Tracing `native_class_for_name`'s `Class.forName(name, true, loader)` path
+(`native-builtins/src/lang_class.rs`): it obtains the freshly-loaded class's mirror via
+`ctx.invoke_virtual(loader, "loadClass", ...)`, which for a `ModuleClassLoader` recursively **interprets
+real bytecode** (`ConcurrentClassLoader`'s ancestor chain) via `execute_prebuilt_frame`
+(`vm/src/runtime/interpreter.rs`) — a completely different code path from the top-level
+"interpreter-dispatches-a-native-and-pushes-the-result" mechanism (`safe_native_call`/
+`native_pending_return`, which several prior sessions' `Family-1` sweeps already hardened). Once that
+recursive interpretation returns, the mirror is a **bare Rust local**, on no interpreter operand stack and
+not yet in any pinned/tracked root — and immediately after, when `initialize` is set,
+`ctx.initialize_class(cid)` runs the class's own `<clinit>` (arbitrary, GC-capable bytecode) before the
+pre-clinit `mirror` value was returned **unrefreshed** at the end of the function. A first hypothesis (a
+TOCTOU race in `vm/src/vm/vm_exec.rs`'s `native_return_pushed_to_stack`/`skip_redundant_native_snapshot`
+interacting badly with the 2026-07-10 INT-3 cross-thread STW takeover) was tried and **empirically
+refuted** — that fix built clean but did not move the reproduction rate at all (still hit in a 400-attempt
+post-fix batch), so it was reverted rather than landed as unproven complexity.
+
+**Fix** (`4bdae388f`): pin the mirror (`ctx.pin_native_root`) immediately after `invoke_virtual` returns
+it, refresh through the pin (`ctx.read_native_pin`) right after `initialize_class` returns (whether it
+succeeded or threw — the refresh happens before the `?`), and unpin right before the final return —
+matching this codebase's established Family-1 pin/refresh idiom exactly.
+
+**Verification:**
+- Two independent 20-wave × 20-parallel (400 attempts total) `CRATONVM_DBG_CCE_BT=1`-armed isolated
+  `standalone.sh` batches post-fix: **0/400** reproductions of this exact signature (`site=asSubclass`,
+  blank `this`), vs reliable reproduction pre-fix (9 hits across ~1,000 mixed pre/post-fix attempts this
+  session, consistent with the family's historically low ~1% per-attempt rate).
+- `cargo test -p cratonvm-native-builtins --lib`: 3033 passed, 3 failed — all three confirmed pre-existing
+  by `git stash`-ing the fix and re-running the exact same tests on unpatched `dev` (byte-identical
+  failures, same panic messages, just different line numbers from the fix's added lines):
+  `jca::key_factory::tests::keyfactory_unproducible_key_throws_not_dead_key`,
+  `phases_late::p57_win_path_tests::trailing_separator_is_removed_only_from_non_roots` (both already noted
+  pre-existing in this doc's own 2026-07-19 "continued" verification section), plus
+  `lang_class::tests::get_constructors_returns_only_complete_public_constructor_mirrors` (newly discovered
+  pre-existing failure, unrelated to `Class.forName`/`asSubclass` — confirmed failing identically on
+  unpatched `dev` in isolation).
+
+### Family remains OPEN: two more distinct producers confirmed live in the same post-fix verification batches
+
+The 400-attempt post-fix verification campaigns were not silent — **2 hits total**, neither matching the
+just-fixed `asSubclass` signature:
+
+1. **The doc's own originally-named root cause #2, unchanged**: `java.lang.ClassCastException: class
+   java.lang.Object cannot be cast to class java.lang.Comparable`, via
+   `EnhancedQueueExecutor$ThreadBody.run` → `ExecutionException` — the exact `compare_via_compare_to`
+   shape documented in the "2026-07-19 session" section above. This fix does **not** touch that mechanism
+   (`native_class_for_name` and `native-collections`'s TreeMap/TreeSet/sorted-collection natural-ordering
+   comparator are unrelated call paths) — it remains exactly as open as before this session. The doc's own
+   prior next-step guidance (confirm `--nojit`/`CRATONVM_DISABLE_JIT=1` changes the rate; if not, look for
+   an unpinned store reachable from `InfinispanSubsystemResourceDefinition.register`/wherever the
+   `EnhancedQueueExecutor` worker's own sorted-collection insert originates) is still the right next step
+   and was **not** attempted this session (time went to the `asSubclass` producer instead, since it had a
+   clean, fully-diagnosable signature in hand already).
+2. **A fifth, new, undiagnosed producer**: `MSC service start() threw java/lang/ClassCastException:
+   java.lang.Object cannot be cast to java.lang.String — marked FAILED, boot continues
+   service=org.wildfly.extension.metrics.registry` (from `jboss_msc`'s own error logging, not an uncaught
+   Java exception — MSC treats a service-start failure as non-fatal by design, so this one does not itself
+   crash boot, but is the same family of stale-receiver/GC-root-visibility bug manifesting a third way).
+   Not investigated further this session — flagged here for whoever continues.
+
+**Whoever picks this up next**: the harness described in the "Methodology" section above (parallel
+`xargs -P 20` isolated `standalone.sh` batches, `CRATONVM_DBG_CCE_BT=1` armed, ~150s per wave) is working
+and fast — a fresh 20-wave batch takes well under 15 minutes wall-clock and reliably surfaces 1-2 hits
+across the family. Start with the `compare_via_compare_to`/Comparable producer (still the doc's
+namesake "root cause #2" and the one with the most existing investigation already sunk into it), test
+`--nojit` first exactly as previously planned, then use the SAME `CRATONVM_DBG_CCE_BT` instrumentation
+already in `native-collections/src/lib.rs`'s `compare_via_compare_to` (no new instrumentation needed) to
+get the Rust-side call stack straight to the producer.
