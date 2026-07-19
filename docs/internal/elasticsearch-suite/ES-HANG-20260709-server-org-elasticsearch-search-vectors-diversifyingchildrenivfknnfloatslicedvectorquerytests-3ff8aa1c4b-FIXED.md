@@ -121,7 +121,7 @@ lost wakeup, present regardless of OS/JIT/ES).
 
 **2026-07-19 re-verification, post-fix:** re-ran this doc's own original
 `testSlicesDense` repro recipe (below) against the fixed binary
-(worktree `serene-lamarr-01d83a`, fix not yet merged to `dev`). The
+(worktree `serene-lamarr-01d83a`, fix merged to `dev` at `bd83c42fa`). The
 process now exits cleanly — `Time: 602.662`, `System.exit(1)` called
 normally, a proper JUnit failure report (2 failures, both
 `Test abandoned because suite timeout was reached` /

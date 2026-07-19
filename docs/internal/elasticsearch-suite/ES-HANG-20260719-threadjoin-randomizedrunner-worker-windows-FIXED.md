@@ -1,6 +1,6 @@
 # ES HANG — `Thread.join()` never returns for a dead RandomizedRunner worker (Windows host)
 
-Status: FIXED (2026-07-19, `vm/src/threading/monitor.rs` + `vm/src/vm/vm_exec.rs`, worktree `serene-lamarr-01d83a`; not yet merged to `dev`)
+Status: FIXED (2026-07-19, `vm/src/threading/monitor.rs` + `vm/src/vm/vm_exec.rs`, worktree `serene-lamarr-01d83a`; merged to `dev` at `bd83c42fa`)
 
 Discovered 2026-07-19 while doing full end-to-end verification of the
 IVFKnn stale-precise-root-mirror fix (see
@@ -135,9 +135,8 @@ monitor step 3 is about to `notify_all`/`exit` on.
 - `cargo test --release -p cratonvm-vm --lib threading::`: 287 passed, 0
   failed — no regressions in the monitor/thread-registry test suite.
 
-Not yet merged to `dev`; not yet committed. Not yet re-run under `--nojit`
-or on Linux post-fix (pre-fix evidence already showed the hang was
-independent of both).
+Merged to `dev` at `bd83c42fa`. Not yet re-run under `--nojit` or on Linux
+post-fix (pre-fix evidence already showed the hang was independent of both).
 
 ## Impact (pre-fix)
 
