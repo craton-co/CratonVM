@@ -43232,10 +43232,31 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     let hash = ctx.identity_hash_code(this);
-    if std::env::var_os("CRATONVM_DBG_VDISP").is_some() {
+    if dbg_vdisp_cached() {
         eprintln!("[vdisp] native_object_hash_code (IDENTITY) called -> {hash}");
     }
     Ok(Some(Value::Int(hash)))
+}
+
+/// Cached `CRATONVM_DBG_VDISP` check for `native_object_hash_code` --
+/// `Object.hashCode()`'s native is one of the hottest paths in the entire
+/// VM (every `HashMap`/`HashSet` operation on a default-hashCode key calls
+/// it), so a raw `std::env::var_os(...)` here -- a global-lock-guarded
+/// syscall -- on every single call is a severe, silently-pervasive
+/// performance bug: any hashCode()-heavy workload (Hibernate Validator's
+/// reflective constraint-metadata caching was the one that surfaced it,
+/// 100+ seconds and climbing for a single-bean `Validator.validate()` call
+/// that completes in low tens of milliseconds on HotSpot -- see
+/// `vm/src/runtime/env_cache.rs`'s `dbg_vdisp` for the SAME diagnostic
+/// already correctly cached for the vm crate's own call sites; this crate
+/// cannot depend on `vm`, so it needs its own cache) rather than a
+/// per-object cost. Cache the lookup once, like every other `CRATONVM_DBG_*`
+/// hot-path check in this file (see `route_ec_to_real` above for the same
+/// pattern).
+fn dbg_vdisp_cached() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_VDISP").is_some())
 }
 
 /// Map a synthetic object's stamped class — an interface, an abstract class, or
@@ -43726,7 +43747,7 @@ fn native_object_equals(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (Value::Object(None), Value::Object(None)) => true,
         _ => false,
     };
-    if std::env::var_os("CRATONVM_DBG_OBJ_EQUALS").is_some() {
+    if dbg_obj_equals_cached() {
         let aid = match this {
             Value::Object(Some(o)) => o.as_ptr() as usize,
             _ => 0,
@@ -43738,6 +43759,27 @@ fn native_object_equals(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         eprintln!("[obj-eq] a={aid:x} b={bid:x} -> {equal}");
     }
     Ok(Some(Value::Int(if equal { 1 } else { 0 })))
+}
+
+/// Cached `CRATONVM_DBG_OBJ_EQUALS` check -- `Object.equals()`'s default
+/// (identity) implementation is exactly as hot as `Object.hashCode()`
+/// (see `dbg_vdisp_cached` above, both fire together on every default-
+/// identity `HashMap`/`HashSet` operation); same fix, same reasoning.
+fn dbg_obj_equals_cached() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_OBJ_EQUALS").is_some())
+}
+
+/// Cached `CRATONVM_DBG_CLONE` check -- `Object.clone()` is far less hot
+/// than hashCode()/equals() but gets the same treatment for consistency
+/// (this whole `CRATONVM_DBG_*`-in-a-frequently-called-native family was
+/// worth a single pass once the hashCode()/equals() cases were found to be
+/// a real, severe performance bug).
+fn dbg_clone_cached() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_CLONE").is_some())
 }
 
 fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -43752,7 +43794,7 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let class_id = ctx.class_id_of_object(this);
     let kind = ctx.heap_kind_of(this);
-    if std::env::var_os("CRATONVM_DBG_CLONE").is_some() {
+    if dbg_clone_cached() {
         let name = ctx
             .class_name_of_id(class_id)
             .unwrap_or_else(|| "<unknown>".to_string());
