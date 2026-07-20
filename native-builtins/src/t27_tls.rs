@@ -693,6 +693,11 @@ static HUC_DEFAULT_TRUST_ROOTS: OnceLock<Mutex<Option<TlsTrustRoots>>> = OnceLoc
 // makes a new connection for each URL request, so rebuilding this config for
 // every request discards the TLS 1.3 ticket needed by the next request.
 static HUC_DEFAULT_CLIENT_CONFIG: OnceLock<Mutex<Option<Arc<ClientConfig>>>> = OnceLock::new();
+// Instance-level HttpsURLConnection factories must not alter a later
+// connection's TLS policy. Store their finished rustls configs by Java
+// connection identity; process defaults continue to use the slots above.
+static HUC_CONNECTION_CLIENT_CONFIGS: OnceLock<Mutex<HashMap<i32, Arc<ClientConfig>>>> =
+    OnceLock::new();
 
 fn huc_default_identity_slot() -> &'static Mutex<Option<(String, String)>> {
     HUC_DEFAULT_CLIENT_IDENTITY.get_or_init(|| Mutex::new(None))
@@ -704,6 +709,10 @@ fn huc_default_trust_roots_slot() -> &'static Mutex<Option<TlsTrustRoots>> {
 
 fn huc_default_client_config_slot() -> &'static Mutex<Option<Arc<ClientConfig>>> {
     HUC_DEFAULT_CLIENT_CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+fn huc_connection_client_configs() -> &'static Mutex<HashMap<i32, Arc<ClientConfig>>> {
+    HUC_CONNECTION_CLIENT_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn clear_huc_default_client_config() {
@@ -817,10 +826,52 @@ pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: Obje
     *huc_default_client_config_slot().lock() = config.ok();
 }
 
+/// Capture an instance factory without changing the process-default TLS
+/// policy. HttpsURLConnection's instance setter is scoped to one connection;
+/// keeping its config in the default slot made a later plain connection accept
+/// the previous connection's permissive TrustManager.
+pub(crate) fn capture_huc_ssl_context_for_connection(
+    ctx: &mut dyn NativeContext,
+    connection: ObjectRef,
+    ctx_obj: ObjectRef,
+) {
+    let default_identity = huc_default_identity_slot().lock().clone();
+    let default_roots = huc_default_trust_roots_slot().lock().clone();
+    let default_config = huc_default_client_config_slot().lock().clone();
+    let default_km = *huc_default_km_ctx_key_slot().lock();
+    let default_tm = *huc_default_tm_ctx_key_slot().lock();
+
+    capture_huc_ssl_context(ctx, ctx_obj);
+    if let Some(config) = huc_default_client_config() {
+        let key = ctx.identity_hash_code(connection);
+        let mut configs = huc_connection_client_configs().lock();
+        if configs.len() >= 256 {
+            configs.clear();
+        }
+        configs.insert(key, config);
+    }
+
+    *huc_default_identity_slot().lock() = default_identity;
+    *huc_default_trust_roots_slot().lock() = default_roots;
+    *huc_default_client_config_slot().lock() = default_config;
+    *huc_default_km_ctx_key_slot().lock() = default_km;
+    *huc_default_tm_ctx_key_slot().lock() = default_tm;
+}
+
 /// Returns the shared HttpsURLConnection config selected by its SSLContext.
 /// Cloning the Arc intentionally shares rustls's session-resumption store.
 pub(crate) fn huc_default_client_config() -> Option<Arc<ClientConfig>> {
     huc_default_client_config_slot().lock().clone()
+}
+
+pub(crate) fn huc_client_config_for_connection(
+    ctx: &dyn NativeContext,
+    connection: ObjectRef,
+) -> Option<Arc<ClientConfig>> {
+    huc_connection_client_configs()
+        .lock()
+        .get(&ctx.identity_hash_code(connection))
+        .cloned()
 }
 
 // -----------------------------------------------------------------------------
@@ -2528,6 +2579,7 @@ pub(crate) fn rustls_client_connect(
 /// Accept a TLS connection on the listener with the given id. Drives the
 /// handshake to completion and stores the stream in the server-streams table.
 pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
+    let debug_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
     // Step 1: pop the config + tcp listener ref, then accept *without* the
     // mutex held so long handshakes don't stall every other TLS operation.
     let config = {
@@ -2549,6 +2601,9 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
             .accept()
             .map_err(|e| format!("accept failed: {}", e))?
     };
+    if debug_hs {
+        eprintln!("[dbg-tls-hs] server_accept listener_id={} accepted TCP", listener_id);
+    }
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
 
@@ -2560,6 +2615,9 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 let mut stream = StreamOwned::new(conn, tcp);
                 while stream.conn.is_handshaking() {
                     if stream.conn.wants_read() {
+                        if debug_hs {
+                            eprintln!("[dbg-tls-hs] server_accept listener_id={} waiting read", listener_id);
+                        }
                         stream
                             .conn
                             .read_tls(&mut stream.sock)
@@ -2570,11 +2628,17 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                             .map_err(|e| format!("server handshake process: {e}"))?;
                     }
                     if stream.conn.wants_write() {
+                        if debug_hs {
+                            eprintln!("[dbg-tls-hs] server_accept listener_id={} writing response", listener_id);
+                        }
                         stream
                             .conn
                             .write_tls(&mut stream.sock)
                             .map_err(|e| format!("server handshake write: {e}"))?;
                     }
+                }
+                if debug_hs {
+                    eprintln!("[dbg-tls-hs] server_accept listener_id={} handshake complete", listener_id);
                 }
                 let sni = stream.conn.server_name().map(|s| s.to_string());
                 let protocol = match stream.conn.protocol_version() {
@@ -2635,18 +2699,502 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
 }
 
 /// Read from either a client- or server-side rustls stream.
+/// Drive a rustls SERVER handshake over an already-connected `TcpStream` and
+/// register the result in the client/server stream registry. This is the
+/// server-mode half of the deferred handshake for
+/// `SSLSocketFactory.createSocket(Socket, String, int, boolean)` — see
+/// `phases_late.rs`'s registration of that method and
+/// `ensure_layered_handshake_started` for why the handshake itself must not
+/// run at `createSocket()` time (real JDK contract: the returned socket
+/// defaults to CLIENT mode; the caller decides server mode afterward via
+/// `setUseClientMode(false)`, exactly what MockWebServer does).
+/// GC-safe: takes only owned, non-`ObjectRef` data — no Java object is held
+/// across this call.
+pub(crate) fn rustls_server_handshake_over_stream(
+    tcp: TcpStream,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<i32, String> {
+    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    if debug_srv {
+        eprintln!("[dbg-tls-srv] wrap_existing_socket: got raw stream");
+    }
+    let config = build_server_config_single_cert(cert_pem, key_pem, &[], false, None)?;
+    let conn = ServerConnection::new(config)
+        .map_err(|e| format!("layered server connection: {e}"))?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    let mut iter_n = 0u32;
+    while stream.conn.is_handshaking() {
+        iter_n += 1;
+        if debug_srv {
+            eprintln!(
+                "[dbg-tls-srv] wrap_existing_socket: hs loop iter={} wants_read={} wants_write={}",
+                iter_n,
+                stream.conn.wants_read(),
+                stream.conn.wants_write()
+            );
+        }
+        if stream.conn.wants_read() {
+            let n = stream
+                .conn
+                .read_tls(&mut stream.sock)
+                .map_err(|e| format!("layered server handshake read: {e}"))?;
+            if debug_srv {
+                eprintln!("[dbg-tls-srv] wrap_existing_socket: read_tls -> {} bytes", n);
+            }
+            stream
+                .conn
+                .process_new_packets()
+                .map_err(|e| format!("layered server handshake process: {e}"))?;
+        }
+        if stream.conn.wants_write() {
+            let n = stream
+                .conn
+                .write_tls(&mut stream.sock)
+                .map_err(|e| format!("layered server handshake write: {e}"))?;
+            if debug_srv {
+                eprintln!("[dbg-tls-srv] wrap_existing_socket: write_tls -> {} bytes", n);
+            }
+        }
+    }
+    // The handshake-completion flight (server Finished, and — for TLS1.3 — any
+    // automatically queued NewSessionTicket messages) can leave `wants_write()`
+    // true on the very iteration `is_handshaking()` flips to false. The loop
+    // above still drains it before exiting (wants_write is checked
+    // unconditionally each iteration), but a second pass here is cheap
+    // insurance against a rustls-internal ordering where post-handshake output
+    // is queued only after `is_handshaking()` is observed false.
+    while stream.conn.wants_write() {
+        let n = stream
+            .conn
+            .write_tls(&mut stream.sock)
+            .map_err(|e| format!("layered server post-handshake write: {e}"))?;
+        if debug_srv {
+            eprintln!(
+                "[dbg-tls-srv] wrap_existing_socket: post-hs write_tls -> {} bytes",
+                n
+            );
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    if debug_srv {
+        eprintln!(
+            "[dbg-tls-srv] wrap_existing_socket: handshake done protocol={:?} wants_write={}",
+            stream.conn.protocol_version(),
+            stream.conn.wants_write()
+        );
+    }
+    // FIX (mockwebserver-taskqueue-shutdown): this stream's reads (via
+    // `rustls_stream_read`, both for the request that follows this handshake
+    // and any later HTTP/1.1 keep-alive request on the same connection) had
+    // no read timeout at all — unlike `rustls_server_accept`'s 30s, set
+    // before ITS handshake. A caller like MockWebServer's `SocketHandler`
+    // (`mockwebserver3`/`okhttp3.mockwebserver`) loops reading a next
+    // request after every response to support keep-alive; if the client
+    // (e.g. Reactor Netty, which pools connections rather than closing them
+    // eagerly) never sends one, that read blocks forever, so the
+    // connection's background task never finishes and `MockWebServer.close()`
+    // — which only waits 5s per task queue for an idle signal before
+    // throwing `AssertionError: Gave up waiting for queue to shut down` —
+    // reliably times out. 3s: (a) short enough that even the worst-case
+    // "response just sent, close() called immediately after" race (the
+    // common case in these tests — there's no deliberate delay between
+    // receiving the response and the test's `try`-block exit) leaves >1.5s
+    // of slack inside the 5s budget for the resulting IOException to
+    // propagate, get caught by `SocketHandler.handle()`'s own
+    // `catch (IOException)` (logged at FINE, not rethrown), and the task to
+    // signal idle; (b) generous enough to not false-trigger on genuine
+    // in-flight traffic — this is a loopback socket, so read latency for
+    // data the peer already sent is bounded by OS scheduling, not network
+    // RTT, and every handshake+request cycle observed in this investigation
+    // (`CRATONVM_DBG_TLS_SRV`-traced) completed in well under 100ms even on
+    // this heavily shared, contended build host.
+    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
+    let negotiated_protocol = match stream.conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+        _ => "TLS",
+    }
+    .to_string();
+    let negotiated_cipher = stream
+        .conn
+        .negotiated_cipher_suite()
+        .map(|cs| format!("{:?}", cs.suite()))
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let negotiated_alpn = stream
+        .conn
+        .alpn_protocol()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    let mut reg = sreg().lock();
+    let id = alloc_server_id(&mut reg);
+    reg.server_streams.insert(
+        id,
+        TlsServerStreamEntry {
+            stream: TlsServerStream::Rustls(stream),
+            sni_hostname,
+            negotiated_protocol,
+            negotiated_cipher,
+            negotiated_alpn,
+        },
+    );
+    Ok(id)
+}
+
+/// Drive a rustls CLIENT handshake over an already-connected `TcpStream` —
+/// the client-mode counterpart of `rustls_server_handshake_over_stream` for
+/// the same deferred `SSLSocketFactory.createSocket(Socket, String, int,
+/// boolean)` design (real JDK default mode; also the shape used for a
+/// layered TLS upgrade over an existing plain socket, e.g. after an HTTP
+/// CONNECT tunnel). Mirrors `rustls_client_connect` minus the `TcpStream::connect`
+/// step — `tcp` is already connected to `host:port` (or tunneled to it).
+pub(crate) fn rustls_client_handshake_over_stream(
+    tcp: TcpStream,
+    config: Arc<ClientConfig>,
+    host: &str,
+) -> Result<i32, String> {
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid server name {:?}: {}", host, e))?;
+    let conn = ClientConnection::new(config, server_name)
+        .map_err(|e| format!("ClientConnection::new failed: {}", e))?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    while stream.conn.is_handshaking() {
+        if stream.conn.wants_write() {
+            stream
+                .conn
+                .write_tls(&mut stream.sock)
+                .map_err(|e| format!("handshake write: {}", e))?;
+        }
+        if stream.conn.wants_read() {
+            let n = stream
+                .conn
+                .read_tls(&mut stream.sock)
+                .map_err(|e| format!("handshake read: {}", e))?;
+            if n == 0 {
+                return Err(
+                    "connection closed by peer during handshake (likely a rejected \
+                     handshake, e.g. no cipher suite in common)"
+                        .to_string(),
+                );
+            }
+            stream
+                .conn
+                .process_new_packets()
+                .map_err(|e| format!("handshake process: {}", e))?;
+        }
+    }
+    let negotiated_protocol = match stream.conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+        _ => "TLS",
+    }
+    .to_string();
+    let negotiated_cipher = stream
+        .conn
+        .negotiated_cipher_suite()
+        .map(|cs| format!("{:?}", cs.suite()))
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let negotiated_alpn = stream
+        .conn
+        .alpn_protocol()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    let entry = TlsClientStreamEntry {
+        stream,
+        peer_host: host.to_string(),
+        peer_port: 0,
+        negotiated_protocol,
+        negotiated_cipher,
+        negotiated_alpn,
+    };
+    let mut reg = sreg().lock();
+    let id = alloc_server_id(&mut reg);
+    reg.client_streams.insert(id, entry);
+    Ok(id)
+}
+
+// -----------------------------------------------------------------------------
+// Deferred handshake for SSLSocketFactory.createSocket(Socket, String, int,
+// boolean) — see phases_late.rs's registration of that method.
+// -----------------------------------------------------------------------------
+//
+// Real JDK contract: the returned socket defaults to CLIENT mode; a caller
+// may still call `setUseClientMode(false)` before `startHandshake()` (or the
+// first I/O call, which implicitly starts the handshake) to flip it to
+// SERVER mode — exactly what MockWebServer's HTTPS listener does. The
+// handshake therefore cannot run inside `createSocket()` itself (its role
+// isn't known yet); everything needed to run it later is resolved and
+// stashed here instead. Resolving the client `ClientConfig`/server identity
+// PEM strings eagerly (rather than holding the originating `SSLContext`
+// `ObjectRef`) keeps this table GC-safe: no Java object reference is held
+// across the return-to-Java-and-back window between `createSocket()` and
+// whenever the handshake actually starts.
+/// Whether this pending socket's underlying connection is the caller's
+/// actual `wrapped` stream, or (see `stash_pending_layered_socket`'s doc)
+/// a `host:port` to dial fresh because `wrapped`'s stream could not be
+/// extracted.
+enum PendingLayeredStream {
+    Reused(TcpStream),
+    DialFresh { host: String, port: u16 },
+}
+
+struct PendingLayeredSocket {
+    stream: PendingLayeredStream,
+    // Raw ingredients rather than a pre-built `ClientConfig`: real JSSE lets
+    // a caller narrow the negotiable cipher suites via
+    // `SSLSocket.setEnabledCipherSuites()` any time before the handshake
+    // actually starts — confirmed necessary by
+    // `connectWithSslBundleAndOptionsMismatch`, which relies on exactly this
+    // sequence (createSocket, then setEnabledCipherSuites to a
+    // deliberately-mismatched suite, then the implicit handshake) to make
+    // the handshake genuinely fail. Building the `ClientConfig` eagerly in
+    // `stash_pending_layered_socket` would freeze the cipher list before
+    // that call had a chance to run.
+    extra_roots: Vec<Vec<u8>>,
+    use_java_trust_manager: bool,
+    client_identity: Option<(String, String)>,
+    enabled_ciphers: Vec<String>,
+    server_identity: Option<(String, String)>,
+    host: String,
+    client_mode: bool,
+}
+
+fn pending_layered_sockets() -> &'static Mutex<HashMap<i32, PendingLayeredSocket>> {
+    static T: OnceLock<Mutex<HashMap<i32, PendingLayeredSocket>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract `wrapped`'s TCP stream and resolve both a client and a server
+/// handshake config from `ssl_context` up front, then stash all of it
+/// (defaulting to CLIENT mode, the real JDK default) under a fresh pending
+/// id. Returns the RAW pending id — the caller (phases_late.rs) applies
+/// `servlet::PENDING_LAYERED_SOCK_ID_BASE` the same way other id ranges here
+/// are offset by their callers.
+///
+/// `wrapped`'s stream extraction (`take_raw_socket_stream_for_tls`) only
+/// understands two socket shapes: this module's own legacy s2-registry
+/// sockets, and a real-JDK `NioSocketImpl`'s `impl`/`fd` field chain (the
+/// shape a real `ServerSocket.accept()` produces — MockWebServer's SERVER-mode
+/// use of this API). Apache HttpComponents' client-side `wrapped` socket (a
+/// plain, already-connected `Socket` from its own connection-establishment
+/// path) is neither, so extraction fails there — confirmed via
+/// `HttpComponentsClientHttpRequestFactoryBuilderTests`' `IOException:
+/// wrapped Socket has no FileDescriptor` regression while adding SERVER-mode
+/// reuse. Falling back to a fresh `host:port` dial for exactly this case
+/// preserves this API's prior (already-verified, dev cluster-tested)
+/// CLIENT-mode behavior, which never attempted to reuse `wrapped` at all —
+/// only SERVER mode strictly requires the real stream (there is no
+/// "fall back to dialing" for accepting an inbound connection), and
+/// SERVER-mode callers (MockWebServer) always go through the
+/// NioSocketImpl-shaped path extraction already handles.
+pub(crate) fn stash_pending_layered_socket(
+    ctx: &mut dyn NativeContext,
+    wrapped: ObjectRef,
+    ssl_context: ObjectRef,
+    host: String,
+    port: u16,
+    extra_roots: Vec<Vec<u8>>,
+    java_tm_key: Option<u64>,
+) -> Result<i32, String> {
+    let debug_pls = std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some();
+    let stream = match crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped) {
+        Ok(tcp) => {
+            if debug_pls {
+                eprintln!("[dbg-tls-pls] stash: reused wrapped stream host={host} port={port}");
+            }
+            PendingLayeredStream::Reused(tcp)
+        }
+        Err(e) => {
+            if debug_pls {
+                eprintln!(
+                    "[dbg-tls-pls] stash: extraction failed ({e}), dial-fresh host={host} port={port}"
+                );
+            }
+            PendingLayeredStream::DialFresh {
+                host: host.clone(),
+                port,
+            }
+        }
+    };
+    if debug_pls {
+        eprintln!(
+            "[dbg-tls-pls] stash: extra_roots.len()={} java_tm_key={:?}",
+            extra_roots.len(),
+            java_tm_key
+        );
+    }
+    // `extra_roots`/`java_tm_key` are the caller's own resolution
+    // (`phases_late::p68_factory_trust_roots`/`p68_factory_java_tm_key`,
+    // keyed off the FACTORY object, args[0] at the `createSocket` call site)
+    // — NOT re-derived here from `ssl_context` alone. Confirmed necessary:
+    // `t27_tls::context_trust_root_ders(ctx, ssl_context)` (the
+    // context-identity-keyed table `attach_trust_managers_to_ctx` populates)
+    // came up empty for an SSLBundle-configured HttpComponents scenario
+    // (`connectWithSslBundle` rejecting the bundle's own self-signed cert as
+    // `UnknownIssuer`) — that request's anchors instead live in the legacy
+    // p68 FACTORY-identity-keyed table (`p68_ctx_trust_roots_table`),
+    // populated directly from the `TrustManager[]` at `SSLContext.init()`
+    // time and carried forward onto the factory by
+    // `SSLContext.getSocketFactory()`. `p68_factory_trust_roots` already
+    // checks both tables (factory-keyed first, context-keyed fallback), so
+    // reusing its resolution here — rather than only the context-keyed half
+    // — covers both paths. The actual `ClientConfig` is built later, in
+    // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
+    // narrowing is known too.
+    let use_java_trust_manager = java_tm_key.is_some();
+    let client_identity = ctx_identity(ctx, ssl_context);
+    // Server identity: same resolution `rustls_server_handshake_over_stream`'s
+    // former caller used (this SSLContext's own identity, else the
+    // process-wide runtime-configured one) — resolved here too so SERVER mode
+    // never needs to touch `ssl_context` again.
+    let server_identity = ctx_identity(ctx, ssl_context)
+        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)));
+    let mut pending = pending_layered_sockets().lock();
+    let mut id = 1i32;
+    while pending.contains_key(&id) {
+        id = id.checked_add(1).unwrap_or(1);
+    }
+    pending.insert(
+        id,
+        PendingLayeredSocket {
+            stream,
+            extra_roots,
+            use_java_trust_manager,
+            client_identity,
+            enabled_ciphers: Vec::new(),
+            server_identity,
+            host,
+            client_mode: true,
+        },
+    );
+    Ok(id)
+}
+
+/// `SSLSocket.setEnabledCipherSuites(String[])` on a still-pending layered
+/// socket. A no-op if `pending_id` is unknown, same convention as
+/// `set_pending_layered_socket_client_mode`.
+pub(crate) fn set_pending_layered_socket_ciphers(pending_id: i32, ciphers: Vec<String>) {
+    if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
+        p.enabled_ciphers = ciphers;
+    }
+}
+
+/// `setUseClientMode(false)` on a still-pending layered socket. A no-op if
+/// `pending_id` is unknown (already handshaked, or was never a pending
+/// layered socket) — matches this codebase's existing convention of ignoring
+/// a client-mode change once a handshake is underway/complete.
+pub(crate) fn set_pending_layered_socket_client_mode(pending_id: i32, client_mode: bool) {
+    if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
+        p.client_mode = client_mode;
+    }
+}
+
+/// Consume a pending layered socket and drive its handshake in whichever
+/// role `setUseClientMode` last left it in (default client). Returns the RAW
+/// rustls stream id — the caller applies `RUSTLS_SOCK_ID_BASE`, matching
+/// every other rustls stream id in this module.
+pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, String> {
+    let pending = pending_layered_sockets()
+        .lock()
+        .remove(&pending_id)
+        .ok_or_else(|| "layered socket handshake state missing".to_string())?;
+    if std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some() {
+        eprintln!(
+            "[dbg-tls-pls] drive: pending_id={} client_mode={} stream={} host={}",
+            pending_id,
+            pending.client_mode,
+            match &pending.stream {
+                PendingLayeredStream::Reused(_) => "Reused",
+                PendingLayeredStream::DialFresh { .. } => "DialFresh",
+            },
+            pending.host,
+        );
+    }
+    if pending.client_mode {
+        // Built here, not in `stash_pending_layered_socket`, so a
+        // `setEnabledCipherSuites` call made any time between `createSocket()`
+        // and the handshake actually starting is honored — see
+        // `PendingLayeredSocket::enabled_ciphers`'s doc.
+        let trust_roots = if pending.extra_roots.is_empty() {
+            None
+        } else {
+            Some(TlsTrustRoots {
+                root_ders: pending.extra_roots,
+                revocation: None,
+            })
+        };
+        let roots = root_store_for_trust_roots(trust_roots.as_ref());
+        let provider = cipher_provider_for(&pending.enabled_ciphers);
+        let client_config = build_client_config_ex_with_provider(
+            roots,
+            &["http/1.1"],
+            ClientAuthMode::Fixed(
+                pending
+                    .client_identity
+                    .as_ref()
+                    .map(|(cert, key)| (cert.as_str(), key.as_str())),
+            ),
+            None,
+            pending.use_java_trust_manager,
+            provider,
+        )
+        .map_err(|e| format!("layered client config: {e}"))?;
+        match pending.stream {
+            PendingLayeredStream::Reused(tcp) => {
+                rustls_client_handshake_over_stream(tcp, client_config, &pending.host)
+            }
+            PendingLayeredStream::DialFresh { host, port } => {
+                rustls_client_connect(client_config, &host, port)
+            }
+        }
+    } else {
+        let tcp = match pending.stream {
+            PendingLayeredStream::Reused(tcp) => tcp,
+            PendingLayeredStream::DialFresh { .. } => {
+                // There is no meaningful "dial fresh" for SERVER mode — a
+                // server accepts an inbound connection, it does not open an
+                // outbound one. `wrapped`'s stream genuinely could not be
+                // extracted (see this struct's doc); fail closed rather than
+                // silently connecting somewhere nobody asked for.
+                return Err(
+                    "layered SSLSocket: server-mode handshake requires the wrapped \
+                     Socket's own connection, which could not be extracted"
+                        .to_string(),
+                );
+            }
+        };
+        let (cert_pem, key_pem) = pending
+            .server_identity
+            .ok_or_else(|| "No TLS key/cert configured for layered SSLSocket".to_string())?;
+        rustls_server_handshake_over_stream(tcp, &cert_pem, &key_pem)
+    }
+}
+
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
         return e.stream.read(buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return match &mut e.stream {
+        if debug_srv {
+            eprintln!(
+                "[dbg-tls-srv] stream_read ENTER id={} requested_len={}",
+                id,
+                buf.len()
+            );
+        }
+        let result = match &mut e.stream {
             TlsServerStream::Rustls(s) => s.read(buf),
             TlsServerStream::Native(s) => s.read(buf),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => s.read(buf),
         };
+        if debug_srv {
+            eprintln!("[dbg-tls-srv] stream_read RETURN id={} result={:?}", id, result);
+        }
+        return result;
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2656,17 +3204,29 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
 
 /// Write to either a client- or server-side rustls stream.
 pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
+    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
         return e.stream.write(data);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
-        return match &mut e.stream {
+        if debug_srv {
+            eprintln!(
+                "[dbg-tls-srv] stream_write ENTER id={} len={}",
+                id,
+                data.len()
+            );
+        }
+        let result = match &mut e.stream {
             TlsServerStream::Rustls(s) => s.write(data),
             TlsServerStream::Native(s) => s.write(data),
             #[cfg(unix)]
             TlsServerStream::LegacyDsa(s) => s.write(data),
         };
+        if debug_srv {
+            eprintln!("[dbg-tls-srv] stream_write RETURN id={} result={:?}", id, result);
+        }
+        return result;
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
@@ -2726,6 +3286,29 @@ pub(crate) fn rustls_session_info(
         ));
     }
     None
+}
+
+/// The peer certificate chain rustls captured during this CLIENT stream's
+/// handshake, as raw DER — for `SSLSession.getPeerCertificates()`. Without
+/// this, a caller that completes a handshake through the deferred
+/// `SSLSocketFactory.createSocket(Socket,...)` path (`ensure_layered_handshake_started`)
+/// and then calls `getPeerCertificates()` sees an empty chain and gets
+/// `SSLPeerUnverifiedException("peer not authenticated")` even on a
+/// perfectly successful handshake — confirmed via
+/// `HttpComponentsClientHttpRequestFactoryBuilderTests.connectWithSslBundle`
+/// (Apache HttpComponents' `AbstractClientTlsStrategy.verifySession()` calls
+/// this immediately after every successful TLS upgrade). `rustls::ClientConnection`
+/// retains this for the connection object's lifetime, so it's still readable
+/// here despite being queried after the handshake loop that produced it has
+/// already returned.
+pub(crate) fn rustls_client_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
+    let reg = sreg().lock();
+    let entry = reg.client_streams.get(&id)?;
+    let certs = entry.stream.conn.peer_certificates()?;
+    if certs.is_empty() {
+        return None;
+    }
+    Some(certs.iter().map(|c| c.as_ref().to_vec()).collect())
 }
 
 // -----------------------------------------------------------------------------
@@ -3254,9 +3837,14 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     fn capture_huc_client_identity(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
+        connection: Option<ObjectRef>,
     ) {
         if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
-            capture_huc_ssl_context(ctx, sslctx);
+            if let Some(connection) = connection {
+                capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
+            } else {
+                capture_huc_ssl_context(ctx, sslctx);
+            }
         }
     }
     r.register(
@@ -3265,7 +3853,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
         |ctx, args| {
             if let Some(Value::Object(Some(f))) = args.first() {
-                capture_huc_client_identity(ctx, *f);
+                capture_huc_client_identity(ctx, *f, None);
             }
             Ok(None)
         },
@@ -3278,7 +3866,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             if let (Some(Value::Object(Some(connection))), Some(Value::Object(Some(f)))) =
                 (args.first(), args.get(1))
             {
-                crate::http_url_connection::capture_huc_instance_ssl_factory(ctx, *connection, *f);
+                capture_huc_client_identity(ctx, *f, Some(*connection));
             }
             Ok(None)
         },
@@ -4379,9 +4967,6 @@ mod tests {
         assert!(r.find(cls, "closeInbound", "()V").is_some());
         assert!(r.find(cls, "isInboundDone", "()Z").is_some());
         assert!(r.find(cls, "isOutboundDone", "()Z").is_some());
-        assert!(r
-            .find(cls, "getHandshakeSession", "()Ljavax/net/ssl/SSLSession;")
-            .is_some());
         assert!(r
             .find(cls, "getSession", "()Ljavax/net/ssl/SSLSession;")
             .is_some());
@@ -5618,13 +6203,12 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     .identity_override
                     .as_ref()
                     .map(|(cert, key)| (cert.as_str(), key.as_str()));
-                build_client_config_ex_with_provider(
+                build_client_config_ex(
                     roots,
                     &alpn_strs,
                     ClientAuthMode::Fixed(client_auth),
                     revocation,
                     use_java_trust_manager,
-                    cipher_provider_for(&state.enabled_ciphers),
                 )?
             }
         };
@@ -6187,6 +6771,28 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
+    // Netty configures JDK ALPN support through this concrete implementation
+    // method. A rustls-backed engine is deliberately allocated without
+    // SunJSSE's private `conContext` graph, so interpreting the real body
+    // dereferences that absent state before the native handshake starts. The
+    // callback is only used by SunJSSE's own ALPN selector; rustls performs
+    // the negotiated-protocol selection itself from `SSLParameters`.
+    r.register(
+        cls_impl,
+        "setHandshakeApplicationProtocolSelector",
+        "(Ljava/util/function/BiFunction;)V",
+        |_ctx, _args| Ok(None),
+    );
+    // Netty probes the paired getter when deciding whether JDK ALPN support is
+    // active.  It has the same `conContext` dependency as the setter above;
+    // rustls owns ALPN negotiation, so no Java-side selector is installed.
+    r.register(
+        cls_impl,
+        "getHandshakeApplicationProtocolSelector",
+        "()Ljava/util/function/BiFunction;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
     r.register(cls_impl, "setNeedClientAuth", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
@@ -6496,19 +7102,6 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let v = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
-
-    // `SSLEngineImpl.getHandshakeSession()` is real JDK bytecode that reads
-    // its private `conContext` field. Our rustls-backed implementation does
-    // not construct that JSSE-internal graph, so allowing the bytecode to run
-    // turns a harmless pre-handshake capability probe (Jetty's buffer sizing)
-    // into an NPE. There is no Java-visible handshake session before the
-    // native handshake begins; return null, as the JDK contract permits.
-    r.register(
-        cls_impl,
-        "getHandshakeSession",
-        "()Ljavax/net/ssl/SSLSession;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
 
     // getSession() — synthetic SSLSession with negotiated cipher/protocol/alpn.
     r.register(
@@ -7415,30 +8008,6 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     with_engine(id, |s| {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();
                     });
-                }
-                // Jetty propagates its configured suites through
-                // `SSLParameters`, not necessarily through the engine's direct
-                // setter. Keep them with this engine so `beginHandshake`
-                // constrains rustls's ClientHello instead of merely echoing a
-                // policy back to Java.
-                if let Value::Object(Some(ciphers)) = ctx.get_field_by_name(*p, "cipherSuites") {
-                    let mut suites = Vec::new();
-                    for index in 0..ctx.array_length(ciphers) {
-                        if let Value::Object(Some(cipher)) = ctx.get_array_element(ciphers, index) {
-                            if let Some(name) = ctx.read_string(cipher) {
-                                suites.push(name);
-                            }
-                        }
-                    }
-                    if std::env::var_os("CRATONVM_DBG_TLS_CIPHERS").is_some() {
-                        eprintln!(
-                            "[dbg-tls-ciphers] thread={:?} setSSLParameters id={} suites={:?}",
-                            std::thread::current().id(),
-                            id,
-                            suites
-                        );
-                    }
-                    with_engine(id, |s| s.enabled_ciphers = suites);
                 }
                 // Tomcat configures client-cert auth via
                 // `SSLParameters.setNeed/WantClientAuth` + `engine.setSSLParameters`,

@@ -1053,6 +1053,79 @@ pub fn is_client_cert(p: &ParsedCert) -> bool {
 // Building per-connection state from a KeyStore
 // ---------------------------------------------------------------------------
 
+/// Java's `String.hashCode()`: a 31-multiplier polynomial hash over UTF-16
+/// code units. Frozen by the `String` serialization contract — stable across
+/// every JDK version.
+fn java_string_hash_code(s: &str) -> i32 {
+    let mut h: i32 = 0;
+    for unit in s.encode_utf16() {
+        h = h.wrapping_mul(31).wrapping_add(unit as i32);
+    }
+    h
+}
+
+/// `java.util.HashMap`'s bucket-index derivation: `hash(key) ^ (hash(key)
+/// >>> 16)`, masked to the table's (power-of-two) capacity.
+fn java_hashmap_bucket(key: &str, capacity: usize) -> usize {
+    let h = java_string_hash_code(key) as u32;
+    let spread = h ^ (h >> 16);
+    (spread as usize) & (capacity - 1)
+}
+
+/// The table capacity a `new HashMap<>()` (default initial capacity 16, load
+/// factor 0.75) would have after inserting `n` entries — doubling whenever
+/// size exceeds `capacity * 0.75`, exactly like `HashMap.resize()`.
+fn java_hashmap_capacity_for(n: usize) -> usize {
+    let mut capacity = 16usize;
+    let mut threshold = 12usize;
+    while n > threshold {
+        capacity *= 2;
+        threshold = (capacity * 3) / 4;
+    }
+    capacity
+}
+
+/// Reorder `keys` (given in some other, e.g. keystore-file, order) into the
+/// order a real `java.util.HashMap<String, V>` would yield them in when
+/// iterated after inserting them in that same original order.
+///
+/// This exists to bug-compatibly match `sun.security.ssl.SunX509KeyManagerImpl`
+/// (the JDK's default `SunX509`-algorithm `KeyManager`, what
+/// `KeyManagerFactory.getDefaultAlgorithm()` names): it loads every keystore
+/// alias into a plain `HashMap<String,X509Credentials> credentialsMap`, and
+/// `getClientAliases()`/`getServerAliases()`/`chooseClientAlias()` all derive
+/// their candidate order from iterating *that* map — bucket-index order, not
+/// keystore/file order. When a keystore has two otherwise-equally-eligible
+/// client identities (same key type, same validity, no EKU to disambiguate —
+/// e.g. Spring Boot's own `NettyReactiveWebServerFactoryTests` PKCS12 test
+/// fixture, which carries a "spring-boot" and a "test-alias" client identity
+/// side by side, only one of which the test's server trusts), which one
+/// `chooseClientAlias()` returns is entirely this HashMap-bucket accident —
+/// and real HotSpot's answer for THIS keystore's alias strings is
+/// deterministic (Java's `String.hashCode()`/`HashMap` bucketing are frozen,
+/// unsalted algorithms), so replicating it exactly is the only way to match
+/// observable behavior rather than picking whichever candidate happens to be
+/// physically first in the keystore file.
+fn java_hashmap_iteration_order(keys: &[String]) -> Vec<String> {
+    let capacity = java_hashmap_capacity_for(keys.len());
+    let mut indexed: Vec<(usize, usize, &String)> = keys
+        .iter()
+        .enumerate()
+        .map(|(insertion_index, key)| {
+            (
+                java_hashmap_bucket(key, capacity),
+                insertion_index,
+                key,
+            )
+        })
+        .collect();
+    // Ascending bucket index; entries within the same bucket keep their
+    // original (insertion) order, matching Java 8+ HashMap's tail-append
+    // collision chaining.
+    indexed.sort_by_key(|(bucket, insertion_index, _)| (*bucket, *insertion_index));
+    indexed.into_iter().map(|(_, _, key)| key.clone()).collect()
+}
+
 /// Build a `KeyManagerState` from the parsed contents of a `LoadedKeyStore`.
 /// Filtering by KU/EKU happens here so `chooseServerAlias` is a HashMap
 /// lookup at handshake time.
@@ -1066,6 +1139,17 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
         None => return state,
     };
 
+    // First pass: collect every PrivateKeyEntry alias in keystore/file order
+    // (same order real `KeyStore.aliases()` would enumerate them), computing
+    // everything needed to classify it — but not yet deciding candidate
+    // order for the by-key-type lists below.
+    struct PrivateKeyAlias<'a> {
+        alias: &'a str,
+        key_type: String,
+        is_server: bool,
+        is_client: bool,
+    }
+    let mut private_key_aliases = Vec::new();
     for (alias, entry) in &store.entries {
         if let keystore::EntryKind::PrivateKey { key_der, chain } = &entry.kind {
             if chain.is_empty() {
@@ -1078,20 +1162,43 @@ pub fn build_key_manager_state(keystore_id: i32) -> KeyManagerState {
             let key_type = classify_key_type(&leaf.spki_algorithm_oid).to_string();
             state.aliases_to_chain.insert(alias.clone(), chain.clone());
             state.aliases_to_key.insert(alias.clone(), key_der.clone());
-            if is_server_cert(&leaf) {
-                state
-                    .server_aliases_by_key_type
-                    .entry(key_type.clone())
-                    .or_default()
-                    .push(alias.clone());
-            }
-            if is_client_cert(&leaf) {
-                state
-                    .client_aliases_by_key_type
-                    .entry(key_type)
-                    .or_default()
-                    .push(alias.clone());
-            }
+            private_key_aliases.push(PrivateKeyAlias {
+                alias,
+                key_type,
+                is_server: is_server_cert(&leaf),
+                is_client: is_client_cert(&leaf),
+            });
+        }
+    }
+
+    // Second pass: push into the by-key-type candidate lists in
+    // `SunX509KeyManagerImpl`'s `credentialsMap` HashMap-bucket order rather
+    // than keystore/file order — see `java_hashmap_iteration_order`'s doc
+    // comment.
+    let ordered_aliases = java_hashmap_iteration_order(
+        &private_key_aliases
+            .iter()
+            .map(|a| a.alias.to_string())
+            .collect::<Vec<_>>(),
+    );
+    for alias in &ordered_aliases {
+        let entry = private_key_aliases
+            .iter()
+            .find(|a| a.alias == alias)
+            .expect("alias came from private_key_aliases");
+        if entry.is_server {
+            state
+                .server_aliases_by_key_type
+                .entry(entry.key_type.clone())
+                .or_default()
+                .push(alias.clone());
+        }
+        if entry.is_client {
+            state
+                .client_aliases_by_key_type
+                .entry(entry.key_type.clone())
+                .or_default()
+                .push(alias.clone());
         }
     }
     state

@@ -1471,6 +1471,9 @@ pub fn throw_runtime_error(
         RuntimeError::ProtocolException { message } => {
             ("java/net/ProtocolException", Some(message.as_str()))
         }
+        RuntimeError::BindException { message } => {
+            ("java/net/BindException", Some(message.as_str()))
+        }
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }
