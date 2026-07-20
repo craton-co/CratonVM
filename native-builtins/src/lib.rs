@@ -15753,9 +15753,22 @@ fn native_mockito_mock_method_advice_is_overridden(
         else {
             return Ok(Some(Value::Int(0)));
         };
-        if ctx.is_interface_class(declaring_class_id) {
-            return Ok(Some(Value::Int(0)));
-        }
+
+        // NOTE: `declaring_class_id` being an interface (e.g. Mockito asks
+        // about `Greeter.greet()` for a call reached via `Interface.super
+        // .method()` from the concrete override) must NOT short-circuit to
+        // "not overridden" here. The walk below still answers correctly for
+        // that case: `class_id == declaring_class_id` simply never matches
+        // while walking the CONCRETE superclass chain (interfaces never
+        // appear in it), so the loop just checks every class from the mock's
+        // own class up to `Object` for a concrete declaration of the method
+        // — exactly what "does the mock's real class override this
+        // interface default method" needs. Returning a hardcoded false here
+        // instead made every interface-default `super` call from a redefined
+        // override re-enter Mockito's `CallsRealMethods` interception
+        // indefinitely (OtlpMetricsPropertiesConfigAdapter.url() calling
+        // `OtlpConfig.super.url()`, and the same shape in any spied/mocked
+        // class that overrides an interface default method).
 
         // Mockito supplies a Method declared by an ancestor, while the mock
         // can inherit its concrete override through one or more intermediate
