@@ -8749,14 +8749,42 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             full_args.push(Value::Object(Some(receiver)));
             full_args.extend_from_slice(args);
 
-            // Dispatch ordinary object calls through the receiver's exact
-            // loaded class. Re-resolving its name through the global class map
-            // can select an inherited Object member even when the receiver has
-            // a concrete override (notably a method-local anonymous class
-            // reached from a native call such as String.format's `%s`).
-            // `invoke_on_class_shared` preserves native-override precedence
-            // while resolving the actual receiver hierarchy.
-            if resolved_from_receiver {
+            // `invoke_on_class_shared` dispatches on `receiver_class_id`
+            // directly rather than re-resolving `class_name` through the
+            // global class map — it preserves native-override precedence
+            // while resolving the actual receiver hierarchy, which matters
+            // for a method-local anonymous class (the global map's
+            // name->id lookup can collapse it onto an unrelated same-named
+            // class registered by another loader, landing on an inherited
+            // Object member instead of the receiver's concrete override —
+            // notably `toString()` reached from a native call such as
+            // String.format's `%s`).
+            //
+            // That path does more locking than `invoke_or_native` and is
+            // unsafe to make the default for every `resolved_from_receiver`
+            // call: routing ALL ordinary virtual dispatch through it
+            // (rather than gating it to cases that actually need exact-
+            // class resolution) reintroduced a startup hang — Spring
+            // Boot's `BackgroundPreinitializingApplicationListener` runs
+            // Hibernate Validator's reflection-heavy constraint-helper
+            // warmup concurrently with the main thread's own bean/class
+            // initialization, and making this heavier path the hot path
+            // for every virtual call from both threads deadlocked them
+            // (see docs/internal/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
+            // Keep it scoped to the two cases that actually need it: the
+            // original loader-identity divergence this mechanism was built
+            // for, and the specific anonymous-`toString()` shape the
+            // regression test (`vm/tests/string_format_throwing_tostring.rs`)
+            // covers.
+            let needs_exact_class_dispatch = resolved_from_receiver
+                && (method_name == "toString" && descriptor == "()Ljava/lang/String;"
+                    || self
+                        .shared
+                        .class_manager
+                        .read()
+                        .get_loaded_class_id(&class_name)
+                        != Some(receiver_class_id));
+            if needs_exact_class_dispatch {
                 invoke_on_class_shared(
                     self.shared,
                     self.thread,
