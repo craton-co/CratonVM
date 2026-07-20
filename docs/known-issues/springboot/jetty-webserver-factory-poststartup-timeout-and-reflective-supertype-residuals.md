@@ -1,13 +1,14 @@
 # Jetty factory post-startup timeout and reflective-supertype residuals
 
-**Status: MOSTLY FIXED - 2026-07-18. The reflective-supertype residual, four
-real bugs, and the `Deflater.end()` monitor hang (both factory classes) are
-fixed. `JettyReactiveWebServerFactoryTests` now completes cleanly (156s,
-22/35 passing — remaining failures are a missing `test.jks` test fixture,
-unrelated to CratonVM). `JettyServletWebServerFactoryTests` no longer hangs
-at its old stuck point either, but a newly-exposed, unrelated OPEN bug
-(blocking socket read ignoring its configured timeout) now blocks it later
-in the same class — see the bottom section.**
+**Status: MOSTLY FIXED - 2026-07-20. The reflective-supertype residual, four
+real bugs, the `Deflater.end()` monitor hang (both factory classes), and the
+blocking-read-timeout bug below are all fixed. `JettyReactiveWebServerFactoryTests`
+completes cleanly (22/35 passing — remaining failures are a missing `test.jks`
+test fixture, unrelated to CratonVM). `JettyServletWebServerFactoryTests` no
+longer hangs on the blocking-read bug either — it now runs 3x further into the
+class (42+ server start/stop cycles vs. the old stuck point at 14) before
+hitting a newly-exposed, unrelated OPEN residual (severe TLD/JAR-scan slowdown
+in Xerces XML parsing, not a hang) — see the bottom section.**
 
 ## Scope and separation
 
@@ -170,11 +171,11 @@ stuck at the old `DeflaterPool.end()` point — it now makes it through 14
 server start/stop cycles before hitting the *different*, unrelated bug
 documented below.
 
-## New OPEN bug found once the hang above stopped masking it: blocking-read timeout not enforced
+## Fixed: blocking-read timeout not enforced (2026-07-20)
 
-`JettyServletWebServerFactoryTests` still does not complete even at a 900s
-timeout (5x the original). A `--stack-dump-on-timeout` capture shows a
-completely different signature from the fixed bug above:
+`JettyServletWebServerFactoryTests` still did not complete even at a 900s
+timeout (5x the original). A `--stack-dump-on-timeout` capture showed a
+completely different signature from the `Deflater.end()` bug above:
 
 ```
 tid=0 name="main" blocked=true
@@ -190,22 +191,126 @@ monitor wait, so the interpreter's dump mechanism can't get a live frame walk
 bounded-timeout read path, used only when `SO_TIMEOUT` is set — so a
 `SocketTimeoutException` should have fired and didn't.
 
-CratonVM's design for this path (`native-io/src/net.rs`, `net_read0` /
-`IOUtil.configureBlocking`) relies on `NioSocketImpl.timedRead` first calling
-`configureBlocking(fd, false)` to flip the OS fd non-blocking, so `read0`
-hits `WouldBlock` → returns `IOStatus.UNAVAILABLE` (-2) → the Java-level loop
-in `timedRead` polls via `Net.poll` against the real deadline. If that
-fd ever ends up performing a genuinely *blocking* `read()` instead (fd not
-actually flipped non-blocking for this connection, or a stream handle that
-bypasses `configureBlocking` entirely), the read blocks until peer-close
-instead of the configured timeout — matching this hang exactly. Not yet
-isolated to a specific test method or root-caused past this point.
+**Root cause**: a `CRATONVM_DBG_NET=1` trace (added as a temporary
+`dbgnet!`/`eprintln!` instrumentation pass in `configureBlocking`) showed
+every single `configureBlocking(fd, false)` call for the affected connections
+hitting the registry while the fd was still `NetSocketHandle::Unbound`:
 
-**Next steps**: identify which specific test method this is (JUnit method
-order isn't logged directly by this run; correlate via elapsed test count —
-this was roughly the 15th test of ~115) and reproduce it in isolation;
-confirm whether `configureBlocking` is actually reached for that connection's
-fd (a `native_ring`/dispatch-trace capture, or a temporary `eprintln!` in
-`configureBlocking`/`net_read0`, would confirm quickly); check whether the
-connection is one CratonVM's registry doesn't recognize (`net_sockets()`
-lookup miss silently falling through to a real/uncontrolled blocking read).
+```
+[NET] configureBlocking fd=0x40000003 kind=unbound blocking=false NO-OP
+```
+
+This is exactly the failure mode the doc's own "Next steps" predicted.
+`NioSocketImpl.connect(timeout)` — the path Apache HttpClient5's classic/io
+transport uses (`org.apache.hc.client5.http.impl.io`, the transport backing
+`AbstractServletWebServerFactoryTests`'s `HttpComponentsClientHttpRequestFactory`-based
+client) — calls `IOUtil.configureBlocking(fd, false)` **before**
+`Net.connect0`, while the fd has no live OS socket yet (`net_socket0` defers
+actual socket creation to `bind0`/`connect0`). `net_connect0`
+(`native-io/src/net.rs`) then always created a fresh, default-*blocking*
+`TcpStream` and inserted it into the registry, silently discarding the
+earlier non-blocking request. Every later `read0` on that connection
+therefore performed a genuine blocking OS `read()` instead of returning
+`IOStatus.UNAVAILABLE` (-2), so `NioSocketImpl.timedRead`'s poll-based
+`SO_TIMEOUT` protocol never engaged and the read blocked until the peer
+closed (or, in this suite, forever — the peer never closes in the "no data
+yet" case a `SO_TIMEOUT` read is supposed to bound).
+
+The exact same class of bug did NOT exist in `socket_channel.rs`'s
+`sc_connect_inner` (the `SocketChannel`-native connect path), which already
+re-applies a pre-connect `configureBlocking(false)` request to the freshly
+connected stream — confirming this was a gap specific to `net.rs`'s
+`Net.connect0`/`Net.bind0` path, not a general design omission.
+
+**Fix** (`native-io/src/net.rs`): added `net_pending_nonblocking()`, a
+small per-fd registry recording the last requested blocking mode. The
+`sun/nio/ch/IOUtil.configureBlocking` native handler now records the
+request unconditionally (not just when a live `Stream`/`Listener` exists),
+and `net_connect0` / `net_bind0` consume-and-apply any pending request right
+after creating the live socket — mirroring the pattern `sc_connect_inner`
+already used. Regression test:
+`t19_5_connect0_applies_nonblocking_requested_while_fd_was_unbound`.
+
+**Verified**: `JettyServletWebServerFactoryTests` no longer hangs at the old
+stuck point — it now completes 3x more server start/stop cycles (42+ vs. the
+previous 14) before hitting the unrelated residual documented below. A
+`SoTimeoutRepro`-style standalone `java.net.Socket` + `setSoTimeout` repro
+(not committed) confirmed the fix directly: a client blocked on `read()` with
+no data available now throws `SocketTimeoutException` after the configured
+timeout instead of hanging.
+
+## New OPEN residual found once the hang above stopped masking it: severe TLD/JAR-scan slowdown in Xerces XML parsing
+
+With the blocking-read bug fixed, `JettyServletWebServerFactoryTests` still
+does not complete within a 900s timeout — but the failure mode has changed
+from a hang to severe cumulative slowness, and per-cycle timing shows this is
+**not** a livelock:
+
+```
+cycle:  ... 13  14  15   16  17 ... 34  35   36  17 ... 42  43   44 ...
+delta:  ...  5s 10s 185s  5s  5s ...  2s 186s 16s  3s ... 12s 194s 10s
+```
+
+(seconds between successive `Jetty started` log lines; full class ~115
+tests). Most server-start/stop cycles take 2-16s, but a handful spike to
+~185-194s each — three observed spikes alone account for over 550s of the
+900s budget. `HotSpot completes the entire class in 22.6s` (verified via the
+same suite-runner harness with `-Vm hotspot`), so this is not a fundamental
+JDK-level cost; the JettyServletWebServerFactoryTests port-clash tests
+(`portClashOfPrimaryConnectorResultsInPortInUseException` and similar)
+correlate with a spike in the one `--stack-dump-on-timeout` capture taken
+mid-spike:
+
+```
+tid=0 name="main" blocked=false
+  ... JettyServletWebServerFactory.getWebServer
+  ... JasperInitializer.doStart -> TldScanner.scan -> TldScanner.scanJars
+  ... StandardJarScanner.scan -> TldParser.parse -> Digester.parse
+  ... (real Xerces SAX parser, ~30 frames of Xerces internals)
+  top=com/sun/org/apache/xerces/internal/impl/XMLEntityScanner.load
+```
+
+`blocked=false` and successive dumps show the frame depth cycling through a
+stable ~110-124 pattern rather than sitting at one fixed pc — i.e. the thread
+is actively working, repeatedly re-entering `XMLEntityScanner.load` (the
+buffer-refill primitive) once per small `.tld`/`web-fragment.xml` file across
+the ~171 jars on the module's flat classpath (see the
+`[jboss-bf] getResources(META-INF/MANIFEST.MF): capping 171 flat-classpath
+matches to 128` log lines), once per Jetty server start (i.e. potentially
+once per test in the class). This is the same subsystem — and likely the
+same underlying "interpreter/native dispatch overhead makes Xerces
+character-level scanning prohibitively slow without a dedicated fast path"
+pattern — documented and fixed for a **different** set of `XMLEntityScanner`
+methods (`scanQName`, `scanContent`, `skipSpaces`, `normalizeNewlines`,
+`checkEntityLimit`; see `force_native_over_real_jdk_bytecode` /
+`is_xerces_xml_parser_native_override` in `vm/src/runtime/interpreter.rs`)
+in
+`docs/internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
+`load` is notably **absent** from that force-native gate's method list.
+
+Unlike the Liquibase/Keycloak case (one large XSD/changelog file, dominated
+by per-character `scanQName`/`scanContent` work), TLD scanning parses **many
+small files**, so the balance likely shifts to per-call overhead in `load`'s
+buffer-refill path (backed by a real `InputStreamReader` over a
+`ByteArrayInputStream` of already-inflated bytes — see
+`native-io/src/zip_real_jar.rs`'s `getInputStream` doc comment — so the
+underlying byte read itself is not the suspect; the JAR-open/central-directory
+parse cost per `new JarFile(...)`, repeated across all ~171 jars on every one
+of the ~115 tests' server starts, is a more likely multiplier) or in
+per-server-start jar-scan repetition with no cross-instance caching. Not yet
+root-caused past this point — this needs the same kind of dedicated
+diagnostic pass (Rust-level profiling of `native-io/src/zip_real_jar.rs`'s
+jar-open path, or extending the `XMLEntityScanner` force-native gate to
+`load`) that produced the Liquibase/Xerces fix, and is being tracked
+separately rather than blocking this doc's closure, since it's a distinct
+root cause (XML/JAR-scan performance, not networking) that plausibly affects
+any Spring Boot suite exercising Jasper/JSP TLD scanning across many
+sequential server starts, not just Jetty.
+
+**Next steps**: reproduce in isolation with a profiling build (or
+`CRATONVM_DBG_JIT_DISASM`/sampling); check whether `new JarFile(...)` reopens
+the same 171 jars from scratch on every one of the ~115 tests (no
+cross-server-instance handle cache) and whether that dominates; if so, either
+cache open `JarState` by canonical path across the process, or add a
+`load`-specific native fast path mirroring the existing `scanQName`/
+`scanContent` ones.

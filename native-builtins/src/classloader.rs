@@ -1505,16 +1505,35 @@ fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<
 /// found it too (HotSpot throws ClassNotFoundException). That made
 /// `ClassUtils.isCacheSafe(composite, siblingLoader)` wrongly true via its
 /// `isLoadable` fallback. ClassUtilsTests.isCacheSafe.
-/// Whether a BUILT-IN loader (application/platform -- anything CratonVM does
-/// not classify as user-defined) appears in `loader`'s parent chain,
-/// including `loader` itself. A `false` answer means the chain terminates at
-/// the bootstrap (null) without ever passing a built-in loader, so per
-/// JVMS 5.3 only bootstrap classes are resolvable through delegation.
+/// Whether an APPLICATION-tier built-in loader appears in `loader`'s parent
+/// chain, including `loader` itself. A `false` answer means the chain never
+/// reaches a loader that can see the application classpath, so per JVMS 5.3
+/// only bootstrap/platform (JDK module) classes are resolvable through
+/// delegation and CratonVM's flat global store -- which conflates every
+/// loaded class, including ones only the application loader can see -- must
+/// not stand in for delegation here.
+///
+/// The platform loader does NOT count, even though it is "built-in" (not
+/// user-defined): it only sees JDK platform modules, never application
+/// classes, so treating it the same as the application loader wrongly let a
+/// loader parented ONLY as `UserLoader -> PlatformClassLoader -> bootstrap`
+/// (e.g. Spring's `CompileWithForkedClassLoaderClassLoader`, whose whole
+/// point is to skip the application loader and mint its OWN fresh copies of
+/// non-JDK classes) "see" an application class that was merely already
+/// loaded elsewhere in the process. That produced a real, reproducing bug:
+/// `SpringFactoriesEnvironmentPostProcessorsFactory` resolved through the
+/// flat store to the ORIGINAL application-loader copy instead of the forked
+/// loader calling its own `findClass` override to mint an isolated copy —
+/// so a `DeferredLogFactory` instance captured against the app-loader
+/// `Class` object failed an `ArgumentResolver` type match against a
+/// factory's constructor parameter resolved via the forked loader, leaving
+/// the parameter null (`NullPointerException` in
+/// `CloudFoundryVcapEnvironmentPostProcessor.<init>`, "logFactory" null).
 pub(crate) fn builtin_loader_reachable(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
     let mut cur = Some(loader);
     for _ in 0..256 {
         let Some(l) = cur else { break };
-        if !is_user_defined_loader(ctx, l) {
+        if !is_user_defined_loader(ctx, l) && !is_platform_class_loader(ctx, l) {
             return true;
         }
         cur = classloader_parent(ctx, l);

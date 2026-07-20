@@ -43520,6 +43520,29 @@ fn tmf_tm_id_by_identity() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+/// Build and throw a real `java.security.NoSuchAlgorithmException` carrying
+/// `msg`. Used by `KeyManagerFactory.getInstance`/`TrustManagerFactory.
+/// getInstance` (below) to honour the JCA `getInstance` contract — real JDK
+/// rejects an algorithm name no registered provider supports rather than
+/// silently substituting a default implementation. Falls back to a catchable
+/// `SecurityException` if the real exception class can't be constructed,
+/// mirroring the `throw_jca`/`p68_signature_failure` pattern used elsewhere
+/// in this crate for the same reason (never swallow a validation failure).
+fn kmf_tmf_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/NoSuchAlgorithmException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -44646,6 +44669,29 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
         |ctx, args| {
+            // FIX (rabbitautoconfigurationtests-cglib-enhance-hang residual):
+            // this used to accept ANY algorithm string unconditionally, so
+            // `TrustManagerFactory.getInstance("bogus-algo")` silently
+            // succeeded instead of throwing `NoSuchAlgorithmException` like
+            // real JDK — breaking `RabbitAutoConfigurationTests.
+            // enableSslWithInvalidTrustStoreAlgorithmShouldFail` (and any
+            // other caller relying on the JCA `getInstance` contract to
+            // reject an unsupported algorithm). Reject up front via the same
+            // provider-chain lookup `KeyManagerFactory.getInstance` (below)
+            // and `getProvider()` already use, so a caller-registered custom
+            // `Provider` service is still honoured.
+            let algo_str = match args.get(0) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if crate::jca::provider_chain::find_service_provider("TrustManagerFactory", &algo_str)
+                .is_none()
+            {
+                return Err(kmf_tmf_no_such_algorithm(
+                    ctx,
+                    &format!("{algo_str} TrustManagerFactory not available"),
+                ));
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 2);
             ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -44912,9 +44958,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let provider_name =
-                crate::jca::provider_chain::find_service_provider("KeyManagerFactory", &algo_str)
-                    .unwrap_or_else(|| "SunJSSE".to_string());
+            // FIX (rabbitautoconfigurationtests-cglib-enhance-hang residual):
+            // no provider (built-in or caller-registered) claims this
+            // algorithm — real JDK's `getInstance` throws
+            // `NoSuchAlgorithmException` here rather than silently falling
+            // back to a default implementation. Was previously unconditional
+            // (`unwrap_or_else(|| "SunJSSE")`), so `KeyManagerFactory.
+            // getInstance("bogus-algo")` always succeeded — breaking
+            // `RabbitAutoConfigurationTests.
+            // enableSslWithInvalidKeyStoreAlgorithmShouldFail` (and any other
+            // caller relying on the JCA contract to reject an unsupported
+            // algorithm).
+            let found_provider =
+                crate::jca::provider_chain::find_service_provider("KeyManagerFactory", &algo_str);
+            if found_provider.is_none() {
+                return Err(kmf_tmf_no_such_algorithm(
+                    ctx,
+                    &format!("{algo_str} KeyManagerFactory not available"),
+                ));
+            }
+            let provider_name = found_provider.unwrap_or_else(|| "SunJSSE".to_string());
             let provider =
                 crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name);
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
@@ -72188,6 +72251,21 @@ mod new13_tests {
         r
     }
 
+    /// Like `build_registry`, but also wires the JCA provider chain
+    /// (`crate::jca::register_jca_natives`, idempotent per its own doc
+    /// comment) so `provider_chain::find_service_provider` resolves the
+    /// built-in SunJSSE `KeyManagerFactory`/`TrustManagerFactory` services —
+    /// real VM boot always registers both; a bare `register_p68_ssl` alone
+    /// leaves the provider-chain seed data (`seed_sunjsse_services`) unrun,
+    /// so `getInstance("SunX509")`/`getInstance("PKIX")` would wrongly throw
+    /// `NoSuchAlgorithmException` in a test using plain `build_registry()`.
+    fn build_registry_with_jca() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        crate::jca::register_jca_natives(&mut r);
+        register_p68_ssl(&mut r);
+        r
+    }
+
     #[test]
     fn ssl_context_getinstance_and_init_are_registered() {
         let r = build_registry();
@@ -72242,7 +72320,7 @@ mod new13_tests {
     fn trust_manager_factory_default_returns_concrete_x509_impl() {
         use crate::test_utils::MockNativeContext;
 
-        let r = build_registry();
+        let r = build_registry_with_jca();
         let mut ctx = MockNativeContext::new();
         let get_instance = r
             .find(
@@ -72251,7 +72329,15 @@ mod new13_tests {
                 "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
             )
             .unwrap();
-        let factory = match get_instance(&mut ctx, &[Value::Object(None)]) {
+        // FIX (rabbitautoconfigurationtests-cglib-enhance-hang residual):
+        // `getInstance` now validates the algorithm against the provider
+        // chain (real JDK throws `NoSuchAlgorithmException` for an unknown
+        // one), so a null/empty algorithm no longer silently succeeds.
+        // "PKIX" is a real, registered `TrustManagerFactory` algorithm — the
+        // test only cares that SOME factory is returned, not which
+        // algorithm, so this is a like-for-like substitution.
+        let algo = ctx.create_string("PKIX");
+        let factory = match get_instance(&mut ctx, &[Value::Object(Some(algo))]) {
             Ok(Some(Value::Object(Some(o)))) => o,
             other => panic!("getInstance should return a factory, got {other:?}"),
         };
@@ -72278,6 +72364,92 @@ mod new13_tests {
             crate::x509_manager::FQN_X509_TM,
             "default TrustManagerFactory must not vend the abstract X509TrustManager interface"
         );
+    }
+
+    // FIX (rabbitautoconfigurationtests-cglib-enhance-hang residual):
+    // `KeyManagerFactory`/`TrustManagerFactory.getInstance` must honour the
+    // real JCA `getInstance` contract — throw for an algorithm no provider
+    // claims, succeed for one that's actually registered. Regression tests
+    // for `RabbitAutoConfigurationTests.
+    // enableSslWith{Invalid,}{KeyStore,TrustStore}AlgorithmShouldFail`.
+    #[test]
+    fn key_manager_factory_get_instance_accepts_known_algorithm() {
+        use crate::test_utils::MockNativeContext;
+        let r = build_registry_with_jca();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/KeyManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
+            )
+            .unwrap();
+        let algo = ctx.create_string("SunX509");
+        match get_instance(&mut ctx, &[Value::Object(Some(algo))]) {
+            Ok(Some(Value::Object(Some(_)))) => {}
+            other => panic!("getInstance(\"SunX509\") should succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_manager_factory_get_instance_rejects_unknown_algorithm() {
+        use crate::test_utils::MockNativeContext;
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/KeyManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
+            )
+            .unwrap();
+        let algo = ctx.create_string("test-invalid-algo");
+        let err = get_instance(&mut ctx, &[Value::Object(Some(algo))])
+            .expect_err("getInstance(\"test-invalid-algo\") must not succeed");
+        match err {
+            MethodCallFailed::ExceptionThrown(_) => {}
+            MethodCallFailed::InternalError(_) => {}
+        }
+    }
+
+    #[test]
+    fn trust_manager_factory_get_instance_accepts_known_algorithm() {
+        use crate::test_utils::MockNativeContext;
+        let r = build_registry_with_jca();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+            )
+            .unwrap();
+        let algo = ctx.create_string("PKIX");
+        match get_instance(&mut ctx, &[Value::Object(Some(algo))]) {
+            Ok(Some(Value::Object(Some(_)))) => {}
+            other => panic!("getInstance(\"PKIX\") should succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trust_manager_factory_get_instance_rejects_unknown_algorithm() {
+        use crate::test_utils::MockNativeContext;
+        let r = build_registry();
+        let mut ctx = MockNativeContext::new();
+        let get_instance = r
+            .find(
+                "javax/net/ssl/TrustManagerFactory",
+                "getInstance",
+                "(Ljava/lang/String;)Ljavax/net/ssl/TrustManagerFactory;",
+            )
+            .unwrap();
+        let algo = ctx.create_string("test-invalid-algo");
+        let err = get_instance(&mut ctx, &[Value::Object(Some(algo))])
+            .expect_err("getInstance(\"test-invalid-algo\") must not succeed");
+        match err {
+            MethodCallFailed::ExceptionThrown(_) => {}
+            MethodCallFailed::InternalError(_) => {}
+        }
     }
 
     #[test]

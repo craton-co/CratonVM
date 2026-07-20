@@ -63,6 +63,60 @@ Per `CompileWithForkedClassLoaderClassLoader`'s real bytecode (`org/springframew
 
 Log: `apps/spring-boot-suite-runner/.suite/results/configdata-classpath-scan-postmerge/all-jit/logs/core_spring-boot-test.org.springframework.boot.test.context.SpringBootContextLoaderAotTests.out.log`.
 
+**Update 2026-07-20 (second, independent investigation session): traced further, one more real fix landed, but the residual survives it.**
+
+Found and fixed a genuine, related bug in `native-builtins/src/classloader.rs`'s
+`builtin_loader_reachable` (consulted by `cl_real_load_class_base`'s
+`scoped_user_chain`/`defer_to_find_class` gating, the exact mechanism this
+doc's "Next step" above points at): it treated *any* built-in loader —
+including the **platform** loader, which can only see JDK platform modules —
+as "safe to consult CratonVM's flat global class store." Only the
+**application**-tier loader actually is. `CompileWithForkedClassLoaderClassLoader`'s
+declared parent (`testClassLoader.getParent()`) is the platform loader in a
+flat `-cp` launch, so this wrongly let the flat store answer for
+`EnvironmentPostProcessorsFactory` before `findClass` ever got a chance,
+exactly matching this doc's own hypothesis above. Fixed by excluding the
+platform loader specifically (reusing the existing `is_platform_class_loader`
+helper) — a small, low-risk, JVMS-5.3-correct change with only 2 call sites
+(the real-JDK and synthetic-JDK counterparts of the same gate).
+
+**But the NPE still reproduces after this fix.** `CRATONVM_DBG_CL_SCOPE`
+tracing (a temporary env-gated `eprintln!`, since removed) confirmed the fix
+changes the decision as expected — `defer_to_find_class=true`,
+`scoped_user_chain=true` for the `EnvironmentPostProcessorsFactory` lookup,
+i.e. the flat-store step 1 is now correctly skipped and step 2 (`findClass`,
+the receiver's own override) is the authoritative path. Yet
+`SpringFactoriesEnvironmentPostProcessorsFactory`'s own defining loader is
+*still* reported as the Application loader afterward (re-traced with the
+same Java-level debug prints described above). Two possibilities, neither
+confirmed:
+
+1. `findClass()`'s own definition path (the forked loader's
+   `defineDynamicClass` → `ClassLoader.defineClass` native, backing its
+   `classResourceLookup` fallback that reads original `.class` bytes off the
+   real classpath for non-AOT-generated classes) may not actually produce a
+   loader-isolated duplicate under CratonVM's `defineClass` — i.e. it may be
+   **collapsing by binary name** into the pre-existing global registration
+   instead of minting a second, independent `ClassId` scoped to the new
+   defining loader. This would be the flat-global-class-store architecture's
+   most fundamental manifestation of this whole bug family — the same family
+   that already needed three separate, narrowly-scoped patches at different
+   call sites (`loader_interface_override` in `interpreter.rs`, the
+   `container_loader` threading in `lang_class.rs`'s annotation-enum arm, and
+   now `builtin_loader_reachable`) — suggesting the flat-store model may need
+   a more systemic fix rather than continuing to patch individual call sites
+   as they surface.
+2. There may be a *second*, not-yet-traced resolution path (distinct from
+   both `resolve_class_loader_aware`'s `New`-instruction path and
+   `cl_real_load_class_base`'s `loadClass` path) through which
+   `SpringFactoriesEnvironmentPostProcessorsFactory` specifically gets
+   resolved, that this investigation didn't reach.
+
+Next step for whoever picks this up: trace CratonVM's real-JDK-mode
+`ClassLoader.defineClass` native implementation directly (not `loadClass`)
+to check whether it deduplicates/collapses by binary name across distinct
+defining-loader instances.
+
 ## Cluster D — missing `"random"` PropertySource — FIXED (upstream, before this session)
 
 `SpringBootContextLoaderTests.propertySourceOrdering()` (1 of 26 tests in the class).

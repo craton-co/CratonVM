@@ -576,6 +576,23 @@ fn net_sockets() -> &'static RwLock<FxHashMap<i32, NetSocketHandle>> {
     REG.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
+/// Per-fd desired blocking mode requested while the fd was still `Unbound`
+/// (no live OS socket to apply it to). `NioSocketImpl.connect(timeout)`
+/// calls `IOUtil.configureBlocking(fd, false)` BEFORE `Net.connect0` — the fd
+/// is deliberately flipped non-blocking ahead of the connect attempt, then
+/// `connect0`/`Net.poll` drive the timed-connect protocol. `net_connect0`
+/// used to always hand back a fresh, default-blocking `TcpStream`, silently
+/// dropping that request: every later `read0` on the connection then did a
+/// genuine blocking OS `read()` instead of returning `IOStatus.UNAVAILABLE`,
+/// so `NioSocketImpl.timedRead`'s configured `SO_TIMEOUT` never fired and the
+/// read blocked until the peer closed. Recorded here on every
+/// `configureBlocking` call (regardless of current registry state) and
+/// consumed by `net_connect0` right after the stream is created.
+fn net_pending_nonblocking() -> &'static RwLock<FxHashMap<i32, bool>> {
+    static PENDING: OnceLock<RwLock<FxHashMap<i32, bool>>> = OnceLock::new();
+    PENDING.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
 /// Per-socket option store (SO_REUSEADDR / SO_KEEPALIVE / TCP_NODELAY / etc.).
 /// Rust's `std::net` exposes a subset directly — for options it doesn't
 /// expose (SO_LINGER on TcpListener, IP_TOS, …) we remember the value so
@@ -605,6 +622,7 @@ fn close_net_fd(fd: i32) {
         let mut map = net_sockets().write();
         map.insert(fd, NetSocketHandle::Closed)
     };
+    net_pending_nonblocking().write().remove(&fd);
     if std::env::var_os("CRATONVM_DBG_NET").is_some() {
         let kind = match &old {
             Some(NetSocketHandle::Unbound) => "unbound",
@@ -930,6 +948,18 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // path (lines 446-469), which similarly does not write back the local
     // port.
 
+    // Mirror `net_connect0`: a `configureBlocking(fd, false)` requested
+    // while this fd was still `Unbound` (e.g. `ServerSocketChannel.open();
+    // configureBlocking(false); bind(...)`) must carry over to the freshly
+    // bound listener, or `accept0`'s WouldBlock/`Net.poll` protocol never
+    // engages.
+    if let Some(nonblocking) = net_pending_nonblocking().write().remove(&fd) {
+        dbgnet!("bind0 fd={fd:#x} applying deferred nonblocking={nonblocking}");
+        listener
+            .set_nonblocking(nonblocking)
+            .map_err(|e| net_err(&bind_addr, e))?;
+    }
+
     let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     net_sockets().write().insert(
         fd,
@@ -1078,6 +1108,19 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             return Err(net_err(&conn_addr, e));
         }
     };
+
+    // Apply a `configureBlocking(fd, false)` that was requested while this
+    // fd was still `Unbound` — see `net_pending_nonblocking`. Without this,
+    // `NioSocketImpl.connect(timeout)`'s pre-connect non-blocking flip is
+    // silently lost and the connection comes up in blocking mode, so
+    // `net_read0` never returns `IOStatus.UNAVAILABLE` and the JDK's
+    // SO_TIMEOUT read protocol never engages.
+    if let Some(nonblocking) = net_pending_nonblocking().write().remove(&fd) {
+        dbgnet!("connect0 fd={fd:#x} applying deferred nonblocking={nonblocking}");
+        stream
+            .set_nonblocking(nonblocking)
+            .map_err(|error| net_err("connect0", error))?;
+    }
 
     net_sockets()
         .write()
@@ -1912,18 +1955,41 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             let fd_obj = obj_arg(args, 0)?;
             let blocking = args.get(1).and_then(|value| value.as_int()).unwrap_or(0) != 0;
             let Some(fd) = net_fd_from_descriptor(ctx, fd_obj) else {
+                dbgnet!("configureBlocking: FileDescriptor has no fd id (blocking={blocking})");
                 return Ok(None);
             };
+            // Record the request regardless of the fd's current registry
+            // state. If the fd is still `Unbound` (pre-`connect0`) this is
+            // the ONLY record of it — see `net_pending_nonblocking`.
+            net_pending_nonblocking()
+                .write()
+                .insert(fd, !blocking);
             let map = net_sockets().read();
             match map.get(&fd) {
-                Some(NetSocketHandle::Stream(stream)) => stream
-                    .set_nonblocking(!blocking)
-                    .map_err(|error| net_err("configureBlocking", error))?,
-                Some(NetSocketHandle::Listener(listener)) => listener
-                    .lock()
-                    .set_nonblocking(!blocking)
-                    .map_err(|error| net_err("configureBlocking", error))?,
-                _ => {}
+                Some(NetSocketHandle::Stream(stream)) => {
+                    dbgnet!("configureBlocking fd={fd:#x} kind=stream blocking={blocking}");
+                    stream
+                        .set_nonblocking(!blocking)
+                        .map_err(|error| net_err("configureBlocking", error))?
+                }
+                Some(NetSocketHandle::Listener(listener)) => {
+                    dbgnet!("configureBlocking fd={fd:#x} kind=listener blocking={blocking}");
+                    listener
+                        .lock()
+                        .set_nonblocking(!blocking)
+                        .map_err(|error| net_err("configureBlocking", error))?
+                }
+                other => {
+                    let kind = match other {
+                        Some(NetSocketHandle::Unbound) => "unbound",
+                        Some(NetSocketHandle::Closed) => "closed",
+                        None => "MISSING",
+                        _ => unreachable!(),
+                    };
+                    dbgnet!(
+                        "configureBlocking fd={fd:#x} kind={kind} blocking={blocking} deferred"
+                    );
+                }
             }
             Ok(None)
         },
@@ -2255,6 +2321,73 @@ mod tests {
         assert_eq!(ctx.blocking_region_counts(), (1, 1));
         srv.join().unwrap();
         remove_fd(fd);
+    }
+
+    #[test]
+    fn t19_5_connect0_applies_nonblocking_requested_while_fd_was_unbound() {
+        // Regression for the JettyServletWebServerFactoryTests blocking-read
+        // timeout hang: `NioSocketImpl.connect(timeout)` calls
+        // `IOUtil.configureBlocking(fd, false)` BEFORE `Net.connect0`, while
+        // the fd is still `Unbound` (no live socket to apply it to). That
+        // request must survive the Unbound -> Stream transition, or the
+        // freshly connected stream comes up in (default) blocking mode and
+        // every later `read0` blocks for real instead of returning
+        // `IOStatus.UNAVAILABLE`, defeating the JDK's SO_TIMEOUT protocol.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let srv = thread::spawn(move || {
+            let (s, _) = server.accept().unwrap();
+            // Deliberately never write or close - a genuinely blocking read0
+            // on the client side would hang here instead of returning -2.
+            thread::sleep(Duration::from_millis(300));
+            drop(s);
+        });
+
+        let fd = register_handle(NetSocketHandle::Unbound);
+        // Simulate the `configureBlocking(fd, false)` native call landing
+        // while `fd` is still `Unbound` — exactly what the registered
+        // `sun/nio/ch/IOUtil.configureBlocking` handler records.
+        net_pending_nonblocking().write().insert(fd, true);
+
+        let mut ctx = MockNativeContext::new();
+        let fd_obj = ctx.alloc_object(0);
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd));
+        let addr_obj = ctx.alloc_object(2);
+        let host_str = ctx.create_string("127.0.0.1");
+        ctx.set_field(addr_obj, 1, Value::Object(Some(host_str)));
+
+        let result = net_connect0(
+            &mut ctx,
+            &[
+                Value::Int(0),
+                Value::Object(Some(fd_obj)),
+                Value::Object(Some(addr_obj)),
+                Value::Int(port as i32),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, Some(Value::Int(1)));
+
+        // The deferred request must be consumed, not left dangling.
+        assert!(net_pending_nonblocking().read().get(&fd).is_none());
+
+        // And actually applied: reading with no data available must report
+        // IOStatus.UNAVAILABLE (-2) promptly rather than blocking.
+        let mut buf = [0u8; 8];
+        let addr = buf.as_mut_ptr() as i64;
+        let read_result = net_read0(
+            &mut ctx,
+            &[
+                Value::Object(Some(fd_obj)),
+                Value::Long(addr),
+                Value::Int(buf.len() as i32),
+            ],
+        )
+        .unwrap();
+        assert_eq!(read_result, Some(Value::Int(-2)));
+
+        remove_fd(fd);
+        srv.join().unwrap();
     }
 
     #[test]
