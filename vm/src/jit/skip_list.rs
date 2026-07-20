@@ -108,6 +108,18 @@ pub enum SkipReason {
     /// after tiered compilation. Keep this cold compiler setup method
     /// interpreted until its JIT lowering is understood.
     JavacToolContext,
+    /// Javac's `ClassReader.readClass` corrupts a `Symbol` reference once
+    /// tier-compiled under repeated in-process compilation. Keep this
+    /// classfile-parsing method interpreted until its JIT lowering is
+    /// understood.
+    ClassReaderReadClass,
+    /// Javac's `ClassFinder.complete` has a second, distinct JIT residual in
+    /// the same repeated-in-process-compilation scenario as
+    /// `ClassReaderReadClass` above — a deprecation-warning `-Werror` false
+    /// positive and outright duplicated-token generated source, not an NPE.
+    /// Keep this symbol-completion method interpreted until its JIT lowering
+    /// is understood.
+    ClassFinderComplete,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -363,6 +375,75 @@ fn should_skip_jit_internal(
     // javac package experiment must not re-enable this known corrupting method.
     if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
         return Some(SkipReason::JavacToolContext);
+    }
+
+    // SPRING-TESTCOMPILER.2 (2026-07-20): a second, distinct JIT residual in
+    // the same repeated-in-process-javac-compilation scenario as
+    // SPRING-TESTCOMPILER.1 above, surfacing even with that fix in place.
+    // Standalone, Spring-free repro (no test framework involved):
+    // `ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped ~20x
+    // in one process, each iteration compiling a trivial one-line class,
+    // deterministically starts throwing `java.lang.NullPointerException:
+    // Cannot read field "kind" because "sym" is null` from inside real
+    // javac's own `com.sun.tools.javac.code.Symbol.packge`, reached via
+    // `ClassReader.readClass` -> `readClassBuffer` -> `readClassFile` ->
+    // `ClassFinder.fillIn` -> `Modules$1.complete` (module-graph symbol
+    // completion during `Modules.setupAllModules`). Confirmed JIT-only:
+    // `--nojit` and `CRATONVM_JIT_THRESHOLD=100000` both make all 30
+    // iterations pass; `CRATONVM_JIT_DENY=com/sun/tools/javac/jvm/ClassReader`
+    // isolates it to this one class, and `CRATONVM_JIT_BISECT_SKIP=
+    // com/sun/tools/javac/jvm/ClassReader.readClass` (this exact method
+    // alone) is sufficient — ruling out `Symbol`, `ClassFinder`, and
+    // `Modules` as the miscompiled site despite each appearing in the
+    // stack trace. Not explained by repeated jimage re-reads (a
+    // `NativeImageBuffer.getNativeMap` call-count trace showed zero calls
+    // during the whole loop) or by heap size (identical failure at the
+    // default heap and at `--Xmx 4g`) or by the weak/phantom-reference GC
+    // clearing added in 994ae578b (`CRATONVM_WEAKREF_CLEAR=0` has no
+    // effect) — this is a genuine x64 JIT lowering defect in
+    // `readClass`'s own compiled body, not an accumulating-resource or
+    // GC-pressure artifact. This is very likely the true root cause behind
+    // most of the AOT cluster's `CompilationException: Unable to compile
+    // source` failures in `beans.factory.aot.*CodeGenerator*Tests` (each
+    // test method triggers its own in-process `TestCompiler.compile()`, so
+    // a whole-class run crosses this same tier-up point partway through).
+    // Keep `readClass` interpreted until the x64 lowering bug is found.
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readClass" {
+        return Some(SkipReason::ClassReaderReadClass);
+    }
+
+    // SPRING-TESTCOMPILER.3 (2026-07-20): a THIRD JIT residual in the same
+    // repeated-in-process-javac-compilation scenario as
+    // SPRING-TESTCOMPILER.2 above, surfacing even with `ClassReader.readClass`
+    // already interpreted. Two distinct symptoms trace to this one method:
+    //
+    // (a) `AutowiredAnnotationBeanRegistrationAotContributionTests`'s
+    //     `DeprecationTests` — Spring's `CodeWarnings.detectDeprecation`
+    //     correctly detects the `@Deprecated` member and DOES emit
+    //     `@SuppressWarnings("deprecation")` on the generated method (visible
+    //     in the dumped source), but real javac's `-Werror` still fails the
+    //     compile in "warnings found and -Werror specified" — i.e. the
+    //     suppression annotation is present in the source but not honored,
+    //     which is a javac-internal symbol/annotation-completion defect, not
+    //     a Spring codegen gap.
+    // (b) `BeanDefinitionMethodGeneratorTests` — outright duplicated tokens
+    //     in generated source, e.g. `import import
+    //     org.springframework.aot.generate.Generated;` and a mangled
+    //     `return return BeanInstanceSupplier...withGenerator(.withGenerator(...`
+    //     body — content corruption, not an exception at all, only visible by
+    //     inspecting the dumped source of an otherwise-silent
+    //     `CompilationException`/`IllegalStateException: Unable to parse
+    //     source file content`.
+    //
+    // Bisected the same way as SPRING-TESTCOMPILER.2:
+    // `CRATONVM_JIT_DENY=com/sun/tools/javac/code/ClassFinder` fixes (a)
+    // (14/14 OK, was 11/14); `CRATONVM_JIT_BISECT_SKIP=
+    // com/sun/tools/javac/code/ClassFinder.complete` (this exact method
+    // alone, ruling out `fillIn` despite it being the frame actually named in
+    // SPRING-TESTCOMPILER.2's stack trace) is equally sufficient. Keep
+    // `complete` interpreted until the x64 lowering bug is found.
+    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
+        return Some(SkipReason::ClassFinderComplete);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
