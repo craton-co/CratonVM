@@ -27204,6 +27204,133 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(hash)))
     });
+    // DIAGNOSTIC (temporary, CRATONVM_TRACE_ARRAYS_HASHCODE-gated):
+    // `createLayoutFromConfigClass` (Thymeleaf/Groovy MetaClass hang, see
+    // docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md)
+    // hangs permanently inside real bytecode `jdk.internal.util.ArraysSupport
+    // .hashCode(Object[], int, int, int)`, called from `Arrays.hashCode` on
+    // a `ParameterizedTypeImpl`'s `actualTypeArguments`. This native
+    // override reads the SAME array via `ctx.array_length`/`get_array_element`
+    // (bypassing whatever real-bytecode interpretation issue may be at
+    // fault) so the trace print reveals the array's ACTUAL length at the
+    // moment of the hang — if that's small and sane, the bug is an
+    // interpreter defect in the specific unrolled/vectorized-adjacent
+    // bytecode shape, not data corruption; if it's huge/garbage, the bug is
+    // upstream in how the array was built or GC-relocated. Left registered
+    // unconditionally (not gated on the trace flag) because if it resolves
+    // the hang outright, that's evidence this IS the fix, not just a probe.
+    registry.register(
+        "java/util/Arrays",
+        "hashCode",
+        "([Ljava/lang/Object;)I",
+        |ctx, args| {
+            let arr = match args.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let len = ctx.array_length(arr);
+            let trace = std::env::var_os("CRATONVM_TRACE_ARRAYS_HASHCODE").is_some();
+            if trace {
+                let mut desc = String::new();
+                for i in 0..len {
+                    if i > 0 {
+                        desc.push_str(", ");
+                    }
+                    match ctx.get_array_element(arr, i) {
+                        Value::Object(None) => desc.push_str("null"),
+                        Value::Object(Some(o)) => {
+                            let cid = ctx.class_id_of_object(o);
+                            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+                            let ident = ctx.identity_hash_code(o);
+                            // If it's a TypeVariable (real or our synthetic
+                            // interface-typed stand-in), also show its `name`
+                            // field so distinct-identity-but-same-conceptual-
+                            // variable recurrence is visible directly, not just
+                            // inferred from the identity hash changing. Our
+                            // synthetic stand-ins (`alloc_concurrent_synthetic`
+                            // on the bare `java/lang/reflect/TypeVariable`
+                            // INTERFACE) have no real field-name table --
+                            // `get_field_by_name` can't resolve "name" on
+                            // them -- so read field 0 POSITIONALLY (the
+                            // documented layout: 0=name, 1=bounds,
+                            // 2=genericDeclaration) as well as the by-name
+                            // path (covers real TypeVariableImpl objects,
+                            // whose real field is NOT named "name" either --
+                            // print raw field-0 content either way for a
+                            // real repr fallback).
+                            let tv_name = if cname.contains("TypeVariable") {
+                                match ctx.get_field_by_name(o, "name") {
+                                    Value::Object(Some(s)) => ctx.read_string(s),
+                                    _ => match ctx.get_field(o, 0) {
+                                        Value::Object(Some(s)) => ctx.read_string(s),
+                                        _ => None,
+                                    },
+                                }
+                            } else {
+                                None
+                            };
+                            // Also show the genericDeclaration (field 2 for
+                            // our synthetic layout) so we can tell which
+                            // class/method declared this variable.
+                            let decl_desc = if cname.contains("TypeVariable") {
+                                match ctx.get_field(o, 2) {
+                                    Value::Object(Some(d)) => {
+                                        let dcid = ctx.class_id_of_object(d);
+                                        let dcname =
+                                            ctx.class_name_of_id(dcid).unwrap_or_default();
+                                        // getName() on a Class/Method/Constructor
+                                        // mirror reveals the actual declaration.
+                                        match ctx.invoke_virtual(
+                                            d,
+                                            "getName",
+                                            "()Ljava/lang/String;",
+                                            &[],
+                                        ) {
+                                            Ok(Some(Value::Object(Some(s)))) => {
+                                                ctx.read_string(s).map(|n| format!("{dcname}:{n}"))
+                                            }
+                                            _ => Some(dcname),
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            match (tv_name, decl_desc) {
+                                (Some(n), Some(d)) => desc.push_str(&format!(
+                                    "{cname}@{ident:x}(name={n:?},decl={d})"
+                                )),
+                                (Some(n), None) => {
+                                    desc.push_str(&format!("{cname}@{ident:x}(name={n:?})"))
+                                }
+                                (None, Some(d)) => {
+                                    desc.push_str(&format!("{cname}@{ident:x}(decl={d})"))
+                                }
+                                (None, None) => desc.push_str(&format!("{cname}@{ident:x}")),
+                            }
+                        }
+                        _ => desc.push_str("?"),
+                    }
+                }
+                eprintln!("ARRAYS-HASHCODE-TRACE: Object[] hashCode len={len} elems=[{desc}]");
+            }
+            let mut hash = 1i32;
+            for i in 0..len {
+                let elem_hash = match ctx.get_array_element(arr, i) {
+                    Value::Object(None) => 0,
+                    Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[])
+                    {
+                        Ok(Some(Value::Int(h))) => h,
+                        _ => 0,
+                    },
+                    _ => 0,
+                };
+                hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
+            }
+            Ok(Some(Value::Int(hash)))
+        },
+    );
     // The process controller starts the Host Controller via ProcessBuilder
     // before the regular phase-57 table is visible in this module path.
     crate::phases_late::register_phase57_process(registry);
@@ -44507,7 +44634,7 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 /// to any other Java-level redirection).  Routing through `stream_writeln`
 /// preserves the canonical fd fast path for the original stream while calling
 /// a capture stream's real `OutputStream.write` override after redirection.
-fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
+pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
     ctx.record_printed_line(text.to_string());
     // `NativeContext::get_system_stream` is the process's canonical fd-backed
     // stream. `System.setOut` intentionally leaves that canonical stream in

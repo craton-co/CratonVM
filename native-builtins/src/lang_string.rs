@@ -589,6 +589,42 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(
         class,
+        "insert",
+        "(I[CII)Ljava/lang/StringBuilder;",
+        native_sb_insert_char_array_off_len,
+    );
+    registry.register(
+        class,
+        "insert",
+        "(I[CII)Ljava/lang/StringBuffer;",
+        native_sb_insert_char_array_off_len,
+    );
+    registry.register(
+        class,
+        "insert",
+        "(I[CII)Ljava/lang/AbstractStringBuilder;",
+        native_sb_insert_char_array_off_len,
+    );
+    registry.register(
+        class,
+        "insert",
+        "(I[C)Ljava/lang/StringBuilder;",
+        native_sb_insert_char_array,
+    );
+    registry.register(
+        class,
+        "insert",
+        "(I[C)Ljava/lang/StringBuffer;",
+        native_sb_insert_char_array,
+    );
+    registry.register(
+        class,
+        "insert",
+        "(I[C)Ljava/lang/AbstractStringBuilder;",
+        native_sb_insert_char_array,
+    );
+    registry.register(
+        class,
         "delete",
         "(II)Ljava/lang/StringBuilder;",
         native_sb_delete,
@@ -2770,6 +2806,107 @@ pub(crate) fn native_sb_insert_object(
         _ => "null".to_string(),
     };
     let insert_chars: Vec<u16> = text.encode_utf16().collect();
+    let chars = sb_read_chars(ctx, this);
+    let offset = std::cmp::min(offset, chars.len());
+    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+    result.extend_from_slice(&chars[..offset]);
+    result.extend_from_slice(&insert_chars);
+    result.extend_from_slice(&chars[offset..]);
+    sb_write_chars(ctx, this, &result);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `insert(int, char[], int, int)` — insert a char[] slice at `offset`.
+///
+/// Unlike the other `insert` overloads above, this specific 4-arg signature
+/// had no native override, so real-JDK bytecode for `AbstractStringBuilder
+/// .insert(int, char[], int, int)` ran directly against CratonVM's synthetic
+/// StringBuilder/StringBuffer layout (`char[] buffer` @0, `int count` @1 —
+/// see `native_sb_get_coder`'s doc comment for the full layout mismatch).
+/// That method's real bytecode reads the REAL JDK field `count` (a field
+/// slot that doesn't exist in our synthetic layout, so it reads back 0) and
+/// calls `checkOffset(dstOffset, count)`, which throws
+/// `ArrayIndexOutOfBoundsException` for any nonzero `dstOffset` — exactly
+/// the failure Log4j2's `FormattingInfo.format`/`ColorConverter` hits when
+/// padding a partially-built line (`sbuf.insert(fieldStart, spaces, 0, n)`
+/// with `fieldStart > 0`), producing "An exception occurred processing
+/// Appender STDOUT" and the log line never reaching `System.out`.
+pub(crate) fn native_sb_insert_char_array_off_len(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let arr = match args.get(2) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let src_off = match args.get(3) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let src_len = match args.get(4) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr_len = ctx.array_length(arr);
+    let src_start = src_off.min(arr_len);
+    let src_end = src_off.saturating_add(src_len).min(arr_len);
+    let mut insert_chars = Vec::with_capacity(src_end.saturating_sub(src_start));
+    for i in src_start..src_end {
+        insert_chars.push(match ctx.get_array_element(arr, i) {
+            Value::Int(c) => c as u16,
+            _ => 0,
+        });
+    }
+
+    let chars = sb_read_chars(ctx, this);
+    let offset = std::cmp::min(offset, chars.len());
+    let mut result = Vec::with_capacity(chars.len() + insert_chars.len());
+    result.extend_from_slice(&chars[..offset]);
+    result.extend_from_slice(&insert_chars);
+    result.extend_from_slice(&chars[offset..]);
+    sb_write_chars(ctx, this, &result);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `insert(int, char[])` — full-array variant (no offset/len). Same
+/// synthetic-vs-real-layout rationale as `native_sb_insert_char_array_off_len`
+/// above: `StringBuilder`/`AbstractStringBuilder` both declare this overload
+/// with real (non-`native`) bytecode, which — without a native override —
+/// reads the real-layout `count` field (absent from our synthetic char[]/int
+/// layout) and throws `ArrayIndexOutOfBoundsException` from `checkOffset`.
+pub(crate) fn native_sb_insert_char_array(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let offset = match args.get(1) {
+        Some(Value::Int(i)) => *i as usize,
+        _ => 0,
+    };
+    let arr = match args.get(2) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+    let arr_len = ctx.array_length(arr);
+    let mut insert_chars = Vec::with_capacity(arr_len);
+    for i in 0..arr_len {
+        insert_chars.push(match ctx.get_array_element(arr, i) {
+            Value::Int(c) => c as u16,
+            _ => 0,
+        });
+    }
+
     let chars = sb_read_chars(ctx, this);
     let offset = std::cmp::min(offset, chars.len());
     let mut result = Vec::with_capacity(chars.len() + insert_chars.len());

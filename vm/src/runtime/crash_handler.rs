@@ -985,6 +985,23 @@ mod windows_fault {
             let _ = std::io::Write::flush(&mut err);
         }
 
+        // Best-effort: dump the last-256-dispatch ring on a stack overflow
+        // specifically. The raw/symbolized native stack walks above are
+        // skipped for EXCEPTION_STACK_OVERFLOW (walking an exhausted stack
+        // would itself fault — see the `n = 0` branch above), so the
+        // faulting PC/RVA is otherwise the ONLY clue to what was recursing.
+        // `dispatch_trace` records bytecode-method entries and native
+        // dispatches independently of the native call stack, so it survives
+        // even when the stack itself is unwalkable. Only useful with
+        // `CRATONVM_DBG_LETSGO=1` set (the ring is empty otherwise, but the
+        // dump header still confirms that plainly rather than leaving the
+        // reader to guess). Same best-effort risk profile as the
+        // symbolization step below: if this itself re-faults on the
+        // depleted guard page, the primary report above already persisted.
+        if code == EXCEPTION_STACK_OVERFLOW {
+            crate::dispatch_trace::dump_to_stderr_unconditional("stack-overflow");
+        }
+
         // (4) Best-effort in-process symbolization. dbghelp can itself re-fault
         // on a wrecked thread state; the raw report above is already persisted,
         // so a death here loses nothing actionable.

@@ -1,16 +1,13 @@
 # WildFly boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.AttributeDefinition` initializing `org.jboss.as.remoting` during parallel-extension-add
 
-Status: **PARTIALLY FIXED, MULTI-PRODUCER FAMILY — see "2026-07-19 session (continued once more): a fourth
-producer found and fixed (`Class.forName` mirror stale across `initialize_class`), the doc's own
-originally-named root cause #2 (`compare_via_compare_to`/Comparable) and a fifth, new producer
-(`Object`→`String` MSC service-start CCE) both confirmed still live post-fix** near the bottom for the
-latest status. `08f8190da` (merged to dev as part of `59a3f38c5`) closes a confirmed-live, previously
-self-documented-but-unfixed stale-`ObjectRef` producer and measurably drops the live reproduction rate
-against the exact known-crashing class set (~2-3% pre-fix → 0.87%, 2/229, post-fix). It does **not**
-close the family: a second, structurally different producer (native-collections `compare_via_compare_to`,
-fed by a stale receiver from a **genuinely bytecode-executing** `EnhancedQueueExecutor` worker-thread path
-that bypasses every native shim) reproduced live post-fix with a full captured stack trace — see that
-section for the concrete pickup point. Remains in `docs/known-issues/` accordingly.
+Status: **MULTI-PRODUCER FAMILY, TWO PRODUCERS FIXED AND VERIFIED CLOSED 2026-07-19, TWO REMAIN OPEN** —
+see "2026-07-19 session (continued a fourth time): the doc's own originally-named root cause #2 FOUND and
+FIXED" near the bottom for the latest status. This session fixed and independently verified (0/400 each)
+both the `Class.forName`/`asSubclass` mirror-staleness producer (`4bdae388f`) and the doc's own
+originally-named `compare_via_compare_to`/`Comparator.comparing` producer (`bdfd6cff4`). Two items remain
+open: an undiagnosed fifth producer (`Object cannot be cast to String`, MSC service-start,
+`org.wildfly.extension.metrics.registry`) and the separately-tracked, pre-existing register-invisible-root
+family (see `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`).
 
 **Update, same day, later session:** three unrelated boot blockers (real-vs-synthetic `Module`/
 `ModuleClassLoader` field-layout gaps plus a missing native `findClass` overload registration — see
@@ -749,3 +746,120 @@ namesake "root cause #2" and the one with the most existing investigation alread
 `--nojit` first exactly as previously planned, then use the SAME `CRATONVM_DBG_CCE_BT` instrumentation
 already in `native-collections/src/lib.rs`'s `compare_via_compare_to` (no new instrumentation needed) to
 get the Rust-side call stack straight to the producer.
+
+## 2026-07-19 session (continued a fourth time): the doc's own originally-named root cause #2 FOUND and FIXED
+
+Same worktree/branch as above. Fix commit `bdfd6cff4`, merged to dev as `21e0e8757` (pushed).
+
+### `--nojit` confirms: not JIT-specific either
+
+Following the doc's own pending next step, a 15-wave `CRATONVM_DISABLE_JIT=1` + `CRATONVM_DBG_CCE_BT=1`
+campaign (300 attempts) reproduced the `compare_via_compare_to`/Comparable signature identically under
+pure interpretation -- ruling out a JIT-frame-root-visibility mechanism for this producer too, exactly as
+the fourth producer above turned out not to be JIT-specific. The full diagnostic fired this time:
+
+```
+CRATONVM_DBG_CCE_BT: site=compare_via_compare_to a=java/lang/Object(cid=0) @0x20023ec9440 b=java/lang/String(cid=6) @0x2002a1823a8
+   ... compare_via_compare_to -> natural_compare -> comparator_compare -> tree_compare -> tm_binary_search -> native_tm_put ...
+```
+
+### Root cause
+
+`native_tm_put`'s own pinning discipline (`kh0`/`vh0`, refreshed before `tm_binary_search`) was already
+correct and complete -- Family-1 sweeps had already hardened it. The actual bug was one level deeper, in
+`comparator_compare`'s `CMP_TAG_COMPARING` branch (`native-collections/src/lib.rs`, the native
+implementation backing `Comparator.comparing(keyExtractor)`, which is exactly the shape
+`ResourceDescriptor`'s `CAPABILITY_COMPARATOR` uses):
+
+```rust
+let ka = ctx.invoke_virtual(key_fn, "apply", ..., &[a])?...;   // extracts key from `a`
+let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);          // key_fn refreshed
+let b = read_pinned_elem(ctx, b_pin, b);                       // b refreshed
+let kb = ctx.invoke_virtual(key_fn, "apply", ..., &[b])?...;   // extracts key from `b` -- GC-capable
+natural_compare(ctx, &ka, &kb)                                 // `ka` used RAW, never refreshed
+```
+
+An existing comment already documented that `key_fn` and `b` must be pinned across the *first*
+`invoke_virtual` call because it "can run arbitrary interpreted bytecode ... and trigger a moving GC" --
+but `ka`, the *result* of that first call, was read raw and reused **after** the second `invoke_virtual`
+call, which is exactly as GC-capable as the first. A moving GC landing during the second call (extracting
+`kb`) could relocate `ka`'s underlying object with nothing left to refresh it.
+
+Class id `0` in the diagnostic capture is itself a small trap worth recording: `ClassStore::next_id`
+assigns sequential ids in registration order, and `java.lang.Object` -- always the first class the
+bootstrap loader touches -- gets id `0` in this VM's real bootstrap sequence. Zeroed/never-written heap
+memory *also* reads back as class id `0`. This coincidence means a stale-`ObjectRef` read into reclaimed
+or not-yet-initialized memory doesn't surface as `<unknown>` or garbage -- it resolves cleanly through
+`class_name_of_id(0)` to `"java/lang/Object"`, masking the staleness as a superficially valid, ordinary
+object rather than an obviously-corrupt one. This is worth remembering for any future stale-`ObjectRef`
+hunt in this codebase: a receiver that identifies as plain `java.lang.Object` in a context where that
+makes no application-level sense is itself a signal, not just a data point.
+
+### Fix
+
+Pin `ka` (`pin_value(ctx, ka)`) immediately after the first `apply` call, across the second, and refresh
+via `read_native_pin` immediately before `natural_compare` consumes it -- matching the pin/refresh idiom
+already used for `key_fn`/`b` two lines above it.
+
+### Verification
+
+- `cargo test -p cratonvm-native-collections --lib`: 74 passed, 0 failed.
+- 20-wave x 20-parallel (400 attempts) `CRATONVM_DBG_CCE_BT=1`-armed isolated `standalone.sh` campaign
+  post-fix: **0/400** `site=compare_via_compare_to` reproductions. One unrelated hit in the same batch
+  (`java.lang.ClassCastException: java.lang.Object cannot be cast to
+  org.jboss.as.controller.OperationStepHandler`, generic interpreter `checkcast`, no `compare_via_compare_to`
+  frame) matches the separately-tracked register-invisible-root family
+  (`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`) -- out of scope for this fix,
+  unaffected by it.
+
+### Family status: two producers now fixed and verified closed; two remain
+
+Between this session's two fixes (`4bdae388f` for `Class.forName`/`asSubclass`, `bdfd6cff4` for
+`Comparator.comparing`), both **confirmed-live, previously-undiagnosed** producers this session found are
+now fixed and independently verified at 0/400 each. Two items remain open for whoever continues:
+
+1. **The fifth producer** (`MSC service start() threw ... Object cannot be cast to String ...
+   service=org.wildfly.extension.metrics.registry`) -- still undiagnosed, not yet attempted.
+2. **The broader register-invisible-root family** (`java.lang.Object cannot be cast to <any extension
+   class>` via plain interpreter `checkcast`, no `compare_via_compare_to`/`asSubclass` frame) -- this is
+   the *pre-existing*, long-running, separately-tracked family documented in
+   `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`; it fired twice in this
+   session's own verification batches (`ExtendedPersistenceInheritance`, `OperationStepHandler`) and is
+   explicitly out of scope here -- see that doc for its own status and next steps.
+
+The `xargs -P 20` isolated `standalone.sh` + `CRATONVM_DBG_CCE_BT=1` harness (see "Methodology" above) is
+proven fast and effective at surfacing whichever family member's turn it is next -- reuse it directly.
+
+## 2026-07-19 session (continued a fifth time): the fifth producer attempted, not reproduced -- session wrap-up
+
+Same worktree/branch. Two further campaigns (15-wave, then 20-wave -- 700 combined attempts,
+`CRATONVM_DBG_CCE_BT=1` armed) specifically hunting the fifth producer (`MSC service start() threw
+java/lang/ClassCastException: java.lang.Object cannot be cast to java.lang.String ... marked FAILED, boot
+continues service=org.wildfly.extension.metrics.registry`) did **not** reproduce it again. Across this
+entire session (~1,700+ combined isolated `standalone.sh` attempts across every campaign), it was seen
+exactly **once**, in the batch that first surfaced it -- no paired `CRATONVM_DBG_CCE_BT` diagnostic was
+captured for that one sighting (it fired from `jboss_msc`'s own error-logging path, not through the
+`checkcast`/`compare_via_compare_to`/`asSubclass` sites already instrumented), so its Rust-side producer
+was never identified. The other campaign hits in this window were exclusively the separately-tracked
+register-invisible-root family (plain interpreter `checkcast`, various extension classes) -- consistent
+with, but not proof of, the fifth producer being a fourth sighting of that *same* pre-existing family
+rather than a new, distinct mechanism.
+
+**Status: unresolved, flagged for a future session.** Whoever picks this up should either (a) add
+`CRATONVM_DBG_CCE_BT`-style instrumentation to whatever native backs `jboss_msc`'s service-start
+`ClassCastException` catch/log path so a future sighting captures a receiver identity + backtrace instead
+of just the log line, or (b) switch to the 6-shard Maven/Arquillian harness (see the 2026-07-19 "session:
+one real producer found and fixed" entry above) for higher per-batch volume against a target class set
+that reliably exercises `org.wildfly.extension.metrics`.
+
+### Session summary
+
+Four confirmed-live producers investigated this session; two found, fixed, and independently verified
+closed (0/400 each); one (the docs original root cause #2) was among them. Fixes merged to `dev` as
+`4bdae388f` (`Class.forName`/`asSubclass` mirror staleness across `initialize_class`) and `bdfd6cff4`
+(`Comparator.comparing` first-extracted-key staleness across the second key-extraction call). Both fixes
+follow this codebase's established Family-1 pin/refresh idiom and were verified with matched pre-fix/
+post-fix live-reproduction batches plus `cargo test` regression checks (no new failures beyond confirmed
+pre-existing ones on unpatched `dev`). Two items remain open: the undiagnosed fifth producer above, and
+the pre-existing, separately-tracked register-invisible-root family (its own doc, unaffected by anything
+in this session).

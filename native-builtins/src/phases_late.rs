@@ -11904,13 +11904,53 @@ fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
             return p57_to_os_path(&raw);
         }
     }
-    match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
+    // STACK-OVERFLOW GUARD (found 2026-07-19 investigating a real crash: JIT
+    // method-stats work on an unrelated ES/Lucene test hit
+    // EXCEPTION_STACK_OVERFLOW at gen_heap::get_field, root-caused via the
+    // dispatch_trace ring to `TestRuleTemporaryFilesCleanup.initializeJavaTempDir`
+    // -> native Path.toString() repeating 256/256 times with zero variation).
+    //
+    // This fallback's `invoke_virtual(path_obj, "toString", ...)` was written
+    // assuming dispatch lands somewhere OTHER than back here — either the
+    // (separate) dead-dispatch-to-Object.toString() bug fixed the same day in
+    // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+    // or a genuine delegating wrapper's own real bytecode `toString()`. A
+    // THIRD same-day fix
+    // (`docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
+    // `vm_exec.rs`'s `invoke_on_class_shared_inner`) made dispatch correctly
+    // receiver-aware: ANY Path-subtype receiver's `toString()` now routes
+    // straight back to this exact native (`p57_path_display_string` ->
+    // `p57_read_path`). For a `path_obj` whose field-0 fast-path read keeps
+    // failing (nothing about the object changes between calls), that
+    // redirect recurses into this same function forever — a real, silent
+    // EXCEPTION_STACK_OVERFLOW, not a Java StackOverflowError (native
+    // recursion via `ctx.invoke_virtual` is invisible to every one of the
+    // interpreter's counted recursion guards; see
+    // `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`).
+    //
+    // A thread-local re-entrancy flag breaks the cycle: the first call takes
+    // the real dispatch as before (the common, legitimate delegating-wrapper
+    // case terminates immediately since IT dispatches into different, real
+    // bytecode); a NESTED re-entry into this exact fallback — which can only
+    // happen via the recursive-redirect case above — returns the same benign
+    // empty-string fallback the final `_ =>` arm already uses for other
+    // failures, instead of recursing again.
+    thread_local! {
+        static IN_TOSTRING_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if IN_TOSTRING_FALLBACK.with(|f| f.get()) {
+        return String::new();
+    }
+    IN_TOSTRING_FALLBACK.with(|f| f.set(true));
+    let result = match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => {
             let raw = ctx.read_string(s).unwrap_or_default();
             p57_to_os_path(&raw)
         }
         _ => String::new(),
-    }
+    };
+    IN_TOSTRING_FALLBACK.with(|f| f.set(false));
+    result
 }
 
 /// Convert a Java-style path to an OS-native path.
@@ -43052,6 +43092,7 @@ const NEW13_SESS_TLSID: usize = 2;
 fn new13_build_connector(
     extra_root_ders: &[Vec<u8>],
     danger_skip_native_verify: bool,
+    client_identity: Option<&(String, String)>,
 ) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
@@ -43084,6 +43125,11 @@ fn new13_build_connector(
             }
         }
     }
+    if let Some((cert_pem, key_pem)) = client_identity {
+        let identity = native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())
+            .map_err(|e| format!("client identity: {e}"))?;
+        builder.identity(identity);
+    }
     builder
         .build()
         .map_err(|e| format!("TlsConnector build failed: {}", e))
@@ -43102,6 +43148,14 @@ fn p68_ctx_trust_roots_table(
 ) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>> {
     static T: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn p68_factory_client_identity_table(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, (String, String)>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<usize, (String, String)>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
@@ -43202,6 +43256,26 @@ fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Optio
     crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
 }
 
+fn p68_factory_client_identity(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<(String, String)> {
+    let Value::Object(Some(factory)) = args.first()? else {
+        return None;
+    };
+    if let Some(identity) = p68_factory_client_identity_table()
+        .lock()
+        .get(&(factory.as_ptr() as usize))
+        .cloned()
+    {
+        return Some(identity);
+    }
+    let Value::Object(Some(ssl_context)) = ctx.get_field(*factory, 0) else {
+        return None;
+    };
+    crate::t27_tls::ctx_identity(ctx, ssl_context)
+}
+
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
 fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
@@ -43278,7 +43352,8 @@ fn p68_create_socket_inet_address(
     }
     let extra_roots = p68_factory_trust_roots(ctx, args);
     let java_tm_key = p68_factory_java_tm_key(ctx, args);
-    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+    let client_identity = p68_factory_client_identity(ctx, args);
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, client_identity)
 }
 
 /// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
@@ -43288,6 +43363,7 @@ fn new13_do_create_socket(
     port: u16,
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
+    client_identity: Option<(String, String)>,
 ) -> MethodCallResult {
     #[cfg(unix)]
     let legacy_dsa_context = extra_root_ders.iter().any(|der| {
@@ -43296,7 +43372,7 @@ fn new13_do_create_socket(
             .and_then(|cert| cert.public_key().ok())
             .is_some_and(|key| key.dsa().is_ok())
     });
-    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
+    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some(), client_identity.as_ref())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
@@ -43323,8 +43399,12 @@ fn new13_do_create_socket(
     #[cfg(not(unix))]
     let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
     ctx.end_blocking_region();
-    let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
-        message: e.to_string(),
+    let tls_id = connect_result.map_err(|e| {
+        crate::phases_early::throw_jca_exc(
+            ctx,
+            "javax/net/ssl/SSLHandshakeException",
+            &e.to_string(),
+        )
     })?;
 
     // FIX (netty-https-client-trust): native verification was disabled above
@@ -43549,7 +43629,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // currently-requested protocol. A failure here surfaces
             // immediately to the caller as a KeyManagementException-shaped
             // IOException.
-            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false) {
+            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false, None) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
                 }
@@ -43580,6 +43660,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     p68_ctx_trust_roots_table()
                         .lock()
                         .insert(factory_key, roots);
+                }
+                if let Some(identity) = crate::t27_tls::ctx_identity(ctx, this) {
+                    p68_factory_client_identity_table()
+                        .lock()
+                        .insert(obj.as_ptr() as usize, identity);
                 }
             }
             Ok(Some(Value::Object(Some(obj))))
@@ -43715,7 +43800,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
+            let client_identity = p68_factory_client_identity(ctx, args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key, client_identity)
         },
     );
     // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
@@ -43758,7 +43844,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
+            let client_identity = p68_factory_client_identity(ctx, args);
+            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, client_identity)
         },
     );
     r.register(
@@ -43800,7 +43887,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
+            let client_identity = p68_factory_client_identity(ctx, args);
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key, client_identity)
         },
     );
 
@@ -43828,6 +43916,87 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Handshake already done in createSocket
         Ok(None)
     });
+    // In real-network mode the generic `java.net.Socket` native surface is
+    // deliberately not registered. A TLS socket still carries synthetic
+    // field slots, however, so inherited `Socket.getSoTimeout()` bytecode
+    // reads slot 0 as its private `impl` and invokes `getOption` on the host
+    // String. Apache HttpClient calls this for every TLS connection. Keep the
+    // timeout contract on the concrete TLS class rather than re-enabling the
+    // broad synthetic Socket surface in real-network mode.
+    r.register(ssl_sock, "getSoTimeout", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setSoTimeout", "(I)V", |ctx, args| {
+        let timeout = args.get(1).and_then(Value::as_int).unwrap_or(0);
+        if timeout < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("negative SO_TIMEOUT: {timeout}"),
+            }
+            .into());
+        }
+        Ok(None)
+    });
+    r.register(ssl_sock, "getPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ctx.get_field(this, NEW13_SOCK_PORT).as_int().unwrap_or(0))))
+    });
+    r.register(
+        ssl_sock,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
+                Value::Object(Some(host)) => ctx.read_string(host).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if host.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, NEW13_SOCK_HOST);
+            let port = ctx.get_field(this, NEW13_SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(ssl_sock, "getLocalPort", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(
+        ssl_sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, _args| {
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, _args| {
+            let host = ctx.create_string("127.0.0.1");
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[Value::Object(Some(host)), Value::Int(0)],
+            )
+        },
+    );
     // getSupportedCipherSuites/getEnabledCipherSuites/getSupportedProtocols/
     // getEnabledProtocols — same AbstractMethodError family as TC0622's
     // SSLSession buffer-size gap: the accessors above cover I/O and
@@ -44033,6 +44202,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(if closed { 0 } else { 1 })))
     });
+    // `javax/net/ssl/SSLSocket` had no native registration for these two —
+    // real (inherited `java.net.Socket`) bytecode ran instead, reading this
+    // synthetic object's uninitialized field slots as if they were the real
+    // `impl`/`shutIn`/`shutOut` internals. Same "real bytecode on a synthetic
+    // object" gap as this cluster's other fixes, just for a mechanism that
+    // reads as flaky (garbage field bits) rather than a hard AbstractMethodError:
+    // Apache HttpClient5's `DefaultBHttpClientConnection$1.checkTLS()` calls
+    // `sslSocket.isInputShutdown()` before every entity write and throws
+    // `ConnectionClosedException` if it observes true — hit only by the POST
+    // variant of `connectWithSslBundle` (GET sends no entity, so checkTLS's
+    // write-gated call site is never reached). Real JSSE `SSLSocketImpl`
+    // rejects `shutdownInput`/`shutdownOutput` outright (TLS has no half-close),
+    // so these can never legitimately become true for the lifetime of a real
+    // SSLSocket — always false is the correct, not just convenient, answer.
+    r.register(ssl_sock, "isInputShutdown", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "isOutputShutdown", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
@@ -44043,6 +44232,27 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // instance. A -1 id or short-read of 0 maps to Java EOF (-1) per
     // InputStream.read semantics.
     let ssl_is = "javax/net/ssl/SSLSocketInputStream";
+    fn ssl_socket_read_error(ctx: &mut dyn NativeContext, error: std::io::Error) -> MethodCallFailed {
+        let message = error.to_string();
+        let lower = message.to_ascii_lowercase();
+        // A peer alert can arrive immediately after the client starts its
+        // first application read (TLS 1.3 client-auth rejection is a common
+        // example), even though `createSocket` has returned. JSSE still
+        // exposes this as a handshake failure, not a generic IOException.
+        if lower.contains("alert")
+            || lower.contains("certificate")
+            || lower.contains("handshake")
+            || lower.contains("rustls")
+            || lower.contains("tls")
+        {
+            return crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLHandshakeException",
+                &message,
+            );
+        }
+        RuntimeError::IOException { message }.into()
+    }
     r.register(ssl_is, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
@@ -44053,10 +44263,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         match crate::servlet::s2_tls_read(tls_id, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(ssl_socket_read_error(ctx, e)),
         }
     });
     r.register(ssl_is, "read", "([BII)I", |ctx, args| {
@@ -44097,10 +44304,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(RuntimeError::IOException {
-                message: e.to_string(),
-            }
-            .into()),
+            Err(e) => Err(ssl_socket_read_error(ctx, e)),
         }
     });
     r.register(ssl_is, "available", "()I", |_ctx, _args| {
@@ -72102,7 +72306,7 @@ mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[], false);
+        let c = new13_build_connector(&[], false, None);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -72112,7 +72316,7 @@ mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage], false);
+        let c = new13_build_connector(&[garbage], false, None);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",

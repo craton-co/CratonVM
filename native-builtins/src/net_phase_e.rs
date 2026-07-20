@@ -6077,6 +6077,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // URL.openStream() for every non-http scheme.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
+            } else if ext.starts_with("https://") {
+                // Spring's SimpleClientHttpsRequestFactory applies its
+                // SSLBundle only after the `HttpsURLConnection` type check.
+                // Returning the plain HTTP carrier for HTTPS URLs silently
+                // skipped that branch, leaving the native client on default
+                // trust roots. This concrete JDK subclass preserves the
+                // expected type while the shared HTTP natives own its I/O.
+                "sun/net/www/protocol/https/HttpsURLConnectionImpl"
             } else {
                 "java/net/HttpURLConnection"
             };
@@ -8758,6 +8766,44 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
         }
     });
+    // method()/uri() — public HttpRequest getters. `build()` above allocates
+    // the returned object directly as class `java/net/http/HttpRequest`
+    // (the abstract JDK class itself, not a concrete subclass), so any real
+    // Java bytecode invoking these instance methods resolves against that
+    // abstract declaration (no Code attribute) unless a native is registered
+    // on this exact class name. Only field-0 (method) and field-1 (uri, a
+    // plain String — see `newBuilder`/`uri` above) were previously
+    // read/written internally by this file's own Rust helpers
+    // (`re5_do_request` et al.); nothing exposed them back to Java callers.
+    // Real-world callers building a request via this builder and then
+    // inspecting it as a genuine `HttpRequest` (not just handing it to
+    // `HttpClient.send`) hit `AbstractMethodError: method
+    // java/net/http/HttpRequest.method()Ljava/lang/String; has no Code
+    // attribute` — see
+    // docs/known-issues/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror.md
+    // (Hazelcast's `RestClient.call` calls `request.method()` purely for its
+    // own logging/retry bookkeeping after building the request).
+    r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        match ctx.get_field(request, 0) {
+            m @ Value::Object(Some(_)) => Ok(Some(m)),
+            _ => Ok(Some(Value::Object(Some(ctx.create_string("GET"))))),
+        }
+    });
+    r.register(req, "uri", "()Ljava/net/URI;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let uri_str = match ctx.get_field(request, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let uri_string_obj = ctx.create_string(&uri_str);
+        ctx.invoke(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[Value::Object(Some(uri_string_obj))],
+        )
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
@@ -9346,13 +9392,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
-            // getSocketFactory() is a client-side call (the server uses
-            // createSSLEngine / getServerSocketFactory). Capture the complete
-            // context for native HttpsURLConnection, including anonymous
-            // client contexts: its ClientConfig owns the TLS ticket cache.
-            // This is the reliable capture point because the real JDK
-            // setDefaultSSLSocketFactory bytecode cannot be overridden here.
-            crate::t27_tls::capture_huc_ssl_context(ctx, this);
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -9495,9 +9534,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // A client context commonly has only trust material. Capture
                 // its roots before the next context creation can replace the
                 // thread-local selection used by the rustls engine.
-                crate::t27_tls::set_engine_trust_roots_override(eng);
+                crate::t27_tls::set_engine_trust_roots_override(ctx, eng);
                 if let Some((cert, key)) = identity {
-                    crate::t27_tls::set_engine_identity_override(eng, cert, key);
+                    crate::t27_tls::set_engine_identity_override(ctx, eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
                 // post-handshake trust check can find its TrustManager[]
@@ -9632,7 +9671,13 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                 .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
+            let id = connect_result.map_err(|e| {
+                crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLHandshakeException",
+                    &format!("TLS connect: {e}"),
+                )
+            })?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
@@ -9770,6 +9815,35 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 )),
             }
         },
+    );
+    // The rustls-backed socket is deliberately a synthetic `SSLSocket`, so
+    // real `SSLSocket.getSSLParameters()` bytecode resolves these abstract
+    // declarations directly.  Supply the ordinary no-client-auth defaults
+    // rather than letting Apache HttpComponents fail with AbstractMethodError
+    // while merely inspecting its TLS parameters.
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "getNeedClientAuth",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "getWantClientAuth",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "setNeedClientAuth",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "setWantClientAuth",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
     );
     r.register(
         sf,

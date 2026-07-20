@@ -1,6 +1,95 @@
 # `WebFluxManagementChildContextConfigurationIntegrationTests`: HANG in Hibernate Validator classloader resource lookup (new `dev` regression, unconfirmed root cause)
 
-**Status: OPEN — found 2026-07-19**
+**Status: OPEN (hang itself no longer reproduces as of `dev` a026c2c4c;
+residual failures remain) — found 2026-07-19; broader than webflux,
+confirmed 2026-07-20**
+
+## Update 2026-07-20 (later same day) — hang no longer reproduces at dev tip `a026c2c4c`; not bisected, not this session's fix
+
+Re-ran all 5 classes below (the original plus the 4 found earlier today)
+against a `dev`-tip build merged with an unrelated `origin/dev` fast-forward
+(`54003fb83` → `a026c2c4c`, ~dozens of concurrent commits from other
+sessions in between — this session did not touch anything in the
+classloader/annotation-scanning area). All 4 of today's HANGs now complete:
+`ConfigurationPropertiesTests` 114/114 PASS (39s), `BinderTests` PASS (4s),
+`WebMvcObservationAutoConfigurationTests` PASS (21s). The **original**
+`WebFluxManagementChildContextConfigurationIntegrationTests` also no longer
+hangs, but now surfaces a **different, real failure** instead (1 of 5
+tests, `AnnotationConfigReactiveWebServerApplicationContext` logs "Exception
+encountered during context initialization" — not yet triaged). Not bisected
+to the specific fixing commit (out of scope this session — found this
+entirely as a side effect of re-verifying an unrelated fix's merge); given
+the sheer commit volume in that window this is a "some concurrent session
+fixed it" situation, not a deliberate fix. `SpringApplicationTests` (listed
+below as "possibly the same slowdown") is a red herring — it still fails
+(4/102, down from 12/102 on the pre-fix baseline) but was never actually a
+hang, and its failures don't match this doc's classloader-hang signature at
+all; drop it from this doc's scope.
+
+Keeping this doc OPEN rather than archiving: the hang mechanism itself was
+never root-caused (this update proves it's now gone, not why), and the
+newly-exposed `WebFluxManagementChildContextConfigurationIntegrationTests`
+failure needs its own triage. Whoever picks this up next should start from
+re-confirming this doc's remaining single failure rather than the hang.
+
+## Update 2026-07-20 — 4 more affected classes, CPU-sampled (busy, not parked), pre-existing on unmodified `dev`
+
+Found while fixing
+[`capturedoutput-empty-console-cluster.md`](capturedoutput-empty-console-cluster.md)
+(archived — see
+`../../internal/springboot/capturedoutput-empty-console-cluster-FIXED.md`):
+running `core/spring-boot`'s `ConfigurationPropertiesTests` (114 tests) as a
+full class — not just its one CapturedOutput-affected method — hangs the
+same way, and 3 more classes in unrelated modules do too:
+`core/spring-boot`'s `org.springframework.boot.context.properties.bind.BinderTests`,
+`module/spring-boot-webmvc`'s
+`org.springframework.boot.webmvc.autoconfigure.WebMvcObservationAutoConfigurationTests`
+(HANG as a full class, despite its 2 individually-listed CapturedOutput
+methods now passing — see the archived doc above), and `core/spring-boot`'s
+`org.springframework.boot.SpringApplicationTests` (this one completes but
+takes 150s+ for 102 tests, vs. a few seconds for comparable classes —
+possibly the same underlying slowdown without fully deadlocking).
+
+**Confirmed pre-existing on unmodified `dev`** (not a regression from the
+`capturedoutput` fix): re-ran all 3 hanging classes against a `dev`-tip
+binary built *before* any of that session's changes
+(`cratonvm-dev-baseline-check.exe`, worktree main `C:\craton\CratonVM` at
+`54003fb83`) — identical HANG/slow-FAIL results, byte-for-byte the same
+shape. `ConfigurationPropertiesTests`' `err.log` tail matches this doc's
+existing symptom exactly: `...DEBUG [org.hibernate.validator.internal.xml
+.config.ResourceLoaderHelper] Trying to load META-INF/validation.xml via
+Hibernate Validator's class loader` then nothing further — same last line,
+same silence.
+
+**New evidence: CPU-sampled busy, not parked** (this doc's own "next steps"
+asked for this). Two `Get-Process -Name <exe> | .CPU` samples ~10s apart on
+the hung `ConfigurationPropertiesTests` process showed CPU time climbing
+(18.0s → 31.0s) — the process is doing real work, not blocked on a lock or
+I/O. `CRATONVM_DBG_HANG_SAMPLE=1` (existing sampling probe,
+`interpreter.rs:18738`, prints every 200,000th `execute_invoke_kind` call)
+shows progress reaches call #200,000 quickly (within seconds) but **never
+reaches call #400,000** even after a full 300s window — both with JIT on
+and with `--nojit`. The specific method sampled at #200,000 varies between
+runs (`org.springframework.core.annotation.TypeMappedAnnotations.scan`,
+`java/lang/Thread.getContextClassLoader`, `java/lang/Object.equals`) —
+consistent with a large but apparently-nonterminating amount of reflective
+work (Spring's meta-annotation scanning / classloader delegation), not one
+single fixed infinite loop always hit at the same call. Whether this is a
+genuine infinite loop (e.g., a broken cycle-detection guard in annotation
+meta-scanning under CratonVM's `Class`/annotation mirror equality) or an
+extreme, unbounded slowdown was not determined — the process never produced
+a 3rd `HANG_SAMPLE` line even at a 1200s (20-minute) timeout in one run,
+which favors "genuinely stuck," but this is not conclusively proven.
+
+Not bisected further this session (out of scope — found while chasing an
+unrelated captured-output bug). Whoever picks up this doc's existing "next
+steps" (bisect the ~122-commit window, get a real stack dump) should
+prioritize it given it now spans at least 5 classes across 3 modules, not
+just the original 1.
+
+---
+
+**Status (original, 2026-07-19): OPEN**
 
 ## Symptom
 
@@ -90,6 +179,13 @@ plausible-candidates list, not a confirmed mechanism.
 
 ## Affected classes
 
+**Hang no longer reproduces as of `dev` a026c2c4c** (see the later
+2026-07-20 update above) for all 4 rows below — kept here for history /
+in case it regresses again, not because they're still hanging today.
+
 | Module | Class |
 |---|---|
-| `module/spring-boot-webflux` | `org.springframework.boot.webflux.autoconfigure.actuate.web.WebFluxManagementChildContextConfigurationIntegrationTests` |
+| `module/spring-boot-webflux` | `org.springframework.boot.webflux.autoconfigure.actuate.web.WebFluxManagementChildContextConfigurationIntegrationTests` (hang gone; now a different, untriaged 1/5 test failure — see update above) |
+| `core/spring-boot` | `org.springframework.boot.context.properties.ConfigurationPropertiesTests` (full class; found 2026-07-20, now 114/114 PASS) |
+| `core/spring-boot` | `org.springframework.boot.context.properties.bind.BinderTests` (found 2026-07-20, now PASS) |
+| `module/spring-boot-webmvc` | `org.springframework.boot.webmvc.autoconfigure.WebMvcObservationAutoConfigurationTests` (full class; found 2026-07-20, now PASS) |
