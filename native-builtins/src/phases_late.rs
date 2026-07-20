@@ -11720,9 +11720,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(1)))
         });
 
-        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |_ctx, _args| {
-            // Return a reasonable default: 100GB free
-            Ok(Some(Value::Long(100_000_000_000)))
+        // real-JDK `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
+        // delegate to `FileSystem.getSpace(File, int)` (SPACE_TOTAL=0,
+        // SPACE_FREE=1, SPACE_USABLE=2) rather than being native themselves —
+        // this path is normally shadowed by the direct natives registered on
+        // `java/io/File` itself (see `file_disk_space_bytes` below), but once
+        // any test in the process instruments `java.io.File` via Mockito's
+        // inline mock maker (`@Mock private File f`), the real (redefined)
+        // `File` bytecode runs and reaches this native instead — must return
+        // the same real values, not a hardcoded stub, or a mixed
+        // mocked/real-File test class (e.g. `DiskSpaceHealthIndicatorTests`)
+        // gets a correct answer for the mocked instances but a fake one for
+        // real `File`s in the same JVM process.
+        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let space_type = match args.get(2) {
+                Some(Value::Int(v)) => *v,
+                _ => 2,
+            };
+            let path = file_read_path(ctx, file_ref);
+            let value = file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| {
+                match space_type {
+                    0 => total,
+                    1 => free,
+                    _ => usable,
+                }
+            });
+            Ok(Some(Value::Long(value as i64)))
         });
 
         r.register(fs_cls, "checkAccess", "(Ljava/io/File;I)Z", |ctx, args| {
@@ -15980,6 +16004,68 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
     strip_unc(&result.to_string_lossy())
 }
 
+/// Query real OS disk-space stats for the volume containing `path`, matching
+/// HotSpot's `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
+/// contract: returns `None` (callers report `0`) if `path` does not name an
+/// existing file or directory — real HotSpot does the same rather than
+/// reporting the containing volume's space for a nonexistent path (see
+/// `DiskSpaceHealthIndicatorTests.whenPathDoesNotExistDiskSpaceIsDown`).
+/// Returns `(total, free, usable)` in bytes on success.
+#[cfg(windows)]
+fn file_disk_space_bytes(path: &str) -> Option<(u64, u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    let dir_path = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => path.to_string(),
+        Ok(_) => {
+            let full = win_get_full_path_name(path)?;
+            std::path::Path::new(&full)
+                .parent()?
+                .to_string_lossy()
+                .into_owned()
+        }
+        Err(_) => return None,
+    };
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&dir_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut usable: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut usable, &mut total, &mut free) };
+    if ok == 0 {
+        return None;
+    }
+    Some((total, free, usable))
+}
+
+#[cfg(not(windows))]
+fn file_disk_space_bytes(path: &str) -> Option<(u64, u64, u64)> {
+    if std::fs::metadata(path).is_err() {
+        return None;
+    }
+    let c_path = std::ffi::CString::new(path).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        let block_size = stat.f_frsize as u64;
+        let total = block_size * stat.f_blocks as u64;
+        let free = block_size * stat.f_bfree as u64;
+        let usable = block_size * stat.f_bavail as u64;
+        Some((total, free, usable))
+    }
+}
+
 /// Allocate a new File synthetic with the given path.
 fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
@@ -16773,15 +16859,25 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- Disk space (fallback: return i64::MAX when no OS query is available) ---
-    r.register(file, "getFreeSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    // --- Disk space (real OS query; 0 for a path that does not exist, matching
+    // HotSpot's WinNTFileSystem/UnixFileSystem contract) ---
+    r.register(file, "getFreeSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let free = file_disk_space_bytes(&path).map_or(0, |(_, free, _)| free);
+        Ok(Some(Value::Long(free as i64)))
     });
-    r.register(file, "getTotalSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    r.register(file, "getTotalSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let total = file_disk_space_bytes(&path).map_or(0, |(total, _, _)| total);
+        Ok(Some(Value::Long(total as i64)))
     });
-    r.register(file, "getUsableSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    r.register(file, "getUsableSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let usable = file_disk_space_bytes(&path).map_or(0, |(_, _, usable)| usable);
+        Ok(Some(Value::Long(usable as i64)))
     });
 
     // --- Equality / comparison ---
