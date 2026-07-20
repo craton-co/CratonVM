@@ -113,6 +113,13 @@ pub enum SkipReason {
     /// classfile-parsing method interpreted until its JIT lowering is
     /// understood.
     ClassReaderReadClass,
+    /// Javac's `ClassFinder.complete` has a second, distinct JIT residual in
+    /// the same repeated-in-process-compilation scenario as
+    /// `ClassReaderReadClass` above — a deprecation-warning `-Werror` false
+    /// positive and outright duplicated-token generated source, not an NPE.
+    /// Keep this symbol-completion method interpreted until its JIT lowering
+    /// is understood.
+    ClassFinderComplete,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -403,6 +410,40 @@ fn should_skip_jit_internal(
     // Keep `readClass` interpreted until the x64 lowering bug is found.
     if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readClass" {
         return Some(SkipReason::ClassReaderReadClass);
+    }
+
+    // SPRING-TESTCOMPILER.3 (2026-07-20): a THIRD JIT residual in the same
+    // repeated-in-process-javac-compilation scenario as
+    // SPRING-TESTCOMPILER.2 above, surfacing even with `ClassReader.readClass`
+    // already interpreted. Two distinct symptoms trace to this one method:
+    //
+    // (a) `AutowiredAnnotationBeanRegistrationAotContributionTests`'s
+    //     `DeprecationTests` — Spring's `CodeWarnings.detectDeprecation`
+    //     correctly detects the `@Deprecated` member and DOES emit
+    //     `@SuppressWarnings("deprecation")` on the generated method (visible
+    //     in the dumped source), but real javac's `-Werror` still fails the
+    //     compile in "warnings found and -Werror specified" — i.e. the
+    //     suppression annotation is present in the source but not honored,
+    //     which is a javac-internal symbol/annotation-completion defect, not
+    //     a Spring codegen gap.
+    // (b) `BeanDefinitionMethodGeneratorTests` — outright duplicated tokens
+    //     in generated source, e.g. `import import
+    //     org.springframework.aot.generate.Generated;` and a mangled
+    //     `return return BeanInstanceSupplier...withGenerator(.withGenerator(...`
+    //     body — content corruption, not an exception at all, only visible by
+    //     inspecting the dumped source of an otherwise-silent
+    //     `CompilationException`/`IllegalStateException: Unable to parse
+    //     source file content`.
+    //
+    // Bisected the same way as SPRING-TESTCOMPILER.2:
+    // `CRATONVM_JIT_DENY=com/sun/tools/javac/code/ClassFinder` fixes (a)
+    // (14/14 OK, was 11/14); `CRATONVM_JIT_BISECT_SKIP=
+    // com/sun/tools/javac/code/ClassFinder.complete` (this exact method
+    // alone, ruling out `fillIn` despite it being the frame actually named in
+    // SPRING-TESTCOMPILER.2's stack trace) is equally sufficient. Keep
+    // `complete` interpreted until the x64 lowering bug is found.
+    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
+        return Some(SkipReason::ClassFinderComplete);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
