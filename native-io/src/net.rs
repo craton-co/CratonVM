@@ -617,6 +617,29 @@ fn register_handle(h: NetSocketHandle) -> i32 {
     id
 }
 
+/// Transfer an accepted `sun.nio.ch.Net` stream to a protocol layer that will
+/// own all subsequent I/O (currently the rustls-backed SSLSocket bridge).
+///
+/// The Java `Socket` remains logically closed after this handoff: its original
+/// registry entry is replaced with `Closed`, while the returned `TcpStream`
+/// owns a duplicated OS handle when another transient Arc still exists.
+pub fn take_stream_for_tls(fd: i32) -> Result<TcpStream, String> {
+    let stream = {
+        let mut map = net_sockets().write();
+        match map.insert(fd, NetSocketHandle::Closed) {
+            Some(NetSocketHandle::Stream(stream)) => stream,
+            Some(other) => {
+                map.insert(fd, other);
+                return Err(format!("Net fd {fd:#x} is not an accepted stream"));
+            }
+            None => return Err(format!("Net fd {fd:#x} is not registered")),
+        }
+    };
+    Arc::try_unwrap(stream)
+        .or_else(|shared| shared.try_clone())
+        .map_err(|e| format!("clone Net fd {fd:#x} for TLS: {e}"))
+}
+
 fn close_net_fd(fd: i32) {
     let old = {
         let mut map = net_sockets().write();
@@ -702,16 +725,29 @@ fn net_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
             }
             .into();
         }
+        ErrorKind::AddrInUse => {
+            return RuntimeError::BindException {
+                message: format!("Address already in use: {ctx}: {e}"),
+            }
+            .into();
+        }
+        ErrorKind::AddrNotAvailable => {
+            return RuntimeError::BindException {
+                message: format!("Cannot assign requested address: {ctx}: {e}"),
+            }
+            .into();
+        }
+        ErrorKind::PermissionDenied => {
+            return RuntimeError::BindException {
+                message: format!("Permission denied: {ctx}: {e}"),
+            }
+            .into();
+        }
         _ => {}
     }
     let msg = match e.kind() {
         ErrorKind::ConnectionReset => format!("SocketException: Connection reset: {ctx}: {e}"),
         ErrorKind::ConnectionAborted => format!("SocketException: Connection aborted: {ctx}: {e}"),
-        ErrorKind::AddrInUse => format!("BindException: Address already in use: {ctx}: {e}"),
-        ErrorKind::AddrNotAvailable => {
-            format!("BindException: Cannot assign requested address: {ctx}: {e}")
-        }
-        ErrorKind::PermissionDenied => format!("BindException: Permission denied: {ctx}: {e}"),
         ErrorKind::NotConnected => format!("SocketException: Not connected: {ctx}: {e}"),
         _ => format!("SocketException: {ctx}: {e}"),
     };

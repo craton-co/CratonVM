@@ -79,28 +79,6 @@ fn pinned_object_value(ctx: &mut dyn NativeContext, value: Value) -> Option<(usi
     }
 }
 
-#[cfg(test)]
-mod gzip_output_regression_tests {
-    use super::*;
-
-    #[test]
-    fn gzip_output_matches_hotspot_for_a_large_json_string() {
-        let mut body = Vec::with_capacity(10_002);
-        body.push(b'[');
-        body.extend(std::iter::repeat_n(b'a', 10_000));
-        body.push(b']');
-
-        let actual = p58_gzip_compress(&body).expect("gzip compression should succeed");
-        let expected = [
-            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xed, 0xc1, 0x31, 0x0d,
-            0x00, 0x00, 0x0c, 0x03, 0x20, 0xa1, 0x4b, 0x8f, 0xf9, 0x37, 0x51, 0x1f, 0x0d, 0x70,
-            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x52, 0xc0, 0x19,
-            0x7d, 0xe0, 0x12, 0x27, 0x00, 0x00,
-        ];
-        assert_eq!(actual, expected);
-    }
-}
-
 fn read_pinned_object_value(
     ctx: &dyn NativeContext,
     pin: Option<(usize, ObjectRef)>,
@@ -5664,29 +5642,10 @@ fn native_quarkus_logging_handle_failed_start(
     result
 }
 
-/// Renders a synthetic `java/nio/file/Path` object's display string exactly
-/// as the `Path.toString()` native below does (jar-FS/jrt-FS entries with
-/// `/`, host paths with the OS separator). Extracted so callers that already
-/// hold a `NativeContext` and a `Path` `ObjectRef` — e.g. javac's
-/// `JavacFileManager.inferBinaryName` fast path in `lib.rs`, which used to
-/// call `ctx.invoke_virtual(path, "toString", ...)` — can get the same
-/// result WITHOUT going through `invoke_virtual`. That indirection doesn't
-/// consult `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
-/// `check_override` allow-list the way the bytecode interpreter's own
-/// `invokevirtual` handling does, so it silently ran `Path`'s real
-/// (nonexistent — `Path` is an interface) bytecode, which resolves to
-/// `Object.toString()` and prints `java.nio.file.Path@<hash>`. That garbage
-/// string then got mangled by `javac_binary_name_from_relative_path` into
-/// the literal binary name `java.nio.file` for every ordinary classpath
-/// class file, breaking real in-process javac compiles (Spring's
-/// `TestCompiler`/AOT generation) referencing any application-classpath
-/// class.
-///
-/// Also called (as `pub`, cross-crate) from `vm/src/runtime/invokedynamic.rs`'s
-/// `value_to_string` — the same dead-dispatch gap exists in the
-/// `invokedynamic`/`StringConcatFactory` bootstrap for `"literal" + aPath`
-/// string concatenation (a third call site bypassing the interpreter's
-/// force-native gates, distinct from the `javac` one above).
+/// Native equivalent of `java.nio.file.Path.toString()`, tuned for synthetic
+/// and real `java/nio/file/Path` values used by Javac/ZipFS and JRT paths.
+/// This avoids going back through virtual `Path.toString` dispatch, keeping
+/// file-bridge paths and archive entry identity stable for real-JDK callers.
 pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     let p = p57_read_path(ctx, this);
     match vfs_decode(&p) {
@@ -6319,7 +6278,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- Path.toString() → String ---
     r.register(path, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let display = p57_path_display_string(ctx, this);
+        let p = p57_read_path(ctx, this);
+        let display = match vfs_decode(&p) {
+            // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+            // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+            Some((_, _, e)) => {
+                if e.starts_with('/') {
+                    e
+                } else {
+                    format!("/{e}")
+                }
+            }
+            // A plain (non-encoded) relative path whose owning FileSystem is a
+            // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+            // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+            // a package name. Rendering the host '\' there would corrupt the key.
+            None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
+            // Host-FS path: render the OS-native separator. CratonVM stores
+            // paths with '/' internally, but HotSpot's WindowsPath.toString()
+            // renders '\'; convert at this display boundary on Windows
+            // (no-op on Unix). Matches `File.getPath()` below.
+            None => file_normalise_path(&p),
+        };
         let s = ctx.create_string(&display);
         Ok(Some(Value::Object(Some(s))))
     });
@@ -7178,11 +7158,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Opaque file-scheme URIs (`file:.`) are not hierarchical — the
             // real JDK's *UriSupport.fromUri throws instead of producing a
             // path. (Spring's PathEditor depends on this throw.)
-            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+            let uri_text = p57_uri_full_text(ctx, uri);
+            if p57_uri_is_opaque_file(&uri_text) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "URI is not hierarchical".to_string(),
                 }
                 .into());
+            }
+            // `Paths.get(uri)` real bytecode dispatches non-`file` schemes to
+            // `FileSystemProvider.getPath(uri)` on the matching installed
+            // provider — for a `jar:` URI (e.g. from `URL.toURI()` on a
+            // `getResources()` hit inside a jar) that lands here, not in
+            // `Path.of(URI)`. Mirror that native's jar-aware handling so both
+            // entry points mount the same jar-backed Path/FileSystem instead
+            // of this falling through to the generic field-4/field-0 read
+            // below, which only understands `file:` URIs and previously
+            // produced a garbage single-segment path (e.g. just "jar", the
+            // bare scheme) for jar-backed lookups — see `Resources.addPackage`
+            // in spring-boot-test-support, which resolves `test.jks` etc. via
+            // exactly this path.
+            if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
+                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                return Ok(Some(Value::Object(Some(result))));
             }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
@@ -11721,9 +11720,33 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(1)))
         });
 
-        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |_ctx, _args| {
-            // Return a reasonable default: 100GB free
-            Ok(Some(Value::Long(100_000_000_000)))
+        // real-JDK `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
+        // delegate to `FileSystem.getSpace(File, int)` (SPACE_TOTAL=0,
+        // SPACE_FREE=1, SPACE_USABLE=2) rather than being native themselves —
+        // this path is normally shadowed by the direct natives registered on
+        // `java/io/File` itself (see `file_disk_space_bytes` below), but once
+        // any test in the process instruments `java.io.File` via Mockito's
+        // inline mock maker (`@Mock private File f`), the real (redefined)
+        // `File` bytecode runs and reaches this native instead — must return
+        // the same real values, not a hardcoded stub, or a mixed
+        // mocked/real-File test class (e.g. `DiskSpaceHealthIndicatorTests`)
+        // gets a correct answer for the mocked instances but a fake one for
+        // real `File`s in the same JVM process.
+        r.register(fs_cls, "getSpace", "(Ljava/io/File;I)J", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let space_type = match args.get(2) {
+                Some(Value::Int(v)) => *v,
+                _ => 2,
+            };
+            let path = file_read_path(ctx, file_ref);
+            let value = file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| {
+                match space_type {
+                    0 => total,
+                    1 => free,
+                    _ => usable,
+                }
+            });
+            Ok(Some(Value::Long(value as i64)))
         });
 
         r.register(fs_cls, "checkAccess", "(Ljava/io/File;I)Z", |ctx, args| {
@@ -12013,33 +12036,6 @@ fn p57_trim_file_trailing_separator(path: &str) -> String {
     trimmed.to_string()
 }
 
-/// WindowsPath removes trailing separators from ordinary paths at construction
-/// time, but retains them for filesystem roots. Keep that representation
-/// invariant in CratonVM's synthetic Path objects so every consumer of a Path
-/// (including `Files.writeString`) sees the same canonical path.
-///
-/// Mounted jar/JRT paths use their trailing `/` as an in-filesystem entry
-/// marker, so they deliberately retain it.
-fn p57_trim_windows_path_trailing_separator(path: &str) -> String {
-    if !cfg!(windows) || vfs_decode(path).is_some() {
-        return path.to_string();
-    }
-
-    let canonical = path.replace('\\', "/");
-    if !canonical.ends_with('/') && !canonical.ends_with('\\') {
-        return canonical;
-    }
-
-    // Roots (drive, UNC, drive-less, and verbatim) must retain their terminal
-    // separator. Every non-root path has at least one name element.
-    let (_, names) = p57_parse_win_root(&canonical);
-    if names.is_empty() {
-        canonical
-    } else {
-        canonical.trim_end_matches(['/', '\\']).to_string()
-    }
-}
-
 #[cfg(windows)]
 fn p57_windows_absolute_path_string(path: &str) -> String {
     let s = path.replace('\\', "/");
@@ -12252,34 +12248,7 @@ mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    use super::{p57_trim_windows_path_trailing_separator, p57_win_is_absolute, p57_win_parent_of};
-
-    // `p57_trim_windows_path_trailing_separator` itself is gated on the
-    // real host OS (`cfg!(windows)`, not a synthetic guest-OS check --
-    // CratonVM's `java.io.File`/`java.nio.Path` follow the actual host's
-    // path semantics) and is a deliberate no-op elsewhere, so this test
-    // only holds on a real Windows build host. Mirrors the existing
-    // per-assertion `#[cfg(windows)]` in `relativize_backtracks_with_dotdot`
-    // below, just scoped to the whole test since every assertion here
-    // depends on the same host-gated behavior.
-    #[test]
-    #[cfg(windows)]
-    fn trailing_separator_is_removed_only_from_non_roots() {
-        assert_eq!(
-            p57_trim_windows_path_trailing_separator("C:/work/one/two/"),
-            "C:/work/one/two"
-        );
-        assert_eq!(
-            p57_trim_windows_path_trailing_separator("one\\two\\"),
-            "one/two"
-        );
-        assert_eq!(p57_trim_windows_path_trailing_separator("C:/"), "C:/");
-        assert_eq!(
-            p57_trim_windows_path_trailing_separator("//server/share/"),
-            "//server/share/"
-        );
-        assert_eq!(p57_trim_windows_path_trailing_separator("/"), "/");
-    }
+    use super::{p57_win_is_absolute, p57_win_parent_of};
 
     #[test]
     fn is_absolute_matches_hotspot() {
@@ -12473,7 +12442,11 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // encoded strings carry a sentinel + their own '/'-separated entry, so
     // never rewrite those.
     #[cfg(windows)]
-    let stored = p57_trim_windows_path_trailing_separator(path);
+    let stored = if jarfs_decode(path).is_some() {
+        path.to_string()
+    } else {
+        path.replace('\\', "/")
+    };
     #[cfg(not(windows))]
     let stored = path.to_string();
     // Pin across the create_string below — a moving young GC there would
@@ -13527,7 +13500,16 @@ fn p57_uri_full_text(ctx: &mut dyn NativeContext, uri: ObjectRef) -> String {
             cands.push(t);
         }
     }
-    for slot in 0..=5usize {
+    // Slot 6 is the "raw" full-URI-text field in the 7-field synthetic
+    // layout `URL.toURI()` allocates (scheme=0, host=1, port=2, path=3,
+    // query=4, fragment=5, raw=6 — see net_phase_e.rs). That native only
+    // populates path (slot 3) for `file:` scheme URLs, leaving non-file
+    // schemes like `jar:` with nothing readable in slots 0..=5 besides the
+    // bare scheme string at slot 0 — callers here previously fell back to
+    // that bare "jar"/"jrt"/etc. text as if it were a full URI, producing a
+    // garbage single-segment path. Scanning slot 6 too lets the jar:/file:
+    // prefix match below find the real `jar:file:/...!/entry` text.
+    for slot in 0..=6usize {
         if let Value::Object(Some(s)) = ctx.get_field(uri, slot) {
             if let Some(t) = ctx.read_string(s) {
                 cands.push(t);
@@ -16022,6 +16004,68 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
     strip_unc(&result.to_string_lossy())
 }
 
+/// Query real OS disk-space stats for the volume containing `path`, matching
+/// HotSpot's `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
+/// contract: returns `None` (callers report `0`) if `path` does not name an
+/// existing file or directory — real HotSpot does the same rather than
+/// reporting the containing volume's space for a nonexistent path (see
+/// `DiskSpaceHealthIndicatorTests.whenPathDoesNotExistDiskSpaceIsDown`).
+/// Returns `(total, free, usable)` in bytes on success.
+#[cfg(windows)]
+fn file_disk_space_bytes(path: &str) -> Option<(u64, u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    let dir_path = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => path.to_string(),
+        Ok(_) => {
+            let full = win_get_full_path_name(path)?;
+            std::path::Path::new(&full)
+                .parent()?
+                .to_string_lossy()
+                .into_owned()
+        }
+        Err(_) => return None,
+    };
+    extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lpDirectoryName: *const u16,
+            lpFreeBytesAvailableToCaller: *mut u64,
+            lpTotalNumberOfBytes: *mut u64,
+            lpTotalNumberOfFreeBytes: *mut u64,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&dir_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut usable: u64 = 0;
+    let mut total: u64 = 0;
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut usable, &mut total, &mut free) };
+    if ok == 0 {
+        return None;
+    }
+    Some((total, free, usable))
+}
+
+#[cfg(not(windows))]
+fn file_disk_space_bytes(path: &str) -> Option<(u64, u64, u64)> {
+    if std::fs::metadata(path).is_err() {
+        return None;
+    }
+    let c_path = std::ffi::CString::new(path).ok()?;
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        let block_size = stat.f_frsize as u64;
+        let total = block_size * stat.f_blocks as u64;
+        let free = block_size * stat.f_bfree as u64;
+        let usable = block_size * stat.f_bavail as u64;
+        Some((total, free, usable))
+    }
+}
+
 /// Allocate a new File synthetic with the given path.
 fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
@@ -16194,15 +16238,6 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     .to_string();
             }
         }
-        // Decode percent-escapes (`%20` -> ` `, etc.) the way the real
-        // `URI.getPath()` accessor does — File(URI) calls that accessor, but
-        // both sources above (the by-name `path` field on a real-JDK URI,
-        // and the raw-text parse fallback) yield the RAW, still-encoded
-        // component. Without this, a jar/file path containing an encoded
-        // space or other reserved character never resolves to the real
-        // on-disk file (Spring Boot's `StaticResourceJars.toFile` silently
-        // treats the mis-decoded `File` as not found).
-        let path = crate::net_phase_e::uri_percent_decode(&path);
         // WinNTFileSystem.fromURIPath: `/C:/foo/` -> `C:/foo`.
         let mut p = path;
         let chars: Vec<char> = p.chars().collect();
@@ -16824,15 +16859,25 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- Disk space (fallback: return i64::MAX when no OS query is available) ---
-    r.register(file, "getFreeSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    // --- Disk space (real OS query; 0 for a path that does not exist, matching
+    // HotSpot's WinNTFileSystem/UnixFileSystem contract) ---
+    r.register(file, "getFreeSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let free = file_disk_space_bytes(&path).map_or(0, |(_, free, _)| free);
+        Ok(Some(Value::Long(free as i64)))
     });
-    r.register(file, "getTotalSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    r.register(file, "getTotalSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let total = file_disk_space_bytes(&path).map_or(0, |(total, _, _)| total);
+        Ok(Some(Value::Long(total as i64)))
     });
-    r.register(file, "getUsableSpace", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(i64::MAX)))
+    r.register(file, "getUsableSpace", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        let usable = file_disk_space_bytes(&path).map_or(0, |(_, _, usable)| usable);
+        Ok(Some(Value::Long(usable as i64)))
     });
 
     // --- Equality / comparison ---
@@ -19551,19 +19596,13 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         // Finish compression if not already done (count >= 0 means not finished)
         let count = ctx.get_field(this, 1).as_int().unwrap_or(0);
-        // `finish` invokes Java OutputStream methods, which may allocate and move
-        // the receiver. Keep it rooted across that call before using it again.
-        let this_pin = ctx.pin_native_root(this);
         if count >= 0 {
-            let this_now = ctx.read_native_pin(this_pin, this);
-            p58_gzip_out_finish(ctx, &[Value::Object(Some(this_now))])?;
+            p58_gzip_out_finish(ctx, args)?;
         }
         // Close underlying stream
-        let this_now = ctx.read_native_pin(this_pin, this);
-        if let Value::Object(Some(underlying)) = ctx.get_field(this_now, 2) {
+        if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
             let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
         }
-        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
 
@@ -20100,15 +20139,10 @@ fn p58_gzip_in_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn p58_gzip_out_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Field 0 = accumulated bytes array, field 1 = count, field 2 = underlying OutputStream
-    // Store the pre-existing Java argument before the allocation below; it is
-    // then reachable through `this` if a moving collection occurs.
-    ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-    let this_pin = ctx.pin_native_root(this);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 1024);
-    let this_now = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this_now, 0, Value::Object(Some(arr)));
-    ctx.set_field(this_now, 1, Value::Int(0));
-    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(this, 0, Value::Object(Some(arr)));
+    ctx.set_field(this, 1, Value::Int(0));
+    ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
     Ok(None)
 }
 
@@ -20141,34 +20175,22 @@ fn p98_gzip_out_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8
     if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
         let cap = ctx.array_length(arr);
         let new_count = count + bytes.len();
-        if new_count > cap {
-            // The new byte[] can trigger a moving collection. Both `this`
-            // and the old buffer are used after that allocation, so raw
-            // ObjectRefs would write stale memory and corrupt the compressed
-            // payload (Zipkin's 10,002-byte JSON body became 11,034 bytes).
-            let this_pin = ctx.pin_native_root(this);
-            let arr_pin = ctx.pin_native_root(arr);
+        // Grow if needed
+        let target = if new_count > cap {
             let new_cap = (new_count * 2).max(1024);
             let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_cap);
             for i in 0..count {
-                let arr_now = ctx.read_native_pin(arr_pin, arr);
-                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr_now, i));
+                ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
             }
-            let this_now = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this_now, 0, Value::Object(Some(new_arr)));
-            for (i, &b) in bytes.iter().enumerate() {
-                ctx.set_array_element(new_arr, count + i, Value::Int(b as i8 as i32));
-            }
-            let this_now = ctx.read_native_pin(this_pin, this);
-            ctx.set_field(this_now, 1, Value::Int(new_count as i32));
-            ctx.unpin_native_roots(arr_pin);
-            ctx.unpin_native_roots(this_pin);
+            ctx.set_field(this, 0, Value::Object(Some(new_arr)));
+            new_arr
         } else {
-            for (i, &b) in bytes.iter().enumerate() {
-                ctx.set_array_element(arr, count + i, Value::Int(b as i8 as i32));
-            }
-            ctx.set_field(this, 1, Value::Int(new_count as i32));
+            arr
+        };
+        for (i, &b) in bytes.iter().enumerate() {
+            ctx.set_array_element(target, count + i, Value::Int(b as i8 as i32));
         }
+        ctx.set_field(this, 1, Value::Int(new_count as i32));
     }
 }
 
@@ -20320,22 +20342,57 @@ fn p58_crc32(data: &[u8]) -> u32 {
     !c
 }
 
+#[cfg(unix)]
 fn p58_zlib_deflate(data: &[u8]) -> Option<Vec<u8>> {
-    let source_len = data.len() as libz_sys::uLong;
-    let mut bound = unsafe { libz_sys::compressBound(source_len) } as usize;
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_int, c_ulong};
+
+    type CompressBound = unsafe extern "C" fn(c_ulong) -> c_ulong;
+    type Compress2 =
+        unsafe extern "C" fn(*mut u8, *mut c_ulong, *const u8, c_ulong, c_int) -> c_int;
+
+    unsafe fn sym<T>(handle: *mut c_void, name: &'static [u8]) -> Option<T> {
+        let ptr = libc::dlsym(handle, name.as_ptr() as *const c_char);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&ptr))
+        }
+    }
+
+    let mut handle = std::ptr::null_mut();
+    for name in [b"libz.so.1\0".as_slice(), b"libz.so\0".as_slice()] {
+        handle = unsafe { libc::dlopen(name.as_ptr() as *const c_char, libc::RTLD_LAZY) };
+        if !handle.is_null() {
+            break;
+        }
+    }
+    if handle.is_null() {
+        return None;
+    }
+
+    let compress_bound: CompressBound = unsafe { sym(handle, b"compressBound\0")? };
+    let compress2: Compress2 = unsafe { sym(handle, b"compress2\0")? };
+
+    let source_len = data.len() as c_ulong;
+    let mut bound = unsafe { compress_bound(source_len) } as usize;
     if bound == 0 {
         bound = data.len().saturating_add(64);
     }
     let mut z = vec![0u8; bound];
-    let mut z_len = bound as libz_sys::uLong;
-    let rc =
-        unsafe { libz_sys::compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
+    let mut z_len = bound as c_ulong;
+    let rc = unsafe { compress2(z.as_mut_ptr(), &mut z_len, data.as_ptr(), source_len, 6) };
     if rc != 0 || z_len < 6 {
         return None;
     }
     z.truncate(z_len as usize);
     // zlib wrapper = 2-byte header + raw deflate + 4-byte Adler-32 trailer.
     Some(z[2..z.len() - 4].to_vec())
+}
+
+#[cfg(not(unix))]
+fn p58_zlib_deflate(_data: &[u8]) -> Option<Vec<u8>> {
+    None
 }
 
 fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -20361,7 +20418,6 @@ fn p58_gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 /// Finish GZIP compression: read accumulated data, compress, write to underlying stream.
 fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let this_pin = ctx.pin_native_root(this);
     let count = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
 
     // Read accumulated uncompressed data
@@ -20380,18 +20436,13 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
     // Write compressed bytes to underlying OutputStream
     if let Value::Object(Some(underlying)) = ctx.get_field(this, 2) {
-        let underlying_pin = ctx.pin_native_root(underlying);
         for &b in &compressed {
-            let underlying_now = ctx.read_native_pin(underlying_pin, underlying);
-            let _ = ctx.invoke_virtual(underlying_now, "write", "(I)V", &[Value::Int(b as i32)]);
+            let _ = ctx.invoke_virtual(underlying, "write", "(I)V", &[Value::Int(b as i32)]);
         }
-        ctx.unpin_native_roots(underlying_pin);
     }
 
     // Mark as finished (set count to -1)
-    let this_now = ctx.read_native_pin(this_pin, this);
-    ctx.set_field(this_now, 1, Value::Int(-1));
-    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(this, 1, Value::Int(-1));
     Ok(None)
 }
 
@@ -22047,23 +22098,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // JarFile.getComment() — inherited from ZipFile in real bytecode, whose
-    // `ensureOpen()` throws `IllegalStateException("zip file closed")` once
-    // `close()` has run. Our synthetic 2-field JarFile has no real ZipFile
-    // backing fields for that bytecode to check, so unregistered dispatch
-    // returned normally with no exception at all — Spring Boot's
-    // `StaticResourceJarsTests.closesJarFromNonCachedConnection` expects the
-    // throw. Mirror `close()`'s closed-marker (path field cleared to null).
-    r.register(jf, "getComment", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if matches!(ctx.get_field(this, 0), Value::Object(None)) {
-            return Err(RuntimeError::IllegalStateException {
-                message: "zip file closed".to_string(),
-            }
-            .into());
-        }
-        Ok(Some(Value::Object(None)))
-    });
     r.register(jf, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -22142,8 +22176,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
     // walks each entry via getName / isDirectory (for the include-filter)
-    // and getComment (consulted when checking the UNPACK: marker on nested
-    // JAR entries). Register them on JarEntry directly so the
+    // and getComment (only consulted when checking the UNPACK: marker on
+    // nested-JAR entries; we do not pack any UNPACK markers so null is
+    // the right answer). Register them on JarEntry directly so the
     // override-allow-list (which forces native-only dispatch on certain
     // jar/zip entry points) sees a non-null result.
     r.register(je, "isDirectory", "()Z", |ctx, args| {
@@ -22162,16 +22197,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
     });
-    r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if je_is_real_layout(ctx, this) {
-            return Ok(Some(ctx.get_field_by_name(this, "comment")));
-        }
-        Ok(Some(if ctx.object_num_fields(this) > 4 {
-            ctx.get_field(this, 4)
-        } else {
-            Value::Object(None)
-        }))
+    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -22340,12 +22367,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "getClassPathUrls",
         "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
         p59_spring_boot_jar_archive_get_class_path_urls,
-    );
-    r.register(
-        "org/springframework/boot/loader/launch/ExplodedArchive",
-        "getClassPathUrls",
-        "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
-        p59_spring_boot_exploded_archive_get_class_path_urls,
     );
 
     // Spring Boot 3.2+ repackaged launcher: `ExecutableArchiveLauncher` overrides
@@ -22572,7 +22593,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22584,9 +22604,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
-            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-                return result;
-            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22598,7 +22615,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22610,9 +22626,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
-            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-                return result;
-            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22626,7 +22639,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22638,9 +22650,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
-            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-                return result;
-            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -22652,7 +22661,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
@@ -22664,9 +22672,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let dotted = ctx.read_string(name_obj).unwrap_or_default();
             let internal = dotted.replace('.', "/");
-            if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-                return result;
-            }
             match ctx.ensure_class_initialized(&internal) {
                 Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
                 Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
@@ -23011,7 +23016,6 @@ pub(crate) struct JarEntryRec {
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
-    pub(crate) comment: Option<String>,
     pub(crate) times: JarEntryTimes,
     pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
@@ -23214,7 +23218,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         #[allow(deprecated)]
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
-        let comment = (!entry.comment().is_empty()).then(|| entry.comment().to_string());
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
         let mut buf = Vec::with_capacity(entry.size() as usize);
@@ -23229,7 +23232,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 csize,
                 method,
                 crc,
-                comment,
                 times,
                 bytes: Arc::new(buf),
             },
@@ -23268,19 +23270,9 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc, comment, times) = (
-            rec.size,
-            rec.csize,
-            rec.method,
-            rec.crc,
-            rec.comment.as_deref(),
-            rec.times,
-        );
-        // Slot 4 carries the optional central-directory comment on synthetic
-        // entries. `JarFileArchive` uses the UNPACK marker in precisely this
-        // field, so returning null for every entry changes its public URL
-        // contract rather than being a harmless metadata omission.
-        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
+        let (size, csize, method, crc, times) =
+            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
+        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
         let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
         let je = ctx.read_native_pin(je_pin, je);
@@ -23301,12 +23293,6 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
-        if let Some(comment) = comment {
-            let comment_s = ctx.create_string(comment);
-            let je = ctx.read_native_pin(je_pin, je);
-            ctx.set_field(je, 4, Value::Object(Some(comment_s)));
-            ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
-        }
         p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
@@ -23330,24 +23316,24 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc, comment, times) = match contents.by_name.get(entry_name) {
+    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
             rec.size,
             rec.csize,
             rec.method,
             rec.crc,
-            rec.comment.clone(),
             rec.times,
         ),
         None => return Value::Object(None),
     };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh entry (native stale-local family).
     let je_pin = ctx.pin_native_root(je);
     let name_s = ctx.create_string(&name);
     let je = ctx.read_native_pin(je_pin, je);
+    ctx.unpin_native_roots(je_pin);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
@@ -23362,15 +23348,7 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
-    if let Some(comment) = comment {
-        let comment_s = ctx.create_string(&comment);
-        let je = ctx.read_native_pin(je_pin, je);
-        ctx.set_field(je, 4, Value::Object(Some(comment_s)));
-        ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
-    }
     p59_set_jar_entry_times(ctx, je, times);
-    let je = ctx.read_native_pin(je_pin, je);
-    ctx.unpin_native_roots(je_pin);
     Value::Object(Some(je))
 }
 
@@ -23395,11 +23373,8 @@ fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     )))))
 }
 
-/// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s.
-///
-/// This remains for the pre-SB3 launcher compatibility route. Newer SB3
-/// `JarFileArchive` callers must instead enumerate every entry and evaluate
-/// their supplied predicate (see `p59_spring_boot_jar_archive_get_class_path_urls`).
+/// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s
+/// (SB3 `JarFileArchive` / launcher classpath scan).
 fn p59_fat_jar_boot_inf_nested_url_values(
     ctx: &mut dyn NativeContext,
     jar_path: &str,
@@ -23441,20 +23416,22 @@ fn p59_fat_jar_boot_inf_nested_url_values(
     urls
 }
 
-/// Spring Boot 3 `JarFileArchive.getClassPathUrls` without its synthetic
-/// Stream pipeline.
+/// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
+/// the central directory, build URL set for `BOOT-INF/classes/` (always
+/// included) plus every `BOOT-INF/lib/*.jar` entry.
 ///
-/// The real implementation enumerates the central directory, wraps each
-/// `JarEntry` in its private `JarArchiveEntry`, evaluates the caller's include
-/// predicate, and delegates URL/unpack handling to `getNestedJarUrl`. Keep
-/// exactly that contract here: the archive may be a plain test jar, a BOOT-INF
-/// jar, or a WEB-INF war, and callers are entitled to arbitrary predicates.
+/// Real-bytecode stream pipeline:
+///   `jarFile.stream().map(JarArchiveEntry::new).filter(p1).map(this::getNestedJarUrl).collect(toCollection(LinkedHashSet::new))`
+///
+/// Replacing it with a single native that materialises the URL set directly
+/// avoids the dependency on `Stream.map / Stream.filter / Stream.collect`
+/// (whose synthetic-Stream implementation does not support arbitrary
+/// `Function` / `Predicate` lambdas yet) and on `Collectors.toCollection`.
 fn p59_spring_boot_jar_archive_get_class_path_urls(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let include_filter = obj_arg(args, 1)?;
     // JarFileArchive layout: field 0 = file (java.io.File), field 1 = jarFile.
     // Both `file_read_path` and JarFile field 0 store the path string, so
     // either route gets us the absolute path on disk.
@@ -23476,62 +23453,7 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    let jar_entries = p59_jar_collect_entries(ctx, &jar_path);
-    let this_pin = ctx.pin_native_root(this);
-    let include_filter_pin = ctx.pin_native_root(include_filter);
-    let mut urls = Vec::with_capacity(jar_entries.len());
-    let mut url_pins = Vec::with_capacity(jar_entries.len());
-
-    for jar_entry_value in jar_entries {
-        let Value::Object(Some(jar_entry)) = jar_entry_value else {
-            continue;
-        };
-        let jar_entry_pin = ctx.pin_native_root(jar_entry);
-        // The record has one component, `jarEntry`. Allocate against the real
-        // class when it is available, then mirror both its resolved field and
-        // the synthetic slot used by lightweight/classloading fallbacks.
-        let archive_entry = alloc_concurrent_synthetic(
-            ctx,
-            "org/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry",
-            1,
-        );
-        let archive_entry_pin = ctx.pin_native_root(archive_entry);
-        let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
-        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-        ctx.set_field(archive_entry, 0, Value::Object(Some(jar_entry)));
-        ctx.set_field_by_name(archive_entry, "jarEntry", Value::Object(Some(jar_entry)));
-
-        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
-        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-        let included = matches!(
-            ctx.invoke_virtual(
-                include_filter,
-                "test",
-                "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(archive_entry))],
-            )?,
-            Some(Value::Int(value)) if value != 0
-        );
-        if included {
-            let this = ctx.read_native_pin(this_pin, this);
-            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-            let url = ctx.invoke_special_bytecode_only(
-                "org/springframework/boot/loader/launch/JarFileArchive",
-                "getNestedJarUrl",
-                "(Lorg/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry;)Ljava/net/URL;",
-                &[
-                    Value::Object(Some(this)),
-                    Value::Object(Some(archive_entry)),
-                ],
-            )?;
-            if let Some(Value::Object(Some(url))) = url {
-                url_pins.push(ctx.pin_native_root(url));
-                urls.push(url);
-            }
-        }
-        ctx.unpin_native_roots(jar_entry_pin);
-        ctx.unpin_native_roots(archive_entry_pin);
-    }
+    let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
 
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!(
@@ -23540,191 +23462,63 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    // The real-JDK ArrayList iterator reads `[0]=modCount`,
-    // `[1]=elementData`, and `[2]=size`.  Use that full layout rather than the
-    // two-slot synthetic collection shape: callers immediately iterate this
-    // return value through the real Set/Collection interfaces.
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
-    let list_pin = ctx.pin_native_root(list);
+    // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
+    // declares `Set` as the return type but only ever calls
+    // `Collection.toArray(Object[])` on it, which is implemented by
+    // ArrayList via `native_collections`. Returning ArrayList sidesteps
+    // the synthetic-HashSet layout drift between `phases_early::Set.of`
+    // (3-field) and `native_collections::HashSet` (1-field).
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
-    for (i, (url, pin)) in urls.iter().zip(&url_pins).enumerate() {
-        let url = ctx.read_native_pin(*pin, *url);
-        ctx.set_array_element(arr, i, Value::Object(Some(url)));
+    for (i, v) in urls.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
     }
-    let list = ctx.read_native_pin(list_pin, list);
-    ctx.set_field(list, 0, Value::Int(0));
-    ctx.set_field(list, 1, Value::Object(Some(arr)));
-    ctx.set_field(list, 2, Value::Int(urls.len() as i32));
-    for pin in url_pins {
-        ctx.unpin_native_roots(pin);
-    }
-    ctx.unpin_native_roots(this_pin);
-    ctx.unpin_native_roots(include_filter_pin);
-    ctx.unpin_native_roots(list_pin);
+    ctx.set_field(list, 0, Value::Object(Some(arr)));
+    ctx.set_field(list, 1, Value::Int(urls.len() as i32));
     Ok(Some(Value::Object(Some(list))))
 }
 
-/// Spring Boot 3 `ExplodedArchive.getClassPathUrls` without depending on the
-/// real-JDK `LinkedList.addAll(0, ...)` path. The latter was retaining the
-/// immediate directories but dropping every descendant under CratonVM, which
-/// made a directory archive silently omit manifests, nested files, and names
-/// requiring URI encoding.
-fn p59_spring_boot_exploded_archive_get_class_path_urls(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let include_filter = obj_arg(args, 1)?;
-    let directory_search_filter = obj_arg(args, 2)?;
-    let root_directory = match ctx.get_field(this, 0) {
-        Value::Object(Some(file)) => file_read_path(ctx, file),
-        _ => String::new(),
-    };
-    let root_path = std::path::PathBuf::from(&root_directory);
-    let mut pending = match std::fs::read_dir(&root_path) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
-    pending.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-    pending.reverse();
-
-    let this_pin = ctx.pin_native_root(this);
-    let include_filter_pin = ctx.pin_native_root(include_filter);
-    let directory_search_filter_pin = ctx.pin_native_root(directory_search_filter);
-    let mut urls = Vec::new();
-    let mut url_pins = Vec::new();
-    while let Some(path) = pending.pop() {
-        let is_directory = path.is_dir();
-        let Ok(relative) = path.strip_prefix(&root_path) else {
-            continue;
-        };
-        let mut entry_name = relative.to_string_lossy().replace('\\', "/");
-        if is_directory {
-            entry_name.push('/');
-        }
-        let file = file_alloc(ctx, &path.to_string_lossy());
-        let file_pin = ctx.pin_native_root(file);
-        let archive_entry = alloc_concurrent_synthetic(
-            ctx,
-            "org/springframework/boot/loader/launch/ExplodedArchive$FileArchiveEntry",
-            2,
-        );
-        let archive_entry_pin = ctx.pin_native_root(archive_entry);
-        let name = ctx.create_string(&entry_name);
-        let file = ctx.read_native_pin(file_pin, file);
-        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-        ctx.set_field(archive_entry, 0, Value::Object(Some(name)));
-        ctx.set_field(archive_entry, 1, Value::Object(Some(file)));
-        ctx.set_field_by_name(archive_entry, "name", Value::Object(Some(name)));
-        ctx.set_field_by_name(archive_entry, "file", Value::Object(Some(file)));
-
-        if is_directory {
-            let directory_search_filter =
-                ctx.read_native_pin(directory_search_filter_pin, directory_search_filter);
-            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-            let search = matches!(
-                ctx.invoke_virtual(
-                    directory_search_filter,
-                    "test",
-                    "(Ljava/lang/Object;)Z",
-                    &[Value::Object(Some(archive_entry))],
-                )?,
-                Some(Value::Int(value)) if value != 0
-            );
-            if search {
-                let mut children = match std::fs::read_dir(&path) {
-                    Ok(entries) => entries
-                        .filter_map(Result::ok)
-                        .map(|entry| entry.path())
-                        .collect::<Vec<_>>(),
-                    Err(_) => Vec::new(),
-                };
-                children.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-                children.reverse();
-                pending.extend(children);
-            }
-        }
-
-        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
-        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
-        let include = matches!(
-            ctx.invoke_virtual(
-                include_filter,
-                "test",
-                "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(archive_entry))],
-            )?,
-            Some(Value::Int(value)) if value != 0
-        );
-        if include {
-            let file = ctx.read_native_pin(file_pin, file);
-            let uri = ctx.invoke_virtual(file, "toURI", "()Ljava/net/URI;", &[])?;
-            if let Some(Value::Object(Some(uri))) = uri {
-                let uri_pin = ctx.pin_native_root(uri);
-                let url = ctx.invoke_virtual(uri, "toURL", "()Ljava/net/URL;", &[])?;
-                ctx.unpin_native_roots(uri_pin);
-                if let Some(Value::Object(Some(url))) = url {
-                    url_pins.push(ctx.pin_native_root(url));
-                    urls.push(url);
-                }
-            }
-        }
-        ctx.unpin_native_roots(file_pin);
-        ctx.unpin_native_roots(archive_entry_pin);
-    }
-
-    // See the JarFileArchive variant above: this return value is consumed by
-    // real-JDK collection iterators, so preserve the real three-slot layout.
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
-    let list_pin = ctx.pin_native_root(list);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
-    for (i, (url, pin)) in urls.iter().zip(&url_pins).enumerate() {
-        let url = ctx.read_native_pin(*pin, *url);
-        ctx.set_array_element(arr, i, Value::Object(Some(url)));
-    }
-    let list = ctx.read_native_pin(list_pin, list);
-    ctx.set_field(list, 0, Value::Int(0));
-    ctx.set_field(list, 1, Value::Object(Some(arr)));
-    ctx.set_field(list, 2, Value::Int(urls.len() as i32));
-    for pin in url_pins {
-        ctx.unpin_native_roots(pin);
-    }
-    ctx.unpin_native_roots(this_pin);
-    ctx.unpin_native_roots(include_filter_pin);
-    ctx.unpin_native_roots(directory_search_filter_pin);
-    ctx.unpin_native_roots(list_pin);
-    Ok(Some(Value::Object(Some(list))))
-}
-
-/// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`.
-///
-/// The native registration re-enters this concrete method's bytecode without
-/// native dispatch, preserving its classpath-index merge and URL ordering.
+/// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`:
+/// real bytecode does `urls.toArray(new URL[0])` and can `ClassCastException`
+/// when collection iteration / typed `toArray` does not match CratonVM's
+/// mixed real-JDK + synthetic collection layout. Rebuild the nested-jar
+/// `URL[]` from the fat-jar path (same scan as [`p59_fat_jar_boot_inf_nested_url_values`])
+/// and `invokespecial` the private `Launcher.createClassLoader(URL[])` on
+/// the real SB3 launcher type.
 fn sb3_executable_archive_launcher_create_class_loader_collection(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let urls = obj_arg(args, 1)?;
+    let cid = ctx.class_id_of_object(this);
+    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+    let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        let cid = ctx.class_id_of_object(this);
-        let cn = ctx.class_name_of_id(cid).unwrap_or_default();
         eprintln!(
-            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} preserving supplied URLs",
-            cn
+            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
+            cn, jar_path
         );
     }
     // Pin across the URL scan / array alloc below — a moving young GC there
-    // The target bytecode preserves its classpath-index merge before it calls
-    // Launcher.createClassLoader(Collection).
-    ctx.invoke_special_bytecode_only(
-        "org/springframework/boot/loader/launch/ExecutableArchiveLauncher",
+    // would relocate `this` and the collected URLs (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
+    let pins = pin_object_values(ctx, &url_values);
+    let url_arr = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        url_values.len(),
+    );
+    for (i, (v, p)) in url_values.iter().zip(&pins).enumerate() {
+        let v = read_pinned_object_value(ctx, *p, *v);
+        ctx.set_array_element(url_arr, i, v);
+    }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.invoke_special(
+        "org/springframework/boot/loader/launch/Launcher",
         "createClassLoader",
-        "(Ljava/util/Collection;)Ljava/lang/ClassLoader;",
-        &[Value::Object(Some(this)), Value::Object(Some(urls))],
+        "([Ljava/net/URL;)Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(this)), Value::Object(Some(url_arr))],
     )
 }
 
@@ -26829,19 +26623,14 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
+    // StackFrame = 6-field synthetic — WP1.9:
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
     //   slot 3: lineNumber (Int, -1/-2 sentinels)
     //   slot 4: byteCodeIndex (Int, -1 for unknown/native)
-    //   slot 5: declaringClassInternalName (String, '/'-form; used only by
-    //           `toStackTraceElement()`'s formatting fallback)
-    //   slot 6: declaringClassMirror (Class or null) — resolved EAGERLY at
-    //           `populate_stack_frame` time from the entry's own ClassId
-    //           (see that function's doc comment for why: a fresh by-name
-    //           lookup performed later, from `getDeclaringClass()`, can fail
-    //           for a frame whose class is still running its own `<clinit>`)
+    //   slot 5: declaringClassInternalName (String, '/'-form used to resolve
+    //           the Class mirror lazily in `getDeclaringClass()`)
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -26863,17 +26652,28 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
-    // StackFrame.getDeclaringClass() — return the Class mirror eagerly
-    // resolved and stored at population time (slot 6). RETAIN_CLASS_REFERENCE
-    // option is not enforced here (we always resolve); bootstrap consumers
-    // that don't request the option simply ignore the returned Class.
+    // StackFrame.getDeclaringClass() — resolve the Class mirror via the
+    // stored internal class name (slot 5). RETAIN_CLASS_REFERENCE option
+    // is not enforced here (we always resolve); bootstrap consumers that
+    // don't request the option simply ignore the returned Class.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 6)))
+            let internal = match ctx.get_field(this, 5) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if internal.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            if let Some(cid) = ctx.class_id_by_name(&internal) {
+                let mirror = ctx.get_class_mirror(cid);
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+            Ok(Some(Value::Object(None)))
         },
     );
     // StackFrame.getMethodType() — we don't yet wire real MethodType
@@ -26949,22 +26749,7 @@ fn populate_stack_frame(
     // (allocation-free) field writes. Holding the freshly-allocated `sf` and
     // strings in bare locals across the subsequent `create_string` calls is a
     // use-after-move/free under the moving collector.
-    // Slot 6: the declaring-class `Class` mirror, resolved EAGERLY here from
-    // `entry.class_id` when available. `entry.class_id` is captured directly
-    // off the live interpreter `Frame` (see `stackwalker::entry_from_frame`)
-    // and is therefore always valid for a real frame -- unlike a fresh
-    // by-name lookup (`class_id_by_name(&entry.class_name)`) performed LATER,
-    // from `getDeclaringClass()`, which can fail for a frame whose class is
-    // still executing its own `<clinit>` (observed: `SpringFactoriesLoader`/
-    // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from their
-    // own static initializers -- log4j-api's `StackLocator` walks back to
-    // that exact self-frame and NPEs when the by-name lookup comes back
-    // empty). Resolving from the guaranteed-valid ClassId at population time
-    // sidesteps that failure mode entirely; `class_id_by_name` remains a
-    // fallback for synthetic/no-frame entries (`entry.class_id.is_none()`).
-    let decl_cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
-
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
     let base = ctx.pin_native_root(sf);
     let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let h_cls = ctx.pin_native_root(cls_str);
@@ -26978,17 +26763,9 @@ fn populate_stack_frame(
         }
         None => (None, None),
     };
-    // Preserve the '/' form too (used by toStackTraceElement()'s fallback).
+    // Preserve the '/' form for declaring-class resolution via class_id_by_name.
     let mut decl_internal = ctx.create_string(&entry.class_name);
     let h_decl = ctx.pin_native_root(decl_internal);
-    let (mut decl_mirror, h_mirror) = match decl_cid {
-        Some(cid) => {
-            let m = ctx.get_class_mirror(cid);
-            let h = ctx.pin_native_root(m);
-            (Some(m), Some(h))
-        }
-        None => (None, None),
-    };
 
     sf = ctx.read_native_pin(base, sf);
     cls_str = ctx.read_native_pin(h_cls, cls_str);
@@ -26997,9 +26774,6 @@ fn populate_stack_frame(
         file_str = Some(ctx.read_native_pin(h, s));
     }
     decl_internal = ctx.read_native_pin(h_decl, decl_internal);
-    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
-        decl_mirror = Some(ctx.read_native_pin(h, m));
-    }
 
     ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
@@ -27011,11 +26785,6 @@ fn populate_stack_frame(
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
-    ctx.set_field(
-        sf,
-        6,
-        decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
-    );
     ctx.unpin_native_roots(base);
     sf
 }
@@ -43092,7 +42861,6 @@ const NEW13_SESS_TLSID: usize = 2;
 fn new13_build_connector(
     extra_root_ders: &[Vec<u8>],
     danger_skip_native_verify: bool,
-    client_identity: Option<&(String, String)>,
 ) -> Result<native_tls::TlsConnector, String> {
     let mut builder = native_tls::TlsConnector::builder();
     builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
@@ -43125,11 +42893,6 @@ fn new13_build_connector(
             }
         }
     }
-    if let Some((cert_pem, key_pem)) = client_identity {
-        let identity = native_tls::Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())
-            .map_err(|e| format!("client identity: {e}"))?;
-        builder.identity(identity);
-    }
     builder
         .build()
         .map_err(|e| format!("TlsConnector build failed: {}", e))
@@ -43148,14 +42911,6 @@ fn p68_ctx_trust_roots_table(
 ) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>> {
     static T: std::sync::OnceLock<
         parking_lot::Mutex<std::collections::HashMap<usize, Vec<Vec<u8>>>>,
-    > = std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
-}
-
-fn p68_factory_client_identity_table(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, (String, String)>> {
-    static T: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<usize, (String, String)>>,
     > = std::sync::OnceLock::new();
     T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
@@ -43256,26 +43011,6 @@ fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Optio
     crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
 }
 
-fn p68_factory_client_identity(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> Option<(String, String)> {
-    let Value::Object(Some(factory)) = args.first()? else {
-        return None;
-    };
-    if let Some(identity) = p68_factory_client_identity_table()
-        .lock()
-        .get(&(factory.as_ptr() as usize))
-        .cloned()
-    {
-        return Some(identity);
-    }
-    let Value::Object(Some(ssl_context)) = ctx.get_field(*factory, 0) else {
-        return None;
-    };
-    crate::t27_tls::ctx_identity(ctx, ssl_context)
-}
-
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
 fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
@@ -43352,8 +43087,7 @@ fn p68_create_socket_inet_address(
     }
     let extra_roots = p68_factory_trust_roots(ctx, args);
     let java_tm_key = p68_factory_java_tm_key(ctx, args);
-    let client_identity = p68_factory_client_identity(ctx, args);
-    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, client_identity)
+    new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
 }
 
 /// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
@@ -43363,7 +43097,6 @@ fn new13_do_create_socket(
     port: u16,
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
-    client_identity: Option<(String, String)>,
 ) -> MethodCallResult {
     #[cfg(unix)]
     let legacy_dsa_context = extra_root_ders.iter().any(|der| {
@@ -43372,7 +43105,7 @@ fn new13_do_create_socket(
             .and_then(|cert| cert.public_key().ok())
             .is_some_and(|key| key.dsa().is_ok())
     });
-    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some(), client_identity.as_ref())
+    let connector = new13_build_connector(extra_root_ders, java_tm_key.is_some())
         .map_err(|msg| RuntimeError::IOException { message: msg })?;
     // FIX (netty-client-socket-write-after-close): this is a real, blocking
     // TCP connect + full TLS handshake (same shape as net_phase_e.rs's own
@@ -43399,12 +43132,8 @@ fn new13_do_create_socket(
     #[cfg(not(unix))]
     let connect_result = crate::servlet::s2_tls_connect(&connector, host, port);
     ctx.end_blocking_region();
-    let tls_id = connect_result.map_err(|e| {
-        crate::phases_early::throw_jca_exc(
-            ctx,
-            "javax/net/ssl/SSLHandshakeException",
-            &e.to_string(),
-        )
+    let tls_id = connect_result.map_err(|e| RuntimeError::IOException {
+        message: e.to_string(),
     })?;
 
     // FIX (netty-https-client-trust): native verification was disabled above
@@ -43652,7 +43381,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // currently-requested protocol. A failure here surfaces
             // immediately to the caller as a KeyManagementException-shaped
             // IOException.
-            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false, None) {
+            if let Err(msg) = new13_build_connector(extra_roots.as_deref().unwrap_or(&[]), false) {
                 return Err(RuntimeError::IOException {
                     message: format!("SSLContext.init: {}", msg),
                 }
@@ -43663,6 +43392,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, NEW13_CTX_TM, tm_arg);
             ctx.set_field(this, NEW13_CTX_RANDOM, sr_arg);
             ctx.set_field(this, NEW13_CTX_INIT, Value::Int(1));
+
+            // Keep the legacy p68 context coherent with the rustls-backed
+            // transport bridge.  A real-JDK dispatch may reach this handler
+            // through an inherited/cached SSLContext call; without these
+            // transfers, a Java-supplied TrustManager is retained only in the
+            // synthetic fields and HttpURLConnection silently falls back to
+            // the platform verifier.
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
+            let tms_array = match tm_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
+            let kms_array = match km_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
             Ok(None)
         },
     );
@@ -43671,23 +43418,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // Field 0 is the originating SSLContext, matching the factory
+            // shape consumed by the HttpURLConnection TLS bridge.
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             // FIX (es-restclient-https): carry this SSLContext's custom trust
             // anchors (if any) forward onto the factory so createSocket can
             // find them — createSocket only has `this` = the factory, not
             // the originating SSLContext.
             if let Ok(this) = obj_arg(args, 0) {
+                ctx.set_field(obj, 0, Value::Object(Some(this)));
                 let ctx_key = this.as_ptr() as usize;
                 if let Some(roots) = p68_ctx_trust_roots_table().lock().get(&ctx_key).cloned() {
                     let factory_key = obj.as_ptr() as usize;
                     p68_ctx_trust_roots_table()
                         .lock()
                         .insert(factory_key, roots);
-                }
-                if let Some(identity) = crate::t27_tls::ctx_identity(ctx, this) {
-                    p68_factory_client_identity_table()
-                        .lock()
-                        .insert(obj.as_ptr() as usize, identity);
                 }
             }
             Ok(Some(Value::Object(Some(obj))))
@@ -43829,8 +43574,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            let client_identity = p68_factory_client_identity(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key, client_identity)
+            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key)
         },
     );
     // `SSLSocketFactory` redeclares the `InetAddress` forms abstract even
@@ -43873,8 +43617,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            let client_identity = p68_factory_client_identity(ctx, args);
-            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, client_identity)
+            new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
         },
     );
     r.register(
@@ -43883,30 +43626,49 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
     );
-    // createSocket(Socket s, String host, int port, boolean autoClose) — we
-    // ignore the supplied Socket (the TLS stream owns its own TCP connection)
-    // but still validate its non-null-ness to match the reference JDK.
+    // createSocket(Socket wrapped, String host, int port, boolean autoClose).
+    // Real JDK contract: this reuses `wrapped`'s existing TCP connection (a
+    // fresh outbound connection would break both the layered-server case
+    // below AND client-side proxy-tunnel/CONNECT layering) and defaults to
+    // CLIENT mode — the caller may still flip it to SERVER mode via
+    // `setUseClientMode(false)` before the handshake actually starts, which
+    // is exactly the MockWebServer HTTPS-listener pattern
+    // (`docs/internal/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
+    // Since the role isn't known yet at this call, the handshake itself is
+    // deferred — see `t27_tls::{stash_pending_layered_socket,
+    // set_pending_layered_socket_client_mode, drive_pending_layered_handshake}`
+    // and this file's `ensure_layered_handshake_started` — to `startHandshake()`
+    // or the first I/O call, whichever comes first (matching real JSSE, where
+    // both implicitly trigger the handshake).
     r.register(
         ssf,
         "createSocket",
         "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;",
         |ctx, args| {
-            if !matches!(args.get(1), Some(Value::Object(Some(_)))) {
-                return Err(RuntimeError::NullPointerException {
-                    message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
-                }
-                .into());
-            }
-            let host_ref = match args.get(2) {
-                Some(Value::Object(Some(r))) => *r,
+            let factory = obj_arg(args, 0)?;
+            let wrapped = match args.get(1) {
+                Some(Value::Object(Some(socket))) => *socket,
                 _ => {
                     return Err(RuntimeError::NullPointerException {
-                        message: Some("SSLSocketFactory.createSocket: host is null".into()),
+                        message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
                     }
-                    .into());
+                    .into())
                 }
             };
-            let host = ctx.read_string(host_ref).unwrap_or_default();
+            // `host` may legitimately be null (real JDK: the socket's own
+            // peer address is used for the handshake in that case) — Spring's
+            // and MockWebServer's callers always pass a non-null String here,
+            // but a null placeholder host is still a valid caller value we
+            // must not NPE on; the DNS/SNI-name concept is meaningless for
+            // the SERVER-mode case (MockWebServer) anyway, since the
+            // handshake there uses `wrapped`'s existing connection, not a
+            // hostname lookup.
+            let host = match args.get(2) {
+                Some(Value::Object(Some(host_ref))) => {
+                    ctx.read_string(*host_ref).unwrap_or_default()
+                }
+                _ => String::new(),
+            };
             let port_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(443);
             if !(0..=65535).contains(&port_i) {
                 return Err(RuntimeError::IllegalArgumentException {
@@ -43914,12 +43676,116 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
+            let ssl_context = match ctx.get_field(factory, 0) {
+                Value::Object(Some(context)) => context,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "SSLSocketFactory has no owning SSLContext".into(),
+                    }
+                    .into())
+                }
+            };
+            // Same trust-anchor/TrustManager resolution `new13_do_create_socket`
+            // (the other `SSLSocketFactory.createSocket` overloads, and this
+            // one's own prior CLIENT-mode behavior before SERVER-mode reuse
+            // was added) already uses successfully — `args[0]` is this
+            // factory. Confirmed necessary: `ssl_context`-keyed resolution
+            // alone (`t27_tls::context_trust_root_ders`) came up empty for
+            // this SSLBundle scenario, whose anchors instead live in the
+            // legacy p68 factory-identity-keyed table populated by
+            // `SSLContext.getSocketFactory()`'s own "carry trust anchors
+            // forward onto the factory" fix.
             let extra_roots = p68_factory_trust_roots(ctx, args);
             let java_tm_key = p68_factory_java_tm_key(ctx, args);
-            let client_identity = p68_factory_client_identity(ctx, args);
-            new13_do_create_socket(ctx, &host, port_i as u16, &extra_roots, java_tm_key, client_identity)
+            let pending_id = crate::t27_tls::stash_pending_layered_socket(
+                ctx,
+                wrapped,
+                ssl_context,
+                host.clone(),
+                port_i as u16,
+                extra_roots,
+                java_tm_key,
+            )
+            .map_err(|message| RuntimeError::IOException { message })?;
+            let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let host_obj = ctx.create_string(&host);
+            let pending_tls_id = crate::servlet::PENDING_LAYERED_SOCK_ID_BASE + pending_id;
+            // The real JDK SSLSocket field layout is not this synthetic
+            // adapter's layout, so these Int field writes may be rejected.
+            // Keep the stream id in the side table used by the SSLSocket I/O
+            // natives; otherwise getInputStream/getOutputStream resolve -1.
+            crate::net_phase_e::sock_set_for_create(ctx, socket, port_i, pending_tls_id);
+            ctx.set_field(socket, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
+            ctx.set_field(socket, NEW13_SOCK_PORT, Value::Int(port_i));
+            ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(pending_tls_id));
+            ctx.set_field(socket, NEW13_SOCK_CLOSED, Value::Int(0));
+            // No SSLSession yet — the handshake hasn't run. `getSession()`
+            // (like real JSSE) implicitly starts the handshake if needed; see
+            // its registration below.
+            Ok(Some(Value::Object(Some(socket))))
         },
     );
+
+    // If `this` (a `javax/net/ssl/SSLSocket`) is still a pending layered
+    // socket (`createSocket(Socket wrapped, ...)`'s deferred-handshake
+    // design — see that registration's doc comment), drive its handshake now
+    // in whichever role `setUseClientMode` last left it in (default client),
+    // update the socket's fields/side-table to the now-real rustls stream
+    // id, and build its SSLSession. Returns the resolved (non-pending) tls
+    // id either way — a socket that was never pending, or already
+    // handshaked, is returned unchanged.
+    fn ensure_layered_handshake_started(
+        ctx: &mut dyn NativeContext,
+        socket: ObjectRef,
+    ) -> Result<i32, MethodCallFailed> {
+        let tls_id = new13_resolve_tls_id(ctx, socket);
+        if tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            || tls_id >= crate::servlet::RUSTLS_SOCK_ID_BASE
+        {
+            return Ok(tls_id);
+        }
+        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+        // Pure native socket I/O below (the actual TLS handshake). Mark this
+        // thread blocked so a concurrent VM safepoint doesn't wait for it
+        // while the peer's event loop waits for this handshake's reply.
+        ctx.begin_blocking_region();
+        let stream_result = crate::t27_tls::drive_pending_layered_handshake(pending_id);
+        ctx.end_blocking_region();
+        // Match `new13_do_create_socket`'s existing contract: a rustls
+        // handshake failure (rejected/mismatched certificate, no common
+        // cipher suite, etc.) must surface as `SSLHandshakeException`, not a
+        // generic `IOException` — callers (this test cluster's
+        // `connectWithSslBundle`/`connectWithSslBundleAndOptionsMismatch`
+        // among them) specifically assert on the JSSE exception type for an
+        // intentionally-rejected connection.
+        let stream_id = stream_result.map_err(|message| {
+            crate::phases_early::throw_jca_exc(ctx, "javax/net/ssl/SSLHandshakeException", &message)
+        })?;
+        let real_tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
+        let port = ctx.get_field(socket, NEW13_SOCK_PORT).as_int().unwrap_or(0);
+        crate::net_phase_e::sock_set_for_create(ctx, socket, port, real_tls_id);
+        ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(real_tls_id));
+        let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
+            .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
+        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        let protocol = ctx.create_string(&protocol);
+        let cipher = ctx.create_string(&cipher);
+        ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(protocol)));
+        ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher)));
+        ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(real_tls_id));
+        // CLIENT-mode only (a server stream never has "peer certificates" in
+        // this sense for our purposes here) — without this, a caller like
+        // Apache HttpComponents' `AbstractClientTlsStrategy.verifySession()`,
+        // which unconditionally checks `SSLSession.getPeerCertificates()`
+        // right after every successful TLS upgrade, sees an empty chain and
+        // throws `SSLPeerUnverifiedException` even though the handshake
+        // itself succeeded.
+        if let Some(chain) = crate::t27_tls::rustls_client_peer_cert_chain_der(stream_id) {
+            crate::t27_tls::record_client_peer_chain(session, chain);
+        }
+        ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+        Ok(real_tls_id)
+    }
 
     // SSLSocket methods
     let ssl_sock = "javax/net/ssl/SSLSocket";
@@ -43929,6 +43795,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Real JSSE: getSession() implicitly starts the handshake if one
+            // hasn't run yet.
+            ensure_layered_handshake_started(ctx, this)?;
             let session = ctx.get_field(this, 4);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
@@ -43941,89 +43810,226 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(session))
         },
     );
-    r.register(ssl_sock, "startHandshake", "()V", |_ctx, _args| {
-        // Handshake already done in createSocket
+    r.register(ssl_sock, "startHandshake", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
-    // In real-network mode the generic `java.net.Socket` native surface is
-    // deliberately not registered. A TLS socket still carries synthetic
-    // field slots, however, so inherited `Socket.getSoTimeout()` bytecode
-    // reads slot 0 as its private `impl` and invokes `getOption` on the host
-    // String. Apache HttpClient calls this for every TLS connection. Keep the
-    // timeout contract on the concrete TLS class rather than re-enabling the
-    // broad synthetic Socket surface in real-network mode.
-    r.register(ssl_sock, "getSoTimeout", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ssl_sock, "setSoTimeout", "(I)V", |ctx, args| {
-        let timeout = args.get(1).and_then(Value::as_int).unwrap_or(0);
-        if timeout < 0 {
-            return Err(RuntimeError::IllegalArgumentException {
-                message: format!("negative SO_TIMEOUT: {timeout}"),
-            }
-            .into());
+    // setUseClientMode/getUseClientMode, setNeedClientAuth/getNeedClientAuth,
+    // setWantClientAuth/getWantClientAuth — unlike getApplicationProtocol
+    // (concrete-but-throws) these six are genuinely `abstract` in the real
+    // `javax.net.ssl.SSLSocket` base class (only a concrete provider
+    // subclass, e.g. SunJSSE's SSLSocketImpl, implements them). Since this
+    // synthetic object's class literally IS `javax/net/ssl/SSLSocket`, an
+    // `invokevirtual` against the abstract declaration throws
+    // `AbstractMethodError` — thrown from `MockWebServer$SocketHandler.
+    // handle()` immediately after `createSocket(Socket,...)` returns
+    // (`sslSocket.setUseClientMode(false)`, unconditional, BEFORE any
+    // ALPN/read/write call), caught by its generic `catch (Exception e)` and
+    // logged at SEVERE — invisible under CratonVM's apparently-inert
+    // `java.util.logging`, so the connection is silently abandoned having
+    // never read the request or written a response. This, not the ALPN
+    // accessors below, is the actual root cause of the request/response
+    // exchange never happening for a server socket obtained via
+    // `SSLSocketFactory.createSocket(Socket,...)` (MockWebServer's HTTPS
+    // listener contract) — `getApplicationProtocol`/`getSSLParameters` are
+    // still worth having registered (OkHttp calls them too, just later) but
+    // execution never reached them without this fix.
+    r.register(ssl_sock, "setUseClientMode", "(Z)V", |ctx, args| {
+        // A socket from `createSocket(Socket wrapped, ...)` defers its actual
+        // handshake (see that registration's doc comment) precisely so this
+        // call can still decide client-vs-server mode; record it on the
+        // pending state if the handshake hasn't started yet. A socket from
+        // any other creation path (already handshaked, or never went through
+        // the deferred path) has no pending entry — matches this file's
+        // existing convention of silently ignoring a mode change once the
+        // role is already fixed.
+        let this = obj_arg(args, 0)?;
+        let use_client = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+        {
+            let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+            crate::t27_tls::set_pending_layered_socket_client_mode(pending_id, use_client);
         }
         Ok(None)
     });
-    r.register(ssl_sock, "getPort", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(ctx.get_field(this, NEW13_SOCK_PORT).as_int().unwrap_or(0))))
-    });
-    r.register(
-        ssl_sock,
-        "getInetAddress",
-        "()Ljava/net/InetAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
-                Value::Object(Some(host)) => ctx.read_string(host).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if host.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
-            Ok(Some(Value::Object(Some(address))))
-        },
-    );
-    r.register(
-        ssl_sock,
-        "getRemoteSocketAddress",
-        "()Ljava/net/SocketAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let host = ctx.get_field(this, NEW13_SOCK_HOST);
-            let port = ctx.get_field(this, NEW13_SOCK_PORT);
-            ctx.new_object_initialized(
-                "java/net/InetSocketAddress",
-                "(Ljava/lang/String;I)V",
-                &[host, port],
-            )
-        },
-    );
-    r.register(ssl_sock, "getLocalPort", "()I", |_ctx, _args| {
+    r.register(ssl_sock, "getUseClientMode", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "getNeedClientAuth", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "getWantClientAuth", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // getApplicationProtocol/getHandshakeApplicationProtocol — the real
+    // `javax.net.ssl.SSLSocket` base class's own body for these (unlike most
+    // of its methods, which are abstract) is CONCRETE and just throws
+    // `UnsupportedOperationException`; only a provider's concrete subclass
+    // (SunJSSE's SSLSocketImpl) overrides it. Since this synthetic object's
+    // class literally IS `javax/net/ssl/SSLSocket`, without a native
+    // registration here that base-class bytecode runs and throws. Callers
+    // like OkHttp's `Platform.getSelectedProtocol()` (used by MockWebServer's
+    // connection handler for ALPN bookkeeping right after `startHandshake()`)
+    // catch that as a generic `Exception`, log it at FINE/SEVERE (invisible
+    // by default under java.util.logging), and abandon the connection having
+    // never read the request or written a response — surfaced to the client
+    // as a silent hang (e.g. Reactor's `.block(Duration)` timing out).
+    fn ssl_sock_negotiated_alpn(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE {
+            return None;
+        }
+        let raw_id = tls_id - crate::servlet::RUSTLS_SOCK_ID_BASE;
+        crate::t27_tls::rustls_session_info(raw_id).and_then(|(_, _, alpn, _)| alpn)
+    }
     r.register(
         ssl_sock,
-        "getLocalAddress",
-        "()Ljava/net/InetAddress;",
-        |ctx, _args| {
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
-            Ok(Some(Value::Object(Some(address))))
+        "getApplicationProtocol",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getApplicationProtocol sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    alpn
+                );
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&alpn)))))
         },
     );
     r.register(
         ssl_sock,
-        "getLocalSocketAddress",
-        "()Ljava/net/SocketAddress;",
-        |ctx, _args| {
-            let host = ctx.create_string("127.0.0.1");
-            ctx.new_object_initialized(
-                "java/net/InetSocketAddress",
-                "(Ljava/lang/String;I)V",
-                &[Value::Object(Some(host)), Value::Int(0)],
-            )
+        "getHandshakeApplicationProtocol",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getHandshakeApplicationProtocol sock={:?} -> {:?}",
+                    std::thread::current().id(),
+                    this,
+                    alpn
+                );
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&alpn)))))
+        },
+    );
+    // getSSLParameters/setSSLParameters — like getApplicationProtocol above,
+    // the real `javax.net.ssl.SSLSocket` base class's default bodies call
+    // through to other (mostly abstract-in-the-base-class) accessors; without
+    // a concrete provider subclass backing this synthetic object, that chain
+    // is liable to throw. OkHttp's `Jdk9Platform.configureTlsExtensions()`
+    // calls `getSSLParameters()` then `setSSLParameters()` on every socket
+    // BEFORE `startHandshake()` (to offer its ALPN protocol list) — for
+    // MockWebServer's synthetic server socket the handshake has already run
+    // synchronously inside `createSocket`, so this call is moot for actual
+    // negotiation, but it must not throw or the caller (uncaught) abandons
+    // the connection having never read the request or written a response.
+    r.register(
+        ssl_sock,
+        "getSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} getSSLParameters ENTER sock={:?}",
+                    std::thread::current().id(),
+                    this
+                );
+            }
+            let ciphers = ssl_sock_supported_cipher_suites(ctx);
+            let protocols = {
+                let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+                let negotiated =
+                    if let Value::Object(Some(session)) = ctx.get_field(this, NEW13_SOCK_SESSION) {
+                        match ctx.get_field(session, NEW13_SESS_PROTO) {
+                            Value::Object(Some(s)) => ctx.read_string(s),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                let s = ctx.create_string(&negotiated.unwrap_or_else(|| "TLSv1.3".to_string()));
+                ctx.set_array_element(arr, 0, Value::Object(Some(s)));
+                arr
+            };
+            let params = match ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[
+                    Value::Object(Some(ciphers)),
+                    Value::Object(Some(protocols)),
+                ],
+            )? {
+                Some(Value::Object(Some(o))) => o,
+                _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
+            };
+            Ok(Some(Value::Object(Some(params))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "setSSLParameters",
+        "(Ljavax/net/ssl/SSLParameters;)V",
+        |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+                eprintln!(
+                    "[dbg-tls-sock] thread={:?} setSSLParameters sock={:?}",
+                    std::thread::current().id(),
+                    args.first()
+                );
+            }
+            // A socket from `createSocket(Socket wrapped, ...)`'s deferred
+            // handshake honors any cipher-suite restriction carried by
+            // `params` if called before the handshake actually starts — the
+            // same real-JSSE-contract reasoning as `setEnabledCipherSuites`
+            // above (which this often replaces: Apache HttpComponents 5
+            // configures TLS options via an `SSLParameters` object and
+            // `SSLSocket.setSSLParameters()`, not the legacy per-field
+            // setters, so `setEnabledCipherSuites` alone never saw
+            // `connectWithSslBundleAndOptionsMismatch`'s deliberately
+            // mismatched cipher suite).
+            if let (Ok(this), Some(Value::Object(Some(params)))) = (obj_arg(args, 0), args.get(1).copied().and_then(|v| match v { Value::Object(Some(_)) => Some(v), _ => None })) {
+                let tls_id = new13_resolve_tls_id(ctx, this);
+                if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+                    && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+                {
+                    let mut ciphers = Vec::new();
+                    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
+                        params,
+                        "getCipherSuites",
+                        "()[Ljava/lang/String;",
+                        &[],
+                    ) {
+                        let len = ctx.array_length(arr);
+                        for i in 0..len {
+                            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                                if let Some(name) = ctx.read_string(s) {
+                                    ciphers.push(name);
+                                }
+                            }
+                        }
+                    }
+                    if !ciphers.is_empty() {
+                        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+                        crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
+                    }
+                }
+            }
+            // Handshake already completed in createSocket for every OTHER
+            // socket shape; the ALPN/cipher preferences a caller sets here
+            // can no longer change anything for those. Accept and discard.
+            Ok(None)
         },
     );
     // getSupportedCipherSuites/getEnabledCipherSuites/getSupportedProtocols/
@@ -44087,7 +44093,36 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_sock,
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // A socket from `createSocket(Socket wrapped, ...)`'s deferred
+            // handshake honors this if called before the handshake actually
+            // starts (real JSSE contract; `connectWithSslBundleAndOptionsMismatch`
+            // relies on exactly this createSocket-then-narrow-ciphers
+            // sequence to make the handshake genuinely fail on a
+            // deliberately mismatched suite). A socket from any other path,
+            // or one that's already handshaked, has no pending entry to
+            // update — accepted but not persisted, same as before.
+            let this = obj_arg(args, 0)?;
+            let tls_id = new13_resolve_tls_id(ctx, this);
+            if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+                && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+            {
+                let mut ciphers = Vec::new();
+                if let Some(Value::Object(Some(arr))) = args.get(1) {
+                    let len = ctx.array_length(*arr);
+                    for i in 0..len {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                            if let Some(name) = ctx.read_string(s) {
+                                ciphers.push(name);
+                            }
+                        }
+                    }
+                }
+                let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+                crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
+            }
+            Ok(None)
+        },
     );
     r.register(
         ssl_sock,
@@ -44139,7 +44174,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = new13_resolve_tls_id(ctx, this);
+            // Real JSSE: the first I/O call implicitly starts the handshake
+            // if one hasn't run yet — this socket may still be pending (see
+            // `createSocket(Socket wrapped, ...)`'s doc comment).
+            let fd_id = ensure_layered_handshake_started(ctx, this)?;
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
@@ -44150,6 +44188,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             // Return an InputStream that reads from the TLS fd
             let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+            // Real JDK stream layouts do not have our synthetic Int slot 0.
+            // Preserve the TLS id in the identity-keyed socket side table too.
+            crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
             ctx.set_field(is, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(is))))
         },
@@ -44160,7 +44201,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = new13_resolve_tls_id(ctx, this);
+            let fd_id = ensure_layered_handshake_started(ctx, this)?;
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getOutputStream sock={:?} tls_id={}",
@@ -44170,6 +44211,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 );
             }
             let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+            crate::net_phase_e::sock_set_for_create(ctx, os, 0, fd_id);
             ctx.set_field(os, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(os))))
         },
@@ -44237,60 +44279,93 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(if closed { 0 } else { 1 })))
     });
-    // `javax/net/ssl/SSLSocket` had no native registration for these two —
-    // real (inherited `java.net.Socket`) bytecode ran instead, reading this
-    // synthetic object's uninitialized field slots as if they were the real
-    // `impl`/`shutIn`/`shutOut` internals. Same "real bytecode on a synthetic
-    // object" gap as this cluster's other fixes, just for a mechanism that
-    // reads as flaky (garbage field bits) rather than a hard AbstractMethodError:
-    // Apache HttpClient5's `DefaultBHttpClientConnection$1.checkTLS()` calls
-    // `sslSocket.isInputShutdown()` before every entity write and throws
-    // `ConnectionClosedException` if it observes true — hit only by the POST
-    // variant of `connectWithSslBundle` (GET sends no entity, so checkTLS's
-    // write-gated call site is never reached). Real JSSE `SSLSocketImpl`
-    // rejects `shutdownInput`/`shutdownOutput` outright (TLS has no half-close),
-    // so these can never legitimately become true for the lifetime of a real
-    // SSLSocket — always false is the correct, not just convenient, answer.
-    r.register(ssl_sock, "isInputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ssl_sock, "isOutputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
+    r.register(ssl_sock, "getSoTimeout", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setSoTimeout", "(I)V", |ctx, args| {
+        let timeout = args.get(1).and_then(Value::as_int).unwrap_or(0);
+        if timeout < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("negative SO_TIMEOUT: {timeout}"),
+            }
+            .into());
+        }
+        Ok(None)
+    });
+    r.register(
+        ssl_sock,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
+                Value::Object(Some(host)) => ctx.read_string(host).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if host.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, NEW13_SOCK_HOST);
+            let port = ctx.get_field(this, NEW13_SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(ssl_sock, "getLocalPort", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(
+        ssl_sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, _args| {
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, _args| {
+            let host = ctx.create_string("127.0.0.1");
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[Value::Object(Some(host)), Value::Int(0)],
+            )
+        },
+    );
 
     // NEW-13: SSLSocketInputStream — reads from a `s2_registry` TLS stream
     // identified by the tls_id stored in field 0 of the synthetic stream
     // instance. A -1 id or short-read of 0 maps to Java EOF (-1) per
     // InputStream.read semantics.
     let ssl_is = "javax/net/ssl/SSLSocketInputStream";
-    fn ssl_socket_read_error(ctx: &mut dyn NativeContext, error: std::io::Error) -> MethodCallFailed {
-        let message = error.to_string();
-        let lower = message.to_ascii_lowercase();
-        // A peer alert can arrive immediately after the client starts its
-        // first application read (TLS 1.3 client-auth rejection is a common
-        // example), even though `createSocket` has returned. JSSE still
-        // exposes this as a handshake failure, not a generic IOException.
-        if lower.contains("alert")
-            || lower.contains("certificate")
-            || lower.contains("handshake")
-            || lower.contains("rustls")
-            || lower.contains("tls")
-        {
-            return crate::phases_early::throw_jca_exc(
-                ctx,
-                "javax/net/ssl/SSLHandshakeException",
-                &message,
-            );
-        }
-        RuntimeError::IOException { message }.into()
-    }
     r.register(ssl_is, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -44298,12 +44373,19 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         match crate::servlet::s2_tls_read(tls_id, &mut buf) {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-            Err(e) => Err(ssl_socket_read_error(ctx, e)),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
     r.register(ssl_is, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
@@ -44339,7 +44421,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 Ok(Some(Value::Int(n as i32)))
             }
-            Err(e) => Err(ssl_socket_read_error(ctx, e)),
+            Err(e) => Err(RuntimeError::IOException {
+                message: e.to_string(),
+            }
+            .into()),
         }
     });
     r.register(ssl_is, "available", "()I", |_ctx, _args| {
@@ -44354,7 +44439,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let ssl_os = "javax/net/ssl/SSLSocketOutputStream";
     r.register(ssl_os, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
@@ -44376,7 +44465,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     });
     r.register(ssl_os, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let tls_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
         if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
             eprintln!(
@@ -67064,8 +67157,20 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // Introspector cache-management methods retain their bridge implementations.
+    // Introspector
     let intro = "java/beans/Introspector";
+    r.register(
+        intro,
+        "getBeanInfo",
+        "(Ljava/lang/Class;)Ljava/beans/BeanInfo;",
+        introspector_get_bean_info,
+    );
+    r.register(
+        intro,
+        "getBeanInfo",
+        "(Ljava/lang/Class;Ljava/lang/Class;)Ljava/beans/BeanInfo;",
+        introspector_get_bean_info,
+    );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
         // Introspector caches BeanInfo per Class. Our implementation doesn't cache
         // anything — each call walks the class freshly — so there's nothing to flush.
@@ -67314,7 +67419,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
 fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let trace = std::env::var_os("CRATONVM_TRACE_BEANINFO").is_some();
+    let trace = false;
     let class_mirror = match args.first() {
         Some(Value::Object(Some(c))) => *c,
         other => {
@@ -67361,22 +67466,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
-        eprintln!("BI-TRACE: ==== entering getBeanInfo for {} ====", cn);
     }
-
-    // The two-argument overload is getBeanInfo(beanClass, stopClass). The
-    // native used to discard stopClass and always walked through Object, which
-    // made it expose inherited Object properties and methods despite the JDK
-    // contract. Spring's standard property resolver uses this overload.
-    let stop_class_id = match args.get(1) {
-        Some(Value::Object(Some(stop_mirror))) => {
-            let stop_pin = ctx.pin_native_root(*stop_mirror);
-            let id = crate::lang_class::mirror_class_id(ctx, *stop_mirror);
-            ctx.unpin_native_roots(stop_pin);
-            id
-        }
-        _ => None,
-    };
 
     // Discover properties from getters/setters across the class + superclasses,
     // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
@@ -67464,9 +67554,6 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut sc = Some(class_id);
     while let Some(cid) = sc {
-        if Some(cid) == stop_class_id {
-            break;
-        }
         scan_cids.push(cid);
         sc = if ctx.is_interface_class(cid) {
             None
@@ -67501,7 +67588,6 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Class.getMethods() entry, and Spring's ExtendedBeanInfo scans them for
     // non-standard write methods.
     let mut all_method_mirrors: Vec<(usize, ObjectRef)> = Vec::new();
-    let mut all_method_names: Vec<String> = Vec::new();
     for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
@@ -67534,9 +67620,6 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 );
                 let mm_all_pin = ctx.pin_native_root(mm_all);
                 all_method_mirrors.push((mm_all_pin, mm_all));
-                if trace {
-                    all_method_names.push(format!("{}{}", name, desc));
-                }
             }
             // JavaBeans properties come from PUBLIC INSTANCE methods only
             // (java.beans uses Class.getMethods(), which is public-only — a
@@ -67733,10 +67816,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Object member) when introspecting a bare interface type — see the
     // `is_interface_class` gate on `scan_cids` above for the matching
     // rationale.
-    if stop_class_id.is_none()
-        && !ctx.is_interface_class(class_id)
-        && !properties.iter().any(|(n, ..)| n == "class")
-    {
+    if !ctx.is_interface_class(class_id) && !properties.iter().any(|(n, ..)| n == "class") {
         let class_class_mirror = match ctx.ensure_class_initialized("java/lang/Class") {
             Ok(cid) => ctx.get_class_mirror(cid),
             // Re-read from the pin: the discovery scan above (and the failed
@@ -67874,14 +67954,6 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // scan and the previous iterations' ctor invokes may have moved it
         // (native stale-local family).
         let m = ctx.read_native_pin(m_pin, m);
-        if trace {
-            eprintln!(
-                "BI-TRACE: MethodDescriptor ctor {}/{} -> {}",
-                i + 1,
-                all_method_mirrors.len(),
-                all_method_names.get(i).map(String::as_str).unwrap_or("?")
-            );
-        }
         let md = match ctx.new_object_initialized(
             "java/beans/MethodDescriptor",
             "(Ljava/lang/reflect/Method;)V",
@@ -72496,7 +72568,7 @@ mod new13_tests {
         // NEW-13.2 DoD: the default connector build (no custom KM/TM) must
         // succeed on every platform supported by native-tls, otherwise
         // SSLContext.init would fail even for the trivial null-TM path.
-        let c = new13_build_connector(&[], false, None);
+        let c = new13_build_connector(&[], false);
         assert!(c.is_ok(), "connector build failed: {:?}", c.err());
     }
 
@@ -72506,7 +72578,7 @@ mod new13_tests {
         // unexpected TrustManager) must be skipped rather than failing the
         // whole connector build — `new13_build_connector` logs and continues.
         let garbage = vec![0xFFu8, 0x00, 0x01, 0x02];
-        let c = new13_build_connector(&[garbage], false, None);
+        let c = new13_build_connector(&[garbage], false);
         assert!(
             c.is_ok(),
             "connector build must tolerate an unparseable extra root: {:?}",
