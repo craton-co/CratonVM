@@ -3,11 +3,19 @@
 Status: **Compile-time correctness FIXED and validated end-to-end against
 the real Tomcat suite fixture** (2026-07-19, two sessions). `Response
 .toAbsolute()` — the doc's own motivating case — now JIT-compiles and
-produces correct results, confirmed directly, not inferred. **Still OPEN**:
-a newly-discovered, separate performance regression (repeated
-recompilation + net slowdown) keeps `TestResponsePerformance`'s
-relative-perf assertion failing — see "session 2" below for the full
-investigation and handoff. The original problem statement (written
+produces correct results, confirmed directly, not inferred. The session-2
+recompile-storm residual (repeated recompilation, 86-94 times per run) is
+now **FIXED** (2026-07-20 session — see "2026-07-20 session" below): the
+root cause was `DeoptReason::OsrExit` being routed through the generic
+mis-speculation recompile policy instead of being treated as the real,
+expected, structurally-unfixable-by-recompiling event it is, compounded by
+a `MakeNotCompilable` give-up decision only updating one of two independent
+JIT-eligibility registries. `toAbsolute()` now compiles at most once per
+process. **Still OPEN**: `TestResponsePerformance`'s relative-perf assertion
+itself still fails, but for a different, deeper, newly-characterized reason
+unrelated to recompilation — see the 2026-07-20 section for the full
+diagnostic and why it looks like it may be an unrelated `dev` regression.
+The original problem statement (written
 session 1, kept at the bottom for history) assumed the JIT had *no*
 mechanism to dispatch a thrown exception to an in-method handler and
 scoped a substantial new compiler feature (Option A/B) to build one. That
@@ -453,6 +461,44 @@ steps:
    candidates), and if a callee's own tier-up invalidates callers that
    inlined it, does that invalidation logic correctly distinguish "this
    caller genuinely needs invalidating" from "false positive"?
+
+## 2026-07-20 session: recompile-storm root-caused and fixed; deeper residual found
+
+Full account, evidence, and the reverted-merge tangent in
+`docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md`'s
+"2026-07-20 session" section — summarized here for this doc's own history.
+
+**Root cause of the recompile storm**: `toAbsolute()`'s internal loop always
+exits back to the interpreter at the same bci (225) — a real `DeoptReason::
+OsrExit`, not a mis-speculation. `jit/src/deopt.rs::recommend_action` routed
+it through the generic count-based recompile-escalation policy anyway,
+so every occurrence evicted the compiled artifact and (once escalated)
+eagerly re-queued a fresh, wasted 15KB recompile — the observed 86-94
+recompiles/run. Fixed in 3 iterations, the last of which uncovered a second,
+independent bug: `DeoptAction::MakeNotCompilable`'s give-up decision only
+updated `SharedVm::jit_skip_set` (consulted by the interpreter's own
+per-call hotness path), not `cratonvm_jit`'s separate RBC.4 bail-list
+(consulted by `try_jit_compile_callee`, the path a JIT-compiled CALLER
+actually uses to dispatch to a callee) — so a caller-dispatched give-up
+never stuck. `toAbsolute()` now compiles at most once per process,
+verified across 3 independent runs; `cargo test -p cratonvm-jit deopt`
+green (86 tests, no regressions).
+
+**New residual**: with recompiling fixed, `TestResponsePerformance`'s
+`home-brew` time is still ~350-420s/round (vs. the historical
+63,500-72,700ms/round baseline) — and this number doesn't move across any
+of the 3 fix iterations, nor under a clean `CRATONVM_JIT_DENY=Response
+.toAbsolute` compile-time deny that bypasses this session's changes
+entirely. That rules out a bug in the deopt-policy fix: the cost is
+inherent to `doHomebrew()` (itself JIT/OSR-compiled, independent of
+`toAbsolute()`'s own compilability) dispatching to a non-compiled callee via
+the generic JIT-to-interpreter fallback path. Since that historical baseline
+was ALSO measured with `toAbsolute()` permanently interpreted (the original,
+pre-this-doc RBC.6 bail), `doHomebrew()` plausibly had this exact shape back
+then too — meaning this may be an unrelated `dev` regression introduced
+sometime after 2026-07-19 rather than a new discovery about the JIT's
+inherent behavior. Not bisected this session (out of scope — see the
+known-issues doc for the full reasoning and next-step recommendation).
 
 ## Remaining follow-ups (not blockers for this fix)
 
