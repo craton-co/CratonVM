@@ -852,6 +852,29 @@ of just the log line, or (b) switch to the 6-shard Maven/Arquillian harness (see
 one real producer found and fixed" entry above) for higher per-batch volume against a target class set
 that reliably exercises `org.wildfly.extension.metrics`.
 
+**Update, same session, continued at explicit request**: found the actual service-start call site
+(`native-builtins/src/jboss_msc.rs`'s `ctx.invoke_virtual(svc, "start", ...)`, the same
+`invoke_virtual`-into-recursively-interpreted-real-bytecode shape as the `Class.forName` fix above) and
+armed `CRATONVM_DBG_MSC=1` (prints a full `printStackTrace()` on any service-start failure) alongside
+`CRATONVM_DBG_CCE_BT=1`. Three further campaigns (300 + 400 + 300 = 1,000 more isolated `standalone.sh`
+attempts) still did not reproduce this specific signature — only the separately-tracked
+register-invisible-root family fired in that window. **Combined across the whole session, the fifth
+producer has now been seen exactly once in ~2,700+ isolated attempts (~0.03-0.04% per-attempt rate) —
+roughly 25x rarer than either of the two producers that WERE found and fixed this session (~1% each).**
+A fourth, larger (600-attempt) campaign was launched to push further, but the isolated worktree
+(`/data/wt-remoting-cce-rc2-20260719`) was deleted out from under the session by something else on this
+shared host before that campaign could run (a known hazard on this host — see
+[[shared-checkout-dumpstream-contamination-from-concurrent-sessions]]-adjacent memory entries; no actual
+work was lost, both fixes above were already merged/pushed before this happened).
+
+At the observed rate, reliable reproduction via this isolated-boot harness would need on the order of
+several thousand further attempts (many hours of wall-clock, even at 20-way parallelism) — a cost that no
+longer seems proportionate to a single non-fatal, boot-continuing residual, relative to switching to the
+6-shard Maven/Arquillian harness (which this bug family's own history shows reproduces at meaningfully
+higher rates than isolated boots for the family as a whole) or simply waiting for it to surface again
+during a routine full-suite run. Leaving this as a documented, deliberately-deprioritized residual rather
+than continuing to grind isolated attempts at these odds.
+
 ### Session summary
 
 Four confirmed-live producers investigated this session; two found, fixed, and independently verified
