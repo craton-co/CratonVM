@@ -8,7 +8,13 @@ test fixture, unrelated to CratonVM). `JettyServletWebServerFactoryTests` no
 longer hangs on the blocking-read bug either — it now runs 3x further into the
 class (42+ server start/stop cycles vs. the old stuck point at 14) before
 hitting a newly-exposed, unrelated OPEN residual (severe TLD/JAR-scan slowdown
-in Xerces XML parsing, not a hang) — see the bottom section.**
+in Xerces XML parsing, not a hang) — see the bottom section. **2026-07-21
+update: the JAR-open/JarFile-native/classpath-resource-lookup layers have all
+been ruled out with hard timing measurements, and the slowdown has been
+isolated to genuine Xerces SAX-parsing execution cost (~197x slower than
+HotSpot even with a reused parser) via a standalone, file-I/O-free repro —
+still OPEN, not fixed; see the bottom section for the full diagnosis and a
+fast (seconds, not minutes) repro to continue from.**
 
 ## Scope and separation
 
@@ -290,27 +296,125 @@ in
 
 Unlike the Liquibase/Keycloak case (one large XSD/changelog file, dominated
 by per-character `scanQName`/`scanContent` work), TLD scanning parses **many
-small files**, so the balance likely shifts to per-call overhead in `load`'s
-buffer-refill path (backed by a real `InputStreamReader` over a
-`ByteArrayInputStream` of already-inflated bytes — see
-`native-io/src/zip_real_jar.rs`'s `getInputStream` doc comment — so the
-underlying byte read itself is not the suspect; the JAR-open/central-directory
-parse cost per `new JarFile(...)`, repeated across all ~171 jars on every one
-of the ~115 tests' server starts, is a more likely multiplier) or in
-per-server-start jar-scan repetition with no cross-instance caching. Not yet
-root-caused past this point — this needs the same kind of dedicated
-diagnostic pass (Rust-level profiling of `native-io/src/zip_real_jar.rs`'s
-jar-open path, or extending the `XMLEntityScanner` force-native gate to
-`load`) that produced the Liquibase/Xerces fix, and is being tracked
-separately rather than blocking this doc's closure, since it's a distinct
-root cause (XML/JAR-scan performance, not networking) that plausibly affects
-any Spring Boot suite exercising Jasper/JSP TLD scanning across many
-sequential server starts, not just Jetty.
+small files**, so the balance was suspected to shift to per-call overhead
+somewhere else in the pipeline. This section originally speculated about
+JAR-open cost and a `load`-specific native fast path; a follow-up session
+(2026-07-21, worktree `fix/jetty-tld-jarscan-slowness-20260721`) measured
+each candidate directly and narrowed it down substantially. **Still OPEN —
+not fixed** — but the search space is now much smaller.
 
-**Next steps**: reproduce in isolation with a profiling build (or
-`CRATONVM_DBG_JIT_DISASM`/sampling); check whether `new JarFile(...)` reopens
-the same 171 jars from scratch on every one of the ~115 tests (no
-cross-server-instance handle cache) and whether that dominates; if so, either
-cache open `JarState` by canonical path across the process, or add a
-`load`-specific native fast path mirroring the existing `scanQName`/
-`scanContent` ones.
+### Ruled out, with hard numbers
+
+1. **Raw JAR-open cost (`native-io/src/zip_real_jar.rs`, the `zip` crate).**
+   A diagnostic Rust test (`zip_real_jar::tests::diag_bench_open_all_module_jars`,
+   `#[ignore]`d, run with `CRATONVM_DIAG_JAR_LIST=<classpath file>`) opened
+   all 167 real jars on the `spring-boot-jetty` module's test classpath via
+   plain `zip::ZipArchive::new`: **215.9ms total (167 jars, avg 1.29ms
+   each)**, 197ms on a warm-cache second pass. Even at ~115 repeats (worst
+   case, no caching) that's ~25s total — nowhere near the observed 550s+ of
+   spike time. Raw zip parsing is not the bottleneck.
+
+2. **`java.util.jar.JarFile`/`ZipFile` native construction is never even
+   reached for this workload.** Added `CRATONVM_DBG_JAR=1` tracing to
+   `open_and_register`/`native_jarfile_close` (fd-handle open/close +
+   registry size). A 300s trace run of `JettyServletWebServerFactoryTests`
+   (covering multiple full server-start cycles) produced **zero** `[JAR]`
+   lines. Tomcat's TLD scanning for this classpath shape does not go through
+   CratonVM's `java.util.jar.JarFile` native emulation at all.
+
+3. **`classloading::ClassPath::new` (the flat-classpath loader that reads
+   every jar's bytes into memory once, referenced by the `[jboss-bf]`
+   log lines) is not reconstructed per server start.** Added
+   `CRATONVM_DBG_CLASSPATH=1` timing to `ClassPath::new`. Across the same
+   300s trace window (~20+ server-start cycles), it was called only **twice**
+   total, at **167ms** for a real 176-path load. It's built once (or a
+   couple of times) at VM/classloader setup, not per Jetty server instance —
+   the original "reopens the same 171 jars from scratch on every test"
+   hypothesis is wrong.
+
+4. **`ClassPath::find_resource` / `find_all_resource_urls` (the resource
+   lookup layer backing `getResource(AsStream)`/`getResources`) are not the
+   bottleneck either.** Added `CRATONVM_DBG_RESOURCE_TIMING=1` timing
+   (`diag_resource_call_wrapper` in `classloading/src/class_path.rs`). Over a
+   400s trace window (31 server-start cycles), only **415 total calls**,
+   **~38ms cumulative time**. Negligible.
+
+### Confirmed, with hard numbers: it's genuine Xerces/SAX parsing execution cost
+
+A standalone, pure-JDK repro (no file/jar/classpath I/O at all — see
+`docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/`) parses a
+~500-byte TLD-shaped XML document repeatedly with a **reused** `SAXParser`
+(mirroring Tomcat's pooled `Digester`, so parser-construction cost doesn't
+confound the measurement):
+
+| | HotSpot | CratonVM (jit=on) | CratonVM (`--nojit`) |
+|---|---:|---:|---:|
+| reused-parser parse | ~44us | ~8.7ms | ~13.0ms |
+| fresh `newSAXParser()` | ~360us | ~12.6ms | ~15.0ms |
+
+**~197x slower per parse even with a warm/reused parser**, entirely inside
+the `parse()` call, with zero file or jar I/O involved. JIT provides a real
+but modest ~33% speedup (8.7ms vs. 13.0ms) — it is not being denied/skipped,
+but it doesn't come close to closing the gap, matching the Liquibase/Keycloak
+precedent's own experience (that fix needed dedicated native fast paths, not
+just "let the JIT handle it").
+
+This single isolated measurement is the right order of magnitude to explain
+the real-world spikes: a ~190s spike over a genuinely small number of actual
+`.tld`-file parses (most of the 167 classpath jars are filtered out by
+Tomcat's own jar-skip-list before ever being opened) is entirely consistent
+with each real parse costing single-digit milliseconds to low tens of
+milliseconds, especially once Digester's DTD/schema-validation overhead
+(absent from this minimal repro) is added back in.
+
+**`UTF8Reader` tested and refuted as the specific hot method.** Given `load`
+is a thin ~15-bytecode wrapper around one `Reader.read(char[], int, int)`
+call, and `com.sun.org.apache.xerces.internal.impl.io.UTF8Reader` (the
+concrete `Reader` Xerces picks for UTF-8-declared documents, confirmed via
+`javap -c` on `XMLEntityScanner.createReader`) is — like `load` — **absent**
+from the existing `XMLEntityScanner` force-native gate, it was a natural
+next suspect. `SaxEncodingCompare.java` (same repro directory) parses the
+identical logical document as both UTF-8 (`UTF8Reader`) and US-ASCII
+(`ASCIIReader`) under CratonVM: ASCII was **not** faster (13.5ms vs. 8.7ms
+for UTF-8) — if `UTF8Reader`'s byte-decode loop were the hot path, ASCII
+should have been faster, not slower. The bottleneck is in scanning/attribute/
+namespace/entity-manager/symbol-table machinery shared by both encodings,
+not in encoding-specific byte decoding.
+
+### Still OPEN — what's left
+
+The exact hot method(s) within Xerces's general SAX scanning pipeline
+(`XMLDocumentFragmentScannerImpl`/`XMLNSDocumentScannerImpl`, attribute
+processing, symbol-table interning, entity-manager/grammar-pool setup even
+for a non-validating, DTD-less parse) are **not yet pinned down** — this
+needs real sampling-profiler or debugger tooling (`cdb`/WinDbg is not
+installed on this box; confirmed unavailable both in the original session
+and this follow-up) to go further responsibly, rather than more
+guess-and-measure cycles. The Liquibase/Keycloak precedent fix iterated
+through a long list of specific methods
+(`XMLChar`, `XMLLimitAnalyzer`, `XSSimpleTypeDecl`, `XSDHandler$XSDKey`,
+`scanQName`/`scanContent`/`skipSpaces`/`normalizeNewlines`/`checkEntityLimit`,
+opti-DOM getters, `RangeToken.sortRanges`) over what was clearly a
+substantial, iterative investigation — closing this residual properly likely
+needs the same scale of effort, not a single targeted native-method
+addition.
+
+**Deliberately not attempted this session**: implementing a native fast path
+without being able to verify which method(s) actually dominate risks
+shipping a subtly-incorrect Xerces reimplementation (the doc's own framing
+for the *previous* residual explicitly flagged this risk) while not even
+fixing the reported slowdown if the guess is wrong (as the `UTF8Reader`
+hypothesis was).
+
+**Next steps for whoever picks this up**: get `cdb`/WinDbg (or run the repro
+under a Linux CratonVM build with `perf`/`gdb`) so the hot method(s) can be
+identified directly instead of by elimination; failing that, keep narrowing
+via the same technique used here (isolate a sub-feature — e.g. try a
+namespace-unaware `SAXParserFactory`, or DTD validation on/off — and compare
+CratonVM timing with vs. without it) using
+`docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/` as the fast
+(seconds, not the 10+ minute full-suite rebuild-and-rerun cycle) iteration
+loop. Diagnostic instrumentation left in place (all opt-in, zero behavior
+change by default, matching the existing `CRATONVM_DBG_NET`/
+`CRATONVM_DBG_GETRESOURCES` convention): `CRATONVM_DBG_JAR`,
+`CRATONVM_DBG_CLASSPATH`, `CRATONVM_DBG_RESOURCE_TIMING`.
