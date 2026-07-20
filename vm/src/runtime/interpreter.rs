@@ -11443,7 +11443,7 @@ fn transfer_osr_exit_into_live_frame(
     // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
     // resume from the STALE pre-OSR pc/locals, silently re-executing (and
     // re-committing) every iteration since OSR entry. See
-    // docs/known-issues/springboot/jit-osr-loop-duplicate-execution-silent-corruption.md.
+    // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
     let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
     for v in &rframe.locals {
         if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
@@ -12708,7 +12708,7 @@ mod deopt_step3_tests {
     /// rejected the entire transfer — discarding real, already-committed OSR
     /// side effects and forcing the interpreter to silently re-execute them
     /// from stale pre-OSR state (the root cause documented in
-    /// docs/known-issues/springboot/jit-osr-loop-duplicate-execution-silent-corruption.md).
+    /// docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
     #[test]
     fn osr_exit_transfer_tolerates_unmappable_local() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
@@ -30136,7 +30136,7 @@ fn compile_osr_artifact(
             // the OSR'd code) get silently RE-EXECUTED by the interpreter from
             // the stale resume state — e.g. an `ArrayList` ending up with extra
             // duplicate elements with no exception anywhere. See
-            // docs/known-issues/springboot/jit-osr-loop-duplicate-execution-silent-corruption.md
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
             // for the full repro and trace. Like `has_athrow` above,
             // method-entry compilation (unaffected by this OSR-only bail path)
             // remains available, so do NOT bail-list here.
