@@ -167,7 +167,7 @@ open each doc for the full picture):
 | [`pulsar-propertiesmapper-timeunit-null-npe.md`](pulsar-propertiesmapper-timeunit-null-npe.md) | OPEN — found 2026-07-17 |
 | [`quartzautoconfigurationtests-jdbc-jobstore-not-applied.md`](quartzautoconfigurationtests-jdbc-jobstore-not-applied.md) | OPEN — found 2026-07-17 |
 | [`r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md`](../../internal/springboot/r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md) | FIXED — 2026-07-18; reverified clean (JIT and `--nojit`) 2026-07-19 on current dev. Same root cause as the HTTP codec/JDBC/Micrometer-tracing `FilteredClassLoader` siblings |
-| [`rabbitautoconfigurationtests-cglib-enhance-hang.md`](rabbitautoconfigurationtests-cglib-enhance-hang.md) | OPEN — found 2026-07-17 |
+| [`rabbitautoconfigurationtests-cglib-enhance-hang-FIXED.md`](../../internal/springboot/rabbitautoconfigurationtests-cglib-enhance-hang-FIXED.md) | FIXED — 2026-07-20; not a hang, CPU-sampling proved genuine (if slow) progress — suite-timeout carve-out added (900s) plus a real residual bug fixed (`KeyManagerFactory`/`TrustManagerFactory.getInstance` now reject an unknown algorithm) |
 | [`reactor-netty-server-startup-hang.md`](reactor-netty-server-startup-hang.md) | OPEN — found 2026-07-17. Hypothesis only, not root-caused. |
 | [`repeatablecontainers-method-cache-classcastexception.md`](repeatablecontainers-method-cache-classcastexception.md) | OPEN — found 2026-07-17, hypothesis unconfirmed |
 | [`resourcestests-trailing-slash-windows-path-error.md`](resourcestests-trailing-slash-windows-path-error.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed against native `j |

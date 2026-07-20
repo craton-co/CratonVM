@@ -603,6 +603,20 @@ function Get-EffectiveClassTimeoutSec {
     'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.LombokPropertyDescriptorTests' = 1200
     'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.MergeMetadataGenerationTests' = 1200
     'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.PropertyDescriptorResolverTests' = 1200
+    # RABBIT-CGLIB.1 (2026-07-20): originally reported as a HANG
+    # (docs/known-issues/springboot/rabbitautoconfigurationtests-cglib-enhance-hang.md)
+    # because the log's last line was a CGLIB `@Configuration` enhancement
+    # right before the standard 300s shard timeout killed the process. A
+    # CPU-sampled standalone repro (same technique as the contextrunner
+    # cluster above: `Get-Process` thread `TotalProcessorTime` growing
+    # ~1 CPU-second per wall-second continuously, no thread ever parked)
+    # proved this is not a deadlock -- the class's 78 tests each build and
+    # tear down a full Spring context (many with CGLIB `@Configuration`
+    # proxies and fresh Mockito/ByteBuddy mocks), which is genuinely
+    # CPU-heavy under CratonVM. Run to natural completion in 470.1s
+    # (`Test run finished after 470134 ms`, 76/78 passed). Keep headroom
+    # above that observed time instead of reporting a false HANG.
+    'module/spring-boot-amqp|org.springframework.boot.amqp.autoconfigure.RabbitAutoConfigurationTests' = 900
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {
