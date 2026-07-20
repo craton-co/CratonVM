@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 70 confirmed genuine bugs remaining |
+| **Status** | OPEN — 66 confirmed genuine bugs remaining |
 | **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
 
@@ -15,15 +15,15 @@ classes on a fresh `dev` merge (`8719dca85`, ~3 days / several hundred
 commits later), 4 shards, same settings (`suite-run.sh`, `BATCH=10
 BATCH_TO=120 ONE_TO=120`, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, real JDK 25).
 
-**107 of the 177 are now fixed.** 70 remain open.
+**111 of the 177 are now fixed.** 66 remain open.
 
 | Of the 177 | Count |
 |---|--:|
-| Now OK (fixed) | 107 |
-| Still FAIL | 52 |
+| Now OK (fixed) | 111 |
+| Still FAIL | 48 |
 | Still/newly TIMEOUT | 16 |
 | Now LOADERR (was TIMEOUT) | 2 |
-| **Still open** | **70** |
+| **Still open** | **66** |
 
 The 86 environmentally-non-OK classes (73 EMPTY + 13 FAIL matching HotSpot,
 not CratonVM bugs) were not rerun individually here but the 263-class rerun
@@ -63,11 +63,29 @@ Kotlin-serialization), `http.converter.StringHttpMessageConverterTests`,
 — all still failing 1-3 methods each, consistent with one shared
 charset/encoding gap.
 
-**`scheduling.concurrent.*` cluster — fully unfixed (4 classes)**:
+**`scheduling.concurrent.*` cluster — fixed 2026-07-20 (4/4 classes).**
 `ConcurrentTaskExecutorTests`, `DecoratedThreadPoolTaskExecutorTests`,
-`ThreadPoolTaskExecutorTests`, `ThreadPoolTaskSchedulerTests`, plus
-`scheduling.quartz.QuartzSupportTests` — all partial failures (2-9 methods
-each), likely a shared executor/scheduler gap.
+`ThreadPoolTaskExecutorTests`, `ThreadPoolTaskSchedulerTests` all now pass
+100% (18/18, 14/14, 23/23, 40/40). Root cause: `native-collections` shadowed
+`getCorePoolSize`/`getMaximumPoolSize`/`isShutdown`/`isTerminated`/
+`shutdownNow` on the concrete class `java/util/concurrent/ThreadPoolExecutor`
+unconditionally with CratonVM's synthetic 2-field executor layout, even for
+REAL bytecode-constructed `ThreadPoolExecutor` instances (disambiguated only
+by class name, which collides with the synthetic placeholder) — so
+`setCorePoolSize()`/`setMaximumPoolSize()` mutations were silently ignored on
+readback, and `shutdownNow()` interrupted workers but always returned an
+empty list instead of draining `workQueue`, leaving queued `FutureTask`s
+neither run nor cancelled (`future.get(timeout)` threw `TimeoutException`
+instead of `CancellationException`). Fixed by routing real receivers through
+the real JDK bytecode instead of the synthetic slots (see
+`native-collections/src/lib.rs` `tp_is_real`), landed on `dev` at `2b41ba9b0`.
+`scheduling.quartz.QuartzSupportTests` was investigated as a possible shared
+residual but could not be verified either way: its module
+(`spring-context-support`) doesn't compile against the shared
+spring-framework checkout used for classpath generation (missing the
+`org.springframework.aop.target` source package entirely, pre-existing and
+unrelated to CratonVM) — left open, out of scope for the concurrent-cluster
+fix.
 
 **Groovy — 1/4 fixed.** `scripting.groovy.GroovyAspectTests` is now fixed;
 `context.groovy.GroovyBeanDefinitionReaderTests` and
@@ -78,7 +96,7 @@ each), likely a shared executor/scheduler gap.
 anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 (45/45) — whatever caused that status/method-count mismatch is gone.
 
-## Full class list (70), by module
+## Full class list (66), by module
 
 ### Aop
 
@@ -177,13 +195,17 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 ### Scheduling
 
+`scheduling.concurrent.*` (4 classes: `ConcurrentTaskExecutorTests`,
+`DecoratedThreadPoolTaskExecutorTests`, `ThreadPoolTaskExecutorTests`,
+`ThreadPoolTaskSchedulerTests`) fixed 2026-07-20 — see "Notable clusters"
+above. Removed from this table.
+
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `scheduling.concurrent.ConcurrentTaskExecutorTests` | FAIL | 16/18 | 4896ms |
-| `scheduling.concurrent.DecoratedThreadPoolTaskExecutorTests` | FAIL | 12/14 | 4853ms |
-| `scheduling.concurrent.ThreadPoolTaskExecutorTests` | FAIL | 19/23 | 4964ms |
-| `scheduling.concurrent.ThreadPoolTaskSchedulerTests` | FAIL | 38/40 | 6671ms |
 | `scheduling.quartz.QuartzSupportTests` | FAIL | 8/17 | 9296ms |
+
+(`QuartzSupportTests` not re-verified this session — see note above; kept as
+FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 
 ### Scripting
 
