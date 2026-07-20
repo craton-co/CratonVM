@@ -829,3 +829,37 @@ now fixed and independently verified at 0/400 each. Two items remain open for wh
 
 The `xargs -P 20` isolated `standalone.sh` + `CRATONVM_DBG_CCE_BT=1` harness (see "Methodology" above) is
 proven fast and effective at surfacing whichever family member's turn it is next -- reuse it directly.
+
+## 2026-07-19 session (continued a fifth time): the fifth producer attempted, not reproduced -- session wrap-up
+
+Same worktree/branch. Two further campaigns (15-wave, then 20-wave -- 700 combined attempts,
+`CRATONVM_DBG_CCE_BT=1` armed) specifically hunting the fifth producer (`MSC service start() threw
+java/lang/ClassCastException: java.lang.Object cannot be cast to java.lang.String ... marked FAILED, boot
+continues service=org.wildfly.extension.metrics.registry`) did **not** reproduce it again. Across this
+entire session (~1,700+ combined isolated `standalone.sh` attempts across every campaign), it was seen
+exactly **once**, in the batch that first surfaced it -- no paired `CRATONVM_DBG_CCE_BT` diagnostic was
+captured for that one sighting (it fired from `jboss_msc`'s own error-logging path, not through the
+`checkcast`/`compare_via_compare_to`/`asSubclass` sites already instrumented), so its Rust-side producer
+was never identified. The other campaign hits in this window were exclusively the separately-tracked
+register-invisible-root family (plain interpreter `checkcast`, various extension classes) -- consistent
+with, but not proof of, the fifth producer being a fourth sighting of that *same* pre-existing family
+rather than a new, distinct mechanism.
+
+**Status: unresolved, flagged for a future session.** Whoever picks this up should either (a) add
+`CRATONVM_DBG_CCE_BT`-style instrumentation to whatever native backs `jboss_msc`'s service-start
+`ClassCastException` catch/log path so a future sighting captures a receiver identity + backtrace instead
+of just the log line, or (b) switch to the 6-shard Maven/Arquillian harness (see the 2026-07-19 "session:
+one real producer found and fixed" entry above) for higher per-batch volume against a target class set
+that reliably exercises `org.wildfly.extension.metrics`.
+
+### Session summary
+
+Four confirmed-live producers investigated this session; two found, fixed, and independently verified
+closed (0/400 each); one (the docs original root cause #2) was among them. Fixes merged to `dev` as
+`4bdae388f` (`Class.forName`/`asSubclass` mirror staleness across `initialize_class`) and `bdfd6cff4`
+(`Comparator.comparing` first-extracted-key staleness across the second key-extraction call). Both fixes
+follow this codebase's established Family-1 pin/refresh idiom and were verified with matched pre-fix/
+post-fix live-reproduction batches plus `cargo test` regression checks (no new failures beyond confirmed
+pre-existing ones on unpatched `dev`). Two items remain open: the undiagnosed fifth producer above, and
+the pre-existing, separately-tracked register-invisible-root family (its own doc, unaffected by anything
+in this session).
