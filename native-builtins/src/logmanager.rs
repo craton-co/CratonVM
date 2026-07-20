@@ -1495,7 +1495,7 @@ fn native_jboss_logger_log_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             }
         }
     }
-    eprintln!("{tag} [{logger}] {message}");
+    crate::emit_framework_log(ctx, &format!("{tag} [{logger}] {message}"));
     // If the record carries a throwable, dump class + message + stack + cause
     // chain — this is how the real Quarkus startup-failure surfaces.
     if let Some(r) = record {
@@ -1546,7 +1546,7 @@ fn native_jboss_logger_log_level_supplier(
         Some(Value::Object(Some(supplier))) => jul_resolve_msg(ctx, *supplier),
         _ => String::new(),
     };
-    eprintln!("{tag} [{logger}] {message}");
+    crate::emit_framework_log(ctx, &format!("{tag} [{logger}] {message}"));
     Ok(None)
 }
 
@@ -1581,8 +1581,10 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
         };
         let prefix = if depth == 0 { "" } else { "Caused by: " };
         match &detail {
-            Some(m) if !m.is_empty() => eprintln!("{indent}{prefix}{cls}: {m}"),
-            _ => eprintln!("{indent}{prefix}{cls}"),
+            Some(m) if !m.is_empty() => {
+                crate::emit_framework_log(ctx, &format!("{indent}{prefix}{cls}: {m}"))
+            }
+            _ => crate::emit_framework_log(ctx, &format!("{indent}{prefix}{cls}")),
         }
 
         // Stack trace is captured by `fillInStackTrace` keyed on the
@@ -1596,10 +1598,13 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
                     (None, -2) => "(Native Method)".to_string(),
                     _ => "(Unknown Source)".to_string(),
                 };
-                eprintln!(
-                    "{indent}    at {}.{}{where_}",
-                    f.class_name.replace('/', "."),
-                    f.method_name
+                crate::emit_framework_log(
+                    ctx,
+                    &format!(
+                        "{indent}    at {}.{}{where_}",
+                        f.class_name.replace('/', "."),
+                        f.method_name
+                    ),
                 );
             }
         }
@@ -1659,7 +1664,7 @@ fn native_jboss_logging_logger_do_log(
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
-    eprintln!("{level_name} [{logger_name}] {message}");
+    crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
     if let Some(t) = throwable_obj {
         dump_throwable_to_stderr(ctx, t, "    ");
     }
@@ -1829,7 +1834,7 @@ fn native_jboss_logging_logger_do_logf(
     } else {
         format
     };
-    eprintln!("{level_name} [{logger_name}] {message}");
+    crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
     if let Some((pin, original)) = throwable_pin {
         let t = ctx.read_native_pin(pin, original);
         dump_throwable_to_stderr(ctx, t, "    ");
@@ -1899,7 +1904,12 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
             }
         }
     }
-    eprintln!("{level} [{logger_name}] {message}");
+    // `eprintln!` writes to the process's raw OS stderr, bypassing the
+    // Java-level `System.out`/`System.err` `PrintStream` that JUnit5's
+    // `OutputCaptureExtension` substitutes — same bug class as
+    // `log_simple`'s fix below; route through the live stream instead.
+    // See docs/known-issues/springboot/propertiesmigration-logfactory-oom-residual.md.
+    crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
     if let Some(t) = throwable {
         dump_throwable_to_stderr(ctx, t, "    ");
     }
@@ -1961,7 +1971,8 @@ fn jboss_logger_emit_fqcn(ctx: &mut dyn NativeContext, args: &[Value], level: &s
         None if matches!(args.get(2), Some(Value::Object(None))) => "null".to_string(),
         None => String::new(),
     };
-    eprintln!("{level} [{logger_name}] {message}");
+    // See `jboss_logger_emit`'s comment above — same raw-eprintln bypass.
+    crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
     if let Some((pin, original)) = throwable_pin {
         let throwable = ctx.read_native_pin(pin, original);
         dump_throwable_to_stderr(ctx, throwable, "    ");
@@ -2042,7 +2053,7 @@ fn native_jul_logger_log_level_msg(
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     publish_jul_handlers(ctx, this, level_obj, message_obj);
-    eprintln!("{level_name} [{logger_name}] {message}");
+    crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
     if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
         publish_to_jul_handlers(ctx, logger, level, message)?;
     }
@@ -2082,7 +2093,7 @@ fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => String::new(),
     };
     let message = template.replace("{0}", &rendered);
-    eprintln!("{tag} [{logger_name}] {message}");
+    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
     Ok(None)
 }
 
@@ -2148,7 +2159,7 @@ fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         }
         None => template,
     };
-    eprintln!("{tag} [{logger_name}] {message}");
+    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
     Ok(None)
 }
 
@@ -2457,12 +2468,15 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             _ => String::new(),
         };
         if detail.is_empty() {
-            eprintln!("{tag} [{logger_name}] {message} ({cls})");
+            crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message} ({cls})"));
         } else {
-            eprintln!("{tag} [{logger_name}] {message} ({cls}: {detail})");
+            crate::emit_framework_log(
+                ctx,
+                &format!("{tag} [{logger_name}] {message} ({cls}: {detail})"),
+            );
         }
     } else {
-        eprintln!("{tag} [{logger_name}] {message}");
+        crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
     }
     if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
         publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
@@ -2733,12 +2747,12 @@ fn native_jul_logger_log_throwable(
         Some(t) => {
             let r = jul_render_throwable(ctx, t);
             if msg.is_empty() {
-                eprintln!("{tag} [{logger_name}] {r}");
+                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {r}"));
             } else {
-                eprintln!("{tag} [{logger_name}] {msg}\n{r}");
+                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}\n{r}"));
             }
         }
-        None => eprintln!("{tag} [{logger_name}] {msg}"),
+        None => crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}")),
     }
     Ok(None)
 }
@@ -2766,7 +2780,7 @@ fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -
         })
         .unwrap_or_default();
     let tag = jul_level_tag(ctx, level_obj);
-    eprintln!("{tag} [{logger_name}] {msg}");
+    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}"));
     Ok(None)
 }
 
@@ -2808,12 +2822,12 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(t) => {
             let r = jul_render_throwable(ctx, t);
             if message.is_empty() {
-                eprintln!("{tag} [{logger_name}] {r}");
+                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {r}"));
             } else {
-                eprintln!("{tag} [{logger_name}] {message}\n{r}");
+                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}\n{r}"));
             }
         }
-        None => eprintln!("{tag} [{logger_name}] {message}"),
+        None => crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}")),
     }
     Ok(None)
 }
@@ -2984,7 +2998,16 @@ fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
-    eprintln!("{level} [{logger_name}] {message}");
+    // `eprintln!` writes to the process's raw OS stderr, entirely bypassing
+    // the Java-level `System.out`/`System.err` `PrintStream` objects — so
+    // JUnit5's `OutputCaptureExtension` (which substitutes those objects via
+    // `System.setOut`/`setErr`) never sees these `java.util.logging.Logger`
+    // convenience-method records, even though a human watching the console
+    // (or this process's raw stderr) sees them fine. Same bug class as the
+    // Logback/commons-logging `emit_framework_log` fix — route through the
+    // live (possibly test-substituted) stream instead.
+    // See docs/known-issues/springboot/propertiesmigration-logfactory-oom-residual.md.
+    crate::emit_framework_log(ctx, &format!("{level} [{logger_name}] {message}"));
 }
 
 fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

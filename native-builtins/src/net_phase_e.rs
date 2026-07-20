@@ -149,6 +149,12 @@ const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
 ];
 
 const SOCK_HOST: usize = 0;
@@ -8766,6 +8772,44 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
         }
     });
+    // method()/uri() — public HttpRequest getters. `build()` above allocates
+    // the returned object directly as class `java/net/http/HttpRequest`
+    // (the abstract JDK class itself, not a concrete subclass), so any real
+    // Java bytecode invoking these instance methods resolves against that
+    // abstract declaration (no Code attribute) unless a native is registered
+    // on this exact class name. Only field-0 (method) and field-1 (uri, a
+    // plain String — see `newBuilder`/`uri` above) were previously
+    // read/written internally by this file's own Rust helpers
+    // (`re5_do_request` et al.); nothing exposed them back to Java callers.
+    // Real-world callers building a request via this builder and then
+    // inspecting it as a genuine `HttpRequest` (not just handing it to
+    // `HttpClient.send`) hit `AbstractMethodError: method
+    // java/net/http/HttpRequest.method()Ljava/lang/String; has no Code
+    // attribute` — see
+    // docs/known-issues/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror.md
+    // (Hazelcast's `RestClient.call` calls `request.method()` purely for its
+    // own logging/retry bookkeeping after building the request).
+    r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        match ctx.get_field(request, 0) {
+            m @ Value::Object(Some(_)) => Ok(Some(m)),
+            _ => Ok(Some(Value::Object(Some(ctx.create_string("GET"))))),
+        }
+    });
+    r.register(req, "uri", "()Ljava/net/URI;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let uri_str = match ctx.get_field(request, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let uri_string_obj = ctx.create_string(&uri_str);
+        ctx.invoke(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[Value::Object(Some(uri_string_obj))],
+        )
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
@@ -9398,6 +9442,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
@@ -9444,6 +9494,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());

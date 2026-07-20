@@ -570,7 +570,7 @@ pub(crate) fn build_engine_client_config_with_identity(
         if has_kms {
             let resolver: Arc<dyn ResolvesClientCert> = Arc::new(JavaKeyManagerResolver {
                 km_ctx_key: key,
-                provider: Arc::new(rustls::crypto::ring::default_provider()),
+                provider: Arc::new(cbc_augmented_default_provider()),
             });
             return build_client_config_with_revocation_and_resolver(
                 roots,
@@ -1688,7 +1688,7 @@ fn build_client_config_ex(
         client_auth,
         revocation,
         use_java_trust_manager,
-        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::new(cbc_augmented_default_provider()),
     )
 }
 
@@ -2209,9 +2209,11 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
 /// Map a Java `SSLEngine.setEnabledCipherSuites` name to the matching rustls
 /// `CipherSuite`. Only covers the suites this module ever advertises via
 /// `getSupportedCipherSuites`/`getEnabledCipherSuites` (see the two identical
-/// 9-entry lists elsewhere in this file) — the full negotiable set for the
-/// `ring` crypto provider. TLS 1.3 suite names differ (Java drops the "13"
-/// infix rustls uses), everything else matches verbatim.
+/// 13-entry lists elsewhere in this file) — the full negotiable set for the
+/// `ring` crypto provider, plus the four TLS1.2 CBC suites added by T-CBC.1
+/// (`t27_tls_cbc`, since `ring` itself never implements CBC-mode suites).
+/// TLS 1.3 suite names differ (Java drops the "13" infix rustls uses),
+/// everything else matches verbatim.
 fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
     use rustls::CipherSuite::*;
     Some(match name {
@@ -2228,17 +2230,38 @@ fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
         "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
             TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
         }
+        "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256" => TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+        "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256" => TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+        "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384" => TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+        "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384" => TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
         _ => return None,
     })
 }
 
+/// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
+/// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
+/// see `docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md`.
+/// Every call site that used to construct `rustls::crypto::ring::default_provider()`
+/// directly now goes through this instead, so the CBC suites are negotiable
+/// (not just reported) everywhere TLS connections get set up.
+fn cbc_augmented_default_provider() -> rustls::crypto::CryptoProvider {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.cipher_suites.extend([
+        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256),
+        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256),
+        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384),
+        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384),
+    ]);
+    provider
+}
+
 /// Build a `CryptoProvider` restricted to `enabled` (Java cipher-suite names),
-/// falling back to the unrestricted `ring` default when `enabled` is empty or
-/// maps to nothing we recognize — so an unmappable/empty list can never starve
-/// the connection down to zero usable suites (which would make the builder
-/// error out instead of just failing to restrict as intended).
+/// falling back to the unrestricted (CBC-augmented) default when `enabled` is
+/// empty or maps to nothing we recognize — so an unmappable/empty list can
+/// never starve the connection down to zero usable suites (which would make
+/// the builder error out instead of just failing to restrict as intended).
 fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider> {
-    let base = rustls::crypto::ring::default_provider();
+    let base = cbc_augmented_default_provider();
     if enabled.is_empty() {
         return Arc::new(base);
     }
@@ -2254,7 +2277,7 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
         .cipher_suites
         .retain(|cs| wanted.contains(&cs.suite()));
     if restricted.cipher_suites.is_empty() {
-        return Arc::new(rustls::crypto::ring::default_provider());
+        return Arc::new(cbc_augmented_default_provider());
     }
     Arc::new(restricted)
 }
@@ -6292,6 +6315,12 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real (not just reported) CBC-mode suites, see
+                // `t27_tls_cbc` / docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
             for (i, &s) in suites.iter().enumerate() {
@@ -7475,6 +7504,12 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real (not just reported) CBC-mode suites, see
+                // `t27_tls_cbc` / docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let protocols = with_engine(id, |s| s.enabled_protocols.clone())
                 .filter(|l| !l.is_empty())

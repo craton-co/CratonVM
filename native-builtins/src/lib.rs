@@ -8538,6 +8538,7 @@ pub mod servlet;
 pub mod http2;
 pub mod jmx_openmbean;
 pub mod t27_tls;
+pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
@@ -44634,7 +44635,7 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 /// to any other Java-level redirection).  Routing through `stream_writeln`
 /// preserves the canonical fd fast path for the original stream while calling
 /// a capture stream's real `OutputStream.write` override after redirection.
-fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
+pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
     ctx.record_printed_line(text.to_string());
     // `NativeContext::get_system_stream` is the process's canonical fd-backed
     // stream. `System.setOut` intentionally leaves that canonical stream in

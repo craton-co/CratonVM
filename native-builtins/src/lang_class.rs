@@ -10994,34 +10994,37 @@ pub(crate) fn annotation_element_to_java_typed(
             // the wrong switch case, surfacing as `IllegalArgumentException`
             // wrapped at `ConfigurationClassParser.parse:181`.  Load the
             // class on demand, mirroring the sibling `Class` arm (C29).
+            //
+            // Loader-faithful resolution (found via
+            // `SpringBootContextLoaderAotTests`, `@CompileWithForkedClassLoader`):
+            // `ctx.class_id_by_name` is a GLOBAL "one class per name" lookup.
+            // Under a forked/isolating classloader, the annotation's declaring
+            // class (and the bytecode that later compares this default value
+            // via `==`, e.g. `useMainMethod == UseMainMethod.NEVER` in
+            // `SpringBootContextLoader.getMainMethod`) is loaded by the FORKED
+            // loader, but the global table can still resolve `class_name` to
+            // the outer/app loader's copy of the enum class — producing a
+            // same-named but reference-UNEQUAL enum constant (default
+            // `UseMainMethod.NEVER` from the wrong loader), so the `==` check
+            // silently fails and `useMainMethod` behaves as if it were
+            // `ALWAYS` (ordinal 0). Mirror the `Class`-valued arm above: when
+            // `container_loader` is present, resolve the enum type through it
+            // first via `loadClass`, so the SAME loader's copy backs both the
+            // default value and the bytecode's own reference to the constant.
             let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
-            // Classloader-isolation: resolve the enum class through the
-            // declaring class's loader FIRST, mirroring the `Class`-valued
-            // arm above. Without this, the name-only `class_id_by_name`
-            // lookup below collapses to whichever copy of the enum class
-            // happens to be registered VM-wide, which can be a DIFFERENT
-            // copy than the one the annotated class's own bytecode
-            // references under a classloader fork (e.g. Spring's
-            // `@CompileWithForkedClassLoader`). That produced a real,
-            // reproducing bug: `SpringBootTest.UseMainMethod.NEVER`
-            // materialised here (via the app loader's copy) compared `==`
-            // false against the `UseMainMethod.NEVER` referenced directly in
-            // `SpringBootContextLoader.getMainMethod` (compiled against the
-            // forked loader's copy) even though both printed "NEVER",
-            // sending the guard down the wrong branch and throwing "Main
-            // method not found on '...'".
-            let class_mirror_via_loader = container_loader.and_then(|loader| {
-                resolve_annotation_class_via_loader(ctx, loader, class_name).ok()
+            let via_loader = container_loader.and_then(|loader| {
+                match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                    Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                    Err(_) => None,
+                }
             });
-            let enum_cid_opt = if class_mirror_via_loader.is_some() {
-                None
-            } else {
+            let enum_cid_opt = via_loader.or_else(|| {
                 ctx.class_id_by_name(class_name).or_else(|| {
                     let _ = ctx.load_class(class_name);
                     ctx.class_id_by_name(class_name)
                 })
-            };
-            if class_mirror_via_loader.is_some() || enum_cid_opt.is_some() {
+            });
+            if let Some(enum_cid) = enum_cid_opt {
                 // GC-safety (2026-07-16): this is the "enum builder" residual
                 // gap flagged (but never swept) in
                 // docs/internal/fixed-suite-bugs/jit-junit-discovery-reflection-corruption.md
@@ -11030,8 +11033,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 // invocation itself, which can allocate/classload) before
                 // being used as an invoke argument. Pin it and re-read the
                 // forwarded reference right before use.
-                let class_mirror = class_mirror_via_loader
-                    .unwrap_or_else(|| ctx.get_class_mirror(enum_cid_opt.unwrap()));
+                let class_mirror = ctx.get_class_mirror(enum_cid);
                 let class_mirror_pin = ctx.pin_native_root(class_mirror);
                 let name_str = ctx.create_string(const_name);
                 let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
@@ -11047,8 +11049,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 ctx.unpin_native_roots(class_mirror_pin);
                 if iae_trace {
                     eprintln!(
-                        "ANN-ENUM class={class_name} const={const_name} via-container-loader={} ok={}",
-                        class_mirror_via_loader.is_some(),
+                        "ANN-ENUM class={class_name} const={const_name} ok={}",
                         invoke_res.as_ref().map(|v| v.is_some()).unwrap_or(false)
                     );
                 }
@@ -12580,8 +12581,36 @@ pub(crate) fn native_class_get_type_parameters(
     let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
-        // genericDeclaration = the declaring Class mirror (`this`).
-        let tv = crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+        // `Class.getTypeParameters()` must return the SAME TypeVariable
+        // objects across repeated calls, exactly like HotSpot's
+        // `Class.getGenericInfo()` soft-reference cache. Building a fresh
+        // synthetic TypeVariable on every call (the previous behavior here)
+        // breaks any algorithm that stashes a type variable from one call
+        // (e.g. as a `ParameterizedType`'s actual-type-argument, baked in by
+        // value) and later compares/looks it up against the result of a
+        // SUBSEQUENT `getTypeParameters()` call on the same class — the two
+        // references are never identical (nor equal, since equals() is by
+        // declaring-class+name and a later call's object still passes that
+        // check, but a plain HashMap key lookup by the OLD reference against
+        // a map keyed by the NEW one still requires hashCode/equals to run,
+        // and repeated re-creation means the cache backing
+        // `resolve_declared_type_variable` keeps getting overwritten mid-walk).
+        // Concretely: Hibernate Validator's `TypeHelper.resolveTypes` walks a
+        // class hierarchy, and at each `ParameterizedType` level calls
+        // `erased.getTypeParameters()` fresh to compute its substitution map;
+        // for a 3+ level generic hierarchy (e.g.
+        // `AbstractInstantBasedTimeValidator` -> `HibernateConstraintValidator`
+        // -> `ConstraintValidator`) sharing reused type-variable names across
+        // levels, repeated non-identical objects for the same (class, name)
+        // corrupt the map this algorithm chases through, producing a cyclic
+        // `while (map.containsKey(x)) x = map.get(x)` walk that never
+        // terminates (observed as an indefinite CPU-pegged hang building the
+        // built-in `ConstraintHelper`, e.g. for classes deriving from
+        // `AbstractInstantBasedTimeValidator`). Reuse the cached object when
+        // one already exists for (this, tp.name); only build+cache a new one
+        // on first request.
+        let tv = crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
+            .unwrap_or_else(|| crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this))));
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }

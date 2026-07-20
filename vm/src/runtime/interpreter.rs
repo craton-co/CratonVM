@@ -19997,40 +19997,41 @@ fn execute_invoke_kind(
     // static constants with the forked receiver (Spring's MergedAnnotation
     // Adapt enum is identity-sensitive). Prefer the receiver loader's exact
     // interface when it is a real superinterface of the receiver.
+    //
+    // BUT only when the receiver is actually going to fall through to that
+    // interface default in the first place. If the receiver's OWN class
+    // hierarchy already declares a concrete (class-level, non-interface)
+    // override of this exact name+descriptor, that override must win —
+    // redirecting `class_id` straight to the interface's per-loader copy
+    // skips past the override and runs the interface default instead. Found
+    // via `SpringBootContextLoaderAotTests` (`@CompileWithForkedClassLoader`):
+    // `DelegatingSmartContextLoader` (loaded by the forked test classloader)
+    // overrides `AotContextLoader.loadContextForAotProcessing(MergedContextConfiguration,
+    // RuntimeHints)`, but this override redirected dispatch to the forked
+    // loader's own copy of `AotContextLoader` — whose default body just calls
+    // the 1-arg `loadContextForAotProcessing(MergedContextConfiguration)`
+    // default, which unconditionally throws
+    // `UnsupportedOperationException("Invoke loadContextForAotProcessing(...)
+    // instead")`. Use `find_method_recursive` on the receiver's OWN class_id
+    // (loader-accurate, unlike a name-based lookup) to check for a real
+    // override before applying the redirect.
     let loader_interface_override = if is_interface
         && !is_special
         && crate::runtime::env_cache::loader_aware_resolution()
     {
         receiver_class_id.and_then(|receiver_id| {
             let cm = shared.class_manager.read();
-            // If the receiver's own class chain already provides a concrete
-            // (class-declared, non-interface-default) override for this
-            // exact name+descriptor, that override is the JLS/JVMS-mandated
-            // most-specific candidate and must win over ANY interface
-            // default -- including the receiver loader's "exact" copy of the
-            // interface. Skipping this check made an overloaded interface
-            // default (two default methods sharing a name, differing only
-            // in arity -- e.g. Spring's `AotContextLoader.
-            // loadContextForAotProcessing(config)` vs `(config, hints)`,
-            // where the 2-arg default's own body just calls the 1-arg one)
-            // dispatch straight to the INTERFACE's default body instead of
-            // the receiver's real override: this override substitutes the
-            // interface's class_id as the dispatch target before
-            // `find_method_recursive` ever gets a chance to walk the
-            // receiver's concrete class chain first.
-            let has_concrete_override = crate::classloading::find_method_recursive(
+            let receiver_has_class_override = crate::classloading::find_method_recursive(
                 receiver_id,
                 &method_name,
                 &method_descriptor,
                 &cm.class_store,
             )
-            .is_some_and(|(m, declaring_id)| {
-                !m.is_abstract()
-                    && cm
-                        .get_class(declaring_id)
-                        .is_some_and(|c| !c.is_interface())
+            .is_some_and(|(_, declaring_id)| {
+                !cm.get_class(declaring_id)
+                    .is_some_and(|class| class.is_interface())
             });
-            if has_concrete_override {
+            if receiver_has_class_override {
                 return None;
             }
             let receiver_loader = cm.get_loader_id(receiver_id)?;
@@ -24520,6 +24521,18 @@ fn force_native_over_real_jdk_bytecode(
                 | "getName"
                 | "size"
         )
+    {
+        return true;
+    }
+    // Keep in sync with vm_exec.rs's `check_override` allow-list entry for
+    // the same triple — see that entry's comment for the full rationale
+    // (synthetic StringBuilder/StringBuffer/AbstractStringBuilder layout vs.
+    // real bytecode's `checkOffset(dstOffset, count)` AIOOBE).
+    if matches!(
+        class_name,
+        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+    ) && method_name == "insert"
+        && (method_descriptor.starts_with("(I[CII)") || method_descriptor.starts_with("(I[C)"))
     {
         return true;
     }
