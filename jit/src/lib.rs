@@ -7454,14 +7454,15 @@ fn try_compile_inner(
     // resolved) bails the WHOLE compile via `?`, exactly like every other
     // CP-resolved metadata table here — the codegen must never guess an
     // invokedynamic's stack effect.
-    let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
     if !scan.indy_ops.is_empty() {
         let resolver = cp_invokedynamic_descriptor_resolver?;
         for &(pc, cp_idx) in &scan.indy_ops {
             let descriptor = resolver(cp_idx)?;
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
-            indy_info.push((pc, arg_slots, ret_type));
+            let arg_type_tags = indy_arg_type_tags(&descriptor);
+            indy_info.push((pc, arg_slots, ret_type, arg_type_tags));
         }
     }
 
@@ -7911,6 +7912,86 @@ pub fn count_param_slots(descriptor: &str) -> usize {
         }
     }
     slots
+}
+
+/// Per-argument JVM type tag, one entry per COMPACT stack slot (mirrors
+/// `count_param_slots`' one-slot-per-parameter counting — a `long`/`double`
+/// occupies a single entry here, not two), in descriptor (left-to-right,
+/// push) order. Tag is one of `I` (int/boolean/byte/char/short, collapsed to
+/// a single non-oop-int tag), `J` (long), `F` (float), `D` (double), or `L`
+/// (object or array reference — the caller already has a precise oop mask
+/// for these; the tag exists for completeness, not because it's read).
+///
+/// Written for the OSR-exit/invokedynamic-uncommon-trap deopt snapshot
+/// (`build_and_record_deopt_point`'s operand-stack loop in `x64.rs`): the
+/// snapshot's generic per-method `wide_fp` gate marks EVERY non-oop stack
+/// slot `Unsupported` once a method touches any `long`/`float`/`double`
+/// ANYWHERE, even when the specific slot at THIS bci is provably a plain
+/// `int` (the abstract stack has no per-entry width source otherwise — see
+/// `uses_long_float_double`'s doc comment). An invokedynamic call site is
+/// the one place stack shape IS known precisely without a full stack-map
+/// simulation: its bootstrap descriptor fixes exactly how many arguments are
+/// live directly beneath it and their types, in order. Using these tags to
+/// override `Unsupported` just for the indy call's own arguments — instead of
+/// the coarse method-level gate — is what let the OSR-exit snapshot at
+/// `getstatic System.out` + an `if`/`else`-computed `makeConcatWithConstants`
+/// argument decode its operand stack precisely; see
+/// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`.
+pub fn indy_arg_type_tags(descriptor: &str) -> Vec<u8> {
+    let bytes = descriptor.as_bytes();
+    let mut tags = Vec::new();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return tags;
+    }
+    let mut i = 1;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'I' | b'B' | b'C' | b'S' | b'Z' => {
+                tags.push(b'I');
+                i += 1;
+            }
+            b'F' => {
+                tags.push(b'F');
+                i += 1;
+            }
+            b'J' => {
+                tags.push(b'J');
+                i += 1;
+            }
+            b'D' => {
+                tags.push(b'D');
+                i += 1;
+            }
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+                tags.push(b'L');
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    if bytes[i] == b'L' {
+                        while i < bytes.len() && bytes[i] != b';' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                tags.push(b'L');
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    tags
 }
 
 /// inc 25: the IR-builder parameter types in JIT-arg order (one per parameter,
@@ -10975,6 +11056,38 @@ mod tests {
     #[test]
     fn test_count_param_slots_empty_string() {
         assert_eq!(count_param_slots(""), 0);
+    }
+
+    // ── indy_arg_type_tags tests ─────────────────────────────────────
+
+    #[test]
+    fn indy_arg_type_tags_matches_the_writingservlet_concat_shape() {
+        // WritingServlet.doGet's `makeConcatWithConstants` bootstrap
+        // descriptor: (int length, String buffered, long elapsedNanos).
+        assert_eq!(
+            indy_arg_type_tags("(ILjava/lang/String;J)Ljava/lang/String;"),
+            vec![b'I', b'L', b'J']
+        );
+    }
+
+    #[test]
+    fn indy_arg_type_tags_one_tag_per_compact_slot() {
+        assert_eq!(count_param_slots("(IJDF)V"), indy_arg_type_tags("(IJDF)V").len());
+        assert_eq!(indy_arg_type_tags("(IJDF)V"), vec![b'I', b'J', b'D', b'F']);
+    }
+
+    #[test]
+    fn indy_arg_type_tags_arrays_are_l() {
+        assert_eq!(
+            indy_arg_type_tags("([I[Ljava/lang/Object;)V"),
+            vec![b'L', b'L']
+        );
+    }
+
+    #[test]
+    fn indy_arg_type_tags_empty() {
+        assert_eq!(indy_arg_type_tags("()V"), Vec::<u8>::new());
+        assert_eq!(indy_arg_type_tags(""), Vec::<u8>::new());
     }
 
     #[test]
