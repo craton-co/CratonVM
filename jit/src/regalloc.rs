@@ -367,6 +367,223 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
     targets
 }
 
+
+/// RBC.6 local-handler-safety fix v2 — proper CFG-based "definitely
+/// assigned" forward dataflow, replacing an earlier raw-pc-order
+/// approximation in `jit/src/lib.rs::local_handler_reads_unsafe_local`
+/// that had two real bugs:
+///
+/// 1. **Over-conservative** (false rejects): it scanned linearly from a
+///    handler's `handler_pc` all the way to the END OF THE METHOD,
+///    ignoring `athrow`/`return` terminators — so a short, simple handler
+///    (e.g. `astore; new Ex; ...; athrow`) was incorrectly judged unsafe
+///    whenever *unrelated, later code in the same method* (reachable only
+///    via a completely different branch, never through this handler)
+///    happened to read a non-param local. This was confirmed to be the
+///    actual, sole remaining blocker for `Response.toAbsolute()` — the
+///    doc's own motivating case — even after the RBC.6 gate itself and the
+///    unrelated BUG-LQB-SCOPE gate were both fixed.
+/// 2. **Under-conservative** (a latent, never-triggered soundness gap):
+///    the raw-pc-order check ("is there SOME store to this slot at a lower
+///    pc, reachable from handler_pc") is not path-sensitive. For
+///    `if (c) { x = ...; } else { read x; }` inside a handler, javac emits
+///    the true-branch (the store) at a LOWER pc than the false-branch (the
+///    read) regardless of which branch actually executes — the old check
+///    would see "a reachable store exists at a lower pc" and wrongly
+///    accept the method even on a run that takes the false branch, where
+///    `x` was never actually written.
+///
+/// Both are fixed by real dominance: a load is safe only if the slot is
+/// written on EVERY control-flow path from `entry_pc` to that load. This
+/// is a standard forward "must" (available-values) dataflow: each freshly
+/// discovered program point's safe-set starts as its first predecessor's
+/// propagated set; every ADDITIONAL predecessor INTERSECTS its own
+/// propagated set in (a slot is only safe at a merge point if every
+/// incoming path made it safe), re-queuing successors whenever a point's
+/// safe-set shrinks. Terminates because safe-sets are monotonically
+/// non-increasing, bounded below by the empty set.
+///
+/// `initial_safe_slots` is a bitmask (bit `i` = local slot `i`) of locals
+/// safe at `entry_pc` before any handler-local code runs (`this` + declared
+/// params). Slots numbered >= 64 cannot be represented in the bitmask;
+/// any load of such a slot is conservatively treated as unsafe (this can
+/// only make the check MORE conservative, never less — matching every
+/// other "when in doubt, don't compile" gate in this scanner).
+///
+/// Reuses this module's own, already load-bearing bytecode-width/branch
+/// decoding (`bc_len`, `branch_target`, `is_unconditional`,
+/// `switch_targets` — the exact functions `build_cfg` itself uses) so this
+/// can never diverge from the CFG this backend already trusts for register
+/// allocation.
+pub(crate) fn handler_has_unsafe_local_read(
+    code: &[u8],
+    code_len: usize,
+    entry_pc: usize,
+    initial_safe_slots: u64,
+) -> bool {
+    use std::collections::{HashMap, VecDeque};
+
+    if entry_pc >= code_len {
+        return false;
+    }
+
+    fn merge_successor(
+        safe_at: &mut HashMap<usize, u64>,
+        worklist: &mut VecDeque<usize>,
+        target: usize,
+        code_len: usize,
+        incoming: u64,
+    ) {
+        if target >= code_len {
+            return;
+        }
+        match safe_at.get(&target).copied() {
+            None => {
+                safe_at.insert(target, incoming);
+                worklist.push_back(target);
+            }
+            Some(existing) => {
+                let merged = existing & incoming;
+                if merged != existing {
+                    safe_at.insert(target, merged);
+                    worklist.push_back(target);
+                }
+            }
+        }
+    }
+
+    let mut safe_at: HashMap<usize, u64> = HashMap::new();
+    safe_at.insert(entry_pc, initial_safe_slots);
+    let mut worklist: VecDeque<usize> = VecDeque::new();
+    worklist.push_back(entry_pc);
+    // Bound iterations defensively (methods here are already capped far
+    // below this by other JIT scan limits) so a pathological CFG can only
+    // ever fall through to "conservatively reject", never hang.
+    let mut steps = 0usize;
+    const MAX_STEPS: usize = 2_000_000;
+
+    while let Some(pc) = worklist.pop_front() {
+        steps += 1;
+        if steps > MAX_STEPS {
+            return true;
+        }
+        if pc >= code_len {
+            continue;
+        }
+        let safe = *safe_at.get(&pc).unwrap_or(&0);
+        let op = code[pc];
+        let len = bc_len(code, pc);
+        if pc + len > code_len + 1 {
+            // Truncated instruction at the tail — cannot safely decode
+            // further; conservatively reject rather than read out of bounds.
+            return true;
+        }
+
+        let mut propagated = safe;
+        let mut unsafe_read = false;
+
+        // Mirrors jit_scan's own load/store/iinc decoding exactly (same
+        // opcode ranges and slot-index arithmetic as `local_slot_ops` in
+        // jit/src/x64.rs).
+        match op {
+            0x15..=0x19 => {
+                if pc + 1 < code.len() {
+                    let slot = code[pc + 1] as u32;
+                    unsafe_read = slot >= 64 || (safe & (1u64 << slot)) == 0;
+                } else {
+                    unsafe_read = true;
+                }
+            }
+            0x1a..=0x1d => {
+                let slot = (op - 0x1a) as u32;
+                unsafe_read = (safe & (1u64 << slot)) == 0;
+            }
+            0x1e..=0x21 => {
+                let slot = (op - 0x1e) as u32;
+                unsafe_read = (safe & (1u64 << slot)) == 0;
+            }
+            0x22..=0x29 => {
+                let slot = ((op - 0x22) % 4) as u32;
+                unsafe_read = (safe & (1u64 << slot)) == 0;
+            }
+            0x2a..=0x2d => {
+                let slot = (op - 0x2a) as u32;
+                unsafe_read = (safe & (1u64 << slot)) == 0;
+            }
+            0x36..=0x3a => {
+                if pc + 1 < code.len() {
+                    let slot = code[pc + 1] as u32;
+                    if slot < 64 {
+                        propagated |= 1u64 << slot;
+                    }
+                }
+            }
+            0x3b..=0x3e => {
+                let slot = (op - 0x3b) as u32;
+                if slot < 64 {
+                    propagated |= 1u64 << slot;
+                }
+            }
+            0x3f..=0x42 => {
+                let slot = (op - 0x3f) as u32;
+                if slot < 64 {
+                    propagated |= 1u64 << slot;
+                }
+            }
+            0x43..=0x4a => {
+                let slot = ((op - 0x43) % 4) as u32;
+                if slot < 64 {
+                    propagated |= 1u64 << slot;
+                }
+            }
+            0x4b..=0x4e => {
+                let slot = (op - 0x4b) as u32;
+                if slot < 64 {
+                    propagated |= 1u64 << slot;
+                }
+            }
+            0x84 => {
+                // iinc — reads then writes the same slot.
+                if pc + 1 < code.len() {
+                    let slot = code[pc + 1] as u32;
+                    unsafe_read = slot >= 64 || (safe & (1u64 << slot)) == 0;
+                    if slot < 64 {
+                        propagated |= 1u64 << slot;
+                    }
+                } else {
+                    unsafe_read = true;
+                }
+            }
+            _ => {}
+        }
+
+        if unsafe_read {
+            return true;
+        }
+
+        if is_unconditional(op) {
+            if matches!(op, 0xaa | 0xab) {
+                for t in switch_targets(code, pc, code_len) {
+                    merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
+                }
+            } else if let Some(t) = branch_target(code, pc) {
+                merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
+            }
+            // return-family / athrow: no successors — this control-flow
+            // path ends here, which is exactly the case the old linear
+            // scan got wrong by continuing past it.
+        } else {
+            if let Some(t) = branch_target(code, pc) {
+                merge_successor(&mut safe_at, &mut worklist, t, code_len, propagated);
+            }
+            let next = pc + len;
+            merge_successor(&mut safe_at, &mut worklist, next, code_len, propagated);
+        }
+    }
+
+    false
+}
+
 /// Build the control flow graph from bytecode.
 fn build_cfg(code: &[u8], code_len: usize) -> Vec<BasicBlock> {
     // First pass: find all block-starting PCs

@@ -5881,6 +5881,74 @@ thread_local! {
     pub(crate) static IR_LOWER_COMPILES: std::cell::Cell<u64> = std::cell::Cell::new(0);
 }
 
+/// RBC.6 local-handler-safety fix. Conservative, sound check answering: for
+/// this method's exception table, could ANY handler observe a local
+/// variable that `route_jit_exception_through_method`'s params-only
+/// handler-frame reconstruction cannot recover — i.e. anything other than
+/// `this` / a declared parameter?
+///
+/// Delegates to `regalloc::handler_has_unsafe_local_read`, a real CFG-based
+/// forward "definitely assigned" dataflow (dominance-respecting, not just
+/// raw-pc-order) — see that function's own doc comment for the full
+/// algorithm and why an earlier, simpler raw-pc-order approximation here
+/// was both over-conservative (continued scanning past a handler's own
+/// `athrow`/`return` into unrelated later code — confirmed, via the real
+/// `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+/// Tomcat suite fixture, to be the actual remaining blocker for the doc's
+/// own motivating case even after the RBC.6 gate itself was relaxed) and
+/// had a latent, never-triggered soundness gap (path-insensitive: a store
+/// on one branch and a read on a different, non-overlapping branch could
+/// be wrongly accepted merely because the store's bytecode pc was lower).
+///
+/// **Confirmed necessary in the first place** via
+/// `AthrowCountBisect.twoThrowsSequential`
+/// (`vm/tests/jit_local_exception_handler_tests.rs`): two sequential,
+/// non-nested try/catch blocks in one method, where the second handler's
+/// own code reads a local (`a`) last assigned by the FIRST try's successful
+/// (non-exceptional) path. Without SOME such check, that method compiled
+/// and silently produced a wrong checksum.
+fn local_handler_reads_unsafe_local(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    method_descriptor: &str,
+    is_static: bool,
+) -> bool {
+    // Widening: `this` (slot 0 for instance methods) + declared param slots.
+    let param_slot_count =
+        count_param_slots_jvm_spec(method_descriptor) as u16 + if is_static { 0 } else { 1 };
+    // Slots >= 64 can't be represented in the u64 bitmask the dataflow uses;
+    // `regalloc::handler_has_unsafe_local_read` conservatively treats any
+    // load of such a slot as unsafe regardless of this mask, so capping the
+    // shift here (rather than overflowing) just keeps this bit of arithmetic
+    // well-defined — it does not change which methods are accepted.
+    let initial_safe_slots: u64 = if param_slot_count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << param_slot_count) - 1
+    };
+    let dbg = std::env::var_os("CRATONVM_DBG_RBC6").is_some();
+    for entry in exception_table {
+        let handler_pc = entry.handler_pc as usize;
+        let unsafe_found = regalloc::handler_has_unsafe_local_read(
+            code,
+            code_len,
+            handler_pc,
+            initial_safe_slots,
+        );
+        if unsafe_found {
+            if dbg {
+                eprintln!(
+                    "[rbc6-dbg] local_handler_reads_unsafe_local UNSAFE (CFG dataflow) handler_pc={} param_slot_count={}",
+                    handler_pc, param_slot_count
+                );
+            }
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -6035,6 +6103,12 @@ fn try_compile_inner(
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
+            if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+                eprintln!(
+                    "[rbc6-dbg] try_compile_inner: jit_scan returned None for {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
+            }
             // RBC.4 — a scan reject (unsupported opcode, e.g. `athrow`) is
             // just as permanent as a backend bail: the bytecode never
             // changes. Without marking it, a hot uncompilable method re-ran
@@ -6049,13 +6123,97 @@ fn try_compile_inner(
         }
     };
 
-    // RBC.6 — a method containing `athrow` compiles only when it has NO
-    // local exception handlers: the athrow lowering stashes the exception
-    // and returns the deopt sentinel, which cannot dispatch to an
-    // in-method handler. Permanent for this bytecode → bail-list it.
-    if scan.has_athrow && !cached.exception_table.is_empty() {
-        *backend_attempted = true;
-        return None;
+    // RBC.6 (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md)
+    // — this gate used to unconditionally refuse any method that combines
+    // `athrow` with a local exception handler, on the theory that "the
+    // athrow lowering stashes the exception and returns the deopt sentinel,
+    // which cannot dispatch to an in-method handler." That was true when
+    // this gate was written (`8d0f029ed`, 2026-06-11), but every fix that
+    // landed the day after and later — BUG-H (`82b9bdf62`), KCFULL-13,
+    // Round-8/9/10/11 (NPE/AIOOBE/arithmetic/general-exception leak fixes),
+    // and the wildfly-bug-05 this/params restore (`549a2c161`) — built
+    // exactly the missing dispatch, generically, and never revisited this
+    // gate:
+    //   - `emitted_athrow` unconditionally forces `has_dispatch = true`
+    //     (`x64.rs`, `RBC.6` comment at the `has_dispatch` computation), so
+    //     any method containing `athrow` is ALWAYS entered through
+    //     `execute_jit_call`'s dispatch-aware slow path, never the raw
+    //     fast-path that would leak the sentinel as a return value.
+    //   - That slow path drains `JIT_PENDING_EXCEPTION` (and NPE/AIOOBE/
+    //     arithmetic) after every JIT return and, whenever the invoked
+    //     method itself declares a non-empty `exception_table`, routes the
+    //     exception through `route_jit_exception_through_method` — a real
+    //     handler search (typed catch-class matching with subclass checks,
+    //     first-match-wins, `finally`/catch-all handling) that pushes a
+    //     fresh interpreter frame at the resolved handler pc with `this`
+    //     and the declared params restored and the exception object on the
+    //     stack, and otherwise propagates to the caller exactly like an
+    //     uncaught throw. This is reached identically whether the pending
+    //     exception came from `athrow` in THIS method or propagated up from
+    //     a callee — the sentinel-return shape is the same either way.
+    //   - `callee_has_exception_table`/`route_implicit_exc_through_callee`
+    //     provide the JIT-to-JIT direct-call sibling of the same routing.
+    //
+    // In other words: the "cannot dispatch to an in-method handler" premise
+    // this gate was built on stopped being true within a day of it landing,
+    // and nothing since has depended on athrow+handler staying uncompiled —
+    // methods that only *declare* a handler (no local `athrow`) already
+    // compile today and already rely on this exact runtime routing (that's
+    // what BUG-H fixed). Only the compile-time refusal itself was stale.
+    // Confirmed root cause of `Response.toAbsolute()` (Tomcat hot path,
+    // `try { ... } catch (IOException) { throw new
+    // IllegalArgumentException(...) }`) never JIT-compiling — see the doc
+    // above for the full trace and validation plan. The IR (optimizing)
+    // path keeps its own independent, unaffected
+    // `cached.exception_table.is_empty()` admission check below, so this
+    // change only widens single-pass (`x64::compile`) eligibility — the
+    // existing, well-tested fallback backend that already carries every
+    // other non-`ir_compatible` method.
+    //
+    // RBC.6 local-handler-safety fix — `route_jit_exception_through_method`
+    // (vm/src/runtime/interpreter.rs) reconstructs the handler frame from
+    // ONLY `this` + the method's declared incoming params (a documented,
+    // pre-existing limitation — see that function's own doc comment). A
+    // handler that reads any OTHER local — one first assigned earlier in
+    // the method, whether inside this try, a DIFFERENT try/catch construct,
+    // or straight-line code before either — observes a stale zero/null
+    // instead of the value the compiled code actually computed. Confirmed
+    // via a differential repro: `AthrowCountBisect.twoThrowsSequential` (two
+    // sequential, non-nested try/catch blocks in one method; the second
+    // handler's own code reads a local last assigned by the FIRST try's
+    // successful path) silently computed a wrong checksum once compiled —
+    // this affects declares-a-handler-no-athrow methods exactly as much as
+    // the newly-relaxed has-athrow ones, since the frame-reconstruction gap
+    // is in the shared runtime routing, not anything athrow-specific. Gate
+    // BOTH populations (any non-empty `exception_table`, not just the
+    // has_athrow case above) on `local_handler_reads_unsafe_local`, a real
+    // CFG-based "definitely assigned" dataflow (dominance-respecting, not a
+    // raw-pc-order approximation — an earlier version of this check used
+    // exactly that simpler approximation and was found, via the REAL
+    // `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+    // Tomcat suite fixture, to over-reject it: it kept scanning past the
+    // handler's own `athrow` terminator into unrelated later code in the
+    // same method). See `local_handler_reads_unsafe_local`'s own doc
+    // comment, and `regalloc::handler_has_unsafe_local_read`'s, for the
+    // full algorithm and soundness argument.
+    if !cached.exception_table.is_empty() {
+        let unsafe_local = local_handler_reads_unsafe_local(
+            code,
+            code_len,
+            &cached.exception_table,
+            &cached.method_descriptor,
+            cached.is_static,
+        );
+        if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+            eprintln!(
+                "[rbc6-dbg] try_compile_inner: local_handler_reads_unsafe_local={} for {}.{}{}",
+                unsafe_local, cached.class_name, cached.method_name, cached.method_descriptor
+            );
+        }
+        if unsafe_local {
+            *backend_attempted = true;
+            return None;
+        }
     }
 
     // Try IR compilation for simple integer-only methods. The IR pipeline

@@ -43,6 +43,10 @@ required-features = ["java-bin-alias"]
 
 [dependencies]
 cratonvm-vm = { path = "../vm", version = "0.3.0" }
+# Direct dep so vm-cli's pre-exit hook can call
+# `tiered::dump_method_stats_to_stderr` (CRATONVM_DBG_JIT_METHOD_STATS=1)
+# without routing through cratonvm-vm.
+cratonvm-jit = { path = "../jit", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 # Direct dep so vm-cli can install the pre-`std::process::exit` hook on
 # `native_system_exit` via `lang_system::set_pre_exit_hook` (installed at the

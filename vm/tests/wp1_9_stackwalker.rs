@@ -37,6 +37,7 @@ fn stack_trace_entry_carries_bci_and_line_number() {
         source_file: Some(Arc::from("Foo.java")),
         line_number: 42,
         byte_code_index: 17,
+        class_id: None,
     };
     assert_eq!(e.line_number, 42);
     assert_eq!(e.byte_code_index, 17);

@@ -4555,9 +4555,15 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
     } else {
         return Err(format!("unsupported URL: {url}"));
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // A query may immediately follow the authority (`http://host:port?x`)
+    // without a slash. Treat it as a request for `/?x`, rather than letting
+    // `?x` leak into the port text. Spring's JdkClientHttpRequest uses this
+    // form for TestRestTemplate requests with query-only paths.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -4573,7 +4579,7 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
         }
         None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path.to_string(), userinfo))
+    Ok((scheme, host, port, path, userinfo))
 }
 
 fn http_perform_request(
@@ -6071,6 +6077,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // URL.openStream() for every non-http scheme.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
+            } else if ext.starts_with("https://") {
+                // Spring's SimpleClientHttpsRequestFactory applies its
+                // SSLBundle only after the `HttpsURLConnection` type check.
+                // Returning the plain HTTP carrier for HTTPS URLs silently
+                // skipped that branch, leaving the native client on default
+                // trust roots. This concrete JDK subclass preserves the
+                // expected type while the shared HTTP natives own its I/O.
+                "sun/net/www/protocol/https/HttpsURLConnectionImpl"
             } else {
                 "java/net/HttpURLConnection"
             };
@@ -9340,13 +9354,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
-            // getSocketFactory() is a client-side call (the server uses
-            // createSSLEngine / getServerSocketFactory). Capture the complete
-            // context for native HttpsURLConnection, including anonymous
-            // client contexts: its ClientConfig owns the TLS ticket cache.
-            // This is the reliable capture point because the real JDK
-            // setDefaultSSLSocketFactory bytecode cannot be overridden here.
-            crate::t27_tls::capture_huc_ssl_context(ctx, this);
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -9626,7 +9633,13 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                 .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
+            let id = connect_result.map_err(|e| {
+                crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLHandshakeException",
+                    &format!("TLS connect: {e}"),
+                )
+            })?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
@@ -9764,6 +9777,35 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 )),
             }
         },
+    );
+    // The rustls-backed socket is deliberately a synthetic `SSLSocket`, so
+    // real `SSLSocket.getSSLParameters()` bytecode resolves these abstract
+    // declarations directly.  Supply the ordinary no-client-auth defaults
+    // rather than letting Apache HttpComponents fail with AbstractMethodError
+    // while merely inspecting its TLS parameters.
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "getNeedClientAuth",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "getWantClientAuth",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "setNeedClientAuth",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        "javax/net/ssl/SSLSocket",
+        "setWantClientAuth",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
     );
     r.register(
         sf,

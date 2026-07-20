@@ -3475,16 +3475,28 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             return Ok(Some(Value::Object(None)));
         }
         if object_extends(ctx, this_ref, "java/net/URLClassLoader") {
-            let class_name = ctx
-                .class_name_of_id(ctx.class_id_of_object(this_ref))
-                .unwrap_or_default();
-            // URLClassLoader subclasses remain user loaders: their inherited
-            // getResource must consult the parent before local URL lookup.
-            // Spring's FilteredClassLoader relies on this to reach a
-            // resource-only parent while still filtering a specific class.
-            if is_builtin_loader_class(&class_name) {
-                return ucl_find_resource(ctx, args);
-            }
+            // URLClassLoader (bare instance OR a user-defined subclass) is
+            // always a user loader for `getResource` purposes: real
+            // `ClassLoader.getResource()` delegates to the parent FIRST
+            // regardless of whether the receiver's own class is literally
+            // `java.net.URLClassLoader` or a subclass. This used to
+            // early-return to the local-only `ucl_find_resource` whenever
+            // `is_builtin_loader_class(&class_name)` matched — which is true
+            // for the literal string "java/net/URLClassLoader" itself (see
+            // its `matches!` list), so a plain, directly-instantiated
+            // `new URLClassLoader(urls, parent)` — a completely ordinary
+            // idiom for a thin resource/class overlay with a real,
+            // resource-bearing parent, e.g. Spring Boot's
+            // `ServletComponentScanIntegrationTests.indexedComponentsAreRegistered`
+            // wrapping just a `@TempDir` holding a generated
+            // `META-INF/spring.components` index — silently skipped parent
+            // delegation and could only ever see its own (here, near-empty)
+            // local URL set. `is_builtin_loader_class`'s other match arms
+            // (`jdk/internal/loader/*`, `sun/misc/Launcher$*`) are dead code
+            // in this specific branch on a modern JDK: none of those classes
+            // actually extend `java.net.URLClassLoader` (JDK 9+ internal
+            // loaders derive from `BuiltinClassLoader`, not `URLClassLoader`),
+            // so removing the gate does not change behavior for them.
             let this_pin = ctx.pin_native_root(this_ref);
             let name_for_parent = Value::Object(Some(ctx.create_string(&name)));
             let this_live = ctx.read_native_pin(this_pin, this_ref);

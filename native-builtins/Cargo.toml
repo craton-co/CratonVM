@@ -38,6 +38,7 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
+indexmap = "2"
 regex = "1"
 # Fallback regex engine for Java patterns that use features the `regex` crate
 # does not support: lookaround `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`,

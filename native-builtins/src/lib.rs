@@ -1014,8 +1014,14 @@ fn char_chunk_range_equals_string(
     true
 }
 
-fn mapping_match_static(ctx: &dyn NativeContext, name: &str) -> Option<ObjectRef> {
-    let class_id = ctx.class_id_by_name("jakarta/servlet/http/MappingMatch")?;
+fn mapping_match_static(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    // `Mapper` can be reached before any Java bytecode has touched
+    // `MappingMatch`. Loading its metadata alone leaves the enum constants
+    // null, which makes `ApplicationMapping` report a null mapping type and
+    // Spring MVC treat an otherwise valid servlet-path request as unmapped.
+    let class_id = ctx
+        .ensure_class_initialized("jakarta/servlet/http/MappingMatch")
+        .ok()?;
     let idx = ctx.static_field_index_by_name(class_id, name)?;
     match ctx.get_static_field(class_id, idx) {
         Value::Object(Some(o)) => Some(o),
