@@ -37,7 +37,7 @@ fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, ClassId, Strin
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_building_type_parameter(
+pub(crate) fn cached_building_type_parameter(
     ctx: &mut dyn NativeContext,
     decl: ObjectRef,
     name: &str,

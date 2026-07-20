@@ -12556,8 +12556,36 @@ pub(crate) fn native_class_get_type_parameters(
     let mut arr = ctx.new_ref_array(ClassId::new(0), class_sig.type_params.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, tp) in class_sig.type_params.iter().enumerate() {
-        // genericDeclaration = the declaring Class mirror (`this`).
-        let tv = crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)));
+        // `Class.getTypeParameters()` must return the SAME TypeVariable
+        // objects across repeated calls, exactly like HotSpot's
+        // `Class.getGenericInfo()` soft-reference cache. Building a fresh
+        // synthetic TypeVariable on every call (the previous behavior here)
+        // breaks any algorithm that stashes a type variable from one call
+        // (e.g. as a `ParameterizedType`'s actual-type-argument, baked in by
+        // value) and later compares/looks it up against the result of a
+        // SUBSEQUENT `getTypeParameters()` call on the same class — the two
+        // references are never identical (nor equal, since equals() is by
+        // declaring-class+name and a later call's object still passes that
+        // check, but a plain HashMap key lookup by the OLD reference against
+        // a map keyed by the NEW one still requires hashCode/equals to run,
+        // and repeated re-creation means the cache backing
+        // `resolve_declared_type_variable` keeps getting overwritten mid-walk).
+        // Concretely: Hibernate Validator's `TypeHelper.resolveTypes` walks a
+        // class hierarchy, and at each `ParameterizedType` level calls
+        // `erased.getTypeParameters()` fresh to compute its substitution map;
+        // for a 3+ level generic hierarchy (e.g.
+        // `AbstractInstantBasedTimeValidator` -> `HibernateConstraintValidator`
+        // -> `ConstraintValidator`) sharing reused type-variable names across
+        // levels, repeated non-identical objects for the same (class, name)
+        // corrupt the map this algorithm chases through, producing a cyclic
+        // `while (map.containsKey(x)) x = map.get(x)` walk that never
+        // terminates (observed as an indefinite CPU-pegged hang building the
+        // built-in `ConstraintHelper`, e.g. for classes deriving from
+        // `AbstractInstantBasedTimeValidator`). Reuse the cached object when
+        // one already exists for (this, tp.name); only build+cache a new one
+        // on first request.
+        let tv = crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
+            .unwrap_or_else(|| crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this))));
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }
