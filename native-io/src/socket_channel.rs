@@ -1933,6 +1933,16 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let id = read_reg_id(ctx, this).ok_or_else(|| ioex("write: channel not connected"))?;
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
+    if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+        let position = ctx.get_field_by_name(bb, "position");
+        let limit = ctx.get_field_by_name(bb, "limit");
+        let address = ctx.get_field_by_name(bb, "address");
+        eprintln!(
+            "[SC_WRITE] id={id:#x} class={} position={position:?} limit={limit:?} address={address:?} data_len={}",
+            ctx.class_name_of_id(ctx.class_id_of_object(bb)).unwrap_or_default(),
+            data.len(),
+        );
+    }
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -1989,6 +1999,9 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
+        if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+            eprintln!("[SC_WRITE] id={id:#x} wrote={n}");
+        }
         let bb = ctx.read_native_pin(bb_pin, bb);
         buffer_advance(ctx, bb, n);
     }
