@@ -120,6 +120,26 @@ open under their own tracking (see e.g.
 [`project_securityinfo_jarsig_datainputstream_close_20260712`] for the
 `SecurityInfoTests`/`NestedJarFileTests` residual).
 
+## Post-fix note: unrelated regression can mask this result on later `dev`
+
+This fix was verified clean (see above) against `dev` commit `939f61817`.
+Re-running the same class against `dev` past commit `~cf3a44e2a`/`f9836e296`
+(and every `dev` tip since — including the current one at time of writing)
+shows 15/32 `PropertiesLauncherTests` failures instead of 0/32, including
+this fix's own 4 target tests. **This is a separate, unrelated regression,
+not a defect in this fix** — confirmed by building `dev` at `99a4c4108`
+(all the same intervening churn) with this fix's 3-file diff manually
+removed: it already shows 15/32 failures running the ORIGINAL, pre-fix
+`PropertiesLauncherTests` code. `--nojit` does not change the result (rules
+out a JIT-codegen cause). See
+[`propertieslauncher-jarloading-cluster-broad-regression-jit-halfgap-suspected.md`](../../known-issues/springboot/propertieslauncher-jarloading-cluster-broad-regression-jit-halfgap-suspected.md)
+for the bisection evidence gathered so far. If re-verifying this fix on a
+current checkout, expect the wider cluster's failures to still be present;
+only the 4 tests this fix specifically targets should be judged by whether
+they'd pass in isolation from that unrelated cluster (confirmed they do, via
+the `939f61817` and `27aa91068`-vs-`99a4c4108`-without-fix comparisons
+above).
+
 ## Affected classes (original)
 
 | module | class |
