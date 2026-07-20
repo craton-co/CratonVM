@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: PARTIALLY FIXED (2026-07-20) — Clusters A, B, D, E confirmed fixed upstream (verified against dev tip, HotSpot-matching PASS); Cluster C's originally-documented NPE is now FIXED (root-caused, third investigation session), plus 2 further residuals discovered along the way are also FIXED. `SpringBootContextLoaderAotTests` still does not fully pass: a fourth, distinct residual (`AotApplicationContextInitializer` loader identity) surfaced only once the earlier three were fixed, and is not yet root-caused.**
+**Status: PARTIALLY FIXED (2026-07-20) — Clusters A, B, D, E confirmed fixed upstream (verified against dev tip, HotSpot-matching PASS); Cluster C's originally-documented NPE is now FIXED (root-caused, third investigation session), plus 2 further residuals discovered along the way are also FIXED. `SpringBootContextLoaderAotTests` still does not fully pass: after merging forward with the latest dev, it now hits a fifth, unrelated-bug-family residual (Groovy `ClassInfo`/`ReflectionCache`, see Cluster C "Residual 5") before ever reaching the fourth (`AotApplicationContextInitializer` loader identity, "Residual 4") — neither is yet root-caused.**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -274,6 +274,43 @@ onlyone.tsv` (module `core/spring-boot-test`, class
 `SpringBootContextLoaderAotTests`) to find exactly which resolution first
 mints its Application-loader-owned `ClassId`.
 
+### Residual 5 (OPEN, distinct bug family, found post-merge): Groovy `ClassInfo.getClassInfo(Class)` returns `null`, unrelated to loader identity
+
+Before merging this branch forward, Residual 4 above (traced against dev
+`fba145c60`, this branch's original base) was the observed failure. After
+merging the latest `origin/dev` — which independently landed an unrelated,
+concurrent fix to `native-builtins/src/classloader.rs`'s
+`builtin_loader_reachable` (excluding the platform loader from the
+"safe to consult the flat global store" set, the same fix this doc's
+"second investigation session" update above had already identified as
+necessary) — `SpringBootContextLoaderAotTests` now reaches a **different,
+earlier** failure instead, during the first phase
+(`loadContextForAotProcessing`, before `applyInitializers` is ever reached):
+
+```
+java.lang.ExceptionInInitializerError
+	at org.springframework.beans.factory.groovy.GroovyBeanDefinitionReader.<init>(GroovyBeanDefinitionReader.java:152)
+Caused by: java.lang.NullPointerException: Cannot invoke "org.codehaus.groovy.reflection.ClassInfo.getCachedClass()" because the return value of "org.codehaus.groovy.reflection.ClassInfo.getClassInfo(java.lang.Class)" is null
+	at org.codehaus.groovy.reflection.ReflectionCache.getCachedClass(ReflectionCache.java:31)
+	at org.codehaus.groovy.reflection.CachedClass$6.initValue(CachedClass.java:179)
+```
+
+Confirmed deterministic (reproduces identically across repeated runs) and
+**not caused by any fix in this doc** — it is a completely different bug
+family (Groovy's own internal `ClassInfo`/`ReflectionCache` global registry
+returning no entry for some `Class`, during `MetaClassImpl.setUpProperties`'s
+`inheritStaticInterfaceFields`/`addConsts` initialization), unrelated to
+loader-identity dispatch. It was previously unreachable simply because the
+test never got this far before (the residual chain in this doc, plus the
+concurrent `builtin_loader_reachable` fix, together let it progress past
+everything documented above). No existing `docs/known-issues` entry covers
+this exact `ClassInfo.getClassInfo` NPE (a *different* Groovy MetaClass gap
+than `docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md`,
+which is an unbounded-loop hang in `TypeResolver`/`Introspector`, not an NPE
+in `ClassInfo`). Not investigated further this session — flagged here as a
+new, separate discovery for follow-up; Residual 4 above may or may not still
+exist further down the chain once this one is fixed.
+
 ### Regression check (third investigation session, 2026-07-20)
 
 All fixes above were verified against the full `core/spring-boot-test`
@@ -285,8 +322,11 @@ tests), no regressions. The 2 additional CratonVM-only failures
 `DuplicateJsonObjectContextCustomizerFactoryTests`) were confirmed
 **pre-existing** — they reproduce identically (same failure signature) against
 the unmodified dev-tip binary, unrelated to any of the fixes in this
-session. `SpringBootContextLoaderAotTests` is the sole remaining failure,
-now blocked on Residual 4 above rather than the originally-documented NPE.
+session. `SpringBootContextLoaderAotTests` is the sole remaining failure;
+as of this branch merging forward with the latest `origin/dev` (see Residual
+5 above), it is now blocked earlier, on Residual 5, rather than Residual 4
+or the originally-documented NPE — both of which this session's 3 fixes
+still resolve correctly.
 
 ## Cluster D — missing `"random"` PropertySource — FIXED (upstream, before this session)
 
@@ -303,6 +343,6 @@ The originally-hypothesized "regression-in-place-of-fix" (SSLSocketFactory fix c
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerWithLegacySwitchTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `SpringBootTestCustomConfigNameTests` — **FIXED** (Cluster B)
-- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **OPEN residual** (Cluster C; originally-documented NPE + 2 more residuals FIXED this session; blocked on a 4th, distinct, not-yet-root-caused residual — see Cluster C "Residual 4")
+- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **OPEN residual** (Cluster C; originally-documented NPE + 2 more residuals FIXED this session; blocked on a 5th, unrelated-bug-family residual — see Cluster C "Residual 5" — with a 4th, distinct, not-yet-root-caused loader-identity residual still waiting behind it, see "Residual 4")
 - `core/spring-boot-test` | `SpringBootContextLoaderTests` — **FIXED**, 26/26 (Cluster D)
 - `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce (Cluster E)
