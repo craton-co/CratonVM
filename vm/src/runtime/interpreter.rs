@@ -22318,7 +22318,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             // Loader-faithful owner resolution (gated): prefer the enclosing
             // loader's copy of the impl class when it diverges from the global.
-            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
                     .class_manager
@@ -22346,7 +22346,7 @@ pub(crate) fn try_lambda_dispatch(
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
             // Loader-faithful owner resolution (gated), same rationale as above.
-            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
                     .class_manager
@@ -22492,10 +22492,13 @@ pub(crate) fn try_lambda_dispatch(
             }
         }
         MethodHandleKind::GetStatic => {
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
@@ -22558,10 +22561,13 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 .into());
             }
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
