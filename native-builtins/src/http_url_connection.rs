@@ -141,41 +141,6 @@ fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// `HttpsURLConnection.setSSLSocketFactory` is native-intercepted, so the JDK
-// carrier's private field is not a reliable source of the configured factory.
-// Retain the rustls config by receiver identity instead, preventing unrelated
-// server contexts from overwriting an SSLBundle client's trust scope through
-// the process-wide compatibility fallback.
-static HUC_INSTANCE_CLIENT_CONFIGS: OnceLock<Mutex<HashMap<i32, Arc<ClientConfig>>>> =
-    OnceLock::new();
-
-fn huc_instance_client_configs() -> &'static Mutex<HashMap<i32, Arc<ClientConfig>>> {
-    HUC_INSTANCE_CLIENT_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn capture_huc_instance_ssl_factory(
-    ctx: &mut dyn NativeContext,
-    connection: ObjectRef,
-    factory: ObjectRef,
-) {
-    let Value::Object(Some(ssl_context)) = ctx.get_field(factory, 0) else {
-        return;
-    };
-    let Ok(config) = crate::t27_tls::client_config_for_ssl_context(ctx, ssl_context) else {
-        return;
-    };
-    if let Ok(mut configs) = huc_instance_client_configs().lock() {
-        configs.insert(ctx.identity_hash_code(connection), config);
-    }
-}
-
-fn huc_instance_client_config(ctx: &dyn NativeContext, connection: ObjectRef) -> Option<Arc<ClientConfig>> {
-    huc_instance_client_configs()
-        .lock()
-        .ok()
-        .and_then(|configs| configs.get(&ctx.identity_hash_code(connection)).cloned())
-}
-
 /// Per-real-connection REQUEST state, keyed by `identity_hash_code(this)`.
 ///
 /// A real-JDK `sun.net.www...HttpURLConnection` (handed out by the genuine
@@ -635,7 +600,6 @@ fn huc_real_perform(
         .ok()
         .and_then(|t| t.get(&key).cloned())
         .unwrap_or_default();
-    let instance_tls_config = huc_instance_client_config(ctx, this);
     let mut method = if req.method.is_empty() {
         "GET".to_string()
     } else {
@@ -669,6 +633,7 @@ fn huc_real_perform(
         };
         let resp = perform(
             ctx,
+            Some(this),
             &parsed,
             &method,
             &req.headers,
@@ -676,7 +641,6 @@ fn huc_real_perform(
             connect_to,
             read_to,
             established_https_stream,
-            instance_tls_config.clone(),
         );
         match resp {
             Ok((status, headers, resp_body))
@@ -773,9 +737,6 @@ fn huc_real_headers(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(String, St
 /// Drop all identity-keyed side-table state for a real carrier (on disconnect).
 fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
     let key = ctx.identity_hash_code(this);
-    if let Ok(mut configs) = huc_instance_client_configs().lock() {
-        configs.remove(&key);
-    }
     if let Ok(mut t) = real_results().lock() {
         t.remove(&key);
     }
@@ -829,6 +790,13 @@ fn socket_timeout_ex<S: Into<String>>(message: S) -> cratonvm_types::error::Meth
 
 fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IllegalArgumentException {
+        message: message.into(),
+    }
+    .into()
+}
+
+fn protocol_ex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::ProtocolException {
         message: message.into(),
     }
     .into()
@@ -1478,6 +1446,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 
 fn perform(
     ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
     parsed: &Url1,
     method: &str,
     headers: &[(String, String)],
@@ -1485,7 +1454,6 @@ fn perform(
     connect_timeout: Duration,
     read_timeout: Duration,
     established_https_stream_id: Option<i32>,
-    instance_tls_config: Option<Arc<ClientConfig>>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let head = method.eq_ignore_ascii_case("HEAD");
     let req = build_request(method, parsed, headers, body);
@@ -1586,8 +1554,10 @@ fn perform(
         // It contains the configured trust roots/client identity and owns the
         // TLS ticket cache required for a following connection to resume.
         // If no custom SSLContext was captured, use cached system roots.
-        let cfg = instance_tls_config
-            .unwrap_or_else(|| crate::t27_tls::huc_default_client_config().unwrap_or_else(shared_legacy_config));
+        let cfg = connection
+            .and_then(|connection| crate::t27_tls::huc_client_config_for_connection(ctx, connection))
+            .or_else(crate::t27_tls::huc_default_client_config)
+            .unwrap_or_else(shared_legacy_config);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -1833,6 +1803,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     // see its doc — so this caller must not wrap the whole call in one.
     let (status, headers, body_bytes) = match perform(
         ctx,
+        Some(this),
         &parsed,
         &method,
         &headers,
@@ -1840,7 +1811,6 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
         connect_to,
         read_to,
         established_https_stream,
-        None,
     ) {
         Ok(v) => v,
         // FIX (client-cipher-restriction): mirror `huc_real_perform`'s
@@ -1900,6 +1870,32 @@ fn with_state<R>(
 
 fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `<init>(Ljava/net/URL;)V` is also the REAL descriptor of the abstract
+    // `java.net.HttpURLConnection(URL u)` protected constructor, so a user
+    // subclass that calls `super(u)` directly (bypassing `URL.openConnection()`)
+    // hits this native too — not just our own synthetic-carrier allocation
+    // path. Detect that case by asking the URL argument for its real
+    // `toExternalForm()`: a genuine `java.net.URL` answers with a proper
+    // "scheme://..." string; treat it as a real carrier (field 0 keeps the
+    // URL object itself, matching `is_real_carrier`/`huc_real_object_url`)
+    // instead of clobbering field 0 with the synthetic Int(-1) conn-id, which
+    // corrupted the real inherited `URLConnection.url`/`doOutput`/... fields
+    // and broke `getURL()` + every `is_real_carrier` check downstream
+    // (`ensure_connected` then misread the never-populated HUC_URL_STR slot
+    // and threw "HttpURLConnection: URL not set").
+    if let Some(Value::Object(Some(url_obj))) = args.get(1) {
+        let url_obj = *url_obj;
+        if let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
+        {
+            if let Some(full) = ctx.read_string(s) {
+                if full.contains("://") {
+                    ctx.set_field(this, HUC_CONN_ID, Value::Object(Some(url_obj)));
+                    return Ok(None);
+                }
+            }
+        }
+    }
     ctx.set_field(this, HUC_CONN_ID, Value::Int(-1));
     let m = ctx.create_string("GET");
     ctx.set_field(this, HUC_METHOD, Value::Object(Some(m)));
@@ -2403,11 +2399,18 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Err(iae("setRequestMethod: null method")),
     };
     let normalized = m.to_ascii_uppercase();
+    // Real JDK's `sun.net.www.protocol.http.HttpURLConnection.setRequestMethod`
+    // whitelist is {GET, POST, HEAD, OPTIONS, PUT, DELETE, TRACE} — notably NOT
+    // PATCH, which is why Spring recommends a different `ClientHttpRequestFactory`
+    // for PATCH and its own test suite (`SimpleClientHttpRequestFactoryTests
+    // .httpMethods()`) asserts `ProtocolException` for it. Rejecting it here
+    // (as `ProtocolException`, matching the real JDK exception type) mirrors
+    // that restriction instead of silently accepting it.
     if !matches!(
         normalized.as_str(),
-        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "TRACE" | "CONNECT"
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT"
     ) {
-        return Err(iae(format!("invalid HTTP method: {m}")));
+        return Err(protocol_ex(format!("Invalid HTTP method: {m}")));
     }
     if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| r.method = normalized);
@@ -2598,19 +2601,6 @@ fn huc_set_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     ctx.set_field(this, HUC_DO_OUTPUT, Value::Int(v));
     Ok(None)
-}
-
-fn huc_get_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if is_real_carrier(ctx, this) {
-        let value = real_reqs()
-            .lock()
-            .ok()
-            .and_then(|reqs| reqs.get(&ctx.identity_hash_code(this)).map(|req| req.do_output))
-            .unwrap_or_else(|| matches!(ctx.get_field_by_name(this, "doOutput"), Value::Int(1)));
-        return Ok(Some(Value::Int(i32::from(value))));
-    }
-    Ok(Some(ctx.get_field(this, HUC_DO_OUTPUT)))
 }
 
 fn huc_set_connect_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2845,7 +2835,6 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     );
     r.register(cls, "setDoInput", "(Z)V", huc_set_do_input);
     r.register(cls, "setDoOutput", "(Z)V", huc_set_do_output);
-    r.register(cls, "getDoOutput", "()Z", huc_get_do_output);
     r.register(cls, "setConnectTimeout", "(I)V", huc_set_connect_timeout);
     r.register(cls, "setReadTimeout", "(I)V", huc_set_read_timeout);
     // Streaming-mode setters are no-ops: our `perform` buffers the request body

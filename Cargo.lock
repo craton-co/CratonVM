@@ -625,6 +625,7 @@ dependencies = [
  "cratonvm-classloading",
  "cratonvm-native-api",
  "cratonvm-native-collections",
+ "cratonvm-native-io",
  "cratonvm-reader",
  "cratonvm-types",
  "ctr",

@@ -24774,16 +24774,93 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Mockito's ModuleMemberAccessor eagerly selects an instrumentation-backed
+    // Java-9 implementation by bootstrapping Byte Buddy in its class
+    // initializer.  The registered bridge returns Mockito's own reflection
+    // implementation, which is the library's supported fallback and avoids
+    // that unsupported eager bootstrap.
+    if class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+        && method_name == "delegate"
+        && method_descriptor == "()Lorg/mockito/plugins/MemberAccessor;"
+    {
+        return true;
+    }
+    // A real SSLContext returns SunJSSE's concrete factory implementation.
+    // The layered Socket overload must still reach the public factory bridge:
+    // MockWebServer uses it to wrap its accepted socket as a TLS server.
+    if (class_name == "javax/net/ssl/SSLSocketFactory"
+        || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
+        && method_name == "createSocket"
+        && matches!(
+            method_descriptor,
+            "(Ljava/lang/String;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
+                | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
+        )
+    {
+        return true;
+    }
+    if (class_name == "javax/net/ssl/SSLSocket"
+        || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
+        && matches!(
+            (method_name, method_descriptor),
+            ("startHandshake", "()V")
+                | ("getInputStream", "()Ljava/io/InputStream;")
+                | ("getOutputStream", "()Ljava/io/OutputStream;")
+                | ("getSession", "()Ljavax/net/ssl/SSLSession;")
+                | ("close", "()V")
+                | ("isClosed", "()Z")
+                | ("isConnected", "()Z")
+                | ("getPort", "()I")
+                // The real `javax.net.ssl.SSLSocket` base class's default body
+                // for these two just throws `UnsupportedOperationException` —
+                // only a concrete provider subclass (SunJSSE's SSLSocketImpl)
+                // overrides them. Our synthetic server-side socket (returned
+                // by `SSLSocketFactory.createSocket(Socket,...)`, e.g. for
+                // MockWebServer's HTTPS listener) IS that class literally, so
+                // without forcing native here the real base-class bytecode
+                // runs and throws — silently caught+logged at FINE by
+                // MockWebServer's connection handler, which then just closes
+                // the socket having never read the request or written a
+                // response (`skipSslValidation`-style 30s client-side hang).
+                | ("getApplicationProtocol", "()Ljava/lang/String;")
+                | ("getHandshakeApplicationProtocol", "()Ljava/lang/String;")
+                | ("getSSLParameters", "()Ljavax/net/ssl/SSLParameters;")
+                | ("setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V")
+                | ("setUseClientMode", "(Z)V")
+                | ("getUseClientMode", "()Z")
+                | ("setNeedClientAuth", "(Z)V")
+                | ("getNeedClientAuth", "()Z")
+                | ("setWantClientAuth", "(Z)V")
+                | ("getWantClientAuth", "()Z")
+        )
+    {
+        return true;
+    }
     // SSLContext's real-JDK bodies delegate through a provider-owned
     // SSLContextSpi. CratonVM stores configured key/trust material on the
     // public context object instead, so the native path must own the complete
     // init-to-engine handoff for a server identity to reach Tomcat's engine.
-    if class_name == "javax/net/ssl/SSLContext"
+    if (class_name == "javax/net/ssl/SSLContext"
+        || class_name.starts_with("sun/security/ssl/SSLContextImpl"))
         && matches!(
             (method_name, method_descriptor),
-            ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+            ("getInstance", "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;")
+                | ("init", "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V")
+                | ("getSocketFactory", "()Ljavax/net/ssl/SSLSocketFactory;")
                 | ("createSSLEngine", "()Ljavax/net/ssl/SSLEngine;")
                 | ("createSSLEngine", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;")
+        )
+    {
+        return true;
+    }
+    if class_name == "sun/security/ssl/SSLEngineImpl"
+        && matches!(
+            (method_name, method_descriptor),
+            ("setHandshakeApplicationProtocolSelector", "(Ljava/util/function/BiFunction;)V")
+                | ("getHandshakeApplicationProtocolSelector", "()Ljava/util/function/BiFunction;")
         )
     {
         return true;
@@ -26770,6 +26847,61 @@ fn intercept_force_registered_native(
             Ok(CachedCallResult::Handled)
         })());
     }
+    // `java/net/HttpURLConnection`'s real-carrier natives (connect,
+    // getResponseCode, getHeaderField, addRequestProperty, ...) must keep
+    // firing for a genuinely real, `URL.openConnection()`-constructed carrier
+    // (its real inherited `URLConnection.url` field 0 populated) even after
+    // ANY instance of this class has been JVMTI-redefined elsewhere in the
+    // process — e.g. a completely unrelated `Mockito.mock(HttpURLConnection
+    // .class)` call. Mockito's default "inline" mock maker redefines the
+    // TARGET CLASS's bytecode IN PLACE rather than subclassing it, so the
+    // class-wide `class_redefine_generation` counter trips permanently for
+    // EVERY instance of the class, mock or not, for the rest of the process.
+    // Without this, `should_force_registered_native_over_bytecode`'s redefine
+    // check below cedes to the now-Mockito-woven bytecode for a real,
+    // non-mock connection too — observed as `getResponseCode()` silently
+    // returning 0 and `getHeaderField`/`addRequestProperty` silently no-op'ing
+    // instead of touching the real request/response, so
+    // `SimpleClientHttpRequestFactoryTests.interceptor()` failed first with
+    // "Status code '0' should be a three-digit positive integer" and then
+    // (once getResponseCode alone was exempted) with the interceptor's added
+    // header missing from the echoed response, simply because an EARLIER,
+    // unrelated test method in the same JVM mocked HttpURLConnection.
+    //
+    // A Mockito mock itself is Objenesis-constructed (no constructor ever
+    // runs), so its field 0 stays null — checking for a non-null field 0
+    // cheaply distinguishes "genuinely real carrier" from "mock or synthetic
+    // carrier" without invoking `toExternalForm`, and this exemption never
+    // fires for an actual mock (whose field 0 is always null), so mocking
+    // HttpURLConnection still correctly routes through Mockito's advice for
+    // stubbing/verification. Deliberately not narrowed to a specific method
+    // allowlist: any native registered on this class for a real carrier is
+    // safe to force, since the receiver check alone already gates out mocks.
+    if class_name == "java/net/HttpURLConnection"
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver)))
+                if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/net/HttpURLConnection", method_name, method_descriptor)
+        {
+            return Some((|| {
+                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result {
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                    )?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                }
+                Ok(CachedCallResult::Handled)
+            })());
+        }
+    }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native: class={} method={}{} \
@@ -27553,6 +27685,42 @@ fn try_stackless_invoke(
         shared
             .native_methods
             .find(class_name, method_name, descriptor)
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLContextImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLContext",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLSocketFactoryImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLSocketFactory",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
+            .or_else(|| {
+                class_name
+                    .starts_with("sun/security/ssl/SSLSocketImpl")
+                    .then(|| {
+                        shared.native_methods.find(
+                            "javax/net/ssl/SSLSocket",
+                            method_name,
+                            descriptor,
+                        )
+                    })
+                    .flatten()
+            })
     })
     .or_else(|| {
         if method_name == "<init>" {
