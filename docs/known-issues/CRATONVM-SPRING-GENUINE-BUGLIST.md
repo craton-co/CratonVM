@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 58 confirmed genuine bugs remaining |
+| **Status** | OPEN — 56 confirmed genuine bugs remaining |
 | **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
 
@@ -15,15 +15,15 @@ classes on a fresh `dev` merge (`8719dca85`, ~3 days / several hundred
 commits later), 4 shards, same settings (`suite-run.sh`, `BATCH=10
 BATCH_TO=120 ONE_TO=120`, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, real JDK 25).
 
-**119 of the 177 are now fixed.** 58 remain open.
+**121 of the 177 are now fixed.** 56 remain open.
 
 | Of the 177 | Count |
 |---|--:|
-| Now OK (fixed) | 119 |
-| Still FAIL | 40 |
+| Now OK (fixed) | 121 |
+| Still FAIL | 38 |
 | Still/newly TIMEOUT | 16 |
 | Now LOADERR (was TIMEOUT) | 2 |
-| **Still open** | **58** |
+| **Still open** | **56** |
 
 The 86 environmentally-non-OK classes (73 EMPTY + 13 FAIL matching HotSpot,
 not CratonVM bugs) were not rerun individually here but the 263-class rerun
@@ -32,12 +32,36 @@ being environmental.
 
 ## Notable clusters (current state, 2026-07-20)
 
-**JMX — 24/26 fixed, 2 remain.** The systemic `RequiredModelMBean` breakage
-flagged on 2026-07-17 is now resolved for all but two classes:
-`jmx.access.MBeanClientInterceptorTests` (11/14 pass) and
-`jmx.access.RemoteMBeanClientInterceptorTests` (2/14 pass) — both partial
-failures now, not total breakage, suggesting the fix addressed the core
-issue and these two hit a narrower residual gap.
+**JMX — 26/26 fixed, cluster fully closed (2026-07-20).** The systemic
+`RequiredModelMBean` breakage flagged on 2026-07-17 was resolved for all but
+two classes (`jmx.access.MBeanClientInterceptorTests` 11/14,
+`jmx.access.RemoteMBeanClientInterceptorTests` 2/14); both are now 14/14.
+Two distinct regressions, both introduced after the 2026-07-05
+jmx-platform-mxbean-registration fix and neither noticed until this session:
+(1) a 2026-07-14 defensive Bridge override
+(`register_management_factory_platform_server_stub`, called from the
+real-JDK native-registration branch in `vm/src/vm/vm_init.rs`) was left
+permanently wired in after the NPE it worked around
+(`ObjectName.getCanonicalKeyPropertyListString()` on the synthetic
+1-field ObjectName model) was independently fixed elsewhere — it silently
+shadowed real `MBeanServerFactory.createMBeanServer()` bytecode with an
+empty synthetic `MBeanServer` in real-JDK mode, so `getPlatformMBeanServer()`
+registered ZERO platform MXBeans (not even `MBeanServerDelegate`) instead of
+the expected ~16. Removed the call, restoring the original KAFKA-MBEAN
+design intent (`native-builtins/src/jmx.rs`'s `register_management_factory`
+already deliberately leaves this method unregistered for exactly this
+reason). (2) `ObjectName.getSerializedNameString()` (real bytecode reached
+from `writeObject()`'s non-compat branch) walks the never-populated
+`_kp_array` field and NPEs the first time an `ObjectName` is genuinely
+Java-serialized — only exercised by the real jmxmp remote
+`MBeanServerConnection` wire protocol, not the in-process `MBeanServer`
+path the rest of the synthetic ObjectName natives cover. Added a native
+override (`RKC-ObjectName-03` in `jmx.rs`) deriving the same canonical text
+from the existing text model, matching the established
+`getCanonicalKeyPropertyListString` pattern. Full `jmx.*` suite (32 classes,
+all `jmx.access`/`jmx.export`/`jmx.support` tests) reconfirmed 100% passing
+after the fix, no regressions. Landed on `dev` at `6923fcb9c`
+(`fix/jmx-cluster-fix-20260720`).
 
 **AOT/TIMEOUT cluster — 16 classes, still fully hung**, plus 2 that flipped
 from TIMEOUT to LOADERR (worth checking — a status-type change, not just
@@ -210,13 +234,6 @@ All 8 HTTP JSON/message-converter cluster classes fixed 2026-07-20 — see
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
 | `jms.core.JmsTemplateTransactedTests` | FAIL | 51/52 | 13857ms |
-
-### Jmx
-
-| Class | Status | Pass/Total | Elapsed |
-|---|---|--:|--:|
-| `jmx.access.MBeanClientInterceptorTests` | FAIL | 11/14 | 5716ms |
-| `jmx.access.RemoteMBeanClientInterceptorTests` | FAIL | 2/14 | 15167ms |
 
 ### Jndi
 
