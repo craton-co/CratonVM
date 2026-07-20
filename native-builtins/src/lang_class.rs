@@ -10994,10 +10994,35 @@ pub(crate) fn annotation_element_to_java_typed(
             // the wrong switch case, surfacing as `IllegalArgumentException`
             // wrapped at `ConfigurationClassParser.parse:181`.  Load the
             // class on demand, mirroring the sibling `Class` arm (C29).
+            //
+            // Loader-faithful resolution (found via
+            // `SpringBootContextLoaderAotTests`, `@CompileWithForkedClassLoader`):
+            // `ctx.class_id_by_name` is a GLOBAL "one class per name" lookup.
+            // Under a forked/isolating classloader, the annotation's declaring
+            // class (and the bytecode that later compares this default value
+            // via `==`, e.g. `useMainMethod == UseMainMethod.NEVER` in
+            // `SpringBootContextLoader.getMainMethod`) is loaded by the FORKED
+            // loader, but the global table can still resolve `class_name` to
+            // the outer/app loader's copy of the enum class — producing a
+            // same-named but reference-UNEQUAL enum constant (default
+            // `UseMainMethod.NEVER` from the wrong loader), so the `==` check
+            // silently fails and `useMainMethod` behaves as if it were
+            // `ALWAYS` (ordinal 0). Mirror the `Class`-valued arm above: when
+            // `container_loader` is present, resolve the enum type through it
+            // first via `loadClass`, so the SAME loader's copy backs both the
+            // default value and the bytecode's own reference to the constant.
             let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
-            let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
-                let _ = ctx.load_class(class_name);
-                ctx.class_id_by_name(class_name)
+            let via_loader = container_loader.and_then(|loader| {
+                match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                    Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                    Err(_) => None,
+                }
+            });
+            let enum_cid_opt = via_loader.or_else(|| {
+                ctx.class_id_by_name(class_name).or_else(|| {
+                    let _ = ctx.load_class(class_name);
+                    ctx.class_id_by_name(class_name)
+                })
             });
             if let Some(enum_cid) = enum_cid_opt {
                 // GC-safety (2026-07-16): this is the "enum builder" residual
