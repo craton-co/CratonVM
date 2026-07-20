@@ -108,6 +108,11 @@ pub enum SkipReason {
     /// after tiered compilation. Keep this cold compiler setup method
     /// interpreted until its JIT lowering is understood.
     JavacToolContext,
+    /// Javac's `ClassReader.readClass` corrupts a `Symbol` reference once
+    /// tier-compiled under repeated in-process compilation. Keep this
+    /// classfile-parsing method interpreted until its JIT lowering is
+    /// understood.
+    ClassReaderReadClass,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -363,6 +368,41 @@ fn should_skip_jit_internal(
     // javac package experiment must not re-enable this known corrupting method.
     if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
         return Some(SkipReason::JavacToolContext);
+    }
+
+    // SPRING-TESTCOMPILER.2 (2026-07-20): a second, distinct JIT residual in
+    // the same repeated-in-process-javac-compilation scenario as
+    // SPRING-TESTCOMPILER.1 above, surfacing even with that fix in place.
+    // Standalone, Spring-free repro (no test framework involved):
+    // `ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped ~20x
+    // in one process, each iteration compiling a trivial one-line class,
+    // deterministically starts throwing `java.lang.NullPointerException:
+    // Cannot read field "kind" because "sym" is null` from inside real
+    // javac's own `com.sun.tools.javac.code.Symbol.packge`, reached via
+    // `ClassReader.readClass` -> `readClassBuffer` -> `readClassFile` ->
+    // `ClassFinder.fillIn` -> `Modules$1.complete` (module-graph symbol
+    // completion during `Modules.setupAllModules`). Confirmed JIT-only:
+    // `--nojit` and `CRATONVM_JIT_THRESHOLD=100000` both make all 30
+    // iterations pass; `CRATONVM_JIT_DENY=com/sun/tools/javac/jvm/ClassReader`
+    // isolates it to this one class, and `CRATONVM_JIT_BISECT_SKIP=
+    // com/sun/tools/javac/jvm/ClassReader.readClass` (this exact method
+    // alone) is sufficient — ruling out `Symbol`, `ClassFinder`, and
+    // `Modules` as the miscompiled site despite each appearing in the
+    // stack trace. Not explained by repeated jimage re-reads (a
+    // `NativeImageBuffer.getNativeMap` call-count trace showed zero calls
+    // during the whole loop) or by heap size (identical failure at the
+    // default heap and at `--Xmx 4g`) or by the weak/phantom-reference GC
+    // clearing added in 994ae578b (`CRATONVM_WEAKREF_CLEAR=0` has no
+    // effect) — this is a genuine x64 JIT lowering defect in
+    // `readClass`'s own compiled body, not an accumulating-resource or
+    // GC-pressure artifact. This is very likely the true root cause behind
+    // most of the AOT cluster's `CompilationException: Unable to compile
+    // source` failures in `beans.factory.aot.*CodeGenerator*Tests` (each
+    // test method triggers its own in-process `TestCompiler.compile()`, so
+    // a whole-class run crosses this same tier-up point partway through).
+    // Keep `readClass` interpreted until the x64 lowering bug is found.
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readClass" {
+        return Some(SkipReason::ClassReaderReadClass);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a

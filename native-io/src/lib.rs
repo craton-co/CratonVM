@@ -4426,6 +4426,11 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// `getResourceBuffer`) then operates on the genuine jimage bytes. This is
 /// the real image content, not a stub. Returning `null` on any read error
 /// preserves the JDK's documented fall-back contract.
+fn jimage_map_cache() -> &'static Mutex<HashMap<String, usize>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path = match args.first() {
         Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
@@ -4434,6 +4439,29 @@ fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         },
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Whenever this native IS invoked (e.g. cold-start module bootstrap,
+    // `ModuleFinder.ofSystem()`), it used to re-read this ~150 MiB jimage
+    // from disk and re-allocate a fresh Java byte[] on every single call.
+    // The image content is immutable for the process's lifetime, so cache
+    // the already-built byte[] behind a global GC root and hand back a
+    // fresh `ByteBuffer.wrap` over the SAME array each call instead of
+    // re-reading and re-allocating. (Investigated as a possible cause of
+    // the repeated-in-process-javac-compilation NPE documented in
+    // jit/skip_list.rs's SPRING-TESTCOMPILER.2 entry — a
+    // call-count trace showed this native is not actually re-invoked per
+    // compile in that scenario, so it is NOT that bug's cause; this change
+    // is a straightforward, independently-verified perf/waste fix, kept on
+    // its own merits.)
+    if let Some(&handle) = jimage_map_cache().lock().get(&path) {
+        if let Some(arr) = ctx.resolve_global_root(handle) {
+            return ctx.invoke(
+                "java/nio/ByteBuffer",
+                "wrap",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[Value::Object(Some(arr))],
+            );
+        }
+    }
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         // Image not readable here → let the caller use its FileChannel path.
@@ -4444,6 +4472,8 @@ fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // 100 MiB+ image), then hand it to the genuine `ByteBuffer.wrap`.
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     ctx.write_byte_array_from(arr, 0, &bytes);
+    let handle = ctx.add_global_root(arr);
+    jimage_map_cache().lock().insert(path, handle);
     ctx.invoke(
         "java/nio/ByteBuffer",
         "wrap",
