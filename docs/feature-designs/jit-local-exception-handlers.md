@@ -487,18 +487,16 @@ green (86 tests, no regressions).
 **New residual**: with recompiling fixed, `TestResponsePerformance`'s
 `home-brew` time is still ~350-420s/round (vs. the historical
 63,500-72,700ms/round baseline) — and this number doesn't move across any
-of the 3 fix iterations, nor under a clean `CRATONVM_JIT_DENY=Response
-.toAbsolute` compile-time deny that bypasses this session's changes
-entirely. That rules out a bug in the deopt-policy fix: the cost is
-inherent to `doHomebrew()` (itself JIT/OSR-compiled, independent of
-`toAbsolute()`'s own compilability) dispatching to a non-compiled callee via
-the generic JIT-to-interpreter fallback path. Since that historical baseline
-was ALSO measured with `toAbsolute()` permanently interpreted (the original,
-pre-this-doc RBC.6 bail), `doHomebrew()` plausibly had this exact shape back
-then too — meaning this may be an unrelated `dev` regression introduced
-sometime after 2026-07-19 rather than a new discovery about the JIT's
-inherent behavior. Not bisected this session (out of scope — see the
-known-issues doc for the full reasoning and next-step recommendation).
+of the 3 fix iterations, a clean `CRATONVM_JIT_DENY=Response.toAbsolute`
+compile-time-deny control, NOR `CRATONVM_JIT_OSR=0` (tested against an
+unrelated CRITICAL OSR-duplicate-execution bug another session found the
+same day — a plausible-looking but ultimately ruled-out explanation, see the
+known-issues doc). That rules out a bug in the deopt-policy fix itself, and
+weakens (doesn't confirm) the "JIT-to-interpreter dispatch boundary" theory
+too, since disabling OSR should force full interpretation on both sides of
+the call and made no difference. Not bisected further this session (out of
+scope) — see the known-issues doc's "2026-07-20 session" for the full
+reasoning across all 3 ruled-out theories and the next-step recommendation.
 
 ## Remaining follow-ups (not blockers for this fix)
 

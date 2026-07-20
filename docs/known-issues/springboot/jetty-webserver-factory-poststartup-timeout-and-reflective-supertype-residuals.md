@@ -11,10 +11,20 @@ hitting a newly-exposed, unrelated OPEN residual (severe TLD/JAR-scan slowdown
 in Xerces XML parsing, not a hang) — see the bottom section. **2026-07-21
 update: the JAR-open/JarFile-native/classpath-resource-lookup layers have all
 been ruled out with hard timing measurements, and the slowdown has been
-isolated to genuine Xerces SAX-parsing execution cost (~197x slower than
-HotSpot even with a reused parser) via a standalone, file-I/O-free repro —
-still OPEN, not fixed; see the bottom section for the full diagnosis and a
-fast (seconds, not minutes) repro to continue from.**
+isolated to genuine Xerces SAX-parsing execution cost via a standalone,
+file-I/O-free repro. Root-caused (via cdb stack sampling) and PARTIALLY
+FIXED: `invokestatic` was missing the same inline-cache fast path
+`invokevirtual`/`invokespecial`/`invokeinterface` already had, so every
+static method call in JDK-internal (Xerces, and any other bootstrap-package)
+bytecode paid full method resolution + a heap-allocating descriptor parse on
+every single call, not just the first. Fixed in
+`vm/src/runtime/interpreter.rs` — real, verified, universal interpreter
+improvement (not Jetty/Xerces-specific), but the full suite still does NOT
+complete within 900s: a large (~180s) stall remains on at least one test,
+consistent with first-call/cache-population cost across the much larger set
+of distinct call sites a full DTD/schema-validating parse exercises (this
+session's repro was intentionally non-validating). Still OPEN; see the
+bottom section for the complete diagnosis, what's fixed, and what's next.**
 
 ## Scope and separation
 
@@ -399,22 +409,149 @@ substantial, iterative investigation — closing this residual properly likely
 needs the same scale of effort, not a single targeted native-method
 addition.
 
-**Deliberately not attempted this session**: implementing a native fast path
-without being able to verify which method(s) actually dominate risks
-shipping a subtly-incorrect Xerces reimplementation (the doc's own framing
-for the *previous* residual explicitly flagged this risk) while not even
-fixing the reported slowdown if the guess is wrong (as the `UTF8Reader`
+**Deliberately not attempted in the prior session**: implementing a native
+fast path without being able to verify which method(s) actually dominate
+risks shipping a subtly-incorrect Xerces reimplementation (the doc's own
+framing for the *previous* residual explicitly flagged this risk) while not
+even fixing the reported slowdown if the guess is wrong (as the `UTF8Reader`
 hypothesis was).
 
-**Next steps for whoever picks this up**: get `cdb`/WinDbg (or run the repro
-under a Linux CratonVM build with `perf`/`gdb`) so the hot method(s) can be
-identified directly instead of by elimination; failing that, keep narrowing
-via the same technique used here (isolate a sub-feature — e.g. try a
-namespace-unaware `SAXParserFactory`, or DTD validation on/off — and compare
-CratonVM timing with vs. without it) using
-`docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/` as the fast
-(seconds, not the 10+ minute full-suite rebuild-and-rerun cycle) iteration
-loop. Diagnostic instrumentation left in place (all opt-in, zero behavior
-change by default, matching the existing `CRATONVM_DBG_NET`/
-`CRATONVM_DBG_GETRESOURCES` convention): `CRATONVM_DBG_JAR`,
-`CRATONVM_DBG_CLASSPATH`, `CRATONVM_DBG_RESOURCE_TIMING`.
+## Root-caused and PARTIALLY FIXED (2026-07-21, cdb profiling follow-up)
+
+Installed `cdb`/WinDbg on the box (via `winget install Microsoft.WinDbg`,
+which bundles `cdbX64.exe` — modern WinDbg's MSIX package, not just the
+GUI). The release profile already builds with `strip = "none"` +
+`debug = "line-tables-only"` (a prior perf session's setup, see the
+`[profile.release]` comment in the workspace `Cargo.toml`), so symbols were
+available immediately — no rebuild-for-symbols step needed.
+
+**Technique**: launched `SaxManySmallFiles` (6000 reps, ~80s+ wall clock) as
+a detached background process, then repeatedly non-invasively attached
+(`cdb -pv -p <PID> -y <symdir> -lines -c "~*kb 20;qd"`, ~25 samples over the
+run) and extracted the `main-vm` thread's (CratonVM's actual interpreter
+thread — distinct from the OS "main" thread, which just waits on a
+`WaitForSingleObject`) leaf frame each time — a cheap poor-man's sampling
+profiler, no `cdb` scripting extensions needed.
+
+**Result: 25/25 samples landed at the exact same spot** —
+`cratonvm_vm::runtime::interpreter::split_method_descriptor` (line 20282,
+`params.push(descriptor[start..i].to_string())`) called from
+`execute_invokestatic` (line 28578 at the time), heap-allocating a
+`Vec<String>` via `alloc::raw_vec::RawVec::grow_one` →
+`mimalloc`/`_mi_theap_get_free_small_page`. **Every single `invokestatic`
+bytecode instruction re-parsed and heap-allocated the full parameter-type
+list from scratch**, even though every consumer
+(`coerce_invoke_arg_for_descriptor`, `decode_arg_kind_aware`) only ever read
+the **first byte** of each parameter token — exactly the case the
+already-existing `nth_param_tag_byte` non-allocating helper (added for a
+*different*, narrower "warm call-dispatch arm" need — see its doc comment)
+was built for.
+
+Worse: `execute_invokevirtual_cached`/`execute_invokestatic_cached` (an
+inline monomorphic call cache, `thread.invoke_cache`) already exists and is
+already wired into the interpreter's *raw-byte-peek fast dispatch loop* —
+but the **main `execute_instruction` dispatcher** (used for JDK-internal
+classes like `com.sun.org.apache.xerces.*`, since that fast loop is
+deliberately gated off for them — see the `Instruction::Invokevirtual`/
+`Invokespecial` arm's own comment, itself a 2026-07-xx fix for the identical
+class of bug that took "a standalone SAX/DTD parse-loop repro... from
+~155ms/parse to ~0.6ms/parse" when applied to those two instructions) called
+`execute_invokestatic_cached` at exactly one call site
+(the OS-thread-startup pending-attach dance) but **never consulted the cache
+for `Instruction::Invokestatic` in the dispatcher every JDK-internal-class
+static call actually goes through** — it called the slow, allocating
+`execute_invokestatic` unconditionally, unlike its `Invokevirtual`/
+`Invokespecial`/`Invokeinterface` siblings right next to it in the same
+`match`.
+
+**Fix** (`vm/src/runtime/interpreter.rs`):
+1. Wired `execute_invokestatic_cached` into the `Instruction::Invokestatic`
+   arm of `execute_instruction`, mirroring the existing
+   `Invokevirtual`/`Invokespecial` arm exactly (cache hit → handled; miss →
+   fall through to the existing slow path, which already populates the
+   cache via `populate_invoke_cache` for next time).
+2. Changed `coerce_invoke_arg_for_descriptor` to take the parameter's tag
+   `u8` directly instead of `&str` (every call site only ever read
+   `.as_bytes().first()`), and replaced every `split_method_descriptor(&d)`
+   + `Vec<String>`/`.get(i)` pattern feeding it with direct
+   `nth_param_tag_byte(&d, i)` calls — across
+   `pop_coerced_invoke_args_virtual`, `pop_coerced_invoke_args_static`,
+   `execute_invoke_kind`, and `execute_invokestatic`'s own slow-path arg
+   popping. This removes the heap allocation entirely from the cache-miss/
+   cold path too (first call to any given call site, JVMTI-redefine/
+   synthetic-stub-upgrade evictions), not just the now-cached steady state.
+   `pop_coerced_invoke_args_intrinsic`'s already-non-allocating
+   `Arc<[Arc<str>]>`-backed path was left untouched (already correct — only
+   its now-`u8`-signature call to `coerce_invoke_arg_for_descriptor` needed
+   updating for the signature change).
+
+**Re-profiling after the fix** (same 25-sample cdb technique): the leaf
+frame is no longer dominated by one spot — samples spread across
+`execute_invokevirtual_cached`, GC heap operations
+(`gen_heap::get_header`/`compact_field_slot`), class resolution
+(`RedefineGate::is_stale`, `class::find_method`), instruction decoding,
+`RwLock` operations, and normal mimalloc alloc/free — i.e. the interpreter
+now looks like it's doing a diversified mix of genuinely necessary work
+rather than being monopolized by one wasteful allocation. This confirms the
+fix eliminated the exact bottleneck found.
+
+**Verification and honest result**: the box was under heavy shared load
+during verification (52-73% background CPU from concurrent sessions/builds
+— see `feedback_shared_host_multitenant_confound`), so a direct wall-clock
+A/B of the microbenchmark was noisy and inconclusive (interleaved runs
+showed anywhere from a 16% improvement to a wash). The code-location
+evidence above (25/25 → fully diversified) is solid regardless of timing
+noise. Running the real `JettyServletWebServerFactoryTests` suite with the
+fix: **17 server-start cycles completed with NO large spikes at all
+(3-12s each, vs. the pre-fix baseline's mix of 2-16s normal + 185-194s
+spikes)** — a real, visible improvement — **but a ~182s stall then occurred
+on the 18th cycle** (`22:29:55.836` "Jetty started" → `22:32:58.054` next
+log line), and the class still did not complete within 900s. `cargo test -p
+cratonvm-vm --lib interpreter::` after the fix: 193/194 pass; the one
+failure (`buffered_input_stream_real_jdk_uses_its_own_bytecode`) is
+pre-existing and unrelated — it fails identically on the unmodified merge
+base (confirmed via `git stash`), asserting a `force_native_over_real_jdk_bytecode`
+gate for `java/io/BufferedInputStream` that no longer exists anywhere in the
+non-test code (a stale test from an earlier refactor, not caused by this
+fix, not investigated further here — out of scope).
+
+**Working theory for the remaining ~182s stall**: the per-call-site cache
+only helps on the *second-and-later* call to a given `(caller_class,
+cp_index)` pair — the *first* call to each distinct call site still pays
+full resolution (native-registry lookup, `force_native_over_real_jdk_bytecode`/
+`synthetic_stub_should_yield_to_real_bytecode` checks, `class_manager`
+`RwLock` reads), now non-allocating but not free. This session's isolated
+repro (`SaxManySmallFiles`) intentionally used a small, non-validating,
+DTD-less parse to isolate the invokestatic-caching bug cleanly — a real
+`.tld` file parsed through Tomcat's actual `Digester`/schema-aware pipeline
+exercises a much larger, more varied set of Xerces/XNI classes and methods
+(grammar pool setup, DTD/XSD validators, symbol tables), plausibly with
+thousands of call sites hit for the first time in a single parse. If so, the
+remaining cost is aggregate first-resolution cost across many distinct call
+sites, not a single repeated hot loop — a different (and likely harder)
+shape of problem than the one just fixed. Not yet confirmed; the next step
+is to re-run the cdb sampling technique against the real suite (not the
+toy repro) during the 182s stall to see whether it's still one dominant
+spot or, as theorized, spread across first-touch resolution machinery.
+
+**Still OPEN. Next steps for whoever picks this up**:
+1. Re-run the cdb sampling technique (documented above, reusable — attach
+   non-invasively during a live slow run, `~*kb 20`, filter for the
+   `main-vm` thread) directly against a real suite run's 182s+ stall,
+   rather than the toy repro, to see whether resolution-cost-at-scale is
+   confirmed or something else is happening.
+2. If confirmed, look at whether `populate_invoke_cache`'s one-time cost
+   itself can be cut (e.g. batched resolution, or caching more eagerly per
+   class rather than strictly per call site) rather than trying to
+   eliminate first-call cost entirely.
+3. `docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/` remains
+   the fast (seconds, not the 10+ minute full-suite rebuild-and-rerun cycle)
+   iteration loop for isolated experiments — extend it with DTD/schema
+   validation enabled to better match the real workload's shape if pursuing
+   (2).
+4. Diagnostic instrumentation left in place from the prior session (opt-in,
+   zero default behavior change): `CRATONVM_DBG_JAR`,
+   `CRATONVM_DBG_CLASSPATH`, `CRATONVM_DBG_RESOURCE_TIMING`.
+5. `cdb`/WinDbg is now installed on this box (`Microsoft.WinDbg` via
+   `winget install Microsoft.WinDbg --source winget`) — no longer a
+   blocker for future sessions on this same machine.
