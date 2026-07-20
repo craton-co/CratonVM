@@ -16,6 +16,20 @@ smaller/individual differences not yet clustered.
 > [`docs/internal/springboot`](../../internal/springboot/); the legacy index
 > links below are retained as redirects.
 
+> Closure update (2026-07-19): the `Archive`/`Launcher` classpath URL
+> enumeration cluster is fixed (`JarFileArchive`/`ExplodedArchive`/
+> `ExecutableArchiveLauncher`). One pre-existing residual remains, tracked
+> by `propertieslauncher-loader-path-ignored-wrong-app-launched.md`.
+
+> Closure update (2026-07-20): `repeatablecontainers-method-cache-classcastexception.md`
+> no longer reproduces on current dev — closed, moved to
+> [`../../internal/springboot/repeatablecontainers-method-cache-classcastexception-FIXED.md`](../../internal/springboot/repeatablecontainers-method-cache-classcastexception-FIXED.md).
+> Its affected class now fails LATER for a different, unrelated reason (new
+> doc: `mockresolver-dynamicclassloader-classnotfound-forked-testcontext.md`).
+> Also filed a new CRITICAL, non-Spring-specific core VM/JIT finding from the
+> same investigation: `jit-osr-loop-duplicate-execution-silent-corruption.md`
+> (back-edge OSR compilation silently re-executes loop iterations).
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -139,7 +153,9 @@ open each doc for the full picture):
 | [`jdk-httpclient-builder-config-loss-cluster-FIXED.md`](../../internal/springboot/jdk-httpclient-builder-config-loss-cluster-FIXED.md) | FIXED — 2026-07-18 |
 | [`jdkclienthttpsender-response-timeout-not-enforced.md`](jdkclienthttpsender-response-timeout-not-enforced.md) | OPEN — found 2026-07-17 (hypothesis, not traced into CratonVM's HTTP |
 | [`jetty-loaderhidingresourcetests-empty-jar-listing.md`](jetty-loaderhidingresourcetests-empty-jar-listing.md) | OPEN — found 2026-07-17 |
-| [`jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster.md`](jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster.md) | OPEN — found 2026-07-17 |
+| [`jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster-FIXED.md`](../../internal/springboot/jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster-FIXED.md) | FIXED — 2026-07-18 |
+| [`jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md`](jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md) | MOSTLY FIXED — reflective-supertype residual + 4 real bugs (deflate SYNC_FLUSH, wildcard connect target, deflate-after-finish corruption, dead-thread-owned-monitor hang) fixed 2026-07-18; `JettyReactiveWebServerFactoryTests` now completes clean; `JettyServletWebServerFactoryTests` hits a newly-exposed, unrelated OPEN bug (blocking socket read ignoring SO_TIMEOUT) |
+| [`jit-osr-loop-duplicate-execution-silent-corruption.md`](jit-osr-loop-duplicate-execution-silent-corruption.md) | OPEN — found 2026-07-20. CRITICAL, core VM/JIT bug (not Spring-specific): a long-enough loop followed by more code in the same method silently re-executes iterations under back-edge OSR compilation once the loop crosses ~2000-3000 iterations (`CRATONVM_JIT_OSR=0` fixes it); no exception, just extra elements added to a collection or an over-large counter. Minimal repro, no Spring/reflection/threads needed |
 | [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) | PARTIALLY FIXED — Cluster A fixed 2026-07-17; unrelated hang remains OPEN |
 | [`jsonreadertests-deprecation-reason-string-truncation.md`](jsonreadertests-deprecation-reason-string-truncation.md) | OPEN — found 2026-07-17 |
 | [`../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md) | FIXED — 2026-07-18 |
@@ -151,7 +167,8 @@ open each doc for the full picture):
 | [`messagesourceautoconfigurationtests-getmessage-default-fallback.md`](messagesourceautoconfigurationtests-getmessage-default-fallback.md) | OPEN — found 2026-07-17 |
 | [`micrometer-tracing-filteredclassloader-condition-not-honored.md`](micrometer-tracing-filteredclassloader-condition-not-honored.md) | OPEN — found 2026-07-17, not root-caused |
 | `MockMvcSecurityIntegrationTests` known-user Basic-auth 401 | **FIXED 2026-07-18** — moved to [`../../internal/springboot/mockmvcsecurity-basicauth-knownuser-401-FIXED.md`](../../internal/springboot/mockmvcsecurity-basicauth-knownuser-401-FIXED.md); the Spring Security BCrypt intrinsic now proves the real credential-verification path in both JIT and `--nojit` modes |
-| [`mockwebenvironmentservletcomponentscanintegrationtests-hang.md`](mockwebenvironmentservletcomponentscanintegrationtests-hang.md) | MERGED into [`../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md) |
+| `MockWebEnvironmentServletComponentScanIntegrationTests` | **FIXED 2026-07-18** — original livelock record and its loader/annotation/reflection follow-ons moved to [`../../internal/springboot/mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md`](../../internal/springboot/mockwebenvironmentservletcomponentscanintegrationtests-hang-FIXED.md) |
+| [`mockresolver-dynamicclassloader-classnotfound-forked-testcontext.md`](mockresolver-dynamicclassloader-classnotfound-forked-testcontext.md) | OPEN — found 2026-07-20, investigated further 2026-07-20 (2nd session): 4 separate isolated repros (resource-read, full TestCompiler+DynamicClassLoader reconstruction, classloading-race stress, pre-touch-Mockito-then-fork) ALL succeeded, matching HotSpot exactly — ruled out classloader delegation, pathing-jar Class-Path parsing, and retransform-shadowing. The real test is ALSO flaky in an unrelated way (assertion failures about management-context count) under heavy shared-host load; likely GC-timing-dependent rather than a clean classloader defect — not fixed |
 | [`thread-dump-endpoint-jmx-threadinfo-fidelity.md`](thread-dump-endpoint-jmx-threadinfo-fidelity.md) | OPEN — found 2026-07-18; separate JMX diagnostic fidelity gap |
 | [`modifiedclasspath-aether-network-hang-cluster.md`](modifiedclasspath-aether-network-hang-cluster.md) | OPEN — found 2026-07-17 |
 | [`mongodb-dns-resolver-null-nameservers-npe-and-reactive-hang.md`](mongodb-dns-resolver-null-nameservers-npe-and-reactive-hang.md) | OPEN — found 2026-07-17 |
@@ -165,7 +182,7 @@ open each doc for the full picture):
 | [`r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md`](../../internal/springboot/r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md) | FIXED — 2026-07-18; reverified clean (JIT and `--nojit`) 2026-07-19 on current dev. Same root cause as the HTTP codec/JDBC/Micrometer-tracing `FilteredClassLoader` siblings |
 | [`rabbitautoconfigurationtests-cglib-enhance-hang-FIXED.md`](../../internal/springboot/rabbitautoconfigurationtests-cglib-enhance-hang-FIXED.md) | FIXED — 2026-07-20; not a hang, CPU-sampling proved genuine (if slow) progress — suite-timeout carve-out added (900s) plus a real residual bug fixed (`KeyManagerFactory`/`TrustManagerFactory.getInstance` now reject an unknown algorithm) |
 | `reactor-netty-server-startup-hang.md` | **FIXED 2026-07-20** — moved to [`../../internal/springboot/reactor-netty-server-startup-hang-FIXED.md`](../../internal/springboot/reactor-netty-server-startup-hang-FIXED.md); the hang itself was already fixed as a side effect of the 2026-07-18 `InterceptingExecutableInvoker` livelock fix. Running the class to completion exposed 12 residual failures; 9 fixed this session across three CratonVM bugs (`FileSystemProvider.getPath(jar:)` losing the jar/entry split, bind() errors never becoming typed `java.net.BindException`, a refused non-blocking connect reporting `connect()==true` instead of surfacing via `finishConnect()`) plus a `SunX509KeyManagerImpl`-compatible alias-ordering fix. Two residuals remain, filed separately: [`pemcertificates-clientauth-rustls-decrypterror.md`](pemcertificates-clientauth-rustls-decrypterror.md), [`h2c-priorknowledge-hpack-headerblock-decode-failure.md`](h2c-priorknowledge-hpack-headerblock-decode-failure.md) |
-| [`repeatablecontainers-method-cache-classcastexception.md`](repeatablecontainers-method-cache-classcastexception.md) | OPEN — found 2026-07-17, hypothesis unconfirmed |
+| [`repeatablecontainers-method-cache-classcastexception-FIXED.md`](../../internal/springboot/repeatablecontainers-method-cache-classcastexception-FIXED.md) | CLOSED 2026-07-20 — does not reproduce on current dev (4/4 clean runs); root cause never pinned, likely fixed as a side effect of unrelated collection/GC work between 07-17 and 07-20. The affected class now fails later, for an unrelated reason — see `mockresolver-dynamicclassloader-classnotfound-forked-testcontext.md` |
 | [`resourcestests-trailing-slash-windows-path-error.md`](resourcestests-trailing-slash-windows-path-error.md) | OPEN — found 2026-07-17 (hypothesis, not confirmed against native `j |
 | [`security-saml2-package-version-npe-and-x509key-unknown-algo.md`](security-saml2-package-version-npe-and-x509key-unknown-algo.md) | OPEN — found 2026-07-17 |
 | [`servletcomponentscanintegrationtests-missing-registration.md`](servletcomponentscanintegrationtests-missing-registration.md) | OPEN — found 2026-07-17, not root-caused |

@@ -1468,6 +1468,9 @@ pub fn throw_runtime_error(
         RuntimeError::ConnectException { message } => {
             ("java/net/ConnectException", Some(message.as_str()))
         }
+        RuntimeError::ProtocolException { message } => {
+            ("java/net/ProtocolException", Some(message.as_str()))
+        }
         RuntimeError::BindException { message } => {
             ("java/net/BindException", Some(message.as_str()))
         }
