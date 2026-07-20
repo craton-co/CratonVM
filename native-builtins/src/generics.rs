@@ -9,7 +9,7 @@
 //! GenericArrayType}` heap objects via `NativeContext`.
 
 use cratonvm_native_api::registry::NativeContext;
-use cratonvm_types::{ClassId, ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -32,11 +32,43 @@ thread_local! {
 /// constructed. For example, while building L extends T, resolving T through
 /// Class.getTypeParameters() would otherwise re-enter the native builder; the
 /// guard below then creates a fallback T with Object as its bound.
-fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, ClassId, String), i32>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, ClassId, String), i32>>> = OnceLock::new();
+/// Cache key's middle component: `class_id_from_mirror(decl)` only resolves
+/// a `Class` mirror (it's a reverse lookup into `class_mirrors_reverse`,
+/// keyed on Class mirrors specifically). For a `Method`/`Constructor`
+/// `GenericDeclaration`, it always returns `None` -- see the CRITICAL note
+/// on [`cached_building_type_parameter`] below for why silently skipping
+/// the cache there is NOT a harmless miss.
+fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, i32, String), i32>> {
+    static CACHE: OnceLock<Mutex<HashMap<(usize, i32, String), i32>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// CRITICAL for termination, not just an optimization: `com.sun.beans
+/// .TypeResolver.resolve(TypeVariable, Map)` (real JDK bytecode) detects a
+/// type variable that maps to itself with `map.get(tv) == tv` --
+/// **reference** equality, not `.equals()`. If two calls to
+/// [`type_param_to_java`] for "the same" conceptual type variable (same
+/// declaration + name) return two DIFFERENT (non-`==`) `TypeVariable`
+/// objects, that self-check can never fire, and `TypeResolver` walks the
+/// bound chain forever instead of terminating -- observed as
+/// `createLayoutFromConfigClass` calling `Arrays.hashCode`
+/// (`ParameterizedTypeImpl.hashCode` -> `WeakCache.get` ->
+/// `TypeResolver.resolve`, itself recursing only 2-3 levels deep, so the
+/// interpreter's call stack never grows) upward of 574,000 times in 5
+/// minutes with no sign of terminating.
+///
+/// The original implementation keyed this cache on
+/// `class_id_from_mirror(decl)`, which only resolves `Class` mirrors --
+/// for a **method- or constructor-scoped** type variable (`decl` is a
+/// `Method`/`Constructor` mirror, e.g. `<T> T getAttribute(String name)`),
+/// that lookup always returns `None`, the `?`/early-return below skips the
+/// cache silently, and every reference to that type variable builds a
+/// FRESH, non-identical `TypeVariable` object. Use the `decl` object's own
+/// identity hash instead of `class_id_from_mirror` -- it works uniformly
+/// for a Class, Method, or Constructor declaration (all are real,
+/// individually-addressable heap objects with a stable identity hash), and
+/// is exactly the same identity-stability property this cache already
+/// relies on for its cached VALUES (`ctx.identity_hash_code(tv)` below).
 fn cached_building_type_parameter(
     ctx: &mut dyn NativeContext,
     decl: ObjectRef,
@@ -44,7 +76,7 @@ fn cached_building_type_parameter(
 ) -> Option<Value> {
     let key = (
         ctx.vm_identity(),
-        ctx.class_id_from_mirror(decl)?,
+        ctx.identity_hash_code(decl),
         name.to_string(),
     );
     let ident = *type_parameter_build_cache()
@@ -61,15 +93,13 @@ fn cache_building_type_parameter(
     name: &str,
     tv: ObjectRef,
 ) {
-    let Some(class_id) = ctx.class_id_from_mirror(decl) else {
-        return;
-    };
+    let decl_ident = ctx.identity_hash_code(decl);
     ctx.register_var_handle_root(tv);
     let ident = ctx.identity_hash_code(tv);
     type_parameter_build_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert((ctx.vm_identity(), class_id, name.to_string()), ident);
+        .insert((ctx.vm_identity(), decl_ident, name.to_string()), ident);
 }
 
 /// RAII guard installing the current [`GENERIC_DECL_SCOPE`] and restoring the
@@ -408,6 +438,29 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // TypeVariable — field 0 = name, field 1 = bounds (Type[]),
             // field 2 = genericDeclaration. Always 3 fields so the
             // `getGenericDeclaration` native's slot-2 read is in bounds.
+            //
+            // MUST be cached per (enclosing decl, name), exactly like
+            // `type_param_to_java`'s own synthetic-TypeVariable path —
+            // without it, EVERY use of an unresolvable-name type variable
+            // (one whose name doesn't match any declared type parameter
+            // walking up to 16 enclosing scopes) allocates a brand new,
+            // non-identical object. `com.sun.beans.TypeResolver.resolve`'s
+            // self-reference check for a type variable that maps to itself
+            // in its substitution map relies on the SAME object recurring
+            // for "the same" variable across repeated resolution passes;
+            // a fresh object every time defeats that check and the real
+            // bytecode never terminates. Confirmed empirically: this exact
+            // gap (there, in `type_param_to_java`'s cache, which only
+            // covered the SUCCESSFULLY-resolved-declaration case) let
+            // `Arrays.hashCode` get called 574,867+ times in 5 minutes with
+            // no sign of terminating, hanging Spring Boot's Thymeleaf
+            // `createLayoutFromConfigClass` test — see
+            // docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
+            if let Value::Object(Some(decl)) = current_generic_decl() {
+                if let Some(cached) = cached_building_type_parameter(ctx, decl, name) {
+                    return cached;
+                }
+            }
             // GC-safety (2026-07-16): same unrooted-across-allocation pattern
             // as the ParameterizedType arm above — pin `tv` immediately and
             // re-read the forwarded reference after each allocating call
@@ -431,6 +484,13 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let tv = ctx.read_native_pin(tv_pin, tv);
             ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
             ctx.set_field(tv, 2, current_generic_decl());
+            // Store into the SAME cache checked at the top of this arm —
+            // without this write, the read-side lookup added above is a
+            // permanent no-op (every call misses and rebuilds). Only
+            // possible to key this when an enclosing decl was in scope.
+            if let Value::Object(Some(decl)) = current_generic_decl() {
+                cache_building_type_parameter(ctx, decl, name, tv);
+            }
             ctx.unpin_native_roots(tv_pin);
             Value::Object(Some(tv))
         }
@@ -703,6 +763,22 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 ctx.set_array_element(args, i, v);
             }
             args = ctx.read_native_pin(args_pin, args);
+            if std::env::var_os("CRATONVM_TRACE_PTI_ARGS").is_some() {
+                let observed_len = ctx.array_length(args);
+                if observed_len != type_args.len() {
+                    eprintln!(
+                        "PTI-TRACE: MISMATCH building {} — type_args.len()={} but array_length(args)={}",
+                        slashed,
+                        type_args.len(),
+                        observed_len
+                    );
+                } else if observed_len > 8 {
+                    eprintln!(
+                        "PTI-TRACE: unusually large actualTypeArguments building {} — len={}",
+                        slashed, observed_len
+                    );
+                }
+            }
             // A nested generic class has an owner even when the classfile
             // signature uses a flattened binary name and carries no
             // parameterized owner node. HotSpot returns the raw enclosing
