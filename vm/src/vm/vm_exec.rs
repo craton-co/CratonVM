@@ -16812,7 +16812,36 @@ fn invoke_on_class_shared_inner(
                                     | ("getSystemResources", "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                     | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                                     | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
-                            ));
+                            ))
+                        // `StringBuilder/StringBuffer/AbstractStringBuilder
+                        // .insert(int, char[], int, int)` (and its no-off/len
+                        // sibling `insert(int, char[])`) has real, concrete
+                        // (non-abstract) JDK bytecode, so without this entry
+                        // `check_override` stays false and that bytecode runs
+                        // directly against fields it expects at the real
+                        // `AbstractStringBuilder` layout (`byte[] value`,
+                        // `byte coder`, `int count`) — but CratonVM backs
+                        // these objects with a synthetic 2-field layout
+                        // (`char[] buffer`, `int count`; see
+                        // `native_sb_get_coder`'s doc comment). Real bytecode's
+                        // `checkOffset(dstOffset, count)` reads back a bogus
+                        // `count` (the synthetic layout has no field at that
+                        // slot) and throws `ArrayIndexOutOfBoundsException`
+                        // for any nonzero `dstOffset` — hit by Log4j2's
+                        // `FormattingInfo.format`/`ColorConverter` padding a
+                        // partially-built line (`sbuf.insert(fieldStart,
+                        // spaces, 0, n)`), which silently drops the log
+                        // record ("An exception occurred processing Appender
+                        // STDOUT") instead of reaching `System.out` —
+                        // see docs/known-issues/springboot/capturedoutput-empty-console-cluster.md.
+                        || (matches!(
+                            class_name,
+                            "java/lang/StringBuilder"
+                                | "java/lang/StringBuffer"
+                                | "java/lang/AbstractStringBuilder"
+                        ) && method_name == "insert"
+                            && (descriptor.starts_with("(I[CII)")
+                                || descriptor.starts_with("(I[C)")));
                     if check_override
                         && shared
                             .native_methods

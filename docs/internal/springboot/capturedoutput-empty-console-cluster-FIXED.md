@@ -1,6 +1,123 @@
 # `CapturedOutput`/`OutputCaptureExtension` sees empty console output (cross-module FAIL cluster)
 
-**Status: OPEN (majority FIXED 2026-07-18) — found 2026-07-17**
+**Status: FIXED 2026-07-20 (archived — see
+`docs/internal/springboot/capturedoutput-empty-console-cluster-FIXED.md`)**
+
+## Update 2026-07-20 — remaining `core/spring-boot` residual root-caused and fixed: 2 missing `StringBuilder.insert` overloads + raw-`eprintln!` JUL/JBoss-logging bypass
+
+Root-caused and fixed the 8-class `core/spring-boot` residual left OPEN by
+the 2026-07-18 update, plus both sibling residual docs
+(`oncondition-report-window-isolation-residual.md`,
+`propertiesmigration-logfactory-oom-residual.md`). Branch
+`fix/captured-output-residuals-20260719`, worktree
+`C:\craton\CratonVM-captured-output-residuals-20260719`.
+
+**Root cause 1 (the majority of the cluster): 2 missing native overrides for
+`StringBuilder`/`StringBuffer`/`AbstractStringBuilder.insert`.**
+CratonVM backs these classes with a synthetic 2-field layout (`char[]
+buffer` @0, `int count` @1 — see `native_sb_get_coder`'s doc comment in
+`native-builtins/src/lang_string.rs`), not the real JDK's `byte[] value` /
+`byte coder` / `int count` layout. The `insert(int, char[], int, int)` and
+`insert(int, char[])` overloads had no native override registered at all,
+so real (non-`native`) JDK bytecode ran directly against the mismatched
+layout: it read the real-layout `count` field (nonexistent in our layout,
+so it read back `0`) and threw `ArrayIndexOutOfBoundsException` from
+`checkOffset(dstOffset, count)` for any nonzero insertion offset. Log4j2's
+`FormattingInfo.format`/`ColorConverter` hits this on every padded field
+(`sbuf.insert(fieldStart, spaces, 0, n)`), so the exception fires inside
+Log4j2's own internal exception handler ("An exception occurred processing
+Appender STDOUT") and the log record never reaches the appender at all —
+same end symptom as this doc's original bug, different mechanism.
+
+Fixed by adding `native_sb_insert_char_array_off_len`/
+`native_sb_insert_char_array` (operating on the synthetic char[]/count
+layout, mirroring the existing `insert(int, String)`/`insert(int, char)`
+natives) and registering them for all 3 classes/both descriptors. **Also
+required** two matching dispatch-gate entries — `force_native_over_real_jdk
+_bytecode` in `vm/src/runtime/interpreter.rs` and the `check_override`
+allow-list in `vm/src/vm/vm_exec.rs`'s `invoke_on_class_shared_inner` —
+since CratonVM does **not** prefer a registered native over real (non-
+`ACC_NATIVE`) JDK bytecode by default; a native registration alone is
+insufficient unless it's also allow-listed at both of these gates (found by
+instrumenting the native with an unconditional `eprintln!` probe: it *was*
+being called for some `insert` call sites but the `ArrayIndexOutOfBoundsException`
+still fired for others — proving a second, uninstrumented dispatch path was
+still running real bytecode for the same registered triple).
+
+**Root cause 2: `java.util.logging.Logger` and `org.jboss.logging.Logger`
+convenience methods wrote via raw Rust `eprintln!`.** `native-builtins/src
+/logmanager.rs` had 15 call sites (`log_simple`, `jboss_logger_emit`,
+`jboss_logger_emit_fqcn`, `dump_throwable_to_stderr`, and the various
+`native_jul_logger_*`/`doLog`/`doLogf` natives) that formatted a log line
+and wrote it with `eprintln!` — which writes straight to the process's raw
+OS stderr, entirely bypassing the Java-level `System.out`/`System.err`
+`PrintStream` objects that `OutputCaptureExtension` substitutes via
+`System.setOut`/`setErr`. The text reached a human watching the console (or
+this project's own raw-stderr harness logs) fine, but `CapturedOutput`
+never saw it — same failure shape as this doc's original bug (a synthetic
+Logger/Log stub bypassing the real stream), just for the JUL/JBoss-logging
+bridge instead of Logback/commons-logging. Confirmed via
+`PropertiesMigrationListenerTests` (uses `commons-logging` →
+`LogFactoryImpl`'s JUL-backed `Jdk14Logger`, which resolves to these native
+overrides on this module's classpath): the exact same formatted line
+("WARN [...PropertiesMigrationListener] ...") appeared in the process's raw
+stderr capture but not in `CapturedOutput`. All 15 sites now route through
+`emit_framework_log` (the existing helper already used by the
+Logback/commons-logging fix, made `pub(crate)` for this) instead.
+
+**Residual docs closed as a side effect:**
+- `oncondition-report-window-isolation-residual.md` — re-verified PASS
+  (3/3 tests) with just the `StringBuilder.insert` fix, before the
+  JUL/JBoss fix was even written. Not independently root-caused this
+  session; likely fixed by an unrelated `dev` change between 2026-07-18 and
+  2026-07-20 (`git log` shows no commits touching this doc's area in that
+  window, so the mechanism is unconfirmed — but the symptom is gone and
+  stayed gone across every subsequent build in this session).
+- `propertiesmigration-logfactory-oom-residual.md` — the `LogFactoryImpl`
+  OOM is GONE (root cause 2's fix above; `PropertiesMigrationListenerTests`
+  now passes in ~2.5s, not an OOM after tens of millions of `Hashtable`
+  entries). The OOM's own root cause (why `LogFactory.getLog` was called
+  with tens of millions of distinct keys) was never directly identified —
+  most likely explanation given the fix: `AbstractPropertyResolver`'s
+  `LogFactory.getLog(AbstractPropertyResolver.class)` call was being
+  reached from a **recursive retry loop triggered by the same
+  `ArrayIndexOutOfBoundsException`** as root cause 1 (Log4j2's own internal
+  exception-during-logging handling can itself log-and-retry), which would
+  explain both bugs sharing one fix. Not independently confirmed via a live
+  repro of the OOM mechanism specifically.
+
+**New residual found (pre-existing, NOT part of this cluster):** running
+`core/spring-boot`'s `ConfigurationPropertiesTests` as a *full* 114-test
+class (not just its 1 originally-listed CapturedOutput-affected test
+method) hangs indefinitely, and 3 more unrelated classes across 2 other
+modules hang/slow down the same way. **Confirmed pre-existing on unmodified
+`dev`** (reproduces identically on a `dev`-tip binary built before this
+session's changes) — not a regression from either fix above. Tracked in
+[`webfluxmanagementchildcontext-hibernatevalidator-classloader-hang.md`](webfluxmanagementchildcontext-hibernatevalidator-classloader-hang.md),
+which already had the identical symptom for a different class; this
+session added 4 more affected classes and CPU-sampling evidence (busy, not
+parked) to that doc.
+
+**Full re-verification against every class this doc and its 2 sibling
+residual docs ever listed** (`residual-classes.tsv`, 10 classes covering
+every entry not already closed by the 2026-07-18 update): 8/10 PASS.
+`SimpleMainTests` is 3/4 PASS — the 4th (`basePackageScan`) is the
+separately-tracked `core-spring-boot-configdata-resource-resolution-empty-cluster.md`
+bug, out of scope here (matches this doc's own 2026-07-18 note).
+`ConfigurationPropertiesTests` HANGs as a full class — the pre-existing,
+unrelated bug above, not this cluster's bug (its own originally-listed test
+method's log-capture mechanism uses the same commons-logging path fixed
+here, but could not be isolated and independently re-verified — JUnit
+Platform's `MethodSelector`-by-name discovery unexpectedly failed to find
+this specific method on this class via a standalone repro tool, for
+reasons not investigated; `selectClass`-based full-class discovery, used by
+the normal harness, finds it fine).
+
+A regression spot-check across 19 diverse previously-passing classes (this
+doc's own already-fixed list plus a sample of unrelated core/module
+classes) found zero regressions — one class (`SpringApplicationTests`)
+actually went from 12 failed/102 to 3 failed/102 under the fix, consistent
+with it also depending on the same captured-output mechanism.
 
 ## Update 2026-07-18 — two independent concurrent fixes; reconciled in favor of the real-bytecode one
 
@@ -424,16 +541,20 @@ only broadens the affected-class list.
 `module/spring-boot-freemarker`'s `FreeMarkerAutoConfigurationTests`;
 `core/spring-boot`'s `LoggingApplicationListenerIntegrationTests`.
 
-Still OPEN (residual — see the 2026-07-18 update above for per-class
-detail):
+**FIXED 2026-07-20** (see the update at the top): `core/spring-boot`'s
+`SimpleMainTests` (3 of 4 — the 4th, `basePackageScan`, is the separately-
+tracked `core-spring-boot-configdata-resource-resolution-empty-cluster.md`
+bug), `ConfigurationWarningsApplicationContextInitializerTests`,
+`FailureAnalyzersIntegrationTests`, `DefaultSslBundleRegistryTests`,
+`ErrorPageFilterTests`,
+`logging.log4j2.GraylogExtendedLogFormatStructuredLogFormatterTests`,
+`logging.logback.GraylogExtendedLogFormatStructuredLogFormatterTests`;
+`core/spring-boot-test-autoconfigure`'s
+`OnFailureConditionReportContextCustomizerFactoryTests` (own residual doc
+closed); `core/spring-boot-properties-migrator`'s
+`PropertiesMigrationListenerTests` (own residual doc closed).
 
-| Module | Class |
-|---|---|
-| `core/spring-boot` | `org.springframework.boot.SimpleMainTests` (3 of 4 failing tests — the 4th, `basePackageScan`, is a different bug, see `core-spring-boot-configdata-resource-resolution-empty-cluster.md`) |
-| `core/spring-boot` | `org.springframework.boot.context.ConfigurationWarningsApplicationContextInitializerTests` (4 tests) |
-| `core/spring-boot` | `org.springframework.boot.context.properties.ConfigurationPropertiesTests` (1 of 114 tests) |
-| `core/spring-boot` | `org.springframework.boot.diagnostics.FailureAnalyzersIntegrationTests` |
-| `core/spring-boot` | `org.springframework.boot.ssl.DefaultSslBundleRegistryTests` |
-| `core/spring-boot` | `org.springframework.boot.web.servlet.support.ErrorPageFilterTests` (2 of 26 tests — now a Log4j2 `ArrayIndexOutOfBoundsException` inside `Appender STDOUT`, a different/new shape, see 2026-07-18 update) |
-| `core/spring-boot` | `org.springframework.boot.logging.log4j2.GraylogExtendedLogFormatStructuredLogFormatterTests` (1 of its failing tests) |
-| `core/spring-boot` | `org.springframework.boot.logging.logback.GraylogExtendedLogFormatStructuredLogFormatterTests` (2 of its failing tests) |
+**NOT this cluster's bug** (pre-existing, unrelated — see
+`webfluxmanagementchildcontext-hibernatevalidator-classloader-hang.md`):
+`core/spring-boot`'s `org.springframework.boot.context.properties.ConfigurationPropertiesTests`
+hangs as a full 114-test class run.
