@@ -131,3 +131,90 @@ were identified as sharing the same hang shape but not independently
 re-verified against this specific fix this session (they were already
 confirmed passing, pre-dating this regression's introduction, in
 `webmvc-error-forward-and-multiboot-timeout-cluster-FIXED.md`).
+
+## Addendum: a second, independent bug in the same code path
+
+A separate investigation of this same doc (before the `invoke_on_class_shared`
+root cause above was found) reproduced what looked like the identical
+symptom — hung in the exact same `TypeHelper.extractConstraintValidatorTypeArgumentType`
+`while (map.containsKey(x)) x = map.get(x)` loop — via a **bare** invocation
+with none of the suite-runner's special env vars, no Tomcat/Spring/sockets at
+all, single-threaded (confirmed with
+`-Dspring.backgroundpreinitializer.ignore=true`), reproducing in ~10s with
+just `ConstraintHelper.forAllBuiltinConstraints()` called directly. This is
+almost certainly a **second, independent** bug — see
+[[reference_hot_op_helperization_trap]]-adjacent territory, not the same
+mechanism as the `invoke_on_class_shared` deadlock above (that one requires
+two threads racing under `CRATONVM_REAL_NET_SOCKETS=1`; the bare repro is
+single-threaded and env-var-independent).
+
+Root-caused one real, generic contributing bug from that investigation:
+`native_class_get_type_parameters` (`native-builtins/src/lang_class.rs`)
+built a **fresh** synthetic `TypeVariable` on every single call to
+`Class.getTypeParameters()`, instead of reusing the cached instance HotSpot's
+`Class.getGenericInfo()` soft-reference guarantees across repeated calls —
+the same identity-stability gap independently found and partially fixed
+(for the cache-key and `type_sig_to_java` fallback-arm cases) by
+`0f36565ff`/`e426eadde` while investigating
+`thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md`'s
+`com.sun.beans.TypeResolver` hang — the two investigations converged on the
+same underlying architectural gap (CratonVM's synthetic `TypeVariable`
+objects not being identity-stable across repeated `getTypeParameters()`/
+type-variable-use resolution, unlike HotSpot) from different symptoms. Fixed
+here for the `native_class_get_type_parameters` call site specifically
+(builds on top of `0f36565ff`'s cache-key generalization). Verified: 3040/3040
+`cargo test -p cratonvm-native-builtins --lib` pass; moved the earliest
+observed hang point later in the built-in constraint list
+(`AbstractInstantBasedTimeValidator` → `AbstractDecimalMinValidator`) in the
+bare repro — real, if partial, effect.
+
+**This fix does not fully resolve the bare-repro hang.** Deep further
+investigation (ruled out: JIT, plain `HashMap`-specific bugs, GC/var-handle-
+root staleness, `TypeVariable.equals()`/`.hashCode()` instability, cached
+`TypeVariable` content corruption, general class-loading-count effects,
+general "any annotation lookup" or "any enum-valued annotation" pattern)
+narrowed the trigger to something specific to
+`Class.getAnnotation(jakarta.validation.constraintvalidation.SupportedValidationTarget.class)`,
+called on a class with no matching annotation, interleaved between two
+`TypeHelper.extractValidatedType` calls (must happen *after* `ConstraintValidator`'s
+own type parameters are first cached, not before) — real minimal repro below.
+Given `invoke_on_class_shared`'s over-broadening (this doc's main fix) was
+ALSO in effect during that entire investigation (it was found first!), it's
+possible the bare-repro hang is itself a symptom of `invoke_on_class_shared`
+routing ordinary bytecode `HashMap`/`TypeVariable` method dispatch through
+its heavier resolution path even outside the two-thread case documented
+above — this was not checked against a build with only the
+`invoke_on_class_shared` fix and none of the `getTypeParameters` identity
+work. **Re-verify the bare repro below against current `dev` before spending
+further effort on it** — it may already be fixed as a side effect of the fix
+above.
+
+```java
+// Minimal ~10s standalone repro (no Tomcat/Spring/sockets) — see if it
+// still hangs on current dev before investigating further.
+import java.lang.reflect.Method;
+import java.lang.reflect.Type;
+
+public class Main10 {
+    static String[] SEQ = {
+        "org.hibernate.validator.internal.constraintvalidators.bv.AssertFalseValidator",
+        "org.hibernate.validator.internal.constraintvalidators.bv.AssertTrueValidator",
+        "org.hibernate.validator.internal.constraintvalidators.bv.number.bound.decimal.DecimalMaxValidatorForBigDecimal",
+    };
+
+    public static void main(String[] args) throws Exception {
+        Class<?> typeHelper = Class.forName("org.hibernate.validator.internal.util.TypeHelper");
+        Method extractValidatedType = typeHelper.getMethod("extractValidatedType", Class.class);
+        for (String cn : SEQ) {
+            Class<?> c = Class.forName(cn);
+            Type result = (Type) extractValidatedType.invoke(null, c);
+            System.out.println(c.getSimpleName() + " -> " + result);
+            c.getAnnotation(jakarta.validation.constraintvalidation.SupportedValidationTarget.class);
+        }
+    }
+}
+```
+
+Run with `hibernate-validator-9.1.0.Final.jar` +
+`jakarta.validation-api-3.1.1.jar` + `jboss-logging-3.6.3.Final.jar` on the
+classpath and `--stack-dump-on-timeout 10`.

@@ -69,7 +69,16 @@ fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, i32, String), 
 /// individually-addressable heap objects with a stable identity hash), and
 /// is exactly the same identity-stability property this cache already
 /// relies on for its cached VALUES (`ctx.identity_hash_code(tv)` below).
-fn cached_building_type_parameter(
+///
+/// `pub(crate)` so `native_class_get_type_parameters`
+/// (`native-builtins/src/lang_class.rs`) can consult it directly: real
+/// `Class.getTypeParameters()` calls hit this same non-identity gap for the
+/// **successfully-declared** parameter case (as opposed to the
+/// unresolvable-name fallback this file's `type_sig_to_java` arm already
+/// guards), which independently hung Hibernate Validator's
+/// `ConstraintHelper`/`TypeHelper` reflection — see
+/// `docs/known-issues/springboot/embedded-tomcat-loopback-self-connect-silent-hang-20260719.md`.
+pub(crate) fn cached_building_type_parameter(
     ctx: &mut dyn NativeContext,
     decl: ObjectRef,
     name: &str,
