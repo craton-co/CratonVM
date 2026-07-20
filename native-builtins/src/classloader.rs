@@ -1471,10 +1471,23 @@ pub fn cl_load_class_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(loader, "parent") {
-        Value::Object(Some(parent)) => return Some(parent),
-        Value::Object(None) | Value::Int(0) | Value::Long(0) => return None,
-        _ => {}
+    // The real named `parent` field is populated by name in exactly ONE
+    // place (the bootstrap app loader's own construction, see
+    // `alloc_classloader`) — every ordinary `ClassLoader`/`URLClassLoader`
+    // constructor native (`cl_init_parent`, `cl_init_name_parent`,
+    // `ucl_setup`, ...) writes only the numeric `CL_PARENT_REF` slot. For
+    // those (the overwhelming majority of real-JDK-mode loaders), a
+    // by-name read of "parent" returns a genuinely-null Java field — NOT
+    // evidence that the loader has no parent — so it must fall through to
+    // the slot, not be trusted as the final answer. Treating that null as
+    // definitive made every `URLClassLoader` constructed with a non-null
+    // parent (e.g. Spring Boot's `PropertiesLauncher.wrapWithCustomClassLoader`
+    // wrapping a `LaunchedClassLoader`) look parentless to
+    // `cl_load_class_base_delegation`, which then skipped real parent-first
+    // delegation entirely and went straight to the (parentless) global/own-URL
+    // fallback — silently losing the parent's classpath.
+    if let Value::Object(Some(parent)) = ctx.get_field_by_name(loader, "parent") {
+        return Some(parent);
     }
     match ctx.get_field(loader, CL_PARENT_REF) {
         Value::Object(Some(parent)) => Some(parent),
@@ -4712,11 +4725,23 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // Normalise: strip a leading `jar:` (so `jar:file:/X!/sub/` collapses
     // to `file:/X!/sub/`), then strip the `file:` scheme. We keep the
     // `!/<prefix>/` suffix intact for `ClassPath::add_path` to interpret.
+    //
+    // Only the FIRST `/!` is the genuine outer-jar/nested-entry boundary
+    // marker (from `getJarReference`'s `"nested:" + jarFilePath + "/!" +
+    // nestedEntryName`). A `.replace` of every occurrence also mangles a
+    // directory-shaped nested entry name (e.g. Spring Boot's
+    // `JarUrl.create(file, "BOOT-INF/classes/")`, whose spec is
+    // `nested:<jar>/!BOOT-INF/classes/!/`): the entry name's own trailing
+    // `/` immediately followed by the URL's separate trailing `!/` root
+    // marker forms a SECOND, spurious `/!` match, which swaps into the
+    // entry name and eats its trailing slash (`BOOT-INF/classes/!/` ->
+    // `BOOT-INF/classes!//`), silently emptying `ClassPath`'s nested-prefix
+    // scan (`parse_jar_subdir_spec` never matches any real zip entry).
     let p = raw
         .strip_prefix("jar:")
         .or_else(|| raw.strip_prefix("nested:"))
         .unwrap_or(&raw)
-        .replace("/!", "!/");
+        .replacen("/!", "!/", 1);
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the

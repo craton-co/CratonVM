@@ -21,6 +21,10 @@ smaller/individual differences not yet clustered.
 > `ExecutableArchiveLauncher`). One pre-existing residual remains, tracked
 > by `propertieslauncher-loader-path-ignored-wrong-app-launched.md`.
 
+> Closure update (2026-07-20): the `propertieslauncher-loader-path-ignored-wrong-app-launched.md`
+> residual is fixed (32/32 `PropertiesLauncherTests` PASS). Canonical record
+> at [`../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md`](../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md).
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -163,7 +167,7 @@ open each doc for the full picture):
 | [`nettyrsocketserverfactorytests-bindexception-os-error-10049.md`](nettyrsocketserverfactorytests-bindexception-os-error-10049.md) | OPEN — found 2026-07-17 |
 | [`objectname-getkeypropertylist-ca-kp-array-npe-residual.md`](objectname-getkeypropertylist-ca-kp-array-npe-residual.md) | OPEN — found 2026-07-17 (residual of a FIXED sibling bug) |
 | [`otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang.md`](otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang.md) | OPEN — found 2026-07-17 (hypothesis, unconfirmed — no thread dump  |
-| [`propertieslauncher-loader-path-ignored-wrong-app-launched.md`](propertieslauncher-loader-path-ignored-wrong-app-launched.md) | OPEN — found 2026-07-17, hypothesis only (root cause not pinned to s |
+| `propertieslauncher-loader-path-ignored-wrong-app-launched.md` | **FIXED 2026-07-20** — moved to [`../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md`](../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md); 32/32 `PropertiesLauncherTests` PASS |
 | [`pulsar-propertiesmapper-timeunit-null-npe.md`](pulsar-propertiesmapper-timeunit-null-npe.md) | OPEN — found 2026-07-17 |
 | [`quartzautoconfigurationtests-jdbc-jobstore-not-applied.md`](quartzautoconfigurationtests-jdbc-jobstore-not-applied.md) | OPEN — found 2026-07-17 |
 | [`r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md`](../../internal/springboot/r2dbc-filteredclassloader-loadclass-override-bypassed-RESOLVED.md) | FIXED — 2026-07-18; reverified clean (JIT and `--nojit`) 2026-07-19 on current dev. Same root cause as the HTTP codec/JDBC/Micrometer-tracing `FilteredClassLoader` siblings |
@@ -177,7 +181,7 @@ open each doc for the full picture):
 | [`spring-boot-configuration-processor-testcompiler-hang-cluster.md`](spring-boot-configuration-processor-testcompiler-hang-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-devtools-residual-fails-cluster.md`](spring-boot-devtools-residual-fails-cluster.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-health-rerun-20260717.md`](spring-boot-health-rerun-20260717.md) | OPEN — found 2026-07-17 |
-| `Archive`/`Launcher` classpath URL enumeration empty/wrong | **FIXED 2026-07-19** — verified 10/10 `JarFileArchiveTests`, 4/4 `WarLauncherTests`, 7/7 `ExplodedArchiveTests`, 5/5 `JarLauncherTests`; moved to [`../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md`](../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md). Residual: `propertieslauncher-loader-path-ignored-wrong-app-launched.md` (8 of its original 11 fixed as a side effect, 4 remain, still OPEN) |
+| `Archive`/`Launcher` classpath URL enumeration empty/wrong | **FIXED 2026-07-19** — verified 10/10 `JarFileArchiveTests`, 4/4 `WarLauncherTests`, 7/7 `ExplodedArchiveTests`, 5/5 `JarLauncherTests`; moved to [`../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md`](../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md). Residual `propertieslauncher-loader-path-ignored-wrong-app-launched.md` also FIXED 2026-07-20, see [`../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md`](../../internal/springboot/propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md) |
 | [`spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md`](spring-boot-loader-zipfile-close-invokespecial-native-bypass-npe.md) | OPEN — found 2026-07-17 |
 | [`spring-boot-restclient-residuals.md`](spring-boot-restclient-residuals.md) | OPEN — found 2026-07-17 |
 | Spring proxy layout-probe livelock blocking broad HttpClient consumers | **FIXED 2026-07-18** — JUnit adapter receiver admission now prevents the unrelated field probe; verified in JIT and `--nojit`; moved to [`../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md`](../../internal/springboot/spring-proxy-layout-livelock-blocking-httpclient-consumers-FIXED.md) |
