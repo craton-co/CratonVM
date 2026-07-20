@@ -135,75 +135,144 @@ of transient objects before ever reaching this test) does.
   the standalone `ReproWeakHashMapHang.java` probe (20 rounds of
   put-5000-then-`System.gc()`-then-`size()`, all completing normally).
 
-## Root cause #2 — OPEN, not yet fixed
+## Root cause #2 — OPEN, deeply investigated, not yet fixed
 
-With root cause #1 fixed, the SAME test still hangs, now one level deeper.
-`--stack-dump-on-timeout` + `--nojit` shows the interpreter permanently
-parked (single dump only this time — not yet re-confirmed across multiple
-samples the way root cause #1 was, so treat "permanently" as provisional)
-at:
+With root cause #1 fixed, the SAME test still hangs, now one level deeper,
+and this is a GENUINE unbounded loop (not merely slow): a run with no
+watchdog and a 300s hard kill logged **574,867** calls to `Arrays.hashCode`
+with no sign of terminating or slowing down.
+
+### What the array-length/corruption theory (this doc's first version) got wrong
+
+Added a diagnostic native override for `java/util/Arrays.hashCode
+([Ljava/lang/Object;)I` (`native-builtins/src/lib.rs`, kept permanently,
+`CRATONVM_TRACE_ARRAYS_HASHCODE=1`-gated tracing, semantically identical to
+the real algorithm so it changes nothing when the flag is off) that prints
+each array's actual length and, for `TypeVariable` elements, their `name`
+and `genericDeclaration`. Result: the array is **always exactly length 1**,
+never corrupted, never huge — that whole theory was wrong. The single
+element, once the run reaches the truly-stuck tail (isolate it with
+`CRATONVM_TRACE_ARRAYS_HASHCODE=1` and look at the LAST couple thousand
+trace lines, not the first several seconds — early output is dominated by
+completely unrelated `Arrays.hashCode` traffic from ordinary Spring Boot
+startup, e.g. `String[]`/`Class[]`/`$Proxy` arrays, since this override is
+global, not scoped to the hang), is **the exact same object, every single
+time** — same identity hash, thousands of samples in a row:
 
 ```
-com/sun/beans/TypeResolver.resolve (recursing, as before)
-  -> com/sun/beans/WeakCache.get -> java/util/WeakHashMap.get -> java/util/WeakHashMap.hash
-  -> sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl.hashCode
-  -> java/util/Arrays.hashCode([Ljava/lang/Object;)
-  -> jdk/internal/util/ArraysSupport.hashCode([Ljava/lang/Object;III)
+java/lang/reflect/TypeVariable@<hash>(name="E", decl=java/lang/Class:java.util.List)
 ```
 
-i.e. `WeakHashMap.get(key)`'s very first step — `hash(k)`, called BEFORE any
-bucket walk — computes `k.hashCode()` where `k` is a real
-`sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl` (one of
-`TypeResolver`'s cache keys). That class's real `hashCode()` is
-`Arrays.hashCode(actualTypeArguments) ^ owner.hashCode() ^ rawType.hashCode()`,
-and `ArraysSupport.hashCode(Object[], int, int, int)`'s bytecode (a simple
-per-element loop calling `Objects.hashCode()`, NOT the SIMD/vectorized path
-used for primitive-array overloads — confirmed via `javap -c
-jdk.internal.util.ArraysSupport`) is where the interpreter is stuck.
+i.e. `java.util.List`'s own declared type parameter `E`. Confirmed this is
+CratonVM's own SYNTHETIC stand-in object (`alloc_concurrent_synthetic(ctx,
+"java/lang/reflect/TypeVariable", 3)` — the bare INTERFACE as the class,
+not `sun.reflect.generics.reflectiveObjects.TypeVariableImpl`, which is
+what a REAL, correctly-resolved `List.getTypeParameters()[0]` would be).
 
-**Leading hypothesis (not yet confirmed):** the `actualTypeArguments` array
-on this `ParameterizedTypeImpl` — built by
-`native-builtins/src/generics.rs`'s `typesig_to_real_type` (constructs REAL
-`sun.reflect.generics.reflectiveObjects.ParameterizedTypeImpl`/
-`WildcardTypeImpl` objects via `ctx.alloc_object` + `set_field_by_name`, for
-`Field.getGenericType`/`Class.getGenericInterfaces`/etc.) — has a corrupted
-or unexpectedly-huge length, making the per-element loop take a very long
-time (or genuinely never terminate, if the length field itself reads as
-garbage). Two candidate mechanisms, neither yet verified:
+### Two real caching bugs found (both fixed) — reduced but did not eliminate the loop
 
-1. A construction-time bug in `typesig_to_real_type`'s array-fill loop
-   (`native-builtins/src/generics.rs` ~line 698-705) — the loop already
-   follows the established pin/re-read-after-every-allocation GC-safety
-   pattern used throughout that file, so a straightforward reread of that
-   code didn't turn up an obvious bug, but it wasn't ruled out by direct
-   testing.
-2. A moving-GC bug corrupting the array's header/length field during a
-   LATER evacuation (after correct construction) — consistent with this
-   codebase's history of array-header-corruption bugs in other contexts
-   (`reference_synthetic_native_wrong_layout_corrupts_adjacent_object`,
-   `reference_compact_field_slot_fabricated_nonref_bug` in project memory).
+`com.sun.beans.TypeResolver.resolve(TypeVariable, Map)` (real JDK bytecode)
+needs to see the SAME `TypeVariable` object recur for its self-mapping
+termination check to fire. `native-builtins/src/generics.rs` had TWO
+independent gaps that built a FRESH, non-cached `TypeVariable` stand-in on
+every call instead of reusing one:
+
+1. `cached_building_type_parameter`/`cache_building_type_parameter`'s cache
+   key used `ctx.class_id_from_mirror(decl)` — a reverse lookup that only
+   resolves `Class` mirrors, always `None` for a `Method`/`Constructor`
+   `decl`. **Fixed**: key on `ctx.identity_hash_code(decl)` instead, which
+   works uniformly for any declaration kind.
+2. `type_sig_to_java`'s `TypeSig::TypeVar` fallback arm (built when
+   `resolve_declared_type_variable` can't find a match walking up to 16
+   enclosing scopes) checked the cache on read but — a bug in THIS
+   session's own first attempt at fixing gap 1 — never actually **wrote**
+   to it, making the read side permanently a no-op. **Fixed**: added the
+   missing `cache_building_type_parameter(...)` call after building the
+   fallback stand-in.
+
+**Verified impact**: call rate in a fixed 25s window dropped from
+~14,700–32,300 (pre-fix runs) to ~8,400 (post gap-1-fix) to a STILL-looping
+but somewhat different shape after the gap-2 fix. Both fixes are real,
+correct, verified via `cargo test -p cratonvm-native-builtins --lib`
+(3040/0/6, unchanged from dev baseline) and
+`ThymeleafReactiveAutoConfigurationTests` (21/21, unchanged) — but neither
+eliminates the hang. **The recurring object being the SAME identity in
+EVERY trace (both before and after these fixes) means object-identity
+caching was never actually the blocking factor** — `TypeResolver.resolve`
+still doesn't terminate even when it keeps seeing the same `E` back.
+
+### Current leading hypothesis — NOT YET CONFIRMED
+
+Since `List`'s "E" is completely mundane (bound `[Object.class]`, no
+self-reference, no F-bounded polymorphism), and a direct, isolated
+`List.class.getTypeParameters()` call returns a correct REAL
+`TypeVariableImpl` on CratonVM (byte-for-byte identical to HotSpot,
+verified standalone — see `ReproListTypeParams.java`), the bug is NOT in
+resolving `List`'s type parameter in isolation. It must be specific to the
+**substitution map** `TypeResolver.resolveInClass`/`getTypeArguments`
+builds by walking the ACTUAL introspected class's full generic
+superclass/interface hierarchy — i.e. something about how CratonVM
+resolves a generic type belonging to `List` while walking the class
+hierarchy of whatever concrete class is actually being introspected
+(still not pinned to a specific one — see "What's already ruled out").
+
+Also directly tested and ruled out: a real `List` **default method**'s own
+generic signature (`sort(Comparator<? super E> c)`, `replaceAll
+(UnaryOperator<E> operator)`), both called directly via reflection and via
+an inheriting concrete class (`ArrayList`), resolves instantly and
+correctly on CratonVM, matching HotSpot exactly (see
+`ReproListDefaultMethod.java`) — so a bare "introspect an inherited List
+default method" scenario is NOT sufficient to reproduce this either. The
+bug needs something about the FULL `resolveInClass`/substitution-map
+machinery operating on the real target class's hierarchy, not any of the
+narrower scenarios tested so far.
 
 **Ruled out:** NOT unbounded/self-referential recursion through nested
-`Type.hashCode()` calls — the stack dump shows each frame exactly once (no
-repeated `ParameterizedTypeImpl.hashCode → Arrays.hashCode → ...` cycle),
-which would be visible if the array contained a cyclic reference back to
-itself or an ancestor type.
+`Type.hashCode()` calls or through the interpreter's call stack — every
+stack dump shows the SAME small, fixed-depth call chain (`resolveInClass`
+→ `resolve` → `resolve` → `resolve` → `WeakCache.get`, 3-4 `resolve` levels,
+never more) — this is an OUTER loop re-invoking that same bounded chain
+over and over, not stack-depth growth. NOT non-canonical Class mirrors
+(`get_class_mirror` is a proper get-or-create singleton per `ClassId`,
+confirmed by code review of `vm/src/vm/vm_exec.rs`'s
+`get_or_create_class_mirror`). NOT `List.class.getTypeParameters()` being
+broken in isolation, NOT a `List` default method's own generic parameter
+resolution in isolation (both directly tested, both correct).
 
 **Next steps for whoever picks this up:**
-- Re-run with `--stack-dump-on-timeout` at a SHORT interval multiple times
-  in a row (as was done for root cause #1) to confirm the PC is genuinely
-  frozen (not just slow) before investing further — the single dump
-  captured this session doesn't yet establish that as conclusively as root
-  cause #1's 80-sample confirmation did.
-- Add an env-gated `eprintln!` in `typesig_to_real_type`'s
-  `ParameterizedType`-building arm printing `type_args.len()` at
-  construction and (separately) the array's `ctx.array_length()` right
-  after the fill loop, to catch a construction-time mismatch directly.
-- If construction looks correct, suspect GC corruption instead — try
-  reproducing with a non-moving/simpler GC backend if CratonVM supports
-  switching, or add a length-sanity assertion at the `Arrays.hashCode`
-  native call boundary (there isn't one currently, since `Arrays.hashCode`
-  runs unmodified real bytecode).
+- The `CRATONVM_TRACE_ARRAYS_HASHCODE=1` native override
+  (`native-builtins/src/lib.rs`, registered unconditionally, only the
+  `eprintln!` tracing is env-gated) is left in place — it's the fastest way
+  to re-confirm exactly which object is looping after any further change;
+  look at the TAIL of a long run, not the head.
+- Need to identify the ACTUAL target class(es) being introspected when the
+  hang happens (still unknown — `introspector_get_bean_info`, the natural
+  place to add this trace, is dead code; the REAL `Introspector`/
+  `TypeResolver` bytecode gives no direct hook). Consider: a native
+  override (temporary, diagnostic-only) for
+  `com.sun.beans.TypeResolver.resolveInClass(Class, Type[])` that traces
+  its `Class` argument before delegating to a hand-rolled equivalent of the
+  real algorithm (risky to get semantically exact — many call sites/
+  overloads) OR instrument `FeatureDescriptor.getParameterTypes`'s CALLER
+  side instead (`MethodDescriptor.<init>`, native override already exists
+  as dead code per `introspector_get_bean_info` — wiring just enough of it
+  up to trace the target `Method` before falling through to real bytecode
+  might be lower-risk than intercepting `TypeResolver` itself).
+- Once the target class is known, build a MUCH more surgical standalone
+  repro: `TypeResolver.resolveInClass(targetClass, someMethod
+  .getGenericParameterTypes())` directly, to reproduce outside the full
+  Spring Boot/Groovy/Thymeleaf stack — this would make iteration far
+  cheaper than the current ~15-25 min per full-rebuild-and-rerun cycle on
+  this host.
+- Given the substitution-map (`getTypeArguments`) walks the FULL generic
+  superclass/interface chain, and `List` surfaced specifically, check
+  whether the introspected class (or something in its ancestry) has a
+  generic interface/superclass signature that, when converted through
+  `native-builtins/src/generics.rs`'s `typesig_to_real_type`/
+  `type_sig_to_java`, produces a subtly wrong `ParameterizedType` for
+  something involving `List` — e.g. a raw `List` usage, or a
+  `List<SomeTypeVar>` where `SomeTypeVar` itself needs multi-hop resolution
+  through more than one enclosing scope.
 
 ## What's already ruled out
 
