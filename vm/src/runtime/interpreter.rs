@@ -16172,10 +16172,26 @@ fn lambda_proxy_satisfies(
     obj_class_id: ClassId,
     target_class_id: ClassId,
 ) -> bool {
+    let dbg_aci = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok();
     let proxies = shared.lambda_proxies.read();
+    if dbg_aci && !proxies.contains_key(&obj_class_id) {
+        eprintln!(
+            "[LOADER-TRACE] lambda_proxy_satisfies: obj_class_id={obj_class_id:?} NOT a registered lambda proxy target_class_id={target_class_id:?}"
+        );
+    }
     if let Some(call_site) = proxies.get(&obj_class_id) {
         let iface_name = call_site.functional_interface.clone();
         drop(proxies); // release lock before loading
+        if dbg_aci {
+            let target_name_dbg = shared
+                .class_manager
+                .read()
+                .get_class(target_class_id)
+                .map(|c| c.name.to_string());
+            eprintln!(
+                "[LOADER-TRACE] lambda_proxy_satisfies: obj_class_id={obj_class_id:?} iface_name={iface_name} target_class_id={target_class_id:?} target_name={target_name_dbg:?}"
+            );
+        }
                        // Lambdas produced by LambdaMetafactory.altMetafactory (used by e.g.
                        // `Comparator.comparing`, `Comparator.comparingInt`) always include
                        // `java.io.Serializable` as a marker interface. We don't currently track
@@ -16201,10 +16217,21 @@ fn lambda_proxy_satisfies(
         }
         let load_result = shared.load_class_concurrent(&iface_name);
         if let Ok(iface_id) = load_result {
+            // Plain ClassId-based `is_subclass_of` fails when `iface_name`'s
+            // globally-resolved copy (e.g. `AotApplicationContextInitializer`,
+            // first loaded under the Application loader) extends a DIFFERENT
+            // loader's copy of `target_class_name` than the one THIS checkcast
+            // resolved (e.g. the fork loader's own `ApplicationContextInitializer`,
+            // `target_class_id`) — both are genuinely "ApplicationContextInitializer"
+            // by name, just different per-loader Class objects. Fall back to the
+            // same name-based hierarchy walk `checkcast` itself already uses for
+            // non-lambda receivers (see `loader_aware_name_assignable`'s call site
+            // in `Instruction::Checkcast`) instead of only trusting ClassId identity.
             return shared
                 .class_manager
                 .read()
-                .is_subclass_of(iface_id, target_class_id);
+                .is_subclass_of(iface_id, target_class_id)
+                || loader_aware_name_assignable(shared, iface_id, target_class_id, &target_name);
         }
     }
     false
@@ -17449,6 +17476,20 @@ fn resolve_class_loader_aware(
     // (gate off / built-in loader / JDK or array name) or the loader is
     // user-defined but has not yet resolved this name. Only the latter takes the
     // cold loadClass path below; everything else resolves globally.
+    let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && (name.contains("EnvironmentPostProcessorsFactory")
+            || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
+    if dbg_trace {
+        let cm = shared.class_manager.read();
+        let ref_name = cm
+            .get_class(referencing_class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_default();
+        let ref_loader = cm.get_loader_id(referencing_class_id);
+        eprintln!(
+            "[LOADER-TRACE] resolve name={name} referencing_class={ref_name} referencing_loader={ref_loader:?}"
+        );
+    }
     let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
@@ -17464,18 +17505,33 @@ fn resolve_class_loader_aware(
     } else {
         None
     };
+    if dbg_trace {
+        eprintln!("[LOADER-TRACE] name={name} user_loader={user_loader:?}");
+    }
     if user_loader.is_some() {
         // Gate-on path: drive the user loader FIRST (initiating-loader
         // semantics), then fall back to the global store.
-        if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
+        let driven = drive_defining_loader_load(shared, thread, referencing_class_id, name);
+        if dbg_trace {
+            eprintln!("[LOADER-TRACE] name={name} drive_defining_loader_load={driven:?}");
+        }
+        if let Some(id) = driven {
             return Ok(id);
         }
         if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
-        return shared
-            .load_class_concurrent(name)
-            .map_err(MethodCallFailed::from);
+        let fallback = shared.load_class_concurrent(name);
+        if dbg_trace {
+            let owner = fallback
+                .as_ref()
+                .ok()
+                .and_then(|id| shared.class_manager.read().get_loader_id(*id));
+            eprintln!(
+                "[LOADER-TRACE] name={name} GATE-ON global fallback after drive-miss result={fallback:?} owner_loader={owner:?}"
+            );
+        }
+        return fallback.map_err(MethodCallFailed::from);
     }
 
     // Gate-off / built-in defining loader: resolve globally FIRST (the legacy
@@ -17491,7 +17547,16 @@ fn resolve_class_loader_aware(
     // it never changes a previously-successful (or differently-failing)
     // resolution.
     match shared.load_class_concurrent(name) {
-        Ok(id) => Ok(id),
+        Ok(id) => {
+            if dbg_trace {
+                let cm = shared.class_manager.read();
+                let owner = cm.get_loader_id(id);
+                eprintln!(
+                    "[LOADER-TRACE] name={name} resolved via GLOBAL-FIRST fallback cid={id:?} owner_loader={owner:?}"
+                );
+            }
+            Ok(id)
+        }
         Err(e) => {
             if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name)
             {
@@ -17518,8 +17583,18 @@ fn drive_defining_loader_load(
     if name.starts_with('[') || is_global_resolution_namespace(name) {
         return None;
     }
-    let loader_obj =
-        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())?;
+    let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && (name.contains("EnvironmentPostProcessorsFactory")
+            || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
+    let loader_obj_opt =
+        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32());
+    if dbg_trace {
+        eprintln!(
+            "[LOADER-TRACE] drive_defining_loader_load name={name} referencing_class_id={referencing_class_id:?} defining_loader_for={:?}",
+            loader_obj_opt.map(|o| o.as_ptr())
+        );
+    }
+    let loader_obj = loader_obj_opt?;
     // A per-thread in-flight guard breaks pathological re-entry for the same
     // (class, name) by degrading to global resolution.
     thread_local! {
@@ -17580,6 +17655,16 @@ fn drive_defining_loader_load(
     IN_FLIGHT.with(|s| {
         s.borrow_mut().pop();
     });
+    if dbg_trace {
+        let mapped = if let Ok(Some(Value::Object(Some(mirror)))) = result {
+            crate::vm::class_id_from_mirror(shared, mirror)
+        } else {
+            None
+        };
+        eprintln!(
+            "[LOADER-TRACE] drive_defining_loader_load name={name} loadClass_result={result:?} mapped_cid={mapped:?}"
+        );
+    }
     if let Ok(Some(Value::Object(Some(mirror)))) = result {
         if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
             if let Some(l) = cache_loader {
@@ -21105,6 +21190,63 @@ pub(crate) fn lambda_impl_dispatch_override(
     lookup_loader_initiated(shared, host, name).filter(|cid| *cid != ClassId::new(0))
 }
 
+/// Like [`lambda_impl_dispatch_override`], but for the call site that actually
+/// EXECUTES a static method-reference lambda's impl method (as opposed to the
+/// read-only callers above that only ever consult an already-populated cache).
+///
+/// A static method reference (e.g. `EnvironmentPostProcessorsFactory::
+/// fromSpringFactories`) captured by a `@CompileWithForkedClassLoader`-style
+/// isolated loader's own class can be the VERY FIRST reference to its impl
+/// owner from that loader's namespace — before any other bytecode (`new`,
+/// `checkcast`, `invokestatic`) has driven that loader's `loadClass` and
+/// populated `initiating_resolution_cache`/the loader's exact-class index.
+/// `lambda_impl_dispatch_override`'s `lookup_loader_initiated` only reads that
+/// cache; on a cold miss it returns `None` and the caller falls through to the
+/// loader-blind `invoke_shared(class_name, ...)`, which resolves to whichever
+/// same-named class the FLAT global store already holds (typically an
+/// unrelated, earlier-loaded Application-loader copy) — running the wrong
+/// loader's impl method body entirely, not just naming the wrong `Class`
+/// object. Concrete failure: `SpringApplication`'s
+/// `EnvironmentPostProcessorApplicationListener` (fork-loader-defined)
+/// constructs `postProcessorsFactory = EnvironmentPostProcessorsFactory::
+/// fromSpringFactories` and calls `.apply(classLoader)` before anything else
+/// in the fork ever touches `EnvironmentPostProcessorsFactory` by name; the
+/// resulting `new SpringFactoriesEnvironmentPostProcessorsFactory(...)` ran
+/// under the Application loader's copy, so a sibling SPI implementation
+/// (`CloudFoundryVcapEnvironmentPostProcessor`, correctly fork-loader-defined)
+/// failed `Class.equals` against it and its constructor's `DeferredLogFactory`
+/// argument resolved to `null`.
+///
+/// Actively drives the host loader's `loadClass` (same as the `New`/`Ldc`
+/// resolution path's gate-on branch) on a cache miss, instead of only
+/// consulting what's already cached. Falls back to the passive check (and
+/// then to `None`, preserving legacy behavior) whenever the gate is off, the
+/// host loader is built-in, or driving the loader fails to produce a class.
+pub(crate) fn lambda_impl_dispatch_override_driven(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    if let Some(cid) = lambda_impl_dispatch_override(shared, call_site) {
+        return Some(cid);
+    }
+    if !crate::runtime::env_cache::loader_aware_resolution() {
+        return None;
+    }
+    let host = *shared
+        .lambda_proxy_hosts
+        .read()
+        .get(&call_site.proxy_class_id)?;
+    if !matches!(
+        shared.class_manager.read().get_loader_id(host),
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    ) {
+        return None;
+    }
+    let name = &call_site.impl_handle.class_name;
+    drive_defining_loader_load(shared, thread, host, name).filter(|cid| *cid != ClassId::new(0))
+}
+
 /// Resolve a lambda implementation that is private in its declaring class.
 ///
 /// LambdaMetafactory may encode a private synthetic lambda body as an
@@ -21839,7 +21981,9 @@ pub(crate) fn try_lambda_dispatch(
                     full_args.len(),
                 );
             }
-            let result = if let Some(impl_cid) = lambda_impl_dispatch_override(shared, &call_site) {
+            let result = if let Some(impl_cid) =
+                lambda_impl_dispatch_override_driven(shared, thread, &call_site)
+            {
                 // Loader-faithful: the enclosing class was defined by a user
                 // loader whose copy of the impl owner diverges from the global
                 // one; dispatch on the exact loader-local class (static → no
@@ -28358,6 +28502,7 @@ fn execute_invokestatic(
 
     if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
         && (method_class_name.contains("SpringFactoriesLoader")
+            || method_class_name.contains("EnvironmentPostProcessorsFactory")
             || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
             || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
     {
