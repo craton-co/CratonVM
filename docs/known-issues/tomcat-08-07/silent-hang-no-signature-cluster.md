@@ -494,6 +494,21 @@ the ~150x-vs-interpreted-driver tax) and any other method sharing this
 common idiom. Should get a `docs/feature-designs/` writeup and its own
 dedicated session(s), given the correctness stakes.
 
+**2026-07-19 session 2 update**: re-validated the RBC.6 fix against the
+real Tomcat suite fixture on the Azure Linux build host and found two MORE
+real bugs blocking `Response.toAbsolute()` specifically (a
+control-flow-insensitivity bug in the session-1 safety check, and a stale
+compile-time gate unrelated to RBC.6, "BUG-LQB-SCOPE") — both root-caused,
+fixed, and validated (including against the real method's own bytecode).
+`Response.toAbsolute()` now confirmed JIT-compiles. HOWEVER a newly
+-discovered, separate performance regression (the method gets recompiled
+80-90+ times during the benchmark and runs net SLOWER once "fixed" than it
+did fully interpreted) still blocks this test's actual pass/fail outcome —
+full investigation, evidence, and next-step handoff in
+`docs/feature-designs/jit-local-exception-handlers.md`'s "session 2"
+section. This doc's disposition is unchanged (stays open) pending that
+follow-up.
+
 ### Doc disposition
 
 Left in `docs/known-issues/` (not fixed) with this root cause recorded in

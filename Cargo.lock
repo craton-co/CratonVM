@@ -482,6 +482,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cratonvm-cuda-bridge",
+ "cratonvm-jit",
  "cratonvm-native-api",
  "cratonvm-native-builtins",
  "cratonvm-vm",

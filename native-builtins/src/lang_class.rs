@@ -1922,6 +1922,37 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
+                // docs/known-issues/wildfly-remoting-classcastexception-
+                // parallel-extension-add.md): `mirror` -- the `Class` object
+                // `invoke_virtual` just handed back from recursively
+                // interpreting `loadClass`'s real bytecode -- is a bare Rust
+                // local at this point, not yet on any interpreter operand
+                // stack and not yet in `native_pending_return` (that only
+                // gets set by the OUTERMOST `safe_native_call` wrapper once
+                // this whole native call -- `Class.forName` -- finally
+                // returns). `ctx.initialize_class(cid)` below runs the
+                // class's `<clinit>`, arbitrary GC-capable bytecode, and the
+                // pre-clinit `mirror` was being returned unrefreshed
+                // afterward -- the classic Family-1 stale-ObjectRef shape.
+                // Live-captured via `EnhancedQueueExecutor$ThreadBody`
+                // worker threads racing this exact window during
+                // `parallel-extension-add`: `Class.asSubclass()` (jboss-
+                // logging's `Messages.doGetBundle`, loading a generated
+                // `*_$bundle` message-bundle impl class) read back a mirror
+                // with every field blank (`class_id_from_mirror`/field-0/
+                // field-1 all miss), producing `ClassCastException: class `
+                // (`this.toString()`'s name empty) -- reproduced identically
+                // under `CRATONVM_DISABLE_JIT=1`, ruling out a JIT-specific
+                // mechanism. Pin `mirror_ref` across `initialize_class` and
+                // refresh before every later use, including the final
+                // return.
+                let mut mirror = mirror;
+                let mirror_pin = if let Value::Object(Some(mirror_ref)) = mirror {
+                    Some(ctx.pin_native_root(mirror_ref))
+                } else {
+                    None
+                };
                 // HIB-CV-26 вЂ” honour the `initialize` flag (args[1]).
                 // `ClassLoader.loadClass` only loads + links the class; it does
                 // NOT run static initialisers. The JDK contract for
@@ -1957,7 +1988,11 @@ pub(crate) fn native_class_for_name(
                             // unrecoverable `VmError::Internal` here, which
                             // aborted the whole VM instead of letting Java
                             // code catch the exception.
-                            ctx.initialize_class(cid)?;
+                            let init_result = ctx.initialize_class(cid);
+                            if let Some(pin) = mirror_pin {
+                                mirror = Value::Object(Some(ctx.read_native_pin(pin, mirror_ref)));
+                            }
+                            init_result?;
                         }
                     }
                 }
@@ -1969,6 +2004,9 @@ pub(crate) fn native_class_for_name(
                             eprintln!("FORNAME-RET name={dotted_name} loader={loader_class_name_debug} cid={} enhanced={enh} (via-loader)", cid.as_u32());
                         }
                     }
+                }
+                if let Some(pin) = mirror_pin {
+                    ctx.unpin_native_roots(pin);
                 }
                 return Ok(Some(mirror));
             }
@@ -10956,10 +10994,35 @@ pub(crate) fn annotation_element_to_java_typed(
             // the wrong switch case, surfacing as `IllegalArgumentException`
             // wrapped at `ConfigurationClassParser.parse:181`.  Load the
             // class on demand, mirroring the sibling `Class` arm (C29).
+            //
+            // Loader-faithful resolution (found via
+            // `SpringBootContextLoaderAotTests`, `@CompileWithForkedClassLoader`):
+            // `ctx.class_id_by_name` is a GLOBAL "one class per name" lookup.
+            // Under a forked/isolating classloader, the annotation's declaring
+            // class (and the bytecode that later compares this default value
+            // via `==`, e.g. `useMainMethod == UseMainMethod.NEVER` in
+            // `SpringBootContextLoader.getMainMethod`) is loaded by the FORKED
+            // loader, but the global table can still resolve `class_name` to
+            // the outer/app loader's copy of the enum class — producing a
+            // same-named but reference-UNEQUAL enum constant (default
+            // `UseMainMethod.NEVER` from the wrong loader), so the `==` check
+            // silently fails and `useMainMethod` behaves as if it were
+            // `ALWAYS` (ordinal 0). Mirror the `Class`-valued arm above: when
+            // `container_loader` is present, resolve the enum type through it
+            // first via `loadClass`, so the SAME loader's copy backs both the
+            // default value and the bytecode's own reference to the constant.
             let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
-            let enum_cid_opt = ctx.class_id_by_name(class_name).or_else(|| {
-                let _ = ctx.load_class(class_name);
-                ctx.class_id_by_name(class_name)
+            let via_loader = container_loader.and_then(|loader| {
+                match resolve_annotation_class_via_loader(ctx, loader, class_name) {
+                    Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                    Err(_) => None,
+                }
+            });
+            let enum_cid_opt = via_loader.or_else(|| {
+                ctx.class_id_by_name(class_name).or_else(|| {
+                    let _ = ctx.load_class(class_name);
+                    ctx.class_id_by_name(class_name)
+                })
             });
             if let Some(enum_cid) = enum_cid_opt {
                 // GC-safety (2026-07-16): this is the "enum builder" residual
@@ -14856,6 +14919,27 @@ pub(crate) fn native_class_as_subclass(
         let name = mirror_class_name(ctx, this)
             .unwrap_or_default()
             .replace('/', ".");
+        if std::env::var_os("CRATONVM_DBG_CCE_BT").is_some() {
+            let this_cid_map = ctx.class_id_from_mirror(this);
+            let this_field0 = ctx.get_field(this, 0);
+            let this_field1 = ctx.get_field(this, 1);
+            let target_cid_map = ctx.class_id_from_mirror(target);
+            let target_field0 = ctx.get_field(target, 0);
+            let target_name = mirror_class_name(ctx, target).unwrap_or_default();
+            eprintln!(
+                "CRATONVM_DBG_CCE_BT: site=asSubclass this=0x{:x} this_cid_from_mirror={:?} this_field0={:?} this_field1={:?} this_name={:?} | target=0x{:x} target_cid_from_mirror={:?} target_field0={:?} target_name={:?}\n{}",
+                this.as_ptr() as usize,
+                this_cid_map,
+                this_field0,
+                this_field1,
+                name,
+                target.as_ptr() as usize,
+                target_cid_map,
+                target_field0,
+                target_name,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         Err(cratonvm_types::error::RuntimeError::ClassCastException {
             message: format!("class {name}"),
         }

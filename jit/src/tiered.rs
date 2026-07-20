@@ -707,6 +707,114 @@ impl Drop for BackgroundCompiler {
 static BACKGROUND_COMPILER: Mutex<Option<BackgroundCompiler>> = Mutex::new(None);
 static BACKGROUND_COMPILER_INIT: std::sync::Once = std::sync::Once::new();
 
+/// Diagnostic-only handle to the (singular, per-process) [`CompilerCore`] —
+/// see [`TieredCompilationManager::new`] and [`dump_method_stats_to_stderr`].
+static DIAG_CORE: std::sync::OnceLock<Arc<CompilerCore>> = std::sync::OnceLock::new();
+/// Diagnostic-only snapshot of the active policy's `c1_threshold`, captured
+/// at [`TieredCompilationManager::new`] — used by
+/// [`dump_method_stats_to_stderr`] to flag methods that crossed the
+/// promotion threshold but never actually got promoted.
+static DIAG_C1_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+
+/// Per-method invocation-vs-promotion counts, aggregated across every method
+/// this process has ever tracked. See [`dump_method_stats_to_stderr`].
+#[derive(Default)]
+struct MethodPromotionSnapshot {
+    distinct_methods: u64,
+    methods_ever_invoked: u64,
+    total_invocations: u64,
+    methods_still_interpreted: u64,
+    methods_at_c1: u64,
+    methods_at_full_profile: u64,
+    methods_at_c2: u64,
+}
+
+/// `CRATONVM_DBG_JIT_METHOD_STATS=1` diagnostic: dump, to stderr, how many
+/// distinct methods this process ever tracked, how many were actually
+/// invoked, and how many reached each compilation tier — plus the aggregate
+/// compile counts/time already tracked in [`CompilationStats`]. Written to
+/// characterize whether a slow run is dominated by code that genuinely never
+/// gets hot enough to promote past the interpreter (as opposed to a stuck
+/// lock, a cache-thrashing hot path, or some other fixable inefficiency) —
+/// see `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+/// No-op if no [`TieredCompilationManager`] was ever constructed this process
+/// (should not happen in the normal VM binary, but keeps this safe to call
+/// unconditionally from an exit hook).
+pub fn dump_method_stats_to_stderr() {
+    let Some(core) = DIAG_CORE.get() else {
+        return;
+    };
+    let c1_threshold = DIAG_C1_THRESHOLD.load(Ordering::Relaxed);
+    let mut snap = MethodPromotionSnapshot::default();
+    // (invocation_count, queued_for_compilation, tier_fail_count, name) for
+    // every Interpreter-tier method whose invocation_count already crossed
+    // c1_threshold — the smoking-gun set: these SHOULD have promoted.
+    let mut hot_but_stuck: Vec<(u64, bool, u32, String)> = Vec::new();
+    {
+        let methods = core.methods.lock();
+        for state in methods.values() {
+            snap.distinct_methods += 1;
+            snap.total_invocations += state.invocation_count;
+            if state.invocation_count > 0 {
+                snap.methods_ever_invoked += 1;
+            }
+            match state.current_tier {
+                CompilationTier::Interpreter => {
+                    snap.methods_still_interpreted += 1;
+                    if state.invocation_count >= c1_threshold {
+                        hot_but_stuck.push((
+                            state.invocation_count,
+                            state.queued_for_compilation,
+                            state.tier_fail_count,
+                            format!(
+                                "{}.{}{}",
+                                state.method_key.class_name,
+                                state.method_key.method_name,
+                                state.method_key.descriptor
+                            ),
+                        ));
+                    }
+                }
+                CompilationTier::C1 | CompilationTier::C1WithProfiling => snap.methods_at_c1 += 1,
+                CompilationTier::FullProfile => snap.methods_at_full_profile += 1,
+                CompilationTier::C2 => snap.methods_at_c2 += 1,
+            }
+        }
+    }
+    let stats = &core.stats;
+    eprintln!(
+        "[cratonvm] JIT method stats: {} distinct methods tracked, {} ever invoked, {} total invocations \
+         | still-interpreted={} c1={} full-profile={} c2={} \
+         | compiles: c1={} c2={} osr={} deopts={} c2_bailouts={} total_compile_time_ms={} \
+         | c1_threshold={} hot_but_stuck_in_interpreter={}",
+        snap.distinct_methods,
+        snap.methods_ever_invoked,
+        snap.total_invocations,
+        snap.methods_still_interpreted,
+        snap.methods_at_c1,
+        snap.methods_at_full_profile,
+        snap.methods_at_c2,
+        stats.c1_compilations.load(Ordering::Relaxed),
+        stats.c2_compilations.load(Ordering::Relaxed),
+        stats.osr_compilations.load(Ordering::Relaxed),
+        stats.deoptimizations.load(Ordering::Relaxed),
+        stats.c2_bailouts.load(Ordering::Relaxed),
+        stats.total_compile_time_ms.load(Ordering::Relaxed),
+        c1_threshold,
+        hot_but_stuck.len(),
+    );
+    if !hot_but_stuck.is_empty() {
+        hot_but_stuck.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!(
+            "[cratonvm] JIT method stats: top {} hot-but-stuck methods (invocations, queued, tier_fail_count, name):",
+            hot_but_stuck.len().min(30)
+        );
+        for (count, queued, fail, name) in hot_but_stuck.iter().take(30) {
+            eprintln!("[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}");
+        }
+    }
+}
+
 /// Idempotently start the background compile thread for `mgr`.
 ///
 /// Safe to call on every interpreter invocation hook — the spawn happens at most
@@ -775,8 +883,16 @@ impl TieredCompilationManager {
         // manager is constructed during VM init) so `process_uptime_ms`
         // reports genuine process age, not "time since first compile".
         process_start();
+        let core = Arc::new(CompilerCore::new());
+        // Diagnostic-only: the VM constructs exactly one manager per process
+        // (this is an embedded single-JVM-per-process binary, not a
+        // multi-tenant host), so a "last one registered" global handle is
+        // safe here purely for `dump_method_stats_to_stderr`'s exit-time
+        // introspection — see that function's doc comment.
+        let _ = DIAG_CORE.set(core.clone());
+        DIAG_C1_THRESHOLD.store(policy.c1_threshold as u64, Ordering::Relaxed);
         Self {
-            core: Arc::new(CompilerCore::new()),
+            core,
             policy: Mutex::new(policy),
         }
     }

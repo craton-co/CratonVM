@@ -1112,47 +1112,29 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     // starting from the handler's own entry pc) has itself written — see
     // that function's doc comment for why this check exists.
     let mut local_slot_ops: Vec<(usize, bool, u16)> = Vec::new(); // (pc, is_store, slot)
-                                  // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
-                                  // observable, non-idempotent side effect (putfield/putstatic, an array
-                                  // store, or any invoke* — a callee can mutate arbitrary state). The
-                                  // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
-                                  // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
-                                  // never returns from the trap into JIT-compiled code, and the VM's
-                                  // fallback for that trap (when no precise resume snapshot exists, which
-                                  // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
-                                  // regression revert — see
-                                  // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
-                                  // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
-                                  // side-effecting bytecode positioned BEFORE the indy in program order
-                                  // already ran for real once under the (aborted) JIT attempt, so the
-                                  // interpreter's from-scratch re-run executes it a SECOND time — a
-                                  // genuine double-execution, not just a performance cost. Confirmed via a
-                                  // minimal standalone repro (`enter()`-shaped method: `counter++;
-                                  // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
-                                  // the counter field was incremented twice per logical call. This is the
-                                  // root cause of the Liquibase `Scope` "Cannot end scope X when currently
-                                  // at scope root" corruption (docs/known-issues/keycloak-07-04/
-                                  // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
-                                  // methods perform a `putstatic`/field mutation before a string-concat
-                                  // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
-                                  // twice for one logical `Scope.enter()` call once such a helper method
-                                  // gets JIT-compiled and reached from a JIT-compiled (or otherwise
-                                  // JIT-dispatching) caller.
-                                  //
-                                  // Fix: track the earliest such pc; after the scan, if it precedes any
-                                  // `invokedynamic` site, refuse to compile the WHOLE method (return
-                                  // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
-                                  // gate below) rather than emit unconditional-trap codegen that can
-                                  // double-execute already-committed work. This only affects methods that
-                                  // have both a live invokedynamic AND an earlier side effect in raw
-                                  // bytecode-pc order — the overwhelmingly common case (an
-                                  // `assert cond : "msg" + x;` message-concat sitting on a dead branch
-                                  // near the end of a method, unrelated to any earlier field/array
-                                  // mutation reachability) is unaffected and still compiles at full JIT
-                                  // speed; methods that fail this new gate simply stay fully interpreted
-                                  // (correct, just not JIT-accelerated), matching the scanner's existing
-                                  // "when in doubt, don't compile" philosophy.
-    let mut first_committing_side_effect_pc: Option<usize> = None;
+                                  // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
+                                  // — documented alongside the RBC.6 relaxation it was found while
+                                  // validating): this scanner used to track the earliest "committing side
+                                  // effect" pc and refuse to compile ANY method where one preceded an
+                                  // `invokedynamic` in raw bytecode-pc order, because at the time
+                                  // (`752796a0a`, 2026-07-07) the trap's fallback was believed to be an
+                                  // imprecise whole-method re-run that could double-execute that side
+                                  // effect (the real, once-confirmed Liquibase `Scope` corruption). That
+                                  // premise is stale: the SAME day, a concurrent fix
+                                  // (`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
+                                  // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
+                                  // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
+                                  // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind
+                                  // `deopt_real_enabled()`) — including the exact nested-compiled-callee
+                                  // identity-mismatch case this gate was defending against
+                                  // (`try_resume_trapped_callee` + baked `method_key` identity checks,
+                                  // verified via a dedicated repro: 30000/30000 corrupted calls before,
+                                  // 0 after). A live indy trap today precisely resumes at the trapping bci
+                                  // with the correct locals/stack reconstructed — it does not re-run
+                                  // anything before it, so there is nothing left to double-execute. Removed
+                                  // this scan-time gate; the underlying runtime protection it was
+                                  // duplicating (imprecisely, at compile time) already exists and is
+                                  // strictly more precise.
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -1267,11 +1249,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 // heap-dependent helper).
                 if op == 0x53 {
                     needs_heap = true;
-                }
-                // BUG-LQB-SCOPE: array stores are observable side effects —
-                // see the tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
                 }
                 pc += 1;
             }
@@ -1388,11 +1365,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // areturn — return object reference
@@ -1417,11 +1389,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 static_field_ops.push((pc, cp_idx));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: observable side effect — see tracker doc
-                // comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // getfield — object field read
@@ -1456,11 +1423,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: observable side effect — see tracker doc
-                // comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // newarray — needs heap for allocation
@@ -1532,11 +1494,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // invokeinterface — interface dispatch via helper (5 bytes: opcode, cp_hi, cp_lo, count, 0)
@@ -1547,11 +1504,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 5;
             }
             // invokedynamic — no longer a permanent scan-time veto (5 bytes:
@@ -1599,26 +1551,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 4 >= code_len {
                     return None;
                 }
-                // BUG-LQB-SCOPE: refuse to compile the WHOLE method if a
-                // committing side effect (putfield/putstatic/array-store/
-                // invoke*) already occurred earlier in raw bytecode-pc order.
-                // The unconditional-trap codegen below can only "safely
-                // reject" by re-running the entire method from its
-                // interpreter entry (see the tracker's declaration-site
-                // comment above for the full explanation and the Liquibase
-                // `Scope` corruption this caused) — that re-run would
-                // double-execute the earlier side effect. Bailing out of
-                // compilation here is conservative (pc-order, not true
-                // control-flow reachability) but always SAFE: the method
-                // simply stays fully interpreted instead of risking a
-                // duplicated side effect. This must be checked BEFORE
-                // `indy_ops.push` / `needs_heap = true` below, matching every
-                // other "unsound shape" bail in this scanner (e.g. RBC.6).
-                if let Some(effect_pc) = first_committing_side_effect_pc {
-                    if effect_pc < pc {
-                        return None;
-                    }
-                }
+                // BUG-LQB-SCOPE gate removed — see the doc comment above
+                // (where `first_committing_side_effect_pc` used to be
+                // declared) for why it's no longer needed.
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 indy_ops.push((pc, cp_idx));
                 needs_heap = true;

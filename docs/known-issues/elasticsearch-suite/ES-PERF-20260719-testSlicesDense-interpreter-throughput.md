@@ -47,17 +47,72 @@ exceeded` JUnit failure — not a VM hang, not an external watchdog abort.
   tests/classes too) — none of them, once fixed, changed `testSlicesDense`'s
   fundamental ~600s wall-clock time.
 
-## Not yet investigated
+## 2026-07-19 investigation: two real findings, neither explains this test's slowness
 
-Nobody has done a dedicated profiling pass aimed at *reducing* this time —
-all prior sessions were chasing (and fixing) correctness bugs that
-happened to surface via this same slow test, not optimizing the interpreter
-path itself. A real investigation would want: a flamegraph/sampling
-profile of a full `testSlicesDense` run, isolating how much of the ~600s
-is reflection dispatch (`Method.invoke`) vs. `local_liveness::analyze`
-cache misses vs. actual Lucene/IVFKnn indexing work, and whether JIT
-compilation thresholds are even being hit for the hot methods on this path
-given the test's short per-call-site iteration counts.
+Added `CRATONVM_DBG_JIT_METHOD_STATS=1` (`jit/src/tiered.rs`'s
+`dump_method_stats_to_stderr`, dumps per-method invocation-vs-promotion
+counts + which methods crossed the JIT threshold but never compiled, at
+process exit) and used it to profile `testSlicesSparseWithFilter` (the same
+test class, ~86-150s, a much faster proxy than the 600s+ `testSlicesDense`
+itself).
+
+**Finding 1** (real, but a dead end for this doc): of 1345 invoked methods,
+967 (72%) crossed the JIT `c1_threshold` (1500 invocations) but never
+compiled — every one showed `tier_fail_count=3` (permanently gave up) and
+`queued=false`. Root cause: `vm/src/jit/skip_list.rs`'s blanket
+`org/apache/lucene/*` ban (`LUCENE-POSTINGS.1`), which force-interpreted
+essentially the entire Lucene surface these tests run through (`Sorter`,
+`Automaton`, `BytesRef`, `ByteArrayDataInput`, `DirectReader`,
+`Lucene90DocValuesProducer`, etc.) — a deliberate, documented
+correctness-driven ban (a JIT-vs-postings corruption bug), not a bug in the
+tiering mechanism itself.
+
+**Investigated whether that ban was still needed — ban stays, but not for
+the reason initially thought.** Re-ran the ban's own original repro plus
+much broader coverage (see `vm/src/jit/skip_list.rs`'s `LUCENE-POSTINGS.1`
+comment for the full verification log) with the ban lifted: zero
+corruption across ~1400s of Lucene-JIT-compiled execution, and (separately)
+lifting it did NOT meaningfully speed up `testSlicesDense` (602.591s vs.
+602.662s interpreted — noise-level, both cut short by the test's own 580s
+suite timeout). Based on that evidence the ban was removed and merged with
+same-day `origin/dev` commits — but the very next verification run,
+immediately post-merge, hit a NEW `EXCEPTION_STACK_OVERFLOW` crash in
+`GenerationalHeap::get_field`. **Turned out to be unrelated to this whole
+investigation**: confirmed the SAME crash reproduces on a byte-for-byte
+clean, unmodified `origin/dev` build with the ban fully in place (default
+config) — a genuine, pre-existing `dev` regression that had nothing to do
+with Lucene/JIT, just discovered by coincidence while testing it. **Since
+FIXED** (same session, root cause: an unrelated `Path.toString()` native
+infinite-recursion bug in `native-builtins/src/phases_late.rs` — see
+[`ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`](../../internal/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md)
+for the full writeup). The Lucene ban itself was left in its original
+(banned) state regardless, since lifting it never showed a performance
+benefit for this test — no reason to carry the extra unproven-safety risk.
+**This specific performance lead is closed** (the ban was never the
+dominant cost driver for `testSlicesDense`, so there's no more upside in
+chasing it further here).
+
+**Finding 2** (not investigated further, real risk if touched): the
+*separate* `java/util/*` package ban in the same skip list (a documented
+hash-table-loop regalloc miscompile, unrelated to `LUCENE-POSTINGS.1`) also
+force-interprets hot JDK collection methods this test uses heavily
+(`Arrays.rangeCheck`, `BitSet.wordIndex`/`get`, `Objects.checkIndex`,
+`Arrays.compareUnsigned`). This ban was **not** re-verified or lifted —
+unlike the Lucene ban, it guards a different, still-real miscompile, and
+touching it needs its own dedicated investigation, not an afterthought here.
+
+**Status of the actual performance question: still open.** Both leads
+investigated this session turned out not to be the dominant cost. Whoever
+picks this up next should not re-litigate the Lucene-ban question (closed,
+see above) — either investigate the `java/util/*` ban's actual impact on
+this test (carefully — it protects a real correctness bug), or do the
+`CRATONVM_DBG_JIT_METHOD_STATS=1` profiling pass directly against
+`testSlicesDense` itself (not just the faster `testSlicesSparseWithFilter`
+proxy) to see whether the hot-but-stuck-interpreter picture looks
+meaningfully different once the Lucene ban is out of the way, or whether
+raw interpreted-bytecode throughput on the surviving `java/util/*`-banned
+methods (or something else entirely — GC, I/O, algorithmic cost) now
+dominates.
 
 ## Repro
 
