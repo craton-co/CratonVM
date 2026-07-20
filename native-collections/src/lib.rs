@@ -42790,7 +42790,19 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         let this = tp_arg0(args);
         if let Some(this) = this {
             if tp_is_real(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(this, "getPoolSize", "()I", &[]);
+                // invoke_special_bytecode_only, NOT invoke_virtual_bytecode_only:
+                // a subclass (e.g. Reactor's BoundedElasticScheduler$
+                // BoundedScheduledExecutorService) that overrides this method and
+                // calls `super.getPoolSize()` would otherwise re-dispatch straight
+                // back into its own override via virtual dispatch on the concrete
+                // receiver, re-entering this native forever (the exact
+                // StackOverflowError shape already fixed for `shutdownNow` below).
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/ThreadPoolExecutor",
+                    "getPoolSize",
+                    "()I",
+                    &[Value::Object(Some(this))],
+                );
             }
         }
         Ok(Some(Value::Int(1)))
@@ -42799,7 +42811,12 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         let this = tp_arg0(args);
         if let Some(this) = this {
             if tp_is_real(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(this, "getActiveCount", "()I", &[]);
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/ThreadPoolExecutor",
+                    "getActiveCount",
+                    "()I",
+                    &[Value::Object(Some(this))],
+                );
             }
         }
         Ok(Some(Value::Int(0)))
@@ -42821,11 +42838,13 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
             let this = tp_arg0(args);
             if let Some(this) = this {
                 if tp_is_real(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
+                    let mut special_args = vec![Value::Object(Some(this))];
+                    special_args.extend_from_slice(&args[1..]);
+                    return ctx.invoke_special_bytecode_only(
+                        "java/util/concurrent/ThreadPoolExecutor",
                         "awaitTermination",
                         "(JLjava/util/concurrent/TimeUnit;)Z",
-                        &args[1..],
+                        &special_args,
                     );
                 }
             }
@@ -42836,7 +42855,12 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         let this = tp_arg0(args);
         if let Some(this) = this {
             if tp_is_real(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(this, "getTaskCount", "()J", &[]);
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/ThreadPoolExecutor",
+                    "getTaskCount",
+                    "()J",
+                    &[Value::Object(Some(this))],
+                );
             }
         }
         Ok(Some(Value::Long(0)))
@@ -42845,11 +42869,11 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         let this = tp_arg0(args);
         if let Some(this) = this {
             if tp_is_real(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(
-                    this,
+                return ctx.invoke_special_bytecode_only(
+                    "java/util/concurrent/ThreadPoolExecutor",
                     "getCompletedTaskCount",
                     "()J",
-                    &[],
+                    &[Value::Object(Some(this))],
                 );
             }
         }
@@ -44135,7 +44159,16 @@ fn native_tp_get_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         None => return Ok(Some(Value::Int(1))),
     };
     if tp_is_real(ctx, this) {
-        return ctx.invoke_virtual_bytecode_only(this, "getCorePoolSize", "()I", &[]);
+        // invoke_special_bytecode_only, NOT invoke_virtual_bytecode_only — see
+        // the `getPoolSize` registration above / `shutdownNow` below for the
+        // infinite-self-recursion hazard this avoids when a subclass overrides
+        // this method and calls `super.getCorePoolSize()`.
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "getCorePoolSize",
+            "()I",
+            &[Value::Object(Some(this))],
+        );
     }
     match ctx.get_field(this, TP_FIELD_SIZE) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
@@ -44152,7 +44185,12 @@ fn native_tp_get_maximum_pool_size(
         None => return Ok(Some(Value::Int(1))),
     };
     if tp_is_real(ctx, this) {
-        return ctx.invoke_virtual_bytecode_only(this, "getMaximumPoolSize", "()I", &[]);
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "getMaximumPoolSize",
+            "()I",
+            &[Value::Object(Some(this))],
+        );
     }
     match ctx.get_field(this, TP_FIELD_SIZE) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
@@ -44166,7 +44204,19 @@ fn native_tp_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         None => return Ok(Some(Value::Int(0))),
     };
     if tp_is_real(ctx, this) {
-        return ctx.invoke_virtual_bytecode_only(this, "isShutdown", "()Z", &[]);
+        // invoke_special_bytecode_only: Reactor's `BoundedElasticScheduler$
+        // BoundedScheduledExecutorService` overrides `isShutdown()` and calls
+        // `super.isShutdown()` — with invoke_virtual_bytecode_only, virtual
+        // dispatch on the concrete receiver re-resolved straight back to that
+        // override, whose invokespecial re-entered this same native ->
+        // infinite recursion / StackOverflowError (observed live in
+        // ReactiveOAuth2ResourceServerAutoConfigurationTests).
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "isShutdown",
+            "()Z",
+            &[Value::Object(Some(this))],
+        );
     }
     match ctx.get_field(this, TP_FIELD_SHUTDOWN) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
@@ -44180,7 +44230,13 @@ fn native_tp_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => return Ok(Some(Value::Int(0))),
     };
     if tp_is_real(ctx, this) {
-        return ctx.invoke_virtual_bytecode_only(this, "isTerminated", "()Z", &[]);
+        // Same infinite-self-recursion hazard as `isShutdown` above.
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "isTerminated",
+            "()Z",
+            &[Value::Object(Some(this))],
+        );
     }
     match ctx.get_field(this, TP_FIELD_SHUTDOWN) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
