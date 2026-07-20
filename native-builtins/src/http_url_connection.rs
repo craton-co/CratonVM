@@ -834,6 +834,13 @@ fn iae<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     .into()
 }
 
+fn protocol_ex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::ProtocolException {
+        message: message.into(),
+    }
+    .into()
+}
+
 fn read_str_field(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Option<String> {
     match ctx.get_field(obj, idx) {
         Value::Object(Some(s)) => ctx.read_string(s),
@@ -1900,6 +1907,32 @@ fn with_state<R>(
 
 fn huc_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // `<init>(Ljava/net/URL;)V` is also the REAL descriptor of the abstract
+    // `java.net.HttpURLConnection(URL u)` protected constructor, so a user
+    // subclass that calls `super(u)` directly (bypassing `URL.openConnection()`)
+    // hits this native too — not just our own synthetic-carrier allocation
+    // path. Detect that case by asking the URL argument for its real
+    // `toExternalForm()`: a genuine `java.net.URL` answers with a proper
+    // "scheme://..." string; treat it as a real carrier (field 0 keeps the
+    // URL object itself, matching `is_real_carrier`/`huc_real_object_url`)
+    // instead of clobbering field 0 with the synthetic Int(-1) conn-id, which
+    // corrupted the real inherited `URLConnection.url`/`doOutput`/... fields
+    // and broke `getURL()` + every `is_real_carrier` check downstream
+    // (`ensure_connected` then misread the never-populated HUC_URL_STR slot
+    // and threw "HttpURLConnection: URL not set").
+    if let Some(Value::Object(Some(url_obj))) = args.get(1) {
+        let url_obj = *url_obj;
+        if let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
+        {
+            if let Some(full) = ctx.read_string(s) {
+                if full.contains("://") {
+                    ctx.set_field(this, HUC_CONN_ID, Value::Object(Some(url_obj)));
+                    return Ok(None);
+                }
+            }
+        }
+    }
     ctx.set_field(this, HUC_CONN_ID, Value::Int(-1));
     let m = ctx.create_string("GET");
     ctx.set_field(this, HUC_METHOD, Value::Object(Some(m)));
@@ -2403,11 +2436,18 @@ fn huc_set_request_method(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Err(iae("setRequestMethod: null method")),
     };
     let normalized = m.to_ascii_uppercase();
+    // Real JDK's `sun.net.www.protocol.http.HttpURLConnection.setRequestMethod`
+    // whitelist is {GET, POST, HEAD, OPTIONS, PUT, DELETE, TRACE} — notably NOT
+    // PATCH, which is why Spring recommends a different `ClientHttpRequestFactory`
+    // for PATCH and its own test suite (`SimpleClientHttpRequestFactoryTests
+    // .httpMethods()`) asserts `ProtocolException` for it. Rejecting it here
+    // (as `ProtocolException`, matching the real JDK exception type) mirrors
+    // that restriction instead of silently accepting it.
     if !matches!(
         normalized.as_str(),
-        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "TRACE" | "CONNECT"
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT"
     ) {
-        return Err(iae(format!("invalid HTTP method: {m}")));
+        return Err(protocol_ex(format!("Invalid HTTP method: {m}")));
     }
     if is_real_carrier(ctx, this) {
         with_real_req(ctx, this, |r| r.method = normalized);

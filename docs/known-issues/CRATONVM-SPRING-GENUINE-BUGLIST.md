@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 70 confirmed genuine bugs remaining |
+| **Status** | OPEN — 58 confirmed genuine bugs remaining |
 | **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
 
@@ -15,15 +15,15 @@ classes on a fresh `dev` merge (`8719dca85`, ~3 days / several hundred
 commits later), 4 shards, same settings (`suite-run.sh`, `BATCH=10
 BATCH_TO=120 ONE_TO=120`, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, real JDK 25).
 
-**107 of the 177 are now fixed.** 70 remain open.
+**119 of the 177 are now fixed.** 58 remain open.
 
 | Of the 177 | Count |
 |---|--:|
-| Now OK (fixed) | 107 |
-| Still FAIL | 52 |
+| Now OK (fixed) | 119 |
+| Still FAIL | 40 |
 | Still/newly TIMEOUT | 16 |
 | Now LOADERR (was TIMEOUT) | 2 |
-| **Still open** | **70** |
+| **Still open** | **58** |
 
 The 86 environmentally-non-OK classes (73 EMPTY + 13 FAIL matching HotSpot,
 not CratonVM bugs) were not rerun individually here but the 263-class rerun
@@ -56,18 +56,82 @@ threshold circuit-breaker now pass. Whatever landed in the last 3 days
 resolved the whole cluster at once — worth checking dev history for the
 specific fix if attribution matters.
 
-**HTTP JSON/message-converter cluster — fully unfixed (8 classes)**, same
-as 2026-07-17: `http.converter.json.*` (Gson, Jsonb, Jackson2,
+**HTTP JSON/message-converter cluster — fixed 2026-07-20 (8/8 classes).**
+`http.converter.json.*` (Gson, Jackson2, MappingJackson2, Jsonb,
 Kotlin-serialization), `http.converter.StringHttpMessageConverterTests`,
 `http.ContentDispositionTests`, `http.client.SimpleClientHttpRequestFactoryTests`
-— all still failing 1-3 methods each, consistent with one shared
-charset/encoding gap.
+all now pass 100%. Two independent root causes, both in `native-io`/
+`native-builtins`/`vm`:
+1. **Shared charset/encoding gap (7/8 classes).** `ByteArrayOutputStream
+   .toString(Charset)`/`toString(String)` (`native-io/src/lib.rs`) ignored
+   the charset argument entirely and always did lossy UTF-8 decoding —
+   fine for ASCII/UTF-8 content, silently mangling anything else (UTF-16BE
+   JSON bodies in the `writeUTF16`/`writeObjectInUtf16` tests, ISO-8859-1
+   in `StringHttpMessageConverterTests.writeDefaultCharset`, Shift_JIS in
+   `ContentDispositionTests.parseQuotedPrintableShiftJISFilename`'s
+   RFC 2047 decode, all of which route through this exact JDK method via
+   `StreamUtils.copyToString(ByteArrayOutputStream, Charset)`). Fixed by
+   routing through the real `cratonvm_native_api::charset` engine using the
+   requested charset.
+2. **`SimpleClientHttpRequestFactoryTests` (1/8 classes, 3 residual method
+   failures after fix 1).**
+   - `deleteWithoutBodyDoesNotRaiseException`/`httpMethods`: the synthetic
+     `HttpURLConnection.<init>(URL)` native (`native-builtins/src/
+     http_url_connection.rs::huc_init`) unconditionally clobbered field 0
+     (the real inherited `URLConnection.url`) whenever real JDK code called
+     `super(url)` directly on a subclass (not just via `URL.openConnection
+     ()`), breaking `getURL()` and real-carrier detection; separately,
+     `setRequestMethod` accepted `"PATCH"` (real JDK's whitelist doesn't,
+     throwing `ProtocolException` — added as a new `RuntimeError` variant).
+   - `interceptor`: a genuinely deep, cross-cutting bug — `Mockito.mock
+     (HttpURLConnection.class)` (default "inline" mock maker) redefines the
+     class's bytecode IN PLACE via JVMTI rather than subclassing it, so
+     CratonVM's redefine-generation counter for `java/net/HttpURLConnection`
+     trips permanently for the rest of the process, for EVERY instance —
+     including totally unrelated, genuinely real connections created by
+     *later* tests in the same JVM. The interpreter's redefine-guard then
+     ceded to the (Mockito-woven) bytecode for those real connections too,
+     so `getResponseCode()`/`getHeaderField()`/etc. silently no-op'd instead
+     of touching the real request/response. Fixed with a receiver-aware
+     exemption in `vm/src/runtime/interpreter.rs::intercept_force_registered
+     _native`: force the native for `java/net/HttpURLConnection` whenever
+     the receiver's field 0 is non-null (a real carrier's populated `url`
+     field vs. a Mockito mock's always-null Objenesis-constructed field),
+     re-validated per-call so genuine mocks (field 0 stays null) are
+     unaffected and still correctly route through Mockito's advice.
 
-**`scheduling.concurrent.*` cluster — fully unfixed (4 classes)**:
+Verified via an 8-class targeted run (all 100%) plus a 27-class regression
+sweep across `http.client.*`/`web.client.*`/the sibling `http.converter`
+cluster (`FormHttpMessageConverterTests`, `BufferedImageHttpMessageConverterTests`,
+`Jaxb2CollectionHttpMessageConverterTests`) — no regressions;
+`web.client.RestClientIntegrationTests`/`RestTemplateIntegrationTests`
+(both pre-existing, out-of-scope failures) even improved (4->2 and 7->3
+failing methods respectively), consistent with sharing the same
+HttpURLConnection root causes.
+
+**`scheduling.concurrent.*` cluster — fixed 2026-07-20 (4/4 classes).**
 `ConcurrentTaskExecutorTests`, `DecoratedThreadPoolTaskExecutorTests`,
-`ThreadPoolTaskExecutorTests`, `ThreadPoolTaskSchedulerTests`, plus
-`scheduling.quartz.QuartzSupportTests` — all partial failures (2-9 methods
-each), likely a shared executor/scheduler gap.
+`ThreadPoolTaskExecutorTests`, `ThreadPoolTaskSchedulerTests` all now pass
+100% (18/18, 14/14, 23/23, 40/40). Root cause: `native-collections` shadowed
+`getCorePoolSize`/`getMaximumPoolSize`/`isShutdown`/`isTerminated`/
+`shutdownNow` on the concrete class `java/util/concurrent/ThreadPoolExecutor`
+unconditionally with CratonVM's synthetic 2-field executor layout, even for
+REAL bytecode-constructed `ThreadPoolExecutor` instances (disambiguated only
+by class name, which collides with the synthetic placeholder) — so
+`setCorePoolSize()`/`setMaximumPoolSize()` mutations were silently ignored on
+readback, and `shutdownNow()` interrupted workers but always returned an
+empty list instead of draining `workQueue`, leaving queued `FutureTask`s
+neither run nor cancelled (`future.get(timeout)` threw `TimeoutException`
+instead of `CancellationException`). Fixed by routing real receivers through
+the real JDK bytecode instead of the synthetic slots (see
+`native-collections/src/lib.rs` `tp_is_real`), landed on `dev` at `2b41ba9b0`.
+`scheduling.quartz.QuartzSupportTests` was investigated as a possible shared
+residual but could not be verified either way: its module
+(`spring-context-support`) doesn't compile against the shared
+spring-framework checkout used for classpath generation (missing the
+`org.springframework.aop.target` source package entirely, pre-existing and
+unrelated to CratonVM) — left open, out of scope for the concurrent-cluster
+fix.
 
 **Groovy — 1/4 fixed.** `scripting.groovy.GroovyAspectTests` is now fixed;
 `context.groovy.GroovyBeanDefinitionReaderTests` and
@@ -78,7 +142,7 @@ each), likely a shared executor/scheduler gap.
 anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 (45/45) — whatever caused that status/method-count mismatch is gone.
 
-## Full class list (70), by module
+## Full class list (66), by module
 
 ### Aop
 
@@ -131,16 +195,8 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 ### Http
 
-| Class | Status | Pass/Total | Elapsed |
-|---|---|--:|--:|
-| `http.ContentDispositionTests` | FAIL | 33/34 | 1346ms |
-| `http.client.SimpleClientHttpRequestFactoryTests` | FAIL | 7/10 | 11006ms |
-| `http.converter.StringHttpMessageConverterTests` | FAIL | 12/13 | 889ms |
-| `http.converter.json.GsonHttpMessageConverterTests` | FAIL | 13/14 | 1553ms |
-| `http.converter.json.JacksonJsonHttpMessageConverterTests` | FAIL | 33/34 | 6805ms |
-| `http.converter.json.JsonbHttpMessageConverterTests` | FAIL | 13/14 | 823ms |
-| `http.converter.json.KotlinSerializationJsonHttpMessageConverterTests` | FAIL | 24/25 | 11650ms |
-| `http.converter.json.MappingJackson2HttpMessageConverterTests` | FAIL | 31/32 | 4911ms |
+All 8 HTTP JSON/message-converter cluster classes fixed 2026-07-20 — see
+"Notable clusters" above. Removed from this table.
 
 ### Jdbc
 
@@ -177,13 +233,17 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 ### Scheduling
 
+`scheduling.concurrent.*` (4 classes: `ConcurrentTaskExecutorTests`,
+`DecoratedThreadPoolTaskExecutorTests`, `ThreadPoolTaskExecutorTests`,
+`ThreadPoolTaskSchedulerTests`) fixed 2026-07-20 — see "Notable clusters"
+above. Removed from this table.
+
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `scheduling.concurrent.ConcurrentTaskExecutorTests` | FAIL | 16/18 | 4896ms |
-| `scheduling.concurrent.DecoratedThreadPoolTaskExecutorTests` | FAIL | 12/14 | 4853ms |
-| `scheduling.concurrent.ThreadPoolTaskExecutorTests` | FAIL | 19/23 | 4964ms |
-| `scheduling.concurrent.ThreadPoolTaskSchedulerTests` | FAIL | 38/40 | 6671ms |
 | `scheduling.quartz.QuartzSupportTests` | FAIL | 8/17 | 9296ms |
+
+(`QuartzSupportTests` not re-verified this session — see note above; kept as
+FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 
 ### Scripting
 

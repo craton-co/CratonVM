@@ -277,6 +277,14 @@ pub enum RuntimeError {
     #[error("ConnectException: {message}")]
     ConnectException { message: String },
 
+    /// `java.net.ProtocolException` — a subclass of `IOException`; real JDK's
+    /// `HttpURLConnection.setRequestMethod` throws this (not
+    /// `IllegalArgumentException`) for a method outside its fixed whitelist
+    /// (e.g. "PATCH" — Spring's `SimpleClientHttpRequestFactoryTests`
+    /// specifically asserts `ProtocolException.class` for it).
+    #[error("ProtocolException: {message}")]
+    ProtocolException { message: String },
+
     #[error("FileNotFoundException: {path}")]
     FileNotFoundException { path: String },
 
