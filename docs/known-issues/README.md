@@ -4,6 +4,18 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-20 Spring suite genuine-bug list reconfirmed: 107/177 fixed, 70 remain
+
+Reran the 263 previously-non-passing classes from the 2026-07-17 full-suite
+triage on a fresh `dev` merge (`8719dca85`, ~3 days later). **107 of the 177
+confirmed genuine bugs are now fixed**, including 24/26 of the systemic JMX
+cluster and the entire 25-class `test.context.jdbc.*` cluster. 70 remain
+open — notably the AOT/TIMEOUT cluster (still fully hung, grew to 16
+classes), the HTTP JSON message-converter cluster (all 8 still failing), and
+`scheduling.concurrent.*` (all 4 still failing).
+[`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md)
+has been trimmed to just the 70 still-open classes.
+
 ## 2026-07-17 Spring suite: full 2912-class run, 177 genuine bugs fully HotSpot-triaged (complete replacement of prior partial docs)
 
 Ran the **complete** Spring Framework suite (all 2912 classes, no filtering)
