@@ -43433,9 +43433,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;",
         |ctx, args| p68_create_socket_inet_address(ctx, args, 1, 2),
     );
-    // createSocket(Socket s, String host, int port, boolean autoClose) — we
-    // ignore the supplied Socket (the TLS stream owns its own TCP connection)
-    // but still validate its non-null-ness to match the reference JDK.
+    // createSocket(Socket wrapped, String host, int port, boolean autoClose).
+    // Real JDK contract: this reuses `wrapped`'s existing TCP connection (a
+    // fresh outbound connection would break both the layered-server case
+    // below AND client-side proxy-tunnel/CONNECT layering) and defaults to
+    // CLIENT mode — the caller may still flip it to SERVER mode via
+    // `setUseClientMode(false)` before the handshake actually starts, which
+    // is exactly the MockWebServer HTTPS-listener pattern
+    // (`docs/internal/springboot/spring-boot-cloudfoundry-rerun-20260717-FIXED.md`).
+    // Since the role isn't known yet at this call, the handshake itself is
+    // deferred — see `t27_tls::{stash_pending_layered_socket,
+    // set_pending_layered_socket_client_mode, drive_pending_layered_handshake}`
+    // and this file's `ensure_layered_handshake_started` — to `startHandshake()`
+    // or the first I/O call, whichever comes first (matching real JSSE, where
+    // both implicitly trigger the handshake).
     r.register(
         ssf,
         "createSocket",
@@ -43451,12 +43462,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            if !matches!(args.get(2), Some(Value::Object(Some(_)))) {
-                return Err(RuntimeError::NullPointerException {
-                    message: Some("SSLSocketFactory.createSocket: host is null".into()),
+            // `host` may legitimately be null (real JDK: the socket's own
+            // peer address is used for the handshake in that case) — Spring's
+            // and MockWebServer's callers always pass a non-null String here,
+            // but a null placeholder host is still a valid caller value we
+            // must not NPE on; the DNS/SNI-name concept is meaningless for
+            // the SERVER-mode case (MockWebServer) anyway, since the
+            // handshake there uses `wrapped`'s existing connection, not a
+            // hostname lookup.
+            let host = match args.get(2) {
+                Some(Value::Object(Some(host_ref))) => {
+                    ctx.read_string(*host_ref).unwrap_or_default()
                 }
-                .into());
-            }
+                _ => String::new(),
+            };
             let port_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(443);
             if !(0..=65535).contains(&port_i) {
                 return Err(RuntimeError::IllegalArgumentException {
@@ -43473,42 +43492,69 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            // The rustls handshake below is pure native socket I/O.  Mark this
-            // server worker blocked while it waits for the client's
-            // ClientHello, otherwise a concurrent VM safepoint can wait for
-            // this thread while the client event loop waits for its reply.
-            ctx.begin_blocking_region();
-            let stream_result = crate::t27_tls::rustls_server_wrap_existing_socket(
-                ctx,
-                wrapped,
-                ssl_context,
-            );
-            ctx.end_blocking_region();
-            let stream_id = stream_result.map_err(|message| RuntimeError::IOException { message })?;
+            let pending_id = crate::t27_tls::stash_pending_layered_socket(ctx, wrapped, ssl_context, host.clone())
+                .map_err(|message| RuntimeError::IOException { message })?;
             let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
-            let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
-                .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
-            let host = ctx.create_string("server");
-            let tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
+            let host_obj = ctx.create_string(&host);
+            let pending_tls_id = crate::servlet::PENDING_LAYERED_SOCK_ID_BASE + pending_id;
             // The real JDK SSLSocket field layout is not this synthetic
             // adapter's layout, so these Int field writes may be rejected.
             // Keep the stream id in the side table used by the SSLSocket I/O
             // natives; otherwise getInputStream/getOutputStream resolve -1.
-            crate::net_phase_e::sock_set_for_create(ctx, socket, port_i, tls_id);
-            ctx.set_field(socket, NEW13_SOCK_HOST, Value::Object(Some(host)));
+            crate::net_phase_e::sock_set_for_create(ctx, socket, port_i, pending_tls_id);
+            ctx.set_field(socket, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
             ctx.set_field(socket, NEW13_SOCK_PORT, Value::Int(port_i));
-            ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(tls_id));
+            ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(pending_tls_id));
             ctx.set_field(socket, NEW13_SOCK_CLOSED, Value::Int(0));
-            let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
-            let protocol = ctx.create_string(&protocol);
-            let cipher = ctx.create_string(&cipher);
-            ctx.set_field(session, 0, Value::Object(Some(protocol)));
-            ctx.set_field(session, 1, Value::Object(Some(cipher)));
-            ctx.set_field(session, 2, Value::Int(tls_id));
-            ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+            // No SSLSession yet — the handshake hasn't run. `getSession()`
+            // (like real JSSE) implicitly starts the handshake if needed; see
+            // its registration below.
             Ok(Some(Value::Object(Some(socket))))
         },
     );
+
+    // If `this` (a `javax/net/ssl/SSLSocket`) is still a pending layered
+    // socket (`createSocket(Socket wrapped, ...)`'s deferred-handshake
+    // design — see that registration's doc comment), drive its handshake now
+    // in whichever role `setUseClientMode` last left it in (default client),
+    // update the socket's fields/side-table to the now-real rustls stream
+    // id, and build its SSLSession. Returns the resolved (non-pending) tls
+    // id either way — a socket that was never pending, or already
+    // handshaked, is returned unchanged.
+    fn ensure_layered_handshake_started(
+        ctx: &mut dyn NativeContext,
+        socket: ObjectRef,
+    ) -> Result<i32, MethodCallFailed> {
+        let tls_id = new13_resolve_tls_id(ctx, socket);
+        if tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            || tls_id >= crate::servlet::RUSTLS_SOCK_ID_BASE
+        {
+            return Ok(tls_id);
+        }
+        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+        // Pure native socket I/O below (the actual TLS handshake). Mark this
+        // thread blocked so a concurrent VM safepoint doesn't wait for it
+        // while the peer's event loop waits for this handshake's reply.
+        ctx.begin_blocking_region();
+        let stream_result = crate::t27_tls::drive_pending_layered_handshake(pending_id);
+        ctx.end_blocking_region();
+        let stream_id =
+            stream_result.map_err(|message| RuntimeError::IOException { message })?;
+        let real_tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
+        let port = ctx.get_field(socket, NEW13_SOCK_PORT).as_int().unwrap_or(0);
+        crate::net_phase_e::sock_set_for_create(ctx, socket, port, real_tls_id);
+        ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(real_tls_id));
+        let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
+            .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
+        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        let protocol = ctx.create_string(&protocol);
+        let cipher = ctx.create_string(&cipher);
+        ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(protocol)));
+        ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher)));
+        ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(real_tls_id));
+        ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
+        Ok(real_tls_id)
+    }
 
     // SSLSocket methods
     let ssl_sock = "javax/net/ssl/SSLSocket";
@@ -43518,6 +43564,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Real JSSE: getSession() implicitly starts the handshake if one
+            // hasn't run yet.
+            ensure_layered_handshake_started(ctx, this)?;
             let session = ctx.get_field(this, 4);
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
@@ -43530,8 +43579,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(session))
         },
     );
-    r.register(ssl_sock, "startHandshake", "()V", |_ctx, _args| {
-        // Handshake already done in createSocket
+    r.register(ssl_sock, "startHandshake", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
     // setUseClientMode/getUseClientMode, setNeedClientAuth/getNeedClientAuth,
@@ -43554,10 +43604,24 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // listener contract) — `getApplicationProtocol`/`getSSLParameters` are
     // still worth having registered (OkHttp calls them too, just later) but
     // execution never reached them without this fix.
-    r.register(ssl_sock, "setUseClientMode", "(Z)V", |_ctx, _args| {
-        // This socket's mode (client vs. server) was fixed by which native
-        // path created it (rustls_client_connect vs.
-        // rustls_server_wrap_existing_socket); the handshake already ran.
+    r.register(ssl_sock, "setUseClientMode", "(Z)V", |ctx, args| {
+        // A socket from `createSocket(Socket wrapped, ...)` defers its actual
+        // handshake (see that registration's doc comment) precisely so this
+        // call can still decide client-vs-server mode; record it on the
+        // pending state if the handshake hasn't started yet. A socket from
+        // any other creation path (already handshaked, or never went through
+        // the deferred path) has no pending entry — matches this file's
+        // existing convention of silently ignoring a mode change once the
+        // role is already fixed.
+        let this = obj_arg(args, 0)?;
+        let use_client = args.get(1).and_then(|v| v.as_int()).unwrap_or(1) != 0;
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+        {
+            let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+            crate::t27_tls::set_pending_layered_socket_client_mode(pending_id, use_client);
+        }
         Ok(None)
     });
     r.register(ssl_sock, "getUseClientMode", "()Z", |_ctx, _args| {
@@ -43809,7 +43873,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = new13_resolve_tls_id(ctx, this);
+            // Real JSSE: the first I/O call implicitly starts the handshake
+            // if one hasn't run yet — this socket may still be pending (see
+            // `createSocket(Socket wrapped, ...)`'s doc comment).
+            let fd_id = ensure_layered_handshake_started(ctx, this)?;
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
@@ -43833,7 +43900,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/io/OutputStream;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fd_id = new13_resolve_tls_id(ctx, this);
+            let fd_id = ensure_layered_handshake_started(ctx, this)?;
             if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getOutputStream sock={:?} tls_id={}",

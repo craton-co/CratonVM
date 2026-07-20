@@ -2676,22 +2676,27 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
 }
 
 /// Read from either a client- or server-side rustls stream.
-/// Layer a rustls server over an already-accepted plain Java Socket. This is
-/// the server-side contract of `SSLSocketFactory.createSocket(Socket, ...)`.
-pub(crate) fn rustls_server_wrap_existing_socket(
-    ctx: &mut dyn NativeContext,
-    socket: ObjectRef,
-    ssl_context: ObjectRef,
+/// Drive a rustls SERVER handshake over an already-connected `TcpStream` and
+/// register the result in the client/server stream registry. This is the
+/// server-mode half of the deferred handshake for
+/// `SSLSocketFactory.createSocket(Socket, String, int, boolean)` — see
+/// `phases_late.rs`'s registration of that method and
+/// `ensure_layered_handshake_started` for why the handshake itself must not
+/// run at `createSocket()` time (real JDK contract: the returned socket
+/// defaults to CLIENT mode; the caller decides server mode afterward via
+/// `setUseClientMode(false)`, exactly what MockWebServer does).
+/// GC-safe: takes only owned, non-`ObjectRef` data — no Java object is held
+/// across this call.
+pub(crate) fn rustls_server_handshake_over_stream(
+    tcp: TcpStream,
+    cert_pem: &str,
+    key_pem: &str,
 ) -> Result<i32, String> {
     let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
-    let tcp = crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, socket)?;
     if debug_srv {
         eprintln!("[dbg-tls-srv] wrap_existing_socket: got raw stream");
     }
-    let identity = ctx_identity(ctx, ssl_context)
-        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)))
-        .ok_or_else(|| "No TLS key/cert configured for layered SSLSocket".to_string())?;
-    let config = build_server_config_single_cert(&identity.0, &identity.1, &[], false, None)?;
+    let config = build_server_config_single_cert(cert_pem, key_pem, &[], false, None)?;
     let conn = ServerConnection::new(config)
         .map_err(|e| format!("layered server connection: {e}"))?;
     let mut stream = StreamOwned::new(conn, tcp);
@@ -2813,6 +2818,178 @@ pub(crate) fn rustls_server_wrap_existing_socket(
         },
     );
     Ok(id)
+}
+
+/// Drive a rustls CLIENT handshake over an already-connected `TcpStream` —
+/// the client-mode counterpart of `rustls_server_handshake_over_stream` for
+/// the same deferred `SSLSocketFactory.createSocket(Socket, String, int,
+/// boolean)` design (real JDK default mode; also the shape used for a
+/// layered TLS upgrade over an existing plain socket, e.g. after an HTTP
+/// CONNECT tunnel). Mirrors `rustls_client_connect` minus the `TcpStream::connect`
+/// step — `tcp` is already connected to `host:port` (or tunneled to it).
+pub(crate) fn rustls_client_handshake_over_stream(
+    tcp: TcpStream,
+    config: Arc<ClientConfig>,
+    host: &str,
+) -> Result<i32, String> {
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid server name {:?}: {}", host, e))?;
+    let conn = ClientConnection::new(config, server_name)
+        .map_err(|e| format!("ClientConnection::new failed: {}", e))?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    while stream.conn.is_handshaking() {
+        if stream.conn.wants_write() {
+            stream
+                .conn
+                .write_tls(&mut stream.sock)
+                .map_err(|e| format!("handshake write: {}", e))?;
+        }
+        if stream.conn.wants_read() {
+            let n = stream
+                .conn
+                .read_tls(&mut stream.sock)
+                .map_err(|e| format!("handshake read: {}", e))?;
+            if n == 0 {
+                return Err(
+                    "connection closed by peer during handshake (likely a rejected \
+                     handshake, e.g. no cipher suite in common)"
+                        .to_string(),
+                );
+            }
+            stream
+                .conn
+                .process_new_packets()
+                .map_err(|e| format!("handshake process: {}", e))?;
+        }
+    }
+    let negotiated_protocol = match stream.conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+        _ => "TLS",
+    }
+    .to_string();
+    let negotiated_cipher = stream
+        .conn
+        .negotiated_cipher_suite()
+        .map(|cs| format!("{:?}", cs.suite()))
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+    let negotiated_alpn = stream
+        .conn
+        .alpn_protocol()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+    let entry = TlsClientStreamEntry {
+        stream,
+        peer_host: host.to_string(),
+        peer_port: 0,
+        negotiated_protocol,
+        negotiated_cipher,
+        negotiated_alpn,
+    };
+    let mut reg = sreg().lock();
+    let id = alloc_server_id(&mut reg);
+    reg.client_streams.insert(id, entry);
+    Ok(id)
+}
+
+// -----------------------------------------------------------------------------
+// Deferred handshake for SSLSocketFactory.createSocket(Socket, String, int,
+// boolean) — see phases_late.rs's registration of that method.
+// -----------------------------------------------------------------------------
+//
+// Real JDK contract: the returned socket defaults to CLIENT mode; a caller
+// may still call `setUseClientMode(false)` before `startHandshake()` (or the
+// first I/O call, which implicitly starts the handshake) to flip it to
+// SERVER mode — exactly what MockWebServer's HTTPS listener does. The
+// handshake therefore cannot run inside `createSocket()` itself (its role
+// isn't known yet); everything needed to run it later is resolved and
+// stashed here instead. Resolving the client `ClientConfig`/server identity
+// PEM strings eagerly (rather than holding the originating `SSLContext`
+// `ObjectRef`) keeps this table GC-safe: no Java object reference is held
+// across the return-to-Java-and-back window between `createSocket()` and
+// whenever the handshake actually starts.
+struct PendingLayeredSocket {
+    tcp: TcpStream,
+    client_config: Arc<ClientConfig>,
+    server_identity: Option<(String, String)>,
+    host: String,
+    client_mode: bool,
+}
+
+fn pending_layered_sockets() -> &'static Mutex<HashMap<i32, PendingLayeredSocket>> {
+    static T: OnceLock<Mutex<HashMap<i32, PendingLayeredSocket>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract `wrapped`'s TCP stream and resolve both a client and a server
+/// handshake config from `ssl_context` up front, then stash all of it
+/// (defaulting to CLIENT mode, the real JDK default) under a fresh pending
+/// id. Returns the RAW pending id — the caller (phases_late.rs) applies
+/// `servlet::PENDING_LAYERED_SOCK_ID_BASE` the same way other id ranges here
+/// are offset by their callers.
+pub(crate) fn stash_pending_layered_socket(
+    ctx: &mut dyn NativeContext,
+    wrapped: ObjectRef,
+    ssl_context: ObjectRef,
+    host: String,
+) -> Result<i32, String> {
+    let tcp = crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped)?;
+    // Client config: reuses the same per-SSLContext resolution HttpsURLConnection's
+    // instance-scoped factory uses (roots/TrustManager/KeyManager/`use_java_trust_manager`
+    // all included), so a caller that later confirms client mode gets identical
+    // trust behavior to every other client entry point.
+    let client_config = client_config_for_ssl_context(ctx, ssl_context)
+        .or_else(|_| build_client_config(root_store_for_trust_roots(None), &["http/1.1"], None))?;
+    // Server identity: same resolution `rustls_server_handshake_over_stream`'s
+    // former caller used (this SSLContext's own identity, else the
+    // process-wide runtime-configured one) — resolved here too so SERVER mode
+    // never needs to touch `ssl_context` again.
+    let server_identity = ctx_identity(ctx, ssl_context)
+        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)));
+    let mut pending = pending_layered_sockets().lock();
+    let mut id = 1i32;
+    while pending.contains_key(&id) {
+        id = id.checked_add(1).unwrap_or(1);
+    }
+    pending.insert(
+        id,
+        PendingLayeredSocket {
+            tcp,
+            client_config,
+            server_identity,
+            host,
+            client_mode: true,
+        },
+    );
+    Ok(id)
+}
+
+/// `setUseClientMode(false)` on a still-pending layered socket. A no-op if
+/// `pending_id` is unknown (already handshaked, or was never a pending
+/// layered socket) — matches this codebase's existing convention of ignoring
+/// a client-mode change once a handshake is underway/complete.
+pub(crate) fn set_pending_layered_socket_client_mode(pending_id: i32, client_mode: bool) {
+    if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
+        p.client_mode = client_mode;
+    }
+}
+
+/// Consume a pending layered socket and drive its handshake in whichever
+/// role `setUseClientMode` last left it in (default client). Returns the RAW
+/// rustls stream id — the caller applies `RUSTLS_SOCK_ID_BASE`, matching
+/// every other rustls stream id in this module.
+pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, String> {
+    let pending = pending_layered_sockets()
+        .lock()
+        .remove(&pending_id)
+        .ok_or_else(|| "layered socket handshake state missing".to_string())?;
+    if pending.client_mode {
+        rustls_client_handshake_over_stream(pending.tcp, pending.client_config, &pending.host)
+    } else {
+        let (cert_pem, key_pem) = pending
+            .server_identity
+            .ok_or_else(|| "No TLS key/cert configured for layered SSLSocket".to_string())?;
+        rustls_server_handshake_over_stream(pending.tcp, &cert_pem, &key_pem)
+    }
 }
 
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
