@@ -43755,6 +43755,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {
@@ -44020,6 +44026,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
             "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
             "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+            // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+            "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
         ];
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
         for (i, &s) in suites.iter().enumerate() {
@@ -45184,6 +45196,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, suites.len());
             for (i, &s) in suites.iter().enumerate() {

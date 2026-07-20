@@ -8538,6 +8538,7 @@ pub mod servlet;
 pub mod http2;
 pub mod jmx_openmbean;
 pub mod t27_tls;
+pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
