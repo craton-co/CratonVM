@@ -35659,6 +35659,46 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
+        // JVMTI redefine guard — the VtableManager entry's `resolved_method`
+        // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
+        // staleness tracking of its own (unlike `CachedInvokeTarget`, which
+        // carries a `RedefineGate` checked on every hit). A class's OWN
+        // vtable is refreshed when IT is redefined (`redefine_class` calls
+        // `vtable_install_adapter` for that class), but a SUBCLASS's vtable
+        // — which copies/inherits the slot from its declaring ancestor at
+        // the time the subclass's own vtable was built, typically at
+        // ordinary class-load time, long before any agent runs — is never
+        // transitively refreshed. So once a receiver's vtable has cached an
+        // inherited slot, a LATER redefinition of the DECLARING ancestor
+        // (e.g. Mockito's inline mock maker weaving advice into a spied
+        // class's whole hierarchy) leaves this entry pointing at the
+        // pre-redefinition bytecode forever — permanently and silently
+        // bypassing the woven advice for any call site that reaches this
+        // fast path before ever going through `execute_invokevirtual_cached`
+        // / `populate_virtual_invoke_cache` (whose `RedefineGate` entries
+        // stay sound). Observed as: `given(spy.get(k)).willReturn(...)`
+        // stubs are silently ignored — `MockMethodAdvice.handle()` is never
+        // even entered — for any call to `spy.get(k)` reached via a call
+        // site whose declared receiver type is an INTERFACE the concrete
+        // spied class doesn't directly implement (so its own invokevirtual
+        // call sites warm the sound tier-1 cache first, but an unrelated
+        // 3rd-party class's invokeinterface call site never does before
+        // hitting this stale entry). See
+        // docs/known-issues/springboot/mockito-inline-nested-selfcall-stub-bypass.md.
+        //
+        // Fix: same guard already used for the native-shadow decision a few
+        // lines above (`receiver_redefined`) — if the entry's OWN declaring
+        // class has ever been redefined, this snapshot cannot be trusted;
+        // cede to the slow, redefine-aware path instead of trusting it.
+        if crate::classloading::any_class_redefined()
+            && shared
+                .class_manager
+                .read()
+                .class_redefine_generation(cached.declaring_class_id)
+                > 0
+        {
+            return Ok(CachedCallResult::CacheMiss);
+        }
         let is_native = entry.is_native;
         // Lock-order fix: drop the `vtable_manager` read guard BEFORE
         // taking `class_manager` below. `vtable_install_adapter` (called
