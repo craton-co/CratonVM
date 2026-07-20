@@ -12864,6 +12864,11 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok() && this_name.contains("ApplicationContextInitializer") {
+        eprintln!(
+            "[LAMBDA-GENERIC] getGenericInterfaces ENTRY this_name={this_name} class_id={class_id:?}"
+        );
+    }
     // If class has a Signature attribute, parse it for generic interfaces
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
@@ -12906,6 +12911,14 @@ pub(crate) fn native_class_get_generic_interfaces(
                 }
                 arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(class_mirror_pin);
+                if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+                    && this_name.contains("ApplicationContextInitializer")
+                {
+                    eprintln!(
+                        "[LAMBDA-GENERIC] getGenericInterfaces(this_name={this_name}) via class_sig.interfaces = {:?}",
+                        class_sig.interfaces
+                    );
+                }
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -12925,6 +12938,40 @@ pub(crate) fn native_class_get_generic_interfaces(
     // then never proxies the lambda bean at all).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
         if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+            // Prefer a real `ParameterizedType` (e.g. `ApplicationContextInitializer<
+            // ConfigurableApplicationContext>`) when the functional interface is
+            // itself generic — reflection-based generic-argument resolvers
+            // require one and throw on a bare raw `Class`. Falls back to the
+            // long-standing raw-mirror behavior for non-generic SAM interfaces
+            // or whenever the type variable(s) can't be matched.
+            let dbg_lg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok();
+            if let Some((sam_name, sam_desc, inst_desc)) =
+                ctx.lambda_call_site_descriptors(class_id)
+            {
+                let sig = crate::generics::lambda_functional_interface_generic_type(
+                    ctx, iface_id, &iface_name, &sam_name, &sam_desc, &inst_desc,
+                );
+                if dbg_lg {
+                    eprintln!(
+                        "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} sam_name={sam_name} sam_desc={sam_desc} inst_desc={inst_desc} sig={sig:?}"
+                    );
+                }
+                if let Some(sig) = sig {
+                    let val = crate::generics::typesig_to_real_type(ctx, &sig);
+                    if dbg_lg {
+                        eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
+                    }
+                    if let Value::Object(Some(pt)) = val {
+                        let arr = ctx.new_ref_array(ClassId::new(0), 1);
+                        ctx.set_array_element(arr, 0, Value::Object(Some(pt)));
+                        return Ok(Some(Value::Object(Some(arr))));
+                    }
+                }
+            } else if dbg_lg {
+                eprintln!(
+                    "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} lambda_call_site_descriptors=None"
+                );
+            }
             let mirror = ctx.get_class_mirror(iface_id);
             let elem = ctx
                 .class_id_by_name("java/lang/Class")
