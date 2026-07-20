@@ -30,6 +30,7 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `bug06-fam5-…` | ✅ **CLOSED 2026-07-02** — moved to `docs/internal/fixed-suite-bugs/repros/bug06-fam5-reflection-null/Refl5.java` | failcause extinct: 0 × `getDeclaredMethod on null` across the clean 2026-06-30/07-01 full re-runs and a fresh 196-class nojit+jit sweep on dev `ffb247e5`; probe stays ==HotSpot. |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
 | `g1-parallel-evac-persistent-forwarding-root-remap` | `g1-parallel-steady-churn/SteadyChurn.java` | archived 2026-07-04 at `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`; the tracked recreation and `run-g1-parallel-steady-churn.ps1` are retained as regression assets. |
+| `jetty-webserver-factory-poststartup-timeout-…` (TLD/JAR-scan residual) | `xerces-sax-manysmallfiles-slowdown/SaxManySmallFiles.java` + `SaxEncodingCompare.java` | Reused-`SAXParser` repeated small-doc parse — no file/jar/classpath I/O. HotSpot ~40-100us/parse; CratonVM ~8-13ms/parse (100-200x). `SaxEncodingCompare` refutes the `UTF8Reader`-decoder hypothesis (ASCII was not faster). Seconds per iteration instead of the full suite's 10+ minute rebuild-and-rerun cycle. |
 
 ## GC-root-race / Family-A probe (needs `GC_STRESS` or load)
 
