@@ -178,6 +178,7 @@ const SK_ATTACHMENT: usize = 4;
 enum SelectableHandle {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
     /// Registered without a live handle — `kernel_select` skips it; useful
     /// for lifecycle tests that want a key in the map without a real socket.
     Dummy,
@@ -189,6 +190,7 @@ enum SelectableHandle {
 pub enum SelectableKind {
     Listener(TcpListener),
     Stream(TcpStream),
+    Udp(UdpSocket),
 }
 
 impl SelectableHandle {
@@ -200,6 +202,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_fd() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_fd() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_fd() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -210,6 +213,7 @@ impl SelectableHandle {
         match self {
             SelectableHandle::Listener(l) => Some(l.as_raw_socket() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_socket() as i64),
+            SelectableHandle::Udp(s) => Some(s.as_raw_socket() as i64),
             SelectableHandle::Dummy => None,
         }
     }
@@ -609,6 +613,10 @@ pub fn selector_register(
         Some(SelectableKind::Stream(s)) => {
             let _ = s.set_nonblocking(true);
             SelectableHandle::Stream(s)
+        }
+        Some(SelectableKind::Udp(s)) => {
+            let _ = s.set_nonblocking(true);
+            SelectableHandle::Udp(s)
         }
         None => SelectableHandle::Dummy,
     };
@@ -1568,6 +1576,20 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                 ready |= OP_WRITE;
             }
         }
+        SelectableHandle::Udp(socket) => {
+            if interest & OP_READ != 0 {
+                let mut buf = [0u8; 1];
+                match socket.peek(&mut buf) {
+                    Ok(n) if n > 0 => ready |= OP_READ,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => {}
+                }
+            }
+            if interest & OP_WRITE != 0 {
+                ready |= OP_WRITE;
+            }
+        }
         SelectableHandle::Dummy => {}
     }
     (ready, accepted)
@@ -1847,6 +1869,7 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
     // The channel's registry id lives in the socket_channel side-table now
     // (its F_REG_ID object slot collides with a real-JDK reference field).
     crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
@@ -2415,7 +2438,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // (its F_REG_ID object slot collides with a real-JDK reference field and
     // would coerce to null). A negative fd means the channel is not bound /
     // connected; selector_register still records the key (interest only).
-    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel).unwrap_or(-1);
+    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+        .unwrap_or(-1);
 
     // If the registered channel is backed by an entry in the WP3.4
     // tcp_registry, hand the selector a clone of the live socket so
@@ -2427,7 +2452,7 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Some(SelectableKind::Listener(l))
         }
         Some(crate::socket_channel::TcpHandleClone::Stream(s)) => Some(SelectableKind::Stream(s)),
-        None => None,
+        None => crate::datagram_channel_udp_clone(ctx, channel).map(SelectableKind::Udp),
     };
 
     let key_obj = ctx
@@ -2498,7 +2523,9 @@ fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     // The channel's net fd (tcp_registry id) is the per-selector key into the
     // registration map — exactly what `channel_register_native` stored under.
-    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel) else {
+    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel)
+        .or_else(|| crate::datagram_channel_fd(ctx, channel))
+    else {
         // Not bound / connected → no live registration to find.
         return Ok(Some(Value::Object(None)));
     };
@@ -3426,6 +3453,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "sun/nio/ch/SocketChannelImpl",
         "java/nio/channels/ServerSocketChannel",
         "sun/nio/ch/ServerSocketChannelImpl",
+        "java/nio/channels/DatagramChannel",
+        "sun/nio/ch/DatagramChannelImpl",
     ] {
         r.register(
             c,

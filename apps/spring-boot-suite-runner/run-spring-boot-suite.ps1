@@ -582,6 +582,27 @@ function Get-EffectiveClassTimeoutSec {
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.servlet.MvcEndpointRequestIntegrationTests' = 700
     'module/spring-boot-security|org.springframework.boot.security.autoconfigure.actuate.web.reactive.EndpointRequestIntegrationTests' = 1000
     'module/spring-boot-micrometer-tracing-opentelemetry|org.springframework.boot.micrometer.tracing.opentelemetry.autoconfigure.OpenTelemetryTracingAutoConfigurationTests' = 1400
+    # WEBMVC.1 (2026-07-18): these are not deadlocks. An explicit 180-second
+    # Craton watchdog captured WebMvcAutoConfigurationTests actively executing
+    # Spring context creation/property binding on CPU; its 93 methods create
+    # many independent contexts. BasicErrorControllerIntegrationTests likewise
+    # repeatedly boots and tears down embedded Tomcat. Keep enough room for the
+    # actual JUnit result instead of reporting a false 300-second HANG.
+    'module/spring-boot-webmvc|org.springframework.boot.webmvc.autoconfigure.WebMvcAutoConfigurationTests' = 7200
+    'module/spring-boot-webmvc|org.springframework.boot.webmvc.autoconfigure.error.BasicErrorControllerIntegrationTests' = 1800
+    # SPRING-TESTCOMPILER.1 (2026-07-18): these processor tests repeatedly
+    # compile fixture sources in-process through the real JDK javac. They are
+    # CPU-bound and silent until JUnit has completed all fixture compilations;
+    # a 300-second shard limit therefore reports a false HANG. The representative
+    # 65-test annotation-processor class completed in 629.68s with JIT and
+    # 680.00s with --nojit. Keep enough headroom to report its actual result.
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.ConfigurationMetadataAnnotationProcessorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.ConstructorParameterPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.EndpointMetadataGenerationTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.JavaBeanPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.LombokPropertyDescriptorTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.MergeMetadataGenerationTests' = 1200
+    'configuration-metadata/spring-boot-configuration-processor|org.springframework.boot.configurationprocessor.PropertyDescriptorResolverTests' = 1200
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {

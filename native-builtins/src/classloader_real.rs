@@ -335,7 +335,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// keeping `this` only in a native local across `init_classloader_common_fields`
 /// could make the following `ucp` initialization write through a forwarded
 /// reference, leaving the live loader with its default null field.
-fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+pub(crate) fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
     let this_pin = ctx.pin_native_root(this);
     let urls_pin = match urls {
         Value::Object(Some(urls)) => Some((ctx.pin_native_root(urls), urls)),
@@ -355,6 +355,28 @@ fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef,
     if let Some((pin, _)) = urls_pin {
         ctx.unpin_native_roots(pin);
     }
+    ctx.unpin_native_roots(this_pin);
+}
+
+pub(crate) fn init_urlclassloader_constructor_with_parent(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    urls: Value,
+    parent: Value,
+) {
+    ctx.set_field_by_name(this, "parent", parent);
+    init_urlclassloader_constructor(ctx, this, urls);
+}
+
+pub(crate) fn init_urlclassloader_constructor_with_default_parent(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    urls: Value,
+) {
+    let this_pin = ctx.pin_native_root(this);
+    let parent = get_or_create_system_cl(ctx);
+    let this = ctx.read_native_pin(this_pin, this);
+    init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent));
     ctx.unpin_native_roots(this_pin);
 }
 
@@ -996,6 +1018,26 @@ fn cl_real_load_class_base(
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
 
+    // The platform loader owns JDK modules, never application entries. The
+    // flat class store is shared by every loader in CratonVM, so allowing its
+    // normal fallback here turns platform-parent delegation into accidental
+    // application-parent delegation. That breaks URLClassLoader children that
+    // intentionally replace or exclude application JARs.
+    if crate::classloader::is_platform_class_loader(ctx, this)
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
+
     // Loader isolation for generated dynamic proxies (JVMS §5.3). A
     // `jdk.proxyN.$ProxyM` lives in its defining loader's per-loader dynamic
     // module, so it must resolve ONLY through a loader that can see it (its
@@ -1254,6 +1296,10 @@ pub fn ucl_real_find_class(
     let internal = class_name.replace('.', "/");
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
+    }
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
     }
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
         return Ok(Some(mirror));

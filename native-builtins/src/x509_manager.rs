@@ -3986,6 +3986,20 @@ fn pkix_engine_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
+    // The provider-SPI route is selected by real-JDK SunJSSE. Mirror the
+    // public KeyManagerFactory.init shim so a JKS key whose password differs
+    // from its store password is materialized before SSLContext initialization.
+    if let Some(Value::Object(Some(ks))) = args.get(1) {
+        let key_password = args
+            .get(2)
+            .map(|value| crate::keystore::read_password(ctx, value))
+            .unwrap_or_default();
+        crate::keystore::keystore_set_pending_km_identity_with_password(
+            ctx,
+            *ks,
+            &key_password,
+        );
+    }
     let ks_id = match args.get(1) {
         Some(Value::Object(Some(ks))) => read_keystore_id(ctx, *ks),
         _ => 0,

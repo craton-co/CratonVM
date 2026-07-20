@@ -2994,6 +2994,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            local_slot_ops: vec![],
             has_newarray: false,
             ldc_ops: vec![],
         };
@@ -3017,6 +3018,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            local_slot_ops: vec![],
             has_newarray: false,
             ldc_ops: vec![],
         };
@@ -3040,6 +3042,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            local_slot_ops: vec![],
             has_newarray: false,
             ldc_ops: vec![],
         };
@@ -3068,6 +3071,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![],
             has_athrow: false,
+            local_slot_ops: vec![],
             has_newarray: false,
             ldc_ops: vec![],
         };
@@ -3097,6 +3101,7 @@ mod tests {
             ldc2w_ops: vec![],
             indy_ops: vec![(0, 1)],
             has_athrow: false,
+            local_slot_ops: vec![],
             has_newarray: false,
             ldc_ops: vec![],
         };

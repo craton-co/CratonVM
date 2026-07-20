@@ -104,6 +104,10 @@ pub enum SkipReason {
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
     BigIntegerArithmetic,
+    /// Javac's `JavacTool.getTask` loses the compiler file-manager context
+    /// after tiered compilation. Keep this cold compiler setup method
+    /// interpreted until its JIT lowering is understood.
+    JavacToolContext,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -347,6 +351,20 @@ fn should_skip_jit_internal(
         return Some(SkipReason::JavaUtilCollection);
     }
 
+    // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
+    // in-process javac invocation per fixture. Once the real JDK's
+    // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
+    // fileManager)` state does not survive into `ClassReader`: JDK 25 then
+    // aborts compilation with `AssertionError: FileManager initialization
+    // error`. The identical 65-test class passes under --nojit and under JIT
+    // when this method alone is excluded. This setup path is cold relative to
+    // application execution; keep it interpreted until the JIT producer is
+    // root-caused. The guard is deliberately unconditional: allowing a broad
+    // javac package experiment must not re-enable this known corrupting method.
+    if class_name == "com/sun/tools/javac/api/JavacTool" && method_name == "getTask" {
+        return Some(SkipReason::JavacToolContext);
+    }
+
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
     // comma-separated list of `Class.method` entries (slash-separated
     // class names, e.g. `java/util/Locale.hashCode`). Any listed method
@@ -519,7 +537,6 @@ fn should_skip_jit_internal(
     {
         return Some(SkipReason::RustJvmTestFixture);
     }
-
 
     // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
     // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
@@ -1015,36 +1032,48 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // LUCENE-POSTINGS.1 (2026-07-05) — fail-closed JIT bans for the Lucene
-        // postings validation path used by Elasticsearch's ES812 postings-format
-        // focused repro (`B17AC9D3E1F2A0C4`,
-        // `testDocsAndFreqsAndPositionsAndPayloads`). With normal JIT the worker
-        // threads throw AIOOBE with byte-swapped-looking postings indices and can
-        // later SIGSEGV from poisoned state. The same binary with
-        // `CRATONVM_DISABLE_JIT=1` passes the method in ~64s; focused
-        // MMapDirectory scalar/bulk/random-access probes match HotSpot, so this
-        // is a JIT execution bug above the FFM read primitives.
+        // LUCENE-POSTINGS.1 (2026-07-05; re-investigated and RE-CONFIRMED NEEDED
+        // 2026-07-19) — fail-closed JIT ban on ALL of `org/apache/lucene/*`, put
+        // in place after the Lucene postings validation path used by
+        // Elasticsearch's ES812 postings-format focused repro
+        // (`B17AC9D3E1F2A0C4`, `testDocsAndFreqsAndPositionsAndPayloads`) threw
+        // AIOOBE with byte-swapped-looking postings indices under normal JIT,
+        // later SIGSEGVing from poisoned state (`CRATONVM_DISABLE_JIT=1` passed
+        // the method in ~64s). Bisection at the time narrowed it to somewhere in
+        // `org/apache/lucene/index/`, dominated by `SlowImpactsEnum.nextDoc/freq`
+        // and a corrupted `PForUtil` receiver, but the exact producer was never
+        // found — so the whole package is kept interpreted for correctness
+        // rather than shipping a guess.
         //
-        // Bisection evidence:
-        // - `CRATONVM_JIT_BISECT_ONLY=org/apache/lucene/codecs/` passes in
-        //   isolation, but with Lucene index and ES postings packages skipped
-        //   the remaining compiled hot path is still codecs-side
-        //   `Impact.toString`, so keep codecs interpreted as part of this
-        //   fail-closed postings cluster.
-        // - `CRATONVM_JIT_BISECT_ONLY=org/apache/lucene/index/` reproduces the
-        //   crash, dominated by `SlowImpactsEnum.nextDoc/freq`.
-        // - Skipping only `SlowImpactsEnum.nextDoc/freq` exposes corrupted
-        //   receiver state (`PForUtil` where a postings enum receiver is
-        //   expected), so the producer is broader than those leaf methods.
+        // 2026-07-19 re-investigation (while profiling why `testSlicesDense` is
+        // slow, see
+        // `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`):
+        // briefly lifted this ban. The ORIGINAL AIOOBE/SIGSEGV repro no longer
+        // reproduced — 0 corruption across the original single-method repro (2
+        // runs), the full 32-test `ES812PostingsFormatTests` class with random
+        // seeds (23/25 clean, 2 = the suite's own timeout on the heaviest fuzz
+        // method, not a crash), and `testSlicesSparseWithFilter`/`testSlicesDense`
+        // — plausibly fixed as a side effect of the unrelated 2026-07-13 postings
+        // fix (Unsafe/ByteBuffer layout corrections, same test class). The
+        // ORIGINAL correctness justification for this ban is therefore probably
+        // gone.
         //
-        // Later JIT-entry summaries with index/codecs/postings already skipped
-        // showed remaining compiled Lucene store/util/backward-codecs methods
-        // (`IndexInput.toString`, `BytesRef.compareTo`, `DataInput.readVInt`,
-        // block-tree frame helpers) before the same postings corruption. The
-        // exact producer is still unresolved, so keep all Lucene bytecode
-        // interpreted for correctness. This is broad but bounded to Lucene and
-        // the focused repro still completes comfortably under the 300s suite
-        // timeout. Liftable via `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        // Despite that, the ban stays banned: while re-verifying, hit a
+        // DIFFERENT, unrelated `EXCEPTION_STACK_OVERFLOW` crash in
+        // `cratonvm_gc::gen_heap::GenerationalHeap::get_field`/`read_slot`
+        // (see `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`)
+        // — confirmed via a byte-for-byte clean `origin/dev` build that this is
+        // a genuine, pre-existing `dev` regression with NO relation to this ban
+        // or to JIT-compiling Lucene at all (it reproduces with the ban fully in
+        // place too). So lifting this ban is not what's unsafe — but since doing
+        // so also produced zero measured benefit (didn't speed up
+        // `testSlicesDense`), there is no upside to justify carrying it while
+        // that separate, more serious bug is still open. Once
+        // `ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md` is resolved,
+        // this ban can be reconsidered purely on its own merits — re-verify
+        // against the ORIGINAL AIOOBE repro (this comment's first paragraph)
+        // before lifting it again. Liftable for investigation via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
         if class_name.starts_with("org/apache/lucene/")
             && !package_allowed("org/apache/lucene/", allow_packages)
         {
@@ -4408,5 +4437,22 @@ mod tests {
             ),
             Some(SkipReason::RustJvmTestFixture)
         );
+    }
+
+    #[test]
+    fn javac_tool_get_task_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/api/JavacTool",
+                    "getTask",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::JavacToolContext),
+                "JavacTool.getTask must remain excluded under every policy",
+            );
+        }
     }
 }

@@ -2,6 +2,25 @@
 
 **Status: OPEN — found 2026-07-17, hypothesis only (root cause not pinned to source)**
 
+**Update 2026-07-19:** the classpath URL enumeration fix in
+[`spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md`](../../internal/springboot/spring-boot-loader-classpath-url-enumeration-empty-cluster-FIXED.md)
+(better `URL`/classpath resolution generally — see its `extract_url_path`
+and `ucl_try_define_local_class` changes) fixed 8 of the 11 tests originally
+listed below as a side effect: `testUserSpecifiedJarPath`,
+`testUserSpecifiedWildcardPath`, `testUserSpecifiedRootOfJarPathWithDot`,
+`testUserSpecifiedDirectoryContainingJarFileWithNestedArchives`,
+`testUserSpecifiedJarPathWithDot`, `testUserSpecifiedJarFileWithNestedArchives`,
+`testUserSpecifiedRootOfJarPath`, `testUserSpecifiedRootOfJarPathWithDotAndJarPrefix`.
+Re-measured full-class run (`SbRunner` against a fresh build, 2026-07-19):
+28/32 tests pass, 4 fail — 3 from the original 11
+(`testUserSpecifiedNestedJarPath`, `testUserSpecifiedClassLoader`,
+`classPathWithoutLoaderPathDefaultsToJarLauncherIncludes`) plus one further
+failure, `testUserSpecifiedClassPathOrder`, not present in the original
+2026-07-17 catalogue below (current `apps/spring-boot` checkout is Spring
+Boot 4.1.0-SNAPSHOT and its fixture set moves; not yet reconciled against
+the original 11 by name). Root-cause hypothesis below is otherwise
+unchanged — not re-investigated this pass.
+
 ## Symptom
 
 11 of `PropertiesLauncherTests`' 14 failures share one signature: the test

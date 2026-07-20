@@ -1147,6 +1147,33 @@ fn seed_sunjce_pbe_services() {
         "HmacSHA256",
         "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
     );
+    // `AlgorithmParameters.getInstance("PBES2")` — the GENERIC PBES2 entry
+    // (verified via `javap -c com.sun.crypto.provider.SunJCE` on JDK 25.0.1:
+    // `ps("AlgorithmParameters", "PBES2", "com.sun.crypto.provider.
+    // PBES2Parameters$General")`), distinct from the per-hash/keysize
+    // `PBEWithHmac*AndAES_*` entries below. `sun.security.x509.AlgorithmId`
+    // decodes an encrypted PKCS#8 key's outer `AlgorithmIdentifier` params by
+    // calling `AlgorithmParameters.getInstance(<name resolved from the OID>)`
+    // — and the PBES2 OID (1.2.840.113549.1.5.13) resolves to the literal
+    // name `"PBES2"`, NOT to the specific PRF+cipher combination (that's only
+    // known once `$General.engineInit` parses the params' own inner ASN.1).
+    // Without this entry, `AlgorithmId.decodeParams()` silently swallows the
+    // NoSuchAlgorithmException and leaves `algParams` null; Spring Boot's
+    // `PemPrivateKeyParser.Pkcs8PrivateKeyDecryptor.getEncryptionAlgorithm`
+    // then falls back to the literal algorithm name `"PBES2"` instead of
+    // `algParameters.toString()` (which would have produced the correct
+    // `"PBEWithHmacSHA256AndAES_256"`-shaped name), so
+    // `SecretKeyFactory.getInstance("PBES2")` throws `"PBES2 SecretKeyFactory
+    // not available"` for EVERY encrypted PEM private key regardless of its
+    // actual PRF/cipher. `PBES2Parameters$General` has the same public no-arg
+    // ctor + pure-ASN.1 (no native methods) shape as the specific nested
+    // classes below.
+    put_service(
+        P,
+        "AlgorithmParameters",
+        "PBES2",
+        "com.sun.crypto.provider.PBES2Parameters$General",
+    );
     const HASHES: &[&str] = &[
         "SHA1",
         "SHA224",
@@ -2573,8 +2600,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // practice: every other engine (`MessageDigest`/RSA/AES/…) keeps its
     // always-on synthetic native, so only real EC/DSA bytecode ever falls
     // through to here.
-    let ec_real =
-        crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real();
+    let ec_real = crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real();
     if ec_real {
         // Mirror SunEC's EC service table into our map so the no-provider
         // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.

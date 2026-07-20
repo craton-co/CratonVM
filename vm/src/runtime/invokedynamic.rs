@@ -694,7 +694,9 @@ fn bootstrap_generic(
     if dbg {
         eprintln!(
             "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{} bsm_args_len={}",
-            info.target_name, info.target_descriptor, bsm_args.len()
+            info.target_name,
+            info.target_descriptor,
+            bsm_args.len()
         );
     }
     let callsite_val = crate::vm::invoke_shared(
@@ -780,13 +782,40 @@ fn bootstrap_generic(
     // --- Invoke the target: MethodHandle.invoke(args...). The signature-
     //     polymorphic native reads the real descriptor off the handle and
     //     adapts each spread argument, so we pass the dynamic args directly. ---
-    let target_mh = thread.native_pin_roots[mh_slot];
     for &(i, slot) in &dyn_pins {
         if let Some(o) = thread.native_pin_roots.get(slot).copied() {
             dyn_args[i] = Value::Object(Some(o));
         }
     }
     let mut invoke_args: Vec<Value> = Vec::with_capacity(dyn_args.len() + 1);
+    // Generic Groovy indy targets are ultimately invoked through our Object[]
+    // MethodHandle bridge. Without an explicit conversion here, a call-site
+    // `Z` value is represented as `Value::Int` and that bridge boxes it as an
+    // Integer. Groovy's constructor selector then rejects a real boolean
+    // parameter (LayoutDialect's DecorateProcessor is the concrete witness).
+    // Box boolean slots as Boolean before entering the erased bridge; a typed
+    // handle will unbox it again, while a dynamic Groovy target observes the
+    // correct Boolean runtime class.
+    for (i, ty) in arg_types.iter().enumerate() {
+        if *ty == 'Z' {
+            if let Value::Int(v) = dyn_args[i] {
+                let boxed = crate::vm::invoke_shared(
+                    shared,
+                    thread,
+                    "java/lang/Boolean",
+                    "valueOf",
+                    "(Z)Ljava/lang/Boolean;",
+                    &[Value::Int(v)],
+                )?
+                .unwrap_or(Value::Object(None));
+                if let Value::Object(Some(o)) = boxed {
+                    thread.native_pin_roots.push(o);
+                }
+                dyn_args[i] = boxed;
+            }
+        }
+    }
+    let target_mh = thread.native_pin_roots[mh_slot];
     invoke_args.push(Value::Object(Some(target_mh)));
     invoke_args.extend_from_slice(&dyn_args);
     if dbg {
@@ -801,7 +830,12 @@ fn bootstrap_generic(
         thread,
         "java/lang/invoke/MethodHandle",
         "invoke",
-        "([Ljava/lang/Object;)Ljava/lang/Object;",
+        // MethodHandle.invoke is signature-polymorphic. Preserve the actual
+        // invokedynamic descriptor so primitive call-site arguments (notably
+        // Groovy's trailing `Z, Z` constructor flags) are adapted as their
+        // declared primitive types instead of being erased and boxed as
+        // Integer through an artificial Object[] signature.
+        &info.target_descriptor,
         &invoke_args,
     )?;
     thread.native_pin_roots.truncate(pin_base);
@@ -1601,6 +1635,46 @@ fn value_to_string(
             if let Some(t) = thread {
                 let mut ctx = NativeContextImpl { shared, thread: t };
                 use cratonvm_native_api::NativeContext;
+
+                // `java.nio.file.Path` is a genuine interface with no `toString()`
+                // body of its own; `ctx.invoke_virtual` below doesn't consult
+                // `force_native_over_real_jdk_bytecode`/the `vm_exec.rs`
+                // `check_override` allow-list the way the bytecode interpreter's
+                // own `invokevirtual` handling does, so it silently resolves to
+                // `Object.toString()` here too (`java.nio.file.Path@<hash>`) for
+                // `"literal" + aPath` string concatenation. Same family as
+                // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+                // a third, distinct call site. Route through the same
+                // display-string helper the registered `Path.toString()` native
+                // itself uses, bypassing `invoke_virtual` entirely for this type.
+                //
+                // NOTE: must use the ClassId-based `is_subclass_of` (which walks
+                // both the superclass chain AND implemented interfaces), not
+                // `ClassManager::is_subclass_of_by_name` — that one is the
+                // exception-`catch_type` fallback and deliberately walks ONLY
+                // the superclass chain (interfaces are never a `catch_type`),
+                // so it can never match an interface like `Path` and this
+                // branch would silently never fire. (A concurrent dev commit
+                // added this same check using `is_subclass_of_by_name` — that
+                // version never actually fires; confirmed via a standalone
+                // `"file:" + Paths.get(...)` repro that still printed
+                // `file:java.nio.file.Path@<hash>` until switched to
+                // `is_subclass_of`.)
+                let obj_class_id = shared.heap.class_id_of(*obj_ref);
+                let is_path = ctx
+                    .class_id_by_name("java/nio/file/Path")
+                    .is_some_and(|path_cid| {
+                        shared
+                            .class_manager
+                            .read()
+                            .is_subclass_of(obj_class_id, path_cid)
+                    });
+                if is_path {
+                    return cratonvm_native_builtins::phases_late::p57_path_display_string(
+                        &mut ctx, *obj_ref,
+                    );
+                }
+
                 match ctx.invoke_virtual(*obj_ref, "toString", "()Ljava/lang/String;", &[]) {
                     Ok(Some(Value::Object(Some(str_ref)))) => {
                         return ctx

@@ -3646,6 +3646,13 @@ pub struct JitMICSlot {
 }
 
 impl JitMICSlot {
+    /// Temporary class-id value used while publishing a new cache entry.
+    ///
+    /// The generated code compares the receiver id before loading the target;
+    /// keeping the guard non-matching until *all* companion fields are ready
+    /// makes the publication atomic from its point of view. Class ids are
+    /// allocated densely from zero and never use this all-ones reservation.
+    const INSTALLING_CLASS_ID: u32 = u32::MAX;
     /// Byte offset of [`Self::cached_class_id`] from the start of the
     /// struct. JIT codegen uses this to emit
     /// `MOV eax, [mic_ptr + CACHED_CLASS_ID_OFFSET]`.
@@ -3679,31 +3686,73 @@ impl JitMICSlot {
 
     /// Update all cached fields after a cache miss.
     pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
-        // cceres2: on a RETARGET (cached class X -> new class Y) a reader that
-        // already matched the old class_id can pair the NEW entry_ptr with the
-        // OLD needs_context (or call a different method's entry under the old
-        // guard). Invalidate the guard first so in-flight readers miss to the
-        // helper instead. This narrows (does not fully close — a reader past
-        // its guard load can still tear; the marshalling choke points now
-        // re-derive the ABI flag from the entry's own CompiledMethod) the
-        // window; first-install (0 -> X) keeps the BUG-24 publish order below.
-        let prev = self
-            .cached_class_id
-            .load(std::sync::atomic::Ordering::Acquire);
-        if prev != 0 && prev != class_id {
-            self.cached_class_id
-                .store(0, std::sync::atomic::Ordering::Release);
+        use std::sync::atomic::Ordering;
+
+        // A raw inline MIC has no helper boundary between its guard load and
+        // indirect CALL. Retargeting a populated slot can therefore pair one
+        // receiver's class guard with another receiver's entry. Make the slot
+        // monomorphic for its lifetime: reserve an empty slot with CAS, publish
+        // its companion fields, then publish the class id last. A different
+        // receiver simply takes the ordinary helper path; this is slower only
+        // for polymorphic sites and cannot redirect native control flow.
+        //
+        // `prepopulate` seeds `cached_class_id` from profiling data with
+        // `cached_entry_ptr` still 0 (a guard hint, not an installed target).
+        // Treat that shape as an empty slot for THIS class id too — otherwise
+        // the very first `update` for the profiled-dominant receiver would
+        // match `id == class_id` and return before ever publishing an entry,
+        // permanently stranding the slot at "unresolved" for its whole
+        // lifetime.
+        loop {
+            let current = self.cached_class_id.load(Ordering::Acquire);
+            if current == class_id {
+                if self.cached_entry_ptr.load(Ordering::Acquire) != 0 {
+                    // Already fully installed for this class: idempotent no-op.
+                    return;
+                }
+                if self
+                    .cached_class_id
+                    .compare_exchange(
+                        class_id,
+                        Self::INSTALLING_CLASS_ID,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+                continue;
+            }
+            match current {
+                0 => {
+                    if self
+                        .cached_class_id
+                        .compare_exchange(
+                            0,
+                            Self::INSTALLING_CLASS_ID,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                Self::INSTALLING_CLASS_ID => std::hint::spin_loop(),
+                _ => return,
+            }
         }
-        // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
-        // (which checks class_id first, then loads entry_ptr) can never observe
-        // the new class id paired with a stale entry_ptr.
+        // Publish entry_ptr BEFORE class_id so the inline cache reader (which
+        // checks class_id first, then loads entry_ptr) never observes a class
+        // id paired with stale target metadata.
         self.cached_entry_ptr
-            .store(entry_ptr, std::sync::atomic::Ordering::Release);
+            .store(entry_ptr, Ordering::Release);
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
-            .store(needs_context, std::sync::atomic::Ordering::Relaxed);
+            .store(needs_context, Ordering::Relaxed);
         self.cached_class_id
-            .store(class_id, std::sync::atomic::Ordering::Release);
+            .store(class_id, Ordering::Release);
     }
 
     /// Drop only the compiled-entry half of the MIC.
@@ -5341,6 +5390,55 @@ pub fn jit_direct_call_requires_dispatch(
     jit_recursive_cycle_methods().read().contains(&key)
 }
 
+/// Enables raw, machine-code JIT-to-JIT direct calls to a compiled callee:
+/// eager callee-compile-and-direct-CALL in this function's caller
+/// (`try_compile_inner`) and the inline virtual MIC fast path (`x64.rs`).
+/// (`vm/src/jit/helpers.rs`'s OWN separate dispatch-helper direct-entry cache
+/// — `jit_invoke_dispatch`/`jit_invoke_virtual_mic`'s cached `entry_ptr` path
+/// — is a different, still-default-OFF gate,
+/// `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY`: it has its own separate,
+/// still-open target-resolution bug on top of the RBP-mirror race below, so
+/// it does not share this flag's default.) This includes calls this JIT's
+/// own self-recursion detection does not resolve to the dedicated
+/// `self_call_patches` fast path (e.g. `BenchSuite.make`/`check`'s tiered
+/// background-compile route) — the flag being off routed those through the
+/// full `jit_invoke_dispatch` helper on every call, a ~15x regression on
+/// bintrees16 (44s vs. 2.9s) that generalizes to any call-heavy recursive
+/// workload, not just the ES repro this flag was introduced for.
+///
+/// A raw JIT-to-JIT CALL updates the per-thread active-RBP mirror to the
+/// callee, while the interpreter-owned root-chain entry still describes the
+/// caller until the callee's own prologue runs — a GC landing in that window
+/// can select the caller's oop map for the callee's frame and lose live
+/// roots. This exact mechanism produced the IVFKnn stress-test
+/// stale-precise-root-mirror corruption (see
+/// docs/known-issues/elasticsearch-suite/
+/// ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md).
+/// Closed by two companion fixes that ship alongside this flag:
+/// [`Compiler::emit_post_call_rbp_republish`] (re-publishes the caller's RBP
+/// after every raw JIT-to-JIT return) and `JitEntryGuard::enter_with_compiled`
+/// always retaining precise frame metadata (`vm/src/jit/conservative_roots.rs`)
+/// so `scan_compiled_frame_bands` can bound each stacked raw-call frame
+/// exactly instead of one imprecise whole-band conservative sweep. Re-enabled
+/// default-ON (re-verified against `testSlicesSparseWithFilter` /
+/// `testRandomWithFilter` / the full `cratonvm-gc`/`cratonvm-jit`/
+/// `cratonvm-vm` --lib suites — see the ES-HANG doc above for results) to
+/// close the general-throughput regression; opt out with
+/// `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` if a new corruption is ever suspected
+/// here again (matches this codebase's established off-switch convention, see
+/// [`x64::guarded_inline_getfield_enabled`]).
+///
+/// NOT OnceLock-cached (mirrors [`x64::guarded_inline_getfield_enabled`]):
+/// this is checked at JIT-compile time, never on the runtime hot path within
+/// this crate, so re-reading the env var has no measurable cost — and caching
+/// would make the flag racy against whichever test/thread compiles first.
+pub fn direct_jit_callee_calls_enabled() -> bool {
+    match std::env::var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 fn clear_jit_recursive_cycle_methods_for_test() {
     jit_recursive_cycle_methods().write().clear();
@@ -5371,6 +5469,81 @@ pub fn try_compile(
     cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
+    cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<JitLdcConstant>>,
+    cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<(i64, bool)>>,
+    profile: Option<&profile::MethodProfile>,
+    helpers: &JitRuntimeHelpers,
+    inline_resolver: Option<&dyn Fn(&str, &str, &str) -> Option<InlineSite>>,
+    string_layout_resolver: Option<&dyn Fn() -> Option<StringFieldLayout>>,
+    cp_invoke_class_id_resolver: Option<&dyn Fn(u16) -> Option<u32>>,
+    cp_elidable_init_resolver: Option<&dyn Fn(u16) -> bool>,
+    optimize: bool,
+    ir_emit_calls: bool,
+    ir_emit_special_calls: bool,
+    ir_emit_long: bool,
+    ir_emit_virtual_calls: bool,
+    ir_emit_fp: bool,
+    cp_invokedynamic_descriptor_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+) -> Option<CompiledMethod> {
+    // Thin compatibility wrapper: the overwhelming majority of callers
+    // (every `jit` crate test, plus any VM call site that hasn't been
+    // updated to supply one) have no need for the JVMS §6.5 `invokespecial`
+    // super-call redirect below — `None` here reproduces this function's
+    // exact pre-existing resolution behavior byte-for-byte.
+    try_compile_with_invokespecial_resolver(
+        cached,
+        cp_class_name_resolver,
+        cp_field_resolver,
+        cp_static_field_resolver,
+        cp_invoke_resolver,
+        None,
+        callee_compiler,
+        cp_new_resolver,
+        cp_ldc_resolver,
+        cp_ldc2w_resolver,
+        profile,
+        helpers,
+        inline_resolver,
+        string_layout_resolver,
+        cp_invoke_class_id_resolver,
+        cp_elidable_init_resolver,
+        optimize,
+        ir_emit_calls,
+        ir_emit_special_calls,
+        ir_emit_long,
+        ir_emit_virtual_calls,
+        ir_emit_fp,
+        cp_invokedynamic_descriptor_resolver,
+    )
+}
+
+/// Full form of [`try_compile`] taking an additional resolver for the JVMS
+/// §6.5 `invokespecial` super-call redirect (`cp_invokespecial_owner_resolver`
+/// below) — used by the VM's own call sites (`try_jit_upgrade_with_gate`,
+/// `callee_compiler`, `try_jit_compile_callee_slow` in
+/// `vm/src/runtime/interpreter.rs`), which have a calling-class identity to
+/// resolve it against. Kept as a separate function (rather than adding the
+/// parameter to `try_compile` itself) so the ~30 existing `try_compile`
+/// call sites in this crate's own test suites need no changes.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn try_compile_with_invokespecial_resolver(
+    cached: &CachedBytecodeMethod,
+    cp_class_name_resolver: Option<&dyn Fn(u16) -> Option<String>>,
+    cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
+    cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
+    cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    // JVMS §6.5 `invokespecial` super-call redirect: given an `invokespecial`
+    // (0xb7) call-site's CP index, returns the JVMS-correct class at which
+    // method selection actually begins when that differs from the plain
+    // `cp_invoke_resolver` class name — i.e. a genuine `super.m(...)` whose
+    // constant-pool reference names an ancestor further up than this
+    // method's own direct superclass. `None` (resolver absent, or it
+    // returns `None` for a given site — the overwhelmingly common case)
+    // leaves `class_name` exactly as `cp_invoke_resolver` returned it. See
+    // `classloading::invokespecial_selection_start` for the algorithm.
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // CRIT-2 — returns (class_id, num_fields, has_nonzero_tag_primitive_init,
     // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
@@ -5587,6 +5760,7 @@ pub fn try_compile(
         cp_field_resolver,
         cp_static_field_resolver,
         cp_invoke_resolver,
+        cp_invokespecial_owner_resolver,
         callee_compiler,
         cp_new_resolver,
         cp_ldc_resolver,
@@ -5707,6 +5881,74 @@ thread_local! {
     pub(crate) static IR_LOWER_COMPILES: std::cell::Cell<u64> = std::cell::Cell::new(0);
 }
 
+/// RBC.6 local-handler-safety fix. Conservative, sound check answering: for
+/// this method's exception table, could ANY handler observe a local
+/// variable that `route_jit_exception_through_method`'s params-only
+/// handler-frame reconstruction cannot recover — i.e. anything other than
+/// `this` / a declared parameter?
+///
+/// Delegates to `regalloc::handler_has_unsafe_local_read`, a real CFG-based
+/// forward "definitely assigned" dataflow (dominance-respecting, not just
+/// raw-pc-order) — see that function's own doc comment for the full
+/// algorithm and why an earlier, simpler raw-pc-order approximation here
+/// was both over-conservative (continued scanning past a handler's own
+/// `athrow`/`return` into unrelated later code — confirmed, via the real
+/// `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+/// Tomcat suite fixture, to be the actual remaining blocker for the doc's
+/// own motivating case even after the RBC.6 gate itself was relaxed) and
+/// had a latent, never-triggered soundness gap (path-insensitive: a store
+/// on one branch and a read on a different, non-overlapping branch could
+/// be wrongly accepted merely because the store's bytecode pc was lower).
+///
+/// **Confirmed necessary in the first place** via
+/// `AthrowCountBisect.twoThrowsSequential`
+/// (`vm/tests/jit_local_exception_handler_tests.rs`): two sequential,
+/// non-nested try/catch blocks in one method, where the second handler's
+/// own code reads a local (`a`) last assigned by the FIRST try's successful
+/// (non-exceptional) path. Without SOME such check, that method compiled
+/// and silently produced a wrong checksum.
+fn local_handler_reads_unsafe_local(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+    method_descriptor: &str,
+    is_static: bool,
+) -> bool {
+    // Widening: `this` (slot 0 for instance methods) + declared param slots.
+    let param_slot_count =
+        count_param_slots_jvm_spec(method_descriptor) as u16 + if is_static { 0 } else { 1 };
+    // Slots >= 64 can't be represented in the u64 bitmask the dataflow uses;
+    // `regalloc::handler_has_unsafe_local_read` conservatively treats any
+    // load of such a slot as unsafe regardless of this mask, so capping the
+    // shift here (rather than overflowing) just keeps this bit of arithmetic
+    // well-defined — it does not change which methods are accepted.
+    let initial_safe_slots: u64 = if param_slot_count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << param_slot_count) - 1
+    };
+    let dbg = std::env::var_os("CRATONVM_DBG_RBC6").is_some();
+    for entry in exception_table {
+        let handler_pc = entry.handler_pc as usize;
+        let unsafe_found = regalloc::handler_has_unsafe_local_read(
+            code,
+            code_len,
+            handler_pc,
+            initial_safe_slots,
+        );
+        if unsafe_found {
+            if dbg {
+                eprintln!(
+                    "[rbc6-dbg] local_handler_reads_unsafe_local UNSAFE (CFG dataflow) handler_pc={} param_slot_count={}",
+                    handler_pc, param_slot_count
+                );
+            }
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -5714,6 +5956,8 @@ fn try_compile_inner(
     cp_field_resolver: Option<&dyn Fn(u16) -> Option<(usize, u8, Option<(u32, bool)>)>>,
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
+    // See `try_compile_with_invokespecial_resolver`.
+    cp_invokespecial_owner_resolver: Option<&dyn Fn(u16) -> Option<String>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
     // (class_id, num_fields, has_nonzero_tag_primitive_init, has_finalizer) — see `try_compile`.
     cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
@@ -5859,6 +6103,12 @@ fn try_compile_inner(
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
+            if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+                eprintln!(
+                    "[rbc6-dbg] try_compile_inner: jit_scan returned None for {}.{}{}",
+                    cached.class_name, cached.method_name, cached.method_descriptor
+                );
+            }
             // RBC.4 — a scan reject (unsupported opcode, e.g. `athrow`) is
             // just as permanent as a backend bail: the bytecode never
             // changes. Without marking it, a hot uncompilable method re-ran
@@ -5873,13 +6123,97 @@ fn try_compile_inner(
         }
     };
 
-    // RBC.6 — a method containing `athrow` compiles only when it has NO
-    // local exception handlers: the athrow lowering stashes the exception
-    // and returns the deopt sentinel, which cannot dispatch to an
-    // in-method handler. Permanent for this bytecode → bail-list it.
-    if scan.has_athrow && !cached.exception_table.is_empty() {
-        *backend_attempted = true;
-        return None;
+    // RBC.6 (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md)
+    // — this gate used to unconditionally refuse any method that combines
+    // `athrow` with a local exception handler, on the theory that "the
+    // athrow lowering stashes the exception and returns the deopt sentinel,
+    // which cannot dispatch to an in-method handler." That was true when
+    // this gate was written (`8d0f029ed`, 2026-06-11), but every fix that
+    // landed the day after and later — BUG-H (`82b9bdf62`), KCFULL-13,
+    // Round-8/9/10/11 (NPE/AIOOBE/arithmetic/general-exception leak fixes),
+    // and the wildfly-bug-05 this/params restore (`549a2c161`) — built
+    // exactly the missing dispatch, generically, and never revisited this
+    // gate:
+    //   - `emitted_athrow` unconditionally forces `has_dispatch = true`
+    //     (`x64.rs`, `RBC.6` comment at the `has_dispatch` computation), so
+    //     any method containing `athrow` is ALWAYS entered through
+    //     `execute_jit_call`'s dispatch-aware slow path, never the raw
+    //     fast-path that would leak the sentinel as a return value.
+    //   - That slow path drains `JIT_PENDING_EXCEPTION` (and NPE/AIOOBE/
+    //     arithmetic) after every JIT return and, whenever the invoked
+    //     method itself declares a non-empty `exception_table`, routes the
+    //     exception through `route_jit_exception_through_method` — a real
+    //     handler search (typed catch-class matching with subclass checks,
+    //     first-match-wins, `finally`/catch-all handling) that pushes a
+    //     fresh interpreter frame at the resolved handler pc with `this`
+    //     and the declared params restored and the exception object on the
+    //     stack, and otherwise propagates to the caller exactly like an
+    //     uncaught throw. This is reached identically whether the pending
+    //     exception came from `athrow` in THIS method or propagated up from
+    //     a callee — the sentinel-return shape is the same either way.
+    //   - `callee_has_exception_table`/`route_implicit_exc_through_callee`
+    //     provide the JIT-to-JIT direct-call sibling of the same routing.
+    //
+    // In other words: the "cannot dispatch to an in-method handler" premise
+    // this gate was built on stopped being true within a day of it landing,
+    // and nothing since has depended on athrow+handler staying uncompiled —
+    // methods that only *declare* a handler (no local `athrow`) already
+    // compile today and already rely on this exact runtime routing (that's
+    // what BUG-H fixed). Only the compile-time refusal itself was stale.
+    // Confirmed root cause of `Response.toAbsolute()` (Tomcat hot path,
+    // `try { ... } catch (IOException) { throw new
+    // IllegalArgumentException(...) }`) never JIT-compiling — see the doc
+    // above for the full trace and validation plan. The IR (optimizing)
+    // path keeps its own independent, unaffected
+    // `cached.exception_table.is_empty()` admission check below, so this
+    // change only widens single-pass (`x64::compile`) eligibility — the
+    // existing, well-tested fallback backend that already carries every
+    // other non-`ir_compatible` method.
+    //
+    // RBC.6 local-handler-safety fix — `route_jit_exception_through_method`
+    // (vm/src/runtime/interpreter.rs) reconstructs the handler frame from
+    // ONLY `this` + the method's declared incoming params (a documented,
+    // pre-existing limitation — see that function's own doc comment). A
+    // handler that reads any OTHER local — one first assigned earlier in
+    // the method, whether inside this try, a DIFFERENT try/catch construct,
+    // or straight-line code before either — observes a stale zero/null
+    // instead of the value the compiled code actually computed. Confirmed
+    // via a differential repro: `AthrowCountBisect.twoThrowsSequential` (two
+    // sequential, non-nested try/catch blocks in one method; the second
+    // handler's own code reads a local last assigned by the FIRST try's
+    // successful path) silently computed a wrong checksum once compiled —
+    // this affects declares-a-handler-no-athrow methods exactly as much as
+    // the newly-relaxed has-athrow ones, since the frame-reconstruction gap
+    // is in the shared runtime routing, not anything athrow-specific. Gate
+    // BOTH populations (any non-empty `exception_table`, not just the
+    // has_athrow case above) on `local_handler_reads_unsafe_local`, a real
+    // CFG-based "definitely assigned" dataflow (dominance-respecting, not a
+    // raw-pc-order approximation — an earlier version of this check used
+    // exactly that simpler approximation and was found, via the REAL
+    // `org.apache.catalina.connector.Response.toAbsolute()` bytecode on the
+    // Tomcat suite fixture, to over-reject it: it kept scanning past the
+    // handler's own `athrow` terminator into unrelated later code in the
+    // same method). See `local_handler_reads_unsafe_local`'s own doc
+    // comment, and `regalloc::handler_has_unsafe_local_read`'s, for the
+    // full algorithm and soundness argument.
+    if !cached.exception_table.is_empty() {
+        let unsafe_local = local_handler_reads_unsafe_local(
+            code,
+            code_len,
+            &cached.exception_table,
+            &cached.method_descriptor,
+            cached.is_static,
+        );
+        if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+            eprintln!(
+                "[rbc6-dbg] try_compile_inner: local_handler_reads_unsafe_local={} for {}.{}{}",
+                unsafe_local, cached.class_name, cached.method_name, cached.method_descriptor
+            );
+        }
+        if unsafe_local {
+            *backend_attempted = true;
+            return None;
+        }
     }
 
     // Try IR compilation for simple integer-only methods. The IR pipeline
@@ -6624,6 +6958,21 @@ fn try_compile_inner(
                 0xb9 => 2,
                 _ => 3,
             };
+            // JVMS §6.5 super-call redirect (see `try_compile`'s doc comment
+            // on `cp_invokespecial_owner_resolver`): for `invokespecial`
+            // sites only, substitute the JVMS-correct selection-start class
+            // when it differs from the plain CP-referenced class. Must run
+            // before EVERY downstream use of `class_name` below (the
+            // recursive-call check, inlining, direct-callee compile, and the
+            // `JitInvokeInfo` baked into the compiled code), so a wrong
+            // target is never baked into any of them.
+            let class_name = if invoke_kind == 1 {
+                cp_invokespecial_owner_resolver
+                    .and_then(|r| r(cp_idx))
+                    .unwrap_or(class_name)
+            } else {
+                class_name
+            };
             let num_params = count_param_slots(&descriptor);
             let has_receiver = invoke_kind != 3;
             let num_jit_args = num_params + if has_receiver { 1 } else { 0 };
@@ -6655,6 +7004,20 @@ fn try_compile_inner(
             // dump). Skip only the direct-call/intrinsic attempts, then fall
             // through to the info construction.
             let mut planned_inline = false;
+            // A raw JIT-to-JIT CALL has no interpreter transition to validate
+            // argument roots, ABI state, or the callee's active frame. The
+            // Elasticsearch IVFKnn stress test exposed a stale precise-root
+            // mirror after a raw JIT-to-JIT CALL. x64 now republishes the
+            // caller RBP after every such return, matching the normal Rust
+            // dispatch boundary, so compiled callee calls can remain enabled.
+            // A raw JIT-to-JIT call updates the per-thread active-RBP mirror
+            // to the callee, while the interpreter-owned root-chain entry
+            // still describes the caller.  Until that transition publishes
+            // callee metadata atomically as well, a GC in the callee can
+            // select the caller's oop map for the callee frame and lose live
+            // roots.  Route through the checked re-entrant bridge instead;
+            // it installs a distinct JitEntryGuard for the actual callee.
+            let direct_jit_callee_calls_enabled = direct_jit_callee_calls_enabled();
             if !is_recursive_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -6686,7 +7049,8 @@ fn try_compile_inner(
                     // pays the full helper round trip per call. `needs_context`
                     // routes vm_ptr as arg 0; the helper preserves the
                     // identity-cache and pending-return rooting contracts.
-                    if invoke_kind == 3
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
                         && class_name == "java/lang/Integer"
                         && method_name == "valueOf"
                         && descriptor == "(I)Ljava/lang/Integer;"
@@ -6708,7 +7072,8 @@ fn try_compile_inner(
                             continue;
                         }
                     }
-                    if let Some(compiler) = callee_compiler.as_ref() {
+                    if direct_jit_callee_calls_enabled {
+                        if let Some(compiler) = callee_compiler.as_ref() {
                         if let Some((entry, callee_needs_ctx)) =
                             compiler(&class_name, &method_name, &descriptor)
                         {
@@ -6735,6 +7100,7 @@ fn try_compile_inner(
                                 ));
                                 continue;
                             }
+                        }
                         }
                     }
                     needs_heap = true;
@@ -6828,7 +7194,8 @@ fn try_compile_inner(
                 // site declared against it is statically monomorphic — the
                 // plain guard-free virtual direct-call path is sound, and
                 // the helper handles the null-receiver NPE itself.
-                if invoke_kind == 0
+                if direct_jit_callee_calls_enabled
+                    && invoke_kind == 0
                     && class_name == "java/lang/Integer"
                     && method_name == "intValue"
                     && descriptor == "()I"
@@ -8214,6 +8581,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         let resolver = |idx: u16| -> Option<(String, String, String)> {
             (idx == 1).then(|| ("pkg/Rec".to_string(), "f".to_string(), "(I)I".to_string()))
@@ -8433,6 +8801,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
         // `#[repr(C)]`, so an all-zero bit pattern is valid (no niches/padding).
@@ -8507,6 +8876,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
         // is valid and never called (the inline getfield emits no helper call,
@@ -8965,6 +9335,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
@@ -9099,6 +9470,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -9211,6 +9583,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -9327,6 +9700,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure long-arithmetic method calls no helper.
@@ -9385,6 +9759,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure FP-arithmetic method calls no helper.
@@ -9446,6 +9821,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10636,6 +11012,13 @@ mod tests {
         use std::sync::Arc;
 
         clear_jit_recursive_cycle_methods_for_test();
+        // This test exercises the direct-callee-compile path (`callee_compiler`
+        // below), which is opt-in by default — see
+        // `direct_jit_callee_calls_enabled`. Not OnceLock-cached, so setting it
+        // here is observed immediately; no other jit test asserts on
+        // invoke-info/PIC/MIC-slot counts, so this is safe under parallel
+        // `cargo test`.
+        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
 
         let a_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(1),
@@ -10651,6 +11034,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         let b_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(2),
@@ -10666,6 +11050,7 @@ mod tests {
             is_synchronized: false,
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         };
         // SAFETY: every helper address is an integer slot. This test only
         // inspects emitted metadata and never executes the generated code.
@@ -10747,6 +11132,7 @@ mod tests {
         );
 
         clear_jit_recursive_cycle_methods_for_test();
+        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
     }
 
     #[test]
@@ -11089,22 +11475,76 @@ mod tests {
         assert!(mic.is_monomorphic());
     }
 
+    /// A raw inline MIC has no helper boundary between its guard load and
+    /// indirect CALL, so retargeting a populated slot risks pairing one
+    /// receiver's class guard with another receiver's entry. `update` is
+    /// therefore monomorphic for the slot's lifetime: the first class to
+    /// install wins, and a later `update` for a DIFFERENT class is a no-op
+    /// (that receiver simply takes the ordinary helper path instead).
     #[test]
-    fn s33_mic_slot_update_overwrites_previous() {
+    fn s33_mic_slot_update_first_install_wins_no_retarget() {
         let mic = JitMICSlot::new();
         mic.update(1, "A", 100, false);
         mic.update(2, "B", 200, true);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
-            2
+            1
         );
-        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("B"));
+        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("A"));
         assert_eq!(
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
-            200
+            100
         );
+        assert!(!mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// A re-`update` for the SAME class as already installed must stay a
+    /// no-op (idempotent), not tear the entry/name/context triple.
+    #[test]
+    fn s33_mic_slot_update_same_class_is_idempotent() {
+        let mic = JitMICSlot::new();
+        mic.update(1, "A", 100, false);
+        mic.update(1, "A", 999, true);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            100
+        );
+        assert!(!mic
+            .cached_needs_context
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// `prepopulate` seeds only `cached_class_id` (a profile-derived guard
+    /// hint) with `cached_entry_ptr` still 0. The first `update` for that
+    /// SAME class id must still publish a real entry — this is the shape
+    /// `mark_current_jit_compile_method_recursive_cycle`'s caller
+    /// (profile-guided MIC seeding, see `try_compile_inner`) relies on.
+    #[test]
+    fn s33_mic_slot_update_resolves_prepopulated_hint() {
+        let mic = JitMICSlot::new();
+        mic.prepopulate(7);
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        mic.update(7, "Hinted", 0x4242, true);
+        assert_eq!(
+            mic.cached_class_id
+                .load(std::sync::atomic::Ordering::Acquire),
+            7
+        );
+        assert_eq!(
+            mic.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0x4242
+        );
+        assert_eq!(mic.cached_class_name.lock().as_deref(), Some("Hinted"));
         assert!(mic
             .cached_needs_context
             .load(std::sync::atomic::Ordering::Relaxed));

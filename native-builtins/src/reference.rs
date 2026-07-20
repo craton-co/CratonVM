@@ -29,18 +29,31 @@ use cratonvm_types::Value;
 
 use crate::{REF_FIELD_NEXT, REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
 
-/// Queue-linkage slot for a Reference: the real-JDK `next` field (slot 2 of
-/// referent/queue/next/discovered) when the object has one; the legacy
-/// referent-slot fallback otherwise (old synthetic 2-field shape). Reusing
-/// the REFERENT slot as the next pointer made `get()` on an
-/// enqueued-but-unpolled WeakReference return the NEXT queue element instead
-/// of null. Both the enqueue and poll sides must agree, so they share this.
+/// Queue-linkage slot for a Reference: the real-JDK `next` field declared on
+/// `java/lang/ref/Reference` itself (referent, queue, next, discovered) when
+/// the object has one; the legacy referent-slot fallback otherwise (old
+/// synthetic 2-field shape). Reusing the REFERENT slot as the next pointer
+/// made `get()` on an enqueued-but-unpolled WeakReference return the NEXT
+/// queue element instead of null. Both the enqueue and poll sides must
+/// agree, so they share this.
+///
+/// MUST resolve BY NAME against `Reference`'s own declaring class rather
+/// than assume a fixed index (the old `object_num_fields > REF_FIELD_NEXT`
+/// heuristic): a `java.util.WeakHashMap$Entry` (itself a `WeakReference`
+/// subclass) also declares its own field named `next` — its hash-BUCKET
+/// chain pointer, a completely different linked list. Blindly using
+/// `REF_FIELD_NEXT`'s index for such a subclass can splice the
+/// ReferenceQueue link over the bucket-chain link, corrupting the bucket a
+/// later `WeakHashMap.get()` walks forever. See the matching fix in
+/// `vm/src/runtime/interpreter.rs`'s `gc_reference_next_slot` (the GC's own
+/// auto-enqueue path must agree with this one) and
+/// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
 fn ref_next_slot(ctx: &mut dyn NativeContext, ref_obj: cratonvm_types::ObjectRef) -> usize {
-    if ctx.object_num_fields(ref_obj) > REF_FIELD_NEXT {
-        REF_FIELD_NEXT
-    } else {
-        REF_FIELD_REFERENT
+    if ctx.object_num_fields(ref_obj) <= REF_FIELD_NEXT {
+        return REF_FIELD_REFERENT; // legacy synthetic 2-field shape
     }
+    ctx.resolve_field_index("java/lang/ref/Reference", "next")
+        .unwrap_or(REF_FIELD_NEXT)
 }
 
 /// Register every `java.lang.ref.*` native. Called from

@@ -238,6 +238,12 @@ impl Arena {
         // same way, so this matches how the walk will stride the region.
         let size = size.checked_add(7)? & !7;
 
+        // Reserve the allocation's aligned footprint, not merely an aligned
+        // start. Compact object bodies can end 1..7 bytes before the next
+        // object boundary; leaving that tail outside the allocation makes
+        // linear heap walks see a phantom region between valid objects.
+        let alloc_size = size.checked_add(align - 1).map(|v| v & !(align - 1))?;
+
         // Free-list fast path: if a prior non-moving sweep reclaimed any
         // holes, satisfy the request from the first block large enough to
         // hold `size` plus the alignment padding. The leftover (head
@@ -250,7 +256,7 @@ impl Arena {
         // block is smaller than `size`, no block can satisfy the request —
         // skip the scans entirely and go straight to the bump path.
         if (!self.free_small.is_empty() || !self.free_large.is_empty())
-            && size <= self.max_free_upper
+            && alloc_size <= self.max_free_upper
         {
             let base = self.data.as_ptr() as usize;
             // Tier selection: a request whose worst-case need (size + max
@@ -259,25 +265,25 @@ impl Arena {
             // entirely. Smaller requests try the small tier first: its
             // blocks are object-sized holes, so a same-shaped request
             // first-fits at ~index 0.
-            let worst_need = size.saturating_add(align - 1);
+            let worst_need = alloc_size.saturating_add(align - 1);
             let hit = if worst_need < LARGE_BLOCK_MIN {
                 Self::first_fit(
                     &mut self.free_small,
                     base,
-                    size,
+                    alloc_size,
                     align,
                     SMALL_TIER_SCAN_BUDGET,
                 )
-                .or_else(|| Self::first_fit(&mut self.free_large, base, size, align, usize::MAX))
+                .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX))
             } else {
-                Self::first_fit(&mut self.free_large, base, size, align, usize::MAX)
+                Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX)
             };
             if let Some((alloc_offset, remainders)) = hit {
                 self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
-                // SAFETY: `alloc_offset + size` lies within the consumed
+                // SAFETY: `alloc_offset + alloc_size` lies within the consumed
                 // block, which came from a region inside the buffer.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
@@ -300,17 +306,44 @@ impl Arena {
         // Bump-allocation path: align the cursor up (checked to prevent
         // overflow near usize::MAX).
         let aligned = self.cursor.checked_add(align - 1).map(|v| v & !(align - 1));
-        let end = aligned.and_then(|a| a.checked_add(size));
-        let aligned = aligned?;
-        let end = end?;
-        if end > self.data.len() {
-            return None;
+        let end = aligned.and_then(|a| a.checked_add(alloc_size));
+        if let (Some(aligned), Some(end)) = (aligned, end) {
+            if end <= self.data.len() {
+                // SAFETY: `aligned` is within `[0, self.data.len())` because
+                // `end <= self.data.len()` was just checked.
+                let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
+                self.cursor = end;
+                return Some(ptr);
+            }
         }
-        // SAFETY: `aligned` is within `[0, self.data.len())` because `end > aligned`
-        // was checked above and `end <= self.data.len()`.
-        let ptr = unsafe { self.data.as_mut_ptr().add(aligned) };
-        self.cursor = end;
-        Some(ptr)
+
+        // The bump tail `SMALL_TIER_SCAN_BUDGET`'s design assumed would
+        // always be available as a fallback (see its doc comment: "a miss
+        // falls through to the bump tail... both valid") is itself
+        // exhausted. A bounded small-tier miss above proved nothing about
+        // whether a fit exists further down the list — `swap_remove`
+        // back-fills the scan prefix with freshly split "dust" remainders,
+        // which can bury a genuinely-sized match past the scan budget
+        // indefinitely once the arena stops growing (the non-moving young
+        // collector never resets its cursor, so this is the steady state
+        // for the rest of the process's life, not a transient blip). Before
+        // declaring the allocation impossible, pay for one full, unbounded
+        // scan of both tiers — this only costs anything in the
+        // already-degenerate case where the bump tail is gone, which the
+        // common case (tail available) never reaches.
+        let base = self.data.as_ptr() as usize;
+        let hit = Self::first_fit(&mut self.free_small, base, alloc_size, align, usize::MAX)
+            .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX));
+        if let Some((alloc_offset, remainders)) = hit {
+            self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
+            for r in remainders.into_iter().flatten() {
+                self.push_block_routed(r);
+            }
+            // SAFETY: `alloc_offset + alloc_size` lies within the consumed
+            // block, which came from a region inside the buffer.
+            return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+        }
+        None
     }
 
     /// Register a reclaimed `[offset, offset+size)` region as a free block.
@@ -627,6 +660,59 @@ mod tests {
         assert_eq!(arena.used(), 64);
     }
 
+    /// dohead-oom (2026-07-19): a bounded small-tier scan miss must not be
+    /// the final word once the bump tail is also exhausted. Simulate the
+    /// non-moving young collector's steady state (cursor pinned at
+    /// capacity, so every further allocation must come from the free list):
+    /// register `SMALL_TIER_SCAN_BUDGET` too-small holes followed by one
+    /// genuinely-sized hole past the scan budget, then request exactly that
+    /// size. Without the post-bump fallback scan in `alloc`, this returns
+    /// `None` despite a valid block existing.
+    #[test]
+    fn arena_alloc_finds_fit_past_scan_budget_when_bump_tail_exhausted() {
+        let dust_count = SMALL_TIER_SCAN_BUDGET + 4;
+        let dust_size = 8usize;
+        let fit_size = 32usize;
+        let capacity = dust_count * dust_size + fit_size + 256;
+        let mut arena = Arena::new(capacity);
+
+        // Carve out `dust_count` tiny live objects, then a fit-sized one.
+        let mut dust_offsets = Vec::new();
+        for _ in 0..dust_count {
+            let ptr = arena.alloc(dust_size, 8).unwrap();
+            dust_offsets.push(unsafe { ptr.offset_from(arena.base_ptr_mut()) } as usize);
+        }
+        let fit_ptr = arena.alloc(fit_size, 8).unwrap();
+        let fit_offset = unsafe { fit_ptr.offset_from(arena.base_ptr_mut()) } as usize;
+
+        // Reclaim them in the same order a real sweep would walk them: dust
+        // first (fills the `swap_remove`-backed scan prefix), fit-sized hole
+        // last (lands past the scan budget).
+        for &off in &dust_offsets {
+            arena.add_free_block(off, dust_size);
+        }
+        arena.add_free_block(fit_offset, fit_size);
+
+        // Exhaust the bump tail so the free list is the only remaining path.
+        let remaining = arena.capacity() - arena.used();
+        arena.alloc(remaining, 8).unwrap();
+        assert_eq!(arena.used(), arena.capacity());
+
+        // A bounded scan alone would only see `dust_size`-sized holes here
+        // and report failure; the fallback full scan must find the
+        // fit-sized hole regardless of its position in the list.
+        let request_size = 24;
+        assert!(
+            fit_size >= request_size,
+            "test fixture invariant: the reclaimed hole must satisfy the request"
+        );
+        assert!(
+            arena.alloc(request_size, 8).is_some(),
+            "alloc must fall back to a full free-list scan once the bump tail \
+             is exhausted, instead of trusting a bounded scan's miss"
+        );
+    }
+
     #[test]
     fn arena_multiple_allocs() {
         let mut arena = Arena::new(256);
@@ -658,6 +744,17 @@ mod tests {
         let mut arena = Arena::new(64);
         assert!(arena.alloc(64, 8).is_some());
         assert!(arena.alloc(1, 1).is_none());
+    }
+
+    #[test]
+    fn arena_alignment_reserves_trailing_padding() {
+        let mut arena = Arena::new(64);
+        let first = arena.alloc(44, 8).unwrap();
+        let second = arena.alloc(8, 8).unwrap();
+
+        assert_eq!(unsafe { first.offset_from(arena.base_ptr_mut()) }, 0);
+        assert_eq!(unsafe { second.offset_from(arena.base_ptr_mut()) }, 48);
+        assert_eq!(arena.used(), 56);
     }
 
     #[test]

@@ -5642,6 +5642,35 @@ fn native_quarkus_logging_handle_failed_start(
     result
 }
 
+/// Native equivalent of `java.nio.file.Path.toString()`, tuned for synthetic
+/// and real `java/nio/file/Path` values used by Javac/ZipFS and JRT paths.
+/// This avoids going back through virtual `Path.toString` dispatch, keeping
+/// file-bridge paths and archive entry identity stable for real-JDK callers.
+pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let p = p57_read_path(ctx, this);
+    match vfs_decode(&p) {
+        // jar-FS / jrt-FS Path.toString() shows the in-archive entry with
+        // '/' (matches the JDK zipfs/jrtfs separator), regardless of host OS.
+        Some((_, _, e)) => {
+            if e.starts_with('/') {
+                e
+            } else {
+                format!("/{e}")
+            }
+        }
+        // A plain (non-encoded) relative path whose owning FileSystem is a
+        // virtual (jar/jrt) FS renders with '/' — e.g. the result of
+        // `jarRoot.relativize(dir)` ("org/h2/tools"), which javac turns into
+        // a package name. Rendering the host '\' there would corrupt the key.
+        None if path_owned_by_virtual_fs(ctx, this) => p.replace('\\', "/"),
+        // Host-FS path: render the OS-native separator. CratonVM stores
+        // paths with '/' internally, but HotSpot's WindowsPath.toString()
+        // renders '\'; convert at this display boundary on Windows
+        // (no-op on Unix). Matches `File.getPath()` below.
+        None => file_normalise_path(&p),
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -43886,6 +43915,76 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
+    r.register(ssl_sock, "getSoTimeout", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ssl_sock, "setSoTimeout", "(I)V", |ctx, args| {
+        let timeout = args.get(1).and_then(Value::as_int).unwrap_or(0);
+        if timeout < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("negative SO_TIMEOUT: {timeout}"),
+            }
+            .into());
+        }
+        Ok(None)
+    });
+    r.register(
+        ssl_sock,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
+                Value::Object(Some(host)) => ctx.read_string(host).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if host.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, &host, &host);
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getRemoteSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let host = ctx.get_field(this, NEW13_SOCK_HOST);
+            let port = ctx.get_field(this, NEW13_SOCK_PORT);
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[host, port],
+            )
+        },
+    );
+    r.register(ssl_sock, "getLocalPort", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(
+        ssl_sock,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, _args| {
+            let address = crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+            Ok(Some(Value::Object(Some(address))))
+        },
+    );
+    r.register(
+        ssl_sock,
+        "getLocalSocketAddress",
+        "()Ljava/net/SocketAddress;",
+        |ctx, _args| {
+            let host = ctx.create_string("127.0.0.1");
+            ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[Value::Object(Some(host)), Value::Int(0)],
+            )
+        },
+    );
 
     // NEW-13: SSLSocketInputStream — reads from a `s2_registry` TLS stream
     // identified by the tls_id stored in field 0 of the synthetic stream

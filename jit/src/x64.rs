@@ -1101,47 +1101,40 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut has_newarray = false; // Primitive array allocation (0xbc)
-                                  // BUG-LQB-SCOPE: earliest bytecode pc of any instruction with an
-                                  // observable, non-idempotent side effect (putfield/putstatic, an array
-                                  // store, or any invoke* — a callee can mutate arbitrary state). The
-                                  // `invokedynamic` (0xba) arm below lowers to an UNCONDITIONAL jump to the
-                                  // shared uncommon-trap deopt stub (reason 8, `UnreachedCode`) — control
-                                  // never returns from the trap into JIT-compiled code, and the VM's
-                                  // fallback for that trap (when no precise resume snapshot exists, which
-                                  // is unconditionally true for reason 8 as of the 2026-07-07 Groovy-
-                                  // regression revert — see
-                                  // docs/known-issues/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression.md)
-                                  // is to RE-EXECUTE THE WHOLE METHOD FROM ITS INTERPRETER ENTRY. Any
-                                  // side-effecting bytecode positioned BEFORE the indy in program order
-                                  // already ran for real once under the (aborted) JIT attempt, so the
-                                  // interpreter's from-scratch re-run executes it a SECOND time — a
-                                  // genuine double-execution, not just a performance cost. Confirmed via a
-                                  // minimal standalone repro (`enter()`-shaped method: `counter++;
-                                  // ...concat via invokedynamic...`) invoked from a JIT-compiled caller:
-                                  // the counter field was incremented twice per logical call. This is the
-                                  // root cause of the Liquibase `Scope` "Cannot end scope X when currently
-                                  // at scope root" corruption (docs/known-issues/keycloak-07-04/
-                                  // testsuite-model-liquibase-scope-corruption.md) — `Scope.enter()`-style
-                                  // methods perform a `putstatic`/field mutation before a string-concat
-                                  // `invokedynamic`, so the ThreadLocal-tracked scope stack gets pushed
-                                  // twice for one logical `Scope.enter()` call once such a helper method
-                                  // gets JIT-compiled and reached from a JIT-compiled (or otherwise
-                                  // JIT-dispatching) caller.
-                                  //
-                                  // Fix: track the earliest such pc; after the scan, if it precedes any
-                                  // `invokedynamic` site, refuse to compile the WHOLE method (return
-                                  // `None`, same fail-safe posture as the RBC.6 athrow+exception-table
-                                  // gate below) rather than emit unconditional-trap codegen that can
-                                  // double-execute already-committed work. This only affects methods that
-                                  // have both a live invokedynamic AND an earlier side effect in raw
-                                  // bytecode-pc order — the overwhelmingly common case (an
-                                  // `assert cond : "msg" + x;` message-concat sitting on a dead branch
-                                  // near the end of a method, unrelated to any earlier field/array
-                                  // mutation reachability) is unaffected and still compiles at full JIT
-                                  // speed; methods that fail this new gate simply stay fully interpreted
-                                  // (correct, just not JIT-accelerated), matching the scanner's existing
-                                  // "when in doubt, don't compile" philosophy.
-    let mut first_committing_side_effect_pc: Option<usize> = None;
+    // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
+    // instruction's (bytecode_pc, local_slot). Populated inline in the
+    // existing, already-correct per-opcode arms below (zero new pc-
+    // advancement logic — just recording a side effect), so it can never
+    // diverge from this scanner's own opcode-width decoding. Consumed by
+    // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
+    // verify every exception-table handler in a method only ever reads a
+    // local it (or something reachable before it in bytecode order,
+    // starting from the handler's own entry pc) has itself written — see
+    // that function's doc comment for why this check exists.
+    let mut local_slot_ops: Vec<(usize, bool, u16)> = Vec::new(); // (pc, is_store, slot)
+                                  // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
+                                  // — documented alongside the RBC.6 relaxation it was found while
+                                  // validating): this scanner used to track the earliest "committing side
+                                  // effect" pc and refuse to compile ANY method where one preceded an
+                                  // `invokedynamic` in raw bytecode-pc order, because at the time
+                                  // (`752796a0a`, 2026-07-07) the trap's fallback was believed to be an
+                                  // imprecise whole-method re-run that could double-execute that side
+                                  // effect (the real, once-confirmed Liquibase `Scope` corruption). That
+                                  // premise is stale: the SAME day, a concurrent fix
+                                  // (`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
+                                  // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
+                                  // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
+                                  // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind
+                                  // `deopt_real_enabled()`) — including the exact nested-compiled-callee
+                                  // identity-mismatch case this gate was defending against
+                                  // (`try_resume_trapped_callee` + baked `method_key` identity checks,
+                                  // verified via a dedicated repro: 30000/30000 corrupted calls before,
+                                  // 0 after). A live indy trap today precisely resumes at the trapping bci
+                                  // with the correct locals/stack reconstructed — it does not re-run
+                                  // anything before it, so there is nothing left to double-execute. Removed
+                                  // this scan-time gate; the underlying runtime protection it was
+                                  // duplicating (imprecisely, at compile time) already exists and is
+                                  // strictly more precise.
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -1189,22 +1182,27 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 1 >= code_len {
                     return None;
                 }
+                local_slot_ops.push((pc, false, code[pc + 1] as u16));
                 pc += 2;
             }
             // iload_0..iload_3
             0x1a..=0x1d => {
+                local_slot_ops.push((pc, false, (op - 0x1a) as u16));
                 pc += 1;
             }
             // lload_0..lload_3
             0x1e..=0x21 => {
+                local_slot_ops.push((pc, false, (op - 0x1e) as u16));
                 pc += 1;
             }
             // fload_0..fload_3, dload_0..dload_3
             0x22..=0x29 => {
+                local_slot_ops.push((pc, false, ((op - 0x22) % 4) as u16));
                 pc += 1;
             }
             // aload_0..aload_3
             0x2a..=0x2d => {
+                local_slot_ops.push((pc, false, (op - 0x2a) as u16));
                 pc += 1;
             }
             // iaload, laload, faload, daload, aaload, baload, caload, saload
@@ -1216,22 +1214,27 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 1 >= code_len {
                     return None;
                 }
+                local_slot_ops.push((pc, true, code[pc + 1] as u16));
                 pc += 2;
             }
             // istore_0..istore_3
             0x3b..=0x3e => {
+                local_slot_ops.push((pc, true, (op - 0x3b) as u16));
                 pc += 1;
             }
             // lstore_0..lstore_3
             0x3f..=0x42 => {
+                local_slot_ops.push((pc, true, (op - 0x3f) as u16));
                 pc += 1;
             }
             // fstore_0..fstore_3, dstore_0..dstore_3
             0x43..=0x4a => {
+                local_slot_ops.push((pc, true, ((op - 0x43) % 4) as u16));
                 pc += 1;
             }
             // astore_0..astore_3
             0x4b..=0x4e => {
+                local_slot_ops.push((pc, true, (op - 0x4b) as u16));
                 pc += 1;
             }
             // iastore, lastore, fastore, dastore, aastore, bastore, castore, sastore
@@ -1246,11 +1249,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 // heap-dependent helper).
                 if op == 0x53 {
                     needs_heap = true;
-                }
-                // BUG-LQB-SCOPE: array stores are observable side effects —
-                // see the tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
                 }
                 pc += 1;
             }
@@ -1308,11 +1306,16 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0x82 | 0x83 => {
                 pc += 1;
             }
-            // iinc
+            // iinc — reads then writes the same slot, in that order (the
+            // read-half must see whatever safety state existed BEFORE this
+            // instruction; the write-half is what makes the slot safe for
+            // anything after).
             0x84 => {
                 if pc + 2 >= code_len {
                     return None;
                 }
+                local_slot_ops.push((pc, false, code[pc + 1] as u16));
+                local_slot_ops.push((pc, true, code[pc + 1] as u16));
                 pc += 3;
             }
             // i2l, i2f, i2d, l2i, l2f, l2d, f2i, f2l, f2d, d2i, d2l, d2f, i2b, i2c, i2s
@@ -1362,11 +1365,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // areturn — return object reference
@@ -1391,11 +1389,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 static_field_ops.push((pc, cp_idx));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: observable side effect — see tracker doc
-                // comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // getfield — object field read
@@ -1430,11 +1423,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: observable side effect — see tracker doc
-                // comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // newarray — needs heap for allocation
@@ -1506,11 +1494,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 3;
             }
             // invokeinterface — interface dispatch via helper (5 bytes: opcode, cp_hi, cp_lo, count, 0)
@@ -1521,11 +1504,6 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
-                // BUG-LQB-SCOPE: a callee can have arbitrary observable side
-                // effects — see tracker doc comment at its declaration above.
-                if first_committing_side_effect_pc.is_none() {
-                    first_committing_side_effect_pc = Some(pc);
-                }
                 pc += 5;
             }
             // invokedynamic — no longer a permanent scan-time veto (5 bytes:
@@ -1573,26 +1551,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 if pc + 4 >= code_len {
                     return None;
                 }
-                // BUG-LQB-SCOPE: refuse to compile the WHOLE method if a
-                // committing side effect (putfield/putstatic/array-store/
-                // invoke*) already occurred earlier in raw bytecode-pc order.
-                // The unconditional-trap codegen below can only "safely
-                // reject" by re-running the entire method from its
-                // interpreter entry (see the tracker's declaration-site
-                // comment above for the full explanation and the Liquibase
-                // `Scope` corruption this caused) — that re-run would
-                // double-execute the earlier side effect. Bailing out of
-                // compilation here is conservative (pc-order, not true
-                // control-flow reachability) but always SAFE: the method
-                // simply stays fully interpreted instead of risking a
-                // duplicated side effect. This must be checked BEFORE
-                // `indy_ops.push` / `needs_heap = true` below, matching every
-                // other "unsound shape" bail in this scanner (e.g. RBC.6).
-                if let Some(effect_pc) = first_committing_side_effect_pc {
-                    if effect_pc < pc {
-                        return None;
-                    }
-                }
+                // BUG-LQB-SCOPE gate removed — see the doc comment above
+                // (where `first_committing_side_effect_pc` used to be
+                // declared) for why it's no longer needed.
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 indy_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1802,6 +1763,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         indy_ops,
         has_athrow,
         has_newarray,
+        local_slot_ops,
     })
 }
 
@@ -1833,13 +1795,25 @@ pub struct JitScanResult {
     /// cannot) and lowers the instruction to an unconditional deopt to the
     /// interpreter via `DeoptReason::UnreachedCode` — see the 0xba codegen arm.
     pub indy_ops: Vec<(usize, u16)>,
-    /// RBC.6 — the method contains `athrow` (0xbf). Compilable only when
-    /// the method has NO local exception handlers (the athrow codegen
-    /// stashes the exception and returns the deopt sentinel; it cannot
-    /// branch to an in-method handler), and never via OSR.
+    /// RBC.6 — the method contains `athrow` (0xbf). Never OSR-eligible
+    /// (declined unconditionally in the OSR trigger, since the OSR bail
+    /// path resumes at the back-edge and could re-run side effects). A
+    /// method combining this with a non-empty local exception table is now
+    /// compilable — see `docs/feature-designs/jit-local-exception-handlers.md`
+    /// — subject to `local_handler_reads_unsafe_local`'s check on
+    /// `local_slot_ops` below.
     pub has_athrow: bool,
     /// The method contains primitive `newarray` (0xbc).
     pub has_newarray: bool,
+    /// RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
+    /// instruction's `(bytecode_pc, is_store, local_slot)`, in bytecode
+    /// order. See the field's push sites in `jit_scan` and
+    /// `local_handler_reads_unsafe_local` (jit/src/lib.rs) for how this is
+    /// used to conservatively verify a method's local exception handler(s)
+    /// never observe a local the JIT's params-only handler-frame
+    /// reconstruction (`route_jit_exception_through_method`) cannot
+    /// recover.
+    pub local_slot_ops: Vec<(usize, bool, u16)>,
 }
 
 /// Check if a bytecode method can be JIT-compiled (backward-compatible wrapper).
@@ -5901,6 +5875,26 @@ fn find_arith_loop_hoists(
         if loop_end > code_len {
             continue;
         }
+        // A virtual/static call can re-enter Java, trigger a safepoint, or
+        // deopt the current compiled frame.  The arithmetic expression is
+        // locally invariant, but keeping its synthetic frame value live
+        // across that boundary is not yet proven safe.  In particular,
+        // Lucene Sorter's recursive merge loop hoisted `middle - 1` across
+        // virtual comparisons and later consumed a corrupted bound.  Retain
+        // LICM for the compute-only loops it was designed for, but leave any
+        // loop containing an invocation in its bytecode order.
+        let mut scan = header;
+        let mut has_invoke = false;
+        while scan < loop_end {
+            if matches!(code[scan], 0xb6..=0xba) {
+                has_invoke = true;
+                break;
+            }
+            scan += bytecode_len_at(code, scan);
+        }
+        if has_invoke {
+            continue;
+        }
         let modified = find_modified_locals(code, header, loop_end);
 
         let mut pc = header;
@@ -8688,8 +8682,20 @@ impl Compiler {
         } else {
             Vec::new()
         };
-        let xmm_assignments = alloc_result.xmm_assignments;
-        let alloc_used_xmms = alloc_result.used_xmm_regs;
+        // The x86-64 System V ABI (Linux/macOS) makes every XMM register
+        // caller-saved.  Keeping a Java float/double local in XMM8..15 across
+        // an invoke therefore loses it when the callee/helper uses SIMD
+        // scratch registers.  MonotonicLongValues.Builder.pack exposed this as
+        // a zeroed page average after its invokespecial, corrupting Lucene's
+        // document map.  Windows x64 preserves XMM6..15, so retain the local
+        // allocation there; System V locals must use their canonical frame
+        // homes until post-call XMM spill/reload exists.
+        #[cfg(windows)]
+        let (xmm_assignments, alloc_used_xmms) =
+            (alloc_result.xmm_assignments, alloc_result.used_xmm_regs);
+        #[cfg(not(windows))]
+        let (xmm_assignments, alloc_used_xmms) =
+            (vec![None; alloc_result.xmm_assignments.len()], Vec::new());
         let num_reg_locals = local_assignments.iter().filter(|a| a.is_some()).count()
             + xmm_assignments.iter().filter(|a| a.is_some()).count();
         let callee_saved_size = alloc_used_regs.len() as i32 * 8; // Cast: x86-64 immediate encoding
@@ -11469,6 +11475,30 @@ impl Compiler {
         if total_sub > 0 {
             self.emit_add_rsp_imm(total_sub);
         }
+    }
+
+    /// Republish this caller's frame after a raw JIT-to-JIT CALL.
+    ///
+    /// A compiled callee records its own RBP in the precise-root mirror in its
+    /// prologue.  On return there is no Rust boundary to restore the caller's
+    /// mirror, leaving a later GC to interpret the caller with the already
+    /// returned callee's frame pointer.  That stale frame was the source of
+    /// the IVFKnn native-control-transfer corruption.  Preserve the Java
+    /// result in RAX while calling the same frame-record hook used by the
+    /// prologue.  The extra eight bytes maintain ABI alignment after PUSH; on
+    /// Windows `stack_arg_block_size(0)` additionally reserves shadow space.
+    fn emit_post_call_rbp_republish(&mut self) {
+        if !self.precise_maps || self.helpers.frame_record == 0 {
+            return;
+        }
+        self.buf.emit_byte(0x50); // PUSH RAX (callee return value)
+        let (abi_reserve, _) = Self::stack_arg_block_size(0);
+        let reserve = abi_reserve + 8; // restore 16-byte call-site alignment
+        self.emit_sub_rsp_imm(reserve);
+        self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+        self.emit_call_absolute(self.helpers.frame_record);
+        self.emit_add_rsp_imm(reserve);
+        self.buf.emit_byte(0x58); // POP RAX
     }
 
     // -----------------------------------------------------------------------
@@ -14514,6 +14544,23 @@ impl Compiler {
         // still issue the helper call.
         skip_post_init_helper: bool,
     ) {
+        // A raw compiled bump updates `Tlab::cursor` without going through
+        // the allocator's publication protocol. In concurrent Elasticsearch
+        // merge churn that left a malformed young-space span before the next
+        // collection could obtain an exact object map. Route through the
+        // checked runtime helper until the raw JIT path can share the same
+        // atomic publication contract as `Tlab::alloc_initialized`.
+        //
+        // The helper retains TLAB allocation (and its fast path); it merely
+        // removes the unsynchronised machine-code cursor writer.
+        if std::env::var_os("CRATONVM_ENABLE_UNSAFE_INLINE_TLAB_NEW").is_none() {
+            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32);
+            self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32);
+            self.emit_call_absolute(self.helpers.new_object);
+            return;
+        }
+
         // Compact reference-field layout: when a per-class layout is registered
         // for exactly this field count, allocate the packed body size and mark
         // the object compact (array_length = body bytes, GC_FLAG_COMPACT) inline
@@ -21174,6 +21221,18 @@ impl Compiler {
                     // Exception ref → first argument register.
                     let exc_slot = self.pop_stack();
                     self.load_slot_to_reg(ARG_REGS[0], exc_slot);
+                    // RBC.6 correctness fix — pass this athrow's own bytecode
+                    // pc as the second argument (a compile-time immediate) so
+                    // `jit_throw_exception` can stash it alongside the
+                    // exception. `execute_jit_call` then gives
+                    // `route_jit_exception_through_method` a real `throw_pc`
+                    // instead of `usize::MAX`, which — with 2+ exception-table
+                    // entries whose catch types are in a subtype relationship —
+                    // can match the wrong entry regardless of which
+                    // try-region actually threw. `pc` here is this
+                    // instruction's own bci (loaded after ARG_REGS[0] so it
+                    // does not disturb the exception-ref load above).
+                    self.emit_mov_imm32_sx(ARG_REGS[1], pc as i32);
                     self.emit_call_absolute(self.helpers.throw_exception);
                     // Helper returned the i64::MIN sentinel in RAX —
                     // propagate it as the method's return value.
@@ -23751,6 +23810,7 @@ impl Compiler {
                             self.emit_pre_safepoint_spill();
                             // Emit direct CALL to callee entry point
                             self.emit_call_absolute(callee_entry);
+                            self.emit_post_call_rbp_republish();
                             // T1.1.2 — direct call to a JIT-compiled
                             // callee is still a safepoint: the callee
                             // may allocate and trigger GC transitively.
@@ -24035,6 +24095,7 @@ impl Compiler {
                         let call_patch = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.self_call_patches.push(call_patch);
+                        self.emit_post_call_rbp_republish();
                         // Stage A (precise oop maps, B-K fix) — a self-recursive
                         // compiled call IS a GC-capable safepoint (the callee
                         // allocates: this is exactly bintrees18's recursive
@@ -25387,6 +25448,7 @@ impl Compiler {
                             // before any GC-triggering CALL.
                             self.emit_pre_safepoint_spill();
                             self.emit_call_absolute(callee_entry);
+                            self.emit_post_call_rbp_republish();
                             // Stage A (precise oop maps, B-K fix) — a direct
                             // invokespecial/virtual call to a compiled callee is a
                             // GC-capable safepoint (the callee may allocate). Like
@@ -25578,6 +25640,24 @@ impl Compiler {
                             //      fits in ARG_REGS.
                             let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
                             let args_fit = n >= 1 && needs_ctx_arg_count <= ARG_REGS.len();
+                            // The inline MIC/PIC path emits a raw CALL into
+                            // another compiled body.  That bypasses the
+                            // interpreter-owned JitEntryGuard, leaving the
+                            // active-RBP mirror pointing at the callee while
+                            // the root-chain metadata still names the caller.
+                            // A GC at that boundary can therefore select an
+                            // incompatible oop map and reclaim a live root.
+                            // `direct_jit_callee_calls_enabled()` gates the
+                            // inline MIC path (default-ON — see its doc
+                            // comment for the closing fixes and the
+                            // regression this default avoids; opt out with
+                            // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0`). The MIC
+                            // publishes one receiver class exactly once, with
+                            // an installing sentinel until its target and ABI
+                            // fields are complete. The multi-entry PIC has not
+                            // gained the same publication protocol, so it
+                            // stays off even when this flag is set.
+                            //
                             // Spring SpEL's flawed-pattern threshold test drives
                             // catastrophic regex backtracking through the mutually
                             // recursive BmpCharPropertyGreedy/GroupHead pair. The
@@ -25585,17 +25665,16 @@ impl Compiler {
                             // helper's frame bookkeeping for that recursion shape
                             // and short-circuits the search after only ~2k
                             // CharSequence accesses. Keep just this pair on the
-                            // helper path; the helper can still call compiled
-                            // callees, but preserves the backtracking state.
+                            // helper path even when the flag is set.
                             let regex_backtracking_frame = self
                                 .method_label
                                 .starts_with("java/util/regex/Pattern$BmpCharPropertyGreedy.match")
                                 || self
                                     .method_label
                                     .starts_with("java/util/regex/Pattern$GroupHead.match");
-                            let inline_virtual_ic_allowed = !regex_backtracking_frame;
-                            let pic_inline =
-                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
+                            let inline_virtual_ic_allowed = crate::direct_jit_callee_calls_enabled()
+                                && !regex_backtracking_frame;
+                            let pic_inline = false;
                             let mic_inline = inline_virtual_ic_allowed
                                 && !pic_inline
                                 && mic_ptr.is_some()
@@ -26053,10 +26132,13 @@ impl Compiler {
                                 self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
                                 // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                 self.buf.emit(&[0x41, 0xFF, 0xD3]);
+                                self.emit_post_call_rbp_republish();
 
-                                // JMP rel8 → .done  (2 bytes, patched)
-                                self.buf.emit(&[0xEB, 0x00]);
-                                done_patch = Some(self.buf.pos() - 1);
+                                // JMP rel32 → .done. The root-frame
+                                // republish above makes the distance exceed
+                                // the old rel8 budget.
+                                self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                                done_patches32.push(self.buf.pos() - 4);
 
                                 // .miss: patch both rel8 sites here.
                                 let miss_off = self.buf.pos();
@@ -33307,6 +33389,35 @@ mod tests {
     }
 
     #[test]
+    fn test_arith_licm_no_hoist_across_invoke_loop() {
+        // The arithmetic itself is invariant, but a loop that invokes Java is
+        // re-entrant: its synthetic LICM frame value must not be kept across
+        // that call boundary. This is the shape exercised by Lucene's
+        // recursive Sorter.mergeInPlace loop.
+        let code: Vec<u8> = vec![
+            0x15, 0x04, // 0: iload 4
+            0x1b, // 2: iload_1
+            0xa2, 0x00, 0x14, // 3: if_icmpge -> 23
+            0x1a, // 6: iload_0 (invariant)
+            0x06, // 7: iconst_3
+            0x68, // 8: imul
+            0x10, 0x0b, // 9: bipush 11
+            0x60, // 11: iadd
+            0x36, 0x05, // 12: istore 5
+            0xb8, 0x00, 0x01, // 14: invokestatic #1
+            0x84, 0x04, 0x01, // 17: iinc 4, 1
+            0xa7, 0xff, 0xec, // 20: goto -> 0
+        ];
+        let code_len = code.len();
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops.len(), 1);
+        assert!(
+            find_arith_loop_hoists(&code, code_len, &loops).is_empty(),
+            "a loop containing invoke* must keep arithmetic in bytecode order"
+        );
+    }
+
+    #[test]
     fn test_arith_licm_no_hoist_when_operand_modified() {
         // Same shape, but `base` (local 0) IS stored inside the loop, so the
         // expression is NOT loop-invariant and must not be hoisted.
@@ -39520,19 +39631,32 @@ mod tests {
         assert_eq!(result_f, 0.0);
     }
 
-    /// Per-clone MIC/PIC slot allocation. Compile a loop containing
-    /// an invokevirtual with a caller-supplied PIC slot, verify the
-    /// resulting CompiledMethod owns ADDITIONAL PIC slot boxes (one
+    /// Per-clone MIC slot allocation. Compile a loop containing an
+    /// invokevirtual with a caller-supplied MIC slot, verify the
+    /// resulting CompiledMethod owns ADDITIONAL MIC slot boxes (one
     /// per duplicated IC site), and that those new boxes' raw
     /// pointers actually appear baked into the emitted instruction
     /// stream at distinct addresses.
+    ///
+    /// The inline MIC fast path is default-ON — see
+    /// `direct_jit_callee_calls_enabled` — but this test sets its env var
+    /// explicitly anyway so it stays correct if the default ever flips back.
+    /// The multi-entry PIC path stays permanently disabled even when the
+    /// flag is set (it has not gained the MIC's atomic
+    /// receiver-class/entry publication protocol), so this exercises the
+    /// monomorphic MIC path, which the flag does cover.
     ///
     /// This is a static / structural check — we don't execute the
     /// loop (the test invoke helpers would panic), but verifying the
     /// duplicator minted-and-baked the right number of fresh slots
     /// is sufficient to prove the per-clone path runs.
     #[test]
-    fn test_unroll_mints_per_clone_pic_slots() {
+    fn test_unroll_mints_per_clone_mic_slots() {
+        // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
+        // setting it here is observed immediately; no other jit test asserts
+        // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel
+        // `cargo test`.
+        std::env::set_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS", "1");
         use crate::JitInvokeInfo;
         // Bytecode: a counted loop with a single invokevirtual.
         //
@@ -39614,7 +39738,7 @@ mod tests {
 
         // The compile *may* bail before duplicating if the loop body
         // hits an unsupported path. We assert compilation succeeds
-        // and that AT LEAST one extra PIC slot was minted (3 expected
+        // and that AT LEAST one extra MIC slot was minted (3 expected
         // from 4x unroll, but the static heuristic could pick 2x for
         // a body ≤ 50 bytes — either way the extra count > 0 proves
         // the per-clone path ran). The static unroller threshold is
@@ -39647,32 +39771,34 @@ mod tests {
 
         // Compilation should succeed: the body has a back-edge and
         // the unroller fires. After unrolling, the compiled method's
-        // `_jit_pic_slots` should contain the per-clone PIC slots
+        // `_jit_mic_slots` should contain the per-clone MIC slots
         // freshly minted by the duplicator.
         //
         // Body span is 15 bytes (pc 4..=19) → static heuristic picks
         // 4x unroll (3 extra copies). The inline-IC fast path engages
-        // for invokevirtual with `args_fit && pic_ptr.is_some()`,
-        // which holds here (n=1, vm_ptr+1 ≤ ARG_REGS.len()). So 3
-        // fresh PIC slots should be minted (one per copy).
+        // for invokevirtual with `args_fit && mic_ptr.is_some()` (PIC
+        // stays disabled unconditionally), which holds here (n=1,
+        // vm_ptr+1 ≤ ARG_REGS.len()). So 3 fresh MIC slots should be
+        // minted (one per copy).
         let method = compiled.expect("invokevirtual-in-loop must compile");
+        std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
         // The compiled method does NOT carry the caller-supplied
-        // PIC slot in its _jit_pic_slots (that vector is owned by
+        // MIC slot in its _jit_mic_slots (that vector is owned by
         // the caller in the production path; in this test the box
-        // is held by the local `caller_pic`). It DOES carry the
+        // is held by the local `caller_mic`). It DOES carry the
         // duplicator-minted clones. Verify count > 0 to confirm
         // the per-clone path ran.
-        let cloned_picks = method._jit_pic_slots.len();
+        let cloned_mics = method._jit_mic_slots.len();
         assert!(
-            cloned_picks >= 1,
-            "expected at least one cloned PIC slot from unroll, got {} \
+            cloned_mics >= 1,
+            "expected at least one cloned MIC slot from unroll, got {} \
              — per-clone IC slot allocation did not run",
-            cloned_picks,
+            cloned_mics,
         );
         // And no duplicates among the cloned slots' raw pointers.
-        // Each Box<JitPICSlot> has a unique heap address.
+        // Each Box<JitMICSlot> has a unique heap address.
         let mut ptrs: Vec<usize> = method
-            ._jit_pic_slots
+            ._jit_mic_slots
             .iter()
             // Cast: non-negative index/count to usize
             .map(|b| b.as_ref() as *const _ as usize)
@@ -39686,7 +39812,7 @@ mod tests {
         assert_eq!(
             dedup_len,
             ptrs.len(),
-            "cloned PIC slots must have distinct addresses (collision \
+            "cloned MIC slots must have distinct addresses (collision \
              would mean cache hits cross-pollute between unrolled copies)",
         );
 

@@ -116,7 +116,13 @@ fn populate_sfi(
     // allocate a fresh `String` per frame. The cache returns an
     // `Arc<str>` keyed by `ClassId`; first touch computes the dotted
     // form, subsequent reads clone the `Arc`. (Rust-side, no Java alloc.)
-    let cid = ctx.class_id_by_name(&entry.class_name);
+    // Prefer the ClassId captured directly off the live interpreter frame
+    // (see `StackTraceEntry::class_id`'s doc comment) over a fresh by-name
+    // lookup: a class executing its own `<clinit>` is guaranteed loaded, but
+    // is not reliably found by `class_id_by_name` from deep inside that same
+    // `<clinit>` (observed via `SpringFactoriesLoader`/`EntityManagerFactoryUtils`
+    // calling `LogFactory.getLog()` from their own static initializers).
+    let cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
     let dotted = match cid {
         Some(c) => crate::lang_class::dotted_class_name(c, &entry.class_name),
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),
@@ -736,14 +742,32 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             };
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
+                _ => String::new(),
             };
-            if internal.is_empty() {
-                return Ok(Some(Value::Object(None)));
+            if !internal.is_empty() {
+                if let Some(cid) = ctx.class_id_by_name(&internal) {
+                    let mirror = ctx.get_class_mirror(cid);
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
             }
-            if let Some(cid) = ctx.class_id_by_name(&internal) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
+            // Fall back to `classOrMemberName` (`populate_sfi` stores the Class
+            // mirror there when its own ClassId resolution -- which prefers
+            // the guaranteed-valid `StackTraceEntry::class_id` over a by-name
+            // lookup -- succeeds). This rescues exactly the case a fresh
+            // by-name lookup here can miss: a frame whose class is still
+            // running its own `<clinit>` (`SpringFactoriesLoader`/
+            // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from
+            // their own static initializers, walked by log4j-api's
+            // `StackLocator`).
+            if let Some(idx) = ctx.resolve_field_index("java/lang/ClassFrameInfo", "classOrMemberName")
+            {
+                let v = ctx.get_field(this, idx);
+                if let Value::Object(Some(_)) = v {
+                    return Ok(Some(v));
+                }
+            }
+            if std::env::var_os("CRATONVM_SFI_NULL_TRACE").is_some() {
+                eprintln!("[SFI-NULL-TRACE getDeclaringClass] both internal={internal:?} lookup and classOrMemberName fallback failed");
             }
             Ok(Some(Value::Object(None)))
         },
@@ -932,6 +956,16 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(_)) = v {
                 return Ok(Some(v));
             }
+        }
+        if std::env::var_os("CRATONVM_SFI_NULL_TRACE").is_some() {
+            let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::from("<no SF_DECL_INTERNAL>"),
+            };
+            eprintln!(
+                "[SFI-NULL-TRACE] declaringClass() returning NULL for frame internal={internal:?} resolved_cid={:?}",
+                if internal.is_empty() { None } else { ctx.class_id_by_name(&internal) }
+            );
         }
         Ok(Some(Value::Object(None)))
     }

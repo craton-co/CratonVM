@@ -150,6 +150,7 @@ pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEn
         source_file,
         line_number,
         byte_code_index: bci_i32,
+        class_id: Some(frame.class_id),
     }
 }
 
@@ -182,6 +183,7 @@ pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
             source_file: f.source_file_arc(),
             line_number: LINE_NUMBER_UNKNOWN,
             byte_code_index: f.last_instr_pc.min(i32::MAX as usize) as i32,
+            class_id: Some(f.class_id),
         })
         .collect()
 }
@@ -196,6 +198,7 @@ pub fn synthetic_entry(class_name: Arc<str>, method_name: Arc<str>) -> StackTrac
         source_file: None,
         line_number: LINE_NUMBER_NATIVE,
         byte_code_index: -1,
+        class_id: None,
     }
 }
 
