@@ -8766,6 +8766,44 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             _ => ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]),
         }
     });
+    // method()/uri() — public HttpRequest getters. `build()` above allocates
+    // the returned object directly as class `java/net/http/HttpRequest`
+    // (the abstract JDK class itself, not a concrete subclass), so any real
+    // Java bytecode invoking these instance methods resolves against that
+    // abstract declaration (no Code attribute) unless a native is registered
+    // on this exact class name. Only field-0 (method) and field-1 (uri, a
+    // plain String — see `newBuilder`/`uri` above) were previously
+    // read/written internally by this file's own Rust helpers
+    // (`re5_do_request` et al.); nothing exposed them back to Java callers.
+    // Real-world callers building a request via this builder and then
+    // inspecting it as a genuine `HttpRequest` (not just handing it to
+    // `HttpClient.send`) hit `AbstractMethodError: method
+    // java/net/http/HttpRequest.method()Ljava/lang/String; has no Code
+    // attribute` — see
+    // docs/known-issues/springboot/cacheautoconfigurationtests-hazelcast-httprequest-abstractmethoderror.md
+    // (Hazelcast's `RestClient.call` calls `request.method()` purely for its
+    // own logging/retry bookkeeping after building the request).
+    r.register(req, "method", "()Ljava/lang/String;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        match ctx.get_field(request, 0) {
+            m @ Value::Object(Some(_)) => Ok(Some(m)),
+            _ => Ok(Some(Value::Object(Some(ctx.create_string("GET"))))),
+        }
+    });
+    r.register(req, "uri", "()Ljava/net/URI;", |ctx, args| {
+        let request = obj_arg(args, 0)?;
+        let uri_str = match ctx.get_field(request, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let uri_string_obj = ctx.create_string(&uri_str);
+        ctx.invoke(
+            "java/net/URI",
+            "create",
+            "(Ljava/lang/String;)Ljava/net/URI;",
+            &[Value::Object(Some(uri_string_obj))],
+        )
+    });
 
     let bl = "java/net/http/HttpRequest$Builder";
     r.register(
