@@ -81,17 +81,16 @@ immediately post-merge, hit a NEW `EXCEPTION_STACK_OVERFLOW` crash in
 investigation**: confirmed the SAME crash reproduces on a byte-for-byte
 clean, unmodified `origin/dev` build with the ban fully in place (default
 config) — a genuine, pre-existing `dev` regression that had nothing to do
-with Lucene/JIT, just discovered by coincidence while testing it. See
-[`ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`](ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md)
-for the full writeup — flagged as a higher-priority, separate issue (it's
-not gated behind any opt-in flag). The Lucene ban itself was left in its
-original (banned) state since lifting it never showed a performance
-benefit for this test — no reason to carry the extra unproven-safety risk
-alongside an already-serious unrelated crash. **This specific performance
-lead is closed** (the ban was never the dominant cost driver for
-`testSlicesDense`, so there's no more upside in chasing it further here)
-— any future work on the `get_field` stack overflow itself belongs in its
-own investigation, not this doc.
+with Lucene/JIT, just discovered by coincidence while testing it. **Since
+FIXED** (same session, root cause: an unrelated `Path.toString()` native
+infinite-recursion bug in `native-builtins/src/phases_late.rs` — see
+[`ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`](../../internal/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md)
+for the full writeup). The Lucene ban itself was left in its original
+(banned) state regardless, since lifting it never showed a performance
+benefit for this test — no reason to carry the extra unproven-safety risk.
+**This specific performance lead is closed** (the ban was never the
+dominant cost driver for `testSlicesDense`, so there's no more upside in
+chasing it further here).
 
 **Finding 2** (not investigated further, real risk if touched): the
 *separate* `java/util/*` package ban in the same skip list (a documented
