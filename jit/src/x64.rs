@@ -7651,7 +7651,14 @@ struct Compiler {
     /// be resolved here (no resolver, or the resolver returns `None`) bails
     /// the whole compile (`x64::compile` returns `None`) rather than
     /// guessing — see `try_compile_inner`.
-    indy_info: Vec<(usize, usize, u8)>,
+    ///
+    /// The 4th tuple element (`indy_arg_type_tags`) is the descriptor's
+    /// per-argument JVM type tag sequence, in push order — used ONLY by the
+    /// OSR-exit/uncommon-trap deopt snapshot (`build_and_record_deopt_point`)
+    /// to precisely type this call's own arguments on the operand stack
+    /// instead of falling back to the coarse per-method `wide_fp` gate. See
+    /// `indy_arg_type_tags`'s doc comment.
+    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
     /// Direct call targets: (bytecode_pc, direct call info).
     /// For invokestatic/invokespecial where the callee is already JIT-compiled.
     direct_calls: Vec<(usize, super::JitDirectCall)>,
@@ -7735,6 +7742,29 @@ struct Compiler {
     /// Expected simulated-stack depth at each forward branch target.
     /// Used to fix up the stack when dead code becomes live at a merge point.
     branch_target_stack_depth: FxHashMap<usize, usize>,
+    /// Companion to `branch_target_stack_depth`: the operand-stack oop-mark
+    /// vector (`stack_oop_marks`) live at each forward branch target, recorded
+    /// in lock-step via `record_branch_target_depth`.
+    ///
+    /// FIX: the dead-code merge reconstruction (`compile_bytecode`'s main
+    /// dispatch loop, where dead code becomes live again at a branch target)
+    /// used to rebuild `stack_oop_marks` from scratch as all-`false`,
+    /// "relying" on the merge target's own bytecode to re-tag any slot that
+    /// genuinely holds a reference as it re-executes the producing
+    /// instruction. That only holds for slots actually PRODUCED between the
+    /// branch and the merge point — a value pushed well BEFORE the branch
+    /// (e.g. `getstatic System.out` ahead of an `if`/`else` computing a later
+    /// argument) is simply carried across untouched, and its true oop-mark
+    /// was silently discarded: a live reference got permanently mis-marked as
+    /// a plain non-oop value for the rest of the compiled method. This is
+    /// invisible in ordinary execution (a conservative frame sweep still
+    /// finds the value), but it silently defeated the OSR-exit/invokedynamic
+    /// uncommon-trap deopt snapshot's operand-stack decoding at any later
+    /// safepoint that read the slot — see
+    /// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`.
+    /// Recording the real marks here lets the reconstruction restore them
+    /// instead of guessing `false`.
+    branch_target_stack_oop_marks: FxHashMap<usize, Vec<bool>>,
     /// Set to true when an internal error (e.g. stack underflow) is detected
     /// during compilation.  `compile_bytecode` checks this and bails out.
     failed: bool,
@@ -7843,6 +7873,20 @@ struct Compiler {
     /// `Register`/`StackSlot`. Empty unless `deopt_real_enabled()` (the only
     /// consumer is the gated snapshot), so production compiles skip the scan.
     local_kinds: Vec<LocalKind>,
+    /// deopt-osr — per-PC local liveness (`regalloc::live_locals_per_pc`),
+    /// bit `i` set ⇒ local `i` may still be read at that bci. Indexed by 0's
+    /// only when `deopt_real_enabled()` populates it (see `local_kinds`
+    /// above); empty otherwise. Consumed by `build_and_record_deopt_point` to
+    /// tell "local's machine location is unreadable because it's genuinely
+    /// dead here" (safe to substitute a placeholder) apart from "unreadable
+    /// and still needed" (must reject the snapshot). Without this, an
+    /// OSR-exit snapshot at a trap that lands just past a hot loop — where
+    /// the loop's own induction variable is provably dead — was rejected
+    /// wholesale, and the safe-reject fallback re-runs the interpreter from
+    /// the pre-OSR-entry frame, silently re-executing every loop iteration
+    /// the OSR-compiled code already committed
+    /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+    local_liveness: Vec<u64>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -8035,6 +8079,14 @@ struct Compiler {
     static_field_info_idx: FxHashMap<usize, usize>,
     invoke_info_idx: FxHashMap<usize, usize>,
     indy_info_idx: FxHashMap<usize, usize>,
+    /// deopt-osr indy-arg-types fix: the invokedynamic call's own per-argument
+    /// type tags (`indy_arg_type_tags`), keyed by the trap's bci — populated
+    /// by the `0xba` codegen arm right before it snapshots the OSR-exit deopt
+    /// point. Consumed by `build_and_record_deopt_point`'s operand-stack loop
+    /// to precisely type the top `tags.len()` stack entries (this call's
+    /// arguments) instead of the coarse per-method `wide_fp` gate. See
+    /// `indy_arg_type_tags`'s doc comment for the motivating bug.
+    indy_stack_arg_types: FxHashMap<usize, Vec<u8>>,
     direct_calls_idx: FxHashMap<usize, usize>,
     mic_slots_idx: FxHashMap<usize, usize>,
     pic_slots_idx: FxHashMap<usize, usize>,
@@ -8859,6 +8911,7 @@ impl Compiler {
             ldc_string_info: Vec::new(),
             ldc2w_info: Vec::new(),
             branch_target_stack_depth: FxHashMap::default(),
+            branch_target_stack_oop_marks: FxHashMap::default(),
             failed: false,
             helpers,
             scratch_xmm_in_use: 0,
@@ -8882,6 +8935,7 @@ impl Compiler {
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
+            local_liveness: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -8916,6 +8970,7 @@ impl Compiler {
             static_field_info_idx: FxHashMap::default(),
             invoke_info_idx: FxHashMap::default(),
             indy_info_idx: FxHashMap::default(),
+            indy_stack_arg_types: FxHashMap::default(),
             direct_calls_idx: FxHashMap::default(),
             mic_slots_idx: FxHashMap::default(),
             pic_slots_idx: FxHashMap::default(),
@@ -9334,6 +9389,29 @@ impl Compiler {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
                 frame_value_for_slot(reg, xmm, off, false)
             };
+            // OSR-exit dead-local fix (see `local_liveness`'s doc comment):
+            // an `Unsupported` non-oop local whose machine location can't be
+            // decoded at `bci` doesn't need rejecting the whole snapshot IF
+            // it's provably dead here — nothing between `bci` and its next
+            // definition reads it, so its resumed value is irrelevant. Only
+            // applied to non-oop slots (`is_oop` is false in this arm): a
+            // dead ref-typed local keeps the existing conservative behaviour,
+            // since substituting a bogus non-null pointer would risk a GC
+            // hazard the way substituting a bogus int never can.
+            // `local_liveness` is empty when `deopt_real_enabled()` didn't run
+            // the scan, so `unwrap_or(u64::MAX)` degrades to the old
+            // behaviour (every slot "live", never override) rather than
+            // panicking or mis-treating everything as dead.
+            let fv = if !is_oop && matches!(fv, FrameValue::Unsupported) && i < 64 {
+                let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
+                if live_here & (1u64 << i) == 0 {
+                    FrameValue::Undefined
+                } else {
+                    fv
+                }
+            } else {
+                fv
+            };
             locals.push(fv);
         }
 
@@ -9352,29 +9430,51 @@ impl Compiler {
         // Pure-int/ref methods (the BCE pilot) are unaffected.
         let wide_fp = self.uses_long_float_double;
         let n = self.stack.len().min(self.stack_oop_marks.len());
+        // deopt-osr indy-arg-types fix: at an invokedynamic trap bci, the top
+        // `indy_arg_types.len()` stack entries are this call's own arguments,
+        // whose types are known PRECISELY from its descriptor — unlike the
+        // rest of the operand stack, which has no per-entry width source and
+        // falls back to the coarse `wide_fp` gate below. `indy_arg_base` is
+        // the first (deepest) global stack index these tags cover; `None`
+        // outside an indy trap bci (the ordinary case), so behavior there is
+        // unchanged. See `indy_stack_arg_types`'s doc comment.
+        let indy_arg_types = self.indy_stack_arg_types.get(&bci);
+        let indy_arg_base = indy_arg_types.map(|tags| n.saturating_sub(tags.len()));
         let mut stack = Vec::with_capacity(n);
         for i in 0..n {
             let is_oop = self.stack_oop_marks[i];
+            let indy_tag = indy_arg_types.zip(indy_arg_base).and_then(|(tags, base)| {
+                if i >= base {
+                    tags.get(i - base).copied()
+                } else {
+                    None
+                }
+            });
             stack.push(match &self.stack[i] {
                 StackSlot::Frame(off) => {
                     if is_oop {
                         FrameValue::StackSlotRef(-*off)
-                    } else if wide_fp {
-                        FrameValue::Unsupported
-                    } else {
+                    } else if indy_tag == Some(b'J') {
+                        FrameValue::StackSlotLong(-*off)
+                    } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::StackSlot(-*off)
+                    } else {
+                        FrameValue::Unsupported
                     }
                 }
                 // A register-resident operand: a ref → `RegisterRef` (GC-tracked
                 // Object on resume); a non-oop slot is a cat-1 `Register` (Int)
-                // only when the method has no wide/FP value that could occupy it.
+                // only when the method has no wide/FP value that could occupy it
+                // (or an indy-arg tag proves it's actually int/long).
                 StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
-                    } else if wide_fp {
-                        FrameValue::Unsupported
-                    } else {
+                    } else if indy_tag == Some(b'J') {
+                        FrameValue::RegisterLong(*r)
+                    } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::Register(*r)
+                    } else {
+                        FrameValue::Unsupported
                     }
                 }
                 StackSlot::Xmm(_) => FrameValue::Unsupported,
@@ -9529,6 +9629,25 @@ impl Compiler {
         if let Some(mark) = self.stack_oop_marks.last_mut() {
             *mark = true;
         }
+    }
+
+    /// Record the operand-stack depth AND oop-mark vector live at
+    /// `target_pc`, the first time this branch target is seen — the single
+    /// entry point every branch-emitting opcode handler uses instead of
+    /// touching `branch_target_stack_depth` directly, so the two maps can
+    /// never drift out of lock-step. See `branch_target_stack_oop_marks`'s
+    /// doc comment for why the oop marks matter (the dead-code merge
+    /// reconstruction needs them to avoid silently mis-marking a live
+    /// reference as non-oop).
+    fn record_branch_target_depth(&mut self, target_pc: usize) {
+        let stack_len = self.stack.len();
+        let marks = self.stack_oop_marks.clone();
+        self.branch_target_stack_depth
+            .entry(target_pc)
+            .or_insert(stack_len);
+        self.branch_target_stack_oop_marks
+            .entry(target_pc)
+            .or_insert(marks);
     }
 
     /// Pop a value from the simulated operand stack.
@@ -11789,9 +11908,7 @@ impl Compiler {
         self.forward_patches.push((patch_offset, target_pc));
         // Record the taken-edge stack depth so the merge-target revival
         // rebuilds the canonicalized slots (mirrors the regular handler).
-        self.branch_target_stack_depth
-            .entry(target_pc)
-            .or_insert(self.stack.len());
+        self.record_branch_target_depth(target_pc);
         self.reset_spills();
 
         Some(next_op_pc + 3)
@@ -11979,9 +12096,7 @@ impl Compiler {
         // Record the merge-point stack depth so the dispatch loop's
         // merge-point canonicalization (if it kicks in at L2) sees a
         // consistent expectation. We just pushed one value.
-        self.branch_target_stack_depth
-            .entry(l2_pc)
-            .or_insert(self.stack.len());
+        self.record_branch_target_depth(l2_pc);
 
         Some(l2_pc)
     }
@@ -18054,16 +18169,43 @@ impl Compiler {
                     // could emit an oop map that mislabels a slot (a stale
                     // `true` pins a non-reference word; a stale `false` would
                     // omit a real oop, which the conservative frame sweep
-                    // still catches, but we must not rely on that here). We
-                    // reset every reconstructed slot to `false` (conservative
-                    // / sound default): the merge-target's own bytecode will
-                    // re-tag any slot that genuinely holds an oop as it
-                    // re-executes the producing instruction. Resetting to a
-                    // known length also keeps marks aligned with `stack`,
-                    // satisfying the lock-step invariant assumed everywhere
-                    // marks is read.
-                    self.stack_oop_marks.clear();
-                    self.stack_oop_marks.resize(expected_depth, false);
+                    // still catches, but we must not rely on that here).
+                    //
+                    // FIX (testoutputbuffer-writespeed-content-length-mismatch
+                    // follow-up): resetting every reconstructed slot to
+                    // `false` was UNSOUND, not just conservative — the "the
+                    // merge target's own bytecode will re-tag any slot that
+                    // genuinely holds an oop as it re-executes the producing
+                    // instruction" argument only holds for slots PRODUCED
+                    // between the branch and this merge point. A slot pushed
+                    // well BEFORE the branch (e.g. `getstatic` of a reference
+                    // field, sitting under an `if`/`else` that only computes
+                    // a LATER argument) is simply carried across untouched:
+                    // nothing re-executes its producing instruction, so a
+                    // blanket `false` here permanently mis-marked it as
+                    // non-oop for the rest of the compiled method — silently
+                    // defeating the OSR-exit/invokedynamic-uncommon-trap
+                    // deopt snapshot's operand-stack decoding at any later
+                    // safepoint that read the slot (confirmed via
+                    // `getstatic System.out` immediately followed by an
+                    // `if`/`else`-computed `makeConcatWithConstants` arg —
+                    // see
+                    // `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+                    // `record_branch_target_depth` now captures the REAL
+                    // marks live at this target the first time it's seen
+                    // (mirroring how `expected_depth` itself is captured);
+                    // use them when present. Falls back to the historical
+                    // all-`false` reconstruction only if no marks were ever
+                    // recorded for this pc (shouldn't happen — every
+                    // depth-recording call site records marks alongside —
+                    // but degrades to the pre-existing, already-reviewed-safe
+                    // behavior rather than panicking or guessing).
+                    self.stack_oop_marks = self
+                        .branch_target_stack_oop_marks
+                        .get(&pc)
+                        .filter(|marks| marks.len() == expected_depth)
+                        .cloned()
+                        .unwrap_or_else(|| vec![false; expected_depth]);
                     self.stack_oop_marks_exact = expected_depth == 0;
                 } else {
                     self.pc_to_native[pc] = -1;
@@ -20499,9 +20641,7 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
+                    self.record_branch_target_depth(target_pc);
                     self.reset_spills();
                     pc += 3;
                 }
@@ -20569,9 +20709,7 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
+                    self.record_branch_target_depth(target_pc);
                     self.reset_spills();
                     pc += 3;
                 }
@@ -20935,9 +21073,7 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
+                    self.record_branch_target_depth(target_pc);
                     self.reset_spills();
                     dead = true;
                     pc += 3;
@@ -26331,8 +26467,8 @@ impl Compiler {
                 // `invokespecial AssertionError.<init>` + `athrow`.
                 0xba => {
                     // O(1) pc-indexed lookup — see `indy_info` field doc.
-                    let info = self.indy_info_idx.get(&pc).map(|&i| self.indy_info[i]);
-                    let Some((_pc, arg_slots, ret_type)) = info else {
+                    let info = self.indy_info_idx.get(&pc).map(|&i| self.indy_info[i].clone());
+                    let Some((_pc, arg_slots, ret_type, arg_type_tags)) = info else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
                         // exactly like every other CP-resolved metadata miss
@@ -26370,6 +26506,16 @@ impl Compiler {
                     // reason) so the resume sinks' de-speculation applies the
                     // give-up-immediately policy — see
                     // `emit_osr_exit_map_at_reason`.
+                    //
+                    // deopt-osr indy-arg-types fix: record this call's own
+                    // per-argument type tags BEFORE the snapshot is built, so
+                    // the operand-stack loop can precisely type the top
+                    // `arg_type_tags.len()` stack entries instead of falling
+                    // back to the coarse `wide_fp` gate — see
+                    // `indy_stack_arg_types`'s doc comment.
+                    if !arg_type_tags.is_empty() {
+                        self.indy_stack_arg_types.insert(pc, arg_type_tags.clone());
+                    }
                     self.emit_osr_exit_map_at_reason(pc, crate::deopt::DeoptReason::UnreachedCode);
 
                     let patch = self.emit_jmp_rel32_patch();
@@ -26660,9 +26806,7 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
+                    self.record_branch_target_depth(target_pc);
                     self.reset_spills();
                     pc += 3;
                 }
@@ -26697,9 +26841,7 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
-                    self.branch_target_stack_depth
-                        .entry(target_pc)
-                        .or_insert(self.stack.len());
+                    self.record_branch_target_depth(target_pc);
                     self.reset_spills();
                     pc += 3;
                 }
@@ -26837,9 +26979,7 @@ impl Compiler {
                         // No-op: fall through. We still need a non-empty
                         // branch-target record so downstream merges see
                         // the expected stack depth.
-                        self.branch_target_stack_depth
-                            .entry(target_pc)
-                            .or_insert(self.stack.len());
+                        self.record_branch_target_depth(target_pc);
                         self.reset_spills();
                         pc += 3;
                     } else {
@@ -26855,9 +26995,7 @@ impl Compiler {
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                         self.forward_patches.push((patch_offset, target_pc));
-                        self.branch_target_stack_depth
-                            .entry(target_pc)
-                            .or_insert(self.stack.len());
+                        self.record_branch_target_depth(target_pc);
                         self.reset_spills();
                         pc += 3;
                     }
@@ -26893,9 +27031,7 @@ impl Compiler {
                         let patch_offset = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.forward_patches.push((patch_offset, target_pc));
-                        self.branch_target_stack_depth
-                            .entry(target_pc)
-                            .or_insert(self.stack.len());
+                        self.record_branch_target_depth(target_pc);
                         self.reset_spills();
                         pc += 3;
                     } else {
@@ -26911,9 +27047,7 @@ impl Compiler {
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                         self.forward_patches.push((patch_offset, target_pc));
-                        self.branch_target_stack_depth
-                            .entry(target_pc)
-                            .or_insert(self.stack.len());
+                        self.record_branch_target_depth(target_pc);
                         self.reset_spills();
                         pc += 3;
                     }
@@ -27240,7 +27374,7 @@ pub fn compile_with_param_slots(
     // field doc on the `Compiler` struct. Empty from the legacy `compile()`
     // test wrapper (which also passes no `indy_ops` to `jit_scan` callers, so
     // this is always consistent with an invokedynamic-free method there).
-    indy_info: Vec<(usize, usize, u8)>,
+    indy_info: Vec<(usize, usize, u8, Vec<u8>)>,
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
@@ -27948,6 +28082,8 @@ pub fn compile_with_param_slots(
         compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
+        // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
+        compiler.local_liveness = super::regalloc::live_locals_per_pc(code, code_len, num_params);
     }
 
     // Emit prologue
