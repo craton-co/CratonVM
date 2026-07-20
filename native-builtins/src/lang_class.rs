@@ -5333,8 +5333,68 @@ fn synthetic_declared_field_alias(
     }
 }
 
+/// Map a `LambdaSerialMetadata::capture_types` char (JVMS field-descriptor
+/// first byte, or `'L'` standing in for both reference and array captures —
+/// `parse_descriptor_args` erases the specific class/array-component name)
+/// to a field descriptor string. Reference captures get a generic
+/// `Ljava/lang/Object;` descriptor since the real one isn't retained; this
+/// only needs to be reflection-readable, not exact — real getters
+/// (`Field.get`) don't re-validate against the declared type on read.
+fn capture_field_descriptor(type_char: char) -> String {
+    match type_char {
+        'B' | 'C' | 'I' | 'S' | 'Z' | 'J' | 'F' | 'D' => type_char.to_string(),
+        _ => "Ljava/lang/Object;".to_string(),
+    }
+}
+
+/// Synthesize the captured-variable fields (`arg$1`, `arg$2`, ...) that
+/// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
+/// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
+/// `class_manager` (they live in `shared.lambda_proxies` instead — see
+/// `docs/internal/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
+/// for the same root cause in a sibling `Comparable` check), so
+/// `NativeContext::declared_fields` can't see them and reflective access to
+/// a lambda's captured field (e.g. AssertJ's `extracting("arg$1")` fallback,
+/// or a test's own `.extracting("jwtProcessor.arg$1...")`) fails with
+/// `NoSuchFieldException` even though the value is right there on the proxy
+/// object at field slot `i` (`allocate_lambda_proxy` in
+/// `vm/src/runtime/invokedynamic.rs` sets captures at fields `0..n` in
+/// factory-argument order, matching `capture_types`' order).
+///
+/// Field *naming* is 1-based (`arg$1` is the first capture, slot 0) —
+/// verified empirically against real HotSpot's `InnerClassLambdaMetafactory`
+/// output: there is no `arg$0`. The heap *slot index* stays 0-based, since
+/// `allocate_lambda_proxy` writes captures starting at field 0.
+fn lambda_proxy_captured_fields(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<FieldMetadata> {
+    let Some(meta) = ctx.lambda_proxy_serial_metadata(class_id) else {
+        return Vec::new();
+    };
+    meta.capture_types
+        .chars()
+        .enumerate()
+        .map(|(i, ty)| FieldMetadata {
+            name: format!("arg${}", i + 1),
+            descriptor: capture_field_descriptor(ty),
+            // ACC_PRIVATE | ACC_FINAL, deliberately WITHOUT ACC_SYNTHETIC:
+            // real HotSpot's `InnerClassLambdaMetafactory` adds these fields
+            // as plain private-final, not synthetic (verified empirically —
+            // AssertJ's `FieldUtils.readField` hard-rejects synthetic fields
+            // with `IllegalArgumentException: Reading synthetic field is not
+            // supported`, yet real JDK reflection over `arg$N` is exactly
+            // the pattern these tests rely on).
+            access_flags: 0x0012,
+            slot_index: i,
+            declaring_class_id: class_id,
+            is_static: false,
+        })
+        .collect()
+}
+
 fn declared_fields_with_aliases(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<FieldMetadata> {
     let mut fields = ctx.declared_fields(class_id);
+    if fields.is_empty() {
+        fields = lambda_proxy_captured_fields(ctx, class_id);
+    }
     if let Some(alias) = synthetic_declared_field_alias(ctx, class_id) {
         if fields.iter().all(|field| field.name != alias.name) {
             fields.push(alias);
