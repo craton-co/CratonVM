@@ -43492,8 +43492,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let pending_id = crate::t27_tls::stash_pending_layered_socket(ctx, wrapped, ssl_context, host.clone())
-                .map_err(|message| RuntimeError::IOException { message })?;
+            // Same trust-anchor/TrustManager resolution `new13_do_create_socket`
+            // (the other `SSLSocketFactory.createSocket` overloads, and this
+            // one's own prior CLIENT-mode behavior before SERVER-mode reuse
+            // was added) already uses successfully — `args[0]` is this
+            // factory. Confirmed necessary: `ssl_context`-keyed resolution
+            // alone (`t27_tls::context_trust_root_ders`) came up empty for
+            // this SSLBundle scenario, whose anchors instead live in the
+            // legacy p68 factory-identity-keyed table populated by
+            // `SSLContext.getSocketFactory()`'s own "carry trust anchors
+            // forward onto the factory" fix.
+            let extra_roots = p68_factory_trust_roots(ctx, args);
+            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let pending_id = crate::t27_tls::stash_pending_layered_socket(
+                ctx,
+                wrapped,
+                ssl_context,
+                host.clone(),
+                port_i as u16,
+                extra_roots,
+                java_tm_key,
+            )
+            .map_err(|message| RuntimeError::IOException { message })?;
             let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let host_obj = ctx.create_string(&host);
             let pending_tls_id = crate::servlet::PENDING_LAYERED_SOCK_ID_BASE + pending_id;
@@ -43538,8 +43558,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx.begin_blocking_region();
         let stream_result = crate::t27_tls::drive_pending_layered_handshake(pending_id);
         ctx.end_blocking_region();
-        let stream_id =
-            stream_result.map_err(|message| RuntimeError::IOException { message })?;
+        // Match `new13_do_create_socket`'s existing contract: a rustls
+        // handshake failure (rejected/mismatched certificate, no common
+        // cipher suite, etc.) must surface as `SSLHandshakeException`, not a
+        // generic `IOException` — callers (this test cluster's
+        // `connectWithSslBundle`/`connectWithSslBundleAndOptionsMismatch`
+        // among them) specifically assert on the JSSE exception type for an
+        // intentionally-rejected connection.
+        let stream_id = stream_result.map_err(|message| {
+            crate::phases_early::throw_jca_exc(ctx, "javax/net/ssl/SSLHandshakeException", &message)
+        })?;
         let real_tls_id = crate::servlet::RUSTLS_SOCK_ID_BASE + stream_id;
         let port = ctx.get_field(socket, NEW13_SOCK_PORT).as_int().unwrap_or(0);
         crate::net_phase_e::sock_set_for_create(ctx, socket, port, real_tls_id);
@@ -43552,6 +43580,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(protocol)));
         ctx.set_field(session, NEW13_SESS_CIPHER, Value::Object(Some(cipher)));
         ctx.set_field(session, NEW13_SESS_TLSID, Value::Int(real_tls_id));
+        // CLIENT-mode only (a server stream never has "peer certificates" in
+        // this sense for our purposes here) — without this, a caller like
+        // Apache HttpComponents' `AbstractClientTlsStrategy.verifySession()`,
+        // which unconditionally checks `SSLSession.getPeerCertificates()`
+        // right after every successful TLS upgrade, sees an empty chain and
+        // throws `SSLPeerUnverifiedException` even though the handshake
+        // itself succeeded.
+        if let Some(chain) = crate::t27_tls::rustls_client_peer_cert_chain_der(stream_id) {
+            crate::t27_tls::record_client_peer_chain(session, chain);
+        }
         ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
         Ok(real_tls_id)
     }
@@ -43758,11 +43796,46 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     args.first()
                 );
             }
-            let _ = ctx;
-            // Handshake already completed in createSocket; the ALPN/cipher
-            // preferences a caller sets here can no longer change anything.
-            // Accept and discard, matching setEnabledCipherSuites/
-            // setEnabledProtocols' no-op contract on this synthetic socket.
+            // A socket from `createSocket(Socket wrapped, ...)`'s deferred
+            // handshake honors any cipher-suite restriction carried by
+            // `params` if called before the handshake actually starts — the
+            // same real-JSSE-contract reasoning as `setEnabledCipherSuites`
+            // above (which this often replaces: Apache HttpComponents 5
+            // configures TLS options via an `SSLParameters` object and
+            // `SSLSocket.setSSLParameters()`, not the legacy per-field
+            // setters, so `setEnabledCipherSuites` alone never saw
+            // `connectWithSslBundleAndOptionsMismatch`'s deliberately
+            // mismatched cipher suite).
+            if let (Ok(this), Some(Value::Object(Some(params)))) = (obj_arg(args, 0), args.get(1).copied().and_then(|v| match v { Value::Object(Some(_)) => Some(v), _ => None })) {
+                let tls_id = new13_resolve_tls_id(ctx, this);
+                if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+                    && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+                {
+                    let mut ciphers = Vec::new();
+                    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
+                        params,
+                        "getCipherSuites",
+                        "()[Ljava/lang/String;",
+                        &[],
+                    ) {
+                        let len = ctx.array_length(arr);
+                        for i in 0..len {
+                            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                                if let Some(name) = ctx.read_string(s) {
+                                    ciphers.push(name);
+                                }
+                            }
+                        }
+                    }
+                    if !ciphers.is_empty() {
+                        let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+                        crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
+                    }
+                }
+            }
+            // Handshake already completed in createSocket for every OTHER
+            // socket shape; the ALPN/cipher preferences a caller sets here
+            // can no longer change anything for those. Accept and discard.
             Ok(None)
         },
     );
@@ -43821,7 +43894,36 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_sock,
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // A socket from `createSocket(Socket wrapped, ...)`'s deferred
+            // handshake honors this if called before the handshake actually
+            // starts (real JSSE contract; `connectWithSslBundleAndOptionsMismatch`
+            // relies on exactly this createSocket-then-narrow-ciphers
+            // sequence to make the handshake genuinely fail on a
+            // deliberately mismatched suite). A socket from any other path,
+            // or one that's already handshaked, has no pending entry to
+            // update — accepted but not persisted, same as before.
+            let this = obj_arg(args, 0)?;
+            let tls_id = new13_resolve_tls_id(ctx, this);
+            if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+                && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+            {
+                let mut ciphers = Vec::new();
+                if let Some(Value::Object(Some(arr))) = args.get(1) {
+                    let len = ctx.array_length(*arr);
+                    for i in 0..len {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                            if let Some(name) = ctx.read_string(s) {
+                                ciphers.push(name);
+                            }
+                        }
+                    }
+                }
+                let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+                crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
+            }
+            Ok(None)
+        },
     );
     r.register(
         ssl_sock,

@@ -2907,9 +2907,31 @@ pub(crate) fn rustls_client_handshake_over_stream(
 // `ObjectRef`) keeps this table GC-safe: no Java object reference is held
 // across the return-to-Java-and-back window between `createSocket()` and
 // whenever the handshake actually starts.
+/// Whether this pending socket's underlying connection is the caller's
+/// actual `wrapped` stream, or (see `stash_pending_layered_socket`'s doc)
+/// a `host:port` to dial fresh because `wrapped`'s stream could not be
+/// extracted.
+enum PendingLayeredStream {
+    Reused(TcpStream),
+    DialFresh { host: String, port: u16 },
+}
+
 struct PendingLayeredSocket {
-    tcp: TcpStream,
-    client_config: Arc<ClientConfig>,
+    stream: PendingLayeredStream,
+    // Raw ingredients rather than a pre-built `ClientConfig`: real JSSE lets
+    // a caller narrow the negotiable cipher suites via
+    // `SSLSocket.setEnabledCipherSuites()` any time before the handshake
+    // actually starts — confirmed necessary by
+    // `connectWithSslBundleAndOptionsMismatch`, which relies on exactly this
+    // sequence (createSocket, then setEnabledCipherSuites to a
+    // deliberately-mismatched suite, then the implicit handshake) to make
+    // the handshake genuinely fail. Building the `ClientConfig` eagerly in
+    // `stash_pending_layered_socket` would freeze the cipher list before
+    // that call had a chance to run.
+    extra_roots: Vec<Vec<u8>>,
+    use_java_trust_manager: bool,
+    client_identity: Option<(String, String)>,
+    enabled_ciphers: Vec<String>,
     server_identity: Option<(String, String)>,
     host: String,
     client_mode: bool,
@@ -2926,19 +2948,79 @@ fn pending_layered_sockets() -> &'static Mutex<HashMap<i32, PendingLayeredSocket
 /// id. Returns the RAW pending id — the caller (phases_late.rs) applies
 /// `servlet::PENDING_LAYERED_SOCK_ID_BASE` the same way other id ranges here
 /// are offset by their callers.
+///
+/// `wrapped`'s stream extraction (`take_raw_socket_stream_for_tls`) only
+/// understands two socket shapes: this module's own legacy s2-registry
+/// sockets, and a real-JDK `NioSocketImpl`'s `impl`/`fd` field chain (the
+/// shape a real `ServerSocket.accept()` produces — MockWebServer's SERVER-mode
+/// use of this API). Apache HttpComponents' client-side `wrapped` socket (a
+/// plain, already-connected `Socket` from its own connection-establishment
+/// path) is neither, so extraction fails there — confirmed via
+/// `HttpComponentsClientHttpRequestFactoryBuilderTests`' `IOException:
+/// wrapped Socket has no FileDescriptor` regression while adding SERVER-mode
+/// reuse. Falling back to a fresh `host:port` dial for exactly this case
+/// preserves this API's prior (already-verified, dev cluster-tested)
+/// CLIENT-mode behavior, which never attempted to reuse `wrapped` at all —
+/// only SERVER mode strictly requires the real stream (there is no
+/// "fall back to dialing" for accepting an inbound connection), and
+/// SERVER-mode callers (MockWebServer) always go through the
+/// NioSocketImpl-shaped path extraction already handles.
 pub(crate) fn stash_pending_layered_socket(
     ctx: &mut dyn NativeContext,
     wrapped: ObjectRef,
     ssl_context: ObjectRef,
     host: String,
+    port: u16,
+    extra_roots: Vec<Vec<u8>>,
+    java_tm_key: Option<u64>,
 ) -> Result<i32, String> {
-    let tcp = crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped)?;
-    // Client config: reuses the same per-SSLContext resolution HttpsURLConnection's
-    // instance-scoped factory uses (roots/TrustManager/KeyManager/`use_java_trust_manager`
-    // all included), so a caller that later confirms client mode gets identical
-    // trust behavior to every other client entry point.
-    let client_config = client_config_for_ssl_context(ctx, ssl_context)
-        .or_else(|_| build_client_config(root_store_for_trust_roots(None), &["http/1.1"], None))?;
+    let debug_pls = std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some();
+    let stream = match crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped) {
+        Ok(tcp) => {
+            if debug_pls {
+                eprintln!("[dbg-tls-pls] stash: reused wrapped stream host={host} port={port}");
+            }
+            PendingLayeredStream::Reused(tcp)
+        }
+        Err(e) => {
+            if debug_pls {
+                eprintln!(
+                    "[dbg-tls-pls] stash: extraction failed ({e}), dial-fresh host={host} port={port}"
+                );
+            }
+            PendingLayeredStream::DialFresh {
+                host: host.clone(),
+                port,
+            }
+        }
+    };
+    if debug_pls {
+        eprintln!(
+            "[dbg-tls-pls] stash: extra_roots.len()={} java_tm_key={:?}",
+            extra_roots.len(),
+            java_tm_key
+        );
+    }
+    // `extra_roots`/`java_tm_key` are the caller's own resolution
+    // (`phases_late::p68_factory_trust_roots`/`p68_factory_java_tm_key`,
+    // keyed off the FACTORY object, args[0] at the `createSocket` call site)
+    // — NOT re-derived here from `ssl_context` alone. Confirmed necessary:
+    // `t27_tls::context_trust_root_ders(ctx, ssl_context)` (the
+    // context-identity-keyed table `attach_trust_managers_to_ctx` populates)
+    // came up empty for an SSLBundle-configured HttpComponents scenario
+    // (`connectWithSslBundle` rejecting the bundle's own self-signed cert as
+    // `UnknownIssuer`) — that request's anchors instead live in the legacy
+    // p68 FACTORY-identity-keyed table (`p68_ctx_trust_roots_table`),
+    // populated directly from the `TrustManager[]` at `SSLContext.init()`
+    // time and carried forward onto the factory by
+    // `SSLContext.getSocketFactory()`. `p68_factory_trust_roots` already
+    // checks both tables (factory-keyed first, context-keyed fallback), so
+    // reusing its resolution here — rather than only the context-keyed half
+    // — covers both paths. The actual `ClientConfig` is built later, in
+    // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
+    // narrowing is known too.
+    let use_java_trust_manager = java_tm_key.is_some();
+    let client_identity = ctx_identity(ctx, ssl_context);
     // Server identity: same resolution `rustls_server_handshake_over_stream`'s
     // former caller used (this SSLContext's own identity, else the
     // process-wide runtime-configured one) — resolved here too so SERVER mode
@@ -2953,14 +3035,26 @@ pub(crate) fn stash_pending_layered_socket(
     pending.insert(
         id,
         PendingLayeredSocket {
-            tcp,
-            client_config,
+            stream,
+            extra_roots,
+            use_java_trust_manager,
+            client_identity,
+            enabled_ciphers: Vec::new(),
             server_identity,
             host,
             client_mode: true,
         },
     );
     Ok(id)
+}
+
+/// `SSLSocket.setEnabledCipherSuites(String[])` on a still-pending layered
+/// socket. A no-op if `pending_id` is unknown, same convention as
+/// `set_pending_layered_socket_client_mode`.
+pub(crate) fn set_pending_layered_socket_ciphers(pending_id: i32, ciphers: Vec<String>) {
+    if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
+        p.enabled_ciphers = ciphers;
+    }
 }
 
 /// `setUseClientMode(false)` on a still-pending layered socket. A no-op if
@@ -2982,13 +3076,75 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
         .lock()
         .remove(&pending_id)
         .ok_or_else(|| "layered socket handshake state missing".to_string())?;
+    if std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some() {
+        eprintln!(
+            "[dbg-tls-pls] drive: pending_id={} client_mode={} stream={} host={}",
+            pending_id,
+            pending.client_mode,
+            match &pending.stream {
+                PendingLayeredStream::Reused(_) => "Reused",
+                PendingLayeredStream::DialFresh { .. } => "DialFresh",
+            },
+            pending.host,
+        );
+    }
     if pending.client_mode {
-        rustls_client_handshake_over_stream(pending.tcp, pending.client_config, &pending.host)
+        // Built here, not in `stash_pending_layered_socket`, so a
+        // `setEnabledCipherSuites` call made any time between `createSocket()`
+        // and the handshake actually starting is honored — see
+        // `PendingLayeredSocket::enabled_ciphers`'s doc.
+        let trust_roots = if pending.extra_roots.is_empty() {
+            None
+        } else {
+            Some(TlsTrustRoots {
+                root_ders: pending.extra_roots,
+                revocation: None,
+            })
+        };
+        let roots = root_store_for_trust_roots(trust_roots.as_ref());
+        let provider = cipher_provider_for(&pending.enabled_ciphers);
+        let client_config = build_client_config_ex_with_provider(
+            roots,
+            &["http/1.1"],
+            ClientAuthMode::Fixed(
+                pending
+                    .client_identity
+                    .as_ref()
+                    .map(|(cert, key)| (cert.as_str(), key.as_str())),
+            ),
+            None,
+            pending.use_java_trust_manager,
+            provider,
+        )
+        .map_err(|e| format!("layered client config: {e}"))?;
+        match pending.stream {
+            PendingLayeredStream::Reused(tcp) => {
+                rustls_client_handshake_over_stream(tcp, client_config, &pending.host)
+            }
+            PendingLayeredStream::DialFresh { host, port } => {
+                rustls_client_connect(client_config, &host, port)
+            }
+        }
     } else {
+        let tcp = match pending.stream {
+            PendingLayeredStream::Reused(tcp) => tcp,
+            PendingLayeredStream::DialFresh { .. } => {
+                // There is no meaningful "dial fresh" for SERVER mode — a
+                // server accepts an inbound connection, it does not open an
+                // outbound one. `wrapped`'s stream genuinely could not be
+                // extracted (see this struct's doc); fail closed rather than
+                // silently connecting somewhere nobody asked for.
+                return Err(
+                    "layered SSLSocket: server-mode handshake requires the wrapped \
+                     Socket's own connection, which could not be extracted"
+                        .to_string(),
+                );
+            }
+        };
         let (cert_pem, key_pem) = pending
             .server_identity
             .ok_or_else(|| "No TLS key/cert configured for layered SSLSocket".to_string())?;
-        rustls_server_handshake_over_stream(pending.tcp, &cert_pem, &key_pem)
+        rustls_server_handshake_over_stream(tcp, &cert_pem, &key_pem)
     }
 }
 
@@ -3107,6 +3263,29 @@ pub(crate) fn rustls_session_info(
         ));
     }
     None
+}
+
+/// The peer certificate chain rustls captured during this CLIENT stream's
+/// handshake, as raw DER — for `SSLSession.getPeerCertificates()`. Without
+/// this, a caller that completes a handshake through the deferred
+/// `SSLSocketFactory.createSocket(Socket,...)` path (`ensure_layered_handshake_started`)
+/// and then calls `getPeerCertificates()` sees an empty chain and gets
+/// `SSLPeerUnverifiedException("peer not authenticated")` even on a
+/// perfectly successful handshake — confirmed via
+/// `HttpComponentsClientHttpRequestFactoryBuilderTests.connectWithSslBundle`
+/// (Apache HttpComponents' `AbstractClientTlsStrategy.verifySession()` calls
+/// this immediately after every successful TLS upgrade). `rustls::ClientConnection`
+/// retains this for the connection object's lifetime, so it's still readable
+/// here despite being queried after the handshake loop that produced it has
+/// already returned.
+pub(crate) fn rustls_client_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
+    let reg = sreg().lock();
+    let entry = reg.client_streams.get(&id)?;
+    let certs = entry.stream.conn.peer_certificates()?;
+    if certs.is_empty() {
+        return None;
+    }
+    Some(certs.iter().map(|c| c.as_ref().to_vec()).collect())
 }
 
 // -----------------------------------------------------------------------------
