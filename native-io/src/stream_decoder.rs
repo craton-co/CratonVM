@@ -474,6 +474,11 @@ fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let this_pin = ctx.pin_native_root(this);
     if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
         let _ = ctx.invoke_virtual(is, "close", "()V", &[]);
+    } else if let Value::Object(Some(ch)) = ctx.get_field_by_name(this, "ch") {
+        // Channel-backed decoder (`Channels.newReader(ReadableByteChannel, ...)`)
+        // — no InputStream exists, close the channel instead so a FileChannel
+        // opened for e.g. a Flyway migration script isn't leaked.
+        let _ = ctx.invoke_virtual(ch, "close", "()V", &[]);
     }
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
@@ -535,7 +540,26 @@ fn decode_into(
         let t = sd_table().lock().unwrap();
         match t.get(&key) {
             Some(s) => (s.name.clone(), s.carry.clone(), s.prop),
-            None => ("UTF-8".to_string(), Vec::new(), None),
+            // No side-table entry: this decoder was built by the real (never
+            // intercepted at construction) `StreamDecoder.forDecoder(ReadableByteChannel,
+            // CharsetDecoder, int)` factory that `Channels.newReader` uses — read
+            // the actual charset off the object's own real `cs` field instead of
+            // assuming UTF-8, so a non-UTF-8 `Channels.newReader(ch, decoder, cap)`
+            // decodes correctly too.
+            None => {
+                let resolved = match ctx.get_field_by_name(this, "cs") {
+                    Value::Object(Some(cs)) => {
+                        let n = resolve_name(ctx, Some(cs), None);
+                        if n.is_empty() {
+                            "UTF-8".to_string()
+                        } else {
+                            n
+                        }
+                    }
+                    _ => "UTF-8".to_string(),
+                };
+                (resolved, Vec::new(), None)
+            }
         }
     };
 
@@ -598,6 +622,55 @@ fn decode_into(
             } else {
                 eof = true;
             }
+        } else if matches!(ctx.get_field_by_name(this, "ch"), Value::Object(Some(_))) {
+            // `java.nio.channels.Channels.newReader(ReadableByteChannel, ...)`
+            // builds a StreamDecoder via the real (unshimmed)
+            // `StreamDecoder.forDecoder` factory, which sets the real `ch`
+            // field instead of `in` — no InputStream exists at all. Without
+            // this branch every such decoder read `in` as null and fell
+            // straight to the `eof = true` case below, so `readLine()`
+            // returned null on the very first call: Flyway's
+            // `FileSystemResource.read()` (which wraps a `FileChannel` this
+            // way) silently saw an empty migration script and reported
+            // "successfully applied" a migration that created zero tables.
+            // See docs/known-issues/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied.md.
+            let bb = crate::alloc_byte_buffer(ctx, want);
+            let bb_pin = ctx.pin_native_root(bb);
+            let cur_this = ctx.read_native_pin(this_pin, this);
+            let r = match ctx.get_field_by_name(cur_this, "ch") {
+                Value::Object(Some(ch)) => {
+                    let cur_bb = ctx.read_native_pin(bb_pin, bb);
+                    ctx.invoke_virtual(
+                        ch,
+                        "read",
+                        "(Ljava/nio/ByteBuffer;)I",
+                        &[Value::Object(Some(cur_bb))],
+                    )
+                }
+                _ => Ok(Some(Value::Int(-1))),
+            };
+            let n = match r {
+                Ok(Some(Value::Int(v))) => v,
+                Ok(_) => -1,
+                Err(e) => {
+                    ctx.unpin_native_roots(bb_pin);
+                    ctx.unpin_native_roots(this_pin);
+                    return Err(e);
+                }
+            };
+            if n > 0 {
+                // The channel read filled the buffer's backing array from
+                // offset 0 (a freshly allocated buffer starts at position 0).
+                let cur_bb = ctx.read_native_pin(bb_pin, bb);
+                if let Value::Object(Some(arr)) = ctx.get_field_by_name(cur_bb, "hb") {
+                    let start = bytes.len();
+                    bytes.resize(start + n as usize, 0);
+                    ctx.read_byte_array_into(arr, 0, &mut bytes[start..]);
+                }
+            } else {
+                eof = true;
+            }
+            ctx.unpin_native_roots(bb_pin);
         } else {
             eof = true;
         }
