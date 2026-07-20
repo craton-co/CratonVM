@@ -341,7 +341,13 @@ fn native_unsafe_get_byte_at_address(
     match crate::unsafe_arena_try_get_byte(addr) {
         Some(v) => {
             refresh_arena_cache(addr, 1);
-            Ok(Some(Value::Int(v as i32)))
+            // `Unsafe.getByte` returns a Java `byte` — signed. Casting `u8`
+            // straight to `i32` zero-extends (0x83 -> 131) instead of
+            // sign-extending (0x83 -> -125), which silently flips every
+            // caller's `b < 0` / top-bit check for byte values >= 0x80. Route
+            // through `i8` first, matching the two-arg `(Object,long)` sibling
+            // (`native_unsafe_get_byte_mb`), which already does this correctly.
+            Ok(Some(Value::Int(v as i8 as i32)))
         }
         // audit-round6 fix (LOW, use-after-free unmasking): the validated
         // accessor (`try_get_byte`) is the authoritative liveness check and
@@ -355,7 +361,8 @@ fn native_unsafe_get_byte_at_address(
             // FIX(bug-A): untagged real pointer (e.g. DirectByteBuffer) → raw read.
             let mut b = [0u8; 1];
             if real_ptr_read(ctx, addr, &mut b) {
-                return Ok(Some(Value::Int(b[0] as i32)));
+                // Sign-extend — see the comment on the arena-hit branch above.
+                return Ok(Some(Value::Int(b[0] as i8 as i32)));
             }
             invalidate_arena_cache();
             Err(RuntimeError::IllegalArgumentException {
