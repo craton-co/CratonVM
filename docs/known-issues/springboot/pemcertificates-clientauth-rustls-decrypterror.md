@@ -116,6 +116,108 @@ with `java PemClientAuthRepro <dir-containing-test-cert.pem-test-key.pem-test.p1
    `@Test`-only extracted copy) versus as part of the full 36-method class
    — this session tested the whole class only.
 
+## 2026-07-20 session: two real bugs found, neither is the whole story
+
+Picked back up as a residual of the h2c HPACK fix
+(`h2c-priorknowledge-hpack-headerblock-decode-failure-FIXED.md`). Re-traced
+with `CRATONVM_DBG_TLS_AUTH=1 CRATONVM_DBG_TLS_HS=1` end to end. Findings:
+
+- **The `BadSignature`/`DecryptError` alert is genuinely a cryptographic
+  signature failure, not a trust-chain rejection** — confirmed by tracing
+  engine ids through the full handshake: the SERVER engine (id=15 in one
+  captured run) hits `process_new_packets -> Err(Some(InvalidCertificate(
+  BadSignature)))` twice while unwrapping the CLIENT's Certificate+
+  CertificateVerify flight, and the CLIENT engine (id=14) then receives
+  `AlertReceived(DecryptError)` — TLS 1.3's `decrypt_error` alert is exactly
+  what rustls sends for a `CertificateVerify` whose signature doesn't
+  validate against the just-presented certificate's public key.
+
+- **Found and FIXED a real, separate, definitely-genuine bug**: `KeyStore.
+  getKey(alias, password)`-sourced `PrivateKey` objects (the synthetic
+  4-field mirror `keystore.rs::engine_get_key` allocates) were never
+  registered in `crypto_impl`'s `RSA_KEY_STORE`/`rsa_realkey_map`. `jca/
+  signature.rs::extract_key_id_from_key` falls through to reading the
+  mirror's field slot 3 as a `crypto_impl` key_id when the identity-hash
+  lookup misses — but slot 3 on this mirror is actually a `(store_id,
+  alias_hash)` composite for a COMPLETELY different consumer
+  (`private_key_der_from_proxy`, used by the native TLS layer/`Key.
+  getEncoded()`). Any `Signature.sign()` call using a `KeyStore.getKey()`-
+  sourced key therefore signed with whatever unrelated key happened to
+  occupy that same numeric id in `RSA_KEY_STORE` (or nothing), producing a
+  signature that fails verification even against the CORRECT public key.
+  Reproduced in complete isolation, no TLS/sockets/Netty at all
+  (`Pkcs12AliasConsistencyProbe.java`: sign with an alias's own key,
+  verify with that SAME alias's own certificate's public key — failed on
+  CratonVM, passed on real HotSpot, for BOTH of `test.p12`'s aliases).
+  **Fixed** in `native-builtins/src/{crypto_impl,keystore}.rs` — added
+  `crypto_impl::parse_rsa_private_key_pkcs8` and register the parsed key
+  under the mirror's `identityHashCode` in `engine_get_key`, the same
+  pattern `jca/key_factory.rs::register_rsa_priv_sign_material` already
+  uses for `KeyFactory.generatePrivate` imports.
+  **This fix did NOT resolve `sslWithPemCertificates`** — confirmed by
+  rerunning the real test after the fix landed (identical `DecryptError`).
+  Root cause: the actual TLS handshake signing goes through rustls's own
+  native `ring`-backed signer (`rustls::crypto::ring::sign::
+  any_supported_type`, fed PEM strings via `t27_tls.rs`), **never** through
+  `java.security.Signature`/`crypto_impl` at all. The two code paths are
+  completely disjoint; the `Signature` bug was real but irrelevant to this
+  test. Worth keeping the fix regardless — it's a live correctness bug for
+  any code that does `KeyStore.getKey()` then `Signature.sign()` (JWT
+  signing, mTLS via `SSLSocket`/`HttpsURLConnection` rather than
+  `SSLEngine`, keycloak-style key verification, etc).
+
+- **Found, attempted, and REVERTED a second, architecturally-real but
+  functionally-unsafe fix.** `engine_begin`'s CLIENT branch
+  (`t27_tls.rs`, the `SSLEngine`-based path `SSLContext.createSSLEngine()`
+  takes — what reactor-netty's `SslProvider.JDK` actually uses) builds its
+  `ClientAuthMode` **exclusively** from `state.identity_override`: the ONE
+  `(cert_pem, key_pem)` pair `KeyManagerFactory.init`/`engineLoad` collapses
+  an entire keystore down to (`keystore.rs`'s `first_key_identity`, always
+  the alias that happens to be first in the keystore's own `IndexMap`
+  insertion order — for `test.p12`, that's `spring-boot`, NOT the
+  `test-alias` identity the server's trust store (`test-cert.pem` ==
+  `test.p12`'s `test-alias-cert`, byte-for-byte, per this doc's earlier
+  verification) actually recognizes). A **different, already-correct**
+  client path (`client_config_for_ssl_context`, used by
+  `SSLSocketFactory.createSocket`-based clients) instead prefers a
+  `JavaKeyManagerResolver` — a real `KeyManager.chooseClientAlias` call made
+  synchronously mid-handshake — whenever the `SSLContext` actually attached
+  real `KeyManager[]` objects at `.init()`, via a `km_ctx_key` field
+  (`build_engine_client_config_with_identity`'s doc comment spells out
+  exactly this priority). `EngineState` (the `SSLEngine` struct) had no
+  equivalent field or wiring at all. Added one (`km_ctx_key`, populated
+  alongside the existing `trust_managers_ctx_key` in
+  `set_engine_trust_ctx_key`) and made `engine_begin`'s client branch prefer
+  the resolver when available, mirroring the SSLSocket path's logic exactly.
+  **This introduced a regression**: `sslNeedsClientAuthenticationSucceedsWithClientCertificate`
+  (previously passing, a single-unambiguous-alias keystore) started failing
+  with `CertificateRequired` (server got NO certificate at all) after this
+  change — `JavaKeyManagerResolver::resolve()` returned `None` for a case
+  the `Fixed` identity path handled correctly. **Reverted** rather than ship
+  a fix that trades one broken test for two. The resolver path clearly has
+  its own gap/precondition (untested for the `SSLEngine` call context,
+  possibly related to `with_active_native_context`'s window not being
+  established the same way `createSSLEngine`'s synchronous call site
+  expects it, or `root_hint_subjects`/acceptable-issuer filtering rejecting
+  a self-signed test cert that the `Fixed` path never checked at all) that
+  needs its own investigation before it's safe to prefer over `Fixed` in the
+  `SSLEngine` path.
+
+**Net assessment**: the original "process-wide `RUNTIME_TLS_IDENTITY` race"
+hypothesis is very likely NOT the actual mechanism (that global is only
+consulted as a last-resort fallback; this test's engines both resolved a
+real per-`SSLContext` `identity_override` via `ctx_identity`, confirmed via
+the `CRATONVM_DBG_TLS_AUTH` trace). The much more likely mechanism is the
+alias-ambiguity gap just described: the `SSLEngine` client path presents
+`spring-boot`'s (self-consistent, correctly-signed — post-fix — but
+untrusted-by-the-server) identity instead of `test-alias`'s. **Still not
+proven** — a definitive confirmation would mean instrumenting
+`JavaKeyManagerResolver::resolve()`'s actual failure mode for THIS test
+(why does it return `None` for `sslNeedsClientAuthenticationSucceedsWithClientCertificate`'s
+single-alias keystore, which should be the easy case?) before it's safe to
+re-attempt wiring it into the `SSLEngine` path. That diagnostic — not
+another guess at the mechanism — is the concrete next step.
+
 ## Affected classes
 
 | Module | Class | Test method |

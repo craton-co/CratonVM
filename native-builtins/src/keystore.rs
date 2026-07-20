@@ -64,6 +64,7 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use parking_lot::RwLock;
 
 use crate::alloc_concurrent_synthetic;
+use crate::crypto_impl;
 
 // ---------------------------------------------------------------------------
 // Public model
@@ -1832,6 +1833,31 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         let alias_hash = fnv1a_32(alias.as_bytes());
         let composite = ((id as i64 & 0xFFFF_FFFF) << 32) | (alias_hash as i64 & 0xFFFF_FFFF);
         ctx.set_field(pk, 3, Value::Long(composite));
+        // FIX (sslWithPemCertificates-decrypterror-20260720): `jca::signature`'s
+        // `extract_key_id_from_key` reads THIS SAME field slot 3 as a
+        // `crypto_impl` RSA key_id when the key's `identityHashCode` isn't
+        // found in `rsa_realkey_map` first — but slot 3 here is the
+        // (store_id, alias_hash) composite above, a completely different
+        // namespace. `Signature.sign()` on a `KeyStore.getKey()`-sourced
+        // PrivateKey therefore signed with whatever unrelated key happened to
+        // occupy that same numeric id in `crypto_impl`'s RSA_KEY_STORE (or
+        // silently produced a bad signature), causing rustls's TLS 1.3
+        // CertificateVerify check to fail on the peer with `BadSignature` /
+        // `DecryptError` during mTLS — reproduced in isolation (no TLS
+        // involved) by round-tripping `Signature.sign()`/`verify()` on a
+        // `KeyStore.getKey()`-sourced PKCS12 RSA key: verify failed on
+        // CratonVM, succeeded on HotSpot, with byte-identical key material.
+        // Register the real key material under this object's identity hash —
+        // exactly like `register_rsa_priv_sign_material` does for
+        // `KeyFactory.generatePrivate` imports — so `extract_key_id_from_key`
+        // finds the correct key_id before ever falling through to slot 3.
+        if algo_idx == 6 {
+            if let Some(kp) = crypto_impl::parse_rsa_private_key_pkcs8(key_der) {
+                let key_id = crypto_impl::rsa_key_next_id();
+                crypto_impl::rsa_key_store(key_id, kp);
+                crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(pk), key_id);
+            }
+        }
         Ok(Some(Value::Object(Some(pk))))
     } else if let EntryKind::SecretKey { key_bytes } = &entry.kind {
         // Return the concrete mirror rather than the `SecretKey` interface:
