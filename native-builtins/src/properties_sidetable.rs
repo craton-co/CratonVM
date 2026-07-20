@@ -1494,6 +1494,32 @@ fn put_non_string_into_chm(
     prev
 }
 
+/// Native `Properties.putIfAbsent(Object, Object)Object` — `Map.putIfAbsent`
+/// semantics: if `this` already maps `key` to a non-null value, return that
+/// value unchanged; otherwise store `value` (via [`native_properties_put`],
+/// so the side-table/CHM mirroring stays identical to a plain `put`) and
+/// return `null`.
+///
+/// Existence is checked through the same side-table → CHM → system-property
+/// read path [`native_properties_get`] already uses, so `putIfAbsent` agrees
+/// with `get`/`getProperty`/`containsKey` about what's "present" instead of
+/// consulting the real (and, for our synthetic Properties, often-broken)
+/// `Hashtable`/`map` fields directly the way the uninterospected inherited
+/// bytecode did.
+fn native_properties_put_if_absent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    if args.first().is_none() {
+        return Ok(Some(Value::Object(None)));
+    }
+    if let Some(Value::Object(Some(existing))) = native_properties_get(ctx, args)? {
+        return Ok(Some(Value::Object(Some(existing))));
+    }
+    native_properties_put(ctx, args)?;
+    Ok(Some(Value::Object(None)))
+}
+
 /// Native `Properties.remove(Object) Object` — symmetric with `put` /
 /// `setProperty`.  JDK 25's `Properties.remove` (Properties.java:1348)
 /// delegates to `map.remove(key)` where `map` is the private
@@ -2860,6 +2886,27 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "putAll",
         "(Ljava/util/Map;)V",
         native_properties_put_all,
+    );
+    // Quartz's `StdSchedulerFactory.initialize(Properties)` (invoked via
+    // Spring's `SchedulerFactoryBean.initSchedulerFactory`) does
+    // `props.putIfAbsent("org.quartz.jobStore.class",
+    // LocalDataSourceJobStore.class.getName())` when a DataSource is
+    // configured. Without a native here, `putIfAbsent` (inherited from
+    // `Hashtable`, never overridden by `Properties` itself) ran real
+    // bytecode against the REAL `map`/`table` backing fields, bypassing
+    // the side-table entirely. The subsequent read —
+    // `PropertiesParser.getStringProperty("org.quartz.jobStore.class",
+    // RAMJobStore.class.getName())`, which is our side-table-only
+    // `getProperty(String,String)` native — never saw the write and fell
+    // back to Quartz's own default, silently wiring up `RAMJobStore`
+    // instead of `LocalDataSourceJobStore` even though the
+    // `spring.quartz.job-store-type=jdbc` customizer ran successfully.
+    // See docs/known-issues/springboot/quartzautoconfigurationtests-jdbc-jobstore-not-applied.md.
+    registry.register(
+        "java/util/Properties",
+        "putIfAbsent",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        native_properties_put_if_absent,
     );
     });
 }

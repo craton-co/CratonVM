@@ -8538,6 +8538,7 @@ pub mod servlet;
 pub mod http2;
 pub mod jmx_openmbean;
 pub mod t27_tls;
+pub mod t27_tls_cbc;
 pub mod t3_impl;
 pub mod tls;
 // Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
@@ -9687,6 +9688,10 @@ const MOCKITO_LOCATION_FACTORY_DEFAULT: &str =
     "org/mockito/internal/debugging/LocationFactory$DefaultLocationFactory";
 const MOCKITO_JAVA8_LOCATION_IMPL: &str = "org/mockito/internal/debugging/Java8LocationImpl";
 const MOCKITO_MOCK_METHOD_ADVICE: &str = "org/mockito/internal/creation/bytebuddy/MockMethodAdvice";
+const MOCKITO_MODULE_MEMBER_ACCESSOR: &str =
+    "org/mockito/internal/util/reflection/ModuleMemberAccessor";
+const MOCKITO_REFLECTION_MEMBER_ACCESSOR: &str =
+    "org/mockito/internal/util/reflection/ReflectionMemberAccessor";
 const HIBERNATE_TESTING_UTIL: &str = "org/hibernate/testing/orm/junit/TestingUtil";
 const HIBERNATE_ANNOTATION_TARGET_SUPPORT: &str =
     "org/hibernate/models/internal/AnnotationTargetSupport";
@@ -15753,9 +15758,22 @@ fn native_mockito_mock_method_advice_is_overridden(
         else {
             return Ok(Some(Value::Int(0)));
         };
-        if ctx.is_interface_class(declaring_class_id) {
-            return Ok(Some(Value::Int(0)));
-        }
+
+        // NOTE: `declaring_class_id` being an interface (e.g. Mockito asks
+        // about `Greeter.greet()` for a call reached via `Interface.super
+        // .method()` from the concrete override) must NOT short-circuit to
+        // "not overridden" here. The walk below still answers correctly for
+        // that case: `class_id == declaring_class_id` simply never matches
+        // while walking the CONCRETE superclass chain (interfaces never
+        // appear in it), so the loop just checks every class from the mock's
+        // own class up to `Object` for a concrete declaration of the method
+        // — exactly what "does the mock's real class override this
+        // interface default method" needs. Returning a hardcoded false here
+        // instead made every interface-default `super` call from a redefined
+        // override re-enter Mockito's `CallsRealMethods` interception
+        // indefinitely (OtlpMetricsPropertiesConfigAdapter.url() calling
+        // `OtlpConfig.super.url()`, and the same shape in any spied/mocked
+        // class that overrides an interface default method).
 
         // Mockito supplies a Method declared by an ancestor, while the mock
         // can inherit its concrete override through one or more intermediate
@@ -15792,6 +15810,19 @@ fn native_mockito_mock_method_advice_is_overridden(
     // the receiver is mocked. Falling back to "not overridden" preserves normal
     // MockHandler interception for class mocks instead of silently bypassing it.
     Ok(Some(Value::Int(0)))
+}
+
+/// Mockito selects its Java-9 `InstrumentationMemberAccessor` by constructing
+/// a Byte Buddy subclass during `ModuleMemberAccessor` class initialization.
+/// CratonVM supports Mockito's ordinary reflection accessor, but that eager
+/// bootstrap enters a bytecode-generation path before the test has requested a
+/// mock.  Return Mockito's own supported fallback directly, preserving the
+/// public MemberAccessor contract without changing mock generation itself.
+fn native_mockito_module_member_accessor_delegate(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    ctx.new_object_initialized(MOCKITO_REFLECTION_MEMBER_ACCESSOR, "()V", &[])
 }
 
 fn bytebuddy_list_hash(
@@ -17399,6 +17430,12 @@ fn register_mockito_debugging_intrinsics(registry: &mut NativeMethodRegistry) {
         "create",
         "(Z)Lorg/mockito/invocation/Location;",
         native_mockito_location_factory_create,
+    );
+    registry.register(
+        MOCKITO_MODULE_MEMBER_ACCESSOR,
+        "delegate",
+        "()Lorg/mockito/plugins/MemberAccessor;",
+        native_mockito_module_member_accessor_delegate,
     );
 }
 
@@ -19534,6 +19571,13 @@ mod antlr_prediction_context_tests {
                 MOCKITO_LOCATION_FACTORY_DEFAULT,
                 "create",
                 "(Z)Lorg/mockito/invocation/Location;",
+            )
+            .is_some());
+        assert!(registry
+            .find(
+                MOCKITO_MODULE_MEMBER_ACCESSOR,
+                "delegate",
+                "()Lorg/mockito/plugins/MemberAccessor;",
             )
             .is_some());
     }
@@ -53746,7 +53790,7 @@ fn native_javac_file_manager_infer_binary_name(
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(file))
         .unwrap_or_default();
-    let binary_name = match class_name.as_str() {
+    let binary_name: Option<String> = match class_name.as_str() {
         "com/sun/tools/javac/file/PathFileObject$DirectoryFileObject" => {
             let relative_path = match ctx.get_field_by_name(file, "relativePath") {
                 Value::Object(Some(relative_path)) => {
@@ -53757,7 +53801,7 @@ fn native_javac_file_manager_infer_binary_name(
                 }
                 _ => None,
             };
-            relative_path.map(|path| javac_binary_name_from_relative_path(&path))
+            relative_path.map(|path| javac_binary_name_from_relative_path(path.as_str()))
         }
         "com/sun/tools/javac/file/PathFileObject$JarFileObject" => {
             // Read the display string directly via the same logic
@@ -53782,7 +53826,7 @@ fn native_javac_file_manager_infer_binary_name(
                 }
                 _ => None,
             };
-            path.map(|path| javac_binary_name_from_relative_path(&path))
+            path.map(|path| javac_binary_name_from_relative_path(path.as_str()))
         }
         "com/sun/tools/javac/file/PathFileObject$JRTFileObject" => {
             let path = match ctx.get_field_by_name(file, "path") {

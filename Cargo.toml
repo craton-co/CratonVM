@@ -388,3 +388,12 @@ panic = "unwind"
 strip = "debuginfo"
 incremental = false
 debug = false
+
+# T-CBC.1: vendored, minimally-patched rustls 0.23.38 (native-builtins/vendor/rustls-cbc)
+# adding mac_key_len support to the TLS1.2 key schedule so classic CBC+HMAC
+# cipher suites (which need a separate MAC secret rustls's stock
+# Tls12AeadAlgorithm/KeyBlockShape has no field for) can derive standard
+# RFC 5246 A.6-ordered key material. See docs/known-issues/springboot/
+# rustls-cbc-cipher-suites-not-supported.md for the full rationale.
+[patch.crates-io]
+rustls = { path = "native-builtins/vendor/rustls-cbc" }

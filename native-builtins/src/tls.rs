@@ -37,6 +37,12 @@ const TLS12_CIPHERS: &[&str] = &[
     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
     "TLS_RSA_WITH_AES_256_GCM_SHA256",
 ];
 

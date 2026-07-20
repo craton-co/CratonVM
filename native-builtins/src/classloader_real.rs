@@ -1177,6 +1177,37 @@ fn cl_real_load_class_base(
         ));
     }
 
+    // 0. Real parent-first delegation to a USER-DEFINED parent (JVMS §5.3.2
+    //    step 2). "Standard VM class loading" below answers through
+    //    CratonVM's flat global class store, which stands in for bootstrap
+    //    → platform → app delegation — but a CUSTOM parent's own recorded
+    //    URLs are deliberately kept OUT of that global store (see
+    //    `ucl_try_define_local_class`'s doc comment: "that would make one
+    //    temporary loader's classes and resources visible to another"), so
+    //    the global store can never answer on a custom parent's behalf.
+    //    Without this step a `URLClassLoader` built with a custom parent
+    //    (e.g. Spring Boot's `PropertiesLauncher.wrapWithCustomClassLoader`
+    //    wrapping a `LaunchedClassLoader`) could never see anything the
+    //    parent itself would have resolved — every lookup fell straight to
+    //    the (parent-blind) global store and then a bare `ClassNotFoundException`.
+    //    Scoped to a genuinely user-defined parent so builtin (app/platform/
+    //    bootstrap) parents are unaffected and keep using the faster global
+    //    path below; a miss or exception here is swallowed (`_ => {}`) so
+    //    every existing fallback (global store, `findClass` override,
+    //    deferred resolution) still runs exactly as before.
+    if let Some(parent) = parent {
+        if crate::classloader::is_user_defined_loader(ctx, parent) {
+            if let Ok(Some(Value::Object(Some(mirror)))) = ctx.invoke_virtual(
+                parent,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(class_name_obj))],
+            ) {
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+        }
+    }
+
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
     //    or when the loader's chain cannot reach a built-in loader).
     if !defer_to_find_class && !scoped_user_chain {
