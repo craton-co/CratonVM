@@ -2207,6 +2207,16 @@ fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // actual server socket had no certificate to present at all, and every
     // TLS handshake against it failed immediately ("unexpected EOF" on the
     // client side). See docs/known-issues/http-server-cluster-residuals.md.
+    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+        eprintln!(
+            "[dbg-tls-hs] engine_set_key_entry store_id={} alias={:?} key_len={} chain_len={} chain_cert_lens={:?}",
+            id,
+            alias,
+            key_der.len(),
+            chain.len(),
+            chain.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
+    }
     if !chain.is_empty() {
         if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
             eprintln!("[dbg-tls-hs] install_identity_from_der CALLER=engine_set_key_entry(direct-API) key_len={}", key_der.len());
@@ -2404,6 +2414,12 @@ pub(crate) fn keystore_set_pending_km_identity_with_password(
     if password.is_empty() {
         let ident = store_identity_pem_map().lock().unwrap().get(&id).cloned();
         if let Some((cert, key)) = ident {
+            if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+                eprintln!(
+                    "[dbg-tls-hs] keystore_set_pending_km_identity_with_password store_id={} SOURCE=cached-snapshot cert_pem_len={} key_pem_len={}",
+                    id, cert.len(), key.len()
+                );
+            }
             crate::t27_tls::set_pending_km_identity(cert, key);
             return;
         }
@@ -2446,6 +2462,13 @@ fn keystore_unlock_private_keys(id: i32, password: &[u8]) {
             if let Some(plain) = jks_recover_key(key_der, password) {
                 *key_der = plain;
                 if !installed_identity {
+                    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+                        eprintln!(
+                            "[dbg-tls-hs] install_identity_from_der CALLER=keystore_unlock_private_keys(store_id={}) key_len={}",
+                            id,
+                            key_der.len()
+                        );
+                    }
                     crate::t27_tls::install_identity_from_der(key_der, chain);
                     installed_identity = true;
                 }
@@ -2459,8 +2482,35 @@ fn keystore_unlock_private_keys(id: i32, password: &[u8]) {
 /// `keystore_set_pending_km_identity`'s fallback for why this is needed.
 fn keystore_get_first_private_key(id: i32) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
     let store = registry().read().stores.get(&id).cloned()?;
-    for entry in store.entries.values() {
+    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+        let summary: Vec<String> = store
+            .entries
+            .iter()
+            .map(|(alias, e)| match &e.kind {
+                EntryKind::PrivateKey { key_der, chain } => format!(
+                    "{alias}=PrivateKey(key_len={},chain_cert_lens={:?})",
+                    key_der.len(),
+                    chain.iter().map(|c| c.len()).collect::<Vec<_>>()
+                ),
+                EntryKind::TrustedCert { cert_der } => {
+                    format!("{alias}=TrustedCert(len={})", cert_der.len())
+                }
+                EntryKind::SecretKey { .. } => format!("{alias}=SecretKey"),
+            })
+            .collect();
+        eprintln!(
+            "[dbg-tls-hs] keystore_get_first_private_key store_id={} entries={:?}",
+            id, summary
+        );
+    }
+    for (alias, entry) in store.entries.iter() {
         if let EntryKind::PrivateKey { key_der, chain } = &entry.kind {
+            if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+                eprintln!(
+                    "[dbg-tls-hs] keystore_get_first_private_key store_id={} PICKED alias={:?}",
+                    id, alias
+                );
+            }
             return Some((key_der.clone(), chain.clone()));
         }
     }
