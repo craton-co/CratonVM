@@ -676,8 +676,19 @@ impl DefaultCacheManagerInner {
     }
 
     /// List all cache names (owned strings so we don't hold the lock).
+    ///
+    /// Includes names registered via `defineConfiguration` even before the
+    /// cache has been lazily instantiated through `get_cache` — mirrors real
+    /// Infinispan's `getCacheNames()`/`getDefinedCaches()`, which reflects
+    /// configuration, not instantiation (see `native_dcm_get_cache_names`'s
+    /// synthetic branch, which surfaced this gap: `defineConfiguration("foo",
+    /// ...)` alone left `cache_names()` empty until `getCache("foo")` was
+    /// also called).
     pub fn cache_names(&self) -> Vec<String> {
-        self.caches.read().keys().cloned().collect()
+        let mut names: std::collections::HashSet<String> =
+            self.caches.read().keys().cloned().collect();
+        names.extend(self.pending_configs.read().keys().cloned());
+        names.into_iter().collect()
     }
 
     #[cfg(test)]
@@ -921,11 +932,131 @@ fn native_dcm_get_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Object(Some(cache_obj))))
 }
 
-/// `DefaultCacheManager.getCacheNames()Ljava/util/Set;` — we return an
-/// empty `Object(None)`; bytecode that needs the real set can call
-/// `cacheExists(name)` instead. Keycloak only hits it for diagnostics.
-fn native_dcm_get_cache_names(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// `DefaultCacheManager.getCacheNames()Ljava/util/Set;`
+///
+/// Registered unconditionally on `DefaultCacheManager`/`EmbeddedCacheManager`
+/// (native dispatch is keyed by class+method+descriptor, not by which
+/// constructor built the receiver — see `is_real_dcm`'s doc), so this also
+/// intercepts `.getCacheNames()` on a REAL `DefaultCacheManager`. The old
+/// unconditional `null` return here (comment: "Keycloak only hits it for
+/// diagnostics") was wrong for the real-manager case: real Infinispan
+/// bytecode iterates the result with no null guard —
+/// `org.infinispan.jcache.embedded.JCacheManager.registerPredefinedCaches()`
+/// (reached via the JSR-107 `JCachingProvider.createCacheManager` path Spring
+/// Boot's `JCacheCacheConfiguration` uses for Infinispan) does
+/// `cm.getCacheNames().iterator()` directly, so returning `null` surfaced as
+/// `NullPointerException: Cannot invoke "java.util.Set.iterator()" because
+/// "cacheNames" is null` instead of an (often empty) real `Set`. See
+/// docs/known-issues/springboot/cacheautoconfigurationtests-infinispan-null-cachemanager-residual.md.
+fn native_dcm_get_cache_names(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(this) = obj_arg(args, 0) {
+        if is_real_dcm(ctx, this) {
+            return native_real_dcm_get_cache_names(ctx, this);
+        }
+    }
+    // Synthetic manager: return the real names actually defined against the
+    // process-wide synthetic cache (via `defineConfiguration`/`getCache`)
+    // instead of `null` — same rationale as the real-manager branch above,
+    // e.g. Spring Boot's `InfinispanCacheConfiguration.infinispanCacheManager`
+    // uses the zero-arg `new DefaultCacheManager()` (this synthetic path)
+    // whenever no `spring.cache.infinispan.config` resource is set, and
+    // `SpringEmbeddedCacheManager.getCacheNames()` calls straight through to
+    // this method with no null guard.
+    let names = global_manager().cache_names();
+    let key_objs: Vec<ObjectRef> = names.iter().map(|n| ctx.create_string(n)).collect();
+    let set = crate::build_real_layout_string_hashset(ctx, &key_objs);
+    Ok(Some(Value::Object(Some(set))))
+}
+
+/// Real-manager path for `getCacheNames()`: mirrors
+/// `DefaultCacheManager.getCacheNames()`'s own real bytecode
+/// (`configurationManager.getDefinedCaches()` unioned with `caches.keySet()`,
+/// filtered through `InternalCacheRegistry.filterPrivateCaches`) via
+/// `invoke_virtual` against the real fields, rather than re-entering this
+/// native (which would just recurse into itself since dispatch is keyed by
+/// method name, not by which code is calling it).
+fn native_real_dcm_get_cache_names(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let configuration_manager = match ctx.get_field_by_name(this_cur, "configurationManager") {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let cm_pin = ctx.pin_native_root(configuration_manager);
+
+        let cm_cur = ctx.read_native_pin(cm_pin, configuration_manager);
+        let defined = ctx.invoke_virtual(
+            cm_cur,
+            "getDefinedCaches",
+            "()Ljava/util/Collection;",
+            &[],
+        )?;
+        let defined_obj = match defined {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let defined_pin = ctx.pin_native_root(defined_obj);
+
+        let defined_cur = ctx.read_native_pin(defined_pin, defined_obj);
+        let set = ctx.new_object_initialized(
+            "java/util/TreeSet",
+            "(Ljava/util/Collection;)V",
+            &[Value::Object(Some(defined_cur))],
+        )?;
+        let set_obj = match set {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let set_pin = ctx.pin_native_root(set_obj);
+
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        if let Value::Object(Some(caches)) = ctx.get_field_by_name(this_cur, "caches") {
+            let caches_pin = ctx.pin_native_root(caches);
+            let caches_cur = ctx.read_native_pin(caches_pin, caches);
+            let key_set = ctx.invoke_virtual(caches_cur, "keySet", "()Ljava/util/Set;", &[])?;
+            if let Some(Value::Object(Some(key_set_obj))) = key_set {
+                let set_cur = ctx.read_native_pin(set_pin, set_obj);
+                ctx.invoke_virtual(
+                    set_cur,
+                    "addAll",
+                    "(Ljava/util/Collection;)Z",
+                    &[Value::Object(Some(key_set_obj))],
+                )?;
+            }
+        }
+
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        if let Value::Object(Some(gcr)) = ctx.get_field_by_name(this_cur, "globalComponentRegistry") {
+            let gcr_pin = ctx.pin_native_root(gcr);
+            if let Ok(icr_cid) =
+                ctx.ensure_class_initialized("org/infinispan/registry/InternalCacheRegistry")
+            {
+                let icr_mirror = ctx.get_class_mirror(icr_cid);
+                let gcr_cur = ctx.read_native_pin(gcr_pin, gcr);
+                let icr = ctx.invoke_virtual(
+                    gcr_cur,
+                    "getComponent",
+                    "(Ljava/lang/Class;)Ljava/lang/Object;",
+                    &[Value::Object(Some(icr_mirror))],
+                )?;
+                if let Some(Value::Object(Some(icr_obj))) = icr {
+                    let set_cur = ctx.read_native_pin(set_pin, set_obj);
+                    ctx.invoke_virtual(
+                        icr_obj,
+                        "filterPrivateCaches",
+                        "(Ljava/util/Set;)V",
+                        &[Value::Object(Some(set_cur))],
+                    )?;
+                }
+            }
+        }
+
+        let set_cur = ctx.read_native_pin(set_pin, set_obj);
+        Ok(Some(Value::Object(Some(set_cur))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// `DefaultCacheManager.cacheExists(String)Z`
