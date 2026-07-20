@@ -9496,9 +9496,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // A client context commonly has only trust material. Capture
                 // its roots before the next context creation can replace the
                 // thread-local selection used by the rustls engine.
-                crate::t27_tls::set_engine_trust_roots_override(eng);
+                crate::t27_tls::set_engine_trust_roots_override(ctx, eng);
                 if let Some((cert, key)) = identity {
-                    crate::t27_tls::set_engine_identity_override(eng, cert, key);
+                    crate::t27_tls::set_engine_identity_override(ctx, eng, cert, key);
                 }
                 // Remember which SSLContext created this engine so the
                 // post-handshake trust check can find its TrustManager[]
