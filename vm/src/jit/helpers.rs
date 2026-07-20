@@ -7545,8 +7545,25 @@ impl DeoptimizationController {
             );
         }
 
-        // Invalidate the compiled method from the JIT cache
-        {
+        // Invalidate the compiled method from the JIT cache. Skipped only
+        // for a SOFT OsrExit (action == Reinterpret, i.e. still within the
+        // "tolerate a few, they're rare" window in deopt.rs's OsrExit arm):
+        // that case means a loop boundary inside an otherwise-good artifact
+        // bailed to the interpreter for THIS call (real_frame_deopt_resume_
+        // and_despeculate already reconstructs and resumes the frame
+        // correctly without needing eviction) -- not that the compiled code
+        // is wrong, so recompiling it would be wasted work. Once OsrExit
+        // escalates past that window (action == MakeNotCompilable, meaning
+        // the SAME bci keeps exiting -- a structural property of the loop,
+        // not noise), evict normally like every other reason: keeping a
+        // doomed compiled entry alive pays the reconstruct-and-resume tax on
+        // literally every future call, which measured net SLOWER than plain
+        // interpretation (347s/round vs a 63-72s/round fully-interpreted
+        // baseline for the same benchmark -- docs/known-issues/tomcat-08-07/
+        // silent-hang-no-signature-cluster.md, TestResponsePerformance).
+        let skip_eviction = reason == cratonvm_jit::deopt::DeoptReason::OsrExit
+            && action == cratonvm_jit::deopt::DeoptAction::Reinterpret;
+        if !skip_eviction {
             let mut jit_cache = vm.jit_cache.write();
             jit_cache.remove(class_name, method_name, descriptor);
         }
@@ -7575,10 +7592,25 @@ impl DeoptimizationController {
             inv_mgr.clear_assumptions(&method_key);
         }
 
-        // If the deopt log recommends giving up, add to the JIT skip set
+        // If the deopt log recommends giving up, add to the JIT skip set.
+        // Also mark it bail-listed in the SEPARATE cratonvm_jit registry
+        // (`is_jit_bail_listed`/`mark_jit_bail_listed`, RBC.4) -- `jit_skip_set`
+        // alone only gates the interpreter's own per-call hotness/upgrade path
+        // (`vm/src/runtime/interpreter.rs`'s `execute()`); a JIT-compiled
+        // caller dispatching to this method as a CALLEE goes through
+        // `try_jit_compile_callee`/`_slow`, which never consults
+        // `jit_skip_set` at all. Without this, a give-up decision reached via
+        // the callee-dispatch path (exactly the shape of Tomcat's
+        // `Response.toAbsolute()`, called from `TestResponsePerformance`'s
+        // JIT-compiled `doHomebrew()` loop) never actually stuck: the method
+        // kept getting recompiled every time its deopt count re-crossed the
+        // threshold, an unbounded repeat of the same 15KB-recompile thrash
+        // this fix exists to stop. See docs/known-issues/tomcat-08-07/
+        // silent-hang-no-signature-cluster.md.
         if action == cratonvm_jit::deopt::DeoptAction::MakeNotCompilable {
             let mut skip = vm.jit_skip_set.write();
             skip.insert((class_name.into(), method_name.into(), descriptor.into()));
+            cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
         }
 
         // deopt-osr Step 9 follow-up (b): eager recompile re-queue. On a

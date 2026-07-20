@@ -24857,6 +24857,16 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // 995ff48c (Tomcat silent-hang scanner fix): interpreted per-byte read
+    // dispatch dominated the scanner's hot path. `<init>`/mark/reset/skip/...
+    // still run their real-JDK bytecode so buffer/mark state stays
+    // bytecode-owned; only the two read overloads are forced native.
+    if class_name == "java/io/BufferedInputStream"
+        && method_name == "read"
+        && matches!(method_descriptor, "([BII)I" | "()I")
+    {
+        return true;
+    }
     if class_name == "java/io/DataInputStream"
         && matches!(
             (method_name, method_descriptor),
