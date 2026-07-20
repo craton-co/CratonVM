@@ -1,6 +1,17 @@
 # `reactive.HttpComponentsClientHttpConnectorBuilderTests` — flaky TLS failures under Apache async IOReactor: engine-identity loss + connection-pool cipher-suite leak
 
-**Status: OPEN — found 2026-07-19**, while verifying the fix for
+**Status: RESOLVED (2026-07-20).** Mechanisms 1 and 2 below are both fixed
+by the same change — see "Resolution" at the end of this doc. 45 repeated
+runs post-fix: 42 PASS, 3 FAIL, **zero** recurrences of either mechanism's
+signature (no crossed ClientHello, no `NoCipherSuitesInCommon`, no generic
+`Connection closed by peer`). The 3 residual failures are a **third,
+different, newly-found** issue — Tomcat's own embedded-server keystore
+loading intermittently throwing `Private key must be accompanied by
+certificate chain` — tracked separately, not investigated to root cause in
+this pass; see
+`docs/known-issues/springboot/tomcat-embedded-server-keystore-empty-cert-chain-intermittent.md`.
+
+**Original write-up follows, found 2026-07-19** while verifying the fix for
 [[springboot-tls-sslbundle-trust-validation-gap-cluster]] (now `docs/internal/fixed-suite-bugs/`).
 That doc's mechanism #4 (mismatch not rejected) is genuinely fixed —
 `connectWithSslBundleAndOptionsMismatch` passes reliably. This is a
@@ -198,3 +209,54 @@ timeouts/resets and should be treated with more skepticism than the
 not garble byte content under scheduling pressure, so those two specifically
 cannot be explained by host load and are the reliable signal for mechanisms
 1 and 2 above.
+
+## Resolution (2026-07-20)
+
+Confirmed a single root cause behind both mechanism 1 (crossed ClientHello)
+and mechanism 2 (connection-pool cipher-suite leak): `engine_table` and
+`sslparams_alpn_table` (`native-builtins/src/t27_tls.rs`) both keyed Java
+`SSLEngine`/`SSLParameters` object identity via `engine_objref_key`, which
+hashed the `ObjectRef`'s Debug-formatted **raw pointer value**. `ObjectRef`
+is a bare heap pointer (`Hash` implemented on the pointer value itself, see
+`types/src/value.rs`), and this VM's young-gen GC moves/reclaims objects —
+so a live object's identity was not actually stable across its own
+lifetime, and neither table ever evicted stale entries. Once an object
+moved (or its old address was reclaimed and reused by an unrelated new
+allocation), the new object landing at that address would silently inherit
+whatever stale `EngineState`/ALPN list/cipher restriction the table still
+had keyed there — explaining both the crossed-handshake symptom (an
+orphaned in-progress `EngineState` restarting a fresh ClientHello) and the
+cipher-leak symptom (a fresh engine inheriting a stale, narrower cipher
+restriction) as two faces of the same bug.
+
+Fix: replaced the raw-pointer hash with `ctx.identity_hash_code(obj)` — the
+VM's real, GC-stable identity hash (same contract as `Object.hashCode()`'s
+default implementation; already the established pattern elsewhere in this
+codebase, e.g. `native-io/src/nio_selector.rs`'s own cross-call Java-object
+identity lookups, and the `HttpsURLConnection` instance-keyed config table
+from the sibling `tls-sslbundle-trust-validation-gap-cluster` fix). This
+required threading a `ctx: &dyn NativeContext` parameter through
+`engine_objref_key`, `engine_id_or_alloc` (28 call sites across
+`register_engine_impl_natives`, `do_wrap`/`do_unwrap`,
+`register_apply_parameters`), and the three `pub(crate)` wrapper functions
+(`set_engine_identity_override`, `set_engine_trust_roots_override`,
+`set_engine_trust_ctx_key`) plus their one caller in `net_phase_e.rs`'s
+`createSSLEngine`. The dead, never-called `engine_id_for` helper was
+removed rather than updated.
+
+Verified: 45 repeated runs of the isolated
+`reactive.HttpComponentsClientHttpConnectorBuilderTests`
+(`-Parallel 1`, one class per process) — 42 PASS, 3 FAIL, zero occurrences
+of either original mechanism's signature. The 3 residual failures are a
+different, third mechanism (Tomcat's own keystore loading, not this bug —
+see the new doc referenced above). Also re-verified all 6 classes from the
+sibling `tls-sslbundle-trust-validation-gap-cluster` fix — all still PASS,
+no regression.
+
+**Scope note**: `objref_key` (a sibling helper with the identical
+raw-pointer-hash flaw, used by unrelated side tables — `sock_alpn_table`,
+`session_peer_certs_table`, and others) was intentionally **not** touched
+in this pass; fixing it would be a much larger, separate refactor across
+many more call sites, and none of those tables were implicated in the
+mechanisms fixed here. Worth revisiting if a similar identity-loss symptom
+turns up elsewhere.
