@@ -4,7 +4,7 @@
 cipher suite support implemented; see "Fix" below. Originally filed
 2026-07-19 while investigating (and disproving) the "corroborating
 evidence" hypothesis in
-`docs/internal/springboot/ssl-pem-pkcs12-store-parse-failure-cluster-FIXED.md`.
+`springboot/ssl-pem-pkcs12-store-parse-failure-cluster-FIXED.md`.
 
 ## Symptom
 
@@ -32,7 +32,7 @@ java.lang.IllegalArgumentException: None of the [ciphers] specified are supporte
     at org.apache.tomcat.util.net.SSLUtilBase.getEnabled(SSLUtilBase.java:164)
 ```
 
-CratonVM's TLS engine is backed by `rustls` (`native-builtins/Cargo.toml`:
+CratonVM's TLS engine is backed by `rustls` (`../../native-builtins/Cargo.toml`:
 `rustls = { version = "0.23", features = ["ring", "std", "tls12", "logging"] }`).
 rustls's stock `ring`/`aws-lc-rs` crypto providers never implement CBC-mode
 cipher suites — a permanent, documented, intentional upstream design
@@ -60,8 +60,8 @@ stance but a genuine architectural gap: a plugin alone cannot fix it.
 This is the small, bounded fork the original feasibility analysis (below)
 anticipated:
 
-1. **Vendored rustls 0.23.38** into `native-builtins/vendor/rustls-cbc`
-   (wired in via `[patch.crates-io]` in the workspace `Cargo.toml`), and
+1. **Vendored rustls 0.23.38** into `../../native-builtins/vendor/rustls-cbc`
+   (wired in via `[patch.crates-io]` in the workspace `../../Cargo.toml`), and
    patched its TLS1.2 key schedule:
    - `crypto::cipher::KeyBlockShape` gained a `mac_key_len` field (0 for
      the existing GCM/ChaCha suites — fully backward compatible).
@@ -73,7 +73,7 @@ anticipated:
      private glue that assembles what gets passed to it.
    - `AeadKey::MAX_LEN` bumped 32 → 96 to hold `mac_key_len + enc_key_len`
      for the AES-256/SHA-384 suite.
-2. **Implemented the suites** in `native-builtins/src/t27_tls_cbc.rs`
+2. **Implemented the suites** in `../../native-builtins/src/t27_tls_cbc.rs`
    using the same audited RustCrypto primitives already used elsewhere in
    this codebase (`aes`, `cbc`, `hmac`, `sha2`, `subtle` — matching
    `hsm-core`'s `crypto::rustcrypto_backend`), rather than hand-rolling
@@ -110,7 +110,7 @@ anticipated:
   variants), a full record-layer round trip, and tampered-ciphertext
   rejection.
 - **Real external interop**: a throwaway example server
-  (`native-builtins/examples/cbc_interop_server.rs`) built with the fix,
+  (`../../native-builtins/examples/cbc_interop_server.rs`) built with the fix,
   restricted to only `TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256`, handshook
   successfully with the system `openssl s_client -cipher
   ECDHE-RSA-AES128-SHA256 -tls1_2` and exchanged application data
@@ -148,7 +148,7 @@ upstream limitation as CBC and classic DHE, but for protocol versions
 rather than cipher suites — and with no modern interop justification,
 since TLS 1.1 is actively being removed industry-wide, not merely
 deprecated). Filed separately as
-`docs/known-issues/springboot/rustls-tls11-protocol-not-supported.md`
+`rustls-tls11-protocol-not-supported.md`
 rather than folded into this doc, since it's a different feature gap
 (protocol version support) with its own (even more clear-cut) "not
 pursued" rationale.
