@@ -21966,6 +21966,26 @@ pub fn comparator_compare(
                 .unwrap_or(Value::Object(None));
             let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
             let b = read_pinned_elem(ctx, b_pin, b);
+            // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
+            // docs/known-issues/wildfly-remoting-classcastexception-
+            // parallel-extension-add.md): `ka` -- the FIRST extracted key --
+            // was read raw here and reused below at `natural_compare(ctx,
+            // &ka, &kb)`, but the very next line's `invoke_virtual` (computing
+            // `kb`) is exactly as GC-capable as the first one that produced
+            // `ka` -- and unlike `key_fn`/`b` just above, `ka` was never
+            // pinned across it. Live-captured via `EnhancedQueueExecutor
+            // $ThreadBody` worker threads racing this window during
+            // `parallel-extension-add`'s `ResourceDescriptor.addCapabilities`
+            // (`Comparator.comparing(Capability::getName)`-shaped natural-
+            // ordering comparator on a `TreeMap`): the stale `ka` read back
+            // as a blank `java.lang.Object` (class id 0 -- which is both the
+            // real bootstrap id of `java.lang.Object` *and* what a zeroed/
+            // never-written header reads as, masking the staleness as a
+            // superficially valid instance) against a freshly-extracted `kb`
+            // `String`, producing `class java.lang.Object cannot be cast to
+            // class java.lang.Comparable`. Pin `ka` across the second
+            // `apply` call and refresh it immediately before use.
+            let ka_pin = pin_value(ctx, ka);
             let kb = ctx
                 .invoke_virtual(
                     key_fn,
@@ -21974,6 +21994,7 @@ pub fn comparator_compare(
                     &[b],
                 )?
                 .unwrap_or(Value::Object(None));
+            let ka = read_pinned_elem(ctx, ka_pin, ka);
             ctx.unpin_native_roots(key_fn_pin);
             natural_compare(ctx, &ka, &kb)
         }
