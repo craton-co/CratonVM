@@ -24524,6 +24524,18 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Keep in sync with vm_exec.rs's `check_override` allow-list entry for
+    // the same triple — see that entry's comment for the full rationale
+    // (synthetic StringBuilder/StringBuffer/AbstractStringBuilder layout vs.
+    // real bytecode's `checkOffset(dstOffset, count)` AIOOBE).
+    if matches!(
+        class_name,
+        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+    ) && method_name == "insert"
+        && (method_descriptor.starts_with("(I[CII)") || method_descriptor.starts_with("(I[C)"))
+    {
+        return true;
+    }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
