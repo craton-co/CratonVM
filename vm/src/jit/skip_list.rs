@@ -1058,22 +1058,22 @@ fn should_skip_jit_internal(
         // ORIGINAL correctness justification for this ban is therefore probably
         // gone.
         //
-        // Despite that, the ban stays banned: while re-verifying, hit a
-        // DIFFERENT, unrelated `EXCEPTION_STACK_OVERFLOW` crash in
-        // `cratonvm_gc::gen_heap::GenerationalHeap::get_field`/`read_slot`
-        // (see `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`)
-        // — confirmed via a byte-for-byte clean `origin/dev` build that this is
+        // While re-verifying, also hit a DIFFERENT, unrelated
+        // `EXCEPTION_STACK_OVERFLOW` crash (symbolized to
+        // `cratonvm_gc::gen_heap::GenerationalHeap::get_field`/`read_slot`,
+        // but that was a red herring — the real cause was a `Path.toString()`
+        // native infinite-recursion bug in `native-builtins/src/phases_late.rs`,
+        // since FIXED — see
+        // `docs/internal/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow-FIXED.md`).
+        // Confirmed via a byte-for-byte clean `origin/dev` build that this was
         // a genuine, pre-existing `dev` regression with NO relation to this ban
-        // or to JIT-compiling Lucene at all (it reproduces with the ban fully in
-        // place too). So lifting this ban is not what's unsafe — but since doing
-        // so also produced zero measured benefit (didn't speed up
-        // `testSlicesDense`), there is no upside to justify carrying it while
-        // that separate, more serious bug is still open. Once
-        // `ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md` is resolved,
-        // this ban can be reconsidered purely on its own merits — re-verify
-        // against the ORIGINAL AIOOBE repro (this comment's first paragraph)
-        // before lifting it again. Liftable for investigation via
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        // or to JIT-compiling Lucene at all (it reproduced with the ban fully
+        // in place too). So lifting THIS ban was never what was unsafe — but
+        // since doing so also produced zero measured benefit (didn't speed up
+        // `testSlicesDense`), it stays banned regardless: no upside to justify
+        // the unproven risk. Re-verify against the ORIGINAL AIOOBE repro (this
+        // comment's first paragraph) before ever lifting it again. Liftable
+        // for investigation via `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
         if class_name.starts_with("org/apache/lucene/")
             && !package_allowed("org/apache/lucene/", allow_packages)
         {

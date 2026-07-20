@@ -11904,13 +11904,53 @@ fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
             return p57_to_os_path(&raw);
         }
     }
-    match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
+    // STACK-OVERFLOW GUARD (found 2026-07-19 investigating a real crash: JIT
+    // method-stats work on an unrelated ES/Lucene test hit
+    // EXCEPTION_STACK_OVERFLOW at gen_heap::get_field, root-caused via the
+    // dispatch_trace ring to `TestRuleTemporaryFilesCleanup.initializeJavaTempDir`
+    // -> native Path.toString() repeating 256/256 times with zero variation).
+    //
+    // This fallback's `invoke_virtual(path_obj, "toString", ...)` was written
+    // assuming dispatch lands somewhere OTHER than back here — either the
+    // (separate) dead-dispatch-to-Object.toString() bug fixed the same day in
+    // `docs/internal/springboot/path-tostring-dead-dispatch-breaks-inprocess-javac-FIXED.md`,
+    // or a genuine delegating wrapper's own real bytecode `toString()`. A
+    // THIRD same-day fix
+    // (`docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`,
+    // `vm_exec.rs`'s `invoke_on_class_shared_inner`) made dispatch correctly
+    // receiver-aware: ANY Path-subtype receiver's `toString()` now routes
+    // straight back to this exact native (`p57_path_display_string` ->
+    // `p57_read_path`). For a `path_obj` whose field-0 fast-path read keeps
+    // failing (nothing about the object changes between calls), that
+    // redirect recurses into this same function forever — a real, silent
+    // EXCEPTION_STACK_OVERFLOW, not a Java StackOverflowError (native
+    // recursion via `ctx.invoke_virtual` is invisible to every one of the
+    // interpreter's counted recursion guards; see
+    // `docs/known-issues/elasticsearch-suite/ES-CRASH-20260719-lucene-jit-getfield-stack-overflow.md`).
+    //
+    // A thread-local re-entrancy flag breaks the cycle: the first call takes
+    // the real dispatch as before (the common, legitimate delegating-wrapper
+    // case terminates immediately since IT dispatches into different, real
+    // bytecode); a NESTED re-entry into this exact fallback — which can only
+    // happen via the recursive-redirect case above — returns the same benign
+    // empty-string fallback the final `_ =>` arm already uses for other
+    // failures, instead of recursing again.
+    thread_local! {
+        static IN_TOSTRING_FALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if IN_TOSTRING_FALLBACK.with(|f| f.get()) {
+        return String::new();
+    }
+    IN_TOSTRING_FALLBACK.with(|f| f.set(true));
+    let result = match ctx.invoke_virtual(path_obj, "toString", "()Ljava/lang/String;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => {
             let raw = ctx.read_string(s).unwrap_or_default();
             p57_to_os_path(&raw)
         }
         _ => String::new(),
-    }
+    };
+    IN_TOSTRING_FALLBACK.with(|f| f.set(false));
+    result
 }
 
 /// Convert a Java-style path to an OS-native path.
