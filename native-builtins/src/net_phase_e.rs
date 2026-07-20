@@ -149,6 +149,12 @@ const CLIENT_SUPPORTED_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
 ];
 
 const SOCK_HOST: usize = 0;
@@ -9436,6 +9442,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
@@ -9482,6 +9494,12 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
                 "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
                 "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+                // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+                // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
             ];
             let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());

@@ -633,6 +633,7 @@ dependencies = [
  "filetime",
  "flate2",
  "getrandom 0.2.17",
+ "hmac",
  "httparse",
  "indexmap",
  "libc",
@@ -660,6 +661,7 @@ dependencies = [
  "sha3",
  "snap",
  "socket2",
+ "subtle",
  "tempfile",
  "thiserror",
  "tracing",
@@ -2509,8 +2511,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.38"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
 dependencies = [
  "log",
  "once_cell",
