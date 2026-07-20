@@ -2230,6 +2230,16 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
 /// ids are small counters, so the high offset never collides.
 pub(crate) const RUSTLS_SOCK_ID_BASE: i32 = 0x4000_0000;
 
+/// A socket returned by `SSLSocketFactory.createSocket(Socket, String, int,
+/// boolean)` before its CLIENT-vs-SERVER handshake role is known (real JDK
+/// contract: defaults to client mode, but the caller may still call
+/// `setUseClientMode(false)` before the handshake actually starts — exactly
+/// what MockWebServer's HTTPS listener does) stores a pending-handshake id
+/// offset by this base instead of a real rustls stream id. Distinct from,
+/// and numerically below, `RUSTLS_SOCK_ID_BASE` so the two ranges never
+/// collide; see `t27_tls::{stash_pending_layered_socket, drive_pending_layered_handshake}`.
+pub(crate) const PENDING_LAYERED_SOCK_ID_BASE: i32 = 0x2000_0000;
+
 /// NEW-13: read from a TLS stream registered via `s2_tls_connect` (native-tls),
 /// or — for ids ≥ `RUSTLS_SOCK_ID_BASE` — the rustls client/server stream table.
 pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {

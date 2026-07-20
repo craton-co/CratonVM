@@ -268,6 +268,54 @@ pub(crate) fn sock_stream_id_for_upcall(ctx: &dyn NativeContext, this: ObjectRef
     sock_get(ctx, this).stream_id
 }
 
+/// Transfer an accepted plain Socket's TCP stream to a TLS layer.
+pub(crate) fn take_raw_socket_stream_for_tls(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<std::net::TcpStream, String> {
+    let side = sock_get(ctx, this);
+    if side.stream_id >= 0 {
+        let stream = crate::servlet::s2_registry()
+            .lock()
+            .streams
+            .remove(&side.stream_id)
+            .ok_or_else(|| "wrapped Socket stream is not available".to_string())?;
+        let tcp = match std::sync::Arc::try_unwrap(stream) {
+            Ok(tcp) => tcp,
+            Err(shared) => shared
+                .try_clone()
+                .map_err(|e| format!("clone wrapped Socket stream: {e}"))?,
+        };
+        sock_set(ctx, this, |s| {
+            s.stream_id = -1;
+            s.closed = 1;
+        });
+        return Ok(tcp);
+    }
+
+    // Real JDK ServerSocket.accept() creates a NioSocketImpl whose TCP stream
+    // is owned by native-io's sun.nio.ch.Net registry, not this module's
+    // legacy s2 registry.  Extract its FileDescriptor and hand the stream to
+    // rustls before MockWebServer calls SSLSocketFactory.createSocket(Socket,
+    // ...).
+    let implementation = match ctx.get_field_by_name(this, "impl") {
+        Value::Object(Some(implementation)) => implementation,
+        _ => return Err("wrapped Socket is not connected".to_string()),
+    };
+    let descriptor = match ctx.get_field_by_name(implementation, "fd") {
+        Value::Object(Some(descriptor)) => descriptor,
+        _ => return Err("wrapped Socket has no FileDescriptor".to_string()),
+    };
+    let fd = match ctx.get_field_by_name(descriptor, "fd") {
+        Value::Int(fd) if fd >= 0 => fd,
+        _ => match ctx.get_field_by_name(descriptor, "handle") {
+            Value::Long(fd) if (0..=i32::MAX as i64).contains(&fd) => fd as i32,
+            _ => return Err("wrapped Socket FileDescriptor has no Net fd".to_string()),
+        },
+    };
+    cratonvm_native_io::net::take_stream_for_tls(fd)
+}
+
 /// FIX (netty-client-socket-write-after-close): companion to
 /// [`sock_stream_id_for_upcall`] for `phases_late.rs`'s NEW-13
 /// `javax/net/ssl/SSLSocket` stream/lifecycle natives (`getInputStream`,
@@ -1762,7 +1810,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-pub(crate) fn uri_percent_decode(input: &str) -> String {
+fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -3570,6 +3618,15 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if sid < 0 {
                 return Err(ioex("Socket.getInputStream: not connected"));
             }
+            // A layered SSLSocket can be invoked through its java.net.Socket
+            // base type (MockWebServer does exactly this). Keep that virtual
+            // call on the rustls-aware stream adapter instead of treating its
+            // high-offset id as a plain raw s2 socket id.
+            if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+                let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+                sock_set_for_create(ctx, is, 0, sid);
+                return Ok(Some(Value::Object(Some(is))));
+            }
             let is = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3);
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
@@ -3587,6 +3644,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let sid = sock_get(ctx, this).stream_id;
             if sid < 0 {
                 return Err(ioex("Socket.getOutputStream: not connected"));
+            }
+            if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+                let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+                sock_set_for_create(ctx, os, 0, sid);
+                return Ok(Some(Value::Object(Some(os))));
             }
             let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
             stream_owner_set(ctx, os, this);
@@ -3876,18 +3938,8 @@ fn re2_bind_listener(
     })?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
-    // A wildcard listener address (0.0.0.0 / ::) is a valid bind target but
-    // not a valid client connect destination on Windows (WSAEADDRNOTAVAIL /
-    // os error 10049) — publish the loopback address instead, mirroring
-    // `native-io/src/socket_channel.rs::advertised_listener_host` (same
-    // rationale, sibling crate, duplicated rather than shared per this
-    // module's existing cross-crate-table pattern above).
     let actual_host = local_addr
-        .map(|a| match a {
-            SocketAddr::V4(a) if a.ip().is_unspecified() => "127.0.0.1".to_string(),
-            SocketAddr::V6(a) if a.ip().is_unspecified() => "::1".to_string(),
-            _ => a.ip().to_string(),
-        })
+        .map(|a| a.ip().to_string())
         .unwrap_or_else(|| ip.to_string());
     let listener_id = s2_alloc_listener(listener);
     ss_set(ctx, this, |s| {
@@ -4538,23 +4590,6 @@ const HUC_BODY: usize = 6;
 const HUC_DO_INPUT: usize = 7;
 const HUC_DO_OUTPUT: usize = 8;
 const HUC_CONNECTED: usize = 9;
-// Field 10 caches the `java/util/jar/JarFile` returned by
-// `JarURLConnection.getJarFile()` so repeat calls see the SAME instance
-// (matching `sun.net.www.protocol.jar.JarURLConnection`, which opens the
-// JarFile once and caches it). Without this, each call minted a fresh
-// JarFile, so closing the jar via one reference never affected another —
-// Spring Boot's `StaticResourceJarsTests.closesJarFromNonCachedConnection`
-// expects `getJarFile().getComment()` to see the CLOSED state after
-// `StaticResourceJars` already closed the connection's jar.
-const HUC_JAR_FILE: usize = 10;
-// Tracks `URLConnection.useCaches` for the `java/net/JarURLConnection`
-// carrier (see the class-scoped `setUseCaches`/`getUseCaches` registrations
-// below `getJarFile`). Reuses HUC_CODE's slot: never read or written by any
-// JarURLConnection-specific native (HUC_CODE only matters for an HTTP
-// response code), and — unlike field 11, which was tried first and proved
-// to silently not persist across calls — sits inside the confirmed-safe
-// 0..=10 field range for this carrier.
-const HUC_USE_CACHES: usize = HUC_CODE;
 
 struct HttpResponse {
     status: i32,
@@ -4576,15 +4611,9 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
     } else {
         return Err(format!("unsupported URL: {url}"));
     };
-    // A query may immediately follow the authority (`http://host:port?x`)
-    // without a slash. Treat it as a request for `/?x`, rather than letting
-    // `?x` leak into the port text. Spring's JdkClientHttpRequest uses this
-    // form for TestRestTemplate requests with query-only paths.
-    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
-        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
-        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
-        Some(i) => (&rest[..i], "/".to_string()),
-        None => (rest, "/".to_string()),
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -4600,7 +4629,7 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
         }
         None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path, userinfo))
+    Ok((scheme, host, port, path.to_string(), userinfo))
 }
 
 fn http_perform_request(
@@ -6034,26 +6063,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // concrete HTTP connection without response state and returns EOF.
             if let Some(raw_path) = ext.strip_prefix("file:") {
                 let decoded = uri_percent_decode(raw_path);
-                // POSIX: the URL's decoded path (e.g. `/data/data/...`) IS
-                // the absolute filesystem path already -- keep it intact.
-                // Windows: strip the leading `/` and, for the MSYS/Cygwin-
-                // style `/c/...` form (no colon), reinject the drive-letter
-                // colon (`c/foo` -> `c:/foo`) so `new File(path)` resolves.
-                // A prior version unconditionally stripped every leading
-                // `/` before this cfg split existed, so on Linux a `file:`
-                // `URL.openConnection()` built a File from a now-RELATIVE
-                // path (resolved against the JVM's cwd instead of `/`) --
-                // silently breaking every real-bytecode `FileURLConnection`
-                // caller (Xerces DTD/schema entity resolution, WAR resource
-                // loading, ...) whenever the cwd wasn't the fixture root.
-                // `URL.openStream()`'s sibling fast path a few dozen lines
-                // up masked this by retrying with the untrimmed absolute
-                // path on failure; this constructor-based path had no such
-                // fallback. See docs/known-issues/tomcat-08-07/
-                // silent-hang-no-signature-cluster.md.
+                let mut path = decoded.trim_start_matches('/').to_string();
                 #[cfg(windows)]
-                let path = {
-                    let mut path = decoded.trim_start_matches('/').to_string();
+                {
                     let bytes = path.as_bytes();
                     if bytes.len() >= 2
                         && bytes[0].is_ascii_alphabetic()
@@ -6061,10 +6073,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     {
                         path.insert(1, ':');
                     }
-                    path
-                };
-                #[cfg(not(windows))]
-                let path = decoded.clone();
+                }
                 let file = match ctx.new_object("java/io/File")? {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),
@@ -6098,14 +6107,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // URL.openStream() for every non-http scheme.
             let carrier = if ext.starts_with("jar:") {
                 "java/net/JarURLConnection"
-            } else if ext.starts_with("https://") {
-                // Spring's SimpleClientHttpsRequestFactory applies its
-                // SSLBundle only after the `HttpsURLConnection` type check.
-                // Returning the plain HTTP carrier for HTTPS URLs silently
-                // skipped that branch, leaving the native client on default
-                // trust roots. This concrete JDK subclass preserves the
-                // expected type while the shared HTTP natives own its I/O.
-                "sun/net/www/protocol/https/HttpsURLConnectionImpl"
+            } else if ext.starts_with("https:") {
+                // Spring's SkipSslVerificationHttpRequestFactory first tests
+                // the carrier with `instanceof HttpsURLConnection`.  Returning
+                // the plain HTTP base here skipped that whole configuration
+                // branch, so its permissive TrustManager was never created.
+                "javax/net/ssl/HttpsURLConnection"
             } else {
                 "java/net/HttpURLConnection"
             };
@@ -6198,14 +6205,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()Ljava/util/jar/JarFile;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Cached from a prior call — return the SAME instance so a
-            // caller that closes it (e.g. `StaticResourceJars` on a
-            // non-cached connection) observes the closed state on every
-            // later `getJarFile()` call, matching real-JDK's cached
-            // `sun.net.www.protocol.jar.JarURLConnection.jarFile` field.
-            if let Value::Object(Some(cached)) = ctx.get_field(this, HUC_JAR_FILE) {
-                return Ok(Some(Value::Object(Some(cached))));
-            }
             let url_obj = match ctx.get_field(this, HUC_URL) {
                 Value::Object(Some(o)) => o,
                 _ => return Err(ioex("JarURLConnection.getJarFile: no URL")),
@@ -6273,7 +6272,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)V",
                 &[Value::Object(Some(jar_file)), Value::Object(Some(path_str))],
             )?;
-            ctx.set_field(this, HUC_JAR_FILE, Value::Object(Some(jar_file)));
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
@@ -6384,55 +6382,6 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
-    // JarURLConnection.setUseCaches(boolean) / getUseCaches() — class-scoped
-    // override (more specific than the base-class no-op above, so it wins
-    // in dispatch for actual JarURLConnection-carrier instances) giving
-    // real get/set semantics instead of the base no-op / real-bytecode
-    // fallback, which always answered `false` regardless of what a caller
-    // set. That made `StaticResourceJars.isResourcesJar(JarURLConnection)`'s
-    // `closeJarFile = !connection.getUseCaches()` unconditionally close a
-    // cached JarFile (see HUC_JAR_FILE, above) even on a `useCaches(true)`
-    // connection, breaking `StaticResourceJarsTests
-    // .doesNotCloseJarFromCachedConnection` once `getJarFile()` started
-    // returning the same instance across calls.
-    //
-    // Storage: reuses HUC_USE_CACHES (field 2, aka HUC_CODE — never read or
-    // written by any JarURLConnection-specific native; only meaningful for
-    // an HTTP response code). Field 11 was tried first and DISCARDED: this
-    // carrier's real backing class (`java/net/JarURLConnection`) apparently
-    // reports a real total-field count of 11 (fields 0..=10), so index 11
-    // silently failed to persist across calls — confirmed empirically with
-    // a probe (`set` landed, the very next `get` read back the unset
-    // default). Field 2 sits well inside the confirmed-persisting 0..=10
-    // range (field 10, HUC_JAR_FILE, is proven reliable elsewhere in this
-    // file), so this is the safe choice, not merely the convenient one.
-    r.register(
-        "java/net/JarURLConnection",
-        "setUseCaches",
-        "(Z)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let v = matches!(args.get(1), Some(Value::Int(n)) if *n != 0);
-            ctx.set_field(this, HUC_USE_CACHES, Value::Int(if v { 1 } else { 0 }));
-            Ok(None)
-        },
-    );
-    r.register(
-        "java/net/JarURLConnection",
-        "getUseCaches",
-        "()Z",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Unset (never called setUseCaches): real-JDK default is `true`
-            // for every protocol except `file:`, which this carrier never
-            // represents (file: uses the real FileURLConnection class).
-            let v = match ctx.get_field(this, HUC_USE_CACHES) {
-                Value::Int(n) => n != 0,
-                _ => true,
-            };
-            Ok(Some(Value::Int(if v { 1 } else { 0 })))
-        },
-    );
     r.register(
         "java/net/URLConnection",
         "getContentLength",
@@ -9025,16 +8974,14 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let body =
                 alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
-            // A request body is binary data.  Keeping it as a String replaces
-            // every non-UTF-8 byte with U+FFFD, then re-encodes that character
-            // as EF BF BD when `re5_request_body_bytes` builds the wire body.
-            // This was invisible for textual HTTP requests but corrupted gzip,
-            // protobuf, and arbitrary binary `ofByteArray` payloads.
-            ctx.set_field(
-                body,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
+            let bytes = match args.first().copied() {
+                Some(Value::Object(Some(arr))) => {
+                    String::from_utf8_lossy(&re5_read_byte_array(ctx, arr)).into_owned()
+                }
+                _ => String::new(),
+            };
+            let s = ctx.create_string(&bytes);
+            ctx.set_field(body, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(body))))
         },
     );
@@ -9292,6 +9239,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.getInstance");
+            }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
             let proto = value_or_string(ctx, proto_val, "TLS");
             if !(proto.eq_ignore_ascii_case("TLS")
@@ -9368,6 +9318,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
+            }
             ctx.set_field(this, 1, Value::Int(1));
             // Per-SSLContext mTLS identity: claim the identity staged by the
             // keystore load that fed this context's KeyManager (same thread),
@@ -9411,8 +9364,15 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                eprintln!("[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}", ctx.identity_hash_code(this));
+            }
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
+            // Obtaining a factory has no connection scope. The HttpsURLConnection
+            // setter captures it later, either as an instance-specific config
+            // or as the JDK process default; doing that here leaked an
+            // instance's permissive TrustManager into later connections.
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -9704,13 +9664,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                 .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
-            let id = connect_result.map_err(|e| {
-                crate::phases_early::throw_jca_exc(
-                    ctx,
-                    "javax/net/ssl/SSLHandshakeException",
-                    &format!("TLS connect: {e}"),
-                )
-            })?;
+            let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let host_s = ctx.create_string(&host);
@@ -9848,35 +9802,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 )),
             }
         },
-    );
-    // The rustls-backed socket is deliberately a synthetic `SSLSocket`, so
-    // real `SSLSocket.getSSLParameters()` bytecode resolves these abstract
-    // declarations directly.  Supply the ordinary no-client-auth defaults
-    // rather than letting Apache HttpComponents fail with AbstractMethodError
-    // while merely inspecting its TLS parameters.
-    r.register(
-        "javax/net/ssl/SSLSocket",
-        "getNeedClientAuth",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    r.register(
-        "javax/net/ssl/SSLSocket",
-        "getWantClientAuth",
-        "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    r.register(
-        "javax/net/ssl/SSLSocket",
-        "setNeedClientAuth",
-        "(Z)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "javax/net/ssl/SSLSocket",
-        "setWantClientAuth",
-        "(Z)V",
-        |_ctx, _args| Ok(None),
     );
     r.register(
         sf,
@@ -12296,7 +12221,7 @@ mod tests {
     }
 
     #[test]
-    fn re5_body_publishers_of_byte_array_preserves_binary_static_arg_slot_zero() {
+    fn re5_body_publishers_of_byte_array_reads_static_arg_slot_zero() {
         let mut registry = NativeMethodRegistry::new();
         register_re5_http_client(&mut registry);
         let native = registry
@@ -12308,24 +12233,21 @@ mod tests {
             .expect("ofByteArray native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let bytes = ctx.new_array(ArrayElementType::Byte, 4);
-        for (index, byte) in [0x1f_u8, 0x8b, b'a', 0xff].into_iter().enumerate() {
-            ctx.set_array_element(bytes, index, Value::Int(byte as i8 as i32));
-        }
+        let bytes = ctx.new_array(ArrayElementType::Byte, 3);
+        ctx.set_array_element(bytes, 0, Value::Int(b'a' as i32));
+        ctx.set_array_element(bytes, 1, Value::Int(b'b' as i32));
+        ctx.set_array_element(bytes, 2, Value::Int(b'c' as i32));
 
         let publisher = match native(&mut ctx, &[Value::Object(Some(bytes))]).unwrap() {
             Some(Value::Object(Some(publisher))) => publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
         };
-        assert!(matches!(
-            ctx.get_field(publisher, 0),
-            Value::Object(Some(body)) if body == bytes
-        ));
-        let stored = ctx.get_field(publisher, 0);
-        assert_eq!(
-            re5_request_body_bytes(&mut ctx, stored).unwrap(),
-            [0x1f, 0x8b, b'a', 0xff]
-        );
+        let body = match ctx.get_field(publisher, 0) {
+            Value::Object(Some(body)) => body,
+            other => panic!("expected publisher body string, got {other:?}"),
+        };
+
+        assert_eq!(ctx.read_string(body).as_deref(), Some("abc"));
     }
 
     fn re5_test_byte_buffer(ctx: &mut MockNativeContext, bytes: &[u8]) -> ObjectRef {

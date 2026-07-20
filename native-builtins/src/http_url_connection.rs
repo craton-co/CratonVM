@@ -141,41 +141,6 @@ fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-// `HttpsURLConnection.setSSLSocketFactory` is native-intercepted, so the JDK
-// carrier's private field is not a reliable source of the configured factory.
-// Retain the rustls config by receiver identity instead, preventing unrelated
-// server contexts from overwriting an SSLBundle client's trust scope through
-// the process-wide compatibility fallback.
-static HUC_INSTANCE_CLIENT_CONFIGS: OnceLock<Mutex<HashMap<i32, Arc<ClientConfig>>>> =
-    OnceLock::new();
-
-fn huc_instance_client_configs() -> &'static Mutex<HashMap<i32, Arc<ClientConfig>>> {
-    HUC_INSTANCE_CLIENT_CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(crate) fn capture_huc_instance_ssl_factory(
-    ctx: &mut dyn NativeContext,
-    connection: ObjectRef,
-    factory: ObjectRef,
-) {
-    let Value::Object(Some(ssl_context)) = ctx.get_field(factory, 0) else {
-        return;
-    };
-    let Ok(config) = crate::t27_tls::client_config_for_ssl_context(ctx, ssl_context) else {
-        return;
-    };
-    if let Ok(mut configs) = huc_instance_client_configs().lock() {
-        configs.insert(ctx.identity_hash_code(connection), config);
-    }
-}
-
-fn huc_instance_client_config(ctx: &dyn NativeContext, connection: ObjectRef) -> Option<Arc<ClientConfig>> {
-    huc_instance_client_configs()
-        .lock()
-        .ok()
-        .and_then(|configs| configs.get(&ctx.identity_hash_code(connection)).cloned())
-}
-
 /// Per-real-connection REQUEST state, keyed by `identity_hash_code(this)`.
 ///
 /// A real-JDK `sun.net.www...HttpURLConnection` (handed out by the genuine
@@ -635,7 +600,6 @@ fn huc_real_perform(
         .ok()
         .and_then(|t| t.get(&key).cloned())
         .unwrap_or_default();
-    let instance_tls_config = huc_instance_client_config(ctx, this);
     let mut method = if req.method.is_empty() {
         "GET".to_string()
     } else {
@@ -669,6 +633,7 @@ fn huc_real_perform(
         };
         let resp = perform(
             ctx,
+            Some(this),
             &parsed,
             &method,
             &req.headers,
@@ -676,7 +641,6 @@ fn huc_real_perform(
             connect_to,
             read_to,
             established_https_stream,
-            instance_tls_config.clone(),
         );
         match resp {
             Ok((status, headers, resp_body))
@@ -773,9 +737,6 @@ fn huc_real_headers(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(String, St
 /// Drop all identity-keyed side-table state for a real carrier (on disconnect).
 fn real_forget(ctx: &dyn NativeContext, this: ObjectRef) {
     let key = ctx.identity_hash_code(this);
-    if let Ok(mut configs) = huc_instance_client_configs().lock() {
-        configs.remove(&key);
-    }
     if let Ok(mut t) = real_results().lock() {
         t.remove(&key);
     }
@@ -1478,6 +1439,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 
 fn perform(
     ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
     parsed: &Url1,
     method: &str,
     headers: &[(String, String)],
@@ -1485,7 +1447,6 @@ fn perform(
     connect_timeout: Duration,
     read_timeout: Duration,
     established_https_stream_id: Option<i32>,
-    instance_tls_config: Option<Arc<ClientConfig>>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let head = method.eq_ignore_ascii_case("HEAD");
     let req = build_request(method, parsed, headers, body);
@@ -1586,8 +1547,10 @@ fn perform(
         // It contains the configured trust roots/client identity and owns the
         // TLS ticket cache required for a following connection to resume.
         // If no custom SSLContext was captured, use cached system roots.
-        let cfg = instance_tls_config
-            .unwrap_or_else(|| crate::t27_tls::huc_default_client_config().unwrap_or_else(shared_legacy_config));
+        let cfg = connection
+            .and_then(|connection| crate::t27_tls::huc_client_config_for_connection(ctx, connection))
+            .or_else(crate::t27_tls::huc_default_client_config)
+            .unwrap_or_else(shared_legacy_config);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -1833,6 +1796,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     // see its doc — so this caller must not wrap the whole call in one.
     let (status, headers, body_bytes) = match perform(
         ctx,
+        Some(this),
         &parsed,
         &method,
         &headers,
@@ -1840,7 +1804,6 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
         connect_to,
         read_to,
         established_https_stream,
-        None,
     ) {
         Ok(v) => v,
         // FIX (client-cipher-restriction): mirror `huc_real_perform`'s
@@ -2600,19 +2563,6 @@ fn huc_set_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-fn huc_get_do_output(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    if is_real_carrier(ctx, this) {
-        let value = real_reqs()
-            .lock()
-            .ok()
-            .and_then(|reqs| reqs.get(&ctx.identity_hash_code(this)).map(|req| req.do_output))
-            .unwrap_or_else(|| matches!(ctx.get_field_by_name(this, "doOutput"), Value::Int(1)));
-        return Ok(Some(Value::Int(i32::from(value))));
-    }
-    Ok(Some(ctx.get_field(this, HUC_DO_OUTPUT)))
-}
-
 fn huc_set_connect_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
@@ -2845,7 +2795,6 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
     );
     r.register(cls, "setDoInput", "(Z)V", huc_set_do_input);
     r.register(cls, "setDoOutput", "(Z)V", huc_set_do_output);
-    r.register(cls, "getDoOutput", "()Z", huc_get_do_output);
     r.register(cls, "setConnectTimeout", "(I)V", huc_set_connect_timeout);
     r.register(cls, "setReadTimeout", "(I)V", huc_set_read_timeout);
     // Streaming-mode setters are no-ops: our `perform` buffers the request body
