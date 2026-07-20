@@ -235,6 +235,24 @@ fn register_object_name(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_object_name_get_canonical_key_property_list_string,
     );
+    // RKC-ObjectName-03: `getSerializedNameString()` is a private helper
+    // called from `writeObject()`'s non-compat branch (the default
+    // `ObjectOutputStream.defaultWriteObject()` + explicit
+    // `writeObject(getSerializedNameString())` path) to rebuild the
+    // canonical name text from `_kp_array` via `writeKeyPropertyListString`.
+    // The synthetic 1-field model never populates `_kp_array`, so real
+    // bytecode NPEs on `_kp_array.length` the first time an ObjectName is
+    // actually serialized — e.g. jmxmp's real remote `MBeanServerConnection`
+    // wire protocol (`RemoteMBeanClientInterceptorTests`), never exercised
+    // by the in-process `MBeanServer` path this synthetic model otherwise
+    // covers. Derive the same output from the canonical text model instead,
+    // mirroring `getCanonicalKeyPropertyListString` above.
+    r.register(
+        cls,
+        "getSerializedNameString",
+        "()Ljava/lang/String;",
+        native_object_name_get_serialized_name_string,
+    );
     r.register(cls, "isPattern", "()Z", native_object_name_is_pattern);
     r.register(
         cls,
@@ -767,6 +785,26 @@ fn native_object_name_get_canonical_key_property_list_string(
     let props_str = props_str.strip_suffix(",*").unwrap_or(props_str);
     let props_str = if props_str == "*" { "" } else { props_str };
     let s = ctx.create_string(props_str);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+/// `ObjectName.getSerializedNameString()`: see `RKC-ObjectName-03` at the
+/// registration site. Real bytecode rebuilds this from `_canonicalName` and
+/// `_kp_array` byte-by-byte, but the result is simply the canonical name
+/// text (domain + sorted key properties, with the pattern suffix normalised
+/// to a bare `*` when there are no other properties) — exactly what
+/// `canonical_object_name_text` already computes for the synthetic model.
+fn native_object_name_get_serialized_name_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let text = object_name_text(ctx, this);
+    let canonical = canonical_object_name_text(&text);
+    let s = ctx.create_string(&canonical);
     Ok(Some(Value::Object(Some(s))))
 }
 
