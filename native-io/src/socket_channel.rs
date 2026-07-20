@@ -305,13 +305,18 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
             message: format!("{ctx}: {e}"),
         }
         .into(),
-        ErrorKind::AddrInUse => ioex(format!("BindException: Address already in use: {ctx}: {e}")),
-        ErrorKind::AddrNotAvailable => ioex(format!(
-            "BindException: Cannot assign requested address: {ctx}: {e}"
-        )),
-        ErrorKind::PermissionDenied => {
-            ioex(format!("BindException: Permission denied: {ctx}: {e}"))
+        ErrorKind::AddrInUse => RuntimeError::BindException {
+            message: format!("Address already in use: {ctx}: {e}"),
         }
+        .into(),
+        ErrorKind::AddrNotAvailable => RuntimeError::BindException {
+            message: format!("Cannot assign requested address: {ctx}: {e}"),
+        }
+        .into(),
+        ErrorKind::PermissionDenied => RuntimeError::BindException {
+            message: format!("Permission denied: {ctx}: {e}"),
+        }
+        .into(),
         ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset => {
             ioex(format!("SocketException: {ctx}: {e}"))
         }
@@ -934,9 +939,15 @@ fn sc_is_connection_pending(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
+    // `ConnectFailed` is also "pending" from Java's point of view: connect()
+    // returned `false` for it (see `sc_connect_inner`/`sc_connect_bound`) and
+    // the failure is only observable via `finishConnect()`, exactly like a
+    // still-in-flight `Connecting` entry — a reactor that checks
+    // `isConnectionPending()` before calling `finishConnect()` must see
+    // `true` here or it will never make the call that reports the error.
     let pending = matches!(
         tcp_registry().read().get(&id),
-        Some(TcpHandle::Connecting(_))
+        Some(TcpHandle::Connecting(_)) | Some(TcpHandle::ConnectFailed(_, _))
     );
     Ok(Some(Value::Int(if pending { 1 } else { 0 })))
 }
@@ -1240,16 +1251,22 @@ fn sc_connect_bound(
             // mirrors the unbound non-blocking path: the Java reactor must
             // reach finishConnect()/its first write and observe the saved
             // failure, rather than receiving a synchronous connect exception.
+            //
+            // Do NOT mark this connected — see the matching comment in
+            // `sc_connect_inner`'s deferred-failure branch. Returning `true`
+            // here made Netty's connect-completion fast path treat a refused
+            // loopback connect as an immediate success, surfacing the real
+            // failure only as a raw "Connection refused" on the first write
+            // instead of a typed exception from `finishConnect()`.
             tcp_registry()
                 .write()
                 .insert(id, TcpHandle::ConnectFailed(stream, error));
             tcp_blocking_state().write().insert(id, false);
-            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
             cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local.port() as i32));
             let host_str = ctx.create_string(host);
             cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
             cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-            return Ok(true);
+            return Ok(false);
         }
         crate::nb_connect::StartConnect::DeferredFailure(_stream, error) => {
             return Err(map_err(&target, error));
@@ -1278,26 +1295,13 @@ fn sc_connect_bound(
             verdict.map_err(|e| map_err(&target, e))?;
             (stream, true)
         }
-        crate::nb_connect::StartConnect::DeferredFailure(stream, error) => {
-            // A non-blocking channel must retain the live descriptor until the
-            // selector drives finishConnect(), just like the unbound channel
-            // path below. Throwing here would violate SocketChannel's async
-            // contract and can strand a caller waiting for OP_CONNECT.
-            if allow_block {
-                return Err(map_err(&target, error));
-            }
-            let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-            tcp_registry()
-                .write()
-                .insert(id, TcpHandle::ConnectFailed(stream, error));
-            tcp_blocking_state().write().insert(id, false);
-            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
-            cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
-            let host_str = ctx.create_string(host);
-            cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
-            cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
-            return Ok(true);
-        }
+        // NOTE: a second `DeferredFailure` arm here would be unreachable —
+        // the unconditional `DeferredFailure(_stream, error) => return
+        // Err(...)` arm above already matches every case this one used to
+        // guard on (`allow_block == true`, since the `if !allow_block` arm
+        // earlier in this match consumes the `false` case). The compiler
+        // flagged the old duplicate arm as a hard unreachable-pattern
+        // warning; removed rather than left as dead code.
     };
     if connected && blocking {
         stream
@@ -1541,18 +1545,30 @@ fn sc_connect_inner(
         let id = tcp_register(TcpHandle::ConnectFailed(stream, error));
         tcp_blocking_state().write().insert(id, false);
         cf_set(ctx, this, F_REG_ID, Value::Int(id));
-        // Windows' selector can fail to deliver OP_CONNECT for an untouched
-        // socket that has already been locally classified as refused. Treat
-        // this narrow terminal state as connected so the async reactor reaches
-        // its ordinary first write; that write below then reports the saved
-        // connection failure immediately instead of stranding the request in
-        // a never-observable pending state.
-        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+        // Do NOT mark this connected. `SocketChannel.connect()` returning
+        // `true` is the JDK contract for "connected immediately" — Netty's
+        // `AbstractNioChannel.AbstractNioUnsafe.connect()` treats a `true`
+        // return as an unconditional success and fulfills the connect
+        // promise right there, never checking SO_ERROR again. The channel
+        // only discovers the refusal later, on its first write, as a raw
+        // "Connection refused" instead of the typed `ConnectException`
+        // real code (and Spring Boot's `PortInUseException`-style cause-chain
+        // walks) expects from a failed connect.
+        //
+        // Returning `false` here is safe: `probe_connect_status` (below)
+        // already treats a registered `ConnectFailed` entry as immediately
+        // `Ready`, so the selector (`nio_selector.rs`, both the Windows
+        // WSAPoll path and the Linux epoll path) delivers `OP_CONNECT`
+        // readiness for it on the very next poll without ever blocking —
+        // there is no "untouched socket the selector can't see" problem to
+        // work around. The reactor then calls `finishConnect()`, which
+        // already correctly reports the saved failure (`Verdict::Failed`
+        // below) as a typed exception.
         let host_str = ctx.create_string(&host);
         cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
         cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!("connect deferred failure(nonblocking) id={id}"));
-        return Ok(true);
+        return Ok(false);
     }
 
     if let Some(stream) = pending {

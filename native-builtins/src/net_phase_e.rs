@@ -3857,8 +3857,23 @@ fn re2_bind_listener(
 ) -> MethodCallResult {
     let ip = resolve_host(host)?;
     let addr = SocketAddr::new(ip, port.clamp(0, 65535) as u16);
-    let listener =
-        TcpListener::bind(addr).map_err(|e| ioex(format!("BindException: {addr}: {e}")))?;
+    let listener = TcpListener::bind(addr).map_err(|e| {
+        // Must be a concrete `java.net.BindException`, not a generic
+        // IOException with "BindException" as a text prefix — real code
+        // (Spring Boot's `PortInUseException.throwIfPortBindingException`)
+        // walks the cause chain with `instanceof BindException` and checks
+        // the message for "in use"; a bare IOException is invisible to that
+        // walk. See the sibling fix in native-io/src/{net,socket_channel}.rs.
+        let message = match e.kind() {
+            std::io::ErrorKind::AddrInUse => format!("Address already in use: {addr}: {e}"),
+            std::io::ErrorKind::AddrNotAvailable => {
+                format!("Cannot assign requested address: {addr}: {e}")
+            }
+            std::io::ErrorKind::PermissionDenied => format!("Permission denied: {addr}: {e}"),
+            _ => format!("{addr}: {e}"),
+        };
+        MethodCallFailed::from(RuntimeError::BindException { message })
+    })?;
     let local_addr = listener.local_addr().ok();
     let actual_port = local_addr.map(|a| a.port() as i32).unwrap_or(port);
     // A wildcard listener address (0.0.0.0 / ::) is a valid bind target but
