@@ -42786,10 +42786,22 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- ThreadPoolExecutor stat methods ---
     let tp = "java/util/concurrent/ThreadPoolExecutor";
-    r.register(tp, "getPoolSize", "()I", |_ctx, _args| {
+    r.register(tp, "getPoolSize", "()I", |ctx, args| {
+        let this = tp_arg0(args);
+        if let Some(this) = this {
+            if tp_is_real(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(this, "getPoolSize", "()I", &[]);
+            }
+        }
         Ok(Some(Value::Int(1)))
     });
-    r.register(tp, "getActiveCount", "()I", |_ctx, _args| {
+    r.register(tp, "getActiveCount", "()I", |ctx, args| {
+        let this = tp_arg0(args);
+        if let Some(this) = this {
+            if tp_is_real(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(this, "getActiveCount", "()I", &[]);
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
     r.register(tp, "getCorePoolSize", "()I", native_tp_get_core_pool_size);
@@ -42797,20 +42809,50 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         tp,
         "getMaximumPoolSize",
         "()I",
-        native_tp_get_core_pool_size,
+        native_tp_get_maximum_pool_size,
     );
     r.register(tp, "isShutdown", "()Z", native_tp_is_shutdown);
-    r.register(tp, "isTerminated", "()Z", native_tp_is_shutdown);
+    r.register(tp, "isTerminated", "()Z", native_tp_is_terminated);
     r.register(
         tp,
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let this = tp_arg0(args);
+            if let Some(this) = this {
+                if tp_is_real(ctx, this) {
+                    return ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "awaitTermination",
+                        "(JLjava/util/concurrent/TimeUnit;)Z",
+                        &args[1..],
+                    );
+                }
+            }
+            Ok(Some(Value::Int(1)))
+        },
     );
-    r.register(tp, "getTaskCount", "()J", |_ctx, _args| {
+    r.register(tp, "getTaskCount", "()J", |ctx, args| {
+        let this = tp_arg0(args);
+        if let Some(this) = this {
+            if tp_is_real(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(this, "getTaskCount", "()J", &[]);
+            }
+        }
         Ok(Some(Value::Long(0)))
     });
-    r.register(tp, "getCompletedTaskCount", "()J", |_ctx, _args| {
+    r.register(tp, "getCompletedTaskCount", "()J", |ctx, args| {
+        let this = tp_arg0(args);
+        if let Some(this) = this {
+            if tp_is_real(ctx, this) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getCompletedTaskCount",
+                    "()J",
+                    &[],
+                );
+            }
+        }
         Ok(Some(Value::Long(0)))
     });
     r.register(
@@ -44058,11 +44100,60 @@ fn native_cf_then_accept_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 const TP_FIELD_SIZE: usize = 0;
 const TP_FIELD_SHUTDOWN: usize = 1;
 
-fn native_tp_get_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(1))),
+fn tp_arg0(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
+/// True if `exec` (or its `e`-delegate target) is a real bytecode-constructed
+/// `ThreadPoolExecutor` -- i.e. has a real `workers` field -- rather than
+/// CratonVM's synthetic 2-field executor placeholder. Mirrors
+/// `native-builtins::executor_has_real_workers` (kept separate to avoid a
+/// crate dependency cycle; same detection `interrupt_tpe_workers` uses below).
+/// A real receiver's `getCorePoolSize`/`getMaximumPoolSize`/`isShutdown`/
+/// `shutdownNow`/etc. must run the REAL bytecode instead of reading the
+/// synthetic 2-field slots -- those slots don't exist on a real object's
+/// layout (field 0/1 are whatever the real class happens to declare first),
+/// so reading them either returns garbage or silently falls through to the
+/// hardcoded default, masking real mutations like `setCorePoolSize()`.
+fn tp_is_real(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    let tpe = match ctx.get_field_by_name(exec, "e") {
+        Value::Object(Some(inner)) => inner,
+        _ => exec,
     };
+    matches!(
+        ctx.get_field_by_name(tpe, "workers"),
+        Value::Object(Some(_))
+    )
+}
+
+fn native_tp_get_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match tp_arg0(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(1))),
+    };
+    if tp_is_real(ctx, this) {
+        return ctx.invoke_virtual_bytecode_only(this, "getCorePoolSize", "()I", &[]);
+    }
+    match ctx.get_field(this, TP_FIELD_SIZE) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(1))),
+    }
+}
+
+fn native_tp_get_maximum_pool_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match tp_arg0(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(1))),
+    };
+    if tp_is_real(ctx, this) {
+        return ctx.invoke_virtual_bytecode_only(this, "getMaximumPoolSize", "()I", &[]);
+    }
     match ctx.get_field(this, TP_FIELD_SIZE) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
         _ => Ok(Some(Value::Int(1))),
@@ -44070,10 +44161,27 @@ fn native_tp_get_core_pool_size(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_tp_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
+    let this = match tp_arg0(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
     };
+    if tp_is_real(ctx, this) {
+        return ctx.invoke_virtual_bytecode_only(this, "isShutdown", "()Z", &[]);
+    }
+    match ctx.get_field(this, TP_FIELD_SHUTDOWN) {
+        Value::Int(v) => Ok(Some(Value::Int(v))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn native_tp_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match tp_arg0(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    if tp_is_real(ctx, this) {
+        return ctx.invoke_virtual_bytecode_only(this, "isTerminated", "()Z", &[]);
+    }
     match ctx.get_field(this, TP_FIELD_SHUTDOWN) {
         Value::Int(v) => Ok(Some(Value::Int(v))),
         _ => Ok(Some(Value::Int(0))),
@@ -44154,15 +44262,40 @@ fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
 }
 
 fn native_tp_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+    let this = match tp_arg0(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
     };
-    // Real ThreadPoolExecutor: interrupt its workers so they terminate; don't
-    // write the synthetic slot (would corrupt a real field).
-    if !interrupt_tpe_workers(ctx, this) {
-        ctx.set_field(this, TP_FIELD_SHUTDOWN, Value::Int(1));
+    if tp_is_real(ctx, this) {
+        // Real ThreadPoolExecutor: run the real bytecode so it actually drains
+        // workQueue and returns the not-yet-started tasks. Callers like
+        // Spring's `ConcurrentTaskExecutorTests.shutdownExecutor()` explicitly
+        // `.cancel(true)` each returned task and rely on that list being
+        // non-empty; the previous interrupt-and-return-empty-list shortcut
+        // left queued FutureTasks neither run nor cancelled, so
+        // `future.get(timeout)` threw TimeoutException instead of the
+        // expected CancellationException. `interrupt_tpe_workers` (above) is
+        // no longer needed on this path: real `shutdownNow()` bytecode
+        // interrupts its own workers as part of draining the queue.
+        //
+        // NOT invoke_virtual_bytecode_only: `ScheduledThreadPoolExecutor`
+        // overrides `shutdownNow()` as `return super.shutdownNow();` (a
+        // single invokespecial on ThreadPoolExecutor, confirmed via javap —
+        // no extra STPE-specific behavior). Virtual dispatch on an STPE
+        // receiver would re-resolve to STPE's own override, whose
+        // `invokespecial ThreadPoolExecutor.shutdownNow` re-enters the native
+        // registry and finds this very native again -> infinite recursion /
+        // StackOverflowError. `invoke_special_bytecode_only` resolves
+        // statically on the NAMED class (ThreadPoolExecutor's own body),
+        // exactly like the sibling fix already applied to `shutdown()` above.
+        return ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "shutdownNow",
+            "()Ljava/util/List;",
+            &[Value::Object(Some(this))],
+        );
     }
+    ctx.set_field(this, TP_FIELD_SHUTDOWN, Value::Int(1));
     // Return empty list
     let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
     let arr = alloc_ref_array(ctx, 0);
