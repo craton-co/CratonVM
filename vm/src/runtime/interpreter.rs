@@ -5780,7 +5780,7 @@ pub fn execute(
                     // pool) is simply omitted; the x64 codegen's 0xba arm then
                     // bails the whole compile (`return false`) rather than
                     // guessing, exactly like the OSR/hot-path resolvers.
-                    let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+                    let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
                     if !scan.indy_ops.is_empty() {
                         let cm_lock = shared.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
@@ -5795,7 +5795,9 @@ pub fn execute(
                                     {
                                         let arg_slots = crate::jit::count_param_slots(descriptor);
                                         let ret_type = crate::jit::return_type(descriptor);
-                                        indy_info.push((pc_indy, arg_slots, ret_type));
+                                        let arg_type_tags =
+                                            crate::jit::indy_arg_type_tags(descriptor);
+                                        indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
                                     }
                                 }
                             }
@@ -30229,7 +30231,7 @@ fn compile_osr_artifact(
             // field doc on the x64 `Compiler` struct. A site that cannot be
             // resolved is simply omitted; the x64 codegen's 0xba arm then
             // bails the whole compile (`return false`) rather than guessing.
-            let mut indy_info: Vec<(usize, usize, u8)> = Vec::new();
+            let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
             if !scan.indy_ops.is_empty() {
                 let cm_lock = shared.class_manager.read();
                 if let Some(class) = cm_lock.get_class(class_id) {
@@ -30244,7 +30246,8 @@ fn compile_osr_artifact(
                             {
                                 let arg_slots = crate::jit::count_param_slots(descriptor);
                                 let ret_type = crate::jit::return_type(descriptor);
-                                indy_info.push((pc_indy, arg_slots, ret_type));
+                                let arg_type_tags = crate::jit::indy_arg_type_tags(descriptor);
+                                indy_info.push((pc_indy, arg_slots, ret_type, arg_type_tags));
                             }
                         }
                     }
