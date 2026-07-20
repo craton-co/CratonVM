@@ -927,6 +927,14 @@ fn parse_jar_subdir_spec(spec: &str) -> Option<(String, String)> {
     let idx = spec.find("!/")?;
     let jar_part = &spec[..idx];
     let prefix_part = &spec[idx + 2..];
+    // Spring Boot's `JarUrl.create(file, "BOOT-INF/classes/")` always marks
+    // the root of the nested location with a SECOND, trailing `!/` after the
+    // prefix itself (`jar:nested:<jar>/!BOOT-INF/classes/!/`), which
+    // `extract_url_path` passes through unchanged. Strip that trailing
+    // marker so the prefix used to match zip entries is the real one
+    // (`BOOT-INF/classes/`) rather than the literal, unmatchable
+    // `BOOT-INF/classes/!/`.
+    let prefix_part = prefix_part.strip_suffix("!/").unwrap_or(prefix_part);
     if jar_part.is_empty() || prefix_part.is_empty() {
         return None;
     }
