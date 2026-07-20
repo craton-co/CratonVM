@@ -14818,11 +14818,36 @@ fn execute_instruction(
             }
         }
         Instruction::Invokestatic(index) => {
-            match execute_invokestatic(shared, thread, frame_idx, *index)? {
+            // Mirrors the Invokevirtual/Invokespecial arm above: JDK-internal
+            // classes (java.xml/Xerces, java.util, java.io, …) run through
+            // this dispatcher rather than the raw-byte-peek fast loop at the
+            // top of `execute_frame` (which already consulted
+            // `execute_invokestatic_cached` — see its call site's history),
+            // so every invokestatic previously paid full method resolution
+            // on every single call: native-registry hash lookup,
+            // `force_native_over_real_jdk_bytecode` /
+            // `synthetic_stub_should_yield_to_real_bytecode` checks, a
+            // `split_method_descriptor` heap allocation, `class_manager`
+            // RwLock reads. `execute_invokestatic_cached` already exists and
+            // is exercised by the other dispatch loop; wiring it in here
+            // gives JDK-internal invokestatic call sites the same lock-free
+            // O(1) cache hit non-JDK bytecode and Invokevirtual/Invokespecial
+            // already enjoyed. A miss/edge-case (JVMTI redefine, synthetic
+            // stub upgrade) falls through to the exact same slow path used
+            // before this fix.
+            match execute_invokestatic_cached(shared, thread, frame_idx, *index)? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invokestatic(shared, thread, frame_idx, *index)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
@@ -18391,8 +18416,7 @@ fn push_invoke_return_value(
 /// non-existent submission, never ran the kernel, and left output
 /// arrays at their pre-launch zero values.
 #[inline]
-fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
-    let b = param_desc.as_bytes().first().copied().unwrap_or(b'L');
+fn coerce_invoke_arg_for_descriptor(b: u8, v: Value) -> Value {
     match b {
         b'L' | b'[' => coerce_value_for_return(v, b),
         b'J' => match v {
@@ -18460,7 +18484,14 @@ fn pop_coerced_invoke_args_virtual(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): `nth_param_tag_byte` replaces `split_method_descriptor`
+    // here — every caller of this Vec<String>/String-allocating parse only
+    // ever read the first byte of each parameter token (see
+    // `coerce_invoke_arg_for_descriptor`/`decode_arg_kind_aware`, both
+    // `u8`-only). This was the single dominant hot spot (confirmed via cdb
+    // stack sampling) behind a ~197x CratonVM-vs-HotSpot slowdown on
+    // method-call-heavy interpreted workloads (Xerces SAX parsing —
+    // see docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/).
     // BC SM2 fix (2026-05-28): use raw CompactValue + descriptor-aware
     // decode so a Long-collision-with-SUB_OBJECT bit pattern doesn't
     // round-trip through Value::Object and lose bits.
@@ -18485,18 +18516,14 @@ fn pop_coerced_invoke_args_virtual(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
+        b'L',
         tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18511,7 +18538,8 @@ fn pop_coerced_invoke_args_static(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor. `CompactValue::to_value()` would
     // mis-decode a Long whose bits collide with SUB_OBJECT as
@@ -18527,13 +18555,9 @@ fn pop_coerced_invoke_args_static(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18862,7 +18886,8 @@ fn execute_invoke_kind(
 
     let total_args = num_params + 1;
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // Pop slots as raw CompactValue and decode with the parameter descriptor
     // so a category-2 long whose NaN-box bit pattern collides with a tagged
     // sub-tag survives bit-exact. The prior `pop()` → `to_value()` decoded
@@ -18892,19 +18917,12 @@ fn execute_invoke_kind(
         );
     }
     let mut args = Vec::with_capacity(total_args);
-    args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
-        recv_val,
-    ));
+    args.push(coerce_invoke_arg_for_descriptor(b'L', recv_val));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     // Apply the same forwarding read barrier used by getfield to every
@@ -24775,6 +24793,16 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // 995ff48c (Tomcat silent-hang scanner fix): interpreted per-byte read
+    // dispatch dominated the scanner's hot path. `<init>`/mark/reset/skip/...
+    // still run their real-JDK bytecode so buffer/mark state stays
+    // bytecode-owned; only the two read overloads are forced native.
+    if class_name == "java/io/BufferedInputStream"
+        && method_name == "read"
+        && matches!(method_descriptor, "([BII)I" | "()I")
+    {
+        return true;
+    }
     if class_name == "java/io/DataInputStream"
         && matches!(
             (method_name, method_descriptor),
@@ -28722,7 +28750,17 @@ fn execute_invokestatic(
         ensure_class_initialized_shared(shared, thread, target_class_id)?;
     }
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
+    // This was the exact call site pinned by cdb stack sampling as the
+    // dominant hot spot behind the ~197x Xerces SAX-parse slowdown (every
+    // invokestatic re-parsed + heap-allocated a Vec<String> from scratch);
+    // the primary fix is wiring `execute_invokestatic_cached` into the main
+    // dispatch loop (see its call site's history) so this cold/miss path is
+    // only reached once per call site instead of on every call. Fixed here
+    // too since it's the same wasteful pattern and still runs on every
+    // cache miss (JVMTI redefine, synthetic-stub upgrade, first call).
+    //
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor so a Long whose bit pattern collides
     // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
@@ -28739,13 +28777,9 @@ fn execute_invokestatic(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     if let Some(res) = intercept_force_registered_native(
@@ -28998,10 +29032,7 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .pop_compact_with_long_mark()?;
     }
     let base = if with_receiver {
-        buf[0] = coerce_invoke_arg_for_descriptor(
-            "Ljava/lang/Object;",
-            cv_buf[0].0.decode_by_descriptor(b'L'),
-        );
+        buf[0] = coerce_invoke_arg_for_descriptor(b'L', cv_buf[0].0.decode_by_descriptor(b'L'));
         1
     } else {
         0
@@ -29013,8 +29044,10 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
         let (cv, is_long) = cv_buf[base + i];
-        buf[base + i] =
-            coerce_invoke_arg_for_descriptor(pd, decode_arg_kind_aware(cv, is_long, pd_byte));
+        buf[base + i] = coerce_invoke_arg_for_descriptor(
+            pd_byte,
+            decode_arg_kind_aware(cv, is_long, pd_byte),
+        );
     }
     Ok(&buf[..total])
 }

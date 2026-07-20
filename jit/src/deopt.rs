@@ -518,6 +518,9 @@ impl DeoptimizationLog {
     pub fn recommend_action(&self, method: &str, reason: DeoptReason) -> DeoptAction {
         let count = self.deopt_count(method);
 
+        let half = (self.max_deopts_per_method as usize) / 2;
+        let full = self.max_deopts_per_method as usize;
+
         // Certain reasons override the count-based policy.
         match reason {
             // Type-related failures benefit from immediate recompile with new profile.
@@ -542,12 +545,42 @@ impl DeoptimizationLog {
             DeoptReason::TransferToInterpreter => {
                 return DeoptAction::Reinterpret;
             }
+            // OSR-exit is a real, EXPECTED control-flow event -- "a running
+            // JIT/OSR frame bailed mid-loop back to the interpreter at a loop
+            // bci (not a guard bci)" (see this enum's own doc comment). It is
+            // not evidence the compiled artifact mis-speculated, so recompiling
+            // cannot fix it: the same loop boundary will exit the same way on
+            // the next compile too. Routing it through the generic count-based
+            // policy (RecompileAndReinterpret then MakeNotEntrant) made a hot
+            // method with a structurally-always-taken OSR-exit (e.g. Tomcat's
+            // `Response.toAbsolute()`, docs/known-issues/tomcat-08-07/silent-
+            // hang-no-signature-cluster.md) get evicted and eagerly recompiled
+            // dozens of times over a single benchmark for zero benefit.
+            //
+            // But ALWAYS reinterpreting (never evicting) is also wrong: a
+            // structurally-always-taken OSR-exit pays the reconstruct-and-
+            // resume tax on literally EVERY call while staying "compiled",
+            // which measured net SLOWER than plain interpretation (347s/round
+            // vs the 63-72s/round fully-interpreted baseline for the same
+            // benchmark -- confirmed empirically, not assumed). A handful of
+            // genuinely rare OSR-exits are cheap and worth tolerating to keep
+            // the rest of the method's hot path compiled; a bci that keeps
+            // exiting is a structural property of the loop, not noise, and no
+            // amount of waiting fixes it. So: tolerate the first `half`
+            // occurrences as a soft deopt (Reinterpret, artifact stays live,
+            // matching `TransferToInterpreter` above), then permanently give
+            // up compiling this method (skip straight to MakeNotCompilable --
+            // recompiling is pointless here, so there is no reason to pass
+            // through MakeNotEntrant's "retryable" state first).
+            DeoptReason::OsrExit => {
+                if count >= half {
+                    return DeoptAction::MakeNotCompilable;
+                }
+                return DeoptAction::Reinterpret;
+            }
             // All other reasons use count-based policy.
             _ => {}
         }
-
-        let half = (self.max_deopts_per_method as usize) / 2;
-        let full = self.max_deopts_per_method as usize;
 
         if count == 0 {
             DeoptAction::Reinterpret
