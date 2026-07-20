@@ -4,6 +4,34 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-20 CRITICAL core JIT/OSR bug FIXED: back-edge OSR silently re-executed loop iterations after an `invokedynamic` trap
+
+FIXED (moved to `docs/internal/`):
+[`jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`](../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md)
+— a `for` loop long enough to trigger back-edge OSR compilation, followed by
+an `invokedynamic` call site (e.g. Java 9+ indy-based string concatenation,
+as in `System.out.println("..." + x)`) in the same method, could silently
+re-execute the loop's already-committed iterations with no exception —
+e.g. an `ArrayList` built in a loop ending up with duplicate/extra elements.
+Root cause: the indy call site's unconditional `UnreachedCode` deopt trap
+reached the OSR-exit transfer (`transfer_osr_exit_into_live_frame`,
+`vm/src/runtime/interpreter.rs`) with reconstructed state the transfer
+couldn't map (an `Unsupported` local from a coarse whole-method slot-reuse
+classification, and — always — `Unsupported` operand-stack values at the
+indy site itself); the transfer's "safe reject" fallback then resumed the
+interpreter from the STALE pre-OSR pc/locals, silently re-running everything
+OSR had already executed. Fixed by (1) tolerating an unmappable LOCAL slot
+in the transfer instead of rejecting it whole (leaving that slot's live
+value untouched — safe per the JVM verifier's definite-assignment rule) and
+(2) banning OSR compilation for any method containing `invokedynamic`
+(new RBC.7, mirroring the existing `athrow` ban in `compile_osr_artifact`).
+Not Spring-specific — a core VM/JIT correctness bug; discovered as a
+byproduct of the `repeatablecontainers-method-cache-classcastexception`
+investigation the same day. Verified across the full originally-reported
+threshold range (100–15000 iterations) plus a value-level diagnostic
+(no duplicated index, not just a correct final count); `cargo test --release
+-p cratonvm-vm --lib` shows no new failures.
+
 ## 2026-07-20 Spring suite genuine-bug list reconfirmed: 107/177 fixed, 70 remain
 
 Reran the 263 previously-non-passing classes from the 2026-07-17 full-suite

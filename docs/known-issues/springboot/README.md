@@ -27,8 +27,9 @@ smaller/individual differences not yet clustered.
 > Its affected class now fails LATER for a different, unrelated reason (new
 > doc: `mockresolver-dynamicclassloader-classnotfound-forked-testcontext.md`).
 > Also filed a new CRITICAL, non-Spring-specific core VM/JIT finding from the
-> same investigation: `jit-osr-loop-duplicate-execution-silent-corruption.md`
-> (back-edge OSR compilation silently re-executes loop iterations).
+> same investigation: back-edge OSR compilation could silently re-execute
+> loop iterations after an `invokedynamic` trap. **FIXED 2026-07-20** — see
+> [`../../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`](../../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
@@ -155,7 +156,7 @@ open each doc for the full picture):
 | [`jetty-loaderhidingresourcetests-empty-jar-listing.md`](jetty-loaderhidingresourcetests-empty-jar-listing.md) | OPEN — found 2026-07-17 |
 | [`jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster-FIXED.md`](../../internal/springboot/jetty-private-lambda-wrong-receiver-startcontext-recursion-cluster-FIXED.md) | FIXED — 2026-07-18 |
 | [`jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md`](jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md) | MOSTLY FIXED — reflective-supertype residual + 4 real bugs (deflate SYNC_FLUSH, wildcard connect target, deflate-after-finish corruption, dead-thread-owned-monitor hang) fixed 2026-07-18; `JettyReactiveWebServerFactoryTests` now completes clean; `JettyServletWebServerFactoryTests` hits a newly-exposed, unrelated OPEN bug (blocking socket read ignoring SO_TIMEOUT) |
-| [`jit-osr-loop-duplicate-execution-silent-corruption.md`](jit-osr-loop-duplicate-execution-silent-corruption.md) | OPEN — found 2026-07-20. CRITICAL, core VM/JIT bug (not Spring-specific): a long-enough loop followed by more code in the same method silently re-executes iterations under back-edge OSR compilation once the loop crosses ~2000-3000 iterations (`CRATONVM_JIT_OSR=0` fixes it); no exception, just extra elements added to a collection or an over-large counter. Minimal repro, no Spring/reflection/threads needed |
+| [`jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`](../../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md) | **FIXED 2026-07-20** — moved to `docs/internal/`; core VM/JIT bug (not Spring-specific): an OSR'd loop followed by an `invokedynamic` call (e.g. string-concat `println`) in the same method could silently re-execute the loop's already-committed iterations when the indy trap's OSR-exit transfer was rejected. Fixed by (1) tolerating an unmappable LOCAL slot in the OSR-exit transfer instead of rejecting it whole, and (2) banning OSR for any method containing `invokedynamic` (RBC.7, mirroring the existing `athrow` ban) |
 | [`jooq-destroy-method-ambiguity-and-hang.md`](jooq-destroy-method-ambiguity-and-hang.md) | PARTIALLY FIXED — Cluster A fixed 2026-07-17; unrelated hang remains OPEN |
 | [`jsonreadertests-deprecation-reason-string-truncation.md`](jsonreadertests-deprecation-reason-string-truncation.md) | OPEN — found 2026-07-17 |
 | [`../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](../../internal/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md) | FIXED — 2026-07-18 |
