@@ -26991,6 +26991,61 @@ fn intercept_force_registered_native(
             Ok(CachedCallResult::Handled)
         })());
     }
+    // `java/net/HttpURLConnection`'s real-carrier natives (connect,
+    // getResponseCode, getHeaderField, addRequestProperty, ...) must keep
+    // firing for a genuinely real, `URL.openConnection()`-constructed carrier
+    // (its real inherited `URLConnection.url` field 0 populated) even after
+    // ANY instance of this class has been JVMTI-redefined elsewhere in the
+    // process — e.g. a completely unrelated `Mockito.mock(HttpURLConnection
+    // .class)` call. Mockito's default "inline" mock maker redefines the
+    // TARGET CLASS's bytecode IN PLACE rather than subclassing it, so the
+    // class-wide `class_redefine_generation` counter trips permanently for
+    // EVERY instance of the class, mock or not, for the rest of the process.
+    // Without this, `should_force_registered_native_over_bytecode`'s redefine
+    // check below cedes to the now-Mockito-woven bytecode for a real,
+    // non-mock connection too — observed as `getResponseCode()` silently
+    // returning 0 and `getHeaderField`/`addRequestProperty` silently no-op'ing
+    // instead of touching the real request/response, so
+    // `SimpleClientHttpRequestFactoryTests.interceptor()` failed first with
+    // "Status code '0' should be a three-digit positive integer" and then
+    // (once getResponseCode alone was exempted) with the interceptor's added
+    // header missing from the echoed response, simply because an EARLIER,
+    // unrelated test method in the same JVM mocked HttpURLConnection.
+    //
+    // A Mockito mock itself is Objenesis-constructed (no constructor ever
+    // runs), so its field 0 stays null — checking for a non-null field 0
+    // cheaply distinguishes "genuinely real carrier" from "mock or synthetic
+    // carrier" without invoking `toExternalForm`, and this exemption never
+    // fires for an actual mock (whose field 0 is always null), so mocking
+    // HttpURLConnection still correctly routes through Mockito's advice for
+    // stubbing/verification. Deliberately not narrowed to a specific method
+    // allowlist: any native registered on this class for a real carrier is
+    // safe to force, since the receiver check alone already gates out mocks.
+    if class_name == "java/net/HttpURLConnection"
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver)))
+                if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
+        )
+    {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("java/net/HttpURLConnection", method_name, method_descriptor)
+        {
+            return Some((|| {
+                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result {
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                    )?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                }
+                Ok(CachedCallResult::Handled)
+            })());
+        }
+    }
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native: class={} method={}{} \

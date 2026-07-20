@@ -19,6 +19,34 @@ use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
 
+/// Diagnostic-only (TLD/JAR-scan slowness investigation, 2026-07-21): time
+/// every `find_resource`/`find_all_resource_urls` call and print a running
+/// summary every 2000 calls when `CRATONVM_DBG_RESOURCE_TIMING=1`. Not a
+/// permanent instrumentation point — remove before shipping the real fix.
+fn diag_resource_call_wrapper<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_RESOURCE_TIMING").is_some());
+    if !enabled {
+        return f();
+    }
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static NANOS: AtomicU64 = AtomicU64::new(0);
+    let t0 = std::time::Instant::now();
+    let result = f();
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let total_nanos = NANOS.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
+    if calls % 2000 == 0 || elapsed > 5_000_000 {
+        eprintln!(
+            "[RES-DIAG] {label} call#{calls} this_call={:?} total_calls={calls} total_time={:?}",
+            std::time::Duration::from_nanos(elapsed),
+            std::time::Duration::from_nanos(total_nanos),
+        );
+    }
+    result
+}
+
 /// Read a classpath file into owned bytes without memory-mapping it.
 ///
 /// Classpath entries are ordinary files controlled by launchers, build tools,
@@ -1230,6 +1258,8 @@ impl ClassPath {
     /// producing an empty classpath and breaking `ServiceLoader`
     /// (`META-INF/services/...`) discovery for every dependency.
     pub fn new(paths: &[String]) -> Self {
+        let __diag_start = std::env::var_os("CRATONVM_DBG_CLASSPATH").map(|_| std::time::Instant::now());
+        let __diag_npaths = paths.len();
         let mut entries = Vec::new();
         for raw in paths {
             for p in Self::expand_classpath_wildcard(raw) {
@@ -1296,6 +1326,15 @@ impl ClassPath {
                     debug!("Skipping non-existent classpath entry: {p}");
                 }
             }
+        }
+        if let Some(t0) = __diag_start {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            eprintln!(
+                "[CP] ClassPath::new call#{n} npaths={__diag_npaths} nentries={} elapsed={:?}",
+                entries.len(),
+                t0.elapsed()
+            );
         }
         Self {
             entries,
@@ -2620,6 +2659,10 @@ impl ClassPath {
     /// or `org/renaissance/jdk/streams/data.txt`). Leading slashes are stripped.
     /// Searches all classpath entries in order; returns `Some(bytes)` on first match.
     pub fn find_resource(&self, resource_name: &str) -> Option<Vec<u8>> {
+        diag_resource_call_wrapper("find_resource", || self.find_resource_impl(resource_name))
+    }
+
+    fn find_resource_impl(&self, resource_name: &str) -> Option<Vec<u8>> {
         let name = resource_name.trim_start_matches('/');
         // Path safety: align with `find_class`'s input filter (rejects `..`,
         // NUL, leading slashes, `\\`, drive letters `:`, and `./` / `.\\`)
@@ -3184,6 +3227,12 @@ impl ClassPath {
     }
 
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
+        diag_resource_call_wrapper("find_all_resource_urls", || {
+            self.find_all_resource_urls_impl(resource_name)
+        })
+    }
+
+    fn find_all_resource_urls_impl(&self, resource_name: &str) -> Vec<String> {
         let name = resource_name.trim_start_matches('/');
         // Same input filter as `find_class`/`find_resource` (see
         // `is_safe_resource_name`).

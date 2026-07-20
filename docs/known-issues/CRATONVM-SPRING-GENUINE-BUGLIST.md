@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 66 confirmed genuine bugs remaining |
+| **Status** | OPEN — 58 confirmed genuine bugs remaining |
 | **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
 
@@ -15,15 +15,15 @@ classes on a fresh `dev` merge (`8719dca85`, ~3 days / several hundred
 commits later), 4 shards, same settings (`suite-run.sh`, `BATCH=10
 BATCH_TO=120 ONE_TO=120`, `CRATONVM_DEFAULT_HEAP_MAX_MB=2048`, real JDK 25).
 
-**111 of the 177 are now fixed.** 66 remain open.
+**119 of the 177 are now fixed.** 58 remain open.
 
 | Of the 177 | Count |
 |---|--:|
-| Now OK (fixed) | 111 |
-| Still FAIL | 48 |
+| Now OK (fixed) | 119 |
+| Still FAIL | 40 |
 | Still/newly TIMEOUT | 16 |
 | Now LOADERR (was TIMEOUT) | 2 |
-| **Still open** | **66** |
+| **Still open** | **58** |
 
 The 86 environmentally-non-OK classes (73 EMPTY + 13 FAIL matching HotSpot,
 not CratonVM bugs) were not rerun individually here but the 263-class rerun
@@ -56,12 +56,58 @@ threshold circuit-breaker now pass. Whatever landed in the last 3 days
 resolved the whole cluster at once — worth checking dev history for the
 specific fix if attribution matters.
 
-**HTTP JSON/message-converter cluster — fully unfixed (8 classes)**, same
-as 2026-07-17: `http.converter.json.*` (Gson, Jsonb, Jackson2,
+**HTTP JSON/message-converter cluster — fixed 2026-07-20 (8/8 classes).**
+`http.converter.json.*` (Gson, Jackson2, MappingJackson2, Jsonb,
 Kotlin-serialization), `http.converter.StringHttpMessageConverterTests`,
 `http.ContentDispositionTests`, `http.client.SimpleClientHttpRequestFactoryTests`
-— all still failing 1-3 methods each, consistent with one shared
-charset/encoding gap.
+all now pass 100%. Two independent root causes, both in `native-io`/
+`native-builtins`/`vm`:
+1. **Shared charset/encoding gap (7/8 classes).** `ByteArrayOutputStream
+   .toString(Charset)`/`toString(String)` (`native-io/src/lib.rs`) ignored
+   the charset argument entirely and always did lossy UTF-8 decoding —
+   fine for ASCII/UTF-8 content, silently mangling anything else (UTF-16BE
+   JSON bodies in the `writeUTF16`/`writeObjectInUtf16` tests, ISO-8859-1
+   in `StringHttpMessageConverterTests.writeDefaultCharset`, Shift_JIS in
+   `ContentDispositionTests.parseQuotedPrintableShiftJISFilename`'s
+   RFC 2047 decode, all of which route through this exact JDK method via
+   `StreamUtils.copyToString(ByteArrayOutputStream, Charset)`). Fixed by
+   routing through the real `cratonvm_native_api::charset` engine using the
+   requested charset.
+2. **`SimpleClientHttpRequestFactoryTests` (1/8 classes, 3 residual method
+   failures after fix 1).**
+   - `deleteWithoutBodyDoesNotRaiseException`/`httpMethods`: the synthetic
+     `HttpURLConnection.<init>(URL)` native (`native-builtins/src/
+     http_url_connection.rs::huc_init`) unconditionally clobbered field 0
+     (the real inherited `URLConnection.url`) whenever real JDK code called
+     `super(url)` directly on a subclass (not just via `URL.openConnection
+     ()`), breaking `getURL()` and real-carrier detection; separately,
+     `setRequestMethod` accepted `"PATCH"` (real JDK's whitelist doesn't,
+     throwing `ProtocolException` — added as a new `RuntimeError` variant).
+   - `interceptor`: a genuinely deep, cross-cutting bug — `Mockito.mock
+     (HttpURLConnection.class)` (default "inline" mock maker) redefines the
+     class's bytecode IN PLACE via JVMTI rather than subclassing it, so
+     CratonVM's redefine-generation counter for `java/net/HttpURLConnection`
+     trips permanently for the rest of the process, for EVERY instance —
+     including totally unrelated, genuinely real connections created by
+     *later* tests in the same JVM. The interpreter's redefine-guard then
+     ceded to the (Mockito-woven) bytecode for those real connections too,
+     so `getResponseCode()`/`getHeaderField()`/etc. silently no-op'd instead
+     of touching the real request/response. Fixed with a receiver-aware
+     exemption in `vm/src/runtime/interpreter.rs::intercept_force_registered
+     _native`: force the native for `java/net/HttpURLConnection` whenever
+     the receiver's field 0 is non-null (a real carrier's populated `url`
+     field vs. a Mockito mock's always-null Objenesis-constructed field),
+     re-validated per-call so genuine mocks (field 0 stays null) are
+     unaffected and still correctly route through Mockito's advice.
+
+Verified via an 8-class targeted run (all 100%) plus a 27-class regression
+sweep across `http.client.*`/`web.client.*`/the sibling `http.converter`
+cluster (`FormHttpMessageConverterTests`, `BufferedImageHttpMessageConverterTests`,
+`Jaxb2CollectionHttpMessageConverterTests`) — no regressions;
+`web.client.RestClientIntegrationTests`/`RestTemplateIntegrationTests`
+(both pre-existing, out-of-scope failures) even improved (4->2 and 7->3
+failing methods respectively), consistent with sharing the same
+HttpURLConnection root causes.
 
 **`scheduling.concurrent.*` cluster — fixed 2026-07-20 (4/4 classes).**
 `ConcurrentTaskExecutorTests`, `DecoratedThreadPoolTaskExecutorTests`,
@@ -149,16 +195,8 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 ### Http
 
-| Class | Status | Pass/Total | Elapsed |
-|---|---|--:|--:|
-| `http.ContentDispositionTests` | FAIL | 33/34 | 1346ms |
-| `http.client.SimpleClientHttpRequestFactoryTests` | FAIL | 7/10 | 11006ms |
-| `http.converter.StringHttpMessageConverterTests` | FAIL | 12/13 | 889ms |
-| `http.converter.json.GsonHttpMessageConverterTests` | FAIL | 13/14 | 1553ms |
-| `http.converter.json.JacksonJsonHttpMessageConverterTests` | FAIL | 33/34 | 6805ms |
-| `http.converter.json.JsonbHttpMessageConverterTests` | FAIL | 13/14 | 823ms |
-| `http.converter.json.KotlinSerializationJsonHttpMessageConverterTests` | FAIL | 24/25 | 11650ms |
-| `http.converter.json.MappingJackson2HttpMessageConverterTests` | FAIL | 31/32 | 4911ms |
+All 8 HTTP JSON/message-converter cluster classes fixed 2026-07-20 — see
+"Notable clusters" above. Removed from this table.
 
 ### Jdbc
 
