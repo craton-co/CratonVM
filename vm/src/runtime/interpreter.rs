@@ -20003,6 +20003,36 @@ fn execute_invoke_kind(
     {
         receiver_class_id.and_then(|receiver_id| {
             let cm = shared.class_manager.read();
+            // If the receiver's own class chain already provides a concrete
+            // (class-declared, non-interface-default) override for this
+            // exact name+descriptor, that override is the JLS/JVMS-mandated
+            // most-specific candidate and must win over ANY interface
+            // default -- including the receiver loader's "exact" copy of the
+            // interface. Skipping this check made an overloaded interface
+            // default (two default methods sharing a name, differing only
+            // in arity -- e.g. Spring's `AotContextLoader.
+            // loadContextForAotProcessing(config)` vs `(config, hints)`,
+            // where the 2-arg default's own body just calls the 1-arg one)
+            // dispatch straight to the INTERFACE's default body instead of
+            // the receiver's real override: this override substitutes the
+            // interface's class_id as the dispatch target before
+            // `find_method_recursive` ever gets a chance to walk the
+            // receiver's concrete class chain first.
+            let has_concrete_override = crate::classloading::find_method_recursive(
+                receiver_id,
+                &method_name,
+                &method_descriptor,
+                &cm.class_store,
+            )
+            .is_some_and(|(m, declaring_id)| {
+                !m.is_abstract()
+                    && cm
+                        .get_class(declaring_id)
+                        .is_some_and(|c| !c.is_interface())
+            });
+            if has_concrete_override {
+                return None;
+            }
             let receiver_loader = cm.get_loader_id(receiver_id)?;
             let exact = cm.class_defined_by_loader_exact(&method_owner_name, receiver_loader)?;
             (Some(exact) != cm.get_loaded_class_id(&method_owner_name)
