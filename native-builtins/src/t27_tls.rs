@@ -4893,23 +4893,35 @@ fn engine_table() -> &'static parking_lot::Mutex<HashMap<u64, i32>> {
     T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
-fn engine_objref_key(o: ObjectRef) -> u64 {
-    // Same trick as objref_key; ObjectRef Debug-prints uniquely per identity.
-    let s = format!("{:?}", o);
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// GC-stable identity key for `engine_table`/`sslparams_alpn_table`.
+///
+/// FIX (reactive-httpcomponents-connector-flaky, mechanism 1): this used to
+/// hash the `ObjectRef`'s Debug-formatted raw pointer value. `ObjectRef` is
+/// a bare pointer to a heap object (`Hash` is implemented on the pointer
+/// value itself, see `types/src/value.rs`), and this VM's young-gen GC
+/// moves/reclaims objects — so a live object's `ObjectRef` is not a stable
+/// identity across its own lifetime (if it moves) and a *different*,
+/// unrelated object can later be allocated at the same address once the
+/// original is collected. Neither `engine_table` nor `sslparams_alpn_table`
+/// ever removed stale entries, so a moved/reclaimed-and-reused address could
+/// silently hand a brand-new Java `SSLEngine`/`SSLParameters` object the
+/// identity (and, for engines, the live `EngineState` — including an
+/// already-`Some` `conn`) of a completely different one. Confirmed live: a
+/// reactive HttpComponents connection's engine issuing a second, distinct
+/// ClientHello mid-handshake on an already-established TCP socket, with
+/// engine-id collisions, tcp registry id-reuse, and cross-listener accept
+/// mixups all directly ruled out first (see the known-issues doc this
+/// references). `ctx.identity_hash_code` is the VM's real, GC-stable
+/// identity hash (same contract as `Object.hashCode()`'s default
+/// implementation, and the same mechanism `nio_selector.rs` already uses
+/// for its own cross-call Java-object identity lookups) — computed once and
+/// pinned for an object's lifetime regardless of later moves.
+fn engine_objref_key(ctx: &dyn NativeContext, o: ObjectRef) -> u64 {
+    ctx.identity_hash_code(o) as u32 as u64
 }
 
-fn engine_id_for(obj: ObjectRef) -> Option<i32> {
-    engine_table().lock().get(&engine_objref_key(obj)).copied()
-}
-
-fn engine_id_or_alloc(obj: ObjectRef) -> i32 {
-    let key = engine_objref_key(obj);
+fn engine_id_or_alloc(ctx: &dyn NativeContext, obj: ObjectRef) -> i32 {
+    let key = engine_objref_key(ctx, obj);
     let mut tab = engine_table().lock();
     if let Some(id) = tab.get(&key) {
         return *id;
@@ -6127,35 +6139,35 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let cls_impl = "sun/security/ssl/SSLEngineImpl";
 
     // Constructor — allocates an engine_id slot in the side-table.
-    r.register(cls_impl, "<init>", "()V", |_ctx, args| {
+    r.register(cls_impl, "<init>", "()V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.get(0) {
-            let _ = engine_id_or_alloc(*this);
+            let _ = engine_id_or_alloc(ctx, *this);
         }
         Ok(None)
     });
 
     // setUseClientMode(Z)V
-    r.register(cls_impl, "setUseClientMode", "(Z)V", |_ctx, args| {
+    r.register(cls_impl, "setUseClientMode", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let mode = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         with_engine(id, |s| {
             s.is_client = mode != 0;
         });
         Ok(None)
     });
 
-    r.register(cls_impl, "getUseClientMode", "()Z", |_ctx, args| {
+    r.register(cls_impl, "getUseClientMode", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let mode = with_engine(id, |s| s.is_client).unwrap_or(true);
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
-    r.register(cls_impl, "setNeedClientAuth", "(Z)V", |_ctx, args| {
+    r.register(cls_impl, "setNeedClientAuth", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
             let conn_is_some = with_engine(id, |s| s.conn.is_some()).unwrap_or(false);
             eprintln!(
@@ -6172,17 +6184,17 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(cls_impl, "getNeedClientAuth", "()Z", |_ctx, args| {
+    r.register(cls_impl, "getNeedClientAuth", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let v = with_engine(id, |s| s.need_client_auth).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
 
-    r.register(cls_impl, "setWantClientAuth", "(Z)V", |_ctx, args| {
+    r.register(cls_impl, "setWantClientAuth", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         with_engine(id, |s| {
             s.want_client_auth = v;
             if v {
@@ -6192,9 +6204,9 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(cls_impl, "getWantClientAuth", "()Z", |_ctx, args| {
+    r.register(cls_impl, "getWantClientAuth", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let v = with_engine(id, |s| s.want_client_auth).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
@@ -6206,7 +6218,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<String> = Vec::new();
             if let Some(Value::Object(Some(arr))) = args.get(1) {
                 let len = ctx.array_length(*arr);
@@ -6235,7 +6247,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()[Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let list = with_engine(id, |s| s.enabled_protocols.clone())
                 .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
@@ -6296,7 +6308,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<String> = Vec::new();
             if let Some(Value::Object(Some(arr))) = args.get(1) {
                 let len = ctx.array_length(*arr);
@@ -6321,7 +6333,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()[Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let list = with_engine(id, |s| s.enabled_ciphers.clone()).unwrap_or_default();
             let names: Vec<String> = if list.is_empty() {
                 vec![
@@ -6342,9 +6354,9 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     );
 
     // beginHandshake — realize the rustls connection.
-    r.register(cls_impl, "beginHandshake", "()V", |_ctx, args| {
+    r.register(cls_impl, "beginHandshake", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let mut g = engine_registry().write();
         if let Some(s) = g.get_mut(&id) {
             engine_begin(s).map_err(|e| RuntimeError::IOException { message: e })?;
@@ -6406,7 +6418,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
             // Return the REAL enum singleton so `engine.getHandshakeStatus() ==
             // NEED_WRAP` etc. in the connector's handshake loop work.
@@ -6414,9 +6426,9 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(cls_impl, "closeOutbound", "()V", |_ctx, args| {
+    r.register(cls_impl, "closeOutbound", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
             eprintln!(
                 "[dbg-tls-hs] thread={:?} JAVA_CALLED closeOutbound() id={}",
@@ -6433,25 +6445,25 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(cls_impl, "closeInbound", "()V", |_ctx, args| {
+    r.register(cls_impl, "closeInbound", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         with_engine(id, |s| {
             s.closed_inbound = true;
         });
         Ok(None)
     });
 
-    r.register(cls_impl, "isInboundDone", "()Z", |_ctx, args| {
+    r.register(cls_impl, "isInboundDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let v = with_engine(id, |s| s.closed_inbound).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
 
-    r.register(cls_impl, "isOutboundDone", "()Z", |_ctx, args| {
+    r.register(cls_impl, "isOutboundDone", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = engine_id_or_alloc(this);
+        let id = engine_id_or_alloc(ctx, this);
         let v = with_engine(id, |s| s.closed_outbound).unwrap_or(false);
         Ok(Some(Value::Int(if v { 1 } else { 0 })))
     });
@@ -6476,7 +6488,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSession;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let (proto, cipher, alpn) = with_engine(id, |s| {
                 let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
                     Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
@@ -6539,7 +6551,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let alpn = with_engine(id, |s| s.negotiated_alpn.clone())
                 .flatten()
                 .unwrap_or_default();
@@ -6555,7 +6567,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let mut list: Vec<Vec<u8>> = Vec::new();
             if let Some(Value::Object(Some(arr))) = args.get(1) {
                 let len = ctx.array_length(*arr);
@@ -6581,7 +6593,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             let alpn = with_engine(id, |s| s.negotiated_alpn.clone())
                 .flatten()
                 .unwrap_or_default();
@@ -6693,7 +6705,7 @@ fn do_wrap(
     srcs: Vec<ObjectRef>,
     dst: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
-    let id = engine_id_or_alloc(this);
+    let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
     if __dbg_hs {
         eprintln!(
@@ -6920,7 +6932,7 @@ fn do_unwrap(
     src: ObjectRef,
     dsts: Vec<ObjectRef>,
 ) -> cratonvm_types::error::MethodCallResult {
-    let id = engine_id_or_alloc(this);
+    let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
     if __dbg_hs {
         eprintln!(
@@ -7327,7 +7339,7 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
             }
             sslparams_alpn_table()
                 .lock()
-                .insert(engine_objref_key(this), list);
+                .insert(engine_objref_key(ctx, this), list);
             Ok(None)
         },
     );
@@ -7340,7 +7352,7 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let list = sslparams_alpn_table()
                 .lock()
-                .get(&engine_objref_key(this))
+                .get(&engine_objref_key(ctx, this))
                 .cloned()
                 .unwrap_or_else(|| vec!["h2".into(), "http/1.1".into()]);
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
@@ -7364,11 +7376,11 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
         "(Ljavax/net/ssl/SSLParameters;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             if let Some(Value::Object(Some(p))) = args.get(1) {
                 if let Some(list) = sslparams_alpn_table()
                     .lock()
-                    .get(&engine_objref_key(*p))
+                    .get(&engine_objref_key(ctx, *p))
                     .cloned()
                 {
                     with_engine(id, |s| {
@@ -7440,7 +7452,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let id = engine_id_or_alloc(this);
+            let id = engine_id_or_alloc(ctx, this);
             // BUG-08: the prior bare `alloc_concurrent_synthetic` SSLParameters left
             // the REAL `protocols`/`cipherSuites` fields null, so the un-intercepted
             // `SSLParameters.getProtocols()`/`getCipherSuites()` bytecode returned
@@ -7499,7 +7511,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
             .unwrap_or_default();
             sslparams_alpn_table()
                 .lock()
-                .insert(engine_objref_key(p), alpn_list);
+                .insert(engine_objref_key(ctx, p), alpn_list);
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -7524,11 +7536,12 @@ fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String
 /// just produced, so `engine_begin` uses this engine's own keystore cert/key
 /// (server cert, or client cert for mTLS) instead of the process-global slot.
 pub(crate) fn set_engine_identity_override(
+    ctx: &dyn NativeContext,
     engine_obj: ObjectRef,
     cert_pem: String,
     key_pem: String,
 ) {
-    let id = engine_id_or_alloc(engine_obj);
+    let id = engine_id_or_alloc(ctx, engine_obj);
     let trust_roots = take_selected_context_trust_roots();
     with_engine(id, |s| {
         s.identity_override = Some((cert_pem, key_pem));
@@ -7541,8 +7554,8 @@ pub(crate) fn set_engine_identity_override(
 /// Copy trust roots selected by the creating SSLContext even when it has no
 /// identity. Pure client contexts otherwise fall back to platform roots when
 /// their engine begins the handshake.
-pub(crate) fn set_engine_trust_roots_override(engine_obj: ObjectRef) {
-    let id = engine_id_or_alloc(engine_obj);
+pub(crate) fn set_engine_trust_roots_override(ctx: &dyn NativeContext, engine_obj: ObjectRef) {
+    let id = engine_id_or_alloc(ctx, engine_obj);
     let trust_roots = take_selected_context_trust_roots();
     with_engine(id, |s| s.trust_roots_override = trust_roots);
 }
@@ -7559,7 +7572,7 @@ pub(crate) fn set_engine_trust_ctx_key(
     ctx_obj: ObjectRef,
 ) {
     let key = ctx_obj_key(ctx, ctx_obj);
-    let id = engine_id_or_alloc(engine_obj);
+    let id = engine_id_or_alloc(ctx, engine_obj);
     if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
         let has_entry = ctx_trust_managers_table().lock().contains_key(&key);
         eprintln!(
