@@ -7178,11 +7178,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Opaque file-scheme URIs (`file:.`) are not hierarchical — the
             // real JDK's *UriSupport.fromUri throws instead of producing a
             // path. (Spring's PathEditor depends on this throw.)
-            if p57_uri_is_opaque_file(&p57_uri_full_text(ctx, uri)) {
+            let uri_text = p57_uri_full_text(ctx, uri);
+            if p57_uri_is_opaque_file(&uri_text) {
                 return Err(RuntimeError::IllegalArgumentException {
                     message: "URI is not hierarchical".to_string(),
                 }
                 .into());
+            }
+            // `Paths.get(uri)` real bytecode dispatches non-`file` schemes to
+            // `FileSystemProvider.getPath(uri)` on the matching installed
+            // provider — for a `jar:` URI (e.g. from `URL.toURI()` on a
+            // `getResources()` hit inside a jar) that lands here, not in
+            // `Path.of(URI)`. Mirror that native's jar-aware handling so both
+            // entry points mount the same jar-backed Path/FileSystem instead
+            // of this falling through to the generic field-4/field-0 read
+            // below, which only understands `file:` URIs and previously
+            // produced a garbage single-segment path (e.g. just "jar", the
+            // bare scheme) for jar-backed lookups — see `Resources.addPackage`
+            // in spring-boot-test-support, which resolves `test.jks` etc. via
+            // exactly this path.
+            if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
+                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
+                return Ok(Some(Value::Object(Some(result))));
             }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
@@ -13527,7 +13546,16 @@ fn p57_uri_full_text(ctx: &mut dyn NativeContext, uri: ObjectRef) -> String {
             cands.push(t);
         }
     }
-    for slot in 0..=5usize {
+    // Slot 6 is the "raw" full-URI-text field in the 7-field synthetic
+    // layout `URL.toURI()` allocates (scheme=0, host=1, port=2, path=3,
+    // query=4, fragment=5, raw=6 — see net_phase_e.rs). That native only
+    // populates path (slot 3) for `file:` scheme URLs, leaving non-file
+    // schemes like `jar:` with nothing readable in slots 0..=5 besides the
+    // bare scheme string at slot 0 — callers here previously fell back to
+    // that bare "jar"/"jrt"/etc. text as if it were a full URI, producing a
+    // garbage single-segment path. Scanning slot 6 too lets the jar:/file:
+    // prefix match below find the real `jar:file:/...!/entry` text.
+    for slot in 0..=6usize {
         if let Value::Object(Some(s)) = ctx.get_field(uri, slot) {
             if let Some(t) = ctx.read_string(s) {
                 cands.push(t);

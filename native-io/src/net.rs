@@ -684,16 +684,29 @@ fn net_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
             }
             .into();
         }
+        ErrorKind::AddrInUse => {
+            return RuntimeError::BindException {
+                message: format!("Address already in use: {ctx}: {e}"),
+            }
+            .into();
+        }
+        ErrorKind::AddrNotAvailable => {
+            return RuntimeError::BindException {
+                message: format!("Cannot assign requested address: {ctx}: {e}"),
+            }
+            .into();
+        }
+        ErrorKind::PermissionDenied => {
+            return RuntimeError::BindException {
+                message: format!("Permission denied: {ctx}: {e}"),
+            }
+            .into();
+        }
         _ => {}
     }
     let msg = match e.kind() {
         ErrorKind::ConnectionReset => format!("SocketException: Connection reset: {ctx}: {e}"),
         ErrorKind::ConnectionAborted => format!("SocketException: Connection aborted: {ctx}: {e}"),
-        ErrorKind::AddrInUse => format!("BindException: Address already in use: {ctx}: {e}"),
-        ErrorKind::AddrNotAvailable => {
-            format!("BindException: Cannot assign requested address: {ctx}: {e}")
-        }
-        ErrorKind::PermissionDenied => format!("BindException: Permission denied: {ctx}: {e}"),
         ErrorKind::NotConnected => format!("SocketException: Not connected: {ctx}: {e}"),
         _ => format!("SocketException: {ctx}: {e}"),
     };
