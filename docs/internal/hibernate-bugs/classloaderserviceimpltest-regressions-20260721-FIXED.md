@@ -257,3 +257,36 @@ caused by independent, later changes:
 
 Neither has been fixed here (no source changes made per this investigation's
 scope); this document records root cause and repro for follow-up.
+
+---
+
+## Resolution (2026-07-21)
+
+**Status: FIXED.**
+
+- Plain `file:` SPI descriptor URLs now use the shared
+  `file_url_path_to_fs_path` conversion. This preserves `C:/...` drive-letter
+  paths while retaining POSIX absolute paths and percent decoding.
+- The real-JDK `ClassLoader.loadClass(String)` native shadow now recognizes an
+  already executing bytecode override on the same receiver. Its nested
+  `super.loadClass(name)` delegation reaches the base path instead of invoking
+  the override a second time. Native-first dispatch remains protected by the
+  existing in-flight identity guard.
+
+Regression coverage:
+
+- `file_url_path_preserves_windows_drive_letter` covers both `file:/C:/...`
+  and percent-decoded POSIX paths.
+- `ClassLoaderSingleOverrideDispatch` proves exact-once behavior for both
+  native-first `Class.forName` and bytecode-first delegated lookup.
+
+Azure verification with `/data/cratonvm-hibernate-classloader-20260721` and
+JDK 25 completed in JIT and `--nojit` modes:
+
+- `service.ClassLoaderServiceImplTest`: `found=2 started=2 ok=2 failed=0`.
+- `bootstrap.registry.classloading.ClassLoaderServiceImplTest`:
+  `found=7 started=7 ok=7 failed=0`.
+
+The runner's `Failed to close extension context` line remains emitted after
+successful methods in both modes; it is a harness cleanup diagnostic and did
+not produce any failed, aborted, or skipped test.
