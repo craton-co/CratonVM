@@ -661,14 +661,14 @@ method interpreted (`SkipReason::SpringBootModifiedClassPathLoader`); ordinary
 application class loading and `findClass` remain JIT-eligible.
 
 Final current-`dev` integration validation used
-`cratonvm-restclient-webclient-withoutjackson-integrated-20260721.exe`
-(`96257DC8DCCBEA671D60AB13B3F66047D3149AB19904E9C48A347F7952CC766D`), serial
+`cratonvm-restclient-webclient-withoutjackson-finaldev-20260721.exe`
+(`BD8FC1B7A66B408D37FC0F3A18092D04443CA59F0955FAAC72C211551A96B275`), serial
 execution, and the real Spring Boot fixture at `C:\craton\CratonVM\apps\spring-boot`:
 
 | Mode | RestClient test | WebClient test |
 |---|---:|---:|
-| Craton JIT | PASS, 107.2s | PASS, 121.2s |
-| Craton `--nojit` | PASS, 124.3s | PASS, 163.2s |
+| Craton JIT | PASS, 154.3s | PASS, 161.7s |
+| Craton `--nojit` | PASS, 153.3s | PASS, 161.2s |
 | HotSpot JIT baseline | PASS, 4.7s | PASS, 5.0s |
 
 Focused unit coverage:
