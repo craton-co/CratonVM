@@ -515,43 +515,131 @@ gate for `java/io/BufferedInputStream` that no longer exists anywhere in the
 non-test code (a stale test from an earlier refactor, not caused by this
 fix, not investigated further here — out of scope).
 
-**Working theory for the remaining ~182s stall**: the per-call-site cache
-only helps on the *second-and-later* call to a given `(caller_class,
-cp_index)` pair — the *first* call to each distinct call site still pays
-full resolution (native-registry lookup, `force_native_over_real_jdk_bytecode`/
-`synthetic_stub_should_yield_to_real_bytecode` checks, `class_manager`
-`RwLock` reads), now non-allocating but not free. This session's isolated
-repro (`SaxManySmallFiles`) intentionally used a small, non-validating,
-DTD-less parse to isolate the invokestatic-caching bug cleanly — a real
-`.tld` file parsed through Tomcat's actual `Digester`/schema-aware pipeline
-exercises a much larger, more varied set of Xerces/XNI classes and methods
-(grammar pool setup, DTD/XSD validators, symbol tables), plausibly with
-thousands of call sites hit for the first time in a single parse. If so, the
-remaining cost is aggregate first-resolution cost across many distinct call
-sites, not a single repeated hot loop — a different (and likely harder)
-shape of problem than the one just fixed. Not yet confirmed; the next step
-is to re-run the cdb sampling technique against the real suite (not the
-toy repro) during the 182s stall to see whether it's still one dominant
-spot or, as theorized, spread across first-touch resolution machinery.
+**Working theory for the remaining ~182s stall (2026-07-21, REFUTED — see
+below)**: the per-call-site cache only helps on the *second-and-later* call
+to a given `(caller_class, cp_index)` pair — the *first* call to each
+distinct call site still pays full resolution (native-registry lookup,
+`force_native_over_real_jdk_bytecode`/`synthetic_stub_should_yield_to_real_bytecode`
+checks, `class_manager` `RwLock` reads), now non-allocating but not free.
+This session's isolated repro (`SaxManySmallFiles`) intentionally used a
+small, non-validating, DTD-less parse to isolate the invokestatic-caching
+bug cleanly — a real `.tld` file parsed through Tomcat's actual
+`Digester`/schema-aware pipeline exercises a much larger, more varied set of
+Xerces/XNI classes and methods (grammar pool setup, DTD/XSD validators,
+symbol tables), plausibly with thousands of call sites hit for the first
+time in a single parse. If so, the remaining cost is aggregate
+first-resolution cost across many distinct call sites, not a single
+repeated hot loop.
 
-**Still OPEN. Next steps for whoever picks this up**:
-1. Re-run the cdb sampling technique (documented above, reusable — attach
-   non-invasively during a live slow run, `~*kb 20`, filter for the
-   `main-vm` thread) directly against a real suite run's 182s+ stall,
-   rather than the toy repro, to see whether resolution-cost-at-scale is
-   confirmed or something else is happening.
-2. If confirmed, look at whether `populate_invoke_cache`'s one-time cost
-   itself can be cut (e.g. batched resolution, or caching more eagerly per
-   class rather than strictly per call site) rather than trying to
-   eliminate first-call cost entirely.
-3. `docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/` remains
-   the fast (seconds, not the 10+ minute full-suite rebuild-and-rerun cycle)
-   iteration loop for isolated experiments — extend it with DTD/schema
-   validation enabled to better match the real workload's shape if pursuing
-   (2).
-4. Diagnostic instrumentation left in place from the prior session (opt-in,
-   zero default behavior change): `CRATONVM_DBG_JAR`,
-   `CRATONVM_DBG_CLASSPATH`, `CRATONVM_DBG_RESOURCE_TIMING`.
-5. `cdb`/WinDbg is now installed on this box (`Microsoft.WinDbg` via
+## Root-caused for real and FIXED (2026-07-21, later same-day follow-up): it was never Xerces
+
+Live `cdb` sampling of a **real suite run's actual 182s stall** (not the toy
+repro) definitively refuted the "aggregate first-call resolution cost"
+theory above: the stuck `main-vm` thread was parked in `net_poll`'s socket
+wait loop, not executing any interpreted bytecode at all. This ruled out
+Xerces/invokestatic-cache entirely and redirected the investigation to the
+network layer.
+
+**Identifying the exact test**: correlated JUnit discovery-order (probed
+directly via a small reflection harness) against the suite log's cumulative
+"Jetty started" line count to pin the stall to
+`JettyServletWebServerFactoryTests.compressionOfResponseToGetRequest` (the
+18th server-start cycle). Reproduced in isolation via `SbRunnerMethod`
+(`apps/spring-boot/sb-runner`), deterministic every time — no full 900s
+suite run needed to iterate.
+
+**Root cause #1 — Deflater direct-`ByteBuffer` natives were unimplemented
+stubs.** `java.util.zip.Deflater` has 4 native compress overloads
+(`deflateBytesBytes`, `deflateBytesBuffer`, `deflateBufferBytes`,
+`deflateBufferBuffer`); only `deflateBytesBytes` (byte[]-in/byte[]-out) had
+a real implementation in `native-builtins/src/zip_real.rs` — the other 3
+all threw `RuntimeError::NotImplemented` via a shared
+`defl_direct_buffer_unsupported` stub. Jetty's `GzipHttpOutputInterceptor`
+calls the `deflateBufferBuffer` overload whenever both its scratch input
+buffer and the connector's pooled network output buffer are direct (the
+normal NIO connector case) — so every gzip-compressed response through
+Jetty's real NIO path hit the stub, which raised an exception deep inside a
+blocking write call in a way that left the connection wedged rather than
+cleanly failing (independently confirmed server-side-only via `curl` and a
+raw-socket Java probe: the client received a 10-byte gzip header and then
+nothing, matching a mid-response native failure rather than a client bug).
+
+Fixed by implementing all 3 direct-buffer overloads for real, sharing core
+compression logic with the existing `deflateBytesBytes` path via a new
+`defl_do_compress` helper (`native-builtins/src/zip_real.rs`). Direct-buffer
+addresses are resolved native `long` values (the JDK bytecode wrapper
+already extracts `((DirectBuffer) buf).address()` before calling the
+native), read/written via the existing `NativeContext::copy_from_native_memory`/
+`copy_to_native_memory` primitives — the same pattern already used in
+`classloader.rs`/`lang_invoke.rs`/`lang_system.rs` for direct-buffer access.
+
+**Root cause #2 — `CRC32.updateByteBuffer0` was *also* a stub**, returning
+the input CRC unchanged instead of computing over the buffer's bytes
+(`native-builtins/src/zip_real.rs`, `crc32_update_byte_buffer_0` — a
+pre-existing, deliberate "return unchanged, better than UnsatisfiedLinkError"
+placeholder per its old comment). This second bug was masked by the first:
+fixing only the Deflater hang let the test proceed far enough to actually
+exercise Jetty's own CRC32-based GZIP trailer computation for the first
+time, which failed with `java.util.zip.ZipException: Corrupt GZIP trailer`
+(ISIZE correct at 10000, CRC32 always exactly `0x00000000` — the
+tell). Fixed the same way as Deflater: read the buffer's bytes via
+`copy_from_native_memory` and feed them through the existing
+`crc32_update_public` helper (same CRC32/IEEE algorithm already used by the
+working byte[] overload).
+
+**Verification**: `compressionOfResponseToGetRequest` went from hanging
+(previously reported as a ~182s stall, confirmed via isolated repro to
+actually hang indefinitely once traced directly rather than via the
+900s-suite-timeout artifact) to **passing in ~21-24s**. `CRATONVM_DBG_DEFLATE`
+env-gated tracing (left in place, opt-in, zero default behavior change)
+confirms the fix path: input consumed across calls summed to the expected
+10000 bytes, `flush_code=4` (Z_FINISH) on the final call.
+
+**Lesson**: this is the second time in this same investigation that a
+plausible-looking "interpreter is slow at X" theory (first Xerces
+char-by-char scanning, then aggregate invokestatic first-resolution cost)
+turned out to be wrong once a real profiler was pointed at the *actual*
+stall rather than a hand-picked isolated repro — the toy repro
+(`SaxManySmallFiles`) was faithfully reproducing a real bug (the
+invokestatic cache gap, genuinely worth fixing) that was simply not the
+cause of *this* particular residual. Prefer sampling the real failure over
+extrapolating from a similar-looking synthetic one.
+
+**Suite verification (2026-07-21)**: ran both classes solo via
+`apps/spring-boot-suite-runner`.
+`JettyReactiveWebServerFactoryTests`: 35 tests, 8 failed — all pre-existing
+SSL/TLS handshake failures (`StacklessSSLHandshakeException`, unrelated to
+compression/CRC, not investigated further here). `JettyServletWebServerFactoryTests`:
+progressed cleanly through **60 server-start/stop cycles in 571s** (vs. the
+pre-fix baseline of 17-18 cycles before an indefinite hang) — a large,
+real improvement — then the process **terminated abnormally (exit code 1,
+no panic message, no `SBRUNNER_RESULT`)** immediately after starting its
+61st server instance (an `h2c`-enabled connector). Neither
+`compressionOfResponseToPostRequest` (discovery position 61) nor
+`whenHttp2IsEnabledAndSslIsDisabledThenHttp11CanStillBeUsed` (position 63,
+also h2c) reproduces the crash when run in isolation — **this is a
+cumulative/state-leak crash that only manifests after ~60 prior
+server-start cycles in the same process**, not a per-test bug. It was
+never reached before this fix (the class always hung around cycle 18-19
+first) — a fourth instance in this investigation of a residual that was
+masked by an earlier-blocking bug. **New OPEN residual, not investigated
+further in this pass** — needs its own cdb-sampling/crash-dump
+investigation in a fresh session, ideally reproduced via a tight loop of
+just the last ~10-15 tests before the crash point to shorten the
+iteration cycle (60 cycles × ~9.5s/cycle ≈ 570s per attempt otherwise).
+
+**Still OPEN / not yet done**:
+1. The new cumulative crash-after-60-cycles residual above — needs a fresh
+   investigation (crash dump/cdb, not a simple isolated-test repro since
+   isolation doesn't reproduce it).
+2. The analogous `Inflater` direct-buffer natives
+   (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in the
+   same file) are likely *also* unimplemented stubs (not yet checked/fixed
+   in this pass) — same risk class, not yet known to be hit by any test.
+3. Diagnostic instrumentation left in place (opt-in, zero default behavior
+   change): `CRATONVM_DBG_JAR`, `CRATONVM_DBG_CLASSPATH`,
+   `CRATONVM_DBG_RESOURCE_TIMING`, `CRATONVM_DBG_DEFLATE`, `CRATONVM_DBG_SOCK`,
+   `CRATONVM_DBG_SOCK_BYTES`.
+4. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
    `winget install Microsoft.WinDbg --source winget`) — no longer a
    blocker for future sessions on this same machine.
