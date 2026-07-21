@@ -2670,6 +2670,24 @@ fn publish_to_jul_handlers_src(
         // class as `native_bos_flush_locked`
         // (docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md).
         let record_pin = ctx.pin_native_root(record);
+        // GC SAFETY (2026-07-21, JulGcStressRepro checkcast root cause): the
+        // LogRecord `<init>` native invoked by `new_object_initialized` above
+        // materializes a java/time/Instant (allocates -> can trigger a moving
+        // GC). `level`/`message` were last read from their pins BEFORE that
+        // call; if a GC fired inside the ctor it already moved the young
+        // message string AND fixed up the record's own `message` field during
+        // evacuation -- after which the raw field writes below would store the
+        // condemned from-space address right back over the corrected field.
+        // `getMessage()` is a plain field read (phases_early lr_get), so it
+        // then faithfully returns the poison: once young space is reset and
+        // reused the address reads as a zero-header object (checkcast
+        // "java.lang.Object cannot be cast to java.lang.String"), a foreign
+        // byte[], or a different, later string. Unlike `invoke_virtual`
+        // (whose entry barrier heals forwarded args), `set_field`/
+        // `set_field_by_name` are direct heap writes with no healing --
+        // re-derive both from their pins first.
+        let level = ctx.read_native_pin(level_pin, level);
+        let message = ctx.read_native_pin(message_pin, message);
         // The compact VM may not materialize the JDK's private LogRecord
         // layout through its constructor. FileHandler.isLoggable() and its
         // formatter consume the public level/message surface, so make that
@@ -2698,10 +2716,26 @@ fn publish_to_jul_handlers_src(
         let message = ctx.read_native_pin(message_pin, message);
         let record_id = next_log_record_id();
         ctx.set_field(record, 1, Value::Long(record_id));
-        log_record_messages()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(record_id, ctx.read_string(message).unwrap_or_default());
+        {
+            let mut messages = log_record_messages()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            messages.insert(record_id, ctx.read_string(message).unwrap_or_default());
+            // Mirror the sibling registry's retention cap. Without it this
+            // identity-keyed delivery path -- the ONLY one that fires for a
+            // real `Logger.getLogger(...)` logger (the name-keyed sibling's
+            // lookup misses there, so its in-loop eviction never runs) --
+            // grows the process-global side table by one entry per log call,
+            // forever.
+            while messages.len() > 4096 {
+                let oldest = messages.keys().next().copied();
+                if let Some(oldest) = oldest {
+                    messages.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
         let handlers = ctx.read_native_pin(handlers_pin, handlers);
         let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
             Some(Value::Int(size)) if size > 0 => size as usize,

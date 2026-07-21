@@ -343,6 +343,16 @@ struct DenseIntEntries {
     dense: Vec<Option<(ObjectRef, Value)>>,
     sparse: FxHashMap<i32, (ObjectRef, Value)>,
     len: usize,
+    // Real JDK `HashMap` never shrinks its table on `remove`, and a node's
+    // position within its bucket chain is fixed at first-insertion time
+    // (a value-only update via a later `put` of the same key does not move
+    // it). `peak_len` mirrors the never-shrinks capacity rule and `seq`/
+    // `next_seq` mirror per-key insertion order, so `keys_in_java_hashmap_order`
+    // below can reproduce real bucket-iteration order instead of this dense
+    // store's raw ascending-key layout. See that method's doc comment.
+    peak_len: usize,
+    next_seq: u64,
+    seq: FxHashMap<i32, u64>,
 }
 
 impl DenseIntEntries {
@@ -350,6 +360,14 @@ impl DenseIntEntries {
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    fn note_fresh_insert(&mut self, key: i32) {
+        self.len += 1;
+        self.peak_len = self.peak_len.max(self.len);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.seq.insert(key, seq);
     }
 
     fn insert(&mut self, key: i32, value: (ObjectRef, Value)) -> Option<(ObjectRef, Value)> {
@@ -362,14 +380,14 @@ impl DenseIntEntries {
                 let sparse_old = self.sparse.remove(&key);
                 let old = self.dense[index].replace(value).or(sparse_old);
                 if old.is_none() {
-                    self.len += 1;
+                    self.note_fresh_insert(key);
                 }
                 return old;
             }
         }
         let old = self.sparse.insert(key, value);
         if old.is_none() {
-            self.len += 1;
+            self.note_fresh_insert(key);
         }
         old
     }
@@ -422,6 +440,35 @@ impl DenseIntEntries {
             .iter_mut()
             .filter_map(Option::as_mut)
             .chain(self.sparse.values_mut())
+    }
+
+    /// Real-JDK `HashMap` bucket-iteration order for the entries currently
+    /// held: grouped by `(capacity - 1) & hash(key)` in ascending bucket
+    /// order (capacity derived from `peak_len` via the same doubling-at-.75-
+    /// load-factor rule real `HashMap` uses, since real `HashMap` capacity
+    /// never shrinks on `remove`), with original insertion order breaking
+    /// ties within a bucket -- exactly how a real bucket array of chains
+    /// iterates. `keys()`/`values()` above are bucket-oblivious (dense-index
+    /// ascending order), which is fine for `get`/`put`/`size` but gives the
+    /// WRONG order for anything Java-visible: `HashSet<Integer>`/
+    /// `HashMap<Integer, V>` `keySet()`/`values()`/`entrySet()` iteration,
+    /// and hence `CollectionUtils.firstElement`/`lastElement`, observe
+    /// dense ascending order instead of real hash-bucket order without this.
+    fn keys_in_java_hashmap_order(&self) -> Vec<i32> {
+        let mut cap: usize = 16;
+        while self.peak_len > (cap * 3) / 4 {
+            cap *= 2;
+        }
+        let mask = (cap as i32) - 1;
+        let mut ordered: Vec<i32> = self.keys().collect();
+        ordered.sort_by_key(|&k| {
+            // JDK `HashMap.hash(Object)`: `(h = key.hashCode()) ^ (h >>> 16)`;
+            // for `Integer`, `hashCode()` is the int value itself.
+            let h = k ^ (((k as u32) >> 16) as i32);
+            let bucket = mask & h;
+            (bucket, self.seq.get(&k).copied().unwrap_or(0))
+        });
+        ordered
     }
 }
 
@@ -584,7 +631,7 @@ fn materialize_hm_int_fast(
         let Some(state) = table.get(&object_key) else {
             return Ok(this);
         };
-        state.entries.keys().collect()
+        state.entries.keys_in_java_hashmap_order()
     };
 
     let map_pin = ctx.pin_native_root(this);
@@ -1981,6 +2028,13 @@ fn al_ensure_capacity(
     }
 
     al_set_data(ctx, this, new_buf);
+    if altrace_enabled() {
+        eprintln!(
+            "[altrace GROW] this={:p} old_cap={old_cap} new_cap={new_cap} new_buf={:p}",
+            this.as_ptr(),
+            new_buf.as_ptr()
+        );
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(new_buf)
 }
@@ -2286,6 +2340,42 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
+// ALTRACE (checkcast-corruption investigation, 20260721): env-gated
+// unconditional trace of every ArrayList add/get -- prints (this ptr, buf
+// ptr, index/size) so two concurrently-growing lists (e.g. `received` vs
+// `garbage` in JulGcStressRepro) can be told apart in the log and any
+// cross-contamination between their backing arrays caught at the exact
+// call that produced it.
+#[inline]
+fn altrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+}
+
+// ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
+// records what the element ACTUALLY IS at that moment (catches stale pointers
+// whose referent has been replaced by a foreign object after a moving GC).
+fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => {
+            let cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .unwrap_or_else(|| "<unknown-class>".to_string());
+            if cls == "java/lang/String" {
+                format!(
+                    "{:p} cls={cls} str={:?}",
+                    o.as_ptr(),
+                    ctx.read_string(o).unwrap_or_default()
+                )
+            } else {
+                format!("{:p} cls={cls}", o.as_ptr())
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2310,6 +2400,14 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         None => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(data, index as usize);
+    if altrace_enabled() {
+        let val_desc = altrace_describe(ctx, val);
+        eprintln!(
+            "[altrace GET] this={:p} buf={:p} index={index} size={size} val={val_desc}",
+            this.as_ptr(),
+            data.as_ptr(),
+        );
+    }
     Ok(Some(val))
 }
 
@@ -2356,6 +2454,14 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let buf = al_ensure_capacity(ctx, this, size + 1)?;
     let this = ctx.read_native_pin(this_pin, this);
     let elem = read_pinned_elem(ctx, elem_pin, elem);
+    if altrace_enabled() {
+        let elem_desc = altrace_describe(ctx, elem);
+        eprintln!(
+            "[altrace ADD] this={:p} buf={:p} at_index={size} elem={elem_desc}",
+            this.as_ptr(),
+            buf.as_ptr(),
+        );
+    }
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
     ctx.unpin_native_roots(this_pin);
@@ -4731,8 +4837,9 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         .map(|state| {
             state
                 .entries
-                .values()
-                .map(|(key, _)| Value::Object(Some(*key)))
+                .keys_in_java_hashmap_order()
+                .into_iter()
+                .filter_map(|k| state.entries.get(&k).map(|(key, _)| Value::Object(Some(*key))))
                 .collect()
         })
     {
@@ -4776,7 +4883,14 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&object_key)
-        .map(|state| state.entries.values().map(|(_, value)| *value).collect())
+        .map(|state| {
+            state
+                .entries
+                .keys_in_java_hashmap_order()
+                .into_iter()
+                .filter_map(|k| state.entries.get(&k).map(|(_, value)| *value))
+                .collect()
+        })
     {
         return values;
     }
@@ -4816,8 +4930,14 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
         .map(|state| {
             state
                 .entries
-                .values()
-                .map(|(key, value)| (Value::Object(Some(*key)), *value))
+                .keys_in_java_hashmap_order()
+                .into_iter()
+                .filter_map(|k| {
+                    state
+                        .entries
+                        .get(&k)
+                        .map(|(key, value)| (Value::Object(Some(*key)), *value))
+                })
                 .collect()
         })
     {
@@ -22848,7 +22968,7 @@ fn native_sj_init_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -22859,10 +22979,33 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
     if let Some(layout) = sj_real_layout(ctx) {
         // `String.valueOf(newElement)`: null -> "null", else `.toString()`.
+        // `read_string` only succeeds for an actual `java.lang.String`; a
+        // `StringBuilder`/`StringBuffer`/other `CharSequence` element (a
+        // common `StringJoiner.add` argument -- e.g. Spring's
+        // `AbstractSqlParameterSource.toString()` builds each entry as a
+        // `StringBuilder`) needs its real `toString()` invoked, exactly like
+        // real `StringJoiner.add`'s `String.valueOf(newElement)`. Without
+        // this fallback, every non-String element silently became the
+        // literal text "null" instead of its real content. `this` is pinned
+        // across the dispatch since `toString()` may allocate.
         // Converted to a plain Rust `String` immediately (no live
         // `ObjectRef` held across the allocations below).
         let elt_str = match element {
-            Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_else(|| "null".to_string()),
+            Value::Object(Some(r)) => match ctx.read_string(r) {
+                Some(s) => s,
+                None => {
+                    let pin = ctx.pin_native_root(this);
+                    let result = ctx.invoke_virtual(r, "toString", "()Ljava/lang/String;", &[]);
+                    this = ctx.read_native_pin(pin, this);
+                    ctx.unpin_native_roots(pin);
+                    match result {
+                        Ok(Some(Value::Object(Some(sref)))) => {
+                            ctx.read_string(sref).unwrap_or_else(|| "null".to_string())
+                        }
+                        _ => "null".to_string(),
+                    }
+                }
+            },
             _ => "null".to_string(),
         };
 

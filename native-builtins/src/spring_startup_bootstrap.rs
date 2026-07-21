@@ -1273,6 +1273,78 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         m3_abstract_bean_definition_resolve_bean_class,
     );
 
+    // Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+    // IntegrationTests#refreshSucceedsWithoutHealth): `AbstractBeanDefinition.
+    // setBeanClass(Class)` is the common tail of EVERY bean-registration path
+    // that already holds a resolved `Class` object — including `Enable
+    // ConfigurationPropertiesRegistrar` → `ConfigurationPropertiesBeanRegistrar
+    // .createBeanDefinition` → `new AnnotatedGenericBeanDefinition(type)`, where
+    // `type` comes from `MergedAnnotation.getClassArray(...)` reading `@Enable
+    // ConfigurationProperties(ServerProperties.class)`'s value off a CACHED,
+    // already-materialised `TypeMappedAnnotation`. Root-caused via a stack-trace
+    // capture at this exact call site (confirmed the caller chain: `Enable
+    // ConfigurationPropertiesRegistrar.registerBeanDefinitions` → `Configuration
+    // PropertiesBeanRegistrar.{register,createBeanDefinition}` →
+    // `AnnotatedGenericBeanDefinition.<init>`).
+    //
+    // Under a Spring Boot `ModifiedClassPathClassLoader`-isolated test
+    // (`@ClassPathExclusions`), that materialised value can carry the
+    // Application-loader's copy of a class even though every OTHER read of the
+    // same annotation attribute (a fresh `Class.getDeclaredAnnotations()` call,
+    // traced separately) correctly resolves through `container_loader` to the
+    // isolated loader's own copy — some earlier, cached materialisation of the
+    // SAME `@EnableConfigurationProperties` instance apparently won. The two
+    // Class objects share a name but not an identity: the bean instantiated
+    // from this (wrong) `Class` later fails `Method.invoke`'s reflective
+    // argument-assignability check against a factory-method parameter type that
+    // WAS correctly resolved via `container_loader`, throwing
+    // `IllegalArgumentException("argument type mismatch")` at a completely
+    // unrelated call site.
+    //
+    // Fix: when the incoming `Class` belongs to no recorded user-defined loader
+    // (i.e. it resolved through the global/Application path) AND the CURRENT
+    // THREAD's context classloader is a user-defined loader — the isolated
+    // loader for the whole duration of a `ModifiedClassPathClassLoader`-forked
+    // test — prefer that loader's OWN copy of the same class name, mirroring
+    // the identical `resolve_class_id_via_tccl` pattern already applied to
+    // `resolve_bean_class_field`'s string-resolution fallback. A loader-owned
+    // `Class` (the overwhelmingly common case outside isolated-loader tests) is
+    // untouched — `resolve_class_id_via_tccl` only returns `Some` when the TCCL
+    // is genuinely user-defined and actually resolves the name, so this can
+    // only ever correct a loader-blind resolution, never override a
+    // legitimately-loader-owned one.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "setBeanClass",
+        "(Ljava/lang/Class;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let mut cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            if let Some(c) = cls {
+                if let Some(cid) = ctx.class_id_from_mirror(c) {
+                    if crate::classloader::defining_loader_for(cid.as_u32()).is_none() {
+                        if let Some(name) = ctx.class_name_of_id(cid) {
+                            if let Some(better_cid) = resolve_class_id_via_tccl(ctx, &name) {
+                                if better_cid != cid {
+                                    let mirror = ctx.get_class_mirror(better_cid);
+                                    cls = Some(mirror);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.set_field_by_name(this, "beanClass", Value::Object(cls));
+            Ok(None)
+        },
+    );
+
     // sportme: the actual throw site is `AbstractBeanDefinition.getBeanClass()`,
     // which throws ISE("Bean class name [%s] has not been resolved into an
     // actual Class") when beanClass is a String (not yet resolved). This used
@@ -2381,6 +2453,78 @@ fn try_build_method_injection(
 /// the subclass directly (see `cglib_enhancer::build_replace_override_subclass`).
 /// Returns `Some(instance)` when at least one replaced method was overridden,
 /// `None` to fall through to the ordinary instantiation path.
+/// A single JVM descriptor type (e.g. `I`, `Ljava/lang/String;`, `[I`) to the
+/// dot-notation name `Class.getName()` would produce (`"int"`,
+/// `"java.lang.String"`, `"[I"`), for `ReplaceOverride.matches(Method)`-style
+/// substring matching against `<arg-type>` fragments -- see
+/// `try_build_replace_override` below.
+fn jvm_type_to_java_name(desc: &str) -> String {
+    let mut dims = 0usize;
+    let mut rest = desc;
+    while let Some(r) = rest.strip_prefix('[') {
+        dims += 1;
+        rest = r;
+    }
+    let base = match rest.chars().next() {
+        Some('L') => rest[1..rest.len().saturating_sub(1)].replace('/', "."),
+        Some('I') => "int".to_string(),
+        Some('J') => "long".to_string(),
+        Some('Z') => "boolean".to_string(),
+        Some('B') => "byte".to_string(),
+        Some('C') => "char".to_string(),
+        Some('S') => "short".to_string(),
+        Some('F') => "float".to_string(),
+        Some('D') => "double".to_string(),
+        _ => rest.to_string(),
+    };
+    if dims == 0 {
+        base
+    } else {
+        // Real `Class.getName()` for an array type keeps the descriptor
+        // shape (`[I`, `[Ljava.lang.String;`) rather than the plain-English
+        // primitive name. Array params are rare for this feature; this is
+        // close enough for the substring match below to behave correctly.
+        let prefix: String = "[".repeat(dims);
+        match rest.chars().next() {
+            Some('L') => format!("{prefix}L{base};"),
+            _ => format!("{prefix}{rest}"),
+        }
+    }
+}
+
+/// Split a JVM method descriptor's parameter section into per-parameter
+/// dot-notation type names (see `jvm_type_to_java_name`).
+fn jvm_descriptor_param_types_dot_notation(descriptor: &str) -> Vec<String> {
+    let Some(open) = descriptor.find('(') else {
+        return Vec::new();
+    };
+    let Some(close) = descriptor.find(')') else {
+        return Vec::new();
+    };
+    let params = &descriptor[open + 1..close];
+    let bytes = params.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'L' {
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            i += 1; // include ';'
+        } else {
+            i += 1; // primitive: single char
+        }
+        if start < i {
+            result.push(jvm_type_to_java_name(&params[start..i]));
+        }
+    }
+    result
+}
+
 fn try_build_replace_override(
     ctx: &mut dyn NativeContext,
     mbd: ObjectRef,
@@ -2413,9 +2557,17 @@ fn try_build_replace_override(
 
     let super_internal = ctx.class_name_of_id(super_cid)?;
 
-    // Collect (methodName → replacerBeanName) for every ReplaceOverride.
+    // Collect (methodName -> [ReplaceOverride configs]) -- a name can have
+    // MORE THAN ONE `<replaced-method>` entry when `<arg-type>` disambiguates
+    // between overloads (see `overrideMethodByArgTypeAttribute`/`Element` in
+    // `XmlBeanFactoryTests`), so this must be a name -> Vec, not name -> single
+    // replacer.
+    struct ReplaceOverrideCfg {
+        type_identifiers: Vec<String>,
+        replacer_bean_name: String,
+    }
     let mbd = ctx.read_native_pin(mbd_pin, mbd);
-    let mut replacers: HashMap<String, String> = HashMap::new();
+    let mut replacers: HashMap<String, Vec<ReplaceOverrideCfg>> = HashMap::new();
     if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
         mbd,
         "getMethodOverrides",
@@ -2446,10 +2598,10 @@ fn try_build_replace_override(
                     if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
                         continue;
                     }
-                    // GC-safety: `getMethodName`/`getMethodReplacerBeanName`
-                    // below can each trigger a collection that relocates
-                    // `ovr` (used again by the next call); pin per-
-                    // iteration and release before continuing to the next
+                    // GC-safety: `getMethodName`/`getMethodReplacerBeanName`/
+                    // `getTypeIdentifiers` below can each trigger a collection
+                    // that relocates `ovr` (used again by the next call); pin
+                    // per-iteration and release before continuing to the next
                     // `i`.
                     let ovr_pin = ctx.pin_native_root(ovr);
                     let mname =
@@ -2476,9 +2628,41 @@ fn try_build_replace_override(
                             continue;
                         }
                     };
+                    // `<arg-type>` fragments (e.g. "String", "java.lang.Exc")
+                    // used to disambiguate an overloaded method name -- see
+                    // `ReplaceOverride.matches(Method)`'s real algorithm,
+                    // which this mirrors below. Added in Spring 6.2.9
+                    // specifically so callers other than CGLIB (i.e. us)
+                    // could read them back out.
+                    let mut type_identifiers: Vec<String> = Vec::new();
+                    let ovr = ctx.read_native_pin(ovr_pin, ovr);
+                    if let Ok(Some(Value::Object(Some(list)))) =
+                        ctx.invoke_virtual(ovr, "getTypeIdentifiers", "()Ljava/util/List;", &[])
+                    {
+                        let list_pin = ctx.pin_native_root(list);
+                        let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+                            Ok(Some(Value::Int(n))) => n,
+                            _ => 0,
+                        };
+                        for j in 0..size {
+                            let list = ctx.read_native_pin(list_pin, list);
+                            if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                                list,
+                                "get",
+                                "(I)Ljava/lang/Object;",
+                                &[Value::Int(j)],
+                            ) {
+                                type_identifiers.push(ctx.read_string(s).unwrap_or_default());
+                            }
+                        }
+                        ctx.unpin_native_roots(list_pin);
+                    }
                     ctx.unpin_native_roots(ovr_pin);
                     if !mname.is_empty() {
-                        replacers.insert(mname, rname);
+                        replacers.entry(mname).or_default().push(ReplaceOverrideCfg {
+                            type_identifiers,
+                            replacer_bean_name: rname,
+                        });
                     }
                 }
                 ctx.unpin_native_roots(arr_pin);
@@ -2494,17 +2678,21 @@ fn try_build_replace_override(
     // single override (the most-derived declaration wins — first seen walking
     // from the bean class upward).
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    struct Candidate {
+        name: String,
+        descriptor: String,
+        access_flags: u16,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
         for m in ctx.declared_methods(cid) {
             if m.name.starts_with('<') {
                 continue;
             }
-            let replacer = match replacers.get(&m.name) {
-                Some(r) => r.clone(),
-                None => continue,
-            };
+            if !replacers.contains_key(&m.name) {
+                continue;
+            }
             if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
                 != 0
             {
@@ -2513,13 +2701,50 @@ fn try_build_replace_override(
             if !seen.insert((m.name.clone(), m.descriptor.clone())) {
                 continue;
             }
-            specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+            candidates.push(Candidate {
                 name: m.name.clone(),
                 descriptor: m.descriptor.clone(),
-                replacer_bean_name: replacer,
+                access_flags: m.access_flags,
             });
         }
         cursor = ctx.superclass_of(cid);
+    }
+    // A name is "overloaded" (in `ReplaceOverride.matches`'s sense) iff more
+    // than one candidate method shares it -- matches Spring's own
+    // `RootBeanDefinition.prepareMethodOverride` computation
+    // (`ClassUtils.getMethodCountForName(clazz, mo.getMethodName()) > 1`).
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for c in &candidates {
+        *name_counts.entry(c.name.clone()).or_insert(0) += 1;
+    }
+    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    for c in &candidates {
+        let cfgs = &replacers[&c.name];
+        let is_overloaded = name_counts.get(&c.name).copied().unwrap_or(0) > 1;
+        let param_types = jvm_descriptor_param_types_dot_notation(&c.descriptor);
+        // First `ReplaceOverride` config whose type identifiers match this
+        // candidate's actual parameter types, mirroring
+        // `ReplaceOverride.matches(Method)`: an unoverloaded name always
+        // matches (arg types irrelevant); an overloaded name requires an
+        // exact-arity, per-parameter substring match.
+        let matched = cfgs.iter().find(|cfg| {
+            if !is_overloaded {
+                return true;
+            }
+            cfg.type_identifiers.len() == param_types.len()
+                && cfg
+                    .type_identifiers
+                    .iter()
+                    .zip(param_types.iter())
+                    .all(|(ident, pty)| pty.contains(ident.as_str()))
+        });
+        let Some(cfg) = matched else { continue };
+        let _ = c.access_flags; // already filtered above
+        specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+            name: c.name.clone(),
+            descriptor: c.descriptor.clone(),
+            replacer_bean_name: cfg.replacer_bean_name.clone(),
+        });
     }
     if specs.is_empty() {
         return None;
@@ -2813,6 +3038,74 @@ enum BeanClassResolution {
     Placeholder,
 }
 
+/// Resolve `internal` through the CURRENT THREAD's context classloader when
+/// it is a user-defined (non-bootstrap/platform/app) loader, mirroring what
+/// real `ClassUtils.forName(name, beanClassLoader)` /
+/// `ClassUtils.getDefaultClassLoader()` would do when a bean factory's own
+/// `beanClassLoader` isn't explicitly threaded down to this native shim.
+///
+/// Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+/// IntegrationTests#refreshSucceedsWithoutHealth): `resolve_bean_class_field`
+/// (below) reads a `RootBeanDefinition`'s `beanClass` field, which can still
+/// be a bare `String` (not yet cached as a `Class` mirror) the first time
+/// this shim runs on it. The plain `ctx.class_id_by_name`/`ensure_class_
+/// initialized` global lookup always collapses to the FIRST-EVER loaded
+/// same-named class — under a Spring Boot `ModifiedClassPathClassLoader`-
+/// isolated test (`@ClassPathExclusions`), that's the plain Application
+/// loader's copy, not the isolated loader's own copy the surrounding test
+/// actually runs under (confirmed via `Thread.currentThread().
+/// getContextClassLoader()` being the isolated loader throughout such a
+/// test — the whole method re-runs under a swapped TCCL). A `ServerProperties`
+/// bean definition resolved this way then silently instantiates as the WRONG
+/// (Application-loader) class, one whose `Class` reference is unequal to the
+/// isolated loader's copy read everywhere else (annotation-driven `@Bean`
+/// factory-method parameter types, `ObjectProvider` identity checks, etc.) —
+/// surfacing much later as `IllegalArgumentException("argument type
+/// mismatch")` at a completely unrelated reflective `Method.invoke` site.
+/// Try the TCCL first, same as the real JDK/Spring default-classloader
+/// convention, before falling back to the global table.
+fn resolve_class_id_via_tccl(
+    ctx: &mut dyn NativeContext,
+    internal: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let tcl = ctx
+        .invoke(
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            &[],
+        )
+        .ok()
+        .flatten();
+    let loader = match tcl {
+        Some(Value::Object(Some(t))) => match ctx.invoke(
+            "java/lang/Thread",
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[Value::Object(Some(t))],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => l,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !crate::classloader::is_user_defined_loader(ctx, loader) {
+        return None;
+    }
+    let dotted = internal.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    let result = ctx.invoke_virtual(
+        loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    );
+    match result {
+        Ok(Some(Value::Object(Some(mirror)))) => ctx.class_id_from_mirror(mirror),
+        _ => None,
+    }
+}
+
 /// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
 /// `ClassId`, retrying with a `ClassUtils.forName`-style dot-vs-dollar
 /// nested-class fallback on failure: if the segment right after the
@@ -2826,6 +3119,9 @@ fn resolve_class_id_with_nested_retry(
     dotted: &str,
     internal: &str,
 ) -> Option<cratonvm_types::ClassId> {
+    if let Some(c) = resolve_class_id_via_tccl(ctx, internal) {
+        return Some(c);
+    }
     if let Some(c) = ctx.class_id_by_name(internal) {
         return Some(c);
     }

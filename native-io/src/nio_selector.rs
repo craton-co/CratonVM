@@ -399,6 +399,48 @@ impl SelectorState {
         }
     }
 
+    /// Windows/non-Linux: interrupt an in-progress blocked `WSAPoll` so it
+    /// re-evaluates the (just-changed) key set immediately, instead of
+    /// waiting out its full timeout.
+    ///
+    /// Unlike Linux epoll — where adding an fd to a live epoll set is picked
+    /// up by an already-blocked `epoll_wait` automatically, and `MOD`
+    /// additionally gets an explicit self-pipe nudge in
+    /// `selector_set_interest` — `WSAPoll` takes a fixed fd array as a
+    /// direct call argument. A thread already blocked inside `WSAPoll` has
+    /// no way to observe a NEW key (`selector_register`) or a changed
+    /// `interest_ops` on an existing key (`selector_set_interest`) until
+    /// that call naturally returns. `select_infinite_cap_ms()` only bounds
+    /// truly INDEFINITE waits (Java `select()` with no timeout); an
+    /// explicit, finite timeout (e.g. Jetty's `select(30000)` idle-poll) is
+    /// honored as-is and is NOT capped — so a missed registration/interest
+    /// change here does not self-heal within any bounded window, it stalls
+    /// for the caller's full requested timeout. Found while investigating
+    /// `JettyClientHttpConnectorBuilderTests`'s 100%-reproducible hang/crash
+    /// (`docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md`):
+    /// a real, confirmed gap (a registration lost this exact way, verified
+    /// via `CRATONVM_DBG_SELECTOR=1` tracing) — but NOT, on its own,
+    /// sufficient to fix that specific hang; see the doc for the remaining
+    /// open gap further down Jetty's connect/handshake call chain.
+    ///
+    /// Deliberately does NOT set the sticky public `woken` flag (matches
+    /// `selector_set_interest`'s Linux self-pipe nudge): this is an internal
+    /// "please re-check readiness now" prod, not a public
+    /// `Selector.wakeup()` request that should make the *next* `select()`
+    /// call return immediately too.
+    #[cfg(not(target_os = "linux"))]
+    fn nudge_blocked_poll(&mut self) {
+        if sel_dbg_enabled() {
+            sel_dbg("NUDGE".to_string());
+        }
+        if self.wakeup_sender.is_none() {
+            let _ = self.init_wakeup_udp();
+        }
+        if let (Some(sender), Some(peer)) = (self.wakeup_sender.as_ref(), self.wakeup_peer) {
+            let _ = sender.send_to(b"N", peer);
+        }
+    }
+
     /// Drain wakeup pipe (Linux self-pipe).
     #[cfg(target_os = "linux")]
     fn drain_wakeup_pipe(&mut self) {
@@ -628,6 +670,11 @@ pub fn selector_register(
     if !st.open {
         return Err(closed_selector());
     }
+    if sel_dbg_enabled() {
+        sel_dbg(format!(
+            "REGISTER id={id} net_fd={net_fd} interest_ops={interest_ops}"
+        ));
+    }
     let _prev = st.keys.insert(
         net_fd,
         KeyState {
@@ -670,6 +717,17 @@ pub fn selector_register(
             }
         }
     }
+    // Windows/non-Linux: unlike epoll (where an already-blocked epoll_wait
+    // observes a live ADD to its own epoll set automatically), WSAPoll's fd
+    // array is a fixed call argument — a thread already parked in WSAPoll
+    // cannot see this new key until its full timeout elapses. Nudge it so it
+    // re-polls with the now-current key set on the very next loop iteration.
+    // See `SelectorState::nudge_blocked_poll`'s doc comment for the full
+    // story.
+    #[cfg(not(target_os = "linux"))]
+    {
+        st.nudge_blocked_poll();
+    }
     Ok(())
 }
 
@@ -682,6 +740,9 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
     let mut st = s.lock();
     if !st.open {
         return Err(closed_selector());
+    }
+    if sel_dbg_enabled() {
+        sel_dbg(format!("SET_INTEREST id={id} net_fd={net_fd} ops={ops}"));
     }
     // Snapshot the bits we need from `k` so we can drop the mutable borrow
     // before touching `st.epoll_fd` again.
@@ -724,6 +785,14 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
                 libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
             };
         }
+    }
+    // Windows/non-Linux equivalent of the epoll self-pipe nudge above: a
+    // thread already blocked in WSAPoll cannot observe this interest_ops
+    // change until its full timeout elapses otherwise. See
+    // `SelectorState::nudge_blocked_poll`'s doc comment for the full story.
+    #[cfg(not(target_os = "linux"))]
+    {
+        st.nudge_blocked_poll();
     }
     Ok(())
 }

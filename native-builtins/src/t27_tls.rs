@@ -3377,12 +3377,17 @@ fn ssl_server_socket_states() -> &'static Mutex<HashMap<u64, SslServerSocketStat
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ssl_server_socket_state(socket: ObjectRef) -> Option<SslServerSocketState> {
-    ssl_server_socket_states().lock().get(&objref_key(socket)).copied()
+fn ssl_server_socket_state(ctx: &dyn NativeContext, socket: ObjectRef) -> Option<SslServerSocketState> {
+    ssl_server_socket_states()
+        .lock()
+        .get(&gc_stable_objref_key(ctx, socket))
+        .copied()
 }
 
-fn set_ssl_server_socket_state(socket: ObjectRef, state: SslServerSocketState) {
-    ssl_server_socket_states().lock().insert(objref_key(socket), state);
+fn set_ssl_server_socket_state(ctx: &dyn NativeContext, socket: ObjectRef, state: SslServerSocketState) {
+    ssl_server_socket_states()
+        .lock()
+        .insert(gc_stable_objref_key(ctx, socket), state);
 }
 
 // Server-side SSLSocket returned from accept(): reuses the existing
@@ -3560,6 +3565,7 @@ fn create_ssl_server_socket(
 
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
     set_ssl_server_socket_state(
+        ctx,
         obj,
         SslServerSocketState {
             listener_id: id,
@@ -3680,7 +3686,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     r.register(sss, "getLocalPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(
-            ssl_server_socket_state(this)
+            ssl_server_socket_state(ctx, this)
                 .map(|state| state.local_port)
                 .unwrap_or_else(|| ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0)),
         )))
@@ -3688,14 +3694,14 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     r.register(sss, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(
-            ssl_server_socket_state(this)
+            ssl_server_socket_state(ctx, this)
                 .map(|state| state.closed)
                 .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1)),
         )))
     });
     r.register(sss, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let state = ssl_server_socket_state(this).unwrap_or(SslServerSocketState {
+        let state = ssl_server_socket_state(ctx, this).unwrap_or(SslServerSocketState {
             listener_id: ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1),
             local_port: ctx.get_field(this, SSS_LOCAL_PORT).as_int().unwrap_or(0),
             closed: 1,
@@ -3706,6 +3712,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
         set_ssl_server_socket_state(
+            ctx,
             this,
             SslServerSocketState {
                 listener_id: -1,
@@ -3718,7 +3725,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     });
     r.register(sss, "accept", "()Ljava/net/Socket;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let id = ssl_server_socket_state(this)
+        let id = ssl_server_socket_state(ctx, this)
             .map(|state| state.listener_id)
             .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
         if id < 0 {
@@ -3754,7 +3761,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // Stash ALPN on the socket so `getApplicationProtocol()` can read it.
         // We use a side-table rather than widening SSLSocket's shape.
         if let Some(alpn_str) = alpn {
-            stash_sock_alpn(sock, alpn_str);
+            stash_sock_alpn(ctx, sock, alpn_str);
         }
         Ok(Some(Value::Object(Some(sock))))
     });
@@ -3777,29 +3784,40 @@ fn sock_alpn_table() -> &'static Mutex<HashMap<u64, String>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn stash_sock_alpn(sock: ObjectRef, alpn: String) {
-    let key = objref_key(sock);
+fn stash_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef, alpn: String) {
+    let key = gc_stable_objref_key(ctx, sock);
     sock_alpn_table().lock().insert(key, alpn);
 }
 
-fn lookup_sock_alpn(sock: ObjectRef) -> Option<String> {
-    let key = objref_key(sock);
+fn lookup_sock_alpn(ctx: &dyn NativeContext, sock: ObjectRef) -> Option<String> {
+    let key = gc_stable_objref_key(ctx, sock);
     sock_alpn_table().lock().get(&key).cloned()
 }
 
-/// Opaque u64 identity for a synthetic object. We cast through a u64 so the
-/// side table can use a primitive key without taking on ObjectRef lifetimes.
-fn objref_key(o: ObjectRef) -> u64 {
-    // ObjectRef is a transparent newtype over u64 in this project.
-    // Accessing the inner value is done via Debug-print fallback if the
-    // public API ever changes shape.
-    let s = format!("{:?}", o);
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// GC-stable identity key for a Java-object-keyed side table.
+///
+/// FIX (tomcat-t27-tls-side-table-objref-key-instability): this used to hash
+/// the `ObjectRef`'s Debug-formatted raw pointer value (`objref_key`, now
+/// removed). `ObjectRef` is a bare pointer to a heap object, and this VM's
+/// young-gen GC moves/reclaims objects, so a live object's `ObjectRef` is not
+/// a stable identity across its own lifetime (if it moves) and a
+/// *different*, unrelated object can later be allocated at the same address
+/// once the original is collected — a table lookup can then silently
+/// *collide* with a stale entry for a completely different, already-freed
+/// object (a wrong-identity match, not just a miss: the table's `Some`
+/// result is trusted over any field-based fallback). This is the exact same
+/// architectural defect already fixed once in this file for
+/// `engine_table`/`sslparams_alpn_table` via `engine_objref_key` (see its
+/// doc comment, and
+/// `docs/internal/fixed-suite-bugs/reactive-httpcomponents-connector-flaky-tls-engine-identity-and-pool-cipher-leak-FIXED.md`)
+/// — that earlier fix's scope note explicitly left
+/// `ssl_server_socket_states`, `sock_alpn_table`, `session_peer_certs_table`,
+/// and `SSLSession.getId()`'s seed unfixed; this closes those.
+/// `ctx.identity_hash_code` is the VM's real, GC-stable identity hash,
+/// computed once and pinned for an object's lifetime regardless of later
+/// moves.
+fn gc_stable_objref_key(ctx: &dyn NativeContext, o: ObjectRef) -> u64 {
+    ctx.identity_hash_code(o) as u32 as u64
 }
 
 fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
@@ -3816,7 +3834,7 @@ fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if let Some(alpn) = lookup_sock_alpn(this) {
+            if let Some(alpn) = lookup_sock_alpn(ctx, this) {
                 let s = ctx.create_string(&alpn);
                 return Ok(Some(Value::Object(Some(s))));
             }
@@ -6791,6 +6809,66 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 // Native registrations (WP5.1 + WP5.4)
 // -----------------------------------------------------------------------------
 
+/// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
+/// outside a handshake, best-effort default) cipher/protocol/ALPN state.
+/// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
+/// registration for why real JDK's `getHandshakeSession()` cannot be left
+/// un-intercepted on this engine implementation.
+fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRef {
+    let (proto, cipher, alpn) = with_engine(id, |s| {
+        let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
+            Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+            Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+            _ => "TLSv1.3",
+        };
+        let cipher = s
+            .conn
+            .as_ref()
+            .and_then(|c| c.negotiated_cipher_suite())
+            .map(|cs| format!("{:?}", cs.suite()))
+            .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
+        let alpn = s.negotiated_alpn.clone().unwrap_or_default();
+        (proto.to_string(), cipher, alpn)
+    })
+    .unwrap_or_else(|| {
+        (
+            "TLSv1.3".into(),
+            "TLS_AES_256_GCM_SHA384".into(),
+            String::new(),
+        )
+    });
+    // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
+    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
+    let cipher_s = ctx.create_string(&cipher);
+    let proto_s = ctx.create_string(&proto);
+    let alpn_s = ctx.create_string(&alpn);
+    ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
+    ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
+    ctx.set_field(ses, 2, Value::Int(1));
+    ctx.set_field(ses, 3, Value::Object(None));
+    ctx.set_field(ses, 4, Value::Int(-1));
+    ctx.set_field(
+        ses,
+        5,
+        Value::Long(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        ),
+    );
+    ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
+    // Associate the peer (client) cert chain with this session object so
+    // SSLSession.getPeerCertificates() can return it for mTLS auth.
+    let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
+    if !peer_chain.is_empty() {
+        session_peer_certs_table()
+            .lock()
+            .insert(gc_stable_objref_key(ctx, ses), peer_chain);
+    }
+    ses
+}
+
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7162,58 +7240,43 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            let (proto, cipher, alpn) = with_engine(id, |s| {
-                let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
-                    Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-                    _ => "TLSv1.3",
-                };
-                let cipher = s
-                    .conn
-                    .as_ref()
-                    .and_then(|c| c.negotiated_cipher_suite())
-                    .map(|cs| format!("{:?}", cs.suite()))
-                    .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
-                let alpn = s.negotiated_alpn.clone().unwrap_or_default();
-                (proto.to_string(), cipher, alpn)
-            })
-            .unwrap_or_else(|| {
-                (
-                    "TLSv1.3".into(),
-                    "TLS_AES_256_GCM_SHA384".into(),
-                    String::new(),
-                )
-            });
-            // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
-            let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
-            let cipher_s = ctx.create_string(&cipher);
-            let proto_s = ctx.create_string(&proto);
-            let alpn_s = ctx.create_string(&alpn);
-            ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
-            ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
-            ctx.set_field(ses, 2, Value::Int(1));
-            ctx.set_field(ses, 3, Value::Object(None));
-            ctx.set_field(ses, 4, Value::Int(-1));
-            ctx.set_field(
-                ses,
-                5,
-                Value::Long(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
-                ),
-            );
-            ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
-            // Associate the peer (client) cert chain with this session object so
-            // SSLSession.getPeerCertificates() can return it for mTLS auth.
-            let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
-            if !peer_chain.is_empty() {
-                session_peer_certs_table()
-                    .lock()
-                    .insert(objref_key(ses), peer_chain);
-            }
-            Ok(Some(Value::Object(Some(ses))))
+            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
+                ctx, id,
+            )))))
+        },
+    );
+
+    // getHandshakeSession() — real `SSLEngineImpl.getHandshakeSession()` reads
+    // a real, JDK-internal `conContext` field that CratonVM's engine never
+    // populates (handshake state lives entirely in `EngineState`/
+    // `engine_registry()`, not on the real bytecode object) — un-intercepted,
+    // it NPEs ("Cannot read field \"handshakeContext\" because
+    // \"this.conContext\" is null"). Found via Jetty's
+    // `SslConnection.getBufferSize()` -> `getApplicationBufferSize()` ->
+    // `sslEngine.getHandshakeSession()`, called while sizing buffers for a
+    // brand-new client connection — i.e. BEFORE `beginHandshake()`/`wrap()`
+    // ever run, so `state.conn` is still `None` at this point. Jetty's own
+    // exception handling here (`ManagedSelector$Accept.run()`'s
+    // catch-Throwable) silently drops the failure (logs at DEBUG only, never
+    // reaches the connection's promise), which is why this specific NPE
+    // manifested as an indefinite hang/silent-exit crash rather than a
+    // visible test failure — see
+    // docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md.
+    // Real JDK's `getHandshakeSession()` returns the session being
+    // negotiated (or null outside a handshake); returning the same
+    // best-effort synthetic session `getSession()` already builds (complete
+    // with graceful "no negotiation yet" defaults) is sufficient for every
+    // caller in this codebase's suites, which only use it for buffer sizing.
+    r.register(
+        cls_impl,
+        "getHandshakeSession",
+        "()Ljavax/net/ssl/SSLSession;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = engine_id_or_alloc(ctx, this);
+            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
+                ctx, id,
+            )))))
         },
     );
 
@@ -8456,13 +8519,17 @@ fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
 /// once, to pass the TrustManager check in `new13_do_create_socket`). A no-op
 /// when the chain is empty (nothing to record; the accessor's existing
 /// empty-chain contract is unaffected).
-pub(crate) fn record_client_peer_chain(session: ObjectRef, chain_der: Vec<Vec<u8>>) {
+pub(crate) fn record_client_peer_chain(
+    ctx: &dyn NativeContext,
+    session: ObjectRef,
+    chain_der: Vec<Vec<u8>>,
+) {
     if chain_der.is_empty() {
         return;
     }
     session_peer_certs_table()
         .lock()
-        .insert(objref_key(session), chain_der);
+        .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
 fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
@@ -8483,7 +8550,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let chain = session_peer_certs_table()
                 .lock()
-                .get(&objref_key(this))
+                .get(&gc_stable_objref_key(ctx, this))
                 .cloned()
                 .unwrap_or_default();
             if chain.is_empty() {
@@ -8531,7 +8598,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // stable 32-byte id derived from the session object's identity.
     r.register(cls, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let seed = objref_key(this);
+        let seed = gc_stable_objref_key(ctx, this);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
         // SplitMix64-style fill so the 32 bytes are stable per session and not
         // all-identical (some callers hash or compare the id).

@@ -1170,6 +1170,20 @@ fn safe_native_call_impl(
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
             }
+            if crate::memory::gc::altrace_enabled_vm() {
+                if let Value::Object(Some(o)) = v {
+                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let cid = shared.heap.class_id_of(*o);
+                    let cname = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("<cid={cid:?}>"));
+                    eprintln!("[altrace NRET] callee={callee} v={:p} cls={cname}", o.as_ptr());
+                }
+            }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             let exc_is_current = shared
@@ -6537,6 +6551,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // the collector can never read a dangling pointer.
                 shared_arc.thread_registry.clear_tlab_addr(tid);
                 shared_arc.thread_registry.mark_dead(tid);
+                // A thread that terminated while blocked inside a native call
+                // made from within a `synchronized` region never executes its
+                // `monitorexit` bytecode — sweep anything it still holds so no
+                // future locker waits forever (see
+                // `MonitorTable::release_monitors_held_by`). Exclude
+                // `term_monitor`: this thread deliberately still owns it here
+                // so the notify below can wake `Thread.join()` waiters — the
+                // blanket sweep must not force-release it first, or the
+                // notify silently no-ops as `NotOwner` (lost-wakeup bug, see
+                // `release_monitors_held_by_except`'s doc comment).
+                shared_arc
+                    .monitors
+                    .release_monitors_held_by_except(tid, term_monitor.as_ref());
             });
 
             if let Some(monitor) = term_monitor {
@@ -7053,9 +7080,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if thread_id == 0 {
             return;
         }
-        self.shared
-            .thread_registry
-            .mark_dead(crate::threading::jvm_thread::ThreadId(thread_id));
+        let tid = crate::threading::jvm_thread::ThreadId(thread_id);
+        self.shared.thread_registry.mark_dead(tid);
+        self.shared.monitors.release_monitors_held_by(tid);
     }
 
     /// T19_K2 вЂ” Attach a `Box<JoinHandle<()>>` to an already-registered
@@ -7757,6 +7784,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let proxies = self.shared.lambda_proxies.read();
             proxies.get(&receiver_class_id).cloned()
         };
+        if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+            && method_name == "aotContributedInitializerStartsManagementContext"
+        {
+            eprintln!(
+                "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
+                method_name, receiver_class_id, call_site.is_some()
+            );
+        }
 
         // Keep the receiver and arguments rooted across the dispatch decision:
         // the selected lambda body can allocate immediately after this block.
@@ -8185,6 +8220,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
+            if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                eprintln!("[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch", method_name);
+            }
             // Not a lambda-dispatch call after all (the receiver wasn't a
             // recognized proxy, or the `.filter()` predicate above rejected
             // it) -- release the pins from the GC-safety block above. Refresh
@@ -10172,6 +10212,24 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
+    // get(Class) dispatch entering the general resolver, with its dispatch
+    // class and receiver identity, so the failing call's route is visible.
+    if method_name == "get"
+        && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
+        && crate::jit::helpers::cv_trace_enabled()
+    {
+        let recv = match args.first() {
+            Some(Value::Object(Some(o))) => o.as_ptr() as usize,
+            _ => 0,
+        };
+        eprintln!(
+            "[cv-ion-entry] class={} recv={:#x} nargs={}",
+            class_name,
+            recv,
+            args.len()
+        );
+    }
     // Skip expensive class loading for obviously invalid class names (e.g. "<unknown class 0>").
     if class_name.contains('<') || class_name.contains(' ') {
         // Optional operator diagnostic: surface exactly which call had no
@@ -11511,7 +11569,14 @@ pub(super) fn proxy_invoke_handler(
             }
         };
         if let Some(result) = dispatch {
-            return Ok(result);
+            // See the identical fix + rationale on the sibling
+            // object-handler path below: a primitive-returning proxy
+            // method whose target is ITSELF a dynamic proxy re-boxes an
+            // already-boxed wrapper (`Method.invoke`'s generic `Object`
+            // return contract) into a fresh wrapper's raw-value slot,
+            // corrupting the value (observed: `Bean.getAge()` through two
+            // nested JDK proxies returned an unrelated int instead of 5).
+            return proxy_unbox_primitive_return(ctx.shared, descriptor, Ok(result));
         }
         return Err(MethodCallFailed::InternalError(VmError::Linkage(
             LinkageError::AbstractMethodError {
@@ -11541,13 +11606,29 @@ pub(super) fn proxy_invoke_handler(
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         &invoke_args,
     );
-    proxy_wrap_undeclared_if_needed(
+    // `InvocationHandler.invoke` returns generic `Object`, so a primitive-
+    // returning proxy method (e.g. `getAge()I`) whose result came back as a
+    // boxed wrapper needs unboxing here -- exactly like the AnnotationProxy
+    // branch above already does via this same helper. Without it, a proxy
+    // wrapping ANOTHER dynamic proxy (the handler's own body reflectively
+    // re-invokes through `Method.invoke` on the nested proxy, which boxes
+    // ITS primitive result) receives an already-boxed wrapper here and
+    // would re-box the wrapper's OBJECT REFERENCE into a fresh wrapper's
+    // raw `int` slot -- corrupting the value into an unrelated number
+    // (confirmed: double-nested `Proxy.newProxyInstance` around a plain
+    // pass-through `InvocationHandler`, `int getAge()` returned garbage
+    // instead of the real value; a single proxy layer was unaffected).
+    proxy_unbox_primitive_return(
         ctx.shared,
-        ctx.thread,
-        proxy,
-        method_name,
         descriptor,
-        result,
+        proxy_wrap_undeclared_if_needed(
+            ctx.shared,
+            ctx.thread,
+            proxy,
+            method_name,
+            descriptor,
+            result,
+        ),
     )
 }
 
@@ -13788,6 +13869,71 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    // `cratonvm/internal/*` classes (`UnmodifiableList`/`Map`/`Set`/
+    // `Collection`/`EntrySet`/`Itr`/`ListItr`/`MapEntry`, ...) are pure
+    // Rust-native VM-internal wrapper types with NO bytecode of their own --
+    // unlike `java/util/*` classes, which are only synthetic stubs until
+    // real JDK bytecode loads, these never gain real bytecode. A method
+    // registered as a native under the receiver's own exact class name here
+    // (e.g. `toString`/`hashCode`/`equals`) is NOT separately declared as a
+    // method entry, so `find_method_recursive` below walks straight past it
+    // to `java/lang/Object`'s real bytecode `toString()`/etc (identity-hash
+    // format instead of e.g. "[foo, bar]"). Ordinary bytecode `invokevirtual`
+    // never hits this: the interpreter's own dispatch checks the native
+    // registry before falling back to inherited bytecode. Only entry points
+    // that bypass that check land here instead -- reflective `Method.invoke
+    // ()` and any native-code-initiated `ctx.invoke_virtual` (e.g. `String
+    // .valueOf`/`StringBuilder.append(Object)` on such a wrapper). Check the
+    // exact-class native FIRST for this namespace so those paths see the
+    // same result ordinary bytecode dispatch already does.
+    // The `is_interface()` disjunct: a few JDK reflection types
+    // (`TypeVariable`, and potentially sibling `sun.reflect.generics`
+    // interfaces) are represented directly as instances of their own
+    // PUBLIC INTERFACE's `ClassId` -- real Java can never have a concrete
+    // object whose class IS an interface, so seeing one here (after the
+    // C25 retarget above already tried to redirect an interface `class_id`
+    // onto the receiver's concrete class and couldn't) means this receiver
+    // is one of those synthetic representations. `TypeVariable.toString()`
+    // has an exact-class native (below) that a real `TypeVariableImpl`
+    // would provide via bytecode; without preferring it here,
+    // `find_method_recursive` walks straight to `java/lang/Object
+    // .toString()` and any non-reflective caller (`StringBuilder.append
+    // (Object)`, string concat, `HashMap.toString()`) gets the identity-
+    // hash format instead of the variable's name -- confirmed via
+    // `"x" + typeVar` and `Map.of(typeVar, ...).toString()` both showing
+    // the bug while a direct `typeVar.toString()` call (ordinary bytecode
+    // invokevirtual, a different, already-correct dispatch path) did not.
+    // Lambda-proxy receivers are already handled and returned above, so
+    // they never reach this branch.
+    if class_name.starts_with("cratonvm/internal/")
+        || shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.is_synthetic_stub || c.is_interface())
+            .unwrap_or(false)
+    {
+        // Generalises the `cratonvm/internal/*` case above: ANY synthetic-
+        // stub class (no real bytecode -- either a permanently-synthetic
+        // VM-internal representation, e.g. the concrete class CratonVM
+        // allocates for `java/lang/reflect/TypeVariable` instances, or a
+        // real class temporarily stubbed before its actual bytecode loads)
+        // has the identical gap: a method registered as a native under its
+        // own exact class name but not separately declared in the class's
+        // method table is invisible to `find_method_recursive`'s hierarchy
+        // walk below, which instead lands on an inherited real-bytecode
+        // method (typically `java/lang/Object`'s) -- e.g. `TypeVariable
+        // .toString()` returning the identity-hash format ("java.lang.
+        // reflect.TypeVariable@25bf") instead of just the variable's name
+        // ("T"), breaking `Map<TypeVariable, Type>.toString()` and hence
+        // `GenericTypeResolver`-based debug output. Once a class's real
+        // bytecode loads, `is_synthetic_stub` flips false and this check
+        // naturally stops applying to it.
+        if let Some(callback) = shared.native_methods.find(&class_name, method_name, descriptor) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|value| coerce_native_return(value, descriptor));
+        }
+    }
     // `java.nio.file.Path` is a genuine interface with no `toString()` body of
     // its own. The receiver-retargeting block above only substitutes the
     // receiver's actual class for `class_id`/`class_name` when the ORIGINAL
@@ -14476,6 +14622,28 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                // `URLClassLoader` declares its OWN
+                                // `getResourceAsStream` override (real OpenJDK
+                                // wraps the stream for `closeables` tracking),
+                                // unlike `getResource`/`getResources`/
+                                // `findResource` above, which it leaves to
+                                // `ClassLoader`/its own extension point. The
+                                // `java/lang/ClassLoader` entry elsewhere in
+                                // this list never matches such a call, so its
+                                // real bytecode ran unforced — same shimmed-`ucp`
+                                // problem as `findResource` above, but ALSO
+                                // missing the native bridge's parent-delegation,
+                                // so a `new URLClassLoader(urls, parent)` whose
+                                // own URL held only a generated resource index
+                                // (Spring Boot's `ServletComponentScanIntegrationTests
+                                // .indexedComponentsAreRegistered`) got `null`
+                                // for every `.class` resource that only the
+                                // PARENT classloader's classpath holds, despite
+                                // `getResource` resolving it fine moments
+                                // earlier. Keep in sync with
+                                // `force_native_over_real_jdk_bytecode`.
+                                || (method_name == "getResourceAsStream"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
@@ -15074,15 +15242,16 @@ fn invoke_on_class_shared_inner(
                                     | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
                                     | ("getEntries", "()Ljava/util/Map;")
                             ))
-                        // Spring Boot 3 fat-jar launcher: short-circuit
-                        // JarFileArchive.getClassPathUrls so our native
-                        // wins over the bytecode that walks
-                        // `JarFile.stream().map().filter().map().collect()` —
-                        // that pipeline depends on Stream operations our
-                        // synthetic Stream does not implement. The native
-                        // materialises the URL set directly from the
-                        // central directory.
-                        || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
+                        // Spring Boot 3 archives: use the native enumerators
+                        // for both jar and exploded layouts. The jar path
+                        // avoids the incomplete synthetic Stream pipeline;
+                        // the exploded path avoids the real-JDK
+                        // LinkedList.addAll(0, ...) route that loses every
+                        // descendant of an immediate directory.
+                        || (matches!(class_name,
+                            "org/springframework/boot/loader/launch/JarFileArchive"
+                                | "org/springframework/boot/loader/launch/ExplodedArchive"
+                        )
                             && method_name == "getClassPathUrls")
                         // Spring Boot 3.2+ `launch.ExecutableArchiveLauncher.createClassLoader`
                         // — same ClassCastException / typed-`toArray` hazard as SB2's iterator
@@ -18872,6 +19041,56 @@ mod tests {
             ctx.record_printed_line("World".to_string());
         }
         assert_eq!(thread.printed_lines, vec!["Hello", "World"]);
+    }
+
+    /// Regression test for the reverted `unregister_native_thread` monitor
+    /// release: a thread that dies while blocked inside a native call made
+    /// from within a `synchronized` region never executes its `monitorexit`
+    /// bytecode. Without `release_monitors_held_by` in the unregister path,
+    /// the monitor stays owned by the dead thread forever and every future
+    /// `monitorenter` on that object blocks indefinitely.
+    #[test]
+    fn unregister_native_thread_releases_monitors_held_by_the_dying_thread() {
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let native_tid = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.register_native_thread("dying-native-thread", true, 0)
+        };
+        // The native thread enters a monitor (simulating `synchronized (obj)
+        // { blockingNativeCall(); }`) and then dies without ever calling
+        // monitorexit. `release_monitors_held_by` only scans INFLATED
+        // monitors (a thin-locked, uncontended object isn't tracked there),
+        // so force inflation the same way a real blocked-in-native-call
+        // thread would have -- `enter()`'s plain thin-lock fast path would
+        // never exercise the code this test targets.
+        let (_monitor, contended) = shared
+            .monitors
+            .enter_inflated_or_contend(obj, ThreadId(native_tid))
+            .expect("inflate");
+        assert!(!contended, "fresh monitor should be acquired immediately");
+        assert!(shared.monitors.holds(obj, ThreadId(native_tid)));
+        {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.unregister_native_thread(native_tid);
+        }
+        assert!(
+            !shared.monitors.holds(obj, ThreadId(native_tid)),
+            "a dead thread must not still be recorded as holding the monitor"
+        );
+        // A different thread must now be able to acquire the same object's
+        // monitor without blocking.
+        let other_tid = ThreadId(native_tid + 1);
+        shared.monitors.enter(obj, other_tid);
+        assert!(shared.monitors.holds(obj, other_tid));
+        assert!(shared.monitors.exit(obj, other_tid).is_ok());
     }
 
     #[test]

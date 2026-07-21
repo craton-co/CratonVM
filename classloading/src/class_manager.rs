@@ -5541,6 +5541,16 @@ impl ClassManager {
             .is_some_and(|child| child.is_subclass_of_by_name(target_name, &self.class_store))
     }
 
+    /// Loader-identity-blind assignability for JIT `checkcast`/`instanceof` —
+    /// see `Class::is_assignable_to_name`'s doc comment for the rationale
+    /// (same-named class defined by two loaders resolving to different
+    /// `ClassId`s through the flat name-only lookup).
+    pub fn is_assignable_to_name(&self, child_id: ClassId, target_name: &str) -> bool {
+        self.class_store
+            .get(child_id)
+            .is_some_and(|child| child.is_assignable_to_name(target_name, &self.class_store))
+    }
+
     /// Get a reference to the underlying class store.
     pub fn class_store(&self) -> &ClassStore {
         &self.class_store

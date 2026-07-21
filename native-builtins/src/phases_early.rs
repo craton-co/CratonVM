@@ -8280,6 +8280,79 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         );
     }
 
+    // ForkJoinPool.submit(Callable) / submit(Runnable) / submit(Runnable, T) —
+    // same Bridge policy as submit(ForkJoinTask) above: these overloads were
+    // previously left off the allow-list, so real JDK bytecode ran them
+    // against a pool whose `commonPool()` shortcut never populates the real
+    // `queues`/`runState`/`mode` fields — `poolSubmit`/`submissionQueue`
+    // throws RejectedExecutionException (RealFjp.java repro). Adapt eagerly
+    // inline like submit(ForkJoinTask): allocate a bare `ForkJoinTask`
+    // instance (no JDK `<init>`/AdaptedCallable machinery needed — nothing
+    // ever calls its `compute()`) as the side-table key, run the user
+    // callable/runnable synchronously, and mark it done with the result.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "submit",
+        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/ForkJoinTask;",
+        |ctx, args| {
+            let callable = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+            let task_pin = ctx.pin_native_root(task);
+            let _callable_pin = ctx.pin_native_root(callable);
+            let result = match ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(val)) => val,
+                _ => Value::Object(None),
+            };
+            let task = ctx.read_native_pin(task_pin, task);
+            ctx.unpin_native_roots(task_pin);
+            fjp_state_set_done(task, result);
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "submit",
+        "(Ljava/lang/Runnable;)Ljava/util/concurrent/ForkJoinTask;",
+        |ctx, args| {
+            let runnable = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+            let task_pin = ctx.pin_native_root(task);
+            let _runnable_pin = ctx.pin_native_root(runnable);
+            let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            let task = ctx.read_native_pin(task_pin, task);
+            ctx.unpin_native_roots(task_pin);
+            fjp_state_set_done(task, Value::Object(None));
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "submit",
+        "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
+        |ctx, args| {
+            let runnable = match args.get(1).copied() {
+                Some(Value::Object(Some(r))) => r,
+                _ => return Ok(args.get(2).copied()),
+            };
+            let fixed_result = args.get(2).copied().unwrap_or(Value::Object(None));
+            let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+            let task_pin = ctx.pin_native_root(task);
+            let _runnable_pin = ctx.pin_native_root(runnable);
+            let result_pin = pinned_object_value(ctx, fixed_result);
+            let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
+            let task = ctx.read_native_pin(task_pin, task);
+            let result = read_pinned_object_value(ctx, result_pin, fixed_result);
+            ctx.unpin_native_roots(task_pin);
+            fjp_state_set_done(task, result);
+            Ok(Some(Value::Object(Some(task))))
+        },
+    );
     // ForkJoinTask.fork / join / invoke / get / isDone / isCompletedNormally /
     // isCancelled / cancel / complete — all routed through the side-table.
     //
@@ -8328,6 +8401,26 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         fjp_state_set_done(this, result);
         Ok(Some(result))
     });
+    // get(long, TimeUnit) — `final` in the real JDK (declaring class is always
+    // ForkJoinTask, even for RecursiveTask/RecursiveAction receivers), needed
+    // by `Future<T>.get(timeout, unit)` callers (e.g. RealFjp.java). Every
+    // task this Bridge produces is already eagerly computed inline, so the
+    // timeout never actually applies — same semantics as the no-arg get().
+    r.register(
+        fjt,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (done, cached) = fjp_state_get(this);
+            if done {
+                return Ok(Some(cached));
+            }
+            let (this, result) = fjp_compute_object_result(ctx, this);
+            fjp_state_set_done(this, result);
+            Ok(Some(result))
+        },
+    );
     r.register(fjt, "isDone", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let (done, _) = fjp_state_get(this);
@@ -8478,6 +8571,12 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     // singleton initialization that is fragile in our environment; we
     // just allocate a synthetic ForkJoinPool with parallelism=N and let
     // the user code call our intercepted invoke().
+    // TODO: this allocates a FRESH pool object on every call instead of
+    // caching a true singleton (unlike the real JDK, where commonPool()
+    // always returns the same instance). Harmless for the Bridge-covered
+    // methods above (state lives in the side-table, keyed by task/adapter
+    // identity, not by pool identity), but `pool1 == pool2` / identity-based
+    // pool bookkeeping in user code would observe distinct objects.
     r.register(
         "java/util/concurrent/ForkJoinPool",
         "commonPool",
