@@ -3655,6 +3655,12 @@ fn main() {
     // even the deepest recursive workloads have headroom; the upper
     // bound is virtual-address-space-only on 64-bit OSes (no commit
     // until the page is touched), so the practical cost is zero.
+    // DBG (CRATONVM_DBG_HEARTBEAT=<ms>): forensic liveness heartbeat, armed
+    // from the launcher thread (not main-vm) so it keeps writing even if
+    // main-vm itself hangs or dies without unwinding. See its own doc
+    // comment for what it's for.
+    cratonvm_vm::runtime::heartbeat_watch::arm_from_env();
+
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
         .stack_size(128 * 1024 * 1024);
