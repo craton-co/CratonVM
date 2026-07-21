@@ -972,16 +972,147 @@ mod tests {
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
-    fn assert_direct_deflate_unsupported(result: MethodCallResult) {
-        match result {
-            Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(RuntimeError::NotImplemented { feature }),
-            )) => assert!(
-                feature.contains("direct-ByteBuffer deflate"),
-                "unexpected NotImplemented feature text: {feature}"
-            ),
-            other => panic!("expected direct deflate NotImplemented error, got {other:?}"),
+    /// Unpacks a `Deflater.deflate*` result long into
+    /// `(inputConsumed, outputConsumed, finished)`.
+    fn unpack_deflate_result(packed: i64) -> (usize, usize, bool) {
+        let p = packed as u64;
+        (
+            (p & 0x7FFF_FFFF) as usize,
+            ((p >> 31) & 0x7FFF_FFFF) as usize,
+            (p >> 62) & 1 == 1,
+        )
+    }
+
+    fn assert_decompresses_to(compressed: &[u8], original: &[u8]) {
+        let mut decomp = Decompress::new(false);
+        let mut out = vec![0u8; 1024];
+        let status = decomp
+            .decompress(compressed, &mut out, FlushDecompress::Finish)
+            .expect("decompress ok");
+        let produced = decomp.total_out() as usize;
+        assert_eq!(&out[..produced], original);
+        assert!(matches!(status, flate2::Status::StreamEnd));
+    }
+
+    fn new_deflater(ctx: &mut dyn NativeContext) -> i64 {
+        match defl_init(ctx, &[Value::Int(6), Value::Int(0), Value::Int(1)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
         }
+    }
+
+    /// Regression guard for the direct-ByteBuffer `Deflater.deflate*`
+    /// overloads (`deflateBytesBuffer`/`deflateBufferBytes`/
+    /// `deflateBufferBuffer`): these used to throw `NotImplemented`, then
+    /// were implemented for real (see `defl_deflate_bytes_buffer`'s doc
+    /// comment for the Jetty `GzipHttpOutputInterceptor` bug this fixed).
+    /// Exercise all three overloads end-to-end and confirm the compressed
+    /// output actually decompresses back to the original input, rather than
+    /// just checking that *some* non-error long comes back.
+    #[test]
+    fn direct_buffer_deflate_paths_produce_correct_output() {
+        let mut ctx = mock_ctx();
+        let original = b"hello hello hello hello hello world world world";
+
+        // deflateBytesBuffer: heap byte[] input, direct ByteBuffer output.
+        let addr = new_deflater(&mut ctx);
+        let input_arr = ctx.new_array(ArrayElementType::Byte, original.len());
+        for (i, b) in original.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i32));
+        }
+        let mut output_buf = vec![0u8; 1024];
+        let output_addr = output_buf.as_mut_ptr() as i64;
+        let packed = match defl_deflate_bytes_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(original.len() as i32),
+                Value::Long(output_addr),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBytesBuffer produced no output");
+        assert!(finished, "deflateBytesBuffer must report finished on FINISH");
+        assert_decompresses_to(&output_buf[..output_consumed], original);
+
+        // deflateBufferBytes: direct ByteBuffer input, heap byte[] output.
+        let addr = new_deflater(&mut ctx);
+        let mut input_buf = original.to_vec();
+        let input_addr = input_buf.as_mut_ptr() as i64;
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 1024);
+        let packed = match defl_deflate_buffer_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input_addr),
+                Value::Int(original.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBufferBytes produced no output");
+        assert!(finished, "deflateBufferBytes must report finished on FINISH");
+        let compressed = read_byte_array(&ctx, output_arr, 0, output_consumed);
+        assert_decompresses_to(&compressed, original);
+
+        // deflateBufferBuffer: both input and output are direct ByteBuffers.
+        let addr = new_deflater(&mut ctx);
+        let mut input_buf = original.to_vec();
+        let input_addr = input_buf.as_mut_ptr() as i64;
+        let mut output_buf = vec![0u8; 1024];
+        let output_addr = output_buf.as_mut_ptr() as i64;
+        let packed = match defl_deflate_buffer_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input_addr),
+                Value::Int(original.len() as i32),
+                Value::Long(output_addr),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBufferBuffer produced no output");
+        assert!(finished, "deflateBufferBuffer must report finished on FINISH");
+        assert_decompresses_to(&output_buf[..output_consumed], original);
     }
 
     #[test]
@@ -1020,14 +1151,6 @@ mod tests {
         // "abc" — CRC-32/IEEE = 0x352441C2.
         let running = crc32_step(0xFFFF_FFFF, b"abc");
         assert_eq!(!running, 0x3524_41C2);
-    }
-
-    #[test]
-    fn direct_buffer_deflate_paths_throw_instead_of_zero_progress() {
-        let mut ctx = mock_ctx();
-        assert_direct_deflate_unsupported(defl_deflate_bytes_buffer(&mut ctx, &[]));
-        assert_direct_deflate_unsupported(defl_deflate_buffer_bytes(&mut ctx, &[]));
-        assert_direct_deflate_unsupported(defl_deflate_buffer_buffer(&mut ctx, &[]));
     }
 
     /// `crc32_update_public` matches the JDK `CRC32.update*` contract:

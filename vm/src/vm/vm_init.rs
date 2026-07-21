@@ -1353,6 +1353,8 @@ impl SharedVm {
         // Reset cached System.getenv()/getProperties() singletons too, so a new
         // VM never returns a stale ObjectRef from a previous instance.
         cratonvm_native_builtins::lang_system::reset_system_singletons();
+        // Reset the ClassValue memoization cache (BUG-W) for the same reason.
+        cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
@@ -2016,6 +2018,15 @@ impl SharedVm {
             // Keep the default CLI's real-JDK registration in sync with the
             // synthetic-feature build above.
             cratonvm_native_builtins::phases_late::register_p60_process_handle(&mut native_methods);
+            // `java.lang.ClassValue#get`/`#remove` (see `phases_late.rs`'s
+            // `register_classvalue_natives`) — needed here explicitly because
+            // this real-JDK-mode branch does NOT call
+            // `register_synthetic_overrides` (which is where this
+            // registration otherwise lives, via `register_p67_misc`), same
+            // "keep in sync" reasoning as `register_p60_process_handle` above.
+            cratonvm_native_builtins::phases_late::register_classvalue_natives(
+                &mut native_methods,
+            );
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:

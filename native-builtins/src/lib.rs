@@ -28844,9 +28844,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "in", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("in", s);
+                system_set_overridden_stream(ctx, "in", s);
             } else {
-                system_clear_overridden_stream("in");
+                system_clear_overridden_stream(ctx, "in");
             }
             Ok(None)
         },
@@ -28859,9 +28859,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "out", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("out", s);
+                system_set_overridden_stream(ctx, "out", s);
             } else {
-                system_clear_overridden_stream("out");
+                system_clear_overridden_stream(ctx, "out");
             }
             Ok(None)
         },
@@ -28874,9 +28874,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "err", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("err", s);
+                system_set_overridden_stream(ctx, "err", s);
             } else {
-                system_clear_overridden_stream("err");
+                system_clear_overridden_stream(ctx, "err");
             }
             Ok(None)
         },
@@ -28889,9 +28889,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "in", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("in", s);
+                system_set_overridden_stream(ctx, "in", s);
             } else {
-                system_clear_overridden_stream("in");
+                system_clear_overridden_stream(ctx, "in");
             }
             Ok(None)
         },
@@ -28904,9 +28904,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "out", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("out", s);
+                system_set_overridden_stream(ctx, "out", s);
             } else {
-                system_clear_overridden_stream("out");
+                system_clear_overridden_stream(ctx, "out");
             }
             Ok(None)
         },
@@ -28919,9 +28919,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             let val = args.first().copied().unwrap_or(Value::Object(None));
             ctx.set_static_field_by_name("java/lang/System", "err", val);
             if let Value::Object(Some(s)) = val {
-                system_set_overridden_stream("err", s);
+                system_set_overridden_stream(ctx, "err", s);
             } else {
-                system_clear_overridden_stream("err");
+                system_clear_overridden_stream(ctx, "err");
             }
             Ok(None)
         },
@@ -44117,34 +44117,91 @@ fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // System.in/out/err override storage (used by setIn0/setOut0/setErr0)
 // ---------------------------------------------------------------------------
 
+/// One System stream override entry. `handle` is a persistent global GC
+/// root (see [`NativeContext::add_global_root`]) so the installed stream
+/// survives — and is remapped by — moving collections; `raw` is only the
+/// registration-time address, kept as a last-resort fallback for contexts
+/// with no global-root support (mocks).
+///
+/// GC-SAFETY (2026-07-21): this table previously stored a bare `ObjectRef`
+/// in a process-global static — invisible to the collector. The first
+/// moving GC after `System.setOut` left the entry pointing at recycled
+/// memory (header reads as `ClassId(0)`/`java/lang/Object`, `num_slots=0`),
+/// which silently dropped every native-originated framework log line under
+/// WildFly (JBoss LogManager installs a delegating stdio stream very early
+/// in boot) and produced the `[RESID-DIAG READ] class=java/lang/Object`
+/// spam. Persistent-singleton native caches MUST hold a global root.
+struct StreamOverride {
+    handle: usize,
+    raw: ObjectRef,
+}
+
 /// Process-wide table of System stream overrides set via System.setIn/setOut/setErr.
 /// Keyed by "in" / "out" / "err". Stores the most recently installed stream reference.
 fn system_overridden_streams(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<&'static str, ObjectRef>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<&'static str, StreamOverride>> {
     use std::sync::OnceLock;
     static OVERRIDES: OnceLock<
-        parking_lot::Mutex<std::collections::HashMap<&'static str, ObjectRef>>,
+        parking_lot::Mutex<std::collections::HashMap<&'static str, StreamOverride>>,
     > = OnceLock::new();
     OVERRIDES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Set the override for the given stream name ("in", "out", or "err").
-pub(crate) fn system_set_overridden_stream(name: &'static str, stream: ObjectRef) {
-    system_overridden_streams().lock().insert(name, stream);
+/// Registers the stream as a persistent global GC root; releases the root
+/// of any previously-installed override for the same name.
+pub(crate) fn system_set_overridden_stream(
+    ctx: &mut dyn NativeContext,
+    name: &'static str,
+    stream: ObjectRef,
+) {
+    let prev = system_overridden_streams().lock().remove(name);
+    if let Some(prev) = prev {
+        if prev.handle != 0 {
+            ctx.remove_global_root(prev.handle);
+        }
+    }
+    let handle = ctx.add_global_root(stream);
+    system_overridden_streams()
+        .lock()
+        .insert(name, StreamOverride { handle, raw: stream });
 }
 
 /// Remove the override for the given stream name (back to default).
-pub(crate) fn system_clear_overridden_stream(name: &'static str) {
-    system_overridden_streams().lock().remove(name);
+pub(crate) fn system_clear_overridden_stream(ctx: &mut dyn NativeContext, name: &'static str) {
+    let prev = system_overridden_streams().lock().remove(name);
+    if let Some(prev) = prev {
+        if prev.handle != 0 {
+            ctx.remove_global_root(prev.handle);
+        }
+    }
 }
 
 /// Read the current override for the given stream name ("in"/"out"/"err"),
-/// if one was installed via `System.setIn/setOut/setErr` (→ `setIn0`/`setOut0`/
-/// `setErr0`). The interpreter's `getstatic System.out/err` bootstrap intercept
-/// consults this so a user redirect is honored instead of always returning the
-/// canonical synthetic fd-backed stream.
+/// resolved through its persistent global root so the returned ref is
+/// valid after any number of moving collections. Falls back to the
+/// registration-time raw ref only for contexts without global-root support.
+pub fn system_overridden_stream_resolved(
+    ctx: &dyn NativeContext,
+    name: &str,
+) -> Option<ObjectRef> {
+    let (handle, raw) = {
+        let map = system_overridden_streams().lock();
+        let e = map.get(name)?;
+        (e.handle, e.raw)
+    };
+    if handle != 0 {
+        ctx.resolve_global_root(handle).or(Some(raw))
+    } else {
+        Some(raw)
+    }
+}
+
+/// Raw-ref variant for callers with no `NativeContext` in reach. The
+/// returned ref is NOT remapped across moving collections — do not
+/// dereference it; identity/presence checks only.
 pub fn system_overridden_stream(name: &str) -> Option<ObjectRef> {
-    system_overridden_streams().lock().get(name).copied()
+    system_overridden_streams().lock().get(name).map(|e| e.raw)
 }
 
 /// Process-wide default Locale set via Locale.setDefault.
@@ -44626,17 +44683,24 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
 }
 
 fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
-    with_stdio_print_lock(|| {
-        if surefire_forwarding_write(ctx, args, text, false) {
-            return;
-        }
-        if route_write_through_out(ctx, args, text.as_bytes()) {
-            return;
-        }
-        if let Some(fd) = stream_fd(ctx, args) {
+    // LOCK-SCOPE (2026-07-21): `surefire_forwarding_write` and
+    // `route_write_through_out` recursively interpret Java bytecode
+    // (`invoke_virtual`); running them under the global stdio print mutex
+    // deadlocks against Java monitors / `class_manager` whose holders may
+    // themselves be blocked on this mutex (live gdb capture: WildFly boot
+    // wedge at parallel-extension-add, 2026-07-20). Only the raw fd write
+    // is serialized.
+    if surefire_forwarding_write(ctx, args, text, false) {
+        return;
+    }
+    if route_write_through_out(ctx, args, text.as_bytes()) {
+        return;
+    }
+    if let Some(fd) = stream_fd(ctx, args) {
+        with_stdio_print_lock(|| {
             let _ = ctx.fd_table().write_string(fd, text);
-        }
-    });
+        });
+    }
 }
 
 /// Return the current JVM line separator, respecting any
@@ -44652,22 +44716,25 @@ fn host_line_separator(ctx: &dyn NativeContext) -> String {
 /// underlying `stream_write` writes UTF-8 bytes raw, which is what Java
 /// specifies for println).
 fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
-    with_stdio_print_lock(|| {
-        let sep = host_line_separator(ctx);
-        if surefire_forwarding_write(ctx, args, text, true) {
-            return;
-        }
-        // User/Tee streams: write text+separator as one buffer through `out`.
-        let mut buf = text.as_bytes().to_vec();
-        buf.extend_from_slice(sep.as_bytes());
-        if route_write_through_out(ctx, args, &buf) {
-            return;
-        }
-        if let Some(fd) = stream_fd(ctx, args) {
+    // LOCK-SCOPE (2026-07-21): see `stream_write` — the Java-interpreting
+    // helpers must not run under the stdio print mutex; only the fd write
+    // pair (text + separator) stays atomic.
+    let sep = host_line_separator(ctx);
+    if surefire_forwarding_write(ctx, args, text, true) {
+        return;
+    }
+    // User/Tee streams: write text+separator as one buffer through `out`.
+    let mut buf = text.as_bytes().to_vec();
+    buf.extend_from_slice(sep.as_bytes());
+    if route_write_through_out(ctx, args, &buf) {
+        return;
+    }
+    if let Some(fd) = stream_fd(ctx, args) {
+        with_stdio_print_lock(|| {
             let _ = ctx.fd_table().write_string(fd, text);
             let _ = ctx.fd_table().write_string(fd, &sep);
-        }
-    });
+        });
+    }
 }
 
 /// Emit a framework log record through the live Java-level console stream.
@@ -44678,13 +44745,75 @@ fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
 /// to any other Java-level redirection).  Routing through `stream_writeln`
 /// preserves the canonical fd fast path for the original stream while calling
 /// a capture stream's real `OutputStream.write` override after redirection.
+thread_local! {
+    /// Recursion depth for `emit_framework_log`'s real-dispatch path. A
+    /// delegating override stream's `println` bytecode may funnel back into
+    /// a print native that logs (or the delegate chain may loop); depth > 2
+    /// falls back to the direct native writeln, which cannot recurse.
+    static EMIT_FRAMEWORK_LOG_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
     ctx.record_printed_line(text.to_string());
     // `NativeContext::get_system_stream` is the process's canonical fd-backed
     // stream. `System.setOut` intentionally leaves that canonical stream in
     // place and records the Java-level replacement in the override table, so
     // native-originated logs must prefer the override just as GETSTATIC does.
-    if let Some(out) = system_overridden_stream("out").or_else(|| ctx.get_system_stream("out")) {
+    let canonical = ctx.get_system_stream("out");
+    if let Some(out) = system_overridden_stream_resolved(ctx, "out").or(canonical) {
+        // DISPATCH (2026-07-21): an override stream installed via
+        // `System.setOut` may be a delegating subclass whose `println`
+        // override is real bytecode routing to a dynamically-looked-up
+        // target (WildFly: `org.jboss.stdio.StdioContext$DelegatingPrintStream`
+        // — its sink is NOT reachable by any field walk, so the old direct
+        // `stream_writeln` call dropped every native-originated boot log
+        // line). Give the receiver's own Java `println` a chance first; the
+        // canonical fd-backed stream keeps the direct native fast path.
+        let is_canonical = ctx
+            .get_system_stream("out")
+            .map(|c| std::ptr::eq(out.as_ptr(), c.as_ptr()))
+            .unwrap_or(false)
+            || ctx
+                .get_system_stream("err")
+                .map(|c| std::ptr::eq(out.as_ptr(), c.as_ptr()))
+                .unwrap_or(false);
+        let depth = EMIT_FRAMEWORK_LOG_DEPTH.with(|d| d.get());
+        // Guard the Java dispatch on the receiver actually being a live,
+        // classed object — a dead/stale ref reads as `java/lang/Object`
+        // (zeroed header) and the `println` dispatch would raise a bogus
+        // `NoSuchMethodError` into whatever Java frame invoked the logging
+        // native (observed killing the WildFly boot thread outright).
+        let receiver_classed = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            Some(n) if n != "java/lang/Object"
+        );
+        if !is_canonical && receiver_classed && depth < 2 {
+            EMIT_FRAMEWORK_LOG_DEPTH.with(|d| d.set(depth + 1));
+            // GC-safety: `create_string` can trigger a moving collection;
+            // pin `out` across it and re-read the (possibly relocated) ref
+            // before dispatching (Family-1 pin/refresh idiom).
+            let pin = ctx.pin_native_root(out);
+            let s = ctx.create_string(text);
+            let out_fixed = ctx.read_native_pin(pin, out);
+            let dispatched = ctx
+                .invoke_virtual(
+                    out_fixed,
+                    "println",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(s))],
+                )
+                .is_ok();
+            // The invoke itself may have moved the stream; refresh before
+            // the fallback writeln uses it.
+            let out_after = ctx.read_native_pin(pin, out_fixed);
+            ctx.unpin_native_roots(pin);
+            EMIT_FRAMEWORK_LOG_DEPTH.with(|d| d.set(depth));
+            if dispatched {
+                return;
+            }
+            stream_writeln(ctx, &[Value::Object(Some(out_after))], text);
+            return;
+        }
         stream_writeln(ctx, &[Value::Object(Some(out))], text);
     }
 }
@@ -45148,18 +45277,17 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     // User/Tee streams route through the real underlying stream; canonical
     // synthetic out/err (out==null) write to the fd directly.
-    with_stdio_print_lock(|| {
-        let text = String::from_utf8_lossy(&buf);
-        if surefire_forwarding_write(ctx, args, &text, false) {
-            return;
-        }
-        if route_write_through_out(ctx, args, &buf) {
-            return;
-        }
+    // LOCK-SCOPE (2026-07-21): see `stream_write`.
+    let text = String::from_utf8_lossy(&buf);
+    if !surefire_forwarding_write(ctx, args, &text, false)
+        && !route_write_through_out(ctx, args, &buf)
+    {
         if let Some(fd) = stream_fd(ctx, args) {
-            let _ = ctx.fd_table().write_bytes(fd, &buf);
+            with_stdio_print_lock(|| {
+                let _ = ctx.fd_table().write_bytes(fd, &buf);
+            });
         }
-    });
+    }
     Ok(None)
 }
 
@@ -45171,18 +45299,17 @@ fn native_printstream_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => 0,
     };
     let buf = [b];
-    with_stdio_print_lock(|| {
-        let text = String::from_utf8_lossy(&buf);
-        if surefire_forwarding_write(ctx, args, &text, false) {
-            return;
-        }
-        if route_write_through_out(ctx, args, &buf) {
-            return;
-        }
+    // LOCK-SCOPE (2026-07-21): see `stream_write`.
+    let text = String::from_utf8_lossy(&buf);
+    if !surefire_forwarding_write(ctx, args, &text, false)
+        && !route_write_through_out(ctx, args, &buf)
+    {
         if let Some(fd) = stream_fd(ctx, args) {
-            let _ = ctx.fd_table().write_bytes(fd, &buf);
+            with_stdio_print_lock(|| {
+                let _ = ctx.fd_table().write_bytes(fd, &buf);
+            });
         }
-    });
+    }
     Ok(None)
 }
 
@@ -48132,6 +48259,22 @@ pub(crate) fn native_unsafe_cas_int(
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 
+/// CRATONVM_DBG_AQS_TRACE support — cached env gate + capped stderr ledger.
+pub fn aqs_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_AQS_TRACE").is_some())
+}
+
+pub fn aqs_trace_line(line: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 500_000 {
+        eprintln!("{line}");
+    }
+}
+
 pub(crate) fn native_unsafe_cas_long(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -48178,7 +48321,35 @@ pub(crate) fn native_unsafe_cas_long(
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
     }
+    // CRATONVM_DBG_AQS_TRACE (2026-07-21): full transition ledger for the
+    // j.u.c.locks synchronizer family — every state CAS with pre-value and
+    // outcome, to catch the acquire/release imbalance behind the WildFly
+    // CapabilityRegistry write-lock wedge.
+    let aqs_trace = aqs_trace_enabled();
+    let pre_for_trace = if aqs_trace {
+        Some(ctx.get_field_volatile(obj, offset))
+    } else {
+        None
+    };
     let result = ctx.compare_and_swap_field(obj, offset, expected, new_val);
+    if aqs_trace {
+        let cid = ctx.class_id_of_object(obj);
+        if let Some(cls) = ctx.class_name_of_id(cid) {
+            if cls.starts_with("java/util/concurrent/locks/") {
+                aqs_trace_line(&format!(
+                    "[AQS] tid={} cas_long obj={:p} cls={} slot={} pre={:?} exp={:?} new={:?} ok={}",
+                    ctx.thread_id(),
+                    obj.as_ptr(),
+                    cls.rsplit('/').next().unwrap_or(&cls),
+                    offset,
+                    pre_for_trace.unwrap_or(Value::Object(None)),
+                    expected,
+                    new_val,
+                    result
+                ));
+            }
+        }
+    }
     // T19_H6_CAS_DIAG: temporary probe — log the first few CAS-fails on long
     // instance fields so we can see whether the heap returned a Double-tagged
     // bit pattern (or Object(None)) for a long slot. Rate-limited to 5 entries
@@ -48325,7 +48496,31 @@ pub(crate) fn native_unsafe_cas_object(
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
     }
+    let aqs_trace = aqs_trace_enabled();
+    let pre_for_trace = if aqs_trace {
+        Some(ctx.get_field_volatile(obj, offset))
+    } else {
+        None
+    };
     let result = ctx.compare_and_swap_field(obj, offset, expected, new_val);
+    if aqs_trace {
+        let cid = ctx.class_id_of_object(obj);
+        if let Some(cls) = ctx.class_name_of_id(cid) {
+            if cls.starts_with("java/util/concurrent/locks/") {
+                aqs_trace_line(&format!(
+                    "[AQS] tid={} cas_obj obj={:p} cls={} slot={} pre={:?} exp={:?} new={:?} ok={}",
+                    ctx.thread_id(),
+                    obj.as_ptr(),
+                    cls.rsplit('/').next().unwrap_or(&cls),
+                    offset,
+                    pre_for_trace.unwrap_or(Value::Object(None)),
+                    expected,
+                    new_val,
+                    result
+                ));
+            }
+        }
+    }
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }
 

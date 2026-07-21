@@ -4226,6 +4226,49 @@ pub fn parse_rsa_public_key(spki: &[u8]) -> Option<RsaPublicKey> {
     })
 }
 
+/// Parse an RSA private key from a PKCS#8 `PrivateKeyInfo` DER blob:
+/// `SEQUENCE { version INTEGER, AlgorithmIdentifier, privateKey OCTET STRING }`
+/// where the OCTET STRING contains the traditional (PKCS#1) `RSAPrivateKey`
+/// `SEQUENCE { version, n, e, d, p, q, dp, dq, qinv }`.
+pub fn parse_rsa_private_key_pkcs8(der: &[u8]) -> Option<RsaKeyPairData> {
+    let (_, outer) = der_read_tag_length(der)?;
+    let (_version, rest) = der_read_integer(outer)?;
+    // Skip AlgorithmIdentifier SEQUENCE.
+    let (alg_len, _) = der_read_tag_length(rest)?;
+    let rest = &rest[alg_len..];
+    // privateKey OCTET STRING wrapping the inner RSAPrivateKey SEQUENCE.
+    if rest.is_empty() || rest[0] != 0x04 {
+        return None;
+    }
+    let (_, octet_content) = der_read_tag_length(rest)?;
+    let (_, inner_seq) = der_read_tag_length(octet_content)?;
+    let (_inner_version, r) = der_read_integer(inner_seq)?;
+    let (n, r) = der_read_integer(r)?;
+    let (e, r) = der_read_integer(r)?;
+    let (d, r) = der_read_integer(r)?;
+    let (p, r) = der_read_integer(r)?;
+    let (q, r) = der_read_integer(r)?;
+    let (dp, r) = der_read_integer(r)?;
+    let (dq, r) = der_read_integer(r)?;
+    let (qinv, _r) = der_read_integer(r)?;
+    Some(RsaKeyPairData {
+        public_key: RsaPublicKey {
+            n: BigUint::from_bytes_be(&n),
+            e: BigUint::from_bytes_be(&e),
+        },
+        private_key: RsaPrivateKey {
+            n: BigUint::from_bytes_be(&n),
+            d: BigUint::from_bytes_be(&d),
+            e: BigUint::from_bytes_be(&e),
+            p: Some(BigUint::from_bytes_be(&p)),
+            q: Some(BigUint::from_bytes_be(&q)),
+            dp: Some(BigUint::from_bytes_be(&dp)),
+            dq: Some(BigUint::from_bytes_be(&dq)),
+            qinv: Some(BigUint::from_bytes_be(&qinv)),
+        },
+    })
+}
+
 /// Parse an ECDSA public key from DER SubjectPublicKeyInfo.
 pub fn parse_ecdsa_public_key(spki: &[u8]) -> Option<EcdsaPublicKey> {
     let (_, outer) = der_read_tag_length(spki)?;

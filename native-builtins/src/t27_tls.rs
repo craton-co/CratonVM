@@ -455,10 +455,45 @@ pub(crate) fn attach_key_managers_to_ctx(
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
 /// roots onto the SSLContext object's per-context slots.
-pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+///
+/// `resolved_km_identity` is the identity resolved DIRECTLY from the actual
+/// `KeyManager[]` this `SSLContext.init` call received (via
+/// `x509_manager::resolved_identity_pem_for_key_manager_array`), when the
+/// caller could trace it.
+/// It takes priority over the thread-local `PENDING_KM_IDENTITY`, which is
+/// only "whichever `KeyManagerFactory.init` ran most recently on this
+/// thread" -- correct when a KMF.init is immediately followed by its own
+/// SSLContext.init, but wrong when Netty/Reactor Netty builds more than one
+/// SSLContext from more than one KeyManagerFactory before either is actually
+/// used (e.g. a protocol-support probe context built ahead of the real one):
+/// an intervening, unrelated SSLContext.init can drain the thread-local
+/// before the context that actually needs it ever consumes it, silently
+/// leaving that context — and every engine created from it — with no
+/// identity at all (see pemcertificates-clientauth-rustls-decrypterror).
+/// The thread-local is drained unconditionally either way so it never leaks
+/// into a later, unrelated SSLContext.init.
+pub(crate) fn attach_pending_identity_to_ctx(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+    resolved_km_identity: Option<(String, String)>,
+) {
     let key = ctx_obj_key(ctx, ctx_obj);
-    if let Some(ident) = take_pending_km_identity() {
+    let pending = take_pending_km_identity();
+    if let Some(ident) = resolved_km_identity.or(pending) {
+        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+            eprintln!(
+                "[dbg-tls-auth] attach_pending_identity_to_ctx key={} STORING km identity key_pem_len={} cert_pem_len={}",
+                key,
+                ident.1.len(),
+                ident.0.len()
+            );
+        }
         ctx_identity_table().lock().insert(key, ident);
+    } else if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        eprintln!(
+            "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending km identity to store",
+            key
+        );
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
@@ -4438,7 +4473,7 @@ mod tests {
         let ctx = fake_object_ref(1);
         let mut mock_ctx = crate::test_utils::mock_ctx();
         set_pending_tm_trust_roots(vec![ca_der.clone()]);
-        attach_pending_identity_to_ctx(&mut mock_ctx, ctx);
+        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None);
 
         assert!(ctx_identity(&mut mock_ctx, ctx).is_none());
         let selected = selected_context_trust_roots().expect("context trust roots selected");
@@ -6203,12 +6238,28 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     .identity_override
                     .as_ref()
                     .map(|(cert, key)| (cert.as_str(), key.as_str()));
-                build_client_config_ex(
+                // Unlike the server branch below (which already threads
+                // `state.enabled_ciphers` through
+                // `build_server_config_single_cert_ex_ciphers`), this client
+                // branch built its `ClientConfig` with the plain default
+                // cipher provider regardless of any cipher-suite restriction
+                // the caller configured (`SSLEngine.setEnabledCipherSuites`/
+                // `setSSLParameters` — see `register_apply_parameters`'s
+                // `setSSLParameters` handler). A deliberately-mismatched
+                // client cipher restriction was therefore silently ignored:
+                // the client engine still offered its full default cipher
+                // list, which generally overlaps with whatever the server
+                // is restricted to, so the handshake succeeded instead of
+                // failing with `SSLHandshakeException` as real-JDK does
+                // (`connectWithSslBundleAndOptionsMismatch`).
+                let provider = cipher_provider_for(&state.enabled_ciphers);
+                build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
                     ClientAuthMode::Fixed(client_auth),
                     revocation,
                     use_java_trust_manager,
+                    provider,
                 )?
             }
         };
@@ -8008,6 +8059,40 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     with_engine(id, |s| {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();
                     });
+                }
+                // Apache HttpComponents 5 (and Tomcat's NioEndpoint, for its
+                // ALPN/client-auth-capable connectors) configure TLS options
+                // via an `SSLParameters` object passed to
+                // `SSLEngine.setSSLParameters()`, not the legacy
+                // `setEnabledCipherSuites`/`setEnabledProtocols` setters (see
+                // `setEnabledCipherSuites` above, and the analogous fix for
+                // the SSLSocket path in `phases_late.rs`'s
+                // `stash_pending_layered_socket`/`setSSLParameters`/
+                // `setEnabledCipherSuites` registrations). Without this, a
+                // cipher-suite restriction set this way was silently
+                // dropped: the engine kept its full default cipher list, so
+                // a deliberately-mismatched client/server cipher
+                // configuration (`connectWithSslBundleAndOptionsMismatch`)
+                // still found a common cipher and the handshake succeeded
+                // instead of failing with `SSLHandshakeException` as
+                // real-JDK does.
+                if let Ok(Some(Value::Object(Some(arr)))) =
+                    ctx.invoke_virtual(*p, "getCipherSuites", "()[Ljava/lang/String;", &[])
+                {
+                    let len = ctx.array_length(arr);
+                    let mut ciphers = Vec::with_capacity(len);
+                    for i in 0..len {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                            if let Some(name) = ctx.read_string(s) {
+                                ciphers.push(name);
+                            }
+                        }
+                    }
+                    if !ciphers.is_empty() {
+                        with_engine(id, |s| {
+                            s.enabled_ciphers = ciphers;
+                        });
+                    }
                 }
                 // Tomcat configures client-cert auth via
                 // `SSLParameters.setNeed/WantClientAuth` + `engine.setSSLParameters`,

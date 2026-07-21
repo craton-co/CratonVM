@@ -515,6 +515,21 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
 fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
+    // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
+    // cluster.md Bug B investigation): logs every call's receiver class and
+    // whether the loader-identity recovery path below (see the 2026-07-20
+    // comment further down, fixed once in 65d738bb5 for a different symptom)
+    // actually runs, vs. the bytecode constructor already having set the field.
+    // Ruled OUT as Bug B's cause: all 159 calls observed in that investigation
+    // showed fast_path=true, so the recovery path never even ran.
+    if std::env::var_os("CRATONVM_DBG_GOCBF").is_some() {
+        let rcid = ctx.class_id_of_object(receiver);
+        let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
+        eprintln!(
+            "[CRATONVM_DBG_GOCBF] receiver={:?} class={} fast_path={} current={:?}",
+            receiver, rname, matches!(current, Value::Object(Some(_))), current
+        );
+    }
     if let Value::Object(Some(bf)) = current {
         return bf;
     }
@@ -529,25 +544,62 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
     // If that also fails (e.g. its own <clinit> cascade NPEs), fall back to a
     // synthetic allocation so that downstream GETFIELD/PUTFIELD on the DLBF
     // still work (they're also overridden natively below).
-    let bf = (|| -> Option<ObjectRef> {
-        let obj = match ctx.new_object(DLBF) {
-            Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
-        };
-        // GC-safety: the `<init>` invocation can itself allocate; pin `obj`
-        // and re-read the forwarded reference before returning it.
-        let obj_pin = ctx.pin_native_root(obj);
-        // Invoke DefaultListableBeanFactory() no-arg constructor.
-        ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))])
-            .ok()?;
-        let obj = ctx.read_native_pin(obj_pin, obj);
-        ctx.unpin_native_roots(obj_pin);
-        Some(obj)
-    })()
-    .unwrap_or_else(|| {
-        // Fallback: synthetic allocation with generous field count.
-        crate::alloc_concurrent_synthetic(ctx, DLBF, 64)
-    });
+    //
+    // Loader identity (2026-07-20, WebFluxManagementChildContextConfiguration
+    // IntegrationTests#refreshSucceedsWithoutHealth): a plain name-based
+    // `ctx.new_object(DLBF)` always resolves the class through the GLOBAL/
+    // first-loaded (typically Application-loader) definer, regardless of
+    // which loader `receiver` (the `GenericApplicationContext`) itself
+    // belongs to. Under a Spring Boot `ModifiedClassPathClassLoader`-isolated
+    // test (`@ClassPathExclusions`), `receiver`'s own class is freshly
+    // reloaded under that child loader, and so is the child loader's own
+    // copy of `ObjectProvider`/`ObjectFactory` referenced by every `@Bean`
+    // factory method's parameter descriptor — but the DLBF instance this
+    // fallback minted stayed the Application loader's copy. Its own
+    // `ObjectFactory.class == descriptor.getDependencyType() || ObjectProvider
+    // .class == ...` identity check (`DefaultListableBeanFactory.
+    // resolveDependency`) then compares the Application loader's `ObjectProvider
+    // .class` against the child loader's parameter type and never matches,
+    // so an `ObjectProvider<TomcatConnectorCustomizer>` parameter with zero
+    // matching beans (by design — the whole point of `ObjectProvider`) falls
+    // through to strict required-dependency resolution and throws
+    // `NoSuchBeanDefinitionException` instead of returning an empty provider.
+    // Resolve DLBF near `receiver`'s own class first so the constructed
+    // factory belongs to the SAME (JVMS §5.3 defining-loader, name) identity
+    // as the rest of the isolated class graph.
+    let receiver_cid = ctx.class_id_of_object(receiver);
+    let dlbf_cid = ctx.class_id_by_name_near(DLBF, receiver_cid);
+    let bf = dlbf_cid
+        .and_then(|cid| {
+            ctx.new_object_initialized_with_class_id(cid, "()V", &[])
+                .ok()
+                .flatten()
+                .and_then(|v| match v {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                })
+        })
+        .or_else(|| {
+            (|| -> Option<ObjectRef> {
+                let obj = match ctx.new_object(DLBF) {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    _ => return None,
+                };
+                // GC-safety: the `<init>` invocation can itself allocate; pin `obj`
+                // and re-read the forwarded reference before returning it.
+                let obj_pin = ctx.pin_native_root(obj);
+                // Invoke DefaultListableBeanFactory() no-arg constructor.
+                ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))])
+                    .ok()?;
+                let obj = ctx.read_native_pin(obj_pin, obj);
+                ctx.unpin_native_roots(obj_pin);
+                Some(obj)
+            })()
+        })
+        .unwrap_or_else(|| {
+            // Fallback: synthetic allocation with generous field count.
+            crate::alloc_concurrent_synthetic(ctx, DLBF, 64)
+        });
     let receiver = ctx.read_native_pin(receiver_pin, receiver);
     ctx.unpin_native_roots(receiver_pin);
 

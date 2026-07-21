@@ -1170,6 +1170,20 @@ fn safe_native_call_impl(
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
             }
+            if crate::memory::gc::altrace_enabled_vm() {
+                if let Value::Object(Some(o)) = v {
+                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let cid = shared.heap.class_id_of(*o);
+                    let cname = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("<cid={cid:?}>"));
+                    eprintln!("[altrace NRET] callee={callee} v={:p} cls={cname}", o.as_ptr());
+                }
+            }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             let exc_is_current = shared
@@ -1418,7 +1432,16 @@ pub(crate) fn monitor_enter_blocking(
             // census recorded (not this thread's guess) can say which.
             let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
         }
-        m.block_enter(tid);
+        if dbg_mon_dump {
+            let cls = {
+                let cid = shared.heap.class_id_of(obj);
+                let cm = shared.class_manager.read();
+                cm.get_class(cid).map(|c| c.name.to_string())
+            };
+            m.block_enter_labeled(tid, cls.as_deref());
+        } else {
+            m.block_enter(tid);
+        }
         drop(blk);
     }
     if dbg_mon_dump {
@@ -3676,21 +3699,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
-        // asserts non-zero ("hash must be nonzero"). The heap's stored hash
-        // could be 0 in pathological cases (counter wrap, zero-initialised
-        // header from forwarding, etc.), so guard the return value here.
-        let h = self.shared.heap.identity_hash_code(obj);
-        if h == 0 {
-            // Mix the object pointer to provide a stable, non-zero fallback.
-            let p = obj.as_ptr() as usize;
-            let mixed = (p as u32 ^ (p >> 32) as u32) as i32;
-            if mixed == 0 {
-                0x7FFF_FFFF
-            } else {
-                mixed
-            }
-        } else {
-            h
+        // asserts non-zero ("hash must be nonzero").
+        //
+        // The heap itself now lazily mints and durably CASes a non-zero hash
+        // into the object's header the first time it's asked (see
+        // `GenerationalHeap`/`G1Collector`/`ZgcRealHeap::identity_hash_code`),
+        // which is what makes the value GC-move-stable — every mover copies
+        // the header's bytes verbatim once non-zero. This used to be handled
+        // HERE instead, by deriving a value from the object's *current*
+        // address whenever the header read back 0: that value silently went
+        // stale the instant a moving GC relocated the object (which happens
+        // routinely — the JIT's inline `new` fast path in `jit/src/x64.rs`
+        // leaves this field TLAB-zeroed on every allocation it makes, so
+        // this was not a rare fallback but the common case for JIT-hot
+        // allocation sites). Any per-object identity-keyed side table built
+        // on the old, address-derived value would silently stop finding its
+        // own entries after the first GC move — see
+        // `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
+        // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
+        //
+        // What remains here is now just a last-resort guard against a 0
+        // making it back out of the heap at all (it shouldn't, but this
+        // keeps the "never 0" contract airtight regardless).
+        match self.shared.heap.identity_hash_code(obj) {
+            0 => i32::MAX,
+            h => h,
         }
     }
 
@@ -7738,6 +7771,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let proxies = self.shared.lambda_proxies.read();
             proxies.get(&receiver_class_id).cloned()
         };
+        if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+            && method_name == "aotContributedInitializerStartsManagementContext"
+        {
+            eprintln!(
+                "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
+                method_name, receiver_class_id, call_site.is_some()
+            );
+        }
 
         // Keep the receiver and arguments rooted across the dispatch decision:
         // the selected lambda body can allocate immediately after this block.
@@ -8166,6 +8207,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
+            if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                eprintln!("[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch", method_name);
+            }
             // Not a lambda-dispatch call after all (the receiver wasn't a
             // recognized proxy, or the `.filter()` predicate above rejected
             // it) -- release the pins from the GC-safety block above. Refresh
@@ -8384,6 +8430,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
+            if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                let global_id = self.shared.class_manager.read().get_loaded_class_id(&class_name);
+                eprintln!(
+                    "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
+                    method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
+                );
+            }
             if needs_exact_class_dispatch {
                 invoke_on_class_shared(
                     self.shared,
@@ -13760,6 +13815,48 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own. The receiver-retargeting block above only substitutes the
+    // receiver's actual class for `class_id`/`class_name` when the ORIGINAL
+    // (CP-symbolic) class at the call site is itself an interface/abstract
+    // class (`this_is_iface_or_abs`). A call site whose declared parameter
+    // type is `Object` — e.g. `String.valueOf(Object obj)`'s internal
+    // `obj.toString()`, which is exactly what javac compiles `"literal:" +
+    // aPath` down to (a real `invokestatic String.valueOf` ahead of the
+    // `StringConcatFactory` indy call, not a direct `Path.toString()` call) —
+    // never retargets, so `class_name` here stays `java/lang/Object` and the
+    // `java/nio/file/Path` force-native entry deep in the `check_override`
+    // chain below (keyed on `class_name`) can never fire, even though the
+    // ACTUAL RECEIVER is one of our synthetic Path values. Check the
+    // receiver's real class directly, independent of the resolved
+    // `class_name`. Same family as
+    // `docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
+    // (which covered this exact call shape) — this hunk went missing from
+    // `invoke_on_class_shared_inner` somewhere between that fix landing
+    // (a6ce01fe2, 2026-07-19) and dev tip; re-added 2026-07-21 after
+    // `templateLocationEmpty` regressed with the identical symptom
+    // (`file:java.nio.file.Path@<hash>` instead of the real path).
+    if method_name == "toString" && descriptor == "()Ljava/lang/String;" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            let recv_cid = shared.heap.class_id_of(recv);
+            let is_path = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name("java/nio/file/Path")
+                    .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
+                    .unwrap_or(false)
+            };
+            if is_path {
+                if let Some(callback) = shared.native_methods.find(
+                    "java/nio/file/Path",
+                    "toString",
+                    "()Ljava/lang/String;",
+                ) {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // `SSLContext.getInstance` returns a SunJSSE provider object.  The TLS
     // bridge is registered on the public API class and must own this complete
     // family before provider bytecode can create an incompatible context SPI.
@@ -16251,6 +16348,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        || crate::runtime::interpreter::is_classvalue_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
                         || crate::runtime::interpreter::is_awt_imageio_native_override(
                             class_name,
                             method_name,
@@ -16416,7 +16518,17 @@ fn invoke_on_class_shared_inner(
                                 | "java/lang/AbstractStringBuilder"
                         ) && method_name == "insert"
                             && (descriptor.starts_with("(I[CII)")
-                                || descriptor.starts_with("(I[C)")));
+                                || descriptor.starts_with("(I[C)")))
+                        // Keep in sync with interpreter.rs's
+                        // `force_native_over_real_jdk_bytecode` entry for the
+                        // same triple — see that entry's comment for the full
+                        // rationale (`java.lang.ClassValue.get()` has real JDK
+                        // bytecode relying on `Class.classValueMap`, which
+                        // CratonVM's Class mirrors don't back; the registered
+                        // native's memoized `computeValue` dispatch must win).
+                        || (class_name == "java/lang/ClassValue"
+                            && method_name == "get"
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
                     if check_override
                         && shared
                             .native_methods

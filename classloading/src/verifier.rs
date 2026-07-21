@@ -1728,7 +1728,7 @@ fn verify_final_method_constraint(class: &Class, store: &ClassStore) -> Result<(
         // Per JVMS, private and static methods are not inherited and therefore
         // cannot be overridden — a same-named method in a subclass is a
         // distinct method, not an override.
-        if let Some((super_method, _)) =
+        if let Some((super_method, super_decl_id)) =
             find_method_recursive(super_id, &method.name, &method.descriptor, store)
         {
             if super_method
@@ -1739,6 +1739,32 @@ fn verify_final_method_constraint(class: &Class, store: &ClassStore) -> Result<(
                 continue;
             }
             if super_method.access_flags.contains(MethodAccessFlags::FINAL) {
+                // JVMS 5.4.5: a package-private method is only inherited (and
+                // therefore overridable) by classes in the same runtime
+                // package. A same-signature method declared in a DIFFERENT
+                // package is a new method, not an override, so the final
+                // check must not fire. Live case: glassfish
+                // ManagedScheduledThreadPoolExecutor.reject(Runnable) vs
+                // j.u.c.ThreadPoolExecutor final package-private
+                // reject(Runnable) -- HotSpot links it; our bogus VerifyError
+                // failed every WildFly EE-concurrent default executor.
+                let is_package_private = !super_method.access_flags.intersects(
+                    MethodAccessFlags::PUBLIC
+                        | MethodAccessFlags::PROTECTED
+                        | MethodAccessFlags::PRIVATE,
+                );
+                if is_package_private {
+                    fn package_of(name: &str) -> &str {
+                        name.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+                    }
+                    let same_package = store
+                        .get(super_decl_id)
+                        .map(|sc| package_of(&sc.name) == package_of(&class.name))
+                        .unwrap_or(false);
+                    if !same_package {
+                        continue;
+                    }
+                }
                 return Err(LinkageError::VerifyError {
                     class_name: class.name.to_string(),
                     method_name: method.name.to_string(),

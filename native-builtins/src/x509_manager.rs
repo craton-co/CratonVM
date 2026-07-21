@@ -3617,6 +3617,75 @@ fn get_km_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     0
 }
 
+/// Trace a `KeyManager[]` (the array `SSLContext.init` was actually called
+/// with) back to the identity (cert_pem, key_pem) that `chooseClientAlias`/
+/// `chooseServerAlias` would ALSO pick for it, by reading each element's
+/// `km_id` (set at `KeyManagerFactory.getKeyManagers` time, see `set_km_id`)
+/// and looking up its `KeyManagerState`.
+///
+/// Returns `None` if the array is absent/empty or every element is an
+/// unrecognized object (e.g. a test wrapper like Tomcat's
+/// `TrackingKeyManager` that doesn't carry a `km_id`) -- callers should fall
+/// back to the thread-local `PENDING_KM_IDENTITY` staging in that case, same
+/// as before this function existed.
+///
+/// Deliberately reuses `KeyManagerState`'s ALREADY-computed
+/// `client_aliases_by_key_type`/`server_aliases_by_key_type` (built by
+/// `java_hashmap_iteration_order`, replicating `SunX509KeyManagerImpl`'s real
+/// alias-selection order) rather than picking the keystore's first entry in
+/// file order: a keystore can carry more than one otherwise-equally-eligible
+/// identity (e.g. Spring Boot's own `NettyReactiveWebServerFactoryTests`
+/// PKCS12 fixture, which carries a "spring-boot" and a "test-alias" client
+/// identity side by side, only one of which the peer trusts -- see that
+/// field's own doc comment). Picking file-order-first would silently select
+/// the untrusted identity even though `chooseClientAlias` itself was already
+/// fixed to pick the right one.
+pub(crate) fn resolved_identity_pem_for_key_manager_array(
+    ctx: &mut dyn NativeContext,
+    kms_arr: Option<ObjectRef>,
+) -> Option<(String, String)> {
+    let arr = kms_arr?;
+    let len = ctx.array_length(arr);
+    let registry = km_registry().read();
+    for i in 0..len {
+        if let Value::Object(Some(km)) = ctx.get_array_element(arr, i) {
+            let id = get_km_id(ctx, km);
+            if id == 0 {
+                continue;
+            }
+            if let Some(state) = registry.get(&id) {
+                if let Some(ident) = first_identity_pem_from_state(state) {
+                    return Some(ident);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pick the alias `chooseClientAlias`/`chooseServerAlias` would ALSO pick
+/// (preferring a client-eligible identity, then a server-eligible one, then
+/// whatever's available), and build its (cert_pem, key_pem).
+fn first_identity_pem_from_state(state: &KeyManagerState) -> Option<(String, String)> {
+    let alias = first_preferred_alias(state)?;
+    let key_der = state.aliases_to_key.get(&alias)?;
+    let chain = state.aliases_to_chain.get(&alias)?;
+    Some(crate::t27_tls::der_identity_to_pem(key_der, chain))
+}
+
+fn first_preferred_alias(state: &KeyManagerState) -> Option<String> {
+    for by_key_type in [&state.client_aliases_by_key_type, &state.server_aliases_by_key_type] {
+        let mut key_types: Vec<&String> = by_key_type.keys().collect();
+        key_types.sort();
+        for kt in key_types {
+            if let Some(first) = by_key_type[kt].first() {
+                return Some(first.clone());
+            }
+        }
+    }
+    state.aliases_to_key.keys().next().cloned()
+}
+
 pub(crate) fn set_km_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     ctx.set_field_by_name(this, "cratonvm$x509km$id", Value::Int(id));
     let n = ctx.object_num_fields(this);
@@ -4101,6 +4170,14 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             .get(2)
             .map(|value| crate::keystore::read_password(ctx, value))
             .unwrap_or_default();
+        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+            eprintln!(
+                "[dbg-tls-auth] kmf_engine_init this_ptr={:?} ks_id={} password_len={}",
+                this.as_ptr(),
+                read_keystore_id(ctx, *ks),
+                key_password.len()
+            );
+        }
         crate::keystore::keystore_set_pending_km_identity_with_password(
             ctx,
             *ks,

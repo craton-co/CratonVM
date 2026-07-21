@@ -815,7 +815,21 @@ pub(crate) fn lambda_functional_interface_generic_type(
             else {
                 return None;
             };
-            let next_id = ctx.class_id_by_name(next_name)?;
+            // Residual 4 (2026-07-20, docs/known-issues/springboot/
+            // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+            // this superinterface walk climbing from a lambda's functional
+            // interface (e.g. Spring AOT's `AotApplicationContextInitializer<C>
+            // extends ApplicationContextInitializer<C>`) up to `next_name` used
+            // a loader-blind `class_id_by_name`. When `current_id`'s copy of the
+            // walk is itself the ONLY thing this fork context has touched so far
+            // (its own super-interface never separately resolved), the blind
+            // lookup silently picks up whichever copy the flat global store
+            // already holds — not necessarily the same loader as `current_id`.
+            // Stay within `current_id`'s own loader scope, mirroring every
+            // other loader-aware resolution in this cluster.
+            let next_id = ctx
+                .class_id_by_name_near(next_name, current_id)
+                .or_else(|| ctx.class_id_by_name(next_name))?;
             let next_sig_str = ctx.class_signature(next_id)?;
             let next_sig = parse_class_signature(&next_sig_str)?;
             let mut new_subst = std::collections::HashMap::new();
