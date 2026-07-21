@@ -1,11 +1,124 @@
-# `WebFluxManagementChildContextConfigurationIntegrationTests`: HANG fixed; ObjectProvider `NoSuchBeanDefinitionException` fixed; DIFFERENT loader-identity residual remains OPEN
+# `WebFluxManagementChildContextConfigurationIntegrationTests`: HANG fixed; ObjectProvider `NoSuchBeanDefinitionException` fixed (x2); ServerProperties loader-identity divergence FIXED; a THIRD, different ObjectProvider residual remains OPEN
 
 **Status: OPEN — hang fixed (confirmed gone as of `dev` a026c2c4c); the
 `ObjectProvider<TomcatConnectorCustomizer>` `NoSuchBeanDefinitionException`
 residual root-caused and FIXED 2026-07-20 (commit `65d738bb5`, merged
-`91f514f64`); a DIFFERENT, deeper `ServerProperties` loader-identity
-divergence now surfaces in its place — see the 2026-07-20 (third session)
-update below. Found 2026-07-19; broader than webflux, confirmed 2026-07-20.**
+`91f514f64`); the `ServerProperties` loader-identity divergence that
+surfaced in its place is now ALSO root-caused and FIXED 2026-07-21 — see
+the 2026-07-21 (fourth session) update below. Fixing it exposed a THIRD,
+different `ObjectProvider<WebSessionIdResolver>` `NoSuchBeanDefinitionException`
+— same symptom family as the already-fixed `TomcatConnectorCustomizer` one,
+but a genuinely different mechanism (ruled out: NOT a `DefaultListableBeanFactory`
+loader-identity mismatch this time). Found 2026-07-19; broader than webflux,
+confirmed 2026-07-20; `ServerProperties` fixed 2026-07-21.**
+
+## Update 2026-07-21 (fourth session) — `ServerProperties` loader-identity divergence root-caused and FIXED; THIRD residual (`ObjectProvider<WebSessionIdResolver>`) found blocking full closure
+
+Picked up the `ServerProperties` residual described in the 2026-07-20 update
+below. The original "ASM/`MetadataReader`" working hypothesis from that
+update turned out to be **wrong** — CratonVM has no native shim for
+`MetadataReader`/ASM classreading at all (confirmed by code search), and
+extensive tracing showed the `Class`-valued annotation-attribute resolution
+machinery (`annotation_element_to_java_typed`'s `Class` arm,
+`container_loader`-threaded) resolves `ServerProperties` **correctly** to the
+isolated loader's own copy every time it is exercised fresh.
+
+**Actual root cause** (found via a purpose-built native shim on
+`AbstractBeanDefinition.setBeanClass(Class)` that captures a full Java stack
+trace whenever its argument is `ServerProperties`, gated behind a temporary
+env var and removed after root-causing): the wrong (Application-loader)
+`ServerProperties` `Class` object is written into the bean definition via
+`EnableConfigurationPropertiesRegistrar.registerBeanDefinitions` →
+`ConfigurationPropertiesBeanRegistrar.{register,createBeanDefinition}` →
+`new AnnotatedGenericBeanDefinition(type)` → `setBeanClass(type)`. `type`
+comes from `MergedAnnotation.getClassArray(...)` reading
+`@EnableConfigurationProperties(ServerProperties.class)`'s value off an
+already-materialised `TypeMappedAnnotation` — a *different, earlier*
+materialisation of the same annotation instance than the one the
+`container_loader`-threaded read (verified correct, resolving to the
+isolated loader) observes. The two `Class` objects share a name but not an
+identity; the bean instantiated from the wrong one later fails
+`Method.invoke`'s reflective argument-assignability check against a
+factory-method parameter type resolved via `container_loader`, throwing
+`IllegalArgumentException("argument type mismatch")` in
+`TomcatWebServerConfiguration.tomcatWebServerFactoryCustomizer` — exactly the
+symptom the 2026-07-20 update described.
+
+**Fixed** (`native-builtins/src/spring_startup_bootstrap.rs`):
+- Added a `resolve_class_id_via_tccl` helper: tries the current thread's
+  context classloader first (mirroring real `ClassUtils.getDefaultClassLoader()`
+  convention) when it is a genuinely user-defined loader, before falling back
+  to the global class table. Wired into `resolve_class_id_with_nested_retry`
+  (used by `resolve_bean_class_field`'s String-to-Class resolution path).
+- Added a native shim for `AbstractBeanDefinition.setBeanClass(Class)` — the
+  common tail of every bean-registration path that already holds a resolved
+  `Class` object. When the incoming `Class` belongs to no recorded
+  user-defined loader (resolved through the global/Application path) and the
+  current thread's context classloader can resolve its own, different copy
+  of the same name, substitutes that loader-correct copy before the field
+  write. This is the actual fix — `resolve_bean_class_field`'s String branch
+  (the first fix attempt) turned out never to be exercised for this specific
+  bug, since `beanClass` was always already a resolved `Class` mirror by the
+  time anything read it; `setBeanClass` is the true single choke point.
+
+**Verified**: `WebFluxManagementChildContextConfigurationIntegrationTests`
+now gets past the `ServerProperties` failure entirely (confirmed via full
+stack-trace tracing that the `IllegalArgumentException("argument type
+mismatch")` no longer occurs). Regression sweep (Windows,
+`cratonvm-webflux-serverprops-loaderid.exe`, `-Jit on`): `BinderTests`
+32/32, `WebMvcObservationAutoConfigurationTests` PASS, `ConfigurationPropertiesTests`
+114/114, `RestClientObservationAutoConfigurationWithoutMetricsTests` PASS,
+`RestTemplateObservationAutoConfigurationWithoutMetricsTests` PASS,
+`SpringApplicationTests` 4/102 fail (matches the already-documented
+pre-existing baseline exactly, not a regression).
+
+**New residual exposed, NOT fixed — doc stays OPEN**: `refreshSucceedsWithoutHealth`
+now fails differently again — `UnsatisfiedDependencyException` creating bean
+`webSessionManager` (defined in `WebFluxAutoConfiguration$EnableWebFluxConfiguration`):
+`NoSuchBeanDefinitionException: No qualifying bean of type
+'ObjectProvider<WebSessionIdResolver>'` — the same *symptom family* as the
+already-fixed `TomcatConnectorCustomizer` residual (an `ObjectProvider`
+with zero matching beans, by design, thrown as a hard failure instead of
+resolving to an empty provider), but **confirmed a different mechanism**:
+added a temporary trace comparing `receiver`'s (the `GenericApplicationContext`)
+and the `DefaultListableBeanFactory`'s own defining-loader identity at every
+`getBeanFactory()` call within the failing test — they were IDENTICAL (both
+correctly the isolated loader) every time, ruling out the
+`get_or_create_bean_factory` loader-mismatch mechanism the 2026-07-20 fix
+targeted. A speculative fast-path fix built on that (now-disproven)
+hypothesis was implemented, tested, found ineffective, and reverted — not
+merged.
+
+**Working hypothesis for the new residual (not confirmed, not fixed)**:
+`webSessionManager`'s actual `@Bean` method implementation likely lives on
+`org.springframework.web.reactive.config.WebFluxConfigurationSupport` (a
+`spring-webflux` FRAMEWORK class that `EnableWebFluxConfiguration` extends),
+attributed to the leaf `@Configuration` class in Spring's bean-origin
+tracking. If framework classes are not reloaded per Spring Boot
+`ModifiedClassPathClassLoader`-isolated test (only application/autoconfigure
+classes on the modified test classpath are), that method's own `ObjectProvider`
+constant-pool reference stays the Application loader's copy even though the
+`DefaultListableBeanFactory` now correctly resolves to the isolated loader —
+the reverse-shaped mismatch from the original bug. Not verified this
+session — whoever picks this up should confirm which class actually declares
+`webSessionManager`'s bytecode and trace its own loader identity the same
+way the `ServerProperties` fix's stack-trace shim did.
+
+**Next steps for whoever picks this up:**
+1. Confirm which class's bytecode declares `webSessionManager(ObjectProvider<WebSessionIdResolver>)`
+   (likely `WebFluxConfigurationSupport`) and whether CratonVM resolves it to
+   the isolated loader or the Application loader under this test.
+2. If the framework-class hypothesis holds, decide the right general fix:
+   either make `DefaultListableBeanFactory.resolveDependency`'s
+   `ObjectFactory.class == descriptor.getDependencyType()` comparison
+   loader-tolerant (name + assignability rather than strict identity) for
+   this narrow case, or ensure the relevant framework classes are resolved
+   consistently with the DLBF's own loader.
+3. Re-run `refreshSucceedsWithoutHealth` after any fix; if it passes, re-run
+   this doc's full class list plus the cross-referenced docs' classes to
+   check for a shared fix.
+4. Only retire this doc to `docs/internal/` once `refreshSucceedsWithoutHealth`
+   passes with zero remaining failures.
 
 ## Update 2026-07-20 (third session) — ObjectProvider `NoSuchBeanDefinitionException` root-caused and FIXED (2 loader-identity bugs); deeper, DIFFERENT residual now blocking full closure
 
