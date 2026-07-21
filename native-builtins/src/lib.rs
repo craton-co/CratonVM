@@ -72301,6 +72301,28 @@ fn transition_real_executor_to_shutdown(
     // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
     // worker blocked in LinkedBlockingQueue.take().
     let _ = interrupt_executor_workers(ctx, executor);
+    // BUG-H2-HANG-0721: the real `ThreadPoolExecutor.shutdown()` body ends
+    // with an unconditional `tryTerminate()` call (see JDK source) -- this is
+    // the ONLY thing that ever moves a pool whose workerCount is *already*
+    // zero at shutdown() time (never used, or already fully drained) from
+    // SHUTDOWN to TIDYING/TERMINATED and fires `termination.signalAll()`.
+    // When workerCount > 0, `processWorkerExit()` (real bytecode, runs when
+    // each interrupted worker actually exits) eventually calls its own
+    // `tryTerminate()` and self-heals -- but a pool with zero workers has no
+    // worker left to ever run that path, so without this call here the pool
+    // is stuck in SHUTDOWN forever and `awaitTermination()` (real bytecode,
+    // genuinely blocks on `termination.awaitNanos`) hangs for the full
+    // requested timeout. H2's `Utils.shutdownExecutor` calls
+    // `awaitTermination(1, TimeUnit.DAYS)`, so this is an effectively
+    // permanent hang for the extremely common "FileStore closed before its
+    // background serialization/save executor ever ran a task" case (most
+    // H2 `TestDb`-based tests hit this on `deleteDb`/`close()`).
+    let _ = ctx.invoke_special_bytecode_only(
+        "java/util/concurrent/ThreadPoolExecutor",
+        "tryTerminate",
+        "()V",
+        &[Value::Object(Some(executor))],
+    );
     Ok(None)
 }
 
