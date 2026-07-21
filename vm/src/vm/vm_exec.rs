@@ -14503,6 +14503,28 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                // `URLClassLoader` declares its OWN
+                                // `getResourceAsStream` override (real OpenJDK
+                                // wraps the stream for `closeables` tracking),
+                                // unlike `getResource`/`getResources`/
+                                // `findResource` above, which it leaves to
+                                // `ClassLoader`/its own extension point. The
+                                // `java/lang/ClassLoader` entry elsewhere in
+                                // this list never matches such a call, so its
+                                // real bytecode ran unforced — same shimmed-`ucp`
+                                // problem as `findResource` above, but ALSO
+                                // missing the native bridge's parent-delegation,
+                                // so a `new URLClassLoader(urls, parent)` whose
+                                // own URL held only a generated resource index
+                                // (Spring Boot's `ServletComponentScanIntegrationTests
+                                // .indexedComponentsAreRegistered`) got `null`
+                                // for every `.class` resource that only the
+                                // PARENT classloader's classpath holds, despite
+                                // `getResource` resolving it fine moments
+                                // earlier. Keep in sync with
+                                // `force_native_over_real_jdk_bytecode`.
+                                || (method_name == "getResourceAsStream"
+                                    && descriptor == "(Ljava/lang/String;)Ljava/io/InputStream;")
                                 || (method_name == "<init>"
                                     && matches!(
                                         descriptor,
@@ -15101,15 +15123,16 @@ fn invoke_on_class_shared_inner(
                                     | ("getMainAttributes", "()Ljava/util/jar/Attributes;")
                                     | ("getEntries", "()Ljava/util/Map;")
                             ))
-                        // Spring Boot 3 fat-jar launcher: short-circuit
-                        // JarFileArchive.getClassPathUrls so our native
-                        // wins over the bytecode that walks
-                        // `JarFile.stream().map().filter().map().collect()` —
-                        // that pipeline depends on Stream operations our
-                        // synthetic Stream does not implement. The native
-                        // materialises the URL set directly from the
-                        // central directory.
-                        || (class_name == "org/springframework/boot/loader/launch/JarFileArchive"
+                        // Spring Boot 3 archives: use the native enumerators
+                        // for both jar and exploded layouts. The jar path
+                        // avoids the incomplete synthetic Stream pipeline;
+                        // the exploded path avoids the real-JDK
+                        // LinkedList.addAll(0, ...) route that loses every
+                        // descendant of an immediate directory.
+                        || (matches!(class_name,
+                            "org/springframework/boot/loader/launch/JarFileArchive"
+                                | "org/springframework/boot/loader/launch/ExplodedArchive"
+                        )
                             && method_name == "getClassPathUrls")
                         // Spring Boot 3.2+ `launch.ExecutableArchiveLauncher.createClassLoader`
                         // — same ClassCastException / typed-`toArray` hazard as SB2's iterator
