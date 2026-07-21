@@ -7519,6 +7519,13 @@ struct Compiler {
     /// created so the `i64::MIN` bail sentinel leaks as the method's (truncated)
     /// return value (e.g. `new int[N]` silently yields 0) instead of throwing.
     emitted_alloc_oom_check: bool,
+    /// Residual-6 companion fix: set when a `checkcast` site emitted the
+    /// post-helper sentinel check. `jit_checkcast` constructs the
+    /// `ClassCastException` for a definitively-failed cast through the
+    /// `JIT_THREAD` TLS (same requirement — and same `has_dispatch` forcing —
+    /// as [`Self::emitted_alloc_oom_check`]); without the dispatch-aware
+    /// entry the helper silently degrades to the legacy null-return.
+    emitted_checkcast_throw: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -8865,6 +8872,7 @@ impl Compiler {
             dbg_last_op: 0,
             emitted_athrow: false,
             emitted_alloc_oom_check: false,
+            emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -26873,6 +26881,16 @@ impl Compiler {
                     // `java/lang/Class` mirror. That's a GC-triggering
                     // safepoint — emit the oop map before pushing.
                     self.emit_oop_map_for_safepoint();
+                    // Residual-6 companion fix: a definitively-failed cast now
+                    // stashes a ClassCastException and returns the i64::MIN
+                    // sentinel (see `jit_checkcast`) instead of a silent null.
+                    // Route the sentinel through the shared exception stub like
+                    // every other fallible helper; `emitted_checkcast_throw`
+                    // forces `has_dispatch` so the helper has the JIT_THREAD
+                    // TLS it needs to construct the CCE and the entry path
+                    // drains the pending exception.
+                    self.emit_post_invoke_exception_check(b'L');
+                    self.emitted_checkcast_throw = true;
                     // Result (obj_ptr or 0 for null) is in RAX — push onto stack
                     self.push_from_rax();
                     // checkcast returns the same reference (or null).
@@ -28164,6 +28182,10 @@ pub fn compile_with_param_slots(
         // A fallible `newarray` OOM bail needs the per-thread TLS set so the
         // helper can GC + construct the OOME (same rationale as direct_calls).
         || compiler.emitted_alloc_oom_check
+        // Residual-6 companion fix — a failed checkcast stashes a CCE through
+        // the JIT_THREAD TLS and bails with the i64::MIN sentinel; the entry
+        // path must set the TLS and drain the pending exception.
+        || compiler.emitted_checkcast_throw
         // BUG-1 companion — a direct (non-dispatch) self-recursive CALL site:
         // its stack guard stashes a catchable StackOverflowError near native
         // exhaustion and returns the i64::MIN sentinel, so the method MUST be

@@ -10199,6 +10199,24 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
+    // get(Class) dispatch entering the general resolver, with its dispatch
+    // class and receiver identity, so the failing call's route is visible.
+    if method_name == "get"
+        && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
+        && crate::jit::helpers::cv_trace_enabled()
+    {
+        let recv = match args.first() {
+            Some(Value::Object(Some(o))) => o.as_ptr() as usize,
+            _ => 0,
+        };
+        eprintln!(
+            "[cv-ion-entry] class={} recv={:#x} nargs={}",
+            class_name,
+            recv,
+            args.len()
+        );
+    }
     // Skip expensive class loading for obviously invalid class names (e.g. "<unknown class 0>").
     if class_name.contains('<') || class_name.contains(' ') {
         // Optional operator diagnostic: surface exactly which call had no
