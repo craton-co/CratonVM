@@ -619,24 +619,38 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
-    // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
-    // ANTLR-runtime, and most of java.util together turns ordinary 9-second
-    // HotSpot tests into multi-minute CratonVM runs. The three package control
-    // returns the class to the 120-second JUnit budget; each narrower control
-    // leaves the regression. Keep the proven interaction interpreted under the
-    // conservative policy until the shared generated-code throughput issue is
-    // root-caused. Each package remains available for bisection through
-    // CRATONVM_JIT_ALLOW_PACKAGES. `java.util.regex` is deliberately excluded:
-    // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
-    // and interpreting Pattern.compile turns that finite check into a watchdog
-    // timeout while its JIT path is stable.
+    // HIB-LONGTAIL.1 (2026-07-15, narrowed 2026-07-20): Hibernate's H2-backed
+    // collection loading runs correctly in the interpreter, but JITting the H2
+    // SQL/MVStore and ANTLR-runtime together turned ordinary 9-second HotSpot
+    // tests into multi-minute CratonVM runs. Originally this also blanket-banned
+    // ALL of java.util (except regex) unconditionally under the conservative
+    // policy, reasoning that the three packages needed to be interpreted
+    // together. That java.util term:
+    // (a) contradicted the T1.1.g invariant a few lines below (java/util/* is
+    //     JIT-eligible again outside the small `is_known_miscompile` list) and
+    //     broke 7 of this module's own unit tests the day it landed (see git
+    //     blame on this comment vs. `tier1_skip_list_no_blanket_java_util_ban`
+    //     and friends — those tests predate this ban and were never updated to
+    //     match it);
+    // (b) turned out to be unnecessary: the ACTUAL root cause of the Hibernate
+    //     longtail (see `docs/internal/fixed-suite-bugs/hib-generic-timeout-hang-longtail-resolved-20260715.md`)
+    //     was the executor-compatibility bridge returning placeholder
+    //     `FutureTask`s, fixed the same day in `native-builtins`/`native-collections`
+    //     — not a java.util JIT-throughput interaction;
+    // (c) unconditionally force-interpreted java.util for every OTHER test in
+    //     the whole suite that never touches H2 or ANTLR, which is exactly
+    //     what made `testSlicesDense` (ES vector search, heavy `Arrays`/`BitSet`/
+    //     `Objects` usage, no H2/ANTLR in sight) stay stuck at ~600s — see
+    //     `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+    // Narrowed back to just the two packages actually implicated (H2, ANTLR
+    // runtime) that motivated this rule. (Historical note on why the old
+    // java.util term carved out `java.util.regex`: DefaultCatalogAndSchemaTest's
+    // AssertJ checks repeatedly compile patterns, and interpreting
+    // Pattern.compile turned that finite check into a watchdog timeout while
+    // its JIT path was stable — moot now that java.util is JIT-eligible again.)
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))
-        || (class_name.starts_with("java/util/")
-            && !class_name.starts_with("java/util/regex/")
-            && !package_allowed("java/util/", allow_packages))
     {
         return Some(SkipReason::RustJvmTestFixture);
     }
