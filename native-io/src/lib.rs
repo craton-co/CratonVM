@@ -3577,9 +3577,60 @@ fn native_baos_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `java.nio.charset.Charset`'s synthetic layout has a single field (slot 0)
+/// holding the charset's name String. Kept in sync with
+/// `native-builtins::CHARSET_FIELD_NAME` — native-io has no dependency on
+/// native-builtins, so the tiny constant is duplicated rather than shared
+/// (same convention as `BUF_FIELD_*` in native-builtins/src/charset.rs).
+const BAOS_CHARSET_OBJ_FIELD_NAME: usize = 0;
+
+/// Extract a canonical charset name from either a `Charset` object (slot 0 =
+/// name String) or a plain `String` charset name — covers both the
+/// `toString(Charset)` and deprecated `toString(String)` overloads. Falls
+/// back to UTF-8 on unrecognised input.
+fn baos_charset_name_of(ctx: &dyn NativeContext, value: Value) -> String {
+    if let Value::Object(Some(o)) = value {
+        if let Value::Object(Some(s)) = ctx.get_field(o, BAOS_CHARSET_OBJ_FIELD_NAME) {
+            if let Some(name) = ctx.read_string(s) {
+                return cratonvm_native_api::charset::canonical_charset_name(&name)
+                    .map(str::to_string)
+                    .unwrap_or(name);
+            }
+        }
+        if let Some(name) = ctx.read_string(o) {
+            return cratonvm_native_api::charset::canonical_charset_name(&name)
+                .map(str::to_string)
+                .unwrap_or(name);
+        }
+    }
+    "UTF-8".to_string()
+}
+
 fn native_baos_to_string_charset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Ignore charset parameter, just delegate to toString()
-    native_baos_to_string(ctx, args)
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let charset_name = baos_charset_name_of(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let data = match ctx.get_field(this, BAOS_FIELD_DATA) {
+        Value::Object(Some(arr)) => arr,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let count = match ctx.get_field(this, BAOS_FIELD_COUNT) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let mut bytes = Vec::with_capacity(count);
+    for i in 0..count {
+        match ctx.get_array_element(data, i) {
+            Value::Int(b) => bytes.push(b as u8),
+            _ => bytes.push(0),
+        }
+    }
+    let units = cratonvm_native_api::charset::decode_bytes_lossy(&charset_name, &bytes);
+    let text = String::from_utf16_lossy(&units);
+    let obj = ctx.create_string(&text);
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn native_baos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4426,6 +4477,11 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// `getResourceBuffer`) then operates on the genuine jimage bytes. This is
 /// the real image content, not a stub. Returning `null` on any read error
 /// preserves the JDK's documented fall-back contract.
+fn jimage_map_cache() -> &'static Mutex<HashMap<String, usize>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let path = match args.first() {
         Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
@@ -4434,6 +4490,29 @@ fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         },
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Whenever this native IS invoked (e.g. cold-start module bootstrap,
+    // `ModuleFinder.ofSystem()`), it used to re-read this ~150 MiB jimage
+    // from disk and re-allocate a fresh Java byte[] on every single call.
+    // The image content is immutable for the process's lifetime, so cache
+    // the already-built byte[] behind a global GC root and hand back a
+    // fresh `ByteBuffer.wrap` over the SAME array each call instead of
+    // re-reading and re-allocating. (Investigated as a possible cause of
+    // the repeated-in-process-javac-compilation NPE documented in
+    // jit/skip_list.rs's SPRING-TESTCOMPILER.2 entry — a
+    // call-count trace showed this native is not actually re-invoked per
+    // compile in that scenario, so it is NOT that bug's cause; this change
+    // is a straightforward, independently-verified perf/waste fix, kept on
+    // its own merits.)
+    if let Some(&handle) = jimage_map_cache().lock().get(&path) {
+        if let Some(arr) = ctx.resolve_global_root(handle) {
+            return ctx.invoke(
+                "java/nio/ByteBuffer",
+                "wrap",
+                "([B)Ljava/nio/ByteBuffer;",
+                &[Value::Object(Some(arr))],
+            );
+        }
+    }
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         // Image not readable here → let the caller use its FileChannel path.
@@ -4444,6 +4523,8 @@ fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // 100 MiB+ image), then hand it to the genuine `ByteBuffer.wrap`.
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     ctx.write_byte_array_from(arr, 0, &bytes);
+    let handle = ctx.add_global_root(arr);
+    jimage_map_cache().lock().insert(path, handle);
     ctx.invoke(
         "java/nio/ByteBuffer",
         "wrap",

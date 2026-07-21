@@ -1,6 +1,23 @@
 # Silent 1200s hangs with no diagnostic signature (3 classes)
 
-**Status:** PARTIALLY FIXED (2026-07-19 update) — 2 of 3 classes (`TestContextConfig`,
+**Status (2026-07-20 update):** the recompile-storm bug that blocked
+`TestResponsePerformance`'s relative-perf assertion is **FIXED and verified**
+(`Response.toAbsolute()` now compiles at most once per process and never
+recompiles again — was 17-94+ times). A **live regression was also found and
+fixed**: a stale-branch merge on `dev` (`b90ecea19`, 2026-07-20) had silently
+reverted the 2026-07-19 POSIX `file:` `URL.openConnection()` fix below,
+re-breaking `TestValidator` (confirmed 10/11 failures on the regressed
+build); restored, re-verified `TestContextConfig` OK (8/8) and `TestValidator`
+OK (11/11). **Still open:** the relative-perf assertion itself still fails —
+not from recompiling anymore, but from a newly-characterized, deeper
+JIT-dispatch-throughput gap (`doHomebrew()`, itself JIT-compiled, dispatching
+to a give-up/interpreted `toAbsolute()` costs ~5x the historical
+fully-interpreted baseline). See "2026-07-20 session: recompile-storm closed,
+new deeper residual found" below for the full account, including why this
+looks like it may be an unrelated `dev` regression rather than a consequence
+of this session's own fix. 2 of 3 classes remain FULLY FIXED as of 2026-07-19.
+
+**Status (2026-07-19 update, historical):** 2 of 3 classes (`TestContextConfig`,
 `TestValidator`) are now **FULLY FIXED**, reliably passing at the canonical
 `-Xmx2g` heap; the true root cause of their hang was misdiagnosed in the
 2026-07-13/07-16 checkpoints as an interpreter-throughput problem — it was
@@ -630,3 +647,197 @@ CP=$(cat .suite/cp-linux-fixed.txt)
    the root cause is known precisely — any suite/app resolving local
    resources via `openConnection()`+`connect()` rather than
    `getResource()`/`openStream()` was silently affected the same way.
+
+## 2026-07-20 session: recompile-storm closed, live merge regression found+fixed, new deeper residual found
+
+Picked this doc back up with an explicit "fix everything, including
+residuals" directive. Worktree `/data/wt-tomcat-silenthang-residuals-20260720`
+on the Azure Linux build host, branch
+`fix/tomcat-silenthang-residuals-20260720`, off `origin/dev`.
+
+### Found first, before any new work: the 2026-07-19 POSIX `file:` fix had been silently reverted on `dev`
+
+Re-running `TestValidator` as a baseline check (before touching anything)
+failed **10/11**, with the exact `FileNotFoundException` signature
+(`data/data/.../web-jsptaglibrary_1_1.dtd`, no leading `/`) that the
+2026-07-19 fix (`4c97b9671`) was supposed to have eliminated for good. Bisecting
+`net_phase_e.rs`'s `URL.openConnection()` `file:` handler across `dev`'s
+history (`git log --first-parent dev -- native-builtins/src/net_phase_e.rs`,
+checking each commit's blob for the fixed `#[cfg(not(windows))] let path =
+decoded.clone();` form) found the exact regression point: **`b90ecea19`**
+("Merge branch 'fix/springboot-cloudfoundry-integrate-20260720' into dev",
+2026-07-20), whose own commit message says "authored on an earlier dev
+snapshot, forward" — the feature branch's stale, pre-fix copy of this
+function silently won the merge for this one hunk (a combined-diff check,
+`git diff <parent1> <merge>` vs `git diff <parent2> <merge>`, confirmed the
+merge result matched the STALE side exactly), reverting the cfg-split fix
+back to the unconditional `decoded.trim_start_matches('/')` for every
+platform. This is on `origin/dev`'s tip as of this writing (confirmed via a
+fresh `git fetch`) — a live, currently-shipping regression, not a stale
+worktree artifact.
+
+**Fixed**: restored the exact `4c97b9671` cfg-split shape in
+`native-builtins/src/net_phase_e.rs` (same code, new comment noting the
+revert-and-restore history). **Verified**: swept every other
+`trim_start_matches('/')` site in the same file (10 total) — all the others
+either operate on classpath/resource-name strings (not filesystem paths, so
+stripping is correct) or already have the "try trimmed first, fall back to
+the untrimmed absolute form" resilience pattern that this one specific site
+lacked. Re-ran `TestContextConfig` (`OK`, 8/8) and `TestValidator` (`OK`,
+11/11) on the restored build — both clean.
+
+### Recompile-storm: root-caused and fixed (3 iterations)
+
+The prior session's "session 2" finding — `Response.toAbsolute()` compiles
+correctly (RBC.6 fixed) but gets recompiled 86-94 times and runs net SLOWER
+— traced with `CRATONVM_DBG_JITC=1 CRATONVM_DBG_DEOPT=1` against the real
+suite fixture:
+
+```
+[cratonvm-deopt] org/apache/catalina/connector/Response.toAbsolute:(...)... reason=OsrExit bci=225 action=RecompileAndReinterpret
+[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) org/apache/catalina/connector/Response.toAbsolute:(...)...
+[cratonvm-jitc] bg-compile org/apache/catalina/connector/Response.toAbsolute(...)... tier=C1 optimized=false
+[cratonvm-jitc] full-compile org/apache/catalina/connector/Response.toAbsolute(...)... entry=0x... len=15451
+```
+
+**Root cause**: `toAbsolute()` has an internal loop that, in practice, always
+exits back to the interpreter at the same bci (225) — a real, EXPECTED
+`OsrExit` event ("a running JIT/OSR frame bailed mid-loop back to the
+interpreter at a loop bci", per `DeoptReason`'s own doc comment;
+`docs/feature-designs/deopt-osr.md` confirms this is by design: "Every
+deopt/OSR-exit ... evicts the artifact from `jit_cache` ... and escalates to
+`MakeNotCompilable` if the deopt rate exceeds a threshold"). But
+`jit/src/deopt.rs::recommend_action` routed `OsrExit` through the SAME
+generic count-based policy used for genuine mis-speculation
+(`RecompileAndReinterpret` → `MakeNotEntrant` → `MakeNotCompilable`).
+Recompiling can never fix an `OsrExit` — the same loop boundary exits the
+same way on every future compile too — so this policy just kept evicting and
+eagerly re-queuing a fresh, expensive 15KB compile of the whole method, for
+zero benefit, dozens of times per run.
+
+**Fix, 3 iterations** (`jit/src/deopt.rs`, `vm/src/jit/helpers.rs`):
+
+1. **First attempt**: make `OsrExit` a permanent soft deopt (`Reinterpret`
+   always, artifact never evicted from `jit_cache`) — eliminated the
+   recompile storm, but exposed a WORSE problem: `toAbsolute()` now paid the
+   real-frame-deopt reconstruct-and-resume cost on literally EVERY call
+   (since the loop exits there every time), measuring 347s/round —
+   *slower* than even the pre-fix recompile-thrash numbers.
+2. **Second attempt**: tolerate the first `half` (10) `OsrExit` occurrences
+   as `Reinterpret`, then escalate directly to `MakeNotCompilable` (skipping
+   `RecompileAndReinterpret`/`MakeNotEntrant`, since recompiling is known
+   pointless for this reason) — the intent being "give up compiling this
+   method for good, revert fully to interpretation." Compile count did drop
+   (no longer unbounded), but `toAbsolute()` kept getting recompiled anyway,
+   just less often, still climbing without bound over a long run.
+3. **Root cause of iteration 2's residual, and the actual fix**:
+   `DeoptAction::MakeNotCompilable` only added the method to
+   `SharedVm::jit_skip_set` — the registry consulted by the interpreter's
+   own per-call hotness/upgrade path (`vm/src/runtime/interpreter.rs`'s
+   `execute()`, ~line 5025). It did **not** update `cratonvm_jit`'s
+   separate RBC.4 bail-list (`is_jit_bail_listed`/`mark_jit_bail_listed`),
+   which is what `try_jit_compile_callee`/`_slow` consult — the path
+   actually taken when a JIT-compiled CALLER (`doHomebrew()`, itself
+   OSR-compiled — it's the benchmark's own hot loop) dispatches to
+   `toAbsolute()` as a callee. Two independent gates, same shape as the
+   pre-existing "native registration needs both `force_native_over_
+   real_jdk_bytecode` AND `check_override`" pattern already known in this
+   codebase — updating only one left the other free to keep re-attempting
+   compilation forever. **Fixed**: `DeoptimizationController::deoptimize`
+   now also calls `cratonvm_jit::mark_jit_bail_listed(...)` when the action
+   is `MakeNotCompilable`, populating both registries.
+
+**Verified**: `toAbsolute()` now compiles **exactly once** per process and
+never again, confirmed across 3 independent full runs (`grep -c
+'full-compile.*toAbsolute'` stays at 1; `action=MakeNotCompilable` fires
+once and the method stays bail-listed for the rest of the run — no further
+`bg-compile`/`full-compile` pairs). `cargo test -p cratonvm-jit deopt`: 86
+lib tests + all filtered integration suites green, no regressions from the
+policy change. This closes the doc's own specific complaint (recompiled
+80-94 times, net slower than interpreted).
+
+### New residual found: the relative-perf assertion still fails, for a different, deeper reason
+
+Even with the recompile storm eliminated, `TestResponsePerformance`'s
+`home-brew` time is still ~350-420s/round on this host — far above the
+historically-recorded 63,500-72,700ms/round fully-interpreted baseline, and
+still losing badly to `URI` (~25-27s/round). This number is **consistent
+across all 3 fix iterations** (always-`Reinterpret`, escalating-blacklist,
+and the final dual-registry fix), and — a targeted diagnostic — is
+**unchanged even under a clean `CRATONVM_JIT_DENY=Response.toAbsolute`**
+(a compile-time deny from the very first call, bypassing the entire
+deopt/eviction machinery this session touched). That rules out a bug in this
+session's fix: the cost is inherent to **`doHomebrew()` (JIT/OSR-compiled)
+dispatching to a non-compiled `toAbsolute()`** via the generic dispatch
+fallback (`vm/src/jit/helpers.rs`'s own comment on that path: "re-enters
+invoke_virtual on every element access, rebuilding conservative JIT roots
+each time") — independent of *why* `toAbsolute()` isn't compiled.
+
+This is a genuinely new, precisely-characterized finding, not a rediscovery
+of the doc's original complaint: `doHomebrew()`'s own OSR-compilation is
+driven purely by its own loop's hotness, independent of whether its callees
+are compilable, so the historical 63-72s/round baseline (measured
+2026-07-19, session 1, well before RBC.6 was even touched, with
+`toAbsolute()` ALREADY permanently interpreted via the old unconditional
+RBC.6 bail) plausibly had this exact same "JIT caller, interpreted callee"
+shape too — meaning either (a) an unrelated `dev` regression landed
+somewhere between 2026-07-19 and now that slowed this specific dispatch
+path (very plausible given the commit velocity demonstrated by the
+`b90ecea19` revert above — dev gained 20+ merges into this exact file's
+history alone in that window), or (b) host-load variance on this heavily
+shared box. Distinguishing these (and, if (a), bisecting to the responsible
+commit) is out of scope for this session — it is exactly the kind of
+"larger, separate interpreter-throughput investigation" this doc's own
+history has already deferred twice (2026-07-13, 2026-07-19 deep-dive).
+
+**`CRATONVM_JIT_OSR=0` control, and why the "JIT dispatch boundary" theory
+above is probably wrong too**: another concurrent session found an unrelated
+CRITICAL bug the same day — OSR-compiled loops crossing ~2000-3000 iterations
+silently RE-EXECUTE portions of their iterations (see
+`docs/known-issues/springboot/jit-osr-loop-duplicate-execution-silent-corruption.md`).
+`doHomebrew()`'s 1,000,000-iteration loop is OSR-compiled, so this looked
+like a very plausible explanation for the slowdown — tested it directly with
+`CRATONVM_JIT_OSR=0` (disables back-edge OSR, which should force
+`doHomebrew()`'s loop to run fully interpreted, since it's invoked too few
+times to ever cross the normal whole-method hotness threshold on its own).
+Result: `home-brew: 387056ms` — statistically identical to every other
+configuration tested (349-420s range across the 3 deopt-policy fix
+iterations, the `CRATONVM_JIT_DENY` control, and now this). **Ruled out**:
+not the OSR-duplicate-execution bug. More surprisingly, this also weakens
+the "JIT-caller-to-interpreted-callee dispatch is the tax" theory: with OSR
+off, `doHomebrew()` should be running FULLY interpreted (both caller and
+callee), which took just as long as every JIT-involved variant — suggesting
+whatever's actually slow here isn't specific to any JIT/interpreter boundary
+at all, and may be a broader interpreter-throughput or host-environment
+factor unrelated to `toAbsolute()`'s own compilability.
+
+**Recommendation for whoever picks this up next**: this residual is now
+LESS understood than it looked mid-session, not more — the working theories
+(recompile-adjacent, JIT-dispatch-boundary, OSR-duplicate-execution) have
+each been tested and ruled out in turn, leaving no confirmed culprit. (1) Get
+a genuinely quiet-host measurement (this Azure box's load average swung
+5.6-17.7 within a single session) of the SAME test at the SAME commit to
+separate host-load confound from a real regression; (2) if still slow on a
+quiet host, `perf`/instruction-count profile a plain, fully-interpreted run
+(`CRATONVM_DISABLE_JIT=1`) directly against the 2026-07-19 measurement's
+conditions to find what changed in raw interpreter throughput between then
+and now — the earlier CharChunk-vs-URI A/B framing may no longer be the
+right lens if the slowdown isn't specific to `toAbsolute()`'s own code
+shape.
+
+### Stale-pointer / OOB-field-read residual: not re-investigated this session
+
+The 2026-07-19 "stale pointer detected in invokevirtual receiver" /
+"out-of-bounds field read dropped" finding at `-Xmx2560m`-`3g` was not
+re-triggered this session — a repro attempt at `-Xmx2560m` was still in the
+`home-brew` phase (not yet reached `doUri()`'s allocation-pressure window)
+when this session's time budget ran out, since a full round now takes
+~350-420s (see the residual above) rather than the ~100s/round this
+diagnostic needs to reach 2 full rounds quickly. The underlying mechanism
+(blocked-thread root-snapshot/GC-sweep race producing an all-zero-header
+receiver, already hardened defensively via `plausible_heap_pointer` at every
+ref-decode site) is a known, previously-assessed-as-high-risk-to-fix bug
+family in an evolved GC subsystem — see prior investigation notes for the
+same defensive-recovery pattern. No new evidence this session; still a
+legitimate, low-priority, non-fatal pickup for a dedicated future session
+with more time budget (or a faster host state) to reach the trigger window.

@@ -2718,6 +2718,16 @@ pub(crate) fn native_class_is_assignable_from(
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+            && (this_name.contains("ObservationRegistry") || other_name.contains("ObservationRegistry"))
+        {
+            let this_cid = mirror_class_id(ctx, this);
+            let other_cid = mirror_class_id(ctx, other);
+            eprintln!(
+                "[OBSREG-DBG] isAssignableFrom this={:?}({} cid={:?}) other={:?}({} cid={:?})",
+                this, this_name, this_cid, other, other_name, other_cid
+            );
+        }
         if this_name.starts_with('[') || other_name.starts_with('[') {
             // Build descriptors. Non-array Class mirrors get an `L...;`
             // wrap to match the array_is_assignable contract; array
@@ -5333,8 +5343,68 @@ fn synthetic_declared_field_alias(
     }
 }
 
+/// Map a `LambdaSerialMetadata::capture_types` char (JVMS field-descriptor
+/// first byte, or `'L'` standing in for both reference and array captures —
+/// `parse_descriptor_args` erases the specific class/array-component name)
+/// to a field descriptor string. Reference captures get a generic
+/// `Ljava/lang/Object;` descriptor since the real one isn't retained; this
+/// only needs to be reflection-readable, not exact — real getters
+/// (`Field.get`) don't re-validate against the declared type on read.
+fn capture_field_descriptor(type_char: char) -> String {
+    match type_char {
+        'B' | 'C' | 'I' | 'S' | 'Z' | 'J' | 'F' | 'D' => type_char.to_string(),
+        _ => "Ljava/lang/Object;".to_string(),
+    }
+}
+
+/// Synthesize the captured-variable fields (`arg$1`, `arg$2`, ...) that
+/// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
+/// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
+/// `class_manager` (they live in `shared.lambda_proxies` instead — see
+/// `docs/internal/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
+/// for the same root cause in a sibling `Comparable` check), so
+/// `NativeContext::declared_fields` can't see them and reflective access to
+/// a lambda's captured field (e.g. AssertJ's `extracting("arg$1")` fallback,
+/// or a test's own `.extracting("jwtProcessor.arg$1...")`) fails with
+/// `NoSuchFieldException` even though the value is right there on the proxy
+/// object at field slot `i` (`allocate_lambda_proxy` in
+/// `vm/src/runtime/invokedynamic.rs` sets captures at fields `0..n` in
+/// factory-argument order, matching `capture_types`' order).
+///
+/// Field *naming* is 1-based (`arg$1` is the first capture, slot 0) —
+/// verified empirically against real HotSpot's `InnerClassLambdaMetafactory`
+/// output: there is no `arg$0`. The heap *slot index* stays 0-based, since
+/// `allocate_lambda_proxy` writes captures starting at field 0.
+fn lambda_proxy_captured_fields(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<FieldMetadata> {
+    let Some(meta) = ctx.lambda_proxy_serial_metadata(class_id) else {
+        return Vec::new();
+    };
+    meta.capture_types
+        .chars()
+        .enumerate()
+        .map(|(i, ty)| FieldMetadata {
+            name: format!("arg${}", i + 1),
+            descriptor: capture_field_descriptor(ty),
+            // ACC_PRIVATE | ACC_FINAL, deliberately WITHOUT ACC_SYNTHETIC:
+            // real HotSpot's `InnerClassLambdaMetafactory` adds these fields
+            // as plain private-final, not synthetic (verified empirically —
+            // AssertJ's `FieldUtils.readField` hard-rejects synthetic fields
+            // with `IllegalArgumentException: Reading synthetic field is not
+            // supported`, yet real JDK reflection over `arg$N` is exactly
+            // the pattern these tests rely on).
+            access_flags: 0x0012,
+            slot_index: i,
+            declaring_class_id: class_id,
+            is_static: false,
+        })
+        .collect()
+}
+
 fn declared_fields_with_aliases(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<FieldMetadata> {
     let mut fields = ctx.declared_fields(class_id);
+    if fields.is_empty() {
+        fields = lambda_proxy_captured_fields(ctx, class_id);
+    }
     if let Some(alias) = synthetic_declared_field_alias(ctx, class_id) {
         if fields.iter().all(|field| field.name != alias.name) {
             fields.push(alias);
@@ -12804,6 +12874,11 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok() && this_name.contains("ApplicationContextInitializer") {
+        eprintln!(
+            "[LAMBDA-GENERIC] getGenericInterfaces ENTRY this_name={this_name} class_id={class_id:?}"
+        );
+    }
     // If class has a Signature attribute, parse it for generic interfaces
     if let Some(sig_str) = ctx.class_signature(class_id) {
         if let Some(class_sig) = crate::generics::parse_class_signature(&sig_str) {
@@ -12846,6 +12921,14 @@ pub(crate) fn native_class_get_generic_interfaces(
                 }
                 arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(class_mirror_pin);
+                if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+                    && this_name.contains("ApplicationContextInitializer")
+                {
+                    eprintln!(
+                        "[LAMBDA-GENERIC] getGenericInterfaces(this_name={this_name}) via class_sig.interfaces = {:?}",
+                        class_sig.interfaces
+                    );
+                }
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
@@ -12865,6 +12948,66 @@ pub(crate) fn native_class_get_generic_interfaces(
     // then never proxies the lambda bean at all).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
         if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+            // Prefer a real `ParameterizedType` (e.g. `ApplicationContextInitializer<
+            // ConfigurableApplicationContext>`) when the functional interface is
+            // itself generic — reflection-based generic-argument resolvers
+            // require one and throw on a bare raw `Class`. Falls back to the
+            // long-standing raw-mirror behavior for non-generic SAM interfaces
+            // or whenever the type variable(s) can't be matched.
+            let dbg_lg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok();
+            if let Some((sam_name, sam_desc, inst_desc)) =
+                ctx.lambda_call_site_descriptors(class_id)
+            {
+                let sig = crate::generics::lambda_functional_interface_generic_type(
+                    ctx, iface_id, &iface_name, &sam_name, &sam_desc, &inst_desc,
+                );
+                if dbg_lg {
+                    eprintln!(
+                        "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} sam_name={sam_name} sam_desc={sam_desc} inst_desc={inst_desc} sig={sig:?}"
+                    );
+                }
+                if let Some(sig) = sig {
+                    // Residual 4 (2026-07-20, docs/known-issues/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+                    // `sig` names the lambda's OWN functional interface (e.g.
+                    // Spring AOT's `AotApplicationContextInitializer<C>`) as its
+                    // raw type — `typesig_to_real_type` must resolve that name
+                    // to a `Class` mirror, and does so through
+                    // `class_id_in_generic_scope`'s current `GENERIC_DECL_SCOPE`.
+                    // Without a scope set here, that resolution is loader-blind
+                    // and can pick up whichever copy the flat global store
+                    // already holds (observed: the Application loader's copy)
+                    // instead of the lambda's own fork loader's copy — the same
+                    // gap already fixed for the "real class" branch above (see
+                    // its own `GenericDeclScope::new` a few lines up). Scope to
+                    // the lambda's host class (its defining/enclosing class,
+                    // already correctly fork-loader-resolved by the time the
+                    // lambda exists) so the interface name resolves in the same
+                    // loader context as the lambda itself.
+                    let _gscope = ctx
+                        .lambda_proxy_host(class_id)
+                        .and_then(|host_name| ctx.class_id_by_name(&host_name))
+                        .map(|host_id| ctx.get_class_mirror(host_id))
+                        .map(|host_mirror| {
+                            crate::generics::GenericDeclScope::new(Value::Object(Some(
+                                host_mirror,
+                            )))
+                        });
+                    let val = crate::generics::typesig_to_real_type(ctx, &sig);
+                    if dbg_lg {
+                        eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
+                    }
+                    if let Value::Object(Some(pt)) = val {
+                        let arr = ctx.new_ref_array(ClassId::new(0), 1);
+                        ctx.set_array_element(arr, 0, Value::Object(Some(pt)));
+                        return Ok(Some(Value::Object(Some(arr))));
+                    }
+                }
+            } else if dbg_lg {
+                eprintln!(
+                    "[LAMBDA-GENERIC] class_id={class_id:?} iface={iface_name} lambda_call_site_descriptors=None"
+                );
+            }
             let mirror = ctx.get_class_mirror(iface_id);
             let elem = ctx
                 .class_id_by_name("java/lang/Class")

@@ -378,7 +378,14 @@ fn open_and_register(
         name_index: None,
     };
     let handle = next_handle();
-    jar_table().lock().insert(handle, state);
+    let table_len = {
+        let mut t = jar_table().lock();
+        t.insert(handle, state);
+        t.len()
+    };
+    if std::env::var_os("CRATONVM_DBG_JAR").is_some() {
+        eprintln!("[JAR] open handle={handle} table_len={table_len} path={validated_path:?}");
+    }
     set_jar_handle(ctx, this, handle);
     // Recovery key for `get_jar_handle` when the object has no writable handle
     // slot (plain ZipFile): map its identity hash → handle.
@@ -1025,7 +1032,14 @@ fn native_jarfile_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(None),
     };
     let handle = get_jar_handle(ctx, this);
-    jar_table().lock().remove(&handle);
+    let table_len = {
+        let mut t = jar_table().lock();
+        t.remove(&handle);
+        t.len()
+    };
+    if std::env::var_os("CRATONVM_DBG_JAR").is_some() {
+        eprintln!("[JAR] close handle={handle} table_len={table_len}");
+    }
     // Drop the identity→handle recovery entry if it still points at us.
     if let Some(id) = identity_hash(ctx, this) {
         let mut t = identity_handle_table().lock();
@@ -1210,6 +1224,72 @@ mod tests {
         zw.write_all(b"hello jar world").unwrap();
         zw.finish().unwrap();
         tmp
+    }
+
+    #[test]
+    #[ignore]
+    fn diag_bench_open_all_module_jars() {
+        // Diagnostic-only, not a real regression test: point
+        // CRATONVM_DIAG_JAR_LIST at a newline/semicolon-separated classpath
+        // file (e.g. spring-boot-jetty's cratonvm-test-cp.txt) and time how
+        // long raw `zip::ZipArchive::new` open + central-directory parse
+        // takes across every real jar, to isolate whether that's the TLD-scan
+        // slowdown bottleneck independent of the VM/interpreter.
+        let list_path = std::env::var("CRATONVM_DIAG_JAR_LIST")
+            .expect("set CRATONVM_DIAG_JAR_LIST to a classpath file path");
+        let contents = std::fs::read_to_string(&list_path).unwrap();
+        let paths: Vec<&str> = contents
+            .split(|c| c == ';' || c == '\n' || c == '\r')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty() && s.to_ascii_lowercase().ends_with(".jar"))
+            .collect();
+        eprintln!("diag: {} jar paths", paths.len());
+
+        let start = std::time::Instant::now();
+        let mut opened = 0usize;
+        let mut failed = 0usize;
+        let mut per_jar: Vec<(std::time::Duration, &str)> = Vec::new();
+        for p in &paths {
+            let t0 = std::time::Instant::now();
+            match File::open(p) {
+                Ok(f) => match zip::ZipArchive::new(f) {
+                    Ok(_archive) => {
+                        opened += 1;
+                        per_jar.push((t0.elapsed(), p));
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("diag: zip parse failed for {p}: {e}");
+                    }
+                },
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("diag: open failed for {p}: {e}");
+                }
+            }
+        }
+        let total = start.elapsed();
+        per_jar.sort_by(|a, b| b.0.cmp(&a.0));
+        eprintln!(
+            "diag: opened={opened} failed={failed} total={total:?} avg={:?}",
+            total.checked_div(opened.max(1) as u32).unwrap_or_default()
+        );
+        eprintln!("diag: top 15 slowest opens:");
+        for (dur, p) in per_jar.iter().take(15) {
+            eprintln!("diag:   {dur:?}  {p}");
+        }
+
+        // Second pass: re-open the SAME jars again (simulating a second
+        // TldScanner pass / second server start in the same process) to see
+        // whether repeat opens are cheaper (OS file-cache warm) or the same
+        // cost every time.
+        let start2 = std::time::Instant::now();
+        for p in &paths {
+            if let Ok(f) = File::open(p) {
+                let _ = zip::ZipArchive::new(f);
+            }
+        }
+        eprintln!("diag: second pass (warm cache) total={:?}", start2.elapsed());
     }
 
     #[test]

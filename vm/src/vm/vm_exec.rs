@@ -5409,6 +5409,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|cs| cs.functional_interface.to_string())
     }
 
+    fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
+        self.shared.lambda_proxies.read().get(&class_id).map(|cs| {
+            (
+                cs.sam_method_name.to_string(),
+                cs.sam_descriptor.to_string(),
+                cs.instantiated_descriptor.to_string(),
+            )
+        })
+    }
+
     fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
         // Prefer the recorded *defining* class (where the lambda / method-ref's
         // invokedynamic appears) — this is what HotSpot names the proxy after and
@@ -16406,7 +16416,17 @@ fn invoke_on_class_shared_inner(
                                 | "java/lang/AbstractStringBuilder"
                         ) && method_name == "insert"
                             && (descriptor.starts_with("(I[CII)")
-                                || descriptor.starts_with("(I[C)")));
+                                || descriptor.starts_with("(I[C)")))
+                        // Keep in sync with interpreter.rs's
+                        // `force_native_over_real_jdk_bytecode` entry for the
+                        // same triple — see that entry's comment for the full
+                        // rationale (`java.lang.ClassValue.get()` has real JDK
+                        // bytecode relying on `Class.classValueMap`, which
+                        // CratonVM's Class mirrors don't back; the registered
+                        // native's memoized `computeValue` dispatch must win).
+                        || (class_name == "java/lang/ClassValue"
+                            && method_name == "get"
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
                     if check_override
                         && shared
                             .native_methods

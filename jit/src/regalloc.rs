@@ -1210,6 +1210,71 @@ pub fn allocate_registers(
     )
 }
 
+/// Compute, for every bytecode PC, the set of locals live-IN at that
+/// instruction (bit `i` set ⇒ local `i` may still be read before its next
+/// definition). Unlike [`RegAllocResult::block_live_in`] (block-boundary
+/// granularity only), this walks each basic block backward at *instruction*
+/// granularity — the same per-instruction gen/kill walk [`build_interference`]
+/// already does, just kept instead of discarded after building interference
+/// edges — so a caller can ask "is local `i` still live at this exact bci"
+/// rather than only "at this block's start".
+///
+/// Written for the OSR-exit deopt snapshot (`x64.rs`'s
+/// `build_and_record_deopt_point`): a local whose machine location can't be
+/// decoded at a snapshot bci (`FrameValue::Unsupported`) used to force the
+/// WHOLE snapshot to reject, even when that local is provably dead there
+/// (e.g. a loop induction variable read for the last time inside the loop,
+/// snapshotted at a trap several instructions after the loop exits). A
+/// rejected OSR-exit snapshot falls back to "continue interpreting the
+/// pre-OSR-entry frame", which re-runs every loop iteration the OSR-compiled
+/// code already executed — silently duplicating side effects (see
+/// `docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
+/// Knowing a local is dead at the snapshot bci lets the caller substitute a
+/// safe placeholder instead of rejecting outright.
+///
+/// Same 64-local cap as the rest of this module (bit `i` only meaningful for
+/// `i < 64`); a caller must treat locals `>= 64` as conservatively live (as
+/// they already do for `block_live_in`).
+pub fn live_locals_per_pc(code: &[u8], code_len: usize, num_params: usize) -> Vec<u64> {
+    let mut blocks = build_cfg(code, code_len);
+    for block in &mut blocks {
+        compute_gen_kill(code, block);
+    }
+    solve_liveness(&mut blocks, num_params);
+
+    let mut live_at = vec![0u64; code_len + 1];
+    for block in &blocks {
+        let mut pcs = Vec::new();
+        {
+            let mut pc = block.start_pc;
+            while pc < block.end_pc {
+                pcs.push(pc);
+                pc += bc_len(code, pc);
+            }
+        }
+
+        // Backward walk, exactly mirroring `build_interference`'s per-instruction
+        // update, but recording the live-in set at every pc instead of only using
+        // it to derive interference edges.
+        let mut live = block.live_out;
+        for &pc in pcs.iter().rev() {
+            if let Some((idx, is_use, is_def)) = local_access(code, pc) {
+                if idx < 64 {
+                    let bit = 1u64 << idx;
+                    if is_def && !is_use {
+                        live &= !bit;
+                    }
+                    if is_use {
+                        live |= bit;
+                    }
+                }
+            }
+            live_at[pc] = live;
+        }
+    }
+    live_at
+}
+
 /// Run register allocation for a method (ARM64).
 pub fn allocate_registers_arm64(
     code: &[u8],
@@ -2103,5 +2168,71 @@ mod tests {
         for &r in &result.used_callee_saved {
             assert!((19..=28).contains(&r), "callee-saved reg X{r} not in range");
         }
+    }
+
+    // ── live_locals_per_pc (OSR-exit dead-local detection) ──────────────────
+
+    #[test]
+    fn live_locals_per_pc_marks_loop_counter_dead_after_loop_exit() {
+        // Mirrors the shape of `TestOutputBuffer.WritingServlet.doGet`'s
+        // `for (int i = 0; i < writeCount; i++) w.write(...)` loop: a counter
+        // local that is live throughout the loop body but genuinely dead once
+        // control reaches the post-loop code (here, returning a DIFFERENT
+        // local). Local 0 = returned after the loop, local 1 = loop counter
+        // `i`, local 2 = the loop bound.
+        #[rustfmt::skip]
+        let code: [u8; 15] = [
+            0x03,             // 0:  iconst_0
+            0x3c,             // 1:  istore_1        i = 0
+            0x1b,             // 2:  iload_1          <- LOOP HEADER
+            0x1c,             // 3:  iload_2
+            0xa2, 0x00, 0x09, // 4:  if_icmpge +9 -> pc13 (EXIT)
+            0x84, 0x01, 0x01, // 7:  iinc 1, 1
+            0xa7, 0xff, 0xf8, // 10: goto -8 -> pc2 (LOOP HEADER)
+            0x1a,             // 13: iload_0          <- EXIT
+            0xac,             // 14: ireturn
+        ];
+        let live_at = live_locals_per_pc(&code, code.len(), 3);
+
+        // Inside the loop (the `iinc`), the counter is live: the loop
+        // condition and the increment itself both still need it.
+        assert_ne!(
+            live_at[7] & (1 << 1),
+            0,
+            "loop counter (local 1) must be live at the iinc inside the loop"
+        );
+
+        // At the post-loop `iload_0` the counter is dead — nothing after this
+        // point reads local 1 before the method returns.
+        assert_eq!(
+            live_at[13] & (1 << 1),
+            0,
+            "loop counter (local 1) must be dead once the loop has exited"
+        );
+        // The local the post-loop code actually reads IS live there.
+        assert_ne!(
+            live_at[13] & (1 << 0),
+            0,
+            "local 0 must be live at the iload_0 that reads it"
+        );
+    }
+
+    #[test]
+    fn live_locals_per_pc_straight_line_no_locals_live_after_last_use() {
+        let code: [u8; 6] = [
+            0x1a, // 0: iload_0
+            0x1b, // 1: iload_1
+            0x60, // 2: iadd
+            0x3c, // 3: istore_1   (local 1 redefined — its old value is dead)
+            0x1c, // 4: iload_2
+            0xac, // 5: ireturn (return value must be int on stack; irrelevant here)
+        ];
+        let live_at = live_locals_per_pc(&code, code.len(), 3);
+        // At the final `iload_2`, locals 0 and 1 are both dead: local 0's only
+        // use was at pc0, and local 1 was just overwritten at pc3 without a
+        // subsequent read before the method returns.
+        assert_eq!(live_at[4] & (1 << 0), 0, "local 0 dead after its only use");
+        assert_eq!(live_at[4] & (1 << 1), 0, "local 1 dead after being overwritten");
+        assert_ne!(live_at[4] & (1 << 2), 0, "local 2 live at the iload_2 that reads it");
     }
 }

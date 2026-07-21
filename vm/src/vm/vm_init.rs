@@ -1353,6 +1353,8 @@ impl SharedVm {
         // Reset cached System.getenv()/getProperties() singletons too, so a new
         // VM never returns a stale ObjectRef from a previous instance.
         cratonvm_native_builtins::lang_system::reset_system_singletons();
+        // Reset the ClassValue memoization cache (BUG-W) for the same reason.
+        cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
@@ -2347,9 +2349,32 @@ impl SharedVm {
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
-            cratonvm_native_builtins::jmx::register_management_factory_platform_server_stub(
-                &mut native_methods,
-            );
+            // JMX-CLUSTER-20260720: do NOT register
+            // `register_management_factory_platform_server_stub` here. It was
+            // added 2026-07-14 as a Bridge (always-wins) override that
+            // permanently shadows real bytecode for
+            // `ManagementFactory.getPlatformMBeanServer()` with an empty
+            // synthetic `MBeanServer` — directly undoing the KAFKA-MBEAN fix
+            // in `register_management_factory` (`native-builtins/src/jmx.rs`),
+            // which deliberately leaves this method unregistered so real
+            // `MBeanServerFactory.createMBeanServer()` bytecode constructs a
+            // genuine `JmxMBeanServer` with a real `registerMBean` Code
+            // attribute. The 07-14 override's rationale was a real,
+            // then-uninvestigated NPE deep in `ObjectName.
+            // getCanonicalKeyPropertyListString()` (`_ca_array` null on the
+            // synthetic 1-field ObjectName model) that aborted the platform
+            // MXBean registration loop — that NPE (and its sibling in
+            // `getSerializedNameString()`/`_kp_array`, hit when an
+            // ObjectName is actually serialized over jmxmp) is now fixed by
+            // the `RKC-ObjectName-01/02/03` natives in `jmx.rs`, so the
+            // workaround is obsolete: it was left in permanently and never
+            // reverted, silently zeroing out EVERY platform MXBean
+            // (Memory/Threading/ClassLoading/...) registered on
+            // `getPlatformMBeanServer()` in real-JDK mode ever since —
+            // confirmed via `MBeanServer.queryNames(null, null)` returning
+            // 0 entries. Leaving this call out restores the original
+            // KAFKA-MBEAN behavior: real bytecode runs end-to-end.
+            //
             // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() and
             // friends. See companion call in the `feature = "synthetic-jdk"`
             // branch above for the rationale (real-JDK bytecode delegates

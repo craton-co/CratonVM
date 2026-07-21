@@ -9,7 +9,7 @@
 //! GenericArrayType}` heap objects via `NativeContext`.
 
 use cratonvm_native_api::registry::NativeContext;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -171,13 +171,18 @@ fn class_id_in_generic_scope(
     ctx: &dyn NativeContext,
     name: &str,
 ) -> Option<cratonvm_types::ClassId> {
-    let scoped = GENERIC_DECL_SCOPE
-        .with(|scope| scope.get())
-        .and_then(|decl| {
-            ctx.class_id_from_mirror(decl)
-                .and_then(|near| ctx.class_id_by_name_near(name, near))
-        });
-    scoped.or_else(|| ctx.class_id_by_name(name))
+    let dbg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok() && name.contains("ApplicationContextInitializer");
+    let decl_opt = GENERIC_DECL_SCOPE.with(|scope| scope.get());
+    let near_opt = decl_opt.and_then(|decl| ctx.class_id_from_mirror(decl));
+    let scoped = near_opt.and_then(|near| ctx.class_id_by_name_near(name, near));
+    let global = ctx.class_id_by_name(name);
+    if dbg {
+        eprintln!(
+            "[LAMBDA-GENERIC] class_id_in_generic_scope name={name} decl_present={} near={near_opt:?} scoped={scoped:?} global={global:?}",
+            decl_opt.is_some()
+        );
+    }
+    scoped.or(global)
 }
 
 fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
@@ -720,6 +725,170 @@ pub fn type_param_to_java(
     }
     ctx.unpin_native_roots(tv_pin);
     Value::Object(Some(tv))
+}
+
+/// Synthesize a concrete, parameterized `TypeSig::Class` for a lambda proxy's
+/// functional interface (e.g. `ApplicationContextInitializer<
+/// ConfigurableApplicationContext>` for a `ctx -> {...}` lambda), using:
+///
+/// - the interface's own `Signature` attribute, for its declared type
+///   parameters (`class_sig.type_params`);
+/// - the SAM method's OWN `Signature` attribute (looked up via its type-erased
+///   descriptor, `sam_descriptor` — the key `method_signature` needs), for
+///   which parameter/return position each type variable appears at; and
+/// - the lambda's call-site `instantiated_descriptor` (concrete, generics-free
+///   — the same descriptor `LambdaMetafactory`'s bootstrap records for this
+///   exact use site), for the concrete type standing in for each type
+///   variable at that position.
+///
+/// A lambda proxy is not in the class store, so it carries no `Signature`
+/// attribute of its own the way a real (compiler-emitted) lambda/anonymous
+/// class would — this reconstructs the equivalent `ParameterizedType`
+/// HotSpot's own generated lambda class exposes, from the pieces CratonVM
+/// already records at `invokedynamic` bootstrap time.
+///
+/// Returns `None` whenever the interface has no generic signature, the SAM
+/// method's signature can't be found or parsed, the instantiated descriptor's
+/// arity doesn't match, or a type variable can't be matched to any SAM
+/// parameter/return position — every caller falls back to the raw (plain,
+/// non-generic) interface `Class` in that case, exactly as before this
+/// existed. Reflection-based generic-argument resolvers (Spring's
+/// `GenericTypeResolver`/`ResolvableType`, and similar) require an actual
+/// `ParameterizedType` to extract a type argument and throw
+/// (`IllegalStateException: No generic type found...`) when only a raw
+/// `Class` is available — concretely, `SpringApplication.applyInitializers`
+/// resolving the `C` in `ApplicationContextInitializer<C>` for a lambda-typed
+/// initializer.
+pub(crate) fn lambda_functional_interface_generic_type(
+    ctx: &mut dyn NativeContext,
+    iface_id: ClassId,
+    iface_name: &str,
+    sam_method_name: &str,
+    sam_descriptor: &str,
+    instantiated_descriptor: &str,
+) -> Option<TypeSig> {
+    let root_sig_str = ctx.class_signature(iface_id)?;
+    let root_sig = parse_class_signature(&root_sig_str)?;
+    if root_sig.type_params.is_empty() {
+        return None;
+    }
+
+    // The SAM method is very often not declared directly on the functional
+    // interface itself — a marker/specialized subinterface (e.g. Spring's
+    // `AotApplicationContextInitializer<C> extends ApplicationContextInitializer<C>`)
+    // merely narrows or forwards a type parameter declared several levels up,
+    // where the SAM is actually declared. Walk the (single-inheritance, as is
+    // universal for real functional interfaces) `extends` chain, threading a
+    // substitution map so a type variable used at any level can be traced
+    // back to one of `iface_id`'s OWN (root) type parameters — or, if some
+    // intermediate level already fixed it to a concrete type, resolved
+    // directly without needing the lambda's instantiated descriptor at all.
+    //
+    // `subst` maps a type-param name AT THE CURRENT WALK LEVEL to either
+    // `TypeSig::TypeVar(root_name)` (still free — traces back to `root_name`
+    // on `iface_id`) or any other concrete `TypeSig` (already fixed by an
+    // intermediate `extends Foo<Concrete>` on the way up).
+    let mut subst: std::collections::HashMap<String, TypeSig> = root_sig
+        .type_params
+        .iter()
+        .map(|tp| (tp.name.clone(), TypeSig::TypeVar(tp.name.clone())))
+        .collect();
+    let mut current_id = iface_id;
+    let mut current_sig = root_sig.clone();
+
+    // Bounded walk — mirrors the depth caps used elsewhere in this codebase
+    // for hierarchy walks (defensive against a pathological/cyclic signature).
+    let (method_sig, subst) = 'walk: {
+        for _ in 0..8 {
+            if let Some(sig_str) = ctx.method_signature(current_id, sam_method_name, sam_descriptor)
+            {
+                if let Some(m) = parse_method_signature(&sig_str) {
+                    break 'walk (m, subst);
+                }
+            }
+            let next_iface = current_sig.interfaces.first()?;
+            let TypeSig::Class {
+                name: next_name,
+                type_args: next_type_args,
+                ..
+            } = next_iface
+            else {
+                return None;
+            };
+            // Residual 4 (2026-07-20, docs/known-issues/springboot/
+            // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+            // this superinterface walk climbing from a lambda's functional
+            // interface (e.g. Spring AOT's `AotApplicationContextInitializer<C>
+            // extends ApplicationContextInitializer<C>`) up to `next_name` used
+            // a loader-blind `class_id_by_name`. When `current_id`'s copy of the
+            // walk is itself the ONLY thing this fork context has touched so far
+            // (its own super-interface never separately resolved), the blind
+            // lookup silently picks up whichever copy the flat global store
+            // already holds — not necessarily the same loader as `current_id`.
+            // Stay within `current_id`'s own loader scope, mirroring every
+            // other loader-aware resolution in this cluster.
+            let next_id = ctx
+                .class_id_by_name_near(next_name, current_id)
+                .or_else(|| ctx.class_id_by_name(next_name))?;
+            let next_sig_str = ctx.class_signature(next_id)?;
+            let next_sig = parse_class_signature(&next_sig_str)?;
+            let mut new_subst = std::collections::HashMap::new();
+            for (i, tp) in next_sig.type_params.iter().enumerate() {
+                let bound = match next_type_args.get(i) {
+                    Some(TypeArg::Exact(TypeSig::TypeVar(name))) => subst
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| TypeSig::TypeVar(name.clone())),
+                    Some(TypeArg::Exact(concrete)) => concrete.clone(),
+                    // Wildcards / missing args carry no substitutable info —
+                    // treat as a fresh free variable local to this level (it
+                    // simply won't trace back to any root var, which correctly
+                    // makes that root var unresolved rather than wrong).
+                    _ => TypeSig::TypeVar(tp.name.clone()),
+                };
+                new_subst.insert(tp.name.clone(), bound);
+            }
+            subst = new_subst;
+            current_id = next_id;
+            current_sig = next_sig;
+        }
+        return None;
+    };
+
+    // A plain (generics-free) method descriptor is itself valid input to the
+    // signature grammar (`TypeArguments` are simply absent) — no separate
+    // descriptor-only parser is needed to recover the instantiated types.
+    let instantiated = parse_method_signature(instantiated_descriptor)?;
+    if instantiated.param_types.len() != method_sig.param_types.len() {
+        return None;
+    }
+
+    let mut type_args = Vec::with_capacity(root_sig.type_params.len());
+    for tp in &root_sig.type_params {
+        let root_var = TypeSig::TypeVar(tp.name.clone());
+        // Which type-var name AT THE SAM'S DECLARING LEVEL traces back to
+        // this root parameter?
+        let local_name = subst
+            .iter()
+            .find(|(_, bound)| **bound == root_var)
+            .map(|(local, _)| local.clone())?;
+        let concrete = method_sig
+            .param_types
+            .iter()
+            .position(|p| matches!(p, TypeSig::TypeVar(n) if n == &local_name))
+            .map(|i| instantiated.param_types[i].clone())
+            .or_else(|| {
+                matches!(&method_sig.return_type, TypeSig::TypeVar(n) if n == &local_name)
+                    .then(|| instantiated.return_type.clone())
+            })?;
+        type_args.push(TypeArg::Exact(concrete));
+    }
+
+    Some(TypeSig::Class {
+        name: iface_name.to_string(),
+        type_args,
+        owner: None,
+    })
 }
 
 /// Build a REAL `sun.reflect.generics.reflectiveObjects.*` Type from a `TypeSig`.

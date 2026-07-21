@@ -123,19 +123,19 @@ correctness bug. If this resurfaces, prefer running the affected class
 directly via `SbRunner`/a single-method runner rather than trusting the
 suite runner's own status classification for it.
 
-## Residual (tracked separately, per triage rule)
+## Residual (tracked separately, per triage rule) — now also FIXED
 
 - **`propertieslauncher-loader-path-ignored-wrong-app-launched.md`**
-  (still OPEN) — the pre-existing, separately-root-caused 11-test cluster in
+  — the pre-existing, separately-root-caused 11-test cluster in
   `PropertiesLauncherTests` (`loader.path` silently not applied). This fix
   happened to repair 8 of those 11 as a side effect (better `URL`/classpath
-  resolution generally). Re-measured full-class run: 28/32 tests pass, 4
-  fail — 3 from the original 11 (`testUserSpecifiedNestedJarPath`,
-  `testUserSpecifiedClassLoader`,
-  `classPathWithoutLoaderPathDefaultsToJarLauncherIncludes`) plus one test
-  not in the original catalogue (`testUserSpecifiedClassPathOrder` — current
-  checkout's fixture set has moved since 2026-07-17). That doc has been
-  updated with this count.
+  resolution generally). The remaining 4 (`testUserSpecifiedNestedJarPath`,
+  `testUserSpecifiedClassLoader`, `classPathWithoutLoaderPathDefaultsToJarLauncherIncludes`,
+  `testUserSpecifiedClassPathOrder`) were fixed 2026-07-20 — two independent
+  bugs (a naive global string-replace corrupting directory-shaped nested jar
+  URLs, and real-JDK-mode `ClassLoader.loadClass` never delegating to a
+  user-defined parent). Full class now 32/32 PASS. See
+  [`propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md`](propertieslauncher-loader-path-ignored-wrong-app-launched-FIXED.md).
 
 ## Affected classes (original)
 

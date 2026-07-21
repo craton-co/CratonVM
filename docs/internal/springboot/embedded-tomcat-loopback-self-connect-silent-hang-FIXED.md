@@ -112,13 +112,16 @@ let needs_exact_class_dispatch = resolved_from_receiver
 
 ## Relationship to `webclient-loopback-self-connect-timeout-os10060-cluster.md`
 
-That doc (still OPEN, root cause not confirmed) describes a *different*,
-milder symptom on the same general shape of test (self-connect over
-loopback to a just-started embedded server) — a fast, real OS-level `os
-error 10060` failure, not a silent indefinite hang. This fix does not touch
-networking/socket code at all (the actual mechanism was a VM-internal
-dispatch/locking issue, unrelated to sockets), so that doc's underlying
-question remains open and is not resolved by this fix.
+That doc describes a *different*, milder symptom on the same general shape
+of test (self-connect over loopback to a just-started embedded server) — a
+fast, real OS-level `os error 10060` failure, not a silent indefinite hang.
+This fix does not touch networking/socket code at all (the actual mechanism
+was a VM-internal dispatch/locking issue, unrelated to sockets), so it did
+not resolve that doc's underlying question. That doc is now **also FIXED**
+(2026-07-20, independently — see
+[`webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md`](webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md)),
+via an unrelated non-blocking-connect-semantics fix in
+`native-io/src/socket_channel.rs`. Both self-connect clusters are closed.
 
 ## Affected classes (confirmed fixed)
 

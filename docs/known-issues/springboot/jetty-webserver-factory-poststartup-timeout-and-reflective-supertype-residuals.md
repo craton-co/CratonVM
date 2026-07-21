@@ -8,7 +8,23 @@ test fixture, unrelated to CratonVM). `JettyServletWebServerFactoryTests` no
 longer hangs on the blocking-read bug either — it now runs 3x further into the
 class (42+ server start/stop cycles vs. the old stuck point at 14) before
 hitting a newly-exposed, unrelated OPEN residual (severe TLD/JAR-scan slowdown
-in Xerces XML parsing, not a hang) — see the bottom section.**
+in Xerces XML parsing, not a hang) — see the bottom section. **2026-07-21
+update: the JAR-open/JarFile-native/classpath-resource-lookup layers have all
+been ruled out with hard timing measurements, and the slowdown has been
+isolated to genuine Xerces SAX-parsing execution cost via a standalone,
+file-I/O-free repro. Root-caused (via cdb stack sampling) and PARTIALLY
+FIXED: `invokestatic` was missing the same inline-cache fast path
+`invokevirtual`/`invokespecial`/`invokeinterface` already had, so every
+static method call in JDK-internal (Xerces, and any other bootstrap-package)
+bytecode paid full method resolution + a heap-allocating descriptor parse on
+every single call, not just the first. Fixed in
+`vm/src/runtime/interpreter.rs` — real, verified, universal interpreter
+improvement (not Jetty/Xerces-specific), but the full suite still does NOT
+complete within 900s: a large (~180s) stall remains on at least one test,
+consistent with first-call/cache-population cost across the much larger set
+of distinct call sites a full DTD/schema-validating parse exercises (this
+session's repro was intentionally non-validating). Still OPEN; see the
+bottom section for the complete diagnosis, what's fixed, and what's next.**
 
 ## Scope and separation
 
@@ -290,27 +306,340 @@ in
 
 Unlike the Liquibase/Keycloak case (one large XSD/changelog file, dominated
 by per-character `scanQName`/`scanContent` work), TLD scanning parses **many
-small files**, so the balance likely shifts to per-call overhead in `load`'s
-buffer-refill path (backed by a real `InputStreamReader` over a
-`ByteArrayInputStream` of already-inflated bytes — see
-`native-io/src/zip_real_jar.rs`'s `getInputStream` doc comment — so the
-underlying byte read itself is not the suspect; the JAR-open/central-directory
-parse cost per `new JarFile(...)`, repeated across all ~171 jars on every one
-of the ~115 tests' server starts, is a more likely multiplier) or in
-per-server-start jar-scan repetition with no cross-instance caching. Not yet
-root-caused past this point — this needs the same kind of dedicated
-diagnostic pass (Rust-level profiling of `native-io/src/zip_real_jar.rs`'s
-jar-open path, or extending the `XMLEntityScanner` force-native gate to
-`load`) that produced the Liquibase/Xerces fix, and is being tracked
-separately rather than blocking this doc's closure, since it's a distinct
-root cause (XML/JAR-scan performance, not networking) that plausibly affects
-any Spring Boot suite exercising Jasper/JSP TLD scanning across many
-sequential server starts, not just Jetty.
+small files**, so the balance was suspected to shift to per-call overhead
+somewhere else in the pipeline. This section originally speculated about
+JAR-open cost and a `load`-specific native fast path; a follow-up session
+(2026-07-21, worktree `fix/jetty-tld-jarscan-slowness-20260721`) measured
+each candidate directly and narrowed it down substantially. **Still OPEN —
+not fixed** — but the search space is now much smaller.
 
-**Next steps**: reproduce in isolation with a profiling build (or
-`CRATONVM_DBG_JIT_DISASM`/sampling); check whether `new JarFile(...)` reopens
-the same 171 jars from scratch on every one of the ~115 tests (no
-cross-server-instance handle cache) and whether that dominates; if so, either
-cache open `JarState` by canonical path across the process, or add a
-`load`-specific native fast path mirroring the existing `scanQName`/
-`scanContent` ones.
+### Ruled out, with hard numbers
+
+1. **Raw JAR-open cost (`native-io/src/zip_real_jar.rs`, the `zip` crate).**
+   A diagnostic Rust test (`zip_real_jar::tests::diag_bench_open_all_module_jars`,
+   `#[ignore]`d, run with `CRATONVM_DIAG_JAR_LIST=<classpath file>`) opened
+   all 167 real jars on the `spring-boot-jetty` module's test classpath via
+   plain `zip::ZipArchive::new`: **215.9ms total (167 jars, avg 1.29ms
+   each)**, 197ms on a warm-cache second pass. Even at ~115 repeats (worst
+   case, no caching) that's ~25s total — nowhere near the observed 550s+ of
+   spike time. Raw zip parsing is not the bottleneck.
+
+2. **`java.util.jar.JarFile`/`ZipFile` native construction is never even
+   reached for this workload.** Added `CRATONVM_DBG_JAR=1` tracing to
+   `open_and_register`/`native_jarfile_close` (fd-handle open/close +
+   registry size). A 300s trace run of `JettyServletWebServerFactoryTests`
+   (covering multiple full server-start cycles) produced **zero** `[JAR]`
+   lines. Tomcat's TLD scanning for this classpath shape does not go through
+   CratonVM's `java.util.jar.JarFile` native emulation at all.
+
+3. **`classloading::ClassPath::new` (the flat-classpath loader that reads
+   every jar's bytes into memory once, referenced by the `[jboss-bf]`
+   log lines) is not reconstructed per server start.** Added
+   `CRATONVM_DBG_CLASSPATH=1` timing to `ClassPath::new`. Across the same
+   300s trace window (~20+ server-start cycles), it was called only **twice**
+   total, at **167ms** for a real 176-path load. It's built once (or a
+   couple of times) at VM/classloader setup, not per Jetty server instance —
+   the original "reopens the same 171 jars from scratch on every test"
+   hypothesis is wrong.
+
+4. **`ClassPath::find_resource` / `find_all_resource_urls` (the resource
+   lookup layer backing `getResource(AsStream)`/`getResources`) are not the
+   bottleneck either.** Added `CRATONVM_DBG_RESOURCE_TIMING=1` timing
+   (`diag_resource_call_wrapper` in `classloading/src/class_path.rs`). Over a
+   400s trace window (31 server-start cycles), only **415 total calls**,
+   **~38ms cumulative time**. Negligible.
+
+### Confirmed, with hard numbers: it's genuine Xerces/SAX parsing execution cost
+
+A standalone, pure-JDK repro (no file/jar/classpath I/O at all — see
+`docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/`) parses a
+~500-byte TLD-shaped XML document repeatedly with a **reused** `SAXParser`
+(mirroring Tomcat's pooled `Digester`, so parser-construction cost doesn't
+confound the measurement):
+
+| | HotSpot | CratonVM (jit=on) | CratonVM (`--nojit`) |
+|---|---:|---:|---:|
+| reused-parser parse | ~44us | ~8.7ms | ~13.0ms |
+| fresh `newSAXParser()` | ~360us | ~12.6ms | ~15.0ms |
+
+**~197x slower per parse even with a warm/reused parser**, entirely inside
+the `parse()` call, with zero file or jar I/O involved. JIT provides a real
+but modest ~33% speedup (8.7ms vs. 13.0ms) — it is not being denied/skipped,
+but it doesn't come close to closing the gap, matching the Liquibase/Keycloak
+precedent's own experience (that fix needed dedicated native fast paths, not
+just "let the JIT handle it").
+
+This single isolated measurement is the right order of magnitude to explain
+the real-world spikes: a ~190s spike over a genuinely small number of actual
+`.tld`-file parses (most of the 167 classpath jars are filtered out by
+Tomcat's own jar-skip-list before ever being opened) is entirely consistent
+with each real parse costing single-digit milliseconds to low tens of
+milliseconds, especially once Digester's DTD/schema-validation overhead
+(absent from this minimal repro) is added back in.
+
+**`UTF8Reader` tested and refuted as the specific hot method.** Given `load`
+is a thin ~15-bytecode wrapper around one `Reader.read(char[], int, int)`
+call, and `com.sun.org.apache.xerces.internal.impl.io.UTF8Reader` (the
+concrete `Reader` Xerces picks for UTF-8-declared documents, confirmed via
+`javap -c` on `XMLEntityScanner.createReader`) is — like `load` — **absent**
+from the existing `XMLEntityScanner` force-native gate, it was a natural
+next suspect. `SaxEncodingCompare.java` (same repro directory) parses the
+identical logical document as both UTF-8 (`UTF8Reader`) and US-ASCII
+(`ASCIIReader`) under CratonVM: ASCII was **not** faster (13.5ms vs. 8.7ms
+for UTF-8) — if `UTF8Reader`'s byte-decode loop were the hot path, ASCII
+should have been faster, not slower. The bottleneck is in scanning/attribute/
+namespace/entity-manager/symbol-table machinery shared by both encodings,
+not in encoding-specific byte decoding.
+
+### Still OPEN — what's left
+
+The exact hot method(s) within Xerces's general SAX scanning pipeline
+(`XMLDocumentFragmentScannerImpl`/`XMLNSDocumentScannerImpl`, attribute
+processing, symbol-table interning, entity-manager/grammar-pool setup even
+for a non-validating, DTD-less parse) are **not yet pinned down** — this
+needs real sampling-profiler or debugger tooling (`cdb`/WinDbg is not
+installed on this box; confirmed unavailable both in the original session
+and this follow-up) to go further responsibly, rather than more
+guess-and-measure cycles. The Liquibase/Keycloak precedent fix iterated
+through a long list of specific methods
+(`XMLChar`, `XMLLimitAnalyzer`, `XSSimpleTypeDecl`, `XSDHandler$XSDKey`,
+`scanQName`/`scanContent`/`skipSpaces`/`normalizeNewlines`/`checkEntityLimit`,
+opti-DOM getters, `RangeToken.sortRanges`) over what was clearly a
+substantial, iterative investigation — closing this residual properly likely
+needs the same scale of effort, not a single targeted native-method
+addition.
+
+**Deliberately not attempted in the prior session**: implementing a native
+fast path without being able to verify which method(s) actually dominate
+risks shipping a subtly-incorrect Xerces reimplementation (the doc's own
+framing for the *previous* residual explicitly flagged this risk) while not
+even fixing the reported slowdown if the guess is wrong (as the `UTF8Reader`
+hypothesis was).
+
+## Root-caused and PARTIALLY FIXED (2026-07-21, cdb profiling follow-up)
+
+Installed `cdb`/WinDbg on the box (via `winget install Microsoft.WinDbg`,
+which bundles `cdbX64.exe` — modern WinDbg's MSIX package, not just the
+GUI). The release profile already builds with `strip = "none"` +
+`debug = "line-tables-only"` (a prior perf session's setup, see the
+`[profile.release]` comment in the workspace `Cargo.toml`), so symbols were
+available immediately — no rebuild-for-symbols step needed.
+
+**Technique**: launched `SaxManySmallFiles` (6000 reps, ~80s+ wall clock) as
+a detached background process, then repeatedly non-invasively attached
+(`cdb -pv -p <PID> -y <symdir> -lines -c "~*kb 20;qd"`, ~25 samples over the
+run) and extracted the `main-vm` thread's (CratonVM's actual interpreter
+thread — distinct from the OS "main" thread, which just waits on a
+`WaitForSingleObject`) leaf frame each time — a cheap poor-man's sampling
+profiler, no `cdb` scripting extensions needed.
+
+**Result: 25/25 samples landed at the exact same spot** —
+`cratonvm_vm::runtime::interpreter::split_method_descriptor` (line 20282,
+`params.push(descriptor[start..i].to_string())`) called from
+`execute_invokestatic` (line 28578 at the time), heap-allocating a
+`Vec<String>` via `alloc::raw_vec::RawVec::grow_one` →
+`mimalloc`/`_mi_theap_get_free_small_page`. **Every single `invokestatic`
+bytecode instruction re-parsed and heap-allocated the full parameter-type
+list from scratch**, even though every consumer
+(`coerce_invoke_arg_for_descriptor`, `decode_arg_kind_aware`) only ever read
+the **first byte** of each parameter token — exactly the case the
+already-existing `nth_param_tag_byte` non-allocating helper (added for a
+*different*, narrower "warm call-dispatch arm" need — see its doc comment)
+was built for.
+
+Worse: `execute_invokevirtual_cached`/`execute_invokestatic_cached` (an
+inline monomorphic call cache, `thread.invoke_cache`) already exists and is
+already wired into the interpreter's *raw-byte-peek fast dispatch loop* —
+but the **main `execute_instruction` dispatcher** (used for JDK-internal
+classes like `com.sun.org.apache.xerces.*`, since that fast loop is
+deliberately gated off for them — see the `Instruction::Invokevirtual`/
+`Invokespecial` arm's own comment, itself a 2026-07-xx fix for the identical
+class of bug that took "a standalone SAX/DTD parse-loop repro... from
+~155ms/parse to ~0.6ms/parse" when applied to those two instructions) called
+`execute_invokestatic_cached` at exactly one call site
+(the OS-thread-startup pending-attach dance) but **never consulted the cache
+for `Instruction::Invokestatic` in the dispatcher every JDK-internal-class
+static call actually goes through** — it called the slow, allocating
+`execute_invokestatic` unconditionally, unlike its `Invokevirtual`/
+`Invokespecial`/`Invokeinterface` siblings right next to it in the same
+`match`.
+
+**Fix** (`vm/src/runtime/interpreter.rs`):
+1. Wired `execute_invokestatic_cached` into the `Instruction::Invokestatic`
+   arm of `execute_instruction`, mirroring the existing
+   `Invokevirtual`/`Invokespecial` arm exactly (cache hit → handled; miss →
+   fall through to the existing slow path, which already populates the
+   cache via `populate_invoke_cache` for next time).
+2. Changed `coerce_invoke_arg_for_descriptor` to take the parameter's tag
+   `u8` directly instead of `&str` (every call site only ever read
+   `.as_bytes().first()`), and replaced every `split_method_descriptor(&d)`
+   + `Vec<String>`/`.get(i)` pattern feeding it with direct
+   `nth_param_tag_byte(&d, i)` calls — across
+   `pop_coerced_invoke_args_virtual`, `pop_coerced_invoke_args_static`,
+   `execute_invoke_kind`, and `execute_invokestatic`'s own slow-path arg
+   popping. This removes the heap allocation entirely from the cache-miss/
+   cold path too (first call to any given call site, JVMTI-redefine/
+   synthetic-stub-upgrade evictions), not just the now-cached steady state.
+   `pop_coerced_invoke_args_intrinsic`'s already-non-allocating
+   `Arc<[Arc<str>]>`-backed path was left untouched (already correct — only
+   its now-`u8`-signature call to `coerce_invoke_arg_for_descriptor` needed
+   updating for the signature change).
+
+**Re-profiling after the fix** (same 25-sample cdb technique): the leaf
+frame is no longer dominated by one spot — samples spread across
+`execute_invokevirtual_cached`, GC heap operations
+(`gen_heap::get_header`/`compact_field_slot`), class resolution
+(`RedefineGate::is_stale`, `class::find_method`), instruction decoding,
+`RwLock` operations, and normal mimalloc alloc/free — i.e. the interpreter
+now looks like it's doing a diversified mix of genuinely necessary work
+rather than being monopolized by one wasteful allocation. This confirms the
+fix eliminated the exact bottleneck found.
+
+**Verification and honest result**: the box was under heavy shared load
+during verification (52-73% background CPU from concurrent sessions/builds
+— see `feedback_shared_host_multitenant_confound`), so a direct wall-clock
+A/B of the microbenchmark was noisy and inconclusive (interleaved runs
+showed anywhere from a 16% improvement to a wash). The code-location
+evidence above (25/25 → fully diversified) is solid regardless of timing
+noise. Running the real `JettyServletWebServerFactoryTests` suite with the
+fix: **17 server-start cycles completed with NO large spikes at all
+(3-12s each, vs. the pre-fix baseline's mix of 2-16s normal + 185-194s
+spikes)** — a real, visible improvement — **but a ~182s stall then occurred
+on the 18th cycle** (`22:29:55.836` "Jetty started" → `22:32:58.054` next
+log line), and the class still did not complete within 900s. `cargo test -p
+cratonvm-vm --lib interpreter::` after the fix: 193/194 pass; the one
+failure (`buffered_input_stream_real_jdk_uses_its_own_bytecode`) is
+pre-existing and unrelated — it fails identically on the unmodified merge
+base (confirmed via `git stash`), asserting a `force_native_over_real_jdk_bytecode`
+gate for `java/io/BufferedInputStream` that no longer exists anywhere in the
+non-test code (a stale test from an earlier refactor, not caused by this
+fix, not investigated further here — out of scope).
+
+**Working theory for the remaining ~182s stall (2026-07-21, REFUTED — see
+below)**: the per-call-site cache only helps on the *second-and-later* call
+to a given `(caller_class, cp_index)` pair — the *first* call to each
+distinct call site still pays full resolution (native-registry lookup,
+`force_native_over_real_jdk_bytecode`/`synthetic_stub_should_yield_to_real_bytecode`
+checks, `class_manager` `RwLock` reads), now non-allocating but not free.
+This session's isolated repro (`SaxManySmallFiles`) intentionally used a
+small, non-validating, DTD-less parse to isolate the invokestatic-caching
+bug cleanly — a real `.tld` file parsed through Tomcat's actual
+`Digester`/schema-aware pipeline exercises a much larger, more varied set of
+Xerces/XNI classes and methods (grammar pool setup, DTD/XSD validators,
+symbol tables), plausibly with thousands of call sites hit for the first
+time in a single parse. If so, the remaining cost is aggregate
+first-resolution cost across many distinct call sites, not a single
+repeated hot loop.
+
+## Root-caused for real and FIXED (2026-07-21, later same-day follow-up): it was never Xerces
+
+Live `cdb` sampling of a **real suite run's actual 182s stall** (not the toy
+repro) definitively refuted the "aggregate first-call resolution cost"
+theory above: the stuck `main-vm` thread was parked in `net_poll`'s socket
+wait loop, not executing any interpreted bytecode at all. This ruled out
+Xerces/invokestatic-cache entirely and redirected the investigation to the
+network layer.
+
+**Identifying the exact test**: correlated JUnit discovery-order (probed
+directly via a small reflection harness) against the suite log's cumulative
+"Jetty started" line count to pin the stall to
+`JettyServletWebServerFactoryTests.compressionOfResponseToGetRequest` (the
+18th server-start cycle). Reproduced in isolation via `SbRunnerMethod`
+(`apps/spring-boot/sb-runner`), deterministic every time — no full 900s
+suite run needed to iterate.
+
+**Root cause #1 — Deflater direct-`ByteBuffer` natives were unimplemented
+stubs.** `java.util.zip.Deflater` has 4 native compress overloads
+(`deflateBytesBytes`, `deflateBytesBuffer`, `deflateBufferBytes`,
+`deflateBufferBuffer`); only `deflateBytesBytes` (byte[]-in/byte[]-out) had
+a real implementation in `native-builtins/src/zip_real.rs` — the other 3
+all threw `RuntimeError::NotImplemented` via a shared
+`defl_direct_buffer_unsupported` stub. Jetty's `GzipHttpOutputInterceptor`
+calls the `deflateBufferBuffer` overload whenever both its scratch input
+buffer and the connector's pooled network output buffer are direct (the
+normal NIO connector case) — so every gzip-compressed response through
+Jetty's real NIO path hit the stub, which raised an exception deep inside a
+blocking write call in a way that left the connection wedged rather than
+cleanly failing (independently confirmed server-side-only via `curl` and a
+raw-socket Java probe: the client received a 10-byte gzip header and then
+nothing, matching a mid-response native failure rather than a client bug).
+
+Fixed by implementing all 3 direct-buffer overloads for real, sharing core
+compression logic with the existing `deflateBytesBytes` path via a new
+`defl_do_compress` helper (`native-builtins/src/zip_real.rs`). Direct-buffer
+addresses are resolved native `long` values (the JDK bytecode wrapper
+already extracts `((DirectBuffer) buf).address()` before calling the
+native), read/written via the existing `NativeContext::copy_from_native_memory`/
+`copy_to_native_memory` primitives — the same pattern already used in
+`classloader.rs`/`lang_invoke.rs`/`lang_system.rs` for direct-buffer access.
+
+**Root cause #2 — `CRC32.updateByteBuffer0` was *also* a stub**, returning
+the input CRC unchanged instead of computing over the buffer's bytes
+(`native-builtins/src/zip_real.rs`, `crc32_update_byte_buffer_0` — a
+pre-existing, deliberate "return unchanged, better than UnsatisfiedLinkError"
+placeholder per its old comment). This second bug was masked by the first:
+fixing only the Deflater hang let the test proceed far enough to actually
+exercise Jetty's own CRC32-based GZIP trailer computation for the first
+time, which failed with `java.util.zip.ZipException: Corrupt GZIP trailer`
+(ISIZE correct at 10000, CRC32 always exactly `0x00000000` — the
+tell). Fixed the same way as Deflater: read the buffer's bytes via
+`copy_from_native_memory` and feed them through the existing
+`crc32_update_public` helper (same CRC32/IEEE algorithm already used by the
+working byte[] overload).
+
+**Verification**: `compressionOfResponseToGetRequest` went from hanging
+(previously reported as a ~182s stall, confirmed via isolated repro to
+actually hang indefinitely once traced directly rather than via the
+900s-suite-timeout artifact) to **passing in ~21-24s**. `CRATONVM_DBG_DEFLATE`
+env-gated tracing (left in place, opt-in, zero default behavior change)
+confirms the fix path: input consumed across calls summed to the expected
+10000 bytes, `flush_code=4` (Z_FINISH) on the final call.
+
+**Lesson**: this is the second time in this same investigation that a
+plausible-looking "interpreter is slow at X" theory (first Xerces
+char-by-char scanning, then aggregate invokestatic first-resolution cost)
+turned out to be wrong once a real profiler was pointed at the *actual*
+stall rather than a hand-picked isolated repro — the toy repro
+(`SaxManySmallFiles`) was faithfully reproducing a real bug (the
+invokestatic cache gap, genuinely worth fixing) that was simply not the
+cause of *this* particular residual. Prefer sampling the real failure over
+extrapolating from a similar-looking synthetic one.
+
+**Suite verification (2026-07-21)**: ran both classes solo via
+`apps/spring-boot-suite-runner`.
+`JettyReactiveWebServerFactoryTests`: 35 tests, 8 failed — all pre-existing
+SSL/TLS handshake failures (`StacklessSSLHandshakeException`, unrelated to
+compression/CRC, not investigated further here). `JettyServletWebServerFactoryTests`:
+progressed cleanly through **60 server-start/stop cycles in 571s** (vs. the
+pre-fix baseline of 17-18 cycles before an indefinite hang) — a large,
+real improvement — then the process **terminated abnormally (exit code 1,
+no panic message, no `SBRUNNER_RESULT`)** immediately after starting its
+61st server instance (an `h2c`-enabled connector). Neither
+`compressionOfResponseToPostRequest` (discovery position 61) nor
+`whenHttp2IsEnabledAndSslIsDisabledThenHttp11CanStillBeUsed` (position 63,
+also h2c) reproduces the crash when run in isolation — **this is a
+cumulative/state-leak crash that only manifests after ~60 prior
+server-start cycles in the same process**, not a per-test bug. It was
+never reached before this fix (the class always hung around cycle 18-19
+first) — a fourth instance in this investigation of a residual that was
+masked by an earlier-blocking bug. **New OPEN residual, not investigated
+further in this pass** — needs its own cdb-sampling/crash-dump
+investigation in a fresh session, ideally reproduced via a tight loop of
+just the last ~10-15 tests before the crash point to shorten the
+iteration cycle (60 cycles × ~9.5s/cycle ≈ 570s per attempt otherwise).
+
+**Still OPEN / not yet done**:
+1. The new cumulative crash-after-60-cycles residual above — needs a fresh
+   investigation (crash dump/cdb, not a simple isolated-test repro since
+   isolation doesn't reproduce it).
+2. The analogous `Inflater` direct-buffer natives
+   (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in the
+   same file) are likely *also* unimplemented stubs (not yet checked/fixed
+   in this pass) — same risk class, not yet known to be hit by any test.
+3. Diagnostic instrumentation left in place (opt-in, zero default behavior
+   change): `CRATONVM_DBG_JAR`, `CRATONVM_DBG_CLASSPATH`,
+   `CRATONVM_DBG_RESOURCE_TIMING`, `CRATONVM_DBG_DEFLATE`, `CRATONVM_DBG_SOCK`,
+   `CRATONVM_DBG_SOCK_BYTES`.
+4. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
+   `winget install Microsoft.WinDbg --source winget`) — no longer a
+   blocker for future sessions on this same machine.

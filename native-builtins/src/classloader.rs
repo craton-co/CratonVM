@@ -26,6 +26,11 @@ fn platform_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
+/// Temporary debug-only accessor (CRATONVM_DBG_OBSREG investigation).
+pub(crate) fn platform_loader_store_dbg() -> &'static Mutex<Option<ObjectRef>> {
+    platform_loader_store()
+}
+
 fn app_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(None))
@@ -1322,7 +1327,33 @@ pub(crate) fn find_loaded_class_for_loader(
     this: ObjectRef,
     internal_name: &str,
 ) -> Option<ObjectRef> {
-    if !is_user_defined_loader(ctx, this) {
+    let __obsreg_dbg =
+        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal_name.contains("ObservationRegistry");
+    let __is_user_defined = is_user_defined_loader(ctx, this);
+    if __obsreg_dbg {
+        eprintln!(
+            "[OBSREG-DBG] find_loaded_class_for_loader(this={:?}, name={}) is_user_defined={}",
+            this, internal_name, __is_user_defined
+        );
+    }
+    let __result = find_loaded_class_for_loader_inner(ctx, this, internal_name, __is_user_defined);
+    if __obsreg_dbg {
+        let cid = __result.map(|m| ctx.class_id_of_object(m));
+        eprintln!(
+            "[OBSREG-DBG] find_loaded_class_for_loader(this={:?}, name={}) -> {:?} (class_id={:?})",
+            this, internal_name, __result, cid
+        );
+    }
+    __result
+}
+
+fn find_loaded_class_for_loader_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal_name: &str,
+    is_user_defined: bool,
+) -> Option<ObjectRef> {
+    if !is_user_defined {
         return ctx.class_id_by_name(internal_name).and_then(|cid| {
             // A generated proxy is checked via `proxy_hidden_from` — loader-identity
             // and delegation aware — REGARDLESS of `loader_id_of_class(cid)`. Proxy
@@ -1471,10 +1502,23 @@ pub fn cl_load_class_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
-    match ctx.get_field_by_name(loader, "parent") {
-        Value::Object(Some(parent)) => return Some(parent),
-        Value::Object(None) | Value::Int(0) | Value::Long(0) => return None,
-        _ => {}
+    // The real named `parent` field is populated by name in exactly ONE
+    // place (the bootstrap app loader's own construction, see
+    // `alloc_classloader`) — every ordinary `ClassLoader`/`URLClassLoader`
+    // constructor native (`cl_init_parent`, `cl_init_name_parent`,
+    // `ucl_setup`, ...) writes only the numeric `CL_PARENT_REF` slot. For
+    // those (the overwhelming majority of real-JDK-mode loaders), a
+    // by-name read of "parent" returns a genuinely-null Java field — NOT
+    // evidence that the loader has no parent — so it must fall through to
+    // the slot, not be trusted as the final answer. Treating that null as
+    // definitive made every `URLClassLoader` constructed with a non-null
+    // parent (e.g. Spring Boot's `PropertiesLauncher.wrapWithCustomClassLoader`
+    // wrapping a `LaunchedClassLoader`) look parentless to
+    // `cl_load_class_base_delegation`, which then skipped real parent-first
+    // delegation entirely and went straight to the (parentless) global/own-URL
+    // fallback — silently losing the parent's classpath.
+    if let Value::Object(Some(parent)) = ctx.get_field_by_name(loader, "parent") {
+        return Some(parent);
     }
     match ctx.get_field(loader, CL_PARENT_REF) {
         Value::Object(Some(parent)) => Some(parent),
@@ -1637,6 +1681,38 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
+    let __obsreg_dbg =
+        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal.contains("ObservationRegistry");
+    if __obsreg_dbg {
+        let parent = classloader_parent(ctx, this);
+        let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        let parent_cls = parent.map(|p| ctx.class_name_of_id(ctx.class_id_of_object(p)));
+        eprintln!(
+            "[OBSREG-DBG] cl_load_class_base_delegation ENTER this={:?} this_class={:?} parent={:?} parent_class={:?} name={}",
+            this, this_cls, parent, parent_cls, internal
+        );
+    }
+    let __result = cl_load_class_base_delegation_inner(ctx, this, name_obj, &internal);
+    if __obsreg_dbg {
+        let cid = match &__result {
+            Ok(Some(Value::Object(Some(m)))) => Some(ctx.class_id_of_object(*m)),
+            _ => None,
+        };
+        eprintln!(
+            "[OBSREG-DBG] cl_load_class_base_delegation EXIT this={:?} name={} -> {:?} (class_id={:?})",
+            this, internal, __result, cid
+        );
+    }
+    __result
+}
+
+fn cl_load_class_base_delegation_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_obj: ObjectRef,
+    internal: &str,
+) -> MethodCallResult {
+    let internal = internal.to_string();
     // HIB-CV-24 / SBR-14 -- honor a supplied child/isolated `ClassLoader`.
     //
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
@@ -4731,11 +4807,23 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // Normalise: strip a leading `jar:` (so `jar:file:/X!/sub/` collapses
     // to `file:/X!/sub/`), then strip the `file:` scheme. We keep the
     // `!/<prefix>/` suffix intact for `ClassPath::add_path` to interpret.
+    //
+    // Only the FIRST `/!` is the genuine outer-jar/nested-entry boundary
+    // marker (from `getJarReference`'s `"nested:" + jarFilePath + "/!" +
+    // nestedEntryName`). A `.replace` of every occurrence also mangles a
+    // directory-shaped nested entry name (e.g. Spring Boot's
+    // `JarUrl.create(file, "BOOT-INF/classes/")`, whose spec is
+    // `nested:<jar>/!BOOT-INF/classes/!/`): the entry name's own trailing
+    // `/` immediately followed by the URL's separate trailing `!/` root
+    // marker forms a SECOND, spurious `/!` match, which swaps into the
+    // entry name and eats its trailing slash (`BOOT-INF/classes/!/` ->
+    // `BOOT-INF/classes!//`), silently emptying `ClassPath`'s nested-prefix
+    // scan (`parse_jar_subdir_spec` never matches any real zip entry).
     let p = raw
         .strip_prefix("jar:")
         .or_else(|| raw.strip_prefix("nested:"))
         .unwrap_or(&raw)
-        .replace("/!", "!/");
+        .replacen("/!", "!/", 1);
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
@@ -5408,6 +5496,33 @@ fn loader_local_resource_urls(
     urls
 }
 
+/// Per-(loader-namespace-id, class-name) locks serializing concurrent
+/// `ucl_try_define_local_class` attempts for the SAME class through the SAME
+/// `URLClassLoader` instance.
+///
+/// Without this, two threads racing to load the same not-yet-defined class
+/// through the same loader (e.g. Spring Boot's
+/// `OnClassCondition$ThreadedOutcomesResolver`, which evaluates
+/// autoconfiguration conditions on a background thread pool while the main
+/// thread needs the same framework classes through the same
+/// `ModifiedClassPathClassLoader`) can both pass the "not yet defined" check
+/// below before either calls `define_class_full`. The second call then hits
+/// a genuine but spurious `IncompatibleClassChangeError`
+/// ("already defined by <this> loader") wrapped as a `NoClassDefFoundError`
+/// -- exactly the check-then-act race a real JVM's per-class
+/// `getClassLoadingLock` exists to prevent. Keyed by loader namespace id
+/// (not the loader `ObjectRef`, which the entry-point pin/GC dance below
+/// makes awkward to hash) plus class name, so unrelated loaders defining a
+/// same-named class concurrently are never serialized against each other.
+fn url_classloader_define_locks() -> &'static Mutex<
+    std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>,
+> {
+    static INSTANCE: OnceLock<
+        Mutex<std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>>,
+    > = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Try to resolve `URLClassLoader.findClass(name)` from the receiver's own
 /// URL set (local filesystem paths and/or real HTTP(S) fetches) and define
 /// the resulting class under that receiver's loader namespace.
@@ -5430,6 +5545,65 @@ pub(crate) fn ucl_try_define_local_class(
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
+
+    // Serialize concurrent definers of this exact (loader, name) pair -- see
+    // `url_classloader_define_locks`. `loader` is freshly passed in by the
+    // caller (not yet pinned across any GC-unsafe window), so reading its
+    // namespace id here is exactly as safe as the `find_loaded_class_for_loader`
+    // probe just above.
+    let define_lock_id = loader_namespace_id(ctx, loader);
+    let define_lock_key = (define_lock_id, internal_name.to_string());
+    let define_lock = {
+        let mut locks = url_classloader_define_locks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(define_lock_key)
+            .or_insert_with(|| {
+                std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()))
+            })
+            .clone()
+    };
+    let (define_lock_mutex, define_lock_cvar) = &*define_lock;
+    let mut in_progress = define_lock_mutex
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while *in_progress {
+        let (guard, timeout) = define_lock_cvar
+            .wait_timeout(in_progress, std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| e.into_inner());
+        in_progress = guard;
+        // The other thread may have finished defining it (success -- return
+        // its result) or failed (we should try ourselves rather than loop
+        // forever on a definition that will never arrive).
+        if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
+            return Some(Ok(Some(Value::Object(Some(mirror)))));
+        }
+        if timeout.timed_out() {
+            break;
+        }
+    }
+    *in_progress = true;
+    drop(in_progress);
+
+    /// Clears the in-progress flag and wakes any waiters, including on an
+    /// unwind, so a panic mid-define doesn't strand other threads on the
+    /// 30s wait forever.
+    struct DefineInProgressGuard<'a> {
+        mutex: &'a Mutex<bool>,
+        cvar: &'a std::sync::Condvar,
+    }
+    impl<'a> Drop for DefineInProgressGuard<'a> {
+        fn drop(&mut self) {
+            let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *in_progress = false;
+            self.cvar.notify_all();
+        }
+    }
+    let _define_in_progress_guard = DefineInProgressGuard {
+        mutex: define_lock_mutex,
+        cvar: define_lock_cvar,
+    };
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
