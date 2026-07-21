@@ -16416,7 +16416,17 @@ fn invoke_on_class_shared_inner(
                                 | "java/lang/AbstractStringBuilder"
                         ) && method_name == "insert"
                             && (descriptor.starts_with("(I[CII)")
-                                || descriptor.starts_with("(I[C)")));
+                                || descriptor.starts_with("(I[C)")))
+                        // Keep in sync with interpreter.rs's
+                        // `force_native_over_real_jdk_bytecode` entry for the
+                        // same triple — see that entry's comment for the full
+                        // rationale (`java.lang.ClassValue.get()` has real JDK
+                        // bytecode relying on `Class.classValueMap`, which
+                        // CratonVM's Class mirrors don't back; the registered
+                        // native's memoized `computeValue` dispatch must win).
+                        || (class_name == "java/lang/ClassValue"
+                            && method_name == "get"
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
                     if check_override
                         && shared
                             .native_methods
