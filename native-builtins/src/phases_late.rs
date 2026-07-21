@@ -42299,51 +42299,17 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     // `gc_scan_classvalue_cache_roots` / `gc_update_classvalue_cache_refs`
     // (wired into `roots.rs` / `gc.rs`) and `reset_classvalue_cache` (wired
     // into VM creation, mirrors `lang_system::reset_system_singletons`).
-    let cv = "java/lang/ClassValue";
-    r.register(
-        cv,
-        "get",
-        "(Ljava/lang/Class;)Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let cls = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let key = classvalue_key(ctx, this, cls);
-            if let Some(v) = classvalue_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&key)
-            {
-                return Ok(Some(Value::Object(Some(*v))));
-            }
-            let result = ctx.invoke_virtual(
-                this,
-                "computeValue",
-                "(Ljava/lang/Class;)Ljava/lang/Object;",
-                &[Value::Object(Some(cls))],
-            )?;
-            if let Some(Value::Object(Some(v))) = result {
-                classvalue_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, v);
-            }
-            Ok(result)
-        },
-    );
-    r.register(cv, "remove", "(Ljava/lang/Class;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
-            let key = classvalue_key(ctx, this, cls);
-            classvalue_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-        }
-        Ok(None)
-    });
+    //
+    // Standalone entry point (`register_classvalue_natives`, below this
+    // function) rather than inlined here: this function (`register_p67_misc`,
+    // reached only via `register_synthetic_overrides`) is DEAD CODE in the
+    // default (non-`synthetic-jdk`-feature) `cratonvm-cli` build — the one
+    // every Spring Boot suite run actually uses — confirmed via
+    // `--dump-native-registry`. Real-JDK-mode `vm/src/vm/vm_init.rs` calls
+    // `register_classvalue_natives` explicitly instead, so this registration
+    // is reachable in the build that matters. See that function's doc
+    // comment for the full writeup.
+    register_classvalue_natives(r);
 
     // java.lang.System additions
     r.register(
@@ -42485,6 +42451,76 @@ pub fn reset_classvalue_cache() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+/// Registers `java.lang.ClassValue#get`/`#remove` (see `register_p67_misc`'s
+/// call site above for the full BUG-W rationale).
+///
+/// A standalone entry point — rather than folded directly into
+/// `register_p67_misc` — so it can be called explicitly from BOTH the
+/// synthetic-JDK bootstrap (`register_synthetic_overrides` →
+/// `register_phase67_natives` → `register_p67_misc`) and the real-JDK-mode
+/// `cratonvm-cli` bootstrap (`vm/src/vm/vm_init.rs`'s `VmContext::new`) — the
+/// latter does NOT call `register_synthetic_overrides` at all (real-JDK mode
+/// hand-picks a curated subset of registration functions instead; synthetic
+/// overrides assume synthetic field layouts and would corrupt real JDK
+/// objects), so without this, the registration is silently unreachable in
+/// the default build — confirmed via `--dump-native-registry` (0 entries for
+/// `java/lang/ClassValue` before this was added as an explicit call).
+///
+/// `NativeKind::Bridge`, not `SyntheticStub`: this is a correct, real
+/// implementation of a mechanism CratonVM cannot run as pure bytecode
+/// (`ClassValue`'s real algorithm depends on CASing a hidden field on
+/// `java.lang.Class` via `jdk.internal.misc.Unsafe`, not faithfully
+/// reproducible against CratonVM's `Class` mirrors), not a placeholder.
+pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
+    let cv = "java/lang/ClassValue";
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            cv,
+            "get",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let cls = match args.get(1) {
+                    Some(Value::Object(Some(c))) => *c,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let key = classvalue_key(ctx, this, cls);
+                if let Some(v) = classvalue_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                {
+                    return Ok(Some(Value::Object(Some(*v))));
+                }
+                let result = ctx.invoke_virtual(
+                    this,
+                    "computeValue",
+                    "(Ljava/lang/Class;)Ljava/lang/Object;",
+                    &[Value::Object(Some(cls))],
+                )?;
+                if let Some(Value::Object(Some(v))) = result {
+                    classvalue_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, v);
+                }
+                Ok(result)
+            },
+        );
+        r.register(cv, "remove", "(Ljava/lang/Class;)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
+                let key = classvalue_key(ctx, this, cls);
+                classvalue_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            }
+            Ok(None)
+        });
+    });
 }
 
 // =============================================================================
