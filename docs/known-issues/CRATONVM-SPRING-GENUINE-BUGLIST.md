@@ -543,6 +543,49 @@ tractable, then traced both bugs to their EXACT call sites:
    position of already knowing whether array classes need per-loader
    caching too, rather than guessing.
 
+**Pushed item 1 (above) one step further with `CRATONVM_DBG_LOADER_TRACE`
+widened to `MergedAnnotations`/`MergedAnnotations$Search` too, not just
+`SearchStrategy`.** At least THREE distinct `MergedAnnotations` outer-class
+copies coexist in the SAME JVM run of `AotIntegrationTests` alone: one
+under `UserDefined(3)` (one test method's fork), one under `UserDefined(4)`
+(a DIFFERENT test method's fork), and one under plain `Application`
+(loaded before any fork existed, plausibly by JUnit's own internal
+annotation scanning). Each resolves its OWN nested `$Search` class
+correctly and self-consistently through the SAME loader
+(`UserDefined(3)`'s `MergedAnnotations` -> `UserDefined(3)`'s `Search`;
+`Application`'s `MergedAnnotations` -> `Application`'s `Search` --
+`resolve_class_loader_aware`/the new carve-out from item 1 works
+correctly for ALL three, individually). The ACTUAL failing
+`withEnclosingClasses` call executes on an INSTANCE of the
+**`Application`-scoped** `Search` class -- meaning whatever code calls
+`MergedAnnotations.search(SearchStrategy.TYPE_HIERARCHY)` in the failing
+path (`TestContextAnnotationUtils`/`TestContextAotGenerator`'s
+`isDisabledInAotMode` predicate, reached via reflection --
+`native_method_invoke`/`native_method_invoke_boxed` frames present in
+the full backtrace) itself resolves `MergedAnnotations` to the
+`Application` copy, not a forked one. If EVERYTHING downstream of that
+call also consistently resolved via `Application` (which the "self-
+consistent" pattern above says it should), there would be no bug -- so
+the actual `SearchStrategy.TYPE_HIERARCHY` value flowing into
+`this.searchStrategy` must be getting resolved through a DIFFERENT
+loader context than the `Search` instance's own class does. The two
+most likely explanations, neither confirmed: (a) the calling method is
+itself a lambda/method-reference whose generated class's defining loader
+differs subtly from the class that lexically declared it, or (b) the
+reflective `Method.invoke()` path (visible in the backtrace) resolves a
+literal constant argument in the CALLER frame's context rather than the
+declared method's, which is a JIT-adjacent misattribution just like
+several of the OTHER argument-decode bugs already fixed elsewhere in
+this codebase (see `wildfly-jit-arg-decode-unboxed-primitive-triple-
+misattribution` in the fixed-bug archive for the general shape). This
+needs live-debugging or per-frame identity instrumentation right at the
+`Method.invoke()` boundary to pin down further -- log-based tracing alone
+cannot distinguish these two theories. Stopping here for this session;
+the `CRATONVM_DBG_LOADER_TRACE` substring widening (`MergedAnnotations`)
+is left in place alongside the earlier `SearchStrategy` one for whoever
+picks this back up.
+
+
 
 **`test.context.jdbc.*` cluster — fully fixed (0 remain).** All 25 classes
 that were uniformly failing behind Spring's `ApplicationContext` failure

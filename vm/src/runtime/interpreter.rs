@@ -17683,7 +17683,7 @@ fn resolve_class_loader_aware(
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
             || name.contains("ManagementContextAutoConfiguration")
             || name.contains("ManagementPortType")
-            || name.contains("ChildManagementContextInitializerAotTests") || name.contains("SearchStrategy"));
+            || name.contains("ChildManagementContextInitializerAotTests") || name.contains("SearchStrategy") || name.contains("MergedAnnotations"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
