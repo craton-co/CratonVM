@@ -42649,17 +42649,44 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
             "get",
             "(Ljava/lang/Class;)Ljava/lang/Object;",
             |ctx, args| {
+                // Residual-6 diagnosis (env-gated): prove/disprove the native
+                // being reached for every logical get() call, including the
+                // malformed-argument silent-null path below.
+                let cv_trace = {
+                    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+                };
                 let this = obj_arg(args, 0)?;
                 let cls = match args.get(1) {
                     Some(Value::Object(Some(c))) => *c,
-                    _ => return Ok(Some(Value::Object(None))),
+                    other => {
+                        if cv_trace {
+                            eprintln!(
+                                "[cv-native] MALFORMED cls arg {:?} -> silent null",
+                                other.map(|v| std::mem::discriminant(v))
+                            );
+                        }
+                        return Ok(Some(Value::Object(None)));
+                    }
                 };
                 let key = classvalue_key(ctx, this, cls);
+                if cv_trace {
+                    eprintln!(
+                        "[cv-native] this={:#x} cls={:#x} key=({},{})",
+                        this.as_ptr() as usize,
+                        cls.as_ptr() as usize,
+                        key.0,
+                        key.1
+                    );
+                }
                 if let Some(v) = classvalue_cache()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&key)
                 {
+                    if cv_trace {
+                        eprintln!("[cv-native] cache HIT -> {:#x}", v.as_ptr() as usize);
+                    }
                     return Ok(Some(Value::Object(Some(*v))));
                 }
                 let result = ctx.invoke_virtual(
@@ -42668,6 +42695,12 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                     "(Ljava/lang/Class;)Ljava/lang/Object;",
                     &[Value::Object(Some(cls))],
                 )?;
+                if cv_trace {
+                    eprintln!(
+                        "[cv-native] computeValue -> is_null={}",
+                        !matches!(result, Some(Value::Object(Some(_))))
+                    );
+                }
                 if let Some(Value::Object(Some(v))) = result {
                     classvalue_cache()
                         .lock()

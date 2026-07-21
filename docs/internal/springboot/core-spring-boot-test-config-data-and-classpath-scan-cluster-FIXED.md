@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: FIXED under interpreter execution, UNCONDITIONALLY (2026-07-20/21, fourth+fifth+sixth investigation sessions — two independent sessions converged on this doc in parallel on 2026-07-21) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end under `-Jit off` — verified 10+ times across isolated and 3-way/6-way concurrent-process stress runs with no failures, including under heavy parallel-sweep host contention (an earlier apparent "load-dependent" recurrence of Residual 4 was a test-methodology error — a stale binary silently used due to an environment-variable-propagation bug in how the test runner was invoked from a backgrounded shell, not a real second race; see Residual 4's note below). One caveat remains open and IS real: under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature. A second, independent session found and fixed a real, general JIT tier-up bug along the way (natively-overridden instance methods could get silently, permanently bypassed once JIT-compiled — 4th occurrence of this bug shape in this interpreter) but that alone did not close this exact symptom; still OPEN. A seventh session (2026-07-21) live-traced every dispatch mechanism, proved each individually correct, fixed one further real-but-insufficient bug, and narrowed the hypothesis to a JIT GC-safepoint root-tracking gap — see "Residual 6" for the full history and the current concrete next step.**
+**Status: FULLY FIXED (2026-07-21, eighth investigation session) — Clusters A, B, D, E fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–6 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end under BOTH `-Jit on` (the suite default) and `-Jit off`. Residual 6's root cause — after seven sessions of (individually correct!) dispatch-machinery analysis — was never in dispatch at all: the JIT's `checkcast` codegen resolves its target class BY NAME through the flat global `find_class_by_name`, so when the AOT-processing forked classloader re-defined Groovy's `ClassInfo` under a second `ClassId`, the id-based subtype check refused a cast between two same-named copies and `jit_checkcast` SILENTLY RETURNED NULL (the codegen pushed the failure-`0` as the result — no CCE, no trace). Fixed by a loader-identity-blind name-based hierarchy-walk fallback in `jit_typecheck_resolve` (covers `instanceof` too), plus a companion hardening that makes a definitively-failed JIT checkcast throw a real `ClassCastException` instead of silently nulling. See Residual 6's eighth-session note for the full root-cause chain.**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -701,6 +701,102 @@ dispatch, and if so, trace which precise-JIT-maps oop-map entry (or lack
 thereof) was supposed to cover that specific stack slot across that
 specific safepoint poll.
 
+**Eighth-session note (2026-07-21, worktree
+`fix/classvalue-jit-dispatch-residual6-20260721`): ROOT-CAUSED AND FIXED.**
+The GC-safepoint hypothesis was refuted first (the NPE reproduces
+identically with `CRATONVM_NO_PRECISE_JIT_MAPS=1` and with a 6 GB heap),
+then a probe ring around every silent-null path found the answer in one
+run. The full mechanism:
+
+1. Once `ReflectionCache.getCachedClass`'s caller chain is JIT-compiled,
+   the failing `getClassInfo` invocation enters the compiled
+   `ClassInfo.getClassInfo` artifact by **direct machine call** (no
+   dispatch helper, hence invisible to all seven sessions'
+   dispatch-helper traces). Inside it, `jit_invoke_virtual_mic` dispatches
+   the `invokeinterface GroovyClassValue.get` **correctly** and the
+   `ClassValue` native returns a **valid, non-null** `ClassInfo`
+   (confirmed live: `[cv-native] cache HIT -> 0x…` + `[cv-mic-hit-result]
+   is_null=false` immediately before the failure).
+2. The compiled body then executes `checkcast
+   org/codehaus/groovy/reflection/ClassInfo`. `jit_checkcast` resolves
+   the target BY NAME via the flat global `find_class_by_name` — but the
+   test's `@CompileWithForkedClassLoader` AOT-processing loader had by
+   then re-defined `ClassInfo` under a second `ClassId` (probe:
+   `[cv-checkcast-fail] typecheck REFUSED: obj_cid=2695
+   obj_cls=org/codehaus/groovy/reflection/ClassInfo
+   target_name=org/codehaus/groovy/reflection/ClassInfo
+   target_cid=Some(2921)`). The id-based subtype check refused the cast
+   between the two same-named copies.
+3. `jit_checkcast` returned `0` for the refusal and the checkcast codegen
+   **pushed that 0 as the result** — a silent null, no CCE, no internal
+   exception, native provably called-and-correct: exactly Residual 6's
+   observed symptom, and exactly why every dispatch-level instrument came
+   back clean for seven sessions. (The earlier interpreted calls to the
+   same code passed because they ran before the duplicate `ClassInfo` was
+   defined, while `find_class_by_name` still returned the original copy.)
+
+**Fixes (both landed on this branch):**
+- `069f26425` — new `Class::is_assignable_to_name` (name-based hierarchy
+  walk over supers + interfaces, mirroring the accepted
+  `is_subclass_of_by_name` loader-identity-blind tradeoff already used
+  for exception `catch_type` resolution) wired into
+  `jit_typecheck_resolve` as a fallback after the id-based checks fail;
+  covers both `checkcast` and `instanceof`. Also adds permanent
+  env-gated (`CRATONVM_TRACE_CLASSVALUE`) probes at every silent-null
+  path in the `get(Class)` dispatch chain and every `jit_checkcast`
+  failure branch — the probe ring that pinpointed this.
+- `c3bc118b2` — companion hardening: a definitively-refused JIT checkcast
+  now stashes a real `java/lang/ClassCastException` and returns the
+  `i64::MIN` sentinel (routed through the standard
+  `emit_post_invoke_exception_check` guard; new `emitted_checkcast_throw`
+  forces `has_dispatch`), so this entire class of silent-null corruption
+  can never hide again. Fail-soft null retained only where the object's
+  type is unknowable (stale/implausible pointer, unresolved site).
+
+**Verified:** `SpringBootContextLoaderAotTests` PASSES under `-Jit on`
+(3/3 isolated runs) and `-Jit off`.
+
+**Eighth-session regression check (2026-07-21):** full 81-class
+`core/spring-boot-test` module sweep with both fixes, `-Exe` passed
+explicitly (binary confirmed via the summary's `craton exe=` line), both
+modes:
+- `-Jit on` (`-Parallel 4`): 76 PASS / 2 FAIL / 2 EMPTY / 1 HANG.
+- `-Jit off` (`-Parallel 4`): 77 PASS / 2 FAIL / 2 EMPTY.
+`SpringBootContextLoaderAotTests` PASSES in-suite in BOTH modes (61.4s /
+75.6s). The 2 EMPTYs are `Abstract*Tests` base classes (enumeration
+noise). The `-Jit on` HANG (`UriBuilderFactoryWebClientTests`, HtmlUnit)
+PASSES in isolation (2/2 tests) — same shared-host parallel-load artifact
+family as the previously-documented
+`UriBuilderFactoryWebConnectionHtmlUnitDriverTests` hang. The 2 FAILs are
+exactly the two pre-existing, this-session-unrelated failures already
+known to this doc: `DuplicateJsonObjectContextCustomizerFactoryTests`
+(JUnit-Platform `DiscoveryIssueException` under parallel Aether `.m2`
+contention — PASSES in isolation, matching Cluster E's disposition) and
+`ImportsContextCustomizerFactoryTests`
+(`contextCustomizerEqualsAndHashCodeConsidersComponentScan`, 1 of 8
+tests, reproduced in isolation under BOTH JIT modes — a real, separate
+annotation-identity bug, not part of this doc's clusters). **No new
+regressions in either mode.**
+
+**Update (same day, later):** `ImportsContextCustomizerFactoryTests` is
+also now **FIXED** — root-caused independently in this session to a
+synthesized-annotation-proxy `hashCode`/`equals` dispatch gap inside the
+native `HashSet`/`HashMap` overlay (two value-equal Spring
+`SynthesizedMergedAnnotationInvocationHandler` proxies hashed by identity
+when the hashing ran through the collections native, so
+`ContextCustomizerKey`'s two key sets compared unequal; a 40-line
+standalone repro — two `synthesize()`d `@ComponentScan`s in a `HashSet` —
+isolated it), and closed by the concurrently-landed dev commit
+`2184973c8` ("fix(genuine56): 6 root-cause bugs across HashMap ordering,
+StringJoiner, proxy dispatch, and HTTP headers"). Verified after merging
+that commit: **8/8 tests PASS under both `-Jit on` and `-Jit off`**.
+With this, every failure this doc has ever named is closed: the only
+remaining non-PASS results in the final full-module confirmation sweep
+are the two `Abstract*Tests` EMPTY entries (enumeration noise) and the
+environment-only parallel-load flakes
+(`DuplicateJsonObjectContextCustomizerFactoryTests` Aether race /
+HtmlUnit-family hangs), all of which PASS in isolation.
+
 ### Regression check (fourth investigation session, 2026-07-20; corrected fifth/sixth session, 2026-07-21)
 
 Re-ran the full `core/spring-boot-test` module (81 test classes; the extra
@@ -758,6 +854,6 @@ The originally-hypothesized "regression-in-place-of-fix" (SSLSocketFactory fix c
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerWithLegacySwitchTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `SpringBootTestCustomConfigNameTests` — **FIXED** (Cluster B)
-- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, unconditionally** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED, PASSES end-to-end — verified isolated and under 3-way/6-way concurrent-process contention, 10+ runs, no failures); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a real, separate, not-yet-root-caused JIT dispatch gap (confirmed with a verified-fresh binary, not a methodology artifact). Seventh investigation session (2026-07-21) exhaustively live-traced every dispatch mechanism and ruled all of them out individually; fixed one real, related, but insufficient bug (`jit_invoke_targets_native_shadow` interface-dispatch blind spot) and narrowed the remaining hypothesis to a JIT-compiled-code GC-safepoint root-tracking gap — still OPEN, see Residual 6's seventh-session note for the precise next step.
+- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under BOTH `-Jit on` and `-Jit off`** (Cluster C; originally-documented NPE + Residuals 1–6 all FIXED). Residual 6 root-caused in the eighth session (2026-07-21): JIT `checkcast`'s name-only target resolution refused a cast between two same-named `ClassInfo` copies from duplicate loaders and silently nulled the result — see the eighth-session note under Residual 6.
 - `core/spring-boot-test` | `SpringBootContextLoaderTests` — **FIXED**, 26/26 (Cluster D)
 - `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce in isolation; flaky under parallel-load regression runs (Cluster E, see update above) — unrelated to this session's changes
