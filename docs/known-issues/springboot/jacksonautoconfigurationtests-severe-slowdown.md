@@ -175,6 +175,92 @@ which itself does bean-type matching) in a class whose real cost driver is
 elsewhere (JUnit5 machinery), not because this bean is itself broken or
 looping.
 
+## Root cause CONFIRMED (2026-07-21, later same day): `update_root_snapshot`, and this is a KNOWN, already-tracked VM-core issue
+
+Traced the "why does JUnit5 wrapping multiply the cost instead of adding to
+it" question to ground truth, and it turns out this investigation
+independently rediscovered an issue a prior session already deeply
+characterized from a completely different angle
+(`docs/internal/tomcat-suite-bugs/03-gc-root-snapshot-contention-FIXED.md` +
+`04-embedded-server-throughput-wall-OPEN.md`, found while chasing embedded
+Tomcat deploy throughput, not Spring Boot test slowdowns at all). That
+convergence from two unrelated starting points is itself strong confirmation
+this is a real, general VM characteristic, not a fluke of one test class.
+
+**The mechanism**: `update_root_snapshot`
+(`vm/src/runtime/interpreter.rs:2763`) runs on every object-returning native
+call (twice, actually — once in `safe_native_call`, once in
+`native_return_pushed_to_stack`) and **rebuilds its GC-root snapshot from
+scratch every time** — `snapshot.clear()` then re-walk. The opt-in
+`CRATONVM_ROOTSNAP_CACHE` (already default-ON in this suite runner, see
+below) avoids re-*scanning* each frame's locals/operand-stack by caching
+per-frame root lists, but it does **not** avoid the O(stack-depth) cost of
+(a) walking the cached prefix to verify it's still valid
+(comparing `(seq, exec_epoch)` per frame) and (b) copying each verified
+frame's cached roots into the freshly-cleared snapshot — both scale with
+however many frames are currently on the stack, cache hit or not.
+
+This explains everything found in this doc's "Refinement" section:
+**it only bites interpreted call chains.** A JIT-compiled call runs on the
+native machine stack and is scanned via a completely different mechanism
+(`conservative_roots.rs`'s JIT-frame chain, not `thread.frames`) — which is
+why a plain-recursion microbenchmark up to 400 frames deep (built to test a
+"generic call-stack depth" hypothesis, see the sibling
+[`oauth2resourceserverautoconfigurationtests-severe-slowdown.md`](oauth2resourceserverautoconfigurationtests-severe-slowdown.md)-style
+methodology) showed **no** scaling at all — those frames were JIT-compiled
+and never touched `thread.frames`. But JUnit5's `InterceptingExecutableInvoker`/
+`InvocationInterceptorChain` and Spring's reflection-heavy bean creation
+essentially never tier up (confirmed earlier in this doc via
+`CRATONVM_DBG_JIT_METHOD_STATS`), so every layer of both **is** a real
+`Frame` on `thread.frames`, and the cache's own prior characterization of
+its worst case — *"a class-init/reflection storm churns the top frames
+every call... so reuse is poor and per-call cost stays near a full scan"*
+(doc 04's words, written about Tomcat's Digester-driven reflective deploy) —
+describes a nested `Method.invoke()` chain (JUnit5's interceptor chain, or
+this session's synthetic reproduction of it) exactly.
+
+**Empirically confirmed** with a synthetic nested-`Method.invoke()`-chain
+microbenchmark (`ReflectiveInvokeProbe.java`, kept in this investigation's
+scratch dir): cost scales from 1x → 1.15x → 1.4x → **~2.9x** as reflective
+nesting depth goes from 1 → 2 → 5 → 10 layers (JIT on, no rootsnap flags).
+With `CRATONVM_ROOTSNAP_CACHE=1` (this suite runner's existing default) the
+ratio drops to **~1.8-1.9x** — a real, measured improvement, matching doc
+04's own finding that the cache buys "only ~2.4x" (vs. ~11x for a stable,
+non-churning stack) on reflection-heavy workloads — but does **not**
+eliminate the scaling. Also tried doc 04's two other existing, already-`bt18`-checksum-validated,
+default-OFF flags together with the cache
+(`CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT=1 CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=1`):
+no further measurable improvement for this call shape (~1.89x, statistically
+indistinguishable from the cache alone) — consistent with doc 04's own
+description of what those two flags target (cutting the *second* per-call
+publish, and surviving GC across cache generations) neither of which
+addresses the "verify + copy scales with churning-frame depth" cost this
+call shape hits.
+
+**The actual fix is already scoped, in doc 04, and was explicitly deferred
+by that session as too risky to implement without dedicated effort**: "Cut
+call FREQUENCY... Guarding the publish on an actual 'collection
+requested/pending' flag (publish at the safepoint poll, not every native
+return) would eliminate the vast majority. Needs the collector/mutator
+handshake to be exactly right (a missed publish = a reclaimed live
+`native_pending_return` = SEGV)." That assessment — hot, shared,
+correctness-critical GC-root code, needs a "careful audit," explicitly
+**not** attempted even by a session with more specialized tooling (cdb
+sampling, the committed `CRATONVM_DBG_ROOTSNAP` counter) — is why this
+investigation is *also* stopping short of implementing it. Doing so blind
+would repeat exactly the mistake
+[[reference_hot_op_helperization_trap]] warns about.
+
+**What this session adds that doc 04 didn't have**: doc 04's repro was
+Tomcat-specific (embedded deploy + Digester reflection) and framed as an
+embedded-server problem. This investigation shows the *same* mechanism, via
+a *different* trigger (JUnit5's own interceptor/parameter-resolution
+machinery, present in literally every JUnit5-launched test), explains a
+whole separate class of "severe slowdown" Spring Boot test-suite reports —
+raising its priority from "one subsystem's deploy path" to "anything that
+runs many reflection-heavy interpreted calls through JUnit5," which is most
+of this suite.
+
 ### Superseded hypotheses from the original 2026-07-20 filing
 
 The original doc listed three unconfirmed candidates. Status now:
@@ -233,19 +319,25 @@ approach produced the 74-method probe class quickly).
 
 Blocks `JacksonAutoConfigurationTests` (74 tests) from ever completing in the
 suite runner's normal per-class timeout window. Not correctness-affecting (no
-wrong results observed, purely a throughput/latency problem). The real fix is
-the same [[project_wire_tiered_manager]] systemic dispatch-overhead
-initiative referenced by the sibling OAuth2ResourceServer doc — not attempted
-here for the same reason (hot, shared, correctness-critical dispatch/tier-up
-machinery needs that initiative's own established validation rigor, not a
-speculative single-session patch). The most promising concrete next step,
-per the "Refinement" section above, is confirming (or refuting) whether
-per-native-call cost in this codebase actually scales with Java call-stack
-depth/frame count — if so, that's a single, well-scoped mechanism that would
-explain the JUnit5×Spring/Jackson compounding effect (and plausibly other
-"severe slowdown" classes) without needing to profile JUnit5's own machinery
-in more detail (which, per the isolated 8.3x measurement here, is not
-pathological on its own).
+wrong results observed, purely a throughput/latency problem).
+
+**The root cause is CONFIRMED and already scoped** (see "Root cause
+CONFIRMED" above): `update_root_snapshot`'s per-native-call, O(stack-depth)
+snapshot rebuild, hitting its known worst case (a "churning" reflection-heavy
+interpreted call chain — JUnit5's interceptor machinery, in this case). The
+concrete fix — publish the root snapshot only when a collector can actually
+read it (safepoint-gated), instead of on every native-call return — is
+already written up as "Fix lever #1" in
+`docs/internal/tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md`.
+That session explicitly deferred implementing it ("needs the
+collector/mutator handshake to be exactly right; a missed publish = a
+reclaimed live `native_pending_return` = SEGV") and this investigation
+reaches the same conclusion independently — not attempted here for the same
+reason, following [[reference_hot_op_helperization_trap]]'s standing caution
+about unvalidated changes to hot dispatch/GC paths. Whoever picks up doc 04's
+fix lever #1 should treat this doc (and the sibling OAuth2ResourceServer doc)
+as additional confirmed impact: it's not just an embedded-Tomcat-deploy
+problem, it affects most reflection-heavy Spring Boot JUnit5 test classes.
 
 ## Affected classes
 

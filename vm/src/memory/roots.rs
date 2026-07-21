@@ -763,6 +763,27 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     is `native_roots::remap_all_native_roots` in `gc.rs`.
     crate::memory::native_roots::scan_all_native_roots(&mut roots);
 
+    if let Some(w) = crate::memory::gc::watch_addr() {
+        let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);
+        eprintln!(
+            "[watch] roots GC#{} addr=0x{w:x} rooted={rooted} frames={} pins={}",
+            shared.heap.collection_count(),
+            thread.frames.len(),
+            thread.native_pin_roots.len()
+        );
+        if !rooted {
+            for (i, f) in thread.frames.iter().enumerate().rev().take(8) {
+                eprintln!(
+                    "[watch]   frame#{i} {}.{} pc={} stack_len={} locals={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.pc,
+                    f.stack.len(),
+                    f.locals_len()
+                );
+            }
+        }
+    }
     roots
 }
 

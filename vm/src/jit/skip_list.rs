@@ -120,6 +120,18 @@ pub enum SkipReason {
     /// Keep this symbol-completion method interpreted until its JIT lowering
     /// is understood.
     ClassFinderComplete,
+    /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
+    /// unconditionally reach an internal `invokedynamic` (lambda) call site
+    /// that `jit_scan` lowers to an always-deopt uncommon trap
+    /// (`DeoptReason::UnreachedCode`) on every single invocation, not just a
+    /// mispredicted rare path. Once JIT-compiled these factories provide zero
+    /// benefit (100% of calls deopt) while still paying compile and
+    /// reconstruct-and-resume costs. Keep them interpreted outright rather
+    /// than relying on the runtime give-up path, which does not reliably stop
+    /// re-invocation once a caller's own inline cache has already cached the
+    /// raw entry point (ES-PERF-20260719 testSlicesDense: 6928 deopt events
+    /// for `makeInt` alone in a single test run).
+    StreamMatchOpsUncommonTrap,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -361,6 +373,21 @@ fn should_skip_jit_internal(
     // invokeinterface PIC invalidation handles changing lambda receivers.
     if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
         return Some(SkipReason::JavaUtilCollection);
+    }
+
+    // ES-PERF-20260719 (2026-07-21): see StreamMatchOpsUncommonTrap doc comment.
+    // Confirmed via CRATONVM_DBG_DEOPT against the real testSlicesDense
+    // workload: `makeInt` alone produced 6928 `reason=UnreachedCode
+    // action=MakeNotCompilable` deopt events in a single ~700s window, none
+    // of which stopped further re-invocation of the doomed compiled entry.
+    // `makeRef`/`makeLong`/`makeDouble` share the exact same factory-method
+    // shape (a MatchKind switch building a sink via an internal lambda) and
+    // are included defensively even though only `makeInt` was observed
+    // faulting in this workload.
+    if class_name == "java/util/stream/MatchOps"
+        && matches!(method_name, "makeInt" | "makeRef" | "makeLong" | "makeDouble")
+    {
+        return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
@@ -619,24 +646,38 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // HIB-LONGTAIL.1 (2026-07-15): Hibernate's H2-backed collection loading
-    // runs correctly in the interpreter, but JITting the H2 SQL/MVStore,
-    // ANTLR-runtime, and most of java.util together turns ordinary 9-second
-    // HotSpot tests into multi-minute CratonVM runs. The three package control
-    // returns the class to the 120-second JUnit budget; each narrower control
-    // leaves the regression. Keep the proven interaction interpreted under the
-    // conservative policy until the shared generated-code throughput issue is
-    // root-caused. Each package remains available for bisection through
-    // CRATONVM_JIT_ALLOW_PACKAGES. `java.util.regex` is deliberately excluded:
-    // DefaultCatalogAndSchemaTest's AssertJ checks repeatedly compile patterns,
-    // and interpreting Pattern.compile turns that finite check into a watchdog
-    // timeout while its JIT path is stable.
+    // HIB-LONGTAIL.1 (2026-07-15, narrowed 2026-07-20): Hibernate's H2-backed
+    // collection loading runs correctly in the interpreter, but JITting the H2
+    // SQL/MVStore and ANTLR-runtime together turned ordinary 9-second HotSpot
+    // tests into multi-minute CratonVM runs. Originally this also blanket-banned
+    // ALL of java.util (except regex) unconditionally under the conservative
+    // policy, reasoning that the three packages needed to be interpreted
+    // together. That java.util term:
+    // (a) contradicted the T1.1.g invariant a few lines below (java/util/* is
+    //     JIT-eligible again outside the small `is_known_miscompile` list) and
+    //     broke 7 of this module's own unit tests the day it landed (see git
+    //     blame on this comment vs. `tier1_skip_list_no_blanket_java_util_ban`
+    //     and friends — those tests predate this ban and were never updated to
+    //     match it);
+    // (b) turned out to be unnecessary: the ACTUAL root cause of the Hibernate
+    //     longtail (see `docs/internal/fixed-suite-bugs/hib-generic-timeout-hang-longtail-resolved-20260715.md`)
+    //     was the executor-compatibility bridge returning placeholder
+    //     `FutureTask`s, fixed the same day in `native-builtins`/`native-collections`
+    //     — not a java.util JIT-throughput interaction;
+    // (c) unconditionally force-interpreted java.util for every OTHER test in
+    //     the whole suite that never touches H2 or ANTLR, which is exactly
+    //     what made `testSlicesDense` (ES vector search, heavy `Arrays`/`BitSet`/
+    //     `Objects` usage, no H2/ANTLR in sight) stay stuck at ~600s — see
+    //     `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`.
+    // Narrowed back to just the two packages actually implicated (H2, ANTLR
+    // runtime) that motivated this rule. (Historical note on why the old
+    // java.util term carved out `java.util.regex`: DefaultCatalogAndSchemaTest's
+    // AssertJ checks repeatedly compile patterns, and interpreting
+    // Pattern.compile turned that finite check into a watchdog timeout while
+    // its JIT path was stable — moot now that java.util is JIT-eligible again.)
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))
-        || (class_name.starts_with("java/util/")
-            && !class_name.starts_with("java/util/regex/")
-            && !package_allowed("java/util/", allow_packages))
     {
         return Some(SkipReason::RustJvmTestFixture);
     }
@@ -4427,6 +4468,41 @@ mod tests {
                 "T1.1.38 GATE: {cls}.{meth} must be JIT-eligible under Aggressive"
             );
         }
+    }
+
+    #[test]
+    fn stream_matchops_uncommon_trap_stays_interpreted() {
+        // ES-PERF-20260719: makeInt/makeRef/makeLong/makeDouble deopt on
+        // literally every call once JIT-compiled (an internal indy site
+        // lowers to an unconditional uncommon trap) — must stay skipped
+        // unconditionally, under both policies, regardless of allow-packages.
+        for meth in ["makeInt", "makeRef", "makeLong", "makeDouble"] {
+            assert_eq!(
+                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::StreamMatchOpsUncommonTrap)
+            );
+            assert_eq!(
+                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Aggressive),
+                Some(SkipReason::StreamMatchOpsUncommonTrap)
+            );
+            assert_eq!(
+                check_with(
+                    "java/util/stream/MatchOps",
+                    meth,
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["java/util/"],
+                ),
+                Some(SkipReason::StreamMatchOpsUncommonTrap),
+                "must not be liftable via CRATONVM_JIT_ALLOW_PACKAGES=java/util/"
+            );
+        }
+        // A sibling MatchOps method not in the targeted list stays eligible.
+        assert_eq!(
+            check("java/util/stream/MatchOps$MatchKind", "values", false, true, SkipPolicy::Conservative),
+            None
+        );
     }
 
     #[test]

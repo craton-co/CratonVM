@@ -1,6 +1,8 @@
 # `java.nio.file.Path.toString()` dead-dispatched to `Object.toString()` via `invokedynamic` string concatenation — FIXED
 
-**Status: FIXED — 2026-07-19**
+**Status: FIXED — 2026-07-19. Fix #1 below (`vm_exec.rs`) silently regressed
+off `dev` sometime after this date and was re-fixed 2026-07-21 — see
+"Regression" at the bottom.**
 
 ## Symptom
 
@@ -100,3 +102,25 @@ Binary: `cratonvm-thymeleaf-residuals-20260719.exe`, worktree
 - `module/spring-boot-thymeleaf` | `ThymeleafReactiveAutoConfigurationTests` | `templateLocationEmpty(CapturedOutput, Path)`
 - `module/spring-boot-thymeleaf` | `ThymeleafServletAutoConfigurationTests` | `templateLocationEmpty(CapturedOutput, Path)` (same fix; not independently re-run because the class also contains the still-open `createLayoutFromConfigClass` hang — see
   `thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md`)
+
+## Regression (found + re-fixed 2026-07-21)
+
+Because `ThymeleafServletAutoConfigurationTests`'s copy of
+`templateLocationEmpty` was never independently re-run (blocked by the
+`createLayoutFromConfigClass` hang, per the note above), a later silent
+regression of fix #1 (the `vm_exec.rs` `invoke_on_class_shared_inner` hunk)
+had no test coverage to catch it. Once the hang was fully closed
+(2026-07-21, see
+`../../internal/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang-FIXED.md`)
+and the full class ran for the first time ever, `templateLocationEmpty`
+failed with the exact original symptom
+(`file:java.nio.file.Path@<hash>`). `git log -S "let is_path = {"` showed
+the hunk was added exactly once (this doc's fix, `a6ce01fe2`) and never
+explicitly removed by any single commit — it was evidently dropped silently
+during a merge conflict resolution somewhere in `dev`'s history between
+2026-07-19 and 2026-07-21. Re-added verbatim; verified
+`ThymeleafServletAutoConfigurationTests` 27/27 including this method, and
+`ThymeleafReactiveAutoConfigurationTests` 21/21 unchanged. The two sibling
+fixes (#2 in this doc, `invokedynamic.rs`'s `value_to_string`; and the
+separate `interpreter.rs` `force_native_over_real_jdk_bytecode`-style gate)
+were confirmed still present and untouched by the regression.

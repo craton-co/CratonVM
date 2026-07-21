@@ -4447,6 +4447,21 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_EXEC_FRAME_TRACE").is_some()
+        && method_name == "aotContributedInitializerStartsManagementContext"
+    {
+        let (cname, loader) = {
+            let cm = shared.class_manager.read();
+            (
+                cm.get_class(class_id).map(|c| c.name.to_string()),
+                cm.get_loader_id(class_id),
+            )
+        };
+        eprintln!(
+            "[EXEC-FRAME-TRACE] method={} class_id={:?} class_name={:?} loader={:?}",
+            method_name, class_id, cname, loader
+        );
+    }
     // S-bytebuddy r1 — Rust-side recursion guard.
     //
     // ByteBuddy's `JavaDispatcher.run()` performs deep reflection via
@@ -17102,6 +17117,16 @@ fn execute_ldc(
                         })
                     })?
                     .to_string();
+                if std::env::var_os("CRATONVM_LDC_CLASSREF_TRACE").is_some()
+                    && (name.contains("ManagementContextAutoConfiguration")
+                        || name.contains("ManagementPortType")
+                        || name.contains("WebEndpointAutoConfiguration"))
+                {
+                    eprintln!(
+                        "[LDC-CLASSREF-TRACE] name={} frame_class_id={:?} frame_class_name={}",
+                        name, frame_class_id, class.name
+                    );
+                }
                 LdcValue::ClassRef(name)
             }
             ConstantPoolEntry::Dynamic {
@@ -17611,7 +17636,10 @@ fn resolve_class_loader_aware(
     // cold loadClass path below; everything else resolves globally.
     let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && (name.contains("EnvironmentPostProcessorsFactory")
-            || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
+            || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
+            || name.contains("ManagementContextAutoConfiguration")
+            || name.contains("ManagementPortType")
+            || name.contains("ChildManagementContextInitializerAotTests"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
@@ -17620,7 +17648,7 @@ fn resolve_class_loader_aware(
             .unwrap_or_default();
         let ref_loader = cm.get_loader_id(referencing_class_id);
         eprintln!(
-            "[LOADER-TRACE] resolve name={name} referencing_class={ref_name} referencing_loader={ref_loader:?}"
+            "[LOADER-TRACE] resolve name={name} referencing_class_id={referencing_class_id:?} referencing_class={ref_name} referencing_loader={ref_loader:?}"
         );
     }
     let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
@@ -28929,15 +28957,23 @@ fn execute_invokestatic(
     if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
         && (method_class_name.contains("SpringFactoriesLoader")
             || method_class_name.contains("EnvironmentPostProcessorsFactory")
+            || method_class_name.contains("ManagementPortType")
             || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
             || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
     {
         let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let cur_name = shared
+            .class_manager
+            .read()
+            .get_class(current_class_id)
+            .map(|c| c.name.to_string());
         let resolved_loader = static_dispatch_class_id
             .and_then(|id| shared.class_manager.read().get_loader_id(id));
+        let global_id = shared.class_manager.read().get_loaded_class_id(&method_class_name);
+        let global_loader = global_id.and_then(|id| shared.class_manager.read().get_loader_id(id));
         eprintln!(
-            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?}",
-            method_class_name, method_name, current_class_id, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader
+            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_class_name={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?} global_lookup_id={:?} global_lookup_loader={:?}",
+            method_class_name, method_name, current_class_id, cur_name, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader, global_id, global_loader
         );
     }
     if !is_native {
@@ -31737,20 +31773,20 @@ fn jit_invoke_targets_native_shadow(
     caller_class_id: ClassId,
     cp_idx: u16,
 ) -> bool {
-    let (target_class, method_name, descriptor, declaring_class) = {
+    let (target_class, method_name, descriptor, declaring_class, is_interface_ref) = {
         let cm = shared.class_manager.read();
         let Some(caller) = cm.get_class(caller_class_id) else {
             return true;
         };
-        let (class_index, nat_index) = match caller.constant_pool.get(cp_idx) {
+        let (class_index, nat_index, is_interface_ref) = match caller.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
                 class_index,
                 name_and_type_index,
-            })
-            | Some(ConstantPoolEntry::InterfaceMethodReference {
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
                 class_index,
                 name_and_type_index,
-            }) => (*class_index, *name_and_type_index),
+            }) => (*class_index, *name_and_type_index, true),
             _ => return true,
         };
         let Some(target_class) = caller
@@ -31777,7 +31813,7 @@ fn jit_invoke_targets_native_shadow(
         } else {
             None
         };
-        (target_class, method_name, descriptor, declaring_class)
+        (target_class, method_name, descriptor, declaring_class, is_interface_ref)
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
@@ -31793,13 +31829,39 @@ fn jit_invoke_targets_native_shadow(
             .find(declaring_class, &method_name, &descriptor)
             .is_some()
     });
-    if (direct || inherited) && crate::runtime::env_cache::dbg_jitc() {
+    // Interface-dispatch blind spot: for `invokeinterface`, `declaring_class`
+    // above is resolved by walking UP FROM THE INTERFACE (`find_method_recursive`
+    // starting at the CP-referenced interface's own class_id) — it can only ever
+    // land on that same interface (its own abstract/default declaration) or a
+    // super-INTERFACE. It can never see a concrete implementor's SUPERCLASS
+    // chain, because interfaces carry no knowledge of their implementors. So
+    // for a receiver that implements this interface but inherits the actual
+    // method body from an unrelated ancestor CLASS — exactly
+    // `org.codehaus.groovy.reflection.v7.GroovyClassValueJava7 implements
+    // GroovyClassValue, extends java.lang.ClassValue` inheriting `get()` from
+    // `ClassValue`, which IS natively registered — `direct`/`inherited` above
+    // both come back false even though the call is genuinely native-shadowed
+    // at every concrete receiver. Fall back to a cheap, class-blind "does ANY
+    // registered native have this exact (name, descriptor)" probe — the same
+    // idiom `might_have_method_descriptor` already serves as a pre-filter
+    // elsewhere (e.g. `execute_invokevirtual_vtable_fast`) — and treat a hit
+    // as a possible shadow. This can only ever ADD conservatism (a same-named,
+    // same-descriptor native for a genuinely unrelated interface is rare and
+    // merely costs a missed tier-up opportunity for that one caller, never a
+    // correctness bug).
+    let interface_blind_possible_shadow = is_interface_ref
+        && !direct
+        && !inherited
+        && shared
+            .native_methods
+            .might_have_method_descriptor(&method_name, &descriptor);
+    if (direct || inherited || interface_blind_possible_shadow) && crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
-            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={}",
-            target_class, method_name, descriptor, direct, inherited
+            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={} interface_blind={}",
+            target_class, method_name, descriptor, direct, inherited, interface_blind_possible_shadow
         );
     }
-    direct || inherited
+    direct || inherited || interface_blind_possible_shadow
 }
 
 fn jit_method_calls_native_shadowed(

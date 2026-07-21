@@ -515,6 +515,21 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
 fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
+    // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
+    // cluster.md Bug B investigation): logs every call's receiver class and
+    // whether the loader-identity recovery path below (see the 2026-07-20
+    // comment further down, fixed once in 65d738bb5 for a different symptom)
+    // actually runs, vs. the bytecode constructor already having set the field.
+    // Ruled OUT as Bug B's cause: all 159 calls observed in that investigation
+    // showed fast_path=true, so the recovery path never even ran.
+    if std::env::var_os("CRATONVM_DBG_GOCBF").is_some() {
+        let rcid = ctx.class_id_of_object(receiver);
+        let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
+        eprintln!(
+            "[CRATONVM_DBG_GOCBF] receiver={:?} class={} fast_path={} current={:?}",
+            receiver, rname, matches!(current, Value::Object(Some(_))), current
+        );
+    }
     if let Value::Object(Some(bf)) = current {
         return bf;
     }

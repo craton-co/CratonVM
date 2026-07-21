@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: FIXED under interpreter execution, UNCONDITIONALLY (2026-07-20/21, fourth+fifth+sixth investigation sessions — two independent sessions converged on this doc in parallel on 2026-07-21) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end under `-Jit off` — verified 10+ times across isolated and 3-way/6-way concurrent-process stress runs with no failures, including under heavy parallel-sweep host contention (an earlier apparent "load-dependent" recurrence of Residual 4 was a test-methodology error — a stale binary silently used due to an environment-variable-propagation bug in how the test runner was invoked from a backgrounded shell, not a real second race; see Residual 4's note below). One caveat remains open and IS real: under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature. A second, independent session found and fixed a real, general JIT tier-up bug along the way (natively-overridden instance methods could get silently, permanently bypassed once JIT-compiled — 4th occurrence of this bug shape in this interpreter) but that alone did not close this exact symptom; still OPEN, see "Residual 6" for both sessions' findings and the concrete next step.**
+**Status: FIXED under interpreter execution, UNCONDITIONALLY (2026-07-20/21, fourth+fifth+sixth investigation sessions — two independent sessions converged on this doc in parallel on 2026-07-21) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end under `-Jit off` — verified 10+ times across isolated and 3-way/6-way concurrent-process stress runs with no failures, including under heavy parallel-sweep host contention (an earlier apparent "load-dependent" recurrence of Residual 4 was a test-methodology error — a stale binary silently used due to an environment-variable-propagation bug in how the test runner was invoked from a backgrounded shell, not a real second race; see Residual 4's note below). One caveat remains open and IS real: under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature. A second, independent session found and fixed a real, general JIT tier-up bug along the way (natively-overridden instance methods could get silently, permanently bypassed once JIT-compiled — 4th occurrence of this bug shape in this interpreter) but that alone did not close this exact symptom; still OPEN. A seventh session (2026-07-21) live-traced every dispatch mechanism, proved each individually correct, fixed one further real-but-insufficient bug, and narrowed the hypothesis to a JIT GC-safepoint root-tracking gap — see "Residual 6" for the full history and the current concrete next step.**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -517,6 +517,190 @@ cleanup pass could remove them once the fifth session's next-step trace
 lands and the real fix is known. Did not attempt the `thread.invoke_cache`
 trace this session — out of this session's scope (`-Jit off`, Residual 4).
 
+**Seventh-session note (2026-07-21, worktree
+`fix/classvalue-jit-dispatch-residual6-20260721`): exhaustively traced every
+Rust-level invoke-dispatch mechanism live with runtime instrumentation
+(not just static code reading) and ruled essentially all of them out as the
+proximate cause; found and fixed one real, related, but ultimately
+insufficient bug; Residual 6 is still OPEN with a much narrower next-step
+hypothesis than before.**
+
+Reproduced reliably via a standalone `SbRunner
+org.springframework.boot.test.context.SpringBootContextLoaderAotTests`
+invocation (no suite-runner wrapper needed) against a debug-instrumented
+build. Added temporary `eprintln!` tracing (since removed; reusing/extending
+the existing `CRATONVM_TRACE_CLASSVALUE` gate) to every plausible dispatch
+site and ran the repro under `-Jit on` (default) with each in turn:
+
+1. **The registered native itself** (`native-builtins/src/phases_late.rs`'s
+   `get()` closure): traced every single invocation's raw args and outcome.
+   Called ~2350+ times across the run, **never once** returns null, and is
+   **never called at all** for the one specific invocation whose result the
+   NPE blames — confirmed by also printing the resolved `cls` argument's
+   class name on every call: the sequence of classes queried runs right up
+   to the failure (`...MetaBeanProperty, [Ljava.lang.Object;, boolean,
+   MetaClass, [Ljava.lang.Class;, Class, List, MetaClass,
+   MetaObjectProtocol`) and then **stops** — the next logical `get()` call
+   (whichever class it's for; the failing call's argument was never
+   confirmed, see below) never reaches the native at all, in any form
+   (not even with a null/malformed argument).
+2. **`jit_invoke_virtual_mic`** (`vm/src/jit/helpers.rs`, the JIT
+   MIC/PIC dispatch helper for compiled invokevirtual/invokeinterface call
+   sites): traced ~800+ real invocations once `ClassInfo.getClassInfo`
+   itself became JIT-compiled partway through the run. `compile_res` is
+   `false` on **every single call** — not because `try_jit_compile_callee`'s
+   native check keeps correctly refusing (though it does, see point 4), but
+   because **`direct_virtual_compiled_callee_entry_enabled()` requires the
+   opt-in env var `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY`, unset
+   by default** — the entire "direct compiled entry" / inline MIC/PIC
+   machine-code cascade this doc's fourth/fifth sessions suspected is
+   **inert in the suite's actual default configuration**. Every traced call
+   correctly falls through to `invoke_or_native`, which correctly resolves
+   and calls the native (confirmed by the matching `cv-native` trace firing
+   for each). Verified via `CRATONVM_DBG_JIT_DISASM=ClassInfo.getClassInfo`
+   (dumps annotated x86-64) that the inline PIC cascade code IS present in
+   the compiled body (a `cmp`/`je` gate on `cached_needs_context` at
+   `JitMICSlot`+0x10 before an unconditional fallback call to
+   `jit_invoke_virtual_mic`), but since `cached_entry_ptr`/`cached_needs_context`
+   are only ever written together by `jit_invoke_virtual_mic` itself (and
+   never populated because the compile attempt is skipped by the disabled
+   flag above), this gate can never open — the cascade is dead weight for
+   this call site, not a live bypass.
+3. **The pure interpreter's own paths** — `execute_invokevirtual_cached`'s
+   `CachedInvokeTarget::VirtualBytecode` arm (dispatches real bytecode from
+   the per-thread inline cache): **zero hits** in the whole run.
+   `execute_invokevirtual_vtable_fast` (the lock-free vtable fast path,
+   dispatched on invoke-cache miss): reached exactly once, at the very start
+   of the run, resolved correctly (`cached_native_shadow=None` →
+   ancestor walk → found `java/lang/ClassValue` native → cached `true` →
+   `CacheMiss`, ceding to the slow path) and never reached again (its own
+   `native_shadow_cache` memoization, plus the interpreter's thread-local
+   `invoke_cache` getting warmed with `VirtualNative`, short-circuits every
+   later call through the cheaper fast paths). `try_stackless_invoke` /
+   `invoke_on_class_shared_inner` (the slow, fully-general dispatcher,
+   consulted on every cache miss): `try_stackless_invoke` fires exactly
+   once (the same cold-miss moment as above) and resolves correctly;
+   `invoke_on_class_shared_inner` is **never reached at all** in the entire
+   run (its own explicit `java/lang/ClassValue.get` allow-list entry in
+   `check_override`, confirmed present and correct, simply never gets
+   exercised because nothing falls through that far after the first call).
+   `jit_invoke_dispatch` (the generic, non-MIC JIT dispatch helper used by
+   methods compiled via the legacy `CRATONVM_JIT_C2_FIRST_CALL` "early
+   compile" path, which builds no MIC/PIC slots at all): **zero hits** —
+   that legacy path is also gated behind an unset-by-default env var and
+   never engages for this repro.
+4. **`try_jit_compile_callee` / `try_jit_compile_callee_slow`** (the shared
+   callee-compile gate `jit_invoke_virtual_mic` and the background/tiered
+   compiler both call through): traced every entry/exit. Both its own-class
+   native check (`native_methods.find(class_name, ...)`, `class_name` =
+   the exact receiver "GroovyClassValueJava7") and its declaring-class
+   check (`native_methods.find(declaring_class_name="java/lang/ClassValue",
+   ...)`, found by resolving `find_method_recursive` from the receiver)
+   correctly and consistently refuse to compile, on every call, for the
+   entire run. The JIT-cache probe at the top of `try_jit_compile_callee`
+   (which would skip the native check entirely on a pre-existing cache hit)
+   never hits either — nothing ever publishes an entry for this
+   `(class, method, descriptor)` key.
+5. **Disabling the background/tiered compiler entirely**
+   (`CRATONVM_BG_COMPILE=0`): does **not** fix the repro — it changes the
+   failure to a different, unrelated `ArrayStoreException` inside the same
+   `GroovySystem.<clinit>` before ever reaching the `ClassValue`-related
+   code path at all (a different, timing-sensitive symptom, not
+   investigated further — flagging here only so a future session doesn't
+   mistake it for the same bug). This rules out `background_compile_task`
+   (the "tiered-enqueue"/"bg-compile" mechanism that in the *default*
+   config does compile `ClassInfo.getClassInfo` itself, confirmed via
+   `CRATONVM_DBG_JITC=1`) as a *required* trigger for the failure — whatever
+   is wrong reproduces independent of whether that specific compiler runs.
+
+**One real, general bug found and fixed along the way (kept, but confirmed
+NOT sufficient to close this residual):** `jit_invoke_targets_native_shadow`
+(`vm/src/runtime/interpreter.rs`), the static bytecode-scanning pre-check
+`try_jit_upgrade_with_gate` (the interpreter's OWN "caller-method-counter"
+JIT tier-up trigger, a *third*, independent compile pathway from both
+`try_jit_compile_callee` and the background/tiered compiler) uses to decide
+whether a method is safe to JIT-compile because it calls something
+natively-shadowed. For an `invokeinterface` call site, this function
+resolved `declaring_class` via `find_method_recursive` starting from the
+**interface's own class_id** — which can only ever walk up to a
+super-interface, never across to a concrete implementor's *superclass*
+chain, because interfaces carry no knowledge of their implementors. So for
+`ClassInfo.getClassInfo`'s own `invokeinterface GroovyClassValue.get` site,
+this check resolved `declaring_class = "GroovyClassValue"` (the interface
+itself, which merely declares `get` abstractly) instead of
+`"java/lang/ClassValue"` (the concrete ancestor every real
+`GroovyClassValue` implementor's `get()` actually resolves to at runtime),
+found no native there, and wrongly reported "not native-shadowed" — the
+same "declaring-class blind spot for a receiver whose bytecode-declaring
+ancestor is invisible from the static call-site type" shape as every other
+occurrence this doc's cluster has found, just manifesting in a *fourth*
+independent function this time. **Fixed** by falling back to a cheap,
+class-blind `native_methods.might_have_method_descriptor(method_name,
+descriptor)` probe specifically for the `invokeinterface` case when the
+interface-rooted resolution comes back clean — a hit is treated as a
+possible shadow (conservative-only: can never cause an *incorrect* dispatch,
+only occasionally decline a tier-up opportunity that was actually safe).
+**Verified this fix does NOT resolve Residual 6** — the exact same NPE
+still reproduces after applying it, confirmed via the same live trace
+instrumentation (the fix only affects whether `try_jit_upgrade_with_gate`
+refuses to compile `getClassInfo`; `background_compile_task`'s separate,
+unguarded-by-this-check compile path was already compiling it successfully
+by design, and disabling that path entirely — point 5 above — doesn't fix
+the repro either). Kept anyway: it is a real, independent, low-risk
+correctness improvement to the general JIT tier-up safety net, consistent
+with (and worth auditing for) the recurring "interface dispatch hides a
+concrete implementor's superclass-inherited native" bug family this whole
+cluster keeps surfacing — spot-checked for regressions (a handful of other
+`core/spring-boot-test` classes under both `-Jit on`/`-Jit off`, identical
+pass/fail as baseline) but not run through the full 81-class module sweep.
+
+**Next-step hypothesis for whoever picks this up, narrower than any prior
+session's:** with every dispatch-*decision* mechanism now individually
+verified correct via live tracing, the remaining candidate is a
+dispatch-*independent* bug — most likely a **GC-safepoint root-tracking gap
+specific to a `getstatic`-loaded local crossing a safepoint poll immediately
+before an `invokeinterface` dispatch, inside JIT-compiled code**.
+`CRATONVM_DBG_JIT_DISASM=ClassInfo.getClassInfo` shows the compiled body's
+shape precisely: `getstatic globalClassValue` (a helper call) → store the
+result to a stack slot → a dense back-to-back spill of every
+callee-saved/argument register (the hallmark of a safepoint poll) → reload
+the same stack slot as the invokeinterface receiver → the MIC-guarded
+dispatch (confirmed correct per point 2 above) → `checkcast` → `areturn`.
+If a GC safepoint fires in that exact window and the precise-JIT-maps /
+safepoint-reload machinery for this specific compiled shape fails to
+correctly re-root or re-forward that ONE stack slot (as opposed to the
+argument/receiver slots the existing `forward_jit_reference_args` machinery
+already covers on the *dispatch-helper* side — this would be a gap in the
+*compiled callee's own* prologue-to-dispatch safepoint handling, upstream
+of any helper call), the receiver read at the invokeinterface site could be
+a stale/zeroed pointer. Critically, this would NOT necessarily manifest as
+the null-receiver NPE sentinel path in `jit_invoke_virtual_mic` (that only
+catches a literal `0` pointer) — a pointer that is non-null but points at
+zeroed/reclaimed memory reads a `class_id` of `0` from its header, which
+`virtual_dispatch_target_for_receiver` already special-cases by falling
+back to `info.class_name` — the *static, CP-declared* type, i.e. the
+`GroovyClassValue` **interface**, not `ClassValue` — with
+`cacheable_receiver = false`. Dispatching `invoke_or_native` with
+`class_name = "GroovyClassValue"` for a *real* (non-corrupted, well-formed)
+receiver would normally still resolve correctly via `invoke_on_class_shared_inner`'s
+C25 retarget (which reads the receiver's *actual* heap class_id
+independently) — but if the receiver truly is a stale/zeroed pointer, that
+retarget's own `class_id_of` read would *also* see class_id 0, so the
+retarget's `rc != ClassId::new(0)` guard suppresses retargeting entirely,
+leaving dispatch resolved against the bare interface — which has an
+*abstract* `get`, no code, and (per this session's finding above) no native
+registered under its own name — a plausible route to a silent, exception-free
+null return that exactly matches every observed symptom (JIT-only; no
+internal NPE; the native never called; every dispatch-decision function
+proven correct in isolation). **Concretely**: instrument (or attach a
+debugger to) the exact moment of the getstatic→safepoint→invokeinterface
+sequence inside a JIT-compiled `ClassInfo.getClassInfo` invocation — verify
+whether `receiver_class_id` (or the raw pointer) ever reads as
+zero/stale for a *live, non-null* `globalClassValue` at the point of
+dispatch, and if so, trace which precise-JIT-maps oop-map entry (or lack
+thereof) was supposed to cover that specific stack slot across that
+specific safepoint poll.
+
 ### Regression check (fourth investigation session, 2026-07-20; corrected fifth/sixth session, 2026-07-21)
 
 Re-ran the full `core/spring-boot-test` module (81 test classes; the extra
@@ -574,6 +758,6 @@ The originally-hypothesized "regression-in-place-of-fix" (SSLSocketFactory fix c
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerWithLegacySwitchTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `SpringBootTestCustomConfigNameTests` — **FIXED** (Cluster B)
-- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, unconditionally** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED, PASSES end-to-end — verified isolated and under 3-way/6-way concurrent-process contention, 10+ runs, no failures); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a real, separate, not-yet-root-caused JIT dispatch gap (confirmed with a verified-fresh binary, not a methodology artifact)
+- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, unconditionally** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED, PASSES end-to-end — verified isolated and under 3-way/6-way concurrent-process contention, 10+ runs, no failures); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a real, separate, not-yet-root-caused JIT dispatch gap (confirmed with a verified-fresh binary, not a methodology artifact). Seventh investigation session (2026-07-21) exhaustively live-traced every dispatch mechanism and ruled all of them out individually; fixed one real, related, but insufficient bug (`jit_invoke_targets_native_shadow` interface-dispatch blind spot) and narrowed the remaining hypothesis to a JIT-compiled-code GC-safepoint root-tracking gap — still OPEN, see Residual 6's seventh-session note for the precise next step.
 - `core/spring-boot-test` | `SpringBootContextLoaderTests` — **FIXED**, 26/26 (Cluster D)
 - `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce in isolation; flaky under parallel-load regression runs (Cluster E, see update above) — unrelated to this session's changes
