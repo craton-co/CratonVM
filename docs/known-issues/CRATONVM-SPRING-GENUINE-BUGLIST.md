@@ -664,6 +664,153 @@ in one sitting — reproduce first with `CRATONVM_DBG_DUPCLASS=1` on
 `AotIntegrationTests` or the `web.service.registry.*` classes before
 attempting either.
 
+**Follow-up same session: landed a real, partial improvement, but the
+full fix is bigger than initially scoped -- three distinct loader-blind
+code paths identified, not one.** Added `CRATONVM_DBG_DUPCLASS_BT=1`
+(full backtrace on every rejected duplicate-registration) to make this
+tractable, then traced both bugs to their EXACT call sites:
+
+1. **`searchEnclosingClass` goes through `resolve_class_loader_aware` /
+   `should_use_loader_initiated_resolution`** (`vm/src/runtime/
+   interpreter.rs`) -- the SAME loader-aware `CONSTANT_Class`/field-ref
+   resolution mechanism already built (and gated off by default) for the
+   Tomcat/Hibernate/WildFly custom-loader work, with an EXISTING narrow,
+   type-checked carve-out for `GroovyClassLoader`. Widened that carve-out
+   to also match Spring's `CompileWithForkedClassLoaderClassLoader`
+   (`is_compile_with_forked_class_loader`, mirroring `is_groovy_class_loader`
+   exactly -- exact-`ClassId` match, no `is_subclass_of` walk needed since
+   the class is `final`). Verified via `CRATONVM_DBG_LOADER_TRACE=1` that
+   this DOES work as intended for at least one call site: a `getstatic
+   SearchStrategy.TYPE_HIERARCHY` reached from `BootstrapUtils` (itself
+   loaded by the fork) now correctly drives the fork's OWN loader first
+   and lands on the fork's own consistent `SearchStrategy` `ClassId`,
+   instead of falling straight to the global fast path.
+   **But this alone does not fix either failing test.** The SAME trace
+   shows a SECOND `getstatic SearchStrategy.TYPE_HIERARCHY` -- reached
+   from `MergedAnnotations$Search.withEnclosingClasses`'s OWN bytecode
+   (the `Assert.state(this.searchStrategy == SearchStrategy.TYPE_HIERARCHY,
+   ...)` check that actually throws) -- with `referencing_loader=
+   Some(Application)`, NOT the fork. So `MergedAnnotations$Search` itself
+   is NOT being given its own forked-loader copy in this VM, even though
+   (per Spring's documented design intent, and the doc's own earlier
+   writeup) it should be, alongside every other framework class the fork
+   redefines. Two references to the same enum constant, resolved via two
+   different loaders (fork vs. Application), is the actual mismatch --
+   narrower and different from the original hypothesis ("one resolution
+   helper is loader-blind"). WHY `MergedAnnotations$Search` itself ends up
+   Application-scoped instead of fork-scoped is not yet root-caused --
+   likely something in how/when that specific class first got loaded
+   in this JVM (possibly before the current test's fork instance even
+   existed), which is a `ClassLoader.loadClass()`-level delegation
+   question, not a `resolve_class_loader_aware` question -- needs its own
+   trace (`CRATONVM_DBG_LOADER_TRACE` widened to also fire on
+   `MergedAnnotations$Search`'s OWN class resolution, not just
+   `SearchStrategy`'s).
+
+2. **The Jackson `ArrayStoreException` goes through a COMPLETELY
+   DIFFERENT path**: `native_object_get_class` (`Object.getClass()`,
+   `native-builtins/src/lib.rs`) calls `ctx.load_class(&array_class_name)`
+   directly on a synthesized `"[L...;"` descriptor string, which recurses
+   into `classloading::class_manager::synthesize_array_class`, which
+   resolves the COMPONENT via a bare `self.load_class(component_name)` --
+   never touching `resolve_class_loader_aware` at all. So fix #1 above is
+   structurally irrelevant to this bug; it needs its own fix in
+   `synthesize_array_class` (or its caller). Tried the obvious one --
+   populate the always-`None` `array_info` field on the synthesized array
+   `Class` with the component `ClassId` this function ALREADY resolves
+   internally (pure-additive: nothing currently reads `array_info`, so
+   this cannot regress anything; the field's own doc comment even says
+   "Wire up real `ArrayInfo` once a consumer... actually reads it", i.e.
+   this was always the planned next step) -- but on reflection this does
+   NOT reliably fix the bug either: `synthesize_array_class` caches ONE
+   array `Class` GLOBALLY per descriptor NAME (not per (loader, name)),
+   so whichever caller happens to synthesize `"[Ltools/jackson/databind/
+   deser/KeyDeserializers;"` FIRST in the JVM session permanently decides
+   `array_info.component_class_id` for every LATER `getClass()` call on
+   ANY `KeyDeserializers[]` array, regardless of that specific array's
+   own actual (and possibly different) component `ClassId` -- the same
+   class-of-bug one level up, just baked into the array-class cache
+   instead of the plain-class cache.
+   **Deliberately did NOT change the array class's own `loader_id`
+   scoping to fix this** (the more "correct-per-JVMS-5.3.3" fix for
+   reference-component arrays) -- `synthesize_array_class` has an
+   existing, deliberate, audited invariant enforcing `loader_id ==
+   Bootstrap` unconditionally regardless of component loader
+   ("Round 7 audit fix (CRIT #2)", with a `debug_assert_eq!` guarding
+   it and an explicit comment warning future contributors not to change
+   `Class::loader_id` without updating the map key too). That invariant
+   was presumably added to fix a DIFFERENT, real bug this session has no
+   visibility into -- touching it without understanding that history first
+   is exactly the kind of change that looks locally correct and
+   regresses something else. Left `array_info` un-populated (reverted)
+   rather than land a fix that looks plausible but is not verified
+   correct.
+
+**Revised recommended next steps**, in order of leverage:
+1. Trace `MergedAnnotations$Search`'s OWN class resolution (not
+   `SearchStrategy`'s) with `CRATONVM_DBG_LOADER_TRACE`/
+   `CRATONVM_DBG_DUPCLASS_BT` to find why it ends up Application-scoped
+   instead of fork-scoped inside a `@CompileWithForkedClassLoader` test --
+   this is probably a `ClassLoader.loadClass()` top-level delegation bug
+   (is `findLoadedClass`/`cl_find_loaded_class` genuinely being consulted
+   for EVERY class the fork's `loadClass()` bytecode touches, or is there
+   a shortcut somewhere that returns an already-cached Application answer
+   without ever asking the fork loader instance at all?), not a
+   constant-pool-resolution bug -- different mechanism, different fix
+   location, from item 1 above.
+2. Before touching `synthesize_array_class`'s loader-scoping, read the
+   Round 7 CRIT #2 audit history (git blame / commit message on the
+   `debug_assert_eq!` near the end of that function) to understand what
+   it was protecting against, so a loader-scoped-for-reference-arrays fix
+   can coexist with whatever that was.
+3. Once (1) is understood, re-attempt the `array_info` wiring from a
+   position of already knowing whether array classes need per-loader
+   caching too, rather than guessing.
+
+**Pushed item 1 (above) one step further with `CRATONVM_DBG_LOADER_TRACE`
+widened to `MergedAnnotations`/`MergedAnnotations$Search` too, not just
+`SearchStrategy`.** At least THREE distinct `MergedAnnotations` outer-class
+copies coexist in the SAME JVM run of `AotIntegrationTests` alone: one
+under `UserDefined(3)` (one test method's fork), one under `UserDefined(4)`
+(a DIFFERENT test method's fork), and one under plain `Application`
+(loaded before any fork existed, plausibly by JUnit's own internal
+annotation scanning). Each resolves its OWN nested `$Search` class
+correctly and self-consistently through the SAME loader
+(`UserDefined(3)`'s `MergedAnnotations` -> `UserDefined(3)`'s `Search`;
+`Application`'s `MergedAnnotations` -> `Application`'s `Search` --
+`resolve_class_loader_aware`/the new carve-out from item 1 works
+correctly for ALL three, individually). The ACTUAL failing
+`withEnclosingClasses` call executes on an INSTANCE of the
+**`Application`-scoped** `Search` class -- meaning whatever code calls
+`MergedAnnotations.search(SearchStrategy.TYPE_HIERARCHY)` in the failing
+path (`TestContextAnnotationUtils`/`TestContextAotGenerator`'s
+`isDisabledInAotMode` predicate, reached via reflection --
+`native_method_invoke`/`native_method_invoke_boxed` frames present in
+the full backtrace) itself resolves `MergedAnnotations` to the
+`Application` copy, not a forked one. If EVERYTHING downstream of that
+call also consistently resolved via `Application` (which the "self-
+consistent" pattern above says it should), there would be no bug -- so
+the actual `SearchStrategy.TYPE_HIERARCHY` value flowing into
+`this.searchStrategy` must be getting resolved through a DIFFERENT
+loader context than the `Search` instance's own class does. The two
+most likely explanations, neither confirmed: (a) the calling method is
+itself a lambda/method-reference whose generated class's defining loader
+differs subtly from the class that lexically declared it, or (b) the
+reflective `Method.invoke()` path (visible in the backtrace) resolves a
+literal constant argument in the CALLER frame's context rather than the
+declared method's, which is a JIT-adjacent misattribution just like
+several of the OTHER argument-decode bugs already fixed elsewhere in
+this codebase (see `wildfly-jit-arg-decode-unboxed-primitive-triple-
+misattribution` in the fixed-bug archive for the general shape). This
+needs live-debugging or per-frame identity instrumentation right at the
+`Method.invoke()` boundary to pin down further -- log-based tracing alone
+cannot distinguish these two theories. Stopping here for this session;
+the `CRATONVM_DBG_LOADER_TRACE` substring widening (`MergedAnnotations`)
+is left in place alongside the earlier `SearchStrategy` one for whoever
+picks this back up.
+
+
+
 **`test.context.jdbc.*` cluster — fully fixed (0 remain).** All 25 classes
 that were uniformly failing behind Spring's `ApplicationContext` failure
 threshold circuit-breaker now pass. Whatever landed in the last 3 days

@@ -2774,11 +2774,15 @@ impl ClassManager {
         }
         if std::env::var("CRATONVM_DBG_DUPCLASS").is_ok() {
             eprintln!(
-                "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?}                  -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
+                "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?} -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
                 candidate,
                 self.class_store.get(candidate).map(|c| c.loader_id),
                 name,
             );
+            if std::env::var_os("CRATONVM_DBG_DUPCLASS_BT").is_some() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_DUPCLASS_BT] {name}\n{bt}");
+            }
         }
         None
     }
