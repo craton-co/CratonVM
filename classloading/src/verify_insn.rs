@@ -815,19 +815,26 @@ pub fn verify_instruction(
             let value = pop_reference(frame, hierarchy)?;
             match return_type_from_descriptor(method_descriptor) {
                 Some(declared @ (VType::ObjectRef(_) | VType::ArrayRef(_))) => {
+                    // Loader-aware execution can hold distinct ClassIds for one
+                    // binary type while Pass 3 frames retain only its binary
+                    // name. That ambiguity is real, but it is already resolved
+                    // upstream, not here: `ClassManager::define_class_with_options`
+                    // defers this entire Pass 3 pass for `UserDefined`-loader
+                    // classes (see `defer_loader_sensitive_pass3`), and
+                    // `vm_util.rs::initialize_class_shared` does the same at
+                    // link time. By the time this arm runs, the class being
+                    // verified is NOT one of those deferred classes, so a
+                    // mismatch here is a genuine violation, not a loader-name
+                    // collision — reject it (JVMS §4.10.1.2 requires the
+                    // verifier be conservative and reject what it cannot
+                    // prove; see the RVERIF.3 note on `ClassHierarchy` in
+                    // `vtype.rs` for the same principle applied to
+                    // `is_assignable_to`).
                     if !value.is_assignable_to(&declared, hierarchy) {
-                        // Loader-aware execution can hold distinct ClassIds for
-                        // one binary type while Pass 3 frames retain only its
-                        // binary name. Runtime return admission remains
-                        // loader-qualified; do not reject this lossy view.
-                        let loader_aware = std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION")
-                            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-                            .unwrap_or(true);
-                        if !loader_aware {
-                            return Err(verify_err(&format!(
-                                "areturn: returned value {value:?} is not assignable to                                  the method's declared return type {declared:?}"
-                            )));
-                        }
+                        return Err(verify_err(&format!(
+                            "areturn: returned value {value:?} is not assignable to \
+                             the method's declared return type {declared:?}"
+                        )));
                     }
                 }
                 // Declared return type is a primitive (Int/Long/Float/

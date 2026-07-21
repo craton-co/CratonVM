@@ -142,12 +142,19 @@ const BB_FIELD_CAPACITY: usize = 3;
 
 const CHANNEL_LISTENER_HANDLE_EVENT_DESC: &str = "(Ljava/nio/channels/Channel;)V";
 
-// The native TCP bridge has no selector thread yet. After a flushed request,
-// poll briefly for the peer's response and fire the read listener from the
-// caller thread once bytes are actually visible on the socket.
-const READ_NOTIFY_RETRY_DELAYS_MS: [u64; 9] = [0, 5, 20, 50, 100, 250, 500, 1000, 2000];
-const READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS: [u64; 11] =
-    [0, 5, 20, 50, 100, 250, 500, 1000, 2000, 5000, 10000];
+// Historical note: before the dedicated source-poller thread existed
+// (`native_source_poller_run`, 10ms tick), these were multi-second sleep
+// ladders ([0,5,20,...,2000] and [...,5000,10000]) that polled for the
+// peer's response INLINE on the calling thread. With the poller in place
+// they became pure harm: `sink_flush`/`resumeWrites` on the management
+// upgrade path slept for seconds on the accept-pump thread AFTER writing
+// the `101 Switching Protocols`, postponing the jboss-remoting greeting
+// frame past the client's 5s connect timeout (WFLYPRT0023) — the server
+// and client each waiting on the other. A single immediate probe keeps the
+// zero-latency fast path (bytes already visible fire the listener now);
+// anything arriving later is the poller's job (<=10ms).
+const READ_NOTIFY_RETRY_DELAYS_MS: [u64; 1] = [0];
+const READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS: [u64; 1] = [0];
 fn xnio_tcp_dbg_enabled() -> bool {
     std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some()
 }
@@ -301,6 +308,13 @@ pub struct SourceChannel {
     /// the poller's next tick (or the caller's own retry-with-delays loop)
     /// fires it once the in-flight dispatch completes.
     pub dispatching: AtomicBool,
+    /// `wakeupReads()` semantics: force one listener invocation even when
+    /// the socket has no pending bytes. Set by `native_source_wakeup_reads`,
+    /// consumed (cleared) by the next guarded dispatch from the poller /
+    /// notify path. Never dispatched inline from the wakeupReads caller —
+    /// see `native_source_resume_reads` for why inline dispatch from a
+    /// Java-called native self-deadlocks Undertow's requestState machine.
+    pub wakeup_pending: AtomicBool,
 }
 
 /// One live sink (write-side) conduit channel.
@@ -539,6 +553,7 @@ pub fn register_source_channel(transport: ConduitTransport) -> u64 {
         read_suspended: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
         dispatching: AtomicBool::new(false),
+        wakeup_pending: AtomicBool::new(false),
     });
     source_channels()
         .lock()
@@ -1207,11 +1222,14 @@ fn notify_source_readable_with_delays(
         }
         let suspended = source_read_suspended(ctx, source, id);
         let pending = source_has_pending_data(id);
+        let wakeup = get_source_channel(id)
+            .map(|ch| ch.wakeup_pending.load(Ordering::Acquire))
+            .unwrap_or(false);
         xnio_tcp_dbg!(
-            "notify_source id={id} retry={retry} delay_ms={} suspended={suspended} pending={pending}",
+            "notify_source id={id} retry={retry} delay_ms={} suspended={suspended} pending={pending} wakeup={wakeup}",
             *delay
         );
-        if suspended || !pending {
+        if suspended || (!pending && !wakeup) {
             continue;
         }
         ctx.set_field(source, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
@@ -1237,6 +1255,12 @@ fn notify_source_readable_with_delays(
         if channel.is_some() && guard.is_none() {
             xnio_tcp_dbg!("notify_source id={id} skipped_reentrant_dispatch");
             return;
+        }
+        // This dispatch satisfies any queued wakeupReads() — clear the flag
+        // before invoking so a wakeup issued DURING the listener run is not
+        // lost (it re-arms for the next tick).
+        if let Some(ch) = &channel {
+            ch.wakeup_pending.store(false, Ordering::Release);
         }
         let fired = invoke_source_read_listener(ctx, source);
         drop(guard);
@@ -1392,24 +1416,76 @@ fn native_source_get_read_listener(
 fn native_source_resume_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     ctx.set_field(this, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
-    if let Some(id) = source_id_of(ctx, this) {
+    let id = source_id_of(ctx, this);
+    if let Some(id) = id {
         if let Some(ch) = get_source_channel(id) {
             // Round-9 HIGH-2: Release -- paired with Acquire in dispatch.
             ch.read_suspended.store(false, Ordering::Release);
         }
     }
-    let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
-        Value::Object(Some(o)) => Some(o),
-        _ => None,
-    };
-    if let Some(listener) = listener {
-        let _ = ctx.invoke_virtual(
-            listener,
-            "handleEvent",
-            CHANNEL_LISTENER_HANDLE_EVENT_DESC,
-            &[Value::Object(Some(this))],
-        );
+    // NO listener dispatch here — not even through the guarded notify path.
+    // resumeReads() is called by Java code that may be mid-state-transition
+    // (Undertow's HttpReadListener.exchangeComplete CASes requestState 1->2,
+    // calls resumeReads(), and only THEN resets to 0). Any synchronous
+    // dispatch on the caller's stack re-enters handleEvent while state==2
+    // and its entry loop (`get != 0` + failing `CAS(1->2)`) spins forever —
+    // a self-deadlock that consumed the accept-pump thread and killed the
+    // management endpoint ~30-60s after every boot. Real XNIO resumeReads
+    // only registers interest; delivery happens from the IO thread. Here the
+    // source-poller thread (10ms tick, guarded + pending-gated) delivers.
+    if id.and_then(get_source_channel).is_none() {
+        // Channel-less stub source: no poller coverage exists, so the
+        // inline dispatch is the only delivery path (the WildFly domain
+        // managed-server startup case this invoke was added for).
+        let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+        if let Some(listener) = listener {
+            let _ = ctx.invoke_virtual(
+                listener,
+                "handleEvent",
+                CHANNEL_LISTENER_HANDLE_EVENT_DESC,
+                &[Value::Object(Some(this))],
+            );
+        }
     }
+    Ok(None)
+}
+
+fn native_source_wakeup_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    ctx.set_field(this, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
+    let id = source_id_of(ctx, this);
+    let channel = id.and_then(get_source_channel);
+    if let Some(ch) = &channel {
+        // Round-9 HIGH-2: Release -- paired with Acquire in dispatch.
+        ch.read_suspended.store(false, Ordering::Release);
+        ch.read_ready.store(true, Ordering::Release);
+        // wakeupReads = resumeReads + force one listener invocation even
+        // with no pending data. Never dispatched inline (see
+        // native_source_resume_reads for the self-deadlock); the poller
+        // consumes this flag on its next tick (<=10ms).
+        ch.wakeup_pending.store(true, Ordering::Release);
+    }
+    ctx.set_field(this, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
+    if channel.is_none() {
+        // Channel-less stub source: no poller coverage — inline dispatch is
+        // the only delivery path.
+        let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+        if let Some(listener) = listener {
+            let _ = ctx.invoke_virtual(
+                listener,
+                "handleEvent",
+                CHANNEL_LISTENER_HANDLE_EVENT_DESC,
+                &[Value::Object(Some(this))],
+            );
+        }
+    }
+    xnio_tcp_dbg!("wakeup_reads id={id:?} queued_for_poller={}", channel.is_some());
     Ok(None)
 }
 
@@ -1910,7 +1986,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_source_is_read_shutdown,
     );
-    r.register(CLS_SOURCE, "wakeupReads", "()V", native_source_resume_reads);
+    r.register(CLS_SOURCE, "wakeupReads", "()V", native_source_wakeup_reads);
     r.register(
         CLS_SOURCE,
         "isReadResumed",
@@ -1984,7 +2060,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_STREAM_SOURCE_CONDUIT,
         "wakeupReads",
         "()V",
-        native_source_resume_reads,
+        native_source_wakeup_reads,
     );
     r.register(
         CLS_STREAM_SOURCE_CONDUIT,
@@ -2052,7 +2128,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_SOURCE_CONDUIT,
         "wakeupReads",
         "()V",
-        native_source_resume_reads,
+        native_source_wakeup_reads,
     );
     r.register(
         CLS_SOURCE_CONDUIT,

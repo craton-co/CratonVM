@@ -15570,12 +15570,58 @@ pub(crate) fn native_class_get_declared_classes(
         // ask the VM to load it (without initializing вЂ” `load_class` calls
         // `load_class_concurrent`, which stops before <clinit>). Failures are
         // dropped, matching HotSpot's behaviour for missing inner classes.
-        let inner_id = match ctx.class_id_by_name(inner_class) {
+        // Use `class_id_by_name_near(inner_class, class_id)` rather than a
+        // plain by-name lookup: a nested class sharing its outer class's
+        // simple name across two loaders (e.g. Spring's
+        // `@CompileWithForkedClassLoader` re-defining an outer AND all its
+        // nested `@Configuration` classes under a fresh forked loader,
+        // alongside the original app-loader copies) must resolve to the
+        // SAME loader's copy as `this` outer class, not whichever loader's
+        // copy happens to sit first in the global flat lookup. Otherwise
+        // `getDeclaredClasses()` on the forked outer class returns the
+        // app-loader's nested classes, splitting identity for anything
+        // downstream that reads their annotations/enum constants (e.g. a
+        // `@Conditional` enum attribute compared by `==` against a value
+        // resolved through the forked loader elsewhere).
+        let inner_id = match ctx.class_id_by_name_near(inner_class, class_id) {
             Some(id) => Some(id),
-            None => match ctx.load_class(inner_class) {
-                Ok(_) => ctx.class_id_by_name(inner_class),
-                Err(_) => None,
-            },
+            None => {
+                // Not already loaded under the outer class's own loader.
+                // Drive that loader's `loadClass` DIRECTLY (JVMS §5.4.3
+                // initiating-loader semantics) before falling back to the
+                // global loader-blind `load_class` — mirrors
+                // `drive_defining_loader_load` in `vm/src/runtime/
+                // interpreter.rs`, unavailable here (crate-boundary), so
+                // reimplemented locally against `defining_loader_for`.
+                // Without this, a nested class that the outer class's
+                // loader has never been asked to load (e.g. Spring's
+                // `@CompileWithForkedClassLoader` outer config class gets
+                // its own fresh copy via a `ldc`, but nothing ever calls
+                // `forkedLoader.loadClass("...NestedConfig")` directly)
+                // falls straight to the global lookup and silently returns
+                // the FIRST same-named class some other loader registered.
+                let driven = crate::classloader::defining_loader_for(class_id.as_u32())
+                    .and_then(|loader_obj| {
+                        let dotted = inner_class.replace('/', ".");
+                        let name_obj = ctx.create_string(&dotted);
+                        match ctx.invoke_virtual(
+                            loader_obj,
+                            "loadClass",
+                            "(Ljava/lang/String;)Ljava/lang/Class;",
+                            &[Value::Object(Some(name_obj))],
+                        ) {
+                            Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
+                            _ => None,
+                        }
+                    });
+                match driven {
+                    Some(id) => Some(id),
+                    None => match ctx.load_class(inner_class) {
+                        Ok(_) => ctx.class_id_by_name_near(inner_class, class_id),
+                        Err(_) => None,
+                    },
+                }
+            }
         };
         if let Some(inner_id) = inner_id {
             declared.push(ctx.get_class_mirror(inner_id));

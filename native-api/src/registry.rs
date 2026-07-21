@@ -3824,6 +3824,34 @@ impl NativeMethodRegistry {
         if self.drop_real_layout_synthetic && class_name == "java/util/EnumSet" {
             return;
         }
+        // Real-JDK mode: drop the synthetic `java/security/Permissions` +
+        // `java/security/PermissionCollection` natives (`add`, `setReadOnly`,
+        // `isReadOnly`). The fake `add` stores the permission into the single
+        // `allPermission` field slot instead of the real JDK
+        // `permsMap` + per-class `PermissionCollection` structure. On a real
+        // JDK `Permissions` object that leaves `permsMap` empty, so `implies`
+        // limps via the `allPermission` fallback (true only for the
+        // last-added permission's own class) while `elements()`/`size()`
+        // iterate the never-populated `permsMap` and return EMPTY. WildFly's
+        // Elytron builds a permission-set verifier by COPYING permissions via
+        // `Permissions.elements()`
+        // (`PermissionMapperDefinitions.createPermissions`): the copy yields
+        // nothing, the `$local` identity never receives `LoginPermission`, and
+        // JBOSS-LOCAL-USER management authentication is rejected
+        // (`ServerRejected` — the entire WildFly integration suite blocker).
+        // The real JDK `Permissions`/`PermissionCollection` bytecode is
+        // self-contained and correct, so drop the synthetic surface and let it
+        // run. The synthetic permissive collection built by
+        // `security_manager::build_permissive_collection` seeds its slots
+        // directly (not via native `add`) and does not depend on these natives.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/security/Permissions" | "java/security/PermissionCollection"
+            )
+        {
+            return;
+        }
         // Real-JDK mode: drop the synthetic LinkedBlockingDeque fallback surface.
         // Its constructor writes the native-collections four-slot queue layout
         // (array/head/size/capacity). A real JDK LinkedBlockingDeque needs its
