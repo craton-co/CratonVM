@@ -516,6 +516,17 @@ struct BeanMethod {
 /// recursion (`StackOverflowError`). Keying on the factory-method thread-local
 /// matches Spring and is name-agnostic, fixing both. No-arg reference-returning
 /// methods only — so comparing the method name (params are always `()`) suffices.
+///
+/// The inter-bean `getBean("<name>")` call is further wrapped exactly like
+/// Spring's `resolveBeanReference`: if `<name>` is already marked "currently
+/// in creation" (an enclosing `getSingleton()` further up the call stack,
+/// e.g. a sibling `@Bean` method invoked from this same class's own
+/// `@PostConstruct` before the factory-method thread-local above is ever
+/// set — SPR-8080), that flag is temporarily cleared for the duration of the
+/// nested `getBean` call and unconditionally restored afterward (success or
+/// exception) via a `finally`-shaped exception-table entry. Without this,
+/// the nested lookup trips `BeanCurrentlyInCreationException` even though
+/// real Spring resolves it fine.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_bean_override(
@@ -556,6 +567,17 @@ fn emit_bean_override(
     // `ConfigurableBeanFactory.registerDependentBean(beanName, outerBeanName)`.
     configurable_bf_cast_idx: u16,
     register_dependent_bean_ref: u16,
+    // Mirrors Spring's `resolveBeanReference`'s reentrancy guard: the bean
+    // being referenced may already be marked "currently in creation" by an
+    // enclosing `getSingleton()` call further up the stack (e.g. a
+    // `@PostConstruct` method on the *factory* `@Configuration` bean calling
+    // one of its own sibling `@Bean` methods before the factory-method
+    // thread-local is set — see `emit_bean_override`'s doc comment). Without
+    // temporarily clearing that flag around the inter-bean `getBean` call,
+    // the nested lookup trips `BeanCurrentlyInCreationException` even though
+    // real Spring resolves it fine (SPR-8080).
+    is_currently_in_creation_ref: u16,
+    set_currently_in_creation_ref: u16,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
@@ -644,63 +666,165 @@ fn emit_bean_override(
     code.extend_from_slice(&b(fq_beanname_lookup_idx));
     // 63: astore_3   (local3 = fq name)
     code.push(0x4E);
-    // 64: L_get: aload_2
+    // 64: L_get: aload_2   (bf)
     code.push(0x2C);
-    // 65: checkcast BeanFactory
+    // 65: checkcast ConfigurableBeanFactory   (used for isCurrentlyInCreation/
+    //     setCurrentlyInCreation/getBean/registerDependentBean — all four
+    //     live on this one interface, so a single cast covers everything
+    //     below; ConfigurableBeanFactory extends BeanFactory).
+    code.push(0xC0);
+    code.extend_from_slice(&b(configurable_bf_cast_idx));
+    // 68: astore 6   (local6 = cbf)
+    code.push(0x3A);
+    code.push(0x06);
+    // 70: aload 6
+    code.push(0x19);
+    code.push(0x06);
+    // 72: aload_3   (beanName)
+    code.push(0x2D);
+    // 73: invokeinterface ConfigurableBeanFactory.isCurrentlyInCreation(String)Z  count=2
+    code.push(0xB9);
+    code.extend_from_slice(&b(is_currently_in_creation_ref));
+    code.push(0x02);
+    code.push(0x00);
+    // 78: istore 5   (local5 = alreadyInCreation)
+    code.push(0x36);
+    code.push(0x05);
+    // 80: iload 5
+    code.push(0x15);
+    code.push(0x05);
+    // 82: ifeq → TRY_START (94); offset 12  (not already in creation → skip
+    //     the temporary clear)
+    code.push(0x99);
+    code.extend_from_slice(&b(12));
+    // 85: aload 6
+    code.push(0x19);
+    code.push(0x06);
+    // 87: aload_3   (beanName)
+    code.push(0x2D);
+    // 88: iconst_0
+    code.push(0x03);
+    // 89: invokeinterface ConfigurableBeanFactory.setCurrentlyInCreation(String,boolean)V  count=3
+    code.push(0xB9);
+    code.extend_from_slice(&b(set_currently_in_creation_ref));
+    code.push(0x03);
+    code.push(0x00);
+    // --- TRY_START (94): the actual inter-bean getBean() call, protected by
+    // the exception-table entry below so the "currently in creation" flag
+    // gets restored (in the handler) even if getBean throws — mirrors
+    // Spring's resolveBeanReference try/finally exactly. ---
+    // 94: aload_2   (bf)
+    code.push(0x2C);
+    // 95: checkcast BeanFactory
     code.push(0xC0);
     code.extend_from_slice(&b(beanfactory_cast_idx));
-    // 68: aload_3   (beanName)
+    // 98: aload_3   (beanName)
     code.push(0x2D);
-    // 69: invokeinterface BeanFactory.getBean(String)Object  count=2
+    // 99: invokeinterface BeanFactory.getBean(String)Object  count=2
     code.push(0xB9);
     code.extend_from_slice(&b(getbean_ref));
     code.push(0x02);
     code.push(0x00);
-    // 74: checkcast <Ret>
+    // 104: checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // --- registerDependentBean(beanName, outerBeanName), mirroring Spring's
-    // resolveBeanReference: only when a factory method IS currently being
-    // invoked (local1 non-null), i.e. this getBean happened while another
-    // @Bean method was under construction, not from arbitrary user code. ---
-    // 77: astore 4   (local4 = result)
+    // 107: astore 4   (local4 = result)
     code.push(0x3A);
     code.push(0x04);
-    // 79: aload_1   (currentlyInvoked Method, or null)
+    // --- TRY_END (109, exclusive). Normal path continues below: mirrors
+    // Spring's resolveBeanReference: only when a factory method IS currently
+    // being invoked (local1 non-null), i.e. this getBean happened while
+    // another @Bean method was under construction, not from arbitrary user
+    // code, register a dependency edge. ---
+    // 109: aload_1   (currentlyInvoked Method, or null)
     code.push(0x2B);
-    // 80: ifnull → L_return (97); offset 17  (no outer factory method → skip)
+    // 110: ifnull → L_restore (125); offset 15  (no outer factory method → skip)
     code.push(0xC6);
-    code.extend_from_slice(&b(17));
-    // 83: aload_2   (bf)
-    code.push(0x2C);
-    // 84: checkcast ConfigurableBeanFactory
-    code.push(0xC0);
-    code.extend_from_slice(&b(configurable_bf_cast_idx));
-    // 87: aload_3   (beanName)
+    code.extend_from_slice(&b(15));
+    // 113: aload 6   (cbf — already ConfigurableBeanFactory, no re-cast needed)
+    code.push(0x19);
+    code.push(0x06);
+    // 115: aload_3   (beanName)
     code.push(0x2D);
-    // 88: aload_1   (currentlyInvoked Method)
+    // 116: aload_1   (currentlyInvoked Method)
     code.push(0x2B);
-    // 89: invokevirtual Method.getName()Ljava/lang/String;   (outerBeanName)
+    // 117: invokevirtual Method.getName()Ljava/lang/String;   (outerBeanName)
     code.push(0xB6);
     code.extend_from_slice(&b(method_get_name_ref));
-    // 92: invokeinterface ConfigurableBeanFactory.registerDependentBean(String,String)V  count=3
+    // 120: invokeinterface ConfigurableBeanFactory.registerDependentBean(String,String)V  count=3
     code.push(0xB9);
     code.extend_from_slice(&b(register_dependent_bean_ref));
     code.push(0x03);
     code.push(0x00);
-    // 97: L_return: aload 4
+    // 125: L_restore: iload 5   (alreadyInCreation)
+    code.push(0x15);
+    code.push(0x05);
+    // 127: ifeq → L_return (139); offset 12  (wasn't already in creation → skip restore)
+    code.push(0x99);
+    code.extend_from_slice(&b(12));
+    // 130: aload 6
+    code.push(0x19);
+    code.push(0x06);
+    // 132: aload_3   (beanName)
+    code.push(0x2D);
+    // 133: iconst_1
+    code.push(0x04);
+    // 134: invokeinterface ConfigurableBeanFactory.setCurrentlyInCreation(String,boolean)V  count=3
+    code.push(0xB9);
+    code.extend_from_slice(&b(set_currently_in_creation_ref));
+    code.push(0x03);
+    code.push(0x00);
+    // 139: L_return: aload 4
     code.push(0x19);
     code.push(0x04);
-    // 99: areturn
+    // 141: areturn
     code.push(0xB0);
-    debug_assert_eq!(code.len(), 100);
+    // --- HANDLER (142): catches any Throwable from the TRY region (start_pc
+    // 94, end_pc 109 exclusive — the getBean call only). Restores the
+    // "currently in creation" flag exactly like the normal path, then
+    // rethrows unchanged (a real `finally` never swallows). ---
+    // 142: astore 7   (local7 = throwable)
+    code.push(0x3A);
+    code.push(0x07);
+    // 144: iload 5
+    code.push(0x15);
+    code.push(0x05);
+    // 146: ifeq → RETHROW (158); offset 12
+    code.push(0x99);
+    code.extend_from_slice(&b(12));
+    // 149: aload 6
+    code.push(0x19);
+    code.push(0x06);
+    // 151: aload_3   (beanName)
+    code.push(0x2D);
+    // 152: iconst_1
+    code.push(0x04);
+    // 153: invokeinterface ConfigurableBeanFactory.setCurrentlyInCreation(String,boolean)V  count=3
+    code.push(0xB9);
+    code.extend_from_slice(&b(set_currently_in_creation_ref));
+    code.push(0x03);
+    code.push(0x00);
+    // 158: RETHROW: aload 7
+    code.push(0x19);
+    code.push(0x07);
+    // 160: athrow
+    code.push(0xBF);
+    debug_assert_eq!(code.len(), 161);
+
+    const TRY_START: u16 = 94;
+    const TRY_END: u16 = 109;
+    const HANDLER_PC: u16 = 142;
 
     let mut code_attr = Vec::new();
-    code_attr.extend_from_slice(&3u16.to_be_bytes()); // max_stack (bumped for the 3-deep registerDependentBean call)
-    code_attr.extend_from_slice(&5u16.to_be_bytes()); // max_locals (this, method, bf, beanName, result)
+    code_attr.extend_from_slice(&3u16.to_be_bytes()); // max_stack (3-deep setCurrentlyInCreation/registerDependentBean calls)
+    code_attr.extend_from_slice(&8u16.to_be_bytes()); // max_locals (this, method, bf, beanName, result, alreadyInCreation, cbf, throwable)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
-    code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&1u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&TRY_START.to_be_bytes());
+    code_attr.extend_from_slice(&TRY_END.to_be_bytes());
+    code_attr.extend_from_slice(&HANDLER_PC.to_be_bytes());
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // catch_type 0 = any (finally semantics)
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
 
     let mut method = Vec::new();
@@ -844,6 +968,21 @@ fn build_enhancer_class(
             "registerDependentBean",
             "(Ljava/lang/String;Ljava/lang/String;)V",
         );
+        // SPR-8080 reentrancy guard (see `emit_bean_override`'s doc comment):
+        // temporarily clear/restore "currently in creation" around the
+        // inter-bean `getBean` call so a nested reference to a bean already
+        // marked in-creation by an enclosing `getSingleton()` doesn't trip
+        // `BeanCurrentlyInCreationException`.
+        let is_currently_in_creation_ref = cw.add_interface_methodref(
+            configurable_bf_cast_idx,
+            "isCurrentlyInCreation",
+            "(Ljava/lang/String;)Z",
+        );
+        let set_currently_in_creation_ref = cw.add_interface_methodref(
+            configurable_bf_cast_idx,
+            "setCurrentlyInCreation",
+            "(Ljava/lang/String;Z)V",
+        );
         let config_gen_iface_idx =
             cw.add_class("org/springframework/context/annotation/ConfigurationBeanNameGenerator");
         let cfg_gen_name_string_idx = cw.add_string(
@@ -897,6 +1036,8 @@ fn build_enhancer_class(
                 fq_beanname_lookup_idx,
                 configurable_bf_cast_idx,
                 register_dependent_bean_ref,
+                is_currently_in_creation_ref,
+                set_currently_in_creation_ref,
             );
             methods.push(override_method);
         }
