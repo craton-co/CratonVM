@@ -5289,6 +5289,73 @@ fn huc_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// HttpURLConnection carriers. Unlike `huc_url_string`, this deliberately uses
 /// `toExternalForm`: a real-JDK URL's field zero is only its protocol (for
 /// example, `file`), not a complete URL suitable for filesystem metadata.
+/// Scan the parsed response-header lines (`"Name: value"` strings, stored
+/// under `HUC_RESP_HEADERS`) for `key` (case-insensitive) and return its
+/// value. Shared by `getHeaderField`/`getLastModified`/`getHeaderFieldDate`
+/// so all three agree on the same real HTTP(S) response headers.
+fn huc_find_header_value(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) -> Option<String> {
+    if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                let line = ctx.read_string(s).unwrap_or_default();
+                if let Some(colon) = line.find(':') {
+                    if line[..colon].trim().eq_ignore_ascii_case(key) {
+                        return Some(line[colon + 1..].trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse an HTTP-date into epoch milliseconds (UTC). Real `HttpURLConnection
+/// .getHeaderFieldDate` accepts all three formats RFC 9110 (`https://www.rfc-
+/// editor.org/rfc/rfc9110#section-5.6.7`) permits for received messages; only
+/// RFC 1123 (`"EEE, dd MMM yyyy HH:mm:ss 'GMT'"`, e.g. `"Wed, 09 Apr 2014
+/// 09:57:42 GMT"`) is implemented here since it's what every real server
+/// (and this codebase's own outgoing `Date`/`Last-Modified` formatting)
+/// emits -- the two legacy formats (RFC 850, asctime) are vanishingly rare
+/// in practice. Returns `None` on anything else so callers fall back to
+/// their caller-supplied default, matching the JDK contract for an
+/// unparseable date header.
+fn parse_rfc1123_date_millis(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // "Wed, 09 Apr 2014 09:57:42 GMT"
+    let rest = s.split_once(", ").map(|(_, r)| r).unwrap_or(s);
+    let mut parts = rest.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let mut hms = time.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let min: i64 = hms.next()?.parse().ok()?;
+    let sec: i64 = hms.next()?.parse().ok()?;
+    let days = days_from_civil_utc(year, month, day);
+    let secs_of_day = hour * 3600 + min * 60 + sec;
+    Some((days * 86_400 + secs_of_day) * 1_000)
+}
+
+/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil
+/// date, UTC. Howard Hinnant's `days_from_civil` algorithm
+/// (`https://howardhinnant.github.io/date_algorithms.html#days_from_civil`)
+/// -- avoids pulling in a date/time crate for this one conversion.
+fn days_from_civil_utc(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
 fn huc_origin_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     let url = match ctx.get_field(this, HUC_URL) {
         Value::Object(Some(u)) => u,
@@ -5300,7 +5367,7 @@ fn huc_origin_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String
     }
 }
 
-fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+fn huc_perform(ctx: &mut dyn NativeContext, mut this: ObjectRef) -> MethodCallResult {
     if ctx.get_field(this, HUC_CONNECTED).as_int().unwrap_or(0) != 0 {
         return Ok(None);
     }
@@ -5313,16 +5380,36 @@ fn huc_perform(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult
     }
     let resp = http_perform_request(&method, &url, &headers, &[], 10, None)
         .map_err(|e| ioex(format!("HTTP {method} {url}: {e}")))?;
+    // GC-SAFETY: everything from here on allocates on the Java heap (the
+    // headers array, one `String` per response header, the body byte[]) --
+    // `this` is a bare `ObjectRef` that a moving GC triggered by any of
+    // those allocations can relocate out from under us. Without pinning,
+    // the LAST `set_field(this, ...)` calls below silently wrote through a
+    // stale `this`, so `getLastModified()`/`getHeaderField(name)` (called
+    // right after `huc_perform` returns) read back an empty/absent
+    // `HUC_RESP_HEADERS` even though the real HTTP response genuinely
+    // contained e.g. a `Last-Modified` header -- confirmed by tracing the
+    // parsed response (correct) against the object's field afterward
+    // (missing). Mirrors the established pin/re-read pattern used
+    // throughout `native-collections` for the identical hazard.
+    let this_pin = ctx.pin_native_root(this);
     ctx.set_field(this, HUC_CODE, Value::Int(resp.status));
-    let hdr_arr = ctx.new_ref_array(ClassId::new(0), resp.headers.len());
+    let mut hdr_arr = ctx.new_ref_array(ClassId::new(0), resp.headers.len());
+    let hdr_pin = ctx.pin_native_root(hdr_arr);
     for (i, (k, v)) in resp.headers.iter().enumerate() {
         let s = ctx.create_string(&format!("{k}: {v}"));
+        this = ctx.read_native_pin(this_pin, this);
+        hdr_arr = ctx.read_native_pin(hdr_pin, hdr_arr);
         ctx.set_array_element(hdr_arr, i, Value::Object(Some(s)));
     }
+    this = ctx.read_native_pin(this_pin, this);
+    hdr_arr = ctx.read_native_pin(hdr_pin, hdr_arr);
     ctx.set_field(this, HUC_RESP_HEADERS, Value::Object(Some(hdr_arr)));
     let body_arr = new_java_byte_array(ctx, &resp.body);
+    this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HUC_BODY, Value::Object(Some(body_arr)));
     ctx.set_field(this, HUC_CONNECTED, Value::Int(1));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -6850,10 +6937,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // getHeaderFieldDate("last-modified", ...) shape used by Spring Boot's
     // JarUrlConnectionTests and NestedUrlConnectionTests.
     r.register(huc, "getLastModified", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
+        let mut this = obj_arg(args, 0)?;
         let url = huc_origin_url_string(ctx, this);
         let value = if url.starts_with("http://") || url.starts_with("https://") {
-            0
+            // A genuine HTTP(S) response's `Last-Modified` header was
+            // previously ignored entirely (always 0), breaking
+            // `UrlResource.lastModified()` for any real HTTP resource
+            // (`URLConnection.getLastModified()` -> `getHeaderFieldDate
+            // ("last-modified", 0)` in real JDK bytecode, but the synthetic
+            // huc's OWN `getLastModified` native short-circuits before that
+            // bytecode ever runs). Perform the request so the response
+            // headers are populated, then parse the real header.
+            //
+            // GC-SAFETY: `huc_perform` allocates heavily (headers array +
+            // one `String` per header + body byte[]); pin `this` across the
+            // call and re-read it before touching the receiver again --
+            // otherwise a moving GC during `huc_perform` leaves THIS local
+            // `this` stale even though `huc_perform` itself wrote the real
+            // (relocated) object correctly, and the header lookup below
+            // reads through the stale copy and always misses.
+            let pin = ctx.pin_native_root(this);
+            huc_perform(ctx, this)?;
+            this = ctx.read_native_pin(pin, this);
+            ctx.unpin_native_roots(pin);
+            huc_find_header_value(ctx, this, "last-modified")
+                .and_then(|v| parse_rfc1123_date_millis(&v))
+                .unwrap_or(0)
         } else {
             synthetic_resource_url_last_modified(&url)
         };
@@ -6864,7 +6973,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getHeaderFieldDate",
         "(Ljava/lang/String;J)J",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
             let name =
                 value_or_string(ctx, args.get(1).copied().unwrap_or(Value::Object(None)), "");
             let fallback = match args.get(2).copied() {
@@ -6872,22 +6981,33 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let url = huc_origin_url_string(ctx, this);
-            if !url.starts_with("http://")
-                && !url.starts_with("https://")
-                && name.eq_ignore_ascii_case("last-modified")
-            {
-                let modified = synthetic_resource_url_last_modified(&url);
-                // RFC 1123 dates carry whole-second precision. FileURLConnection
-                // therefore rounds the filesystem's millisecond timestamp down
-                // before exposing it as the `last-modified` header date.
-                let header_date = modified / 1_000 * 1_000;
-                return Ok(Some(Value::Long(if header_date == 0 {
-                    fallback
-                } else {
-                    header_date
-                })));
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                if name.eq_ignore_ascii_case("last-modified") {
+                    let modified = synthetic_resource_url_last_modified(&url);
+                    // RFC 1123 dates carry whole-second precision. FileURLConnection
+                    // therefore rounds the filesystem's millisecond timestamp down
+                    // before exposing it as the `last-modified` header date.
+                    let header_date = modified / 1_000 * 1_000;
+                    return Ok(Some(Value::Long(if header_date == 0 {
+                        fallback
+                    } else {
+                        header_date
+                    })));
+                }
+                return Ok(Some(Value::Long(fallback)));
             }
-            Ok(Some(Value::Long(fallback)))
+            // Real HTTP(S) response: parse whatever the actual header says
+            // (any date-valued header, not just last-modified -- matches
+            // real `HttpURLConnection.getHeaderFieldDate`, which is generic).
+            // GC-SAFETY: see the identical pin/re-read in `getLastModified`
+            // above -- `huc_perform` can relocate `this`.
+            let pin = ctx.pin_native_root(this);
+            huc_perform(ctx, this)?;
+            this = ctx.read_native_pin(pin, this);
+            ctx.unpin_native_roots(pin);
+            let parsed = huc_find_header_value(ctx, this, &name)
+                .and_then(|v| parse_rfc1123_date_millis(&v));
+            Ok(Some(Value::Long(parsed.unwrap_or(fallback))))
         },
     );
     r.register(
@@ -6895,26 +7015,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "getHeaderField",
         "(Ljava/lang/String;)Ljava/lang/String;",
         |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            let mut this = obj_arg(args, 0)?;
+            // GC-SAFETY: see the identical pin/re-read in `getLastModified`
+            // above -- `huc_perform` can relocate `this`.
+            let pin = ctx.pin_native_root(this);
             huc_perform(ctx, this)?;
+            this = ctx.read_native_pin(pin, this);
+            ctx.unpin_native_roots(pin);
             let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
             let key = value_or_string(ctx, key_val, "");
-            if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
-                let len = ctx.array_length(arr);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
-                        let line = ctx.read_string(s).unwrap_or_default();
-                        if let Some(colon) = line.find(':') {
-                            if line[..colon].trim().eq_ignore_ascii_case(&key) {
-                                let val = line[colon + 1..].trim().to_string();
-                                let v = ctx.create_string(&val);
-                                return Ok(Some(Value::Object(Some(v))));
-                            }
-                        }
-                    }
-                }
+            match huc_find_header_value(ctx, this, &key) {
+                Some(val) => Ok(Some(Value::Object(Some(ctx.create_string(&val))))),
+                None => Ok(Some(Value::Object(None))),
             }
-            Ok(Some(Value::Object(None)))
         },
     );
     r.register(
