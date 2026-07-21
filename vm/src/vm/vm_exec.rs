@@ -1418,7 +1418,16 @@ pub(crate) fn monitor_enter_blocking(
             // census recorded (not this thread's guess) can say which.
             let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
         }
-        m.block_enter(tid);
+        if dbg_mon_dump {
+            let cls = {
+                let cid = shared.heap.class_id_of(obj);
+                let cm = shared.class_manager.read();
+                cm.get_class(cid).map(|c| c.name.to_string())
+            };
+            m.block_enter_labeled(tid, cls.as_deref());
+        } else {
+            m.block_enter(tid);
+        }
         drop(blk);
     }
     if dbg_mon_dump {
@@ -16247,6 +16256,11 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_class_mirror_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_classvalue_native_override(
                             class_name,
                             method_name,
                             descriptor,

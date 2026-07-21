@@ -26623,14 +26623,19 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 6-field synthetic — WP1.9:
+    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
     //   slot 3: lineNumber (Int, -1/-2 sentinels)
     //   slot 4: byteCodeIndex (Int, -1 for unknown/native)
-    //   slot 5: declaringClassInternalName (String, '/'-form used to resolve
-    //           the Class mirror lazily in `getDeclaringClass()`)
+    //   slot 5: declaringClassInternalName (String, '/'-form; used only by
+    //           `toStackTraceElement()`'s formatting fallback)
+    //   slot 6: declaringClassMirror (Class or null) — resolved EAGERLY at
+    //           `populate_stack_frame` time from the entry's own ClassId
+    //           (see that function's doc comment for why: a fresh by-name
+    //           lookup performed later, from `getDeclaringClass()`, can fail
+    //           for a frame whose class is still running its own `<clinit>`)
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -26656,24 +26661,17 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     // stored internal class name (slot 5). RETAIN_CLASS_REFERENCE option
     // is not enforced here (we always resolve); bootstrap consumers that
     // don't request the option simply ignore the returned Class.
+    // StackFrame.getDeclaringClass() — return the Class mirror eagerly
+    // resolved and stored at population time (slot 6). RETAIN_CLASS_REFERENCE
+    // option is not enforced here (we always resolve); bootstrap consumers
+    // that don't request the option simply ignore the returned Class.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let internal = match ctx.get_field(this, 5) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            if internal.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            if let Some(cid) = ctx.class_id_by_name(&internal) {
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
-            }
-            Ok(Some(Value::Object(None)))
+            Ok(Some(ctx.get_field(this, 6)))
         },
     );
     // StackFrame.getMethodType() — we don't yet wire real MethodType
@@ -26749,7 +26747,22 @@ fn populate_stack_frame(
     // (allocation-free) field writes. Holding the freshly-allocated `sf` and
     // strings in bare locals across the subsequent `create_string` calls is a
     // use-after-move/free under the moving collector.
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 6);
+    // Slot 6: the declaring-class `Class` mirror, resolved EAGERLY here from
+    // `entry.class_id` when available. `entry.class_id` is captured directly
+    // off the live interpreter `Frame` (see `stackwalker::entry_from_frame`)
+    // and is therefore always valid for a real frame -- unlike a fresh
+    // by-name lookup (`class_id_by_name(&entry.class_name)`) performed LATER,
+    // from `getDeclaringClass()`, which can fail for a frame whose class is
+    // still executing its own `<clinit>` (observed: `SpringFactoriesLoader`/
+    // `EntityManagerFactoryUtils` calling `LogFactory.getLog()` from their
+    // own static initializers -- log4j-api's `StackLocator` walks back to
+    // that exact self-frame and NPEs when the by-name lookup comes back
+    // empty). Resolving from the guaranteed-valid ClassId at population time
+    // sidesteps that failure mode entirely; `class_id_by_name` remains a
+    // fallback for synthetic/no-frame entries (`entry.class_id.is_none()`).
+    let decl_cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
+
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
     let base = ctx.pin_native_root(sf);
     let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let h_cls = ctx.pin_native_root(cls_str);
@@ -26763,9 +26776,17 @@ fn populate_stack_frame(
         }
         None => (None, None),
     };
-    // Preserve the '/' form for declaring-class resolution via class_id_by_name.
+    // Preserve the '/' form too (used by toStackTraceElement()'s fallback).
     let mut decl_internal = ctx.create_string(&entry.class_name);
     let h_decl = ctx.pin_native_root(decl_internal);
+    let (mut decl_mirror, h_mirror) = match decl_cid {
+        Some(cid) => {
+            let m = ctx.get_class_mirror(cid);
+            let h = ctx.pin_native_root(m);
+            (Some(m), Some(h))
+        }
+        None => (None, None),
+    };
 
     sf = ctx.read_native_pin(base, sf);
     cls_str = ctx.read_native_pin(h_cls, cls_str);
@@ -26774,6 +26795,9 @@ fn populate_stack_frame(
         file_str = Some(ctx.read_native_pin(h, s));
     }
     decl_internal = ctx.read_native_pin(h_decl, decl_internal);
+    if let (Some(m), Some(h)) = (decl_mirror, h_mirror) {
+        decl_mirror = Some(ctx.read_native_pin(h, m));
+    }
 
     ctx.set_field(sf, 0, Value::Object(Some(cls_str)));
     ctx.set_field(sf, 1, Value::Object(Some(meth_str)));
@@ -26785,6 +26809,11 @@ fn populate_stack_frame(
     ctx.set_field(sf, 3, Value::Int(entry.line_number));
     ctx.set_field(sf, 4, Value::Int(entry.byte_code_index));
     ctx.set_field(sf, 5, Value::Object(Some(decl_internal)));
+    ctx.set_field(
+        sf,
+        6,
+        decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
+    );
     ctx.unpin_native_roots(base);
     sf
 }
@@ -42270,51 +42299,17 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     // `gc_scan_classvalue_cache_roots` / `gc_update_classvalue_cache_refs`
     // (wired into `roots.rs` / `gc.rs`) and `reset_classvalue_cache` (wired
     // into VM creation, mirrors `lang_system::reset_system_singletons`).
-    let cv = "java/lang/ClassValue";
-    r.register(
-        cv,
-        "get",
-        "(Ljava/lang/Class;)Ljava/lang/Object;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let cls = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let key = classvalue_key(ctx, this, cls);
-            if let Some(v) = classvalue_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&key)
-            {
-                return Ok(Some(Value::Object(Some(*v))));
-            }
-            let result = ctx.invoke_virtual(
-                this,
-                "computeValue",
-                "(Ljava/lang/Class;)Ljava/lang/Object;",
-                &[Value::Object(Some(cls))],
-            )?;
-            if let Some(Value::Object(Some(v))) = result {
-                classvalue_cache()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, v);
-            }
-            Ok(result)
-        },
-    );
-    r.register(cv, "remove", "(Ljava/lang/Class;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
-            let key = classvalue_key(ctx, this, cls);
-            classvalue_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-        }
-        Ok(None)
-    });
+    //
+    // Standalone entry point (`register_classvalue_natives`, below this
+    // function) rather than inlined here: this function (`register_p67_misc`,
+    // reached only via `register_synthetic_overrides`) is DEAD CODE in the
+    // default (non-`synthetic-jdk`-feature) `cratonvm-cli` build — the one
+    // every Spring Boot suite run actually uses — confirmed via
+    // `--dump-native-registry`. Real-JDK-mode `vm/src/vm/vm_init.rs` calls
+    // `register_classvalue_natives` explicitly instead, so this registration
+    // is reachable in the build that matters. See that function's doc
+    // comment for the full writeup.
+    register_classvalue_natives(r);
 
     // java.lang.System additions
     r.register(
@@ -42456,6 +42451,76 @@ pub fn reset_classvalue_cache() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+}
+
+/// Registers `java.lang.ClassValue#get`/`#remove` (see `register_p67_misc`'s
+/// call site above for the full BUG-W rationale).
+///
+/// A standalone entry point — rather than folded directly into
+/// `register_p67_misc` — so it can be called explicitly from BOTH the
+/// synthetic-JDK bootstrap (`register_synthetic_overrides` →
+/// `register_phase67_natives` → `register_p67_misc`) and the real-JDK-mode
+/// `cratonvm-cli` bootstrap (`vm/src/vm/vm_init.rs`'s `VmContext::new`) — the
+/// latter does NOT call `register_synthetic_overrides` at all (real-JDK mode
+/// hand-picks a curated subset of registration functions instead; synthetic
+/// overrides assume synthetic field layouts and would corrupt real JDK
+/// objects), so without this, the registration is silently unreachable in
+/// the default build — confirmed via `--dump-native-registry` (0 entries for
+/// `java/lang/ClassValue` before this was added as an explicit call).
+///
+/// `NativeKind::Bridge`, not `SyntheticStub`: this is a correct, real
+/// implementation of a mechanism CratonVM cannot run as pure bytecode
+/// (`ClassValue`'s real algorithm depends on CASing a hidden field on
+/// `java.lang.Class` via `jdk.internal.misc.Unsafe`, not faithfully
+/// reproducible against CratonVM's `Class` mirrors), not a placeholder.
+pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
+    let cv = "java/lang/ClassValue";
+    r.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            cv,
+            "get",
+            "(Ljava/lang/Class;)Ljava/lang/Object;",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let cls = match args.get(1) {
+                    Some(Value::Object(Some(c))) => *c,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let key = classvalue_key(ctx, this, cls);
+                if let Some(v) = classvalue_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                {
+                    return Ok(Some(Value::Object(Some(*v))));
+                }
+                let result = ctx.invoke_virtual(
+                    this,
+                    "computeValue",
+                    "(Ljava/lang/Class;)Ljava/lang/Object;",
+                    &[Value::Object(Some(cls))],
+                )?;
+                if let Some(Value::Object(Some(v))) = result {
+                    classvalue_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, v);
+                }
+                Ok(result)
+            },
+        );
+        r.register(cv, "remove", "(Ljava/lang/Class;)V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
+                let key = classvalue_key(ctx, this, cls);
+                classvalue_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            }
+            Ok(None)
+        });
+    });
 }
 
 // =============================================================================
