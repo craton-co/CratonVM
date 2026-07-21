@@ -2547,6 +2547,19 @@ fn publish_to_jul_handlers_src(
             Some(Value::Object(Some(record))) => record,
             _ => return Ok(None),
         };
+        // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): pin
+        // `record` immediately, before any of the field sets/invokes below.
+        // `record` used to go unpinned until just before the handler loop,
+        // well after `setMessage` (an `invoke_virtual` into real,
+        // overridable `LogRecord` bytecode that can allocate and trigger a
+        // moving GC) had already run and the subsequent `set_field(record,
+        // 1, ...)` had already used the stale, unpinned reference -- caught
+        // live via the `gen_heap` OOB-write corruption guard (backtrace
+        // through this exact `set_field(record, 1, ...)` call, `index=1`,
+        // landing on a fresh zero-field `java/lang/Object`). Same hazard
+        // class as `native_bos_flush_locked`
+        // (docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md).
+        let record_pin = ctx.pin_native_root(record);
         // The compact VM may not materialize the JDK's private LogRecord
         // layout through its constructor. FileHandler.isLoggable() and its
         // formatter consume the public level/message surface, so make that
@@ -2568,13 +2581,17 @@ fn publish_to_jul_handlers_src(
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(message))],
         );
+        // `setMessage` above can GC; refresh both `record` and `message`
+        // (the latter is also read again below, past the same call) before
+        // touching either again.
+        let record = ctx.read_native_pin(record_pin, record);
+        let message = ctx.read_native_pin(message_pin, message);
         let record_id = next_log_record_id();
         ctx.set_field(record, 1, Value::Long(record_id));
         log_record_messages()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(record_id, ctx.read_string(message).unwrap_or_default());
-        let record_pin = ctx.pin_native_root(record);
         let handlers = ctx.read_native_pin(handlers_pin, handlers);
         let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
             Some(Value::Int(size)) if size > 0 => size as usize,
@@ -2603,6 +2620,12 @@ fn publish_to_jul_handlers_src(
             // FileHandler buffers output. The native publication bridge is
             // synchronous, so preserve JUL's observable completion contract
             // before the caller inspects its per-webapp log file.
+            //
+            // GC SAFETY: `publish` above is arbitrary, overridable Java
+            // bytecode that can GC; refresh `handler` from its pin before
+            // reusing it for `flush` below (same hazard class as the
+            // `record`/`message` fix above this loop).
+            let handler = ctx.read_native_pin(handler_pin, handler);
             let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
         }
         Ok(None)
