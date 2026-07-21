@@ -22638,53 +22638,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // Also register for the SB3 repackaged launcher
+    // Spring Boot 3.2+/4's launcher must resolve through its recorded URLs,
+    // not the process-global `ensure_class_initialized` shortcut used by the
+    // legacy SB2 bridge above. Reuse the real-mode base delegation, including
+    // its post-parent URLClassLoader local lookup.
     let luc3 = "org/springframework/boot/loader/launch/LaunchedClassLoader";
-    r.register(
-        luc3,
-        "loadClass",
+    for descriptor in [
         "(Ljava/lang/String;)Ljava/lang/Class;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("LaunchedClassLoader.loadClass: null name".to_string()),
-                    }
-                    .into())
-                }
-            };
-            let dotted = ctx.read_string(name_obj).unwrap_or_default();
-            let internal = dotted.replace('.', "/");
-            match ctx.ensure_class_initialized(&internal) {
-                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-            }
-        },
-    );
-    r.register(
-        luc3,
-        "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
-        |ctx, args| {
-            let name_obj = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("LaunchedClassLoader.loadClass(Z): null name".to_string()),
-                    }
-                    .into())
-                }
-            };
-            let dotted = ctx.read_string(name_obj).unwrap_or_default();
-            let internal = dotted.replace('.', "/");
-            match ctx.ensure_class_initialized(&internal) {
-                Ok(class_id) => Ok(Some(Value::Object(Some(ctx.get_class_mirror(class_id))))),
-                Err(_) => Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into()),
-            }
-        },
-    );
-
+    ] {
+        r.register(luc3, "loadClass", descriptor, |ctx, args| {
+            crate::classloader_real::cl_real_load_class_base_from_args(ctx, args)
+        });
+    }
     // ---------------------------------------------------------------------------
     // S111r21 — Spring's ClassUtils.forName(String, ClassLoader) native override.
     //
@@ -23423,21 +23389,23 @@ fn p59_fat_jar_boot_inf_nested_url_values(
 }
 
 /// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
-/// the central directory, build URL set for `BOOT-INF/classes/` (always
-/// included) plus every `BOOT-INF/lib/*.jar` entry.
+/// the central directory, apply Spring Boot's caller-supplied entry predicate,
+/// and build a nested URL for every included entry.
 ///
 /// Real-bytecode stream pipeline:
 ///   `jarFile.stream().map(JarArchiveEntry::new).filter(p1).map(this::getNestedJarUrl).collect(toCollection(LinkedHashSet::new))`
 ///
-/// Replacing it with a single native that materialises the URL set directly
-/// avoids the dependency on `Stream.map / Stream.filter / Stream.collect`
-/// (whose synthetic-Stream implementation does not support arbitrary
-/// `Function` / `Predicate` lambdas yet) and on `Collectors.toCollection`.
+/// Replacing the stream pipeline with a native avoids the unsupported generic
+/// `Stream.map / Stream.filter / Stream.collect` path while preserving the
+/// source-level predicate contract. In particular, PropertiesLauncher uses
+/// this with paths such as `app.jar!/` and must receive `foo.jar`, not an
+/// unconditional `BOOT-INF/classes/` URL intended only for repackaged jars.
 fn p59_spring_boot_jar_archive_get_class_path_urls(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let include_filter = obj_arg(args, 1)?;
     // JarFileArchive layout: field 0 = file (java.io.File), field 1 = jarFile.
     // Both `file_read_path` and JarFile field 0 store the path string, so
     // either route gets us the absolute path on disk.
@@ -23459,7 +23427,60 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    let urls = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
+    let include_filter_pin = ctx.pin_native_root(include_filter);
+    let mut urls: Vec<(ObjectRef, usize)> = Vec::new();
+    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
+    for jar_entry in p59_jar_collect_entries(ctx, &jar_path) {
+        let Value::Object(Some(jar_entry)) = jar_entry else {
+            continue;
+        };
+        let jar_entry_pin = ctx.pin_native_root(jar_entry);
+        let archive_entry = alloc_concurrent_synthetic(
+            ctx,
+            "org/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry",
+            1,
+        );
+        let archive_entry_pin = ctx.pin_native_root(archive_entry);
+        let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        ctx.set_field(archive_entry, 0, Value::Object(Some(jar_entry)));
+        ctx.set_field_by_name(archive_entry, "jarEntry", Value::Object(Some(jar_entry)));
+
+        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        let include = matches!(
+            ctx.invoke_virtual(
+                include_filter,
+                "test",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(archive_entry))],
+            )?,
+            Some(Value::Int(value)) if value != 0
+        );
+        if include {
+            let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
+            let name = match ctx.get_field_by_name(jar_entry, "name") {
+                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if !name.is_empty() {
+                // The Spring Boot nested protocol represents a directory
+                // class root (for example `BOOT-INF/classes/`) differently
+                // from a nested archive. The local class resolver understands
+                // the former `jar:nested:` form; preserve the ordinary
+                // `jar:file:` spelling for nested JAR/ZIP entries.
+                let url_text = if name.ends_with('/') {
+                    format!("jar:nested:/{jar_uri_path}/!{name}!/")
+                } else {
+                    format!("jar:file:/{jar_uri_path}!/{name}!/")
+                };
+                let url = p59_alloc_url(ctx, &url_text);
+                urls.push((url, ctx.pin_native_root(url)));
+            }
+        }
+        ctx.unpin_native_roots(archive_entry_pin);
+        ctx.unpin_native_roots(jar_entry_pin);
+    }
 
     if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
         eprintln!(
@@ -23468,19 +23489,33 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
-    // Build a 2-field synthetic ArrayList (backing-array, size). The bytecode
-    // declares `Set` as the return type but only ever calls
-    // `Collection.toArray(Object[])` on it, which is implemented by
-    // ArrayList via `native_collections`. Returning ArrayList sidesteps
-    // the synthetic-HashSet layout drift between `phases_early::Set.of`
-    // (3-field) and `native_collections::HashSet` (1-field).
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
-    for (i, v) in urls.iter().enumerate() {
-        ctx.set_array_element(arr, i, *v);
+    // This result is subsequently merged into a real LinkedHashSet by
+    // PropertiesLauncher. A synthetic two-slot ArrayList only happens to work
+    // for native collection consumers; real-JDK Collection.addAll walks the
+    // actual inherited elementData/size fields and therefore saw it as empty.
+    // Build a real ArrayList through its own native-backed constructor/add
+    // path so both real bytecode and native callers observe the URLs.
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+        Some(Value::Object(Some(obj))) => obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for (url, pin) in &urls {
+        let list = ctx.read_native_pin(list_pin, list);
+        let url = ctx.read_native_pin(*pin, *url);
+        ctx.invoke_virtual(
+            list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(url))],
+        )?;
     }
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(urls.len() as i32));
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(list_pin);
+    for (_, pin) in urls {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(include_filter_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
