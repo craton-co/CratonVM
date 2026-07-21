@@ -11409,9 +11409,9 @@ fn transfer_osr_exit_into_live_frame(
     }
 
     // Map reconstructed FrameValues → interpreter Values (Int / Long / Float /
-    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved /
-    // `Unsupported` → None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE
-    // any frame mutation so a reject can never half-write the frame.
+    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved →
+    // None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE any frame
+    // mutation so a reject can never half-write the frame.
     //
     // `ir_deopt_frame_values` is the 1:1 (NON-collapsing) mapper, which is exactly
     // what the in-place transfer needs: the locals snapshot is JVM-slot-indexed
@@ -11423,10 +11423,38 @@ fn transfer_osr_exit_into_live_frame(
     // `Frame::new_pooled`, uses the COLLAPSING `ir_deopt_locals` instead because
     // `copy_args_to_locals` re-expands a compact list; here there is no
     // re-expansion, so collapsing would mis-align the direct slot writes.
-    let locals = match ir_deopt_frame_values(&rframe.locals) {
-        Some(l) => l,
-        None => return bail("unmappable local"),
-    };
+    //
+    // FIX (jit-osr-loop-duplicate-execution, silent data corruption): a LOCAL
+    // slot's `FrameValue::Unsupported` must NOT reject the whole transfer the
+    // way an unmappable STACK slot does. `classify_local_kinds` (jit/src/x64.rs)
+    // is a coarse WHOLE-METHOD scan: a slot accessed as more than one JVM kind
+    // ANYWHERE in the method (e.g. an `int` loop counter whose slot is later
+    // reused, after the loop's scope ends, for an unrelated `long`) is always
+    // `Ambiguous` → `Unsupported`, at EVERY bci in that method, even ones where
+    // the reused slot provably cannot be read yet. The bytecode we're resuming
+    // already passed verification, which requires a fresh `store` before any
+    // `load` of a given logical local — so at the resume bci, an `Unsupported`
+    // slot is either genuinely dead (its old value is never read before being
+    // overwritten) or belongs to a not-yet-live disjoint reuse of the slot;
+    // either way its CURRENT value in the live frame is safe to leave in
+    // place. Previously this fell through to `bail("unmappable local")` on
+    // every method with any such slot, which discarded the whole transfer —
+    // even after the OSR'd loop had already run to completion with real,
+    // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
+    // resume from the STALE pre-OSR pc/locals, silently re-executing (and
+    // re-committing) every iteration since OSR entry. See
+    // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
+    let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
+    for v in &rframe.locals {
+        if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
+            locals.push(None);
+        } else {
+            match fv_to_value(v) {
+                Some(val) => locals.push(Some(val)),
+                None => return bail("unmappable local"),
+            }
+        }
+    }
     let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
         None => return bail("unmappable stack slot"),
@@ -11435,10 +11463,14 @@ fn transfer_osr_exit_into_live_frame(
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
     // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot,
-    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1.
+    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1. A `None` entry
+    // (an `Unsupported` source slot, see above) leaves that slot's existing live
+    // value untouched instead of writing anything.
     let frame = &mut thread.frames[frame_idx];
     for (i, v) in locals.iter().enumerate() {
-        frame.set_local_unchecked(i, *v);
+        if let Some(val) = v {
+            frame.set_local_unchecked(i, *val);
+        }
     }
     frame.stack.clear();
     for v in &stack_vals {
@@ -12664,12 +12696,62 @@ mod deopt_step3_tests {
         assert_eq!(frame.get_local(1), Value::Int(9));
     }
 
-    /// An unmappable slot (cat-2 `Unsupported`) rejects (returns `None`) and leaves
-    /// the live frame COMPLETELY untouched — the mapping happens before any
-    /// mutation, so a reject can never half-write the frame (the caller then safely
-    /// continues interpreting the pre-OSR state).
+    /// FIX (jit-osr-loop-duplicate-execution): an `Unsupported` LOCAL slot must
+    /// NOT reject the whole transfer. `classify_local_kinds` marks a slot
+    /// `Ambiguous` (→ `Unsupported`) whenever it is used as more than one JVM
+    /// kind ANYWHERE in the method — including a slot legally reused, after its
+    /// original local's scope ends, for an unrelated local (e.g. an `int` loop
+    /// counter's slot later reused for a `long`). The bytecode being resumed
+    /// already passed verification, which requires a fresh `store` before any
+    /// `load` of a given logical local, so an `Unsupported` slot's CURRENT live
+    /// value is always safe to leave untouched. Before this fix, ANY such slot
+    /// rejected the entire transfer — discarding real, already-committed OSR
+    /// side effects and forcing the interpreter to silently re-execute them
+    /// from stale pre-OSR state (the root cause documented in
+    /// docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
     #[test]
-    fn osr_exit_transfer_rejects_unmappable_without_mutating() {
+    fn osr_exit_transfer_tolerates_unmappable_local() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![FrameValue::Int(33)],
+            5,
+        );
+
+        let advanced = rframe(
+            vec![FrameValue::Int(99), FrameValue::Unsupported],
+            vec![],
+            8,
+        );
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            "an Unsupported LOCAL must not block the transfer"
+        );
+
+        let frame = &thread.frames[0];
+        // Mappable slot 0 is overwritten from the reconstructed state...
+        assert_eq!(frame.get_local(0), Value::Int(99));
+        // ...but the Unsupported slot 1 keeps its PRE-transfer live value
+        // (it is provably not yet readable in this scope — see doc comment).
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 8);
+        assert_eq!(frame.stack.len(), 0, "empty snapshot stack replaces the stale one");
+    }
+
+    /// An unmappable OPERAND STACK slot (unlike a local) still rejects the whole
+    /// transfer and leaves the live frame COMPLETELY untouched: stack values are
+    /// transient and about to be consumed, so there is no scope/verification
+    /// guarantee protecting a stale or fabricated value the way there is for a
+    /// local — the mapping happens before any mutation, so a reject can never
+    /// half-write the frame (the caller then safely continues interpreting the
+    /// pre-OSR state).
+    #[test]
+    fn osr_exit_transfer_rejects_unmappable_stack_without_mutating() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
@@ -12683,8 +12765,8 @@ mod deopt_step3_tests {
         );
 
         let bad = rframe(
-            vec![FrameValue::Int(99), FrameValue::Unsupported],
-            vec![],
+            vec![FrameValue::Int(99), FrameValue::Int(0)],
+            vec![FrameValue::Unsupported],
             8,
         );
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
@@ -30064,6 +30146,40 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
+            // 2026-07-20) — never OSR a method containing `invokedynamic`. The
+            // 0xba codegen arm lowers every indy call site to an unconditional
+            // `DeoptReason::UnreachedCode` trap (it never links/inlines the
+            // bootstrap), so entering that site while OSR-compiled always
+            // bails. For a NORMAL (method-entry) compile that bail resumes by
+            // building a brand-new frame from scratch (no prior live frame to
+            // reconcile), which is precise. For OSR the bail must instead
+            // transfer the JIT-advanced state IN PLACE into the pre-existing
+            // live interpreter frame (`transfer_osr_exit_into_live_frame`) —
+            // and that transfer routinely fails: the operand-stack values
+            // live at an indy call site (its recipe/constant args) are exactly
+            // the kind of value the single-pass backend's per-site stack-slot
+            // classifier cannot always precisely re-type (see `FrameValue::
+            // Unsupported`'s doc in jit/src/deopt.rs), which correctly rejects
+            // the transfer rather than fabricate one. The OSR trigger then
+            // falls back to its "safe reject" default — resuming interpretation
+            // at the STALE pre-OSR back-edge pc/locals — which is only actually
+            // safe when the bail precedes any committed loop iteration. An indy
+            // trap reached *after* a hot loop that already ran to completion
+            // inside the OSR'd continuation (e.g. a `System.out.println("..." +
+            // n + ...)` immediately following the loop, "..." string-concat
+            // compiling to `invokedynamic`) violates that precondition: the
+            // loop's real side effects (already committed once, correctly, by
+            // the OSR'd code) get silently RE-EXECUTED by the interpreter from
+            // the stale resume state — e.g. an `ArrayList` ending up with extra
+            // duplicate elements with no exception anywhere. See
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // for the full repro and trace. Like `has_athrow` above,
+            // method-entry compilation (unaffected by this OSR-only bail path)
+            // remains available, so do NOT bail-list here.
+            if !scan.indy_ops.is_empty() {
                 return None;
             }
             // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
