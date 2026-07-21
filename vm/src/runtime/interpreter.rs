@@ -26999,11 +26999,55 @@ pub(crate) fn should_force_registered_native_over_bytecode(
 ) -> bool {
     should_force_registered_native_over_bytecode_precomputed(
         shared,
-        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
+        force_native_over_real_jdk_bytecode_memoized(class_name, method_name, method_descriptor),
         class_name,
         method_name,
         method_descriptor,
     )
+}
+
+/// Memoizing wrapper around [`force_native_over_real_jdk_bytecode`].
+///
+/// That function is a pure, ~55-branch sequential scan over hardcoded
+/// (class, method, descriptor) triples with no side effects and no
+/// dependency on mutable VM state -- its result for a given triple never
+/// changes for the lifetime of the process. `CachedBytecodeMethod
+/// ::force_native_cache` already memoizes it once per warm bytecode-PC
+/// invoke-cache entry, but every OTHER call path that reaches
+/// `should_force_registered_native_over_bytecode` -- reflective
+/// `Method.invoke()` dispatch (which has no bytecode PC to key an
+/// invoke-cache entry on), megamorphic/polymorphic call sites that never
+/// settle on one cached target, `invokespecial`, and interface-default
+/// dispatch -- re-ran the full scan on every single call with no
+/// memoization at all. Profiling `BeanRegistrationsAotContributionTests`
+/// (~54 min vs HotSpot's 13s for the same test, see
+/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
+/// section) found exactly this: `intercept_force_registered_native` ->
+/// `should_force_registered_native_over_bytecode` ->
+/// `force_native_over_real_jdk_bytecode` live at the top of repeated gdb
+/// stack samples, reached through deep `try_lambda_dispatch` recursion
+/// driven by Mockito's constructor-mock listener dispatch (reflective
+/// `Method.invoke()` on many distinct generated classes, so per-callsite
+/// caching never warms up). A global cache keyed by the exact same 3
+/// inputs is safe by construction -- the wrapped function reads no state
+/// beyond its own arguments, so there is nothing to invalidate.
+fn force_native_over_real_jdk_bytecode_memoized(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+    type Key = (Box<str>, Box<str>, Box<str>);
+    static CACHE: OnceLock<Mutex<rustc_hash::FxHashMap<Key, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()));
+    let key: Key = (class_name.into(), method_name.into(), method_descriptor.into());
+    if let Some(&v) = cache.lock().get(&key) {
+        return v;
+    }
+    let v = force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor);
+    cache.lock().insert(key, v);
+    v
 }
 
 /// Same decision as [`should_force_registered_native_over_bytecode`], but
