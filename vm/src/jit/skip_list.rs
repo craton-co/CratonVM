@@ -1251,9 +1251,31 @@ fn should_skip_jit_internal(
         // in place too). So lifting THIS ban was never what was unsafe — but
         // since doing so also produced zero measured benefit (didn't speed up
         // `testSlicesDense`), it stays banned regardless: no upside to justify
-        // the unproven risk. Re-verify against the ORIGINAL AIOOBE repro (this
-        // comment's first paragraph) before ever lifting it again. Liftable
-        // for investigation via `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        // the unproven risk.
+        //
+        // 2026-07-21 re-verification #2 (after `0bdd62344`/java.util narrowing
+        // and `b416011bc`/MatchOps fixes landed — neither was in place for the
+        // "zero measured benefit" finding above): re-ran with both fixes on
+        // `dev`. `testSlicesDense` now DOES show a real ~26% speedup with the
+        // ban lifted (2572s vs. 3457s, same seed/session) and no visible
+        // correctness issue on that specific test. But `ES812PostingsFormatTests`
+        // (this ban's own original correctness repro, 32-test class) FAILS with
+        // the ban lifted: an uncaught `IllegalArgumentException: fromIndex(4) >
+        // toIndex(0)` in `RandomPostingsTester`, plus an
+        // `IllegalMonitorStateException` ("thread does not own the monitor") on
+        // `IndexWriter.doWait`'s implicit monitorexit at frame-pop (the `B8`
+        // diagnostic in `runtime/interpreter.rs`) — NEITHER of which reproduce
+        // with the ban left in place (control run: clean `OK (32 tests)`, same
+        // seed). This is a DIFFERENT correctness gap than the original
+        // AIOOBE/SIGSEGV this ban was created for — a JIT-vs-synchronized-method
+        // monitor-handling bug specific to `IndexWriter`'s synchronized wait
+        // loop — but it is real, reproducible, and currently unfixed. THE BAN
+        // MUST STAY. See
+        // `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`'s
+        // 2026-07-21 section for the full writeup. Do not re-lift based on the
+        // testSlicesDense speed win alone — that test doesn't exercise the
+        // synchronized-method path that breaks. Liftable for investigation via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
         if class_name.starts_with("org/apache/lucene/")
             && !package_allowed("org/apache/lucene/", allow_packages)
         {
