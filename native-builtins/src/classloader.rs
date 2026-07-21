@@ -1184,6 +1184,13 @@ pub(crate) fn invoke_single_load_class_override(
     if reentrant {
         return None;
     }
+    if ctx.is_executing_instance_method(this, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;")
+    {
+        SINGLE_LOAD_CLASS_OVERRIDE_IN_FLIGHT.with(|active| {
+            debug_assert_eq!(active.borrow_mut().pop(), Some(identity));
+        });
+        return None;
+    }
     let result = ctx.invoke_virtual(
         this,
         "loadClass",
