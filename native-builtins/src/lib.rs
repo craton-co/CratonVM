@@ -27887,7 +27887,20 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             },
         };
         if let Some(output) = output {
-            let _ = ctx.invoke_virtual(output, "flush", "()V", &[])?;
+            // `invoke_virtual` (the generic native-context dispatcher) can
+            // resolve a dynamically-generated subclass (e.g. a Mockito
+            // ByteBuddy mock of `OutputStream`) to the WRONG declaring
+            // method's bytecode without erroring -- it silently no-ops
+            // instead of running the mock's own overridden `flush()`, so
+            // Mockito's interaction recorder never sees the call
+            // (`StreamUtils.nonClosing(mock).flush()` -> `ordered.verify
+            // (source).flush()` failed with "wanted but not invoked" even
+            // though this native ran and returned success). `invoke_virtual
+            // _bytecode_only` walks the RECEIVER's actual class hierarchy to
+            // find where the method is truly declared and executes that
+            // bytecode directly, matching what an ordinary `invokevirtual`
+            // instruction would do.
+            let _ = ctx.invoke_virtual_bytecode_only(output, "flush", "()V", &[])?;
         }
         Ok(None)
     });
@@ -27904,7 +27917,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             },
         };
         if let Some(output) = output {
-            let _ = ctx.invoke_virtual(output, "close", "()V", &[])?;
+            // See the identical fix + rationale on the sibling `flush()`
+            // native above.
+            let _ = ctx.invoke_virtual_bytecode_only(output, "close", "()V", &[])?;
         }
         Ok(None)
     });

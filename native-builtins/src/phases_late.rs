@@ -22368,6 +22368,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
         p59_spring_boot_jar_archive_get_class_path_urls,
     );
+    r.register(
+        "org/springframework/boot/loader/launch/ExplodedArchive",
+        "getClassPathUrls",
+        "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
+        p59_spring_boot_exploded_archive_get_class_path_urls,
+    );
 
     // Spring Boot 3.2+ repackaged launcher: `ExecutableArchiveLauncher` overrides
     // `createClassLoader(Collection)` and can CCE in `toArray` / typed iteration
@@ -23475,6 +23481,168 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
     }
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(urls.len() as i32));
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// Spring Boot 3 `ExplodedArchive.getClassPathUrls` without depending on the
+/// real-JDK `LinkedList.addAll(0, ...)` path. The latter was retaining the
+/// immediate directories but dropping every descendant under CratonVM, which
+/// made a directory archive silently omit manifests, nested files, and names
+/// requiring URI encoding.
+fn p59_spring_boot_exploded_archive_get_class_path_urls(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let include_filter = obj_arg(args, 1)?;
+    let directory_search_filter = obj_arg(args, 2)?;
+    let root_directory = match ctx.get_field(this, 0) {
+        Value::Object(Some(file)) => file_read_path(ctx, file),
+        _ => String::new(),
+    };
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+        eprintln!(
+            "[DBG_SBLOAD] ExplodedArchive.getClassPathUrls root_directory={:?}",
+            root_directory
+        );
+    }
+    let root_path = std::path::PathBuf::from(&root_directory);
+    let mut pending = match std::fs::read_dir(&root_path) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    pending.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    pending.reverse();
+
+    let this_pin = ctx.pin_native_root(this);
+    let include_filter_pin = ctx.pin_native_root(include_filter);
+    let directory_search_filter_pin = ctx.pin_native_root(directory_search_filter);
+    let mut urls = Vec::new();
+    let mut url_pins = Vec::new();
+    while let Some(path) = pending.pop() {
+        let is_directory = path.is_dir();
+        let Ok(relative) = path.strip_prefix(&root_path) else {
+            continue;
+        };
+        let mut entry_name = relative.to_string_lossy().replace('\\', "/");
+        if is_directory {
+            entry_name.push('/');
+        }
+        let file = file_alloc(ctx, &path.to_string_lossy());
+        let file_pin = ctx.pin_native_root(file);
+        let archive_entry = alloc_concurrent_synthetic(
+            ctx,
+            "org/springframework/boot/loader/launch/ExplodedArchive$FileArchiveEntry",
+            2,
+        );
+        let archive_entry_pin = ctx.pin_native_root(archive_entry);
+        let name = ctx.create_string(&entry_name);
+        let file = ctx.read_native_pin(file_pin, file);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        ctx.set_field(archive_entry, 0, Value::Object(Some(name)));
+        ctx.set_field(archive_entry, 1, Value::Object(Some(file)));
+        ctx.set_field_by_name(archive_entry, "name", Value::Object(Some(name)));
+        ctx.set_field_by_name(archive_entry, "file", Value::Object(Some(file)));
+
+        if is_directory {
+            let directory_search_filter =
+                ctx.read_native_pin(directory_search_filter_pin, directory_search_filter);
+            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+            let search = matches!(
+                ctx.invoke_virtual(
+                    directory_search_filter,
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(archive_entry))],
+                )?,
+                Some(Value::Int(value)) if value != 0
+            );
+            if search {
+                let mut children = match std::fs::read_dir(&path) {
+                    Ok(entries) => entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                children.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+                children.reverse();
+                pending.extend(children);
+            }
+        }
+
+        let include_filter = ctx.read_native_pin(include_filter_pin, include_filter);
+        let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+        let include = matches!(
+            ctx.invoke_virtual(
+                include_filter,
+                "test",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(archive_entry))],
+            )?,
+            Some(Value::Int(value)) if value != 0
+        );
+        if include {
+            let file = ctx.read_native_pin(file_pin, file);
+            let uri = ctx.invoke_virtual(file, "toURI", "()Ljava/net/URI;", &[])?;
+            if let Some(Value::Object(Some(uri))) = uri {
+                let uri_pin = ctx.pin_native_root(uri);
+                let url = ctx.invoke_virtual(uri, "toURL", "()Ljava/net/URL;", &[])?;
+                ctx.unpin_native_roots(uri_pin);
+                if let Some(Value::Object(Some(url))) = url {
+                    url_pins.push(ctx.pin_native_root(url));
+                    urls.push(url);
+                }
+            }
+        }
+        ctx.unpin_native_roots(file_pin);
+        ctx.unpin_native_roots(archive_entry_pin);
+    }
+    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+        eprintln!(
+            "[DBG_SBLOAD] ExplodedArchive.getClassPathUrls -> {} urls",
+            urls.len()
+        );
+    }
+
+    // Unlike the JarFileArchive sibling above (whose result is only ever
+    // consumed through a native `LinkedHashSet(Collection)` constructor
+    // that reads a synthetic 2-field ArrayList's slots directly), this
+    // return value is `.addAll()`'d into a real `LinkedHashSet` and
+    // `new LinkedHashSet<>(...)`-copy-constructed by PropertiesLauncher's
+    // own bytecode — both of which walk it via real bytecode's
+    // `Collection.iterator()`. A hand-built synthetic ArrayList with
+    // `elementData`/`size` hardcoded at slots 0/1 silently yields an empty
+    // iteration in real-JDK mode, where those fields resolve to different
+    // slots (inherited from AbstractList/AbstractCollection). Build a
+    // genuine `ArrayList` through its own natively-backed `<init>`/`add`
+    // so it stays correct regardless of the active field layout.
+    let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
+        Some(Value::Object(Some(obj))) => obj,
+        _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    for (url, pin) in urls.iter().zip(&url_pins) {
+        let list = ctx.read_native_pin(list_pin, list);
+        let url = ctx.read_native_pin(*pin, *url);
+        ctx.invoke_virtual(
+            list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(url))],
+        )?;
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    for pin in url_pins {
+        ctx.unpin_native_roots(pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(include_filter_pin);
+    ctx.unpin_native_roots(directory_search_filter_pin);
+    ctx.unpin_native_roots(list_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -42481,17 +42649,44 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
             "get",
             "(Ljava/lang/Class;)Ljava/lang/Object;",
             |ctx, args| {
+                // Residual-6 diagnosis (env-gated): prove/disprove the native
+                // being reached for every logical get() call, including the
+                // malformed-argument silent-null path below.
+                let cv_trace = {
+                    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+                };
                 let this = obj_arg(args, 0)?;
                 let cls = match args.get(1) {
                     Some(Value::Object(Some(c))) => *c,
-                    _ => return Ok(Some(Value::Object(None))),
+                    other => {
+                        if cv_trace {
+                            eprintln!(
+                                "[cv-native] MALFORMED cls arg {:?} -> silent null",
+                                other.map(|v| std::mem::discriminant(v))
+                            );
+                        }
+                        return Ok(Some(Value::Object(None)));
+                    }
                 };
                 let key = classvalue_key(ctx, this, cls);
+                if cv_trace {
+                    eprintln!(
+                        "[cv-native] this={:#x} cls={:#x} key=({},{})",
+                        this.as_ptr() as usize,
+                        cls.as_ptr() as usize,
+                        key.0,
+                        key.1
+                    );
+                }
                 if let Some(v) = classvalue_cache()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&key)
                 {
+                    if cv_trace {
+                        eprintln!("[cv-native] cache HIT -> {:#x}", v.as_ptr() as usize);
+                    }
                     return Ok(Some(Value::Object(Some(*v))));
                 }
                 let result = ctx.invoke_virtual(
@@ -42500,6 +42695,12 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                     "(Ljava/lang/Class;)Ljava/lang/Object;",
                     &[Value::Object(Some(cls))],
                 )?;
+                if cv_trace {
+                    eprintln!(
+                        "[cv-native] computeValue -> is_null={}",
+                        !matches!(result, Some(Value::Object(Some(_))))
+                    );
+                }
                 if let Some(Value::Object(Some(v))) = result {
                     classvalue_cache()
                         .lock()

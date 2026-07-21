@@ -754,6 +754,65 @@ impl Class {
         self.is_subclass_of_by_name_inner(target_name, store, 0, &mut visited)
     }
 
+    /// Loader-identity-blind assignability: like [`Self::is_subclass_of`] but
+    /// comparing each node's fully-qualified NAME to `target_name` instead of
+    /// `ClassId` identity, walking BOTH the superclass chain and the interface
+    /// DAG (unlike [`Self::is_subclass_of_by_name`], whose supers-only walk is
+    /// specific to exception `catch_type`s, which are never interfaces).
+    ///
+    /// Exists for JIT `checkcast`/`instanceof` (`jit_typecheck_resolve` in
+    /// `vm/src/jit/helpers.rs`): the compiled artifact carries only the target
+    /// class NAME, and resolving it through the flat global
+    /// `find_class_by_name` can land on a *different* `ClassId` than the
+    /// receiver's when the same class got defined twice by two loaders (e.g.
+    /// Spring's AOT-processing/`CompileWithForkedClassLoader` child loaders
+    /// re-defining app classes — the exact shape behind
+    /// `SpringBootContextLoaderAotTests`' Residual 6, where a JIT-compiled
+    /// `checkcast org/codehaus/groovy/reflection/ClassInfo` refused the cast
+    /// between two same-named `ClassInfo` copies and silently nulled Groovy's
+    /// registry lookups). Same accepted tradeoff as
+    /// [`Self::is_subclass_of_by_name`]: in CratonVM's flat class store,
+    /// treating identically-named classes as assignable is far less harmful
+    /// than failing a cast the interpreter's loader-faithful CP resolution
+    /// would have passed.
+    pub fn is_assignable_to_name(&self, target_name: &str, store: &ClassStore) -> bool {
+        let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+        self.is_assignable_to_name_inner(target_name, store, 0, &mut visited)
+    }
+
+    fn is_assignable_to_name_inner(
+        &self,
+        target_name: &str,
+        store: &ClassStore,
+        depth: usize,
+        visited: &mut FxHashSet<ClassId>,
+    ) -> bool {
+        if depth > MAX_HIERARCHY_DEPTH {
+            return false;
+        }
+        if &*self.name == target_name {
+            return true;
+        }
+        if !visited.insert(self.id) {
+            return false;
+        }
+        if let Some(super_id) = self.superclass {
+            if let Some(super_class) = store.get(super_id) {
+                if super_class.is_assignable_to_name_inner(target_name, store, depth + 1, visited) {
+                    return true;
+                }
+            }
+        }
+        for &iface_id in &self.interfaces {
+            if let Some(iface_class) = store.get(iface_id) {
+                if iface_class.is_assignable_to_name_inner(target_name, store, depth + 1, visited) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn is_subclass_of_by_name_inner(
         &self,
         target_name: &str,
