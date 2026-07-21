@@ -1737,8 +1737,59 @@ impl GenerationalHeap {
     }
 
     /// Get the identity hash code of a heap object.
+    ///
+    /// The JIT's inline `new` fast path (`jit/src/x64.rs`) deliberately
+    /// leaves this header field TLAB-zeroed rather than paying a mint on
+    /// every allocation, deferring to what its own comment calls a "lazy-
+    /// mint contract". This is that contract: when the stored value is 0,
+    /// mint a fresh one here and CAS it into the header so it becomes a
+    /// durable, GC-move-stable property of the object from this point on
+    /// (every mover in this file copies the header's bytes verbatim, so
+    /// once non-zero this field survives every future relocation). Without
+    /// this, callers that need a *stable* per-object key (e.g.
+    /// `native-builtins/src/keystore.rs`'s `store_id_by_identity`, or
+    /// `VarHandle` root dedup in `vm_exec.rs`) would otherwise have to
+    /// derive one from the object's current address — which silently goes
+    /// stale the moment a moving GC relocates the object. See
+    /// `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        self.get_header(obj_ref).identity_hash_code
+        let existing = self.get_header(obj_ref).identity_hash_code;
+        if existing != 0 {
+            return existing;
+        }
+        self.mint_identity_hash_code(obj_ref)
+    }
+
+    /// Lazily mint and durably install a non-zero identity hash for an
+    /// object whose header field is still 0. Safe to call concurrently:
+    /// the header field is written via a CAS from 0, so a losing racer's
+    /// mint is discarded and every caller (including the loser) converges
+    /// on the single value that actually ends up stored.
+    fn mint_identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
+        let minted = match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        };
+        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code`
+        // is a plain `i32` field at a fixed offset within `ObjectHeader` on
+        // every heap backend (see `types/src/heap_types.rs`). This is the
+        // sole writer that mutates this field post-allocation, and it only
+        // ever moves it 0 -> nonzero via CAS, so treating the field as an
+        // `AtomicI32` for this one operation cannot race with the plain
+        // (non-atomic) reads the rest of the codebase performs elsewhere: a
+        // naturally-aligned 4-byte load/store is already atomic at the ISA
+        // level, and no other writer can observe/produce a torn value. Same
+        // pragmatic accommodation this file already makes for `mark_word`
+        // (see the "Round-2 fix (T2-4)" comment on the GC-copy path above).
+        unsafe {
+            let field_ptr =
+                std::ptr::addr_of_mut!((*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code);
+            let atomic = &*(field_ptr as *const AtomicI32);
+            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => minted,
+                Err(existing) => existing,
+            }
+        }
     }
 
     /// Conservative validity check for a *raw address* — used by NEW-1.5
