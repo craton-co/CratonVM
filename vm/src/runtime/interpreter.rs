@@ -17508,6 +17508,47 @@ fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectR
     }
 }
 
+/// Whether `referencing_class_id`'s DEFINING loader is (exactly) Spring's
+/// `org.springframework.core.test.tools.CompileWithForkedClassLoaderClassLoader`
+/// -- the loader `@CompileWithForkedClassLoader` gives each annotated test
+/// method its own fresh instance of. Same rationale and same narrow,
+/// type-checked shape as [`is_groovy_class_loader`] just above: this
+/// loader's `findClass` deliberately redefines any class (INCLUDING
+/// framework classes like `MergedAnnotations$SearchStrategy`, not just the
+/// test's own fixtures) it can pull bytes for via `testClassLoader.
+/// getResourceAsStream(...)`, so code running inside its context has a
+/// genuinely FRESH `Class`/enum-constant identity for those classes, by
+/// design -- matches real CGLIB/Spring behavior, works fine on HotSpot.
+/// With the global gate off, a `CONSTANT_Class`/field-ref resolution
+/// reached from inside that forked context for a name the built-in
+/// delegation chain can ALSO serve (e.g. any `org/springframework/*`
+/// class -- `is_global_resolution_namespace` only excludes `java`/`javax`/
+/// `jdk`/`sun`/`com.sun`) skipped the loader-initiated fast path entirely
+/// and went straight to the global, loader-blind `load_class_concurrent`,
+/// which can silently create a SECOND, distinct `ClassId` for a class the
+/// fork's own loader already has its own copy of -- surfacing as
+/// `IllegalStateException`/`ClassCastException`-shaped `==`/`instanceof`
+/// failures wherever the two identities meet (see
+/// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md`'s
+/// `searchEnclosingClass` writeup). The class is `final` with no
+/// subtypes, so an exact-id match is sufficient -- no `is_subclass_of`
+/// walk needed, unlike Groovy's.
+fn is_compile_with_forked_class_loader(
+    shared: &SharedVm,
+    loader_obj: cratonvm_types::ObjectRef,
+) -> bool {
+    let cm = shared.class_manager.read();
+    let loader_class_id = shared.heap.class_id_of(loader_obj);
+    match cm.get_loaded_class_id(
+        "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader",
+    ) {
+        Some(forked_cl_id) => loader_class_id == forked_cl_id,
+        // Not loaded at all in this process (spring-core-test not on the
+        // classpath, or the annotation never used) => trivially not this loader.
+        None => false,
+    }
+}
+
 /// Whether loader-initiated (JVMS §5.4.3 initiating-loader) `CONSTANT_Class`
 /// resolution should run for a reference from `referencing_class_id`: either
 /// the global gate is on, or the referencing class was defined by a
@@ -17524,7 +17565,10 @@ fn should_use_loader_initiated_resolution(
     }
     match cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
     {
-        Some(loader_obj) => is_groovy_class_loader(shared, loader_obj),
+        Some(loader_obj) => {
+            is_groovy_class_loader(shared, loader_obj)
+                || is_compile_with_forked_class_loader(shared, loader_obj)
+        }
         None => false,
     }
 }
@@ -17639,7 +17683,7 @@ fn resolve_class_loader_aware(
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
             || name.contains("ManagementContextAutoConfiguration")
             || name.contains("ManagementPortType")
-            || name.contains("ChildManagementContextInitializerAotTests"));
+            || name.contains("ChildManagementContextInitializerAotTests") || name.contains("SearchStrategy") || name.contains("MergedAnnotations"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm

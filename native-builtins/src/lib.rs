@@ -72282,7 +72282,7 @@ fn native_logger_log(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     jul_log_msg(ctx, args)
 }
 
-fn transition_real_executor_to_shutdown(
+pub(crate) fn transition_real_executor_to_shutdown(
     ctx: &mut dyn NativeContext,
     executor: ObjectRef,
 ) -> MethodCallResult {
@@ -72301,6 +72301,22 @@ fn transition_real_executor_to_shutdown(
     // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
     // worker blocked in LinkedBlockingQueue.take().
     let _ = interrupt_executor_workers(ctx, executor);
+    // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue. Its
+    // real `onShutdown()` removes cancelled delayed tasks (including JUnit's
+    // cancelled timeout watchdog); without it, the queue stays nonempty until
+    // the original timeout expires and `awaitTermination()` cannot finish.
+    // Preserve the JDK shutdown ordering while keeping the existing native
+    // transition for real ThreadPoolExecutor receivers.
+    let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
+    // `onShutdown()` may have emptied the queue. Run the real finalization
+    // path so it signals the termination condition immediately when there are
+    // no workers left, rather than waiting for a later worker-exit callback.
+    let _ = ctx.invoke_special_bytecode_only(
+        "java/util/concurrent/ThreadPoolExecutor",
+        "tryTerminate",
+        "()V",
+        &[Value::Object(Some(executor))],
+    )?;
     Ok(None)
 }
 

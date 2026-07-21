@@ -26,6 +26,7 @@ pub mod deopt_materialize;
 pub mod diagnostics;
 pub mod fx_collections;
 pub mod gc_integration;
+pub mod heartbeat_watch;
 pub mod hprof;
 pub mod jdk_layout;
 pub mod jit_integration;

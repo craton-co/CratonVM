@@ -2,9 +2,233 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 41 confirmed genuine bugs remaining |
-| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`) |
+| **Status** | OPEN — 40 confirmed genuine bugs remaining (1 fixed 2026-07-21 late session; AOT cluster excluded, being worked separately) |
+| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`), 1 more fixed 2026-07-21 late session (dev `063cd747d`, see below) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
+
+## 2026-07-21 late session — non-AOT residual sweep
+
+Scope: every OPEN class in this doc EXCLUDING the AOT cluster (both the
+strict `*.aot.*`-package classes and the wider set of TIMEOUT classes swept
+into that investigation's narrative — `core.io.buffer.DataBufferTests`,
+`scripting.groovy.GroovyScriptFactoryTests`,
+`context.groovy.GroovyBeanDefinitionReaderTests`,
+`context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`,
+`test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`,
+`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`/
+`RequestMappingMessageConversionIntegrationTests`, and
+`web.service.registry.*` — left alone per explicit instruction, another
+session (`wt-aot-cluster-20260721`, branch `fix/aot-cluster-residuals-20260721`)
+is actively working that cluster). Worktree
+`/data/wt-spring-genuine-residuals-20260721` (branch
+`fix/spring-genuine-buglist-residuals-20260721`), binary
+`cratonvm-springresid-v2.bin`.
+
+**1 genuine bug fixed.** `native-builtins/src/cglib_enhancer.rs`'s
+`emit_bean_override` (the native `ConfigurationClassEnhancer` `@Bean`-method
+proxy-override bytecode emitter) implemented the
+`isCurrentlyInvokedFactoryMethod` → `super.<name>()` /
+inter-bean-reference → `getBean(name)` dichotomy from real Spring's
+`BeanMethodInterceptor.intercept`, but never replicated
+`resolveBeanReference`'s SPR-8080 reentrancy guard: temporarily clearing
+`ConfigurableBeanFactory.setCurrentlyInCreation(beanName, false)` around the
+inter-bean `getBean()` call (restored in a `finally`) whenever that bean
+name was already marked "currently in creation" by an enclosing
+`getSingleton()` further up the call stack. Without it, a `@PostConstruct`
+method on a `@Configuration` class that called one of its own sibling
+`@Bean` methods — when that factory bean's OWN creation was triggered as a
+side effect of resolving the `@Bean` method's product as a dependency
+elsewhere (e.g. `Config2` registered before `Config1`, so `Config1` gets
+created while the container is mid-`getSingleton("beanMethod", ...)`) —
+tripped a spurious `BeanCurrentlyInCreationException` that real Spring
+resolves fine. Fixed by adding the same temporarily-clear/finally-restore
+dance as hand-written JVM bytecode (new locals for `alreadyInCreation`/`cbf`/
+the caught throwable, one new exception-table entry covering just the
+`getBean()` call, mirroring `resolveBeanReference`'s `try/finally` exactly).
+Fixes `context.annotation.ConfigurationClassPostConstructAndAutowiringTests`
+.`originalReproCase` (2/2, was 1/2). No regression: reran
+`ConfigurationClassPostProcessorTests`/`Spr15275Tests`/`Spr6602Tests` and a
+22-class `context.annotation.*Configuration*` sweep (all unchanged vs.
+pre-fix baseline), plus `cargo test -p cratonvm-vm --lib --release`
+(2227 passed / 10 failed — 8 pre-existing lock_order release-mode-only
+"should panic" assertions plus 2 confirmed-pre-existing/flaky via a
+git-stash A/B: `enforcement_active_in_debug_builds` fails deterministically
+in ANY release build regardless of code changes (it literally asserts
+`cfg!(debug_assertions)`), `native::jni::tests::process_vm_publish_and_resolve`
+passed in isolation and is unrelated to this crate — both confirmed
+unaffected by this fix). Landed on `dev` at `063cd747d`
+(`fix/spring-genuine-buglist-residuals-20260721`).
+
+**3 classes confirmed already fixed as side effects of other concurrent
+dev work** (no code change needed, stable across repeat runs):
+`web.context.request.RequestScopeTests` (0/7 → 7/7),
+`web.servlet.view.groovy.GroovyMarkupViewTests` (9/10 → 10/10). Also
+`web.client.RestClientIntegrationTests` (226/230 → 227/230, 2 fail + 1
+abort remain), `web.client.RestTemplateIntegrationTests` (118/125 → 119/125,
+3 fail + 3 abort remain), and `web.reactive.function.client
+.WebClientIntegrationTests` (168/170 unchanged, now 1 fail + 1 skip)
+improved but did not fully clear — see residuals below.
+
+**Root-caused but NOT fixed this session** (each would need substantial new
+native-VM feature work or live/gdb tracing beyond this session's time
+budget — flagged for a dedicated follow-up):
+
+- **`context.annotation.Spr6602Tests`.`configurationClassBehavior` +
+  `context.annotation.Spr15275Tests`.`withFactoryBean`/`withFinalFactoryBean`
+  (3 methods, 2 classes).** Real Spring's `ConfigurationClassEnhancer
+  .BeanMethodInterceptor.enhanceFactoryBean()` — when an inter-bean
+  reference resolves to a `FactoryBean`, wraps it in a CGLIB subclass (or a
+  JDK interface proxy, for a `final` factory exposed via an interface
+  return type) whose `getObject()` delegates to the container's cached
+  product (`beanFactory.getBean(name)`) instead of the factory's real
+  `getObject()` body — has no native-reimplementation equivalent here;
+  `emit_bean_override` only ever does the plain `getBean(&name)`/
+  `getBean(name)` dichotomy (already correctly chooses `&name` for
+  FactoryBean-typed methods, just returns the RAW factory instead of an
+  enhanced one), so a raw `factory.getObject()` call bypasses the
+  container's `factoryBeanObjectCache` entirely, returning a fresh
+  (non-singleton-matching) product instance. Confirmed via
+  `Spr6602Tests`'s exact failure (`bar1` from the container's cache !=
+  `foo.bar` from the raw uncached `getObject()` call). A full fix needs:
+  (1) a new dynamic-subclass-or-interface-proxy generator reusing this
+  file's `ClassWriter`; (2) `ctx.allocate_instance(name)` +
+  `ctx.set_field_by_name(...)` to sidestep constructor-descriptor/
+  anonymous-class-outer-instance-capture problems entirely (no `<init>`
+  call needed at all — same trick real CGLIB's Objenesis path uses); (3) a
+  new `invokestatic` dispatch target from the generated bytecode into this
+  new Rust helper. **(3) was the main open uncertainty and is now
+  RESOLVED**: `ctx.ensure_synthetic_class(...)` (see
+  `native-builtins/src/lang_system.rs`'s `cratonvm/internal/UnmodifiableMap`
+  for a working precedent) confirms purely-synthetic invokestatic targets
+  with no real `.class` bytes ARE supported by this VM, so a
+  `cratonvm/internal/ConfigEnhancerSupport.enhanceFactoryBeanReference(...)`
+  -style helper is a safe, proven pattern here — just not implemented.
+- **`context.annotation.ConfigurationClassPostProcessorTests`** (11/85
+  fail, unchanged from this session's own pre-fix baseline — note this is
+  DOWN from the doc's previously-recorded 82/85/3-fail state, i.e. 8 MORE
+  failures appeared here between 2026-07-21's earlier session and this one,
+  from unrelated concurrent dev work landing on `dev` in between; not
+  investigated). Two distinct root causes found for 5/11:
+  - 4 failures (`genericsBasedInjectionWith{Early,Late}GenericsMatchingOn
+    {Cglib,Jdk}Proxy`) — Spring AOP's `proxyTargetClass=true` auto-proxy
+    creator tries to CGLIB-subclass an ALREADY-native-CGLIB-generated
+    `ConfigurationClassEnhancer` proxy class
+    (`RepositoryConfiguration$$SpringCGLIB$$0`); real CGLIB bytecode-gen
+    (there's no native AOP-CGLIB-proxy reimplementation anywhere in
+    `native-builtins`, unlike `ConfigurationClassEnhancer.enhance` — general
+    AOP CGLIB subclassing of ordinary classes must therefore be working via
+    REAL CGLIB bytecode execution today) then fails with cglib's own
+    generic `Could not generate CGLIB subclass... Common causes of this
+    problem include using a final class or a non-visible class`. Most
+    likely cause: classes defined via `define_class_full` (this file's
+    `build_enhancer_class`) don't expose retrievable `.class` bytes via
+    `getResourceAsStream`/similar for real CGLIB's ASM-based
+    `ClassReader` to introspect when asked to subclass one of them a
+    SECOND time. This is a general VM-level gap (native-class bytecode
+    retrievability for reflective/ASM tooling), not specific to this file
+    — needs investigation in `classloader.rs`/`classloader_real.rs`.
+  - 1 failure (`configurationClassesWithInvalidOverridingForProgrammaticCall`)
+    — `emit_bean_override`'s inter-bean-reference path does a raw JVM
+    `checkcast <Ret>` after `getBean()`, throwing a bare
+    `ClassCastException` on type mismatch instead of replicating real
+    Spring's `resolveBeanReference` `ClassUtils.isAssignableValue` check +
+    descriptive `IllegalStateException` (`"@Bean method X.y called as bean
+    reference for type [...] but overridden by non-compatible bean
+    instance of type [...]. Overriding bean of same name declared in:
+    ..."`). Full replacement bytecode designed in detail (instanceof+null
+    check inside the existing SPR-8080 try-region, `StringBuilder` message
+    build using a Rust-precomputed static prefix + `Class.getName()`/
+    `Object.getClass()` reflective calls for the dynamic parts, throw
+    `IllegalStateException`) but not implemented — mechanical, ~90 more
+    bytes, all new constant-pool entries are straightforward reuses of
+    patterns already in this file. This ALSO throws a customer-visible raw
+    `ClassCastException` instead of Spring's real message ANYWHERE an
+    inter-bean `@Bean` reference resolves to an incompatible override
+    anywhere else in the suite — likely affects more than just this one
+    test, worth fixing first in a follow-up.
+  - Remaining 6/11 failures not investigated at all this session.
+- **`jndi.JndiObjectFactoryBeanTests`.`lookupWithExposeAccessContext`**
+  (24/25). Confirmed the exact expected math from real
+  `JndiObjectFactoryBean`/`JndiObjectTargetSource`/
+  `JndiContextExposingInterceptor` source: 1 `Context.close()` from
+  `JndiObjectTargetSource.afterPropertiesSet()`'s eager `lookup()`, + 1 from
+  the single ELIGIBLE proxied invocation (`setAge`, interface-declared).
+  `equals()`/`hashCode()` should be short-circuited by `JdkDynamicAopProxy`
+  before ever reaching the interceptor; `toString()` reaches it but
+  `isEligible()` should return `false` since its `Method.getDeclaringClass()
+  == Object.class`. CratonVM produces 3 closes (1 extra) — needs live/gdb
+  tracing of the native `java.lang.reflect.Proxy` invocation-handler
+  dispatch to find which of the three incorrectly gets routed through with
+  a non-`Object` declaring class (or isn't fast-path short-circuited);
+  static grep of `native-builtins` found no obvious culprit.
+- **`orm.jpa.support.PersistenceInjectionTests`.
+  `publicExtendedPersistenceContextSetterWithSerialization`** (26/27).
+  `DummyInvocationHandler.closed` stays `false` after a `SimpleMapScope`
+  Java-serialization round-trip + `serialized.close()`. Involves a
+  scope-destruction-callback object (likely wrapping the
+  `ExtendedEntityManagerCreator`-generated `EntityManager` proxy) needing
+  to survive Java serialization and still correctly invoke `close()` post-
+  deserialization — deep cross-cutting serialization+scope+JPA-proxy
+  interaction, not traced to a specific native gap.
+- **`test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests`
+  + the sibling `.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests`**
+  (3/5 and 4/6 — same 2 method names fail identically in both, one shared
+  root cause). A Mockito-mocked `StringBuilder` (final class, inline mock
+  maker) correctly answers `length()`/`isEmpty()`-style calls but
+  `.substring(0)` returns `""` instead of Mockito's default-answer `null`
+  — `substring` isn't being intercepted at all (falls through to real,
+  empty-buffer bytecode). Likely the same family as this repo's other
+  documented Mockito inline-redefine gaps (redefine only covering the
+  concrete mocked class's own declared methods, missing ones inherited from
+  `java.lang.AbstractStringBuilder`).
+- **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
+  (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
+  `MultipleFailuresError` ("Test Event Statistics", 2 failures);
+  `rejectTestsInParallelWithInstancePerClassAndRecordApplicationEvents`
+  fails a plain `AssertionError`. JUnit parallel-execution × Spring
+  TestContext `ApplicationEvents` recording interaction, not investigated.
+- **`test.web.servlet.assertj.MockMvcTesterIntegrationTests`** (72/74) —
+  `debugUsesSystemOutByDefault`/`debugCanPrintToCustomOutputStream` both
+  fail plain `AssertionError`s (`MockMvcTester`'s `.debug()`/`.print()`
+  output-stream-capture assertions). Not investigated.
+- **`web.servlet.config.MvcNamespaceTests`.`customConversionService`**
+  (24/25) and **`web.servlet.config.annotation.ViewResolutionIntegrationTests`
+  .`freemarkerWithExplicitDefaultEncodingAndContentType`** (6/7) — single
+  plain-`AssertionError` failures each, not investigated.
+- **`web.socket.messaging.StompWebSocketIntegrationTests`** (14/16 per the
+  2026-07-20 baseline) — NOT re-verified with full detail this session; a
+  200s rerun timed out (this test spins up a real embedded Tomcat per test
+  method across 16 methods, and the host was under heavy concurrent load
+  from several other sessions' builds/test-runs during this rerun attempt).
+  No regression expected from anything touched this session, but the exact
+  current pass count needs reconfirming with a longer timeout when the host
+  is quieter.
+
+**Confirmed unchanged / out of scope, no action taken:**
+`core.io.ResourceTests` (66/68, same 2 `remoteResourceExists*` methods the
+doc already flagged), `core.retry.RetryPolicyTests` (22/23, doc's own
+"deliberate design choice, not worth fixing" stands),
+`scheduling.quartz.QuartzSupportTests` (doc's own "environmental,
+`spring-context-support` doesn't compile against the shared checkout"
+stands), `beans.factory.xml.XmlBeanFactoryTests` (10/95, unchanged, doc
+already has detailed root-causing for 2/10 pointing at a `try_build_replace
+_override` `super_cid` class-resolution bug upstream of this file, likely
+the same loader-identity family documented elsewhere in this repo's
+history).
+
+**Host note:** `/data/tmp/cores` (7.6GB of stale 2026-07-17 core dumps) was
+cleared at the start of this session to relieve disk pressure (29G free
+after, was 21G). The shared `spring-framework-recheck` checkout used for
+classpath generation currently has uncommitted local modifications to
+`spring-aop`/`spring-context` (`git status` shows deletions matching the
+"corrupted `spring-aop/src` tree" symptom documented in the 2026-07-20 AOT
+session) — NOT touched or fixed this session (shared resource, another
+session may be mid-use); none of the modules this session's target classes
+live in (`spring-core`/`spring-context`/`spring-web`/`spring-webflux`/
+`spring-webmvc`/`spring-websocket`/`spring-orm`/`spring-context-support`/
+`spring-test`) needed rebuilding, so this didn't block anything, but
+whoever continues should check `git status` there before trusting a
+`spring-aop`/`spring-orm` rebuild.
 
 ## Summary
 
@@ -258,7 +482,7 @@ adds real overhead to these compile-heavy tests):
 | `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` | TIMEOUT (FAIL 8/2/6 historically) | **OK 8/8** | fixed |
 | `test.context.aot.TestClassScannerTests` | TIMEOUT | **OK 7/7** | fixed |
 | `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT (perf partially fixed — see below) | **genuine, severe performance defect — do not call this "not a bug".** Originally ~54 minutes (`3242228ms`). Measured HotSpot on the SAME classpath/JDK: **`13126ms` (13.1s)**, ~247x slower. **2026-07-21 session: root-caused and fixed the dominant lever.** gdb sampling of the largest method (`applyToWithVeryLargeBeanDefinitionsCreatesSeparateSourceFiles`, 10001 bean definitions) found `Arena::free_list_bytes()`'s summation closure dominating 3/5 stack samples — its epoch-gated cache (2026-07-15) degrades back to O(free-list-size) per call under steady allocation churn (content changes on nearly every call from its only caller, `needs_gc`, which runs on every allocation), and the list never fully drains over a session. Replaced with an incrementally-maintained running total (`gc/src/arena.rs`), making it unconditionally O(1); also memoized `force_native_over_real_jdk_bytecode` for uncached dispatch paths (reflective `Method.invoke()`, megamorphic call sites) reached via Mockito's constructor-mock dispatch. Merged `49b75fa20`. Measured impact: the fixed method alone dropped 379s -> 179s (2.13x); full 14-method class dropped 3242s -> 2976s (~8.2% aggregate -- the other 13 methods don't hit the same free-list-growth pathology as severely, since it scales with allocation volume and only that one method allocates ~10k objects). Residual ~227x-vs-HotSpot gap remains and needs further investigation beyond the free-list fix -- the next lead is whatever dominates the OTHER 13 methods' time, not yet profiled. |
-| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | LOADERR | FAIL **34/31/3** (was effectively 34/16/18 pre-fix) | major improvement; 3 residuals are the SAME duplicated-token/content-corruption shape as fix (2) above but NOT YET isolated to a specific method — `--nojit` makes this class fully 34/34, so it's confirmed JIT, just an unidentified third culprit. Next step: repeat the `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP` bisection from this session on the 3 remaining methods (`generateBeanDefinitionMethodWhenInnerBeanGeneratesMethod`, `generateBeanDefinitionMethodWhenBeanIsInJavaPackage`, `generateBeanDefinitionMethodWithDeprecatedGenericElementInTargetClass` — the last is the SAME duplicated-import bug, not a distinct deprecation issue despite the name). |
+| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | LOADERR | **OK 34/34 (2026-07-21, FIXED)** | **fully fixed.** The 3 residuals (2 as of a 2026-07-21 rebaseline — `generateBeanDefinitionMethodWhenInnerBeanGeneratesMethod` content-corruption + `generateBeanDefinitionMethodUSeBeanClassNameIfNotReachable`'s `ClassCastException: String cannot be cast to TypeName`) were a FOURTH javac-adjacent JIT residual, this time in Spring's own shaded JavaPoet, not javac itself: `org/springframework/javapoet/CodeBlock$Builder.add(String, Object...)` (the `$`-placeholder format-string parser). Bisected with `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP` the same way as fixes (1)/(2): denying the whole `CodeBlock` class does nothing, denying `CodeBlock$Builder` fixes both symptoms, and narrowing further rules out `argToType`/`addArgument` individually — only `add` itself (which inlines `argToType`'s instanceof-guarded `checkcast` into its own compiled body) is sufficient. Added `SkipReason::JavaPoetCodeBlockBuilderAdd` to `vm/src/jit/skip_list.rs`. Verified 34/34 OK, deterministic across 3 repeat runs. `cargo test -p cratonvm-vm --lib --release`: 2227 passed / 9 failed, same pre-existing release-mode lock_order baseline before/after. Landed on `fix/aot-cluster-residuals-20260721` (`20abd63d0`), not yet merged to `dev`. |
 | `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | FAIL **40/32/8** (2026-07-21 session; was 40/16/24) | **2026-07-21: found and fixed 6 compounding bugs in the native ConfigurationClassEnhancer CGLIB-proxy reimplementation** (`native-builtins/src/cglib_enhancer.rs`), all surfaced by the single dominant family "any @Configuration class using constructor injection": (1) generated proxy constructor was always no-arg regardless of the superclass's real constructor -- fixed by emitting one delegating constructor per non-private superclass constructor; (2) generated class was named with cglib's default `$$EnhancerByCGLIB$$` tag instead of Spring's own `SpringNamingPolicy` `$$SpringCGLIB$$` tag, so even a correctly-built class was invisible under the name generated source references; (3) the native reimplementation never notified `ReflectUtils.generatedClassHandler`, so Spring AOT's `GeneratedFiles` capture (needed for the LATER compile step to resolve the proxy class) never fired; (4) the per-superclass class-identity cache (added earlier, load-bearing for a different test) skipped that notification entirely on a cache hit, so a SECOND test enhancing an already-cached class never got its own `GeneratedFiles` populated; (5) real CGLIB emits `CGLIB$SET_STATIC_CALLBACKS`/`CGLIB$SET_THREAD_CALLBACKS` stub methods on every generated class that `Enhancer.isEnhanced()`/`registerStaticCallbacks()` reflectively check for -- added as no-op stubs since this reimplementation never uses a real callback array; (6) resolving `ReflectUtils` by a loader-agnostic (or enhanced-class-scoped) lookup could resolve the WRONG `ReflectUtils` instance under `@CompileWithForkedClassLoader` (each test gets its own forked child loader for infrastructure classes) -- fixed by resolving via the `enhance()` call's own receiver's loader instead. Merged `da109dc5a`. Verified 16/40 -> 32/40 (31/40 on a from-scratch merge-tip rebuild, small variance consistent with this class's already-documented cross-test-timing sensitivity). Remaining 8 residuals include at least one distinct, unrelated bug: `@Value`-annotated field injection not reaching the proxied instance (`processAheadOfTimeWhenHasCglibProxyAndMixedAutowiring` now compiles and runs but asserts `"Hi null"` instead of `"Hi AOT World"`) -- not yet root-caused, a separate area from proxy generation itself. |
 | `test.context.aot.AotIntegrationTests` | TIMEOUT | FAIL **4/0/2/2** (2026-07-21 rebaseline: found=4 succ=0 fail=2 skip=2) | **new dominant failure as of 2026-07-21** (supersedes the `TestContextAotException` shape below -- that may still be the residual once this is fixed, not yet re-checked): `java.lang.IllegalStateException: A custom 'searchEnclosingClass' predicate can only be combined with SearchStrategy.TYPE_HIERARCHY`, thrown from `MergedAnnotations$Search.withEnclosingClasses` via `TestContextAnnotationUtils.hasAnnotation` <- `TestContextAotGenerator`'s `isDisabledInAotMode` predicate. The calling code literally does `MergedAnnotations.search(SearchStrategy.TYPE_HIERARCHY).withEnclosingClasses(...)` in one expression -- the guard should trivially pass. Confirmed via a standalone minimal repro (`SearchStrategyProbe.java`, same call shape, no Spring-test/AOT machinery) that this is **not** a general enum `==` bug: the isolated repro passes cleanly on the SAME binary. The failure is specific to the real AOT/`@CompileWithForkedClassLoader` context. `CompileWithForkedClassLoaderClassLoader`'s constructor deliberately sets its OWN parent to `testClassLoader.getParent()` (skipping `testClassLoader` itself) and its `findClass` redefines any class it can pull bytes for via `testClassLoader.getResourceAsStream(...)` -- so framework classes (`MergedAnnotations`, `SearchStrategy`, `TestContextAnnotationUtils`) get a genuinely FRESH `Class`/enum-constant identity per forked test, by design (matches real CGLIB/Spring behavior, works fine on HotSpot). Suspected root cause: some CratonVM-side cache/registry (class definition, enum constant, or similar) is keyed by NAME ONLY rather than by (name, loader), letting one of the two sides of the `==` comparison resolve to a STALE instance from an earlier forked-loader instance instead of the current one -- the exact same bug *shape* as the StackWalker regression and the ApplicationContextAotGeneratorTests ReflectUtils-notification bug fixed the same session, just not yet localized to a specific cache/table. Ruled out: a standalone repro mimicking `CompileWithForkedClassLoaderClassLoader`'s EXACT parent-skip + resource-byte-redefine behavior (`ForkedLoaderProbe.java`/`SearchStrategyWorker.java`, no JUnit Platform involved), running the identical `MergedAnnotations.search(...).withEnclosingClasses(...)` call 3x through 3 fresh forked-loader instances, passed cleanly every time -- so the classloader-fork mechanism ALONE isn't sufficient to trigger it; the real cause needs something else specific to the full JUnit Platform Launcher machinery and/or `TestContextAnnotationUtils`/`TestContextAotGenerator` themselves (their own static state, or a DIFFERENT/nested classloader boundary somewhere in that path). Next step: instrument `identityHashCode`/`getClassLoader()` at both operands of the `==` directly inside a copy of `TestContextAnnotationUtils.hasAnnotation`, or bisect by replacing pieces of the JUnit Platform launch path in the standalone repro until it starts reproducing. |
 | `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL 0/4 | FAIL **4/0/4** (2026-07-21 rebaseline: found=4 succ=0 fail=4, regressed from 2/4 passing) | **same new dominant failure as AotIntegrationTests above** (`IllegalStateException: A custom searchEnclosingClass predicate...`) now hits ALL 4 methods (`processAheadOfTimeWithWebTests`, `processAheadOfTimeWithBasicTests`, `endToEndTests`), except `processAheadOfTimeWithXmlTests` which still shows the older `TestContextAotException: Failed to process test class [...XmlSpringVintageTests] for AOT` shape -- fix the searchEnclosingClass bug first, then re-baseline this class's residuals (the previously-documented 2 residuals below may or may not still apply). |
@@ -286,17 +510,306 @@ the classpath/checkout integrity first** when a whole cluster of
 AOT/compile-based tests shows the exact same `CompilationException`
 shape.
 
-**Recommended next steps for whoever continues this cluster:**
-1. Bisect `BeanDefinitionMethodGeneratorTests`'s 3rd JIT residual the
-   same way (this session's `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP`
-   technique on `com/sun/tools/javac/*`).
-2. Re-verify `ApplicationContextAotGeneratorTests` with `--nojit` first
-   to confirm/refute it's the same JIT family before any other work.
-3. Get the full stack trace (`KRUN_STACK=1`) for `AotIntegrationTests`'s
-   and `TestContextAotGeneratorIntegrationTests`'s `TestContextAotException`
-   causes — the outer wrapper hides the real defect.
-4. Root-cause the new `ArrayStoreException`/Jackson `ArrayBuilders`
-   finding shared by both `web.service.registry.*` classes.
+**Recommended next steps for whoever continues this cluster (updated
+2026-07-21 late session — see that section below for the full detail
+behind each item):**
+1. ~~Bisect `BeanDefinitionMethodGeneratorTests`'s 3rd JIT residual~~ —
+   DONE, class is 34/34 OK.
+2. ~~Re-verify `ApplicationContextAotGeneratorTests` with `--nojit`~~ —
+   DONE: confirmed only partially the same JIT family (32/40 JIT-enabled
+   after the JavaPoet fix vs. 33/40 under `--nojit` with none of the JIT
+   fixes needed) — a 7th CGLIB counter-scoping bug (now fixed, see below)
+   accounts for most of the rest.
+3. The `TestContextAotException` next step is SUPERSEDED — the dominant
+   failure in both `test.context.aot.*` classes is now the
+   `searchEnclosingClass`/`SearchStrategy` duplicate-`ClassId` bug (see
+   below); `KRUN_STACK=1` is no longer the useful lever,
+   `CRATONVM_DBG_DUPCLASS=1` is.
+4. The `ArrayStoreException` finding IS root-caused now (see below) but
+   NOT fixed — it's the SAME duplicate-`ClassId` mechanism as item 3, one
+   level removed (an interface, not an enum). Fix both together.
+5. **NEW**: the duplicate-`ClassId`-under-`@CompileWithForkedClassLoader`
+   mechanism itself (items 3+4's shared root cause) needs a dedicated,
+   careful session — likely the single highest-leverage remaining AOT-
+   cluster fix, since it plausibly also explains some of
+   `ApplicationContextAotGeneratorTests`'s remaining residuals
+   (`processAheadOfTimeUsesCglibClassForFactoryMethod`'s intermittent
+   `"is not an enhanced class"`) and possibly other `@CompileWith
+   ForkedClassLoader`-using classes elsewhere in the suite not yet
+   connected to this finding. See the recommended-next-step paragraph in
+   the 2026-07-21 late session section for the two candidate fix shapes.
+6. `beans.factory.aot.BeanRegistrationsAotContributionTests` perf: the
+   free-list O(1) fix landed but the class is still ~227x slower than
+   HotSpot and TIMEOUTs; profile which of the OTHER 13 methods (only 1 of
+   14 hit the free-list pathology) dominates next.
+
+## AOT cluster — 2026-07-21 late session (4th JIT bug, CGLIB counter fix, duplicate-ClassId unifying finding)
+
+**`beans.factory.aot.BeanDefinitionMethodGeneratorTests` — FIXED, 34/34.**
+See the updated table row above for the full writeup: a fourth JIT
+miscompilation, this time in Spring's shaded JavaPoet
+(`org/springframework/javapoet/CodeBlock$Builder.add`) rather than javac
+itself. `SkipReason::JavaPoetCodeBlockBuilderAdd` added to
+`vm/src/jit/skip_list.rs`.
+
+**`context.aot.ApplicationContextAotGeneratorTests` — found and fixed a
+7th CGLIB-proxy bug, on top of the 6 already landed as `da109dc5a`
+earlier the same day.** The `$$SpringCGLIB$$<n>` proxy-name counter
+(`native-builtins/src/cglib_enhancer.rs::next_config_enhancer_counter`)
+was keyed by superclass name ALONE. That's correct for the single-method
+case the counter was originally added for
+(`AnnotationConfigApplicationContextTests.refreshForAotRegisterHintsForCglibProxy`,
+one enhancement of `CglibConfiguration` per JVM), but
+`ApplicationContextAotGeneratorTests` has SEVERAL `@Test` methods that each
+enhance their OWN fixture class sharing the simple name `CglibConfiguration`
+— `@CompileWithForkedClassLoader` gives each test method a fresh child
+loader, so these are genuinely distinct `ClassId`s, not repeat enhancements
+of one class — and since `KRun` batches every `@Test` method of a class into
+one JVM process, the second and third such methods inherited the first
+one's already-incremented counter and got suffix `1`/`2` instead of the `0`
+every one of them independently expects (real CGLIB's own
+`AbstractClassGenerator` naming/cache state lives in a per-`ClassLoader`
+map, so a fresh loader always restarts the count on HotSpot). Rekeyed the
+counter by `(defining_loader_id, super_internal_name)` instead of the name
+alone — `native_array_new_array` also now prefers the component mirror's
+own `ClassId` over re-resolving by name, matching the existing
+`class_id_defined_by_loader_exact` pattern used a few lines away in
+`getComponentType()`.
+
+Isolating the two fixes' individual contributions (both on top of the
+already-landed 6-bug CGLIB session and both AFTER a from-scratch rebuild):
+JavaPoet fix alone (JIT enabled, no counter fix) measured **32/40**, all 8
+residuals CGLIB/autowiring-shaped; `--nojit` (JIT effectively off, no JIT
+fixes needed at all) independently measured **33/40**, confirming most but
+not all of the residual set is JIT-independent. This class is **extremely**
+sensitive to host contention — repeat clean-room runs later the same
+session intermittently OOM'd/LOADERR'd purely from unrelated concurrent
+sessions' heavy JVMs on the shared Azure host (an ES perf test at `-Xmx
+4g`, a WildFly surefire run), not from these fixes; treat any single run's
+exact pass count on this class as noisy and prefer a multi-run median, per
+the class's own already-documented cross-test-timing sensitivity. Remaining
+residuals include the previously-documented `@Value`-field-injection gap
+(`processAheadOfTimeWhenHasCglibProxyAndMixedAutowiring`) and
+`processAheadOfTimeUsesCglibClassForFactoryMethod`'s
+`IllegalArgumentException: ... is not an enhanced class` (order-dependent,
+only seen on some runs — likely the SAME underlying duplicate-`ClassId`
+mechanism below, not yet confirmed).
+
+**Unifying root-cause finding (NOT fixed, needs a dedicated session):
+`searchEnclosingClass` (`test.context.aot.*`) and the Jackson
+`ArrayStoreException` (`web.service.registry.*`) are the SAME bug shape.**
+Added an opt-in diagnostic (`CRATONVM_DBG_DUPCLASS=1`,
+`classloading/src/class_manager.rs::resolve_fast_path_class_id`) that logs
+whenever a name lookup REJECTS an existing `UserDefined`-loader class
+registration in favor of creating a fresh one under `Application` (because
+the built-in delegation chain can also find the class's bytes — see that
+function's own doc comment for why this is deliberate, added to fix an
+earlier, different bug). Running `AotIntegrationTests` with it on shows
+`org/springframework/core/annotation/MergedAnnotations$SearchStrategy`
+(the exact enum `withEnclosingClasses`'s `IllegalStateException` compares
+with `==`) hitting this rejection path 3 times — i.e. the SAME class name
+is registered under (at least) two DIFFERENT `ClassId`s: one under the
+`@CompileWithForkedClassLoader` fork's own `UserDefined` loader (which
+redefines every framework class it can pull bytes for, by design, so code
+running inside that forked context should see ITS OWN `SearchStrategy`
+identity) and a second, separate one created by any loader-BLIND
+name-only resolution helper (`ensure_class_initialized`/
+`load_class_concurrent`/`resolve_fast_path_class_id`) reached from that
+same forked context — those helpers have no notion of "which loader is
+asking" and default to preferring `Application` whenever the built-in
+chain can also serve the class, silently creating a duplicate instead of
+reusing the forked loader's copy. `MergedAnnotations.search(SearchStrategy
+.TYPE_HIERARCHY).withEnclosingClasses(...)`'s two `SearchStrategy.
+TYPE_HIERARCHY` references (the literal passed to `.search(...)` and the
+one `withEnclosingClasses` compares against with `==`) can therefore
+resolve to two numerically-different-but-logically-identical enum
+constants depending on which resolution path each one took.
+
+Traced the EXACT SAME mechanism independently for the
+`web.service.registry.*` `ArrayStoreException`: `tools/jackson/databind/
+deser/KeyDeserializers` (an interface, not an enum, but the identical
+duplicate-`ClassId`-for-one-name shape) is registered under two different
+`ClassId`s; `old.getClass().getComponentType()` re-derives the component
+by NAME (`ensure_class_initialized`) rather than reading back the array's
+own already-correct component `ClassId`, so `Array.newInstance(...)`
+allocates a new array tagged with the WRONG (duplicate) `ClassId`, and the
+subsequent `System.arraycopy` of the old elements into it correctly
+throws `ArrayStoreException` against that mismatch. Tried the
+locally-obvious fix (route `getComponentType()`'s array branch through the
+class registry's own `array_info.component_class_id` instead of the name
+string) but discovered `array_info` is populated `None` at EVERY
+class-construction site in the codebase (`grep -rn 'array_info: Some'`
+across `classloading/src/` returns zero matches) — it's a fully unwired
+stub, not a locally-fixable gap, so that patch was reverted rather than
+landed as dead code.
+
+**Recommended next step for whoever continues this specific finding**:
+this is a genuine, structural gap — native helpers that resolve a class
+by NAME ALONE (`ensure_class_initialized`, and whatever underlies
+`Array.newInstance`'s reflective component resolution) have no way to
+know which loader/context is asking, so under
+`@CompileWithForkedClassLoader` (and likely any other scenario where a
+custom loader redefines a framework class already reachable via the
+built-in delegation chain) they can silently duplicate a class the
+CALLER's own context already has a perfectly good copy of. A full fix
+needs either (a) threading the CALLER's defining-loader id through these
+name-only resolution helpers so they can consult
+`class_id_defined_by_loader_exact` first (the pattern already used
+correctly a few lines away in `native_class_get_component_type`'s
+`classLoader`-field branch), or (b) wiring up `array_info` properly at
+every array-class synthesis site so `array_component_class_id` (already
+present on the `NativeContext` trait for exactly this purpose) stops
+being a permanent no-op. Both are bigger, riskier changes than fit safely
+in one sitting — reproduce first with `CRATONVM_DBG_DUPCLASS=1` on
+`AotIntegrationTests` or the `web.service.registry.*` classes before
+attempting either.
+
+**Follow-up same session: landed a real, partial improvement, but the
+full fix is bigger than initially scoped -- three distinct loader-blind
+code paths identified, not one.** Added `CRATONVM_DBG_DUPCLASS_BT=1`
+(full backtrace on every rejected duplicate-registration) to make this
+tractable, then traced both bugs to their EXACT call sites:
+
+1. **`searchEnclosingClass` goes through `resolve_class_loader_aware` /
+   `should_use_loader_initiated_resolution`** (`vm/src/runtime/
+   interpreter.rs`) -- the SAME loader-aware `CONSTANT_Class`/field-ref
+   resolution mechanism already built (and gated off by default) for the
+   Tomcat/Hibernate/WildFly custom-loader work, with an EXISTING narrow,
+   type-checked carve-out for `GroovyClassLoader`. Widened that carve-out
+   to also match Spring's `CompileWithForkedClassLoaderClassLoader`
+   (`is_compile_with_forked_class_loader`, mirroring `is_groovy_class_loader`
+   exactly -- exact-`ClassId` match, no `is_subclass_of` walk needed since
+   the class is `final`). Verified via `CRATONVM_DBG_LOADER_TRACE=1` that
+   this DOES work as intended for at least one call site: a `getstatic
+   SearchStrategy.TYPE_HIERARCHY` reached from `BootstrapUtils` (itself
+   loaded by the fork) now correctly drives the fork's OWN loader first
+   and lands on the fork's own consistent `SearchStrategy` `ClassId`,
+   instead of falling straight to the global fast path.
+   **But this alone does not fix either failing test.** The SAME trace
+   shows a SECOND `getstatic SearchStrategy.TYPE_HIERARCHY` -- reached
+   from `MergedAnnotations$Search.withEnclosingClasses`'s OWN bytecode
+   (the `Assert.state(this.searchStrategy == SearchStrategy.TYPE_HIERARCHY,
+   ...)` check that actually throws) -- with `referencing_loader=
+   Some(Application)`, NOT the fork. So `MergedAnnotations$Search` itself
+   is NOT being given its own forked-loader copy in this VM, even though
+   (per Spring's documented design intent, and the doc's own earlier
+   writeup) it should be, alongside every other framework class the fork
+   redefines. Two references to the same enum constant, resolved via two
+   different loaders (fork vs. Application), is the actual mismatch --
+   narrower and different from the original hypothesis ("one resolution
+   helper is loader-blind"). WHY `MergedAnnotations$Search` itself ends up
+   Application-scoped instead of fork-scoped is not yet root-caused --
+   likely something in how/when that specific class first got loaded
+   in this JVM (possibly before the current test's fork instance even
+   existed), which is a `ClassLoader.loadClass()`-level delegation
+   question, not a `resolve_class_loader_aware` question -- needs its own
+   trace (`CRATONVM_DBG_LOADER_TRACE` widened to also fire on
+   `MergedAnnotations$Search`'s OWN class resolution, not just
+   `SearchStrategy`'s).
+
+2. **The Jackson `ArrayStoreException` goes through a COMPLETELY
+   DIFFERENT path**: `native_object_get_class` (`Object.getClass()`,
+   `native-builtins/src/lib.rs`) calls `ctx.load_class(&array_class_name)`
+   directly on a synthesized `"[L...;"` descriptor string, which recurses
+   into `classloading::class_manager::synthesize_array_class`, which
+   resolves the COMPONENT via a bare `self.load_class(component_name)` --
+   never touching `resolve_class_loader_aware` at all. So fix #1 above is
+   structurally irrelevant to this bug; it needs its own fix in
+   `synthesize_array_class` (or its caller). Tried the obvious one --
+   populate the always-`None` `array_info` field on the synthesized array
+   `Class` with the component `ClassId` this function ALREADY resolves
+   internally (pure-additive: nothing currently reads `array_info`, so
+   this cannot regress anything; the field's own doc comment even says
+   "Wire up real `ArrayInfo` once a consumer... actually reads it", i.e.
+   this was always the planned next step) -- but on reflection this does
+   NOT reliably fix the bug either: `synthesize_array_class` caches ONE
+   array `Class` GLOBALLY per descriptor NAME (not per (loader, name)),
+   so whichever caller happens to synthesize `"[Ltools/jackson/databind/
+   deser/KeyDeserializers;"` FIRST in the JVM session permanently decides
+   `array_info.component_class_id` for every LATER `getClass()` call on
+   ANY `KeyDeserializers[]` array, regardless of that specific array's
+   own actual (and possibly different) component `ClassId` -- the same
+   class-of-bug one level up, just baked into the array-class cache
+   instead of the plain-class cache.
+   **Deliberately did NOT change the array class's own `loader_id`
+   scoping to fix this** (the more "correct-per-JVMS-5.3.3" fix for
+   reference-component arrays) -- `synthesize_array_class` has an
+   existing, deliberate, audited invariant enforcing `loader_id ==
+   Bootstrap` unconditionally regardless of component loader
+   ("Round 7 audit fix (CRIT #2)", with a `debug_assert_eq!` guarding
+   it and an explicit comment warning future contributors not to change
+   `Class::loader_id` without updating the map key too). That invariant
+   was presumably added to fix a DIFFERENT, real bug this session has no
+   visibility into -- touching it without understanding that history first
+   is exactly the kind of change that looks locally correct and
+   regresses something else. Left `array_info` un-populated (reverted)
+   rather than land a fix that looks plausible but is not verified
+   correct.
+
+**Revised recommended next steps**, in order of leverage:
+1. Trace `MergedAnnotations$Search`'s OWN class resolution (not
+   `SearchStrategy`'s) with `CRATONVM_DBG_LOADER_TRACE`/
+   `CRATONVM_DBG_DUPCLASS_BT` to find why it ends up Application-scoped
+   instead of fork-scoped inside a `@CompileWithForkedClassLoader` test --
+   this is probably a `ClassLoader.loadClass()` top-level delegation bug
+   (is `findLoadedClass`/`cl_find_loaded_class` genuinely being consulted
+   for EVERY class the fork's `loadClass()` bytecode touches, or is there
+   a shortcut somewhere that returns an already-cached Application answer
+   without ever asking the fork loader instance at all?), not a
+   constant-pool-resolution bug -- different mechanism, different fix
+   location, from item 1 above.
+2. Before touching `synthesize_array_class`'s loader-scoping, read the
+   Round 7 CRIT #2 audit history (git blame / commit message on the
+   `debug_assert_eq!` near the end of that function) to understand what
+   it was protecting against, so a loader-scoped-for-reference-arrays fix
+   can coexist with whatever that was.
+3. Once (1) is understood, re-attempt the `array_info` wiring from a
+   position of already knowing whether array classes need per-loader
+   caching too, rather than guessing.
+
+**Pushed item 1 (above) one step further with `CRATONVM_DBG_LOADER_TRACE`
+widened to `MergedAnnotations`/`MergedAnnotations$Search` too, not just
+`SearchStrategy`.** At least THREE distinct `MergedAnnotations` outer-class
+copies coexist in the SAME JVM run of `AotIntegrationTests` alone: one
+under `UserDefined(3)` (one test method's fork), one under `UserDefined(4)`
+(a DIFFERENT test method's fork), and one under plain `Application`
+(loaded before any fork existed, plausibly by JUnit's own internal
+annotation scanning). Each resolves its OWN nested `$Search` class
+correctly and self-consistently through the SAME loader
+(`UserDefined(3)`'s `MergedAnnotations` -> `UserDefined(3)`'s `Search`;
+`Application`'s `MergedAnnotations` -> `Application`'s `Search` --
+`resolve_class_loader_aware`/the new carve-out from item 1 works
+correctly for ALL three, individually). The ACTUAL failing
+`withEnclosingClasses` call executes on an INSTANCE of the
+**`Application`-scoped** `Search` class -- meaning whatever code calls
+`MergedAnnotations.search(SearchStrategy.TYPE_HIERARCHY)` in the failing
+path (`TestContextAnnotationUtils`/`TestContextAotGenerator`'s
+`isDisabledInAotMode` predicate, reached via reflection --
+`native_method_invoke`/`native_method_invoke_boxed` frames present in
+the full backtrace) itself resolves `MergedAnnotations` to the
+`Application` copy, not a forked one. If EVERYTHING downstream of that
+call also consistently resolved via `Application` (which the "self-
+consistent" pattern above says it should), there would be no bug -- so
+the actual `SearchStrategy.TYPE_HIERARCHY` value flowing into
+`this.searchStrategy` must be getting resolved through a DIFFERENT
+loader context than the `Search` instance's own class does. The two
+most likely explanations, neither confirmed: (a) the calling method is
+itself a lambda/method-reference whose generated class's defining loader
+differs subtly from the class that lexically declared it, or (b) the
+reflective `Method.invoke()` path (visible in the backtrace) resolves a
+literal constant argument in the CALLER frame's context rather than the
+declared method's, which is a JIT-adjacent misattribution just like
+several of the OTHER argument-decode bugs already fixed elsewhere in
+this codebase (see `wildfly-jit-arg-decode-unboxed-primitive-triple-
+misattribution` in the fixed-bug archive for the general shape). This
+needs live-debugging or per-frame identity instrumentation right at the
+`Method.invoke()` boundary to pin down further -- log-based tracing alone
+cannot distinguish these two theories. Stopping here for this session;
+the `CRATONVM_DBG_LOADER_TRACE` substring widening (`MergedAnnotations`)
+is left in place alongside the earlier `SearchStrategy` one for whoever
+picks this back up.
+
+
 
 **`test.context.jdbc.*` cluster — fully fixed (0 remain).** All 25 classes
 that were uniformly failing behind Spring's `ApplicationContext` failure
@@ -417,10 +930,10 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
 | `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests` | TIMEOUT | 0/0 | 120000ms |
-| `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | FAIL | 1/2 | 412ms |
-| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL | 82/85 | 20126ms |
-| `context.annotation.Spr15275Tests` | FAIL | 4/6 | 2038ms |
-| `context.annotation.Spr6602Tests` | FAIL | 1/2 | 1229ms |
+| `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | OK (2026-07-21 SPR-8080 fix) | 2/2 | 829ms |
+| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL (2026-07-21 reconfirmed, worse than recorded — see notes) | 74/85 | 8802ms |
+| `context.annotation.Spr15275Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 4/6 | 1174ms |
+| `context.annotation.Spr6602Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 1/2 | 1140ms |
 | `context.aot.ApplicationContextAotGeneratorTests` | FAIL (2026-07-20, see caveat above — needs re-verify) | 16/40 | 389879ms |
 | `context.groovy.GroovyBeanDefinitionReaderTests` | TIMEOUT | 0/0 | 120000ms |
 
@@ -515,18 +1028,18 @@ above. Removed from this table.
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `web.client.RestClientIntegrationTests` | FAIL | 226/230 | 96436ms |
-| `web.client.RestTemplateIntegrationTests` | FAIL | 118/125 | 88728ms |
-| `web.context.request.RequestScopeTests` | FAIL | 0/7 | 1300ms |
-| `web.reactive.function.client.WebClientIntegrationTests` | FAIL | 168/170 | 47143ms |
+| `web.client.RestClientIntegrationTests` | FAIL (2026-07-21, improved via side effect) | 227/230 | ~30000ms |
+| `web.client.RestTemplateIntegrationTests` | FAIL (2026-07-21, improved via side effect) | 119/125 | ~20000ms |
+| `web.context.request.RequestScopeTests` | OK (2026-07-21, side effect) | 7/7 | 1700ms |
+| `web.reactive.function.client.WebClientIntegrationTests` | FAIL (2026-07-21, reconfirmed, 1 fail + 1 skip) | 168/170 | 23337ms |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
 | `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | FAIL (2026-07-20, now completes, NEW bug found, see above) | 3/5 | 51669ms |
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL (original CCE confirmed gone, new shared bug, see above) | 3/5 | 54239ms |
-| `web.servlet.config.MvcNamespaceTests` | FAIL | 24/25 | 24938ms |
-| `web.servlet.config.annotation.ViewResolutionIntegrationTests` | FAIL | 6/7 | 29415ms |
-| `web.servlet.view.groovy.GroovyMarkupViewTests` | FAIL | 9/10 | 28950ms |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 14/16 | 105475ms |
+| `web.servlet.config.MvcNamespaceTests` | FAIL (2026-07-21, reconfirmed, not investigated) | 24/25 | 24938ms |
+| `web.servlet.config.annotation.ViewResolutionIntegrationTests` | FAIL (2026-07-21, reconfirmed, not investigated) | 6/7 | 29415ms |
+| `web.servlet.view.groovy.GroovyMarkupViewTests` | OK (2026-07-21, side effect) | 10/10 | 21827ms |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL (not re-verified 2026-07-21, host load prevented reconfirmation, see notes) | 14/16 | 105475ms |
 
 ## Raw data
 
