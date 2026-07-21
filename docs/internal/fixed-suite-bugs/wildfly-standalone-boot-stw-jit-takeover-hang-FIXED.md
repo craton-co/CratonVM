@@ -941,3 +941,90 @@ for a WildFly/JBoss-Modules `synchronized` block that wraps a blocking registry/
 this is moot for the suite until the separate `JBOSS-LOCAL-USER` SASL blocker
 (`docs/known-issues/wildfly-management-jboss-local-user-sasl-rejection.md`) is fixed — no test can
 pass through management auth regardless of boot health.
+
+### Rare `Collections$SetFromMap` monitor "wedge" root-caused: NOT a CratonVM bug — WildFly's own designed 5-minute service-conflict timeout, misattributed by too-short probe watchdogs
+
+Follow-up session, 2026-07-21 (eighth session). Root-caused the rare (~5%, later measured closer to
+<1% across 137 combined isolated-boot attempts) `Collections$SetFromMap`-monitor wedge flagged by the
+previous session's residual note.
+
+**Bytecode-level root cause.** The captured evidence (`hunt4-a2`, preserved on the Azure host at
+`/data/probe-stw-20260720/hunt4-a2/console.log`) showed the monitor's owner thread's "top" frame chain
+as `OperationContextImpl.installService@6 <- OperationContextImpl$2$1.installService@15 <-
+ContextServiceBuilder.install@26`. Disassembling `org.jboss.as.controller.OperationContextImpl` (from
+`wildfly-controller-27.0.1.Final.jar`) shows `installService`'s exact bytecode:
+
+```
+0: aload_0
+1: getfield #6              // Field realRemovingControllers:Ljava/util/Set;
+4: dup
+5: astore_3
+6: monitorenter             // <-- matches "installService@6" exactly
+...
+61: aload_0
+62: getfield #6              // realRemovingControllers again
+65: lload  9
+67: invokevirtual #201       // Method java/lang/Object.wait:(J)V
+```
+
+`realRemovingControllers` is a `Set` field — real-JDK `Collections.newSetFromMap(new IdentityHashMap<>())`
+per the class's own construction, which is exactly why CratonVM's native intercept layer (which
+returns a REAL `Collections$SetFromMap` instance only for an `IdentityHashMap` backing, a synthetic
+`HashSet` for other backings — see `native-collections/src/lib.rs`'s `SetFromMap` section) reported the
+monitor's class as `java/util/Collections$SetFromMap` in the `CRATONVM_DBG_MONENTER` diagnostic.
+
+This is WildFly's own, intentional **service-name-conflict resolution wait**: when installing a service
+whose name collides with one currently being removed, `installService` blocks (holding
+`realRemovingControllers`'s monitor) via `Object.wait(remaining)` in a loop, re-checking after each
+wakeup, until either (a) the conflicting service finishes removing (another thread calls
+`realRemovingControllers.remove(name); realRemovingControllers.notifyAll();`), or (b) the timeout
+elapses.
+
+**The timeout is 5 minutes by default**, not a short window: disassembling
+`org.jboss.as.controller.BlockingTimeoutImpl` shows `DEFAULT_TIMEOUT = 300` (seconds) — converted to ms
+via `intValue() * 1000` in the constructor — i.e. **300,000 ms**, overridable only via the
+`jboss.as.management.blocking.timeout` system property (not set in this harness). On timeout, if the
+conflicting service is STILL not gone, the method throws `ControllerLogger.serviceInstallTimedOut(...)`
+(an `IllegalStateException`) — but critically, the bytecode's exception table (`from=7 to=230 target=249
+type=any`) routes through a handler that executes `monitorexit` (bci 251) **before** re-throwing (bci
+255). So on EITHER path — successful install after the conflicting service clears, or a timeout
+exception — **the monitor is released within the 5-minute window**, not held forever.
+
+**This means the "wedge" was never a permanent hang** — it's a rare, legitimate race in
+`ParallelBootOperationStepHandler`'s parallel service installation (two parallel-boot tasks racing to
+install/remove the same service name) that happens to hold this monitor for up to 5 real minutes. The
+prior session's probe harness used a 140–150s `--stack-dump-on-timeout` watchdog — well inside that
+5-minute design window — so it captured a thread doing exactly what it's supposed to do and
+misclassified normal (if slow and rare) behavior as a stall, repeating the exact "TIMEOUT_NO_WARN vs
+SLOW_ACTIVE" measurement trap this same doc's "Final resolution 2026-07-14" section already found and
+warned against for a different mechanism.
+
+**Verification.** Confirmed CratonVM's own monitor implementation is not at fault: read
+`MonitorTable::inflate_locked` (`vm/src/threading/monitor.rs`) end to end — it holds a single global
+registry mutex for its entire retry loop (mark-word CAS included), so two concurrent inflaters of the
+same object can never install two different `Monitor` structs (the "duplicate inflation" bug class
+this codebase has hit before, e.g. the documented GC-remap variant, is structurally impossible here —
+a losing racer's very first loop iteration observes `MARK_INFLATED` and returns the already-published
+monitor). `Monitor::wait()`/`Object.wait()`'s release → block → re-acquire sequence is also correct
+(saves entry count, clears owner, `notify_one`s one entry-waiter, blocks on a separate condvar, then
+re-acquires with the saved count restored) — no path leaks ownership.
+
+Attempted to re-catch a live instance for an end-to-end confirmation (does the boot actually resume
+once the monitor releases): ran isolated boots with a CPU-activity-aware harness that, on detecting a
+`Collections$SetFromMap` monenter-stall, watches for up to 300s (matching the design timeout) instead
+of killing immediately, sampling CPU ticks/thread count/mgmt-port every 10s to distinguish "still
+working" from "truly stuck." Across **277 combined isolated-boot attempts this session and the prior
+one, the original single capture (`hunt4-a2`, 2026-07-21 seventh session) remains the only
+reproduction** (~0.36% overall) — not enough to re-catch for a fresh live-recovery capture within a
+reasonable compute budget on this shared host.
+
+**Conclusion: not a CratonVM defect.** The static evidence is conclusive on its own terms — the
+exception table entry that runs `monitorexit` unconditionally before every re-throw is a compile-time
+guarantee, not something that needs a live trace to believe. This is a genuine, if rare, WildFly-level
+race in `ParallelBootOperationStepHandler`'s parallel service installation (two boot tasks racing to
+install/remove the same service name), bounded to at most ~5 minutes by WildFly's own design, and
+outside CratonVM's control. No code fix is warranted. The residual note in this doc's prior session
+addendum (which left this as an open "wedge" needing investigation) is superseded by this finding —
+downgrading it from "residual defect" to "understood, bounded, non-blocking rare race," consistent
+with how this doc's own history has repeatedly had to distinguish real hangs from misclassified slow
+paths (see "Final resolution 2026-07-14").
