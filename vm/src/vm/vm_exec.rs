@@ -13779,6 +13779,48 @@ fn invoke_on_class_shared_inner(
             .map(|class| class.name.to_string())
             .unwrap_or_default()
     };
+    // `java.nio.file.Path` is a genuine interface with no `toString()` body of
+    // its own. The receiver-retargeting block above only substitutes the
+    // receiver's actual class for `class_id`/`class_name` when the ORIGINAL
+    // (CP-symbolic) class at the call site is itself an interface/abstract
+    // class (`this_is_iface_or_abs`). A call site whose declared parameter
+    // type is `Object` — e.g. `String.valueOf(Object obj)`'s internal
+    // `obj.toString()`, which is exactly what javac compiles `"literal:" +
+    // aPath` down to (a real `invokestatic String.valueOf` ahead of the
+    // `StringConcatFactory` indy call, not a direct `Path.toString()` call) —
+    // never retargets, so `class_name` here stays `java/lang/Object` and the
+    // `java/nio/file/Path` force-native entry deep in the `check_override`
+    // chain below (keyed on `class_name`) can never fire, even though the
+    // ACTUAL RECEIVER is one of our synthetic Path values. Check the
+    // receiver's real class directly, independent of the resolved
+    // `class_name`. Same family as
+    // `docs/internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`
+    // (which covered this exact call shape) — this hunk went missing from
+    // `invoke_on_class_shared_inner` somewhere between that fix landing
+    // (a6ce01fe2, 2026-07-19) and dev tip; re-added 2026-07-21 after
+    // `templateLocationEmpty` regressed with the identical symptom
+    // (`file:java.nio.file.Path@<hash>` instead of the real path).
+    if method_name == "toString" && descriptor == "()Ljava/lang/String;" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            let recv_cid = shared.heap.class_id_of(recv);
+            let is_path = {
+                let cm = shared.class_manager.read();
+                cm.find_class_by_name("java/nio/file/Path")
+                    .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
+                    .unwrap_or(false)
+            };
+            if is_path {
+                if let Some(callback) = shared.native_methods.find(
+                    "java/nio/file/Path",
+                    "toString",
+                    "()Ljava/lang/String;",
+                ) {
+                    return safe_native_call(shared, thread, callback, args)
+                        .map(|value| coerce_native_return(value, descriptor));
+                }
+            }
+        }
+    }
     // `SSLContext.getInstance` returns a SunJSSE provider object.  The TLS
     // bridge is registered on the public API class and must own this complete
     // family before provider bytecode can create an incompatible context SPI.
