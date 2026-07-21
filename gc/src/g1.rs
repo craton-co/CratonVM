@@ -1548,6 +1548,30 @@ impl G1Collector {
         self.next_hash_code.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Lazily mint and durably install a non-zero identity hash for an
+    /// object whose header field is still 0 (the JIT inline `new` fast path
+    /// leaves it TLAB-zeroed — see `identity_hash_code`'s doc comment).
+    /// Safe under concurrency: the header field is written via CAS from 0,
+    /// so a losing racer's mint is discarded and every caller converges on
+    /// the single value that ends up durably stored.
+    fn mint_identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        let minted = match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        };
+        // SAFETY: see the identical justification in
+        // `gen_heap::GenerationalHeap::mint_identity_hash_code`.
+        unsafe {
+            let field_ptr =
+                std::ptr::addr_of_mut!((*(obj.as_ptr() as *mut ObjectHeader)).identity_hash_code);
+            let atomic = &*(field_ptr as *const AtomicI32);
+            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => minted,
+                Err(existing) => existing,
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Allocation
     // -----------------------------------------------------------------------
@@ -6908,7 +6932,11 @@ impl GarbageCollector for G1Collector {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        self.get_header(obj).identity_hash_code
+        let existing = self.get_header(obj).identity_hash_code;
+        if existing != 0 {
+            return existing;
+        }
+        self.mint_identity_hash_code(obj)
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
