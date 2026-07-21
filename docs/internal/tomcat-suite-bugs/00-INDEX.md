@@ -26,10 +26,11 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
+| [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run (Azure host) + HotSpot control diff | 23 classes (jakarta.el/catalina/coyote/juli/util.buf/websocket) | FAIL/HANG | 🔴 **OPEN** (individually undiagnosed, like 05) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
-FAILs (05).
+FAILs (05, 16).
 
 > **Bug 06 — re-verified FIXED (2026-06-15).** The "OpenSSL Panama/FFM clinit →
 > libffi SEGV" label was a wrong diagnosis. The crash was a GC stale-reference in
@@ -57,3 +58,18 @@ NOSUMMARY so far: `catalina.realm.TestJNDIRealm` (bug-09 family residual).
 (07/08/09) are fixed; the remaining gap is (a) interpreter throughput for
 server-test deployment (group 04, the bulk) and (b) the ~30 craton-only FAILs in
 group 05 still to be individually diagnosed.
+
+## Full 6-shard Linux run, 2026-07-21 (group 16)
+
+Complete 646-class run on the Azure Linux host, `dev` @ `660985acb`, real
+JDK 25 boot, `-Xmx2g`, 300s/class timeout, 6-way shard, plus a same-fixture
+HotSpot control pass to separate real regressions from environment noise (see
+[[reference_tomcat_triage_20260629]]'s rule — a HotSpot control pass is what
+turned an apparent 184/646 FAIL count into 23 real ones):
+
+**451 PASS / 23 confirmed CratonVM-only regressions / 172 fail on HotSpot too
+(fixture gaps: missing `httpd`, missing OCSP-responder infra, `*LargeHeap`
+needing a bigger `-Xmx` than the flat default) / 0 CRASH.**
+
+Full breakdown and the 23-class list: [16](16-full-suite-6shard-rerun-20260721.md).
+Reusable Linux runner: `apps/tomcat-suite-runner/run-tomcat-suite.sh`.
