@@ -397,6 +397,132 @@ needed) rather than more guessing from stack dumps alone. Whoever picks this
 up next should start there, not with a `ThreadRegistry` eviction patch —
 that path has now been checked and shown insufficient on its own.
 
+### Second follow-up pass (same day): the `ThreadRegistry`/GC-cost theory ITSELF measured and refuted; the actual hang mechanism narrowed further; three more specific hypotheses tested and ruled out
+
+Went further than the profiling recommendation above by directly
+instrumenting the three suspect `ThreadRegistry` functions
+(`collect_all_root_snapshots`, `alive_count_and_os_tids`,
+`alive_count_blocked_and_os_tids`) with call-count/cumulative-time counters
+(`CRATONVM_DBG_THREADREG_PERF=1`, additive-only, zero cost when unset).
+
+**Result: the GC/registry-walk cost hypothesis above is WRONG.** Across
+multiple runs — including one that CRASHED with the exact 153-line/
+`Stopping ProtocolHandler [...auto-20-<port>]` signature — GC fired only
+**ONCE** in the entire run (registry size ~373-386 at that point), and that
+one call cost ~20-80 **microseconds** total across both functions. This is
+utterly negligible against a 15-300+ second runtime. The "per-alive-thread
+VM overhead" framing above was too hasty — measured directly, it is not the
+bottleneck, at least not through these functions. (`alive_count_and_os_tids`
+specifically — a sibling function on a different call path — was never
+invoked at all in this workload.)
+
+**Narrowed the actual failure with a live `--stack-dump-on-timeout` capture
+on the CURRENT (post-fix) binary**: the main thread is parked in
+`reactor.core.publisher.BlockingSingleSubscriber.blockingGet` <-
+`Mono.block` <- `AbstractClientHttpConnectorBuilderTests.connectWithSslBundle`
+— note this is a **normal, successful-handshake** test method (not the
+cipher-mismatch test Cluster A's fix targeted), at the class's 20th/last
+Tomcat cycle, matching the concurrent session's own earlier finding
+(`NamespacedHierarchicalStore.close` et al. is downstream of this same
+block, once the launcher gets that far — it never does).
+
+**Confirmed via forced `org.apache.hc` (Apache HttpComponents 5) DEBUG
+logging that the actual HTTP request/response cycle completes with zero
+errors** — full wire-level log through `200 OK`, response body consumed,
+`"message exchange successfully completed"`, connection released back to
+the pool and gracefully closed. This is not a failed connection, a stuck
+socket, or an unhandled exception in HttpComponents' own code — the
+work the main thread is waiting on genuinely finishes. **The main thread
+simply never wakes up from `Mono.block()` afterward** — the log ends
+mid-cycle-20, in the identical spot, across 6 independently-captured hang
+instances (2376-2377 lines each, byte-for-byte reproducible stopping point).
+
+Tested and ruled out, in order:
+
+1. **Lost `LockSupport.unpark()` wakeup** — `vm/src/vm/vm_exec.rs`'s
+   `unpark()` already has a purpose-built `CRATONVM_DBG_UNPARK_MISS`
+   diagnostic for exactly this failure mode (logs `[unpark] MISS` when a
+   `Thread` object's `ParkState` can't be resolved — the exact shape of bug
+   that `mark_dead`'s own doc comments describe fixing once already, for a
+   *dead* thread's recycled mirror address; `thread_obj_to_park`'s
+   raw-pointer keying IS correctly remapped on every GC move via
+   `update_thread_objs_after_gc`, so a *live* thread's relocated mirror is
+   not an obviously exposed gap either — confirmed empirically). Enabled it
+   and captured **two independent genuine hangs** with it active: **zero**
+   `[unpark] MISS` lines in either. This specific lost-wakeup mechanism is
+   ruled out.
+2. **Reactor's own reactive-streams plumbing silently swallowing an
+   exception/never delivering `onComplete`** (the same shape as the fixed
+   Jetty bug, just in `reactor.core.*` instead of `org.eclipse.jetty`) —
+   added `reactor` and `io.netty` to the forced-DEBUG logger list and
+   captured **four independent genuine hangs** with it active: **zero**
+   `reactor.core.*` log lines anywhere in any of the four full logs. This
+   isn't evidence of a clean signal path — it means Reactor's own operators
+   in this specific pipeline (`Mono.block()` wrapping a single async result,
+   no `.log()` chained) don't call any logger at all regardless of level,
+   so this technique simply has no signal to observe here. Neither
+   confirms nor refutes Reactor-internal swallowing; it just means the
+   forced-DEBUG-logging technique that found the Jetty bug doesn't apply to
+   this specific library/pipeline shape.
+
+3. **Spring Framework's own bridge code** (the adapter between
+   HttpComponents' completion callback and Reactor's `Mono`, e.g.
+   `HttpComponentsClientHttpConnector` in `spring-web`/
+   `spring-boot-http-client`) — added `org.springframework.http`,
+   `org.springframework.web`, and `org.springframework.core` to the
+   forced-DEBUG list (on top of the previous ten) and captured **five more
+   independent genuine hangs**: again **zero** `org.springframework.*` log
+   lines appear anywhere after HttpComponents' last line. Across all four
+   DEBUG-logging passes combined (14 distinct top-level packages now
+   tried), the process produces **absolutely no further Java-level log
+   output whatsoever** once HttpComponents' `SSLIOSession` reaches `Close
+   GRACEFUL` for the final exchange — a remarkably consistent, exact
+   stopping point (2317-2428 total lines depending on which loggers were
+   enabled that run, but always ending on the identical HttpComponents
+   line) across 11 independently-captured hangs now.
+4. **Whether the process is globally frozen at all** — added
+   `CRATONVM_DBG_SELECTOR=1` (native NIO selector tracing, the same
+   instrumentation that found and fixed the Jetty wakeup bug) on top of
+   everything else and captured 2 more hangs. **The process is NOT frozen**:
+   all ~30+ leaked-but-alive `httpclient-dispatch-N` threads (see the
+   thread-composition finding above) keep idle-polling their own selectors
+   in an endless `ENTER`/`EXIT n=0` loop for the *entire* remaining timeout
+   window, exactly as a correctly-functioning idle reactor thread should.
+   The failure is precisely isolated to one thing: whatever should
+   eventually deliver a completion signal to the specific `Mono` the main
+   thread is blocked on never does, while every other thread and the
+   native selector layer keep running completely normally.
+
+**Where this leaves the investigation**: four specific, independently
+falsifiable hypotheses have now been tested with direct instrumentation and
+firmly ruled out (GC/registry cost, lost `LockSupport.unpark()`, and —
+via "no logger anywhere fires" — every candidate site in Reactor,
+HttpComponents, and Spring's own bridge code that could plausibly log a
+swallowed exception or completion event). The forced-DEBUG-logging
+technique that cracked the Jetty bug has been pushed about as far as it
+usefully goes for this specific failure: the code path that's actually
+stuck apparently contains **no SLF4J logging statements at all** in its
+entire call chain, which points toward raw `java.util.concurrent` internals
+(`CompletableFuture`, `AbstractQueuedSynchronizer`'s queue/park machinery,
+or a JDK-internal callback dispatch) — code that generally doesn't log
+anything on any JVM, CratonVM included. **This needs a different
+technique than more logging**: either a debugger capable of inspecting a
+live process's native+Java frames simultaneously (none available on this
+box per prior sessions' findings), or targeted native-side tracing added
+directly to whichever CratonVM native method backs the specific JDK
+concurrency primitive Spring's reactive bridge actually uses underneath
+`Mono.block()` for this connector (check `native-builtins/src/` for
+`CompletableFuture`/`AbstractQueuedSynchronizer`-adjacent overrides — most
+of `java.util.concurrent.locks` likely runs as real, un-intercepted
+bytecode calling already-cleared `LockSupport.park`/`unpark`, so the actual
+gap, if it's VM-side at all, is probably in something more specific:
+worth checking whether Spring's async bridge for this connector uses a
+raw callback registered directly against HttpComponents' own
+`Future`/`CompletableFuture` object, and whether *that* completion path
+(as opposed to the generic `LockSupport` primitives already cleared) has
+its own natively-intercepted method with a bug analogous to the two
+already fixed this session).
+
 ## Fixes landed this session (both real, independent bugs)
 
 1. **`native-io/src/nio_selector.rs`**: `SelectorState::nudge_blocked_poll()`
