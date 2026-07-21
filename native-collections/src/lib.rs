@@ -6207,6 +6207,16 @@ fn native_map_remove_pinned(
         let head_matches = node_matches_inner(ctx, head, is_null_key, key_ref)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
+        // investigation): the refresh above covers `head`/`buckets` but not
+        // `this` (the map object itself) -- `this` was only ever derived
+        // from `remove_pin_base` once, at function entry, before this
+        // GC-capable `equals()` call. A GC landing during it left `this`
+        // dangling, so the `set_map_size` below silently corrupted whatever
+        // object now sat at that stale address (guarded OOB drop) instead of
+        // updating the map's real `size` field. Re-derive `this` from its
+        // pin on every refresh, same as the other locals.
+        let this = ctx.read_native_pin(remove_pin_base, this);
         ctx.unpin_native_roots(buckets_pin); // pops head_pin too (pushed after it)
         if head_matches {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
@@ -6252,6 +6262,9 @@ fn native_map_remove_pinned(
             let curr_matches = node_matches_inner(ctx, curr, is_null_key, key_ref)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
+            // GC SAFETY: same `this`-goes-stale hazard as the head check
+            // above -- re-derive it from `remove_pin_base` every iteration.
+            let this = ctx.read_native_pin(remove_pin_base, this);
             ctx.unpin_native_roots(prev_pin); // pops curr_pin too
             if curr_matches {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
