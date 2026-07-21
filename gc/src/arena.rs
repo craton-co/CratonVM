@@ -83,22 +83,20 @@ pub struct Arena {
     /// * [`Self::clear_free_list`] / [`Self::reset`] / [`Self::reset_no_zero`]
     ///   zero it alongside the list.
     max_free_upper: usize,
-    /// PERF (2026-07-15, round 2 of the RequestMappingMessageConversionIntegrationTests
-    /// investigation): monotonic counter bumped on every free-list CONTENT
-    /// change (a block added via `push_block_routed`, or removed/consumed by
-    /// `alloc`'s free-list fast path; NOT bumped by the `max_free_upper`
-    /// tightening on a failed scan, which doesn't touch list contents).
-    /// Pairs with `free_bytes_cache` below to make `free_list_bytes()` O(1)
-    /// on the (overwhelmingly common) case where nothing changed since the
-    /// last call.
-    free_list_epoch: u64,
-    /// Cached `(epoch, bytes)` from the last `free_list_bytes()` computation.
-    /// `Cell` (not a plain field) because the getter takes `&self`: `Arena`
-    /// is always accessed through an external `Mutex` (see e.g.
-    /// `GenerationalHeap::young_from`), so exclusive access is already
-    /// guaranteed and a `Cell` cache is sound despite the shared-reference
-    /// getter signature.
-    free_bytes_cache: std::cell::Cell<(u64, usize)>,
+    /// Running total of bytes currently held across both free-list tiers,
+    /// maintained incrementally at every mutation site (`push_block_routed`
+    /// adds a pushed block's size; `first_fit`'s consuming hit subtracts the
+    /// whole consumed block's size before its remainder is re-routed;
+    /// `clear_free_list` / `reset` / `reset_no_zero` zero it alongside the
+    /// list). This replaced an epoch-gated cache (2026-07-15) that was only
+    /// O(1) between calls with no free-list mutation in between — under
+    /// steady allocation churn (an object-heavy workload where the young
+    /// sweep keeps reclaiming into the list while `alloc` keeps consuming
+    /// from it) the list content changes on nearly every call, so the old
+    /// cache degraded back to O(free-list-size) per call. Maintaining the
+    /// sum incrementally instead of gating a from-scratch recompute makes
+    /// `free_list_bytes()` unconditionally O(1), including under churn.
+    free_bytes_total: usize,
 }
 
 /// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
@@ -144,8 +142,7 @@ impl Arena {
             free_small: Vec::new(),
             free_large: Vec::new(),
             max_free_upper: 0,
-            free_list_epoch: 0,
-            free_bytes_cache: std::cell::Cell::new((0, 0)),
+            free_bytes_total: 0,
         }
     }
 
@@ -166,7 +163,7 @@ impl Arena {
         } else {
             self.free_large.push(block);
         }
-        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
+        self.free_bytes_total += block.size;
     }
 
     /// First-fit scan of ONE tier, visiting at most `max_scan` blocks. On a
@@ -191,6 +188,7 @@ impl Arena {
         size: usize,
         align: usize,
         max_scan: usize,
+        total: &mut usize,
     ) -> Option<(usize, [Option<FreeBlock>; 2])> {
         for i in 0..list.len().min(max_scan) {
             let block = list[i];
@@ -207,6 +205,7 @@ impl Arena {
                 let alloc_offset = block.offset + padding;
                 let remaining = block.size - padding - size;
                 list.swap_remove(i);
+                *total -= block.size;
                 let head = (padding > 0).then_some(FreeBlock {
                     offset: block.offset,
                     size: padding,
@@ -273,13 +272,13 @@ impl Arena {
                     alloc_size,
                     align,
                     SMALL_TIER_SCAN_BUDGET,
+                    &mut self.free_bytes_total,
                 )
-                .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX))
+                .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total))
             } else {
-                Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX)
+                Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total)
             };
             if let Some((alloc_offset, remainders)) = hit {
-                self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
                 }
@@ -332,10 +331,9 @@ impl Arena {
         // already-degenerate case where the bump tail is gone, which the
         // common case (tail available) never reaches.
         let base = self.data.as_ptr() as usize;
-        let hit = Self::first_fit(&mut self.free_small, base, alloc_size, align, usize::MAX)
-            .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX));
+        let hit = Self::first_fit(&mut self.free_small, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total)
+            .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total));
         if let Some((alloc_offset, remainders)) = hit {
-            self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
             for r in remainders.into_iter().flatten() {
                 self.push_block_routed(r);
             }
@@ -377,7 +375,7 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
-        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
+        self.free_bytes_total = 0;
     }
 
     /// Total bytes currently held on the free lists (reclaimed but unallocated).
@@ -398,14 +396,7 @@ impl Arena {
     /// O(1); the summation itself is unchanged (same tiers, same order),
     /// so a cache miss recomputes byte-identically to the old behavior.
     pub fn free_list_bytes(&self) -> usize {
-        let (cached_epoch, cached_bytes) = self.free_bytes_cache.get();
-        if cached_epoch == self.free_list_epoch {
-            return cached_bytes;
-        }
-        let total = self.free_small.iter().map(|b| b.size).sum::<usize>()
-            + self.free_large.iter().map(|b| b.size).sum::<usize>();
-        self.free_bytes_cache.set((self.free_list_epoch, total));
-        total
+        self.free_bytes_total
     }
 
     /// Size of the largest single free-list block (0 if the free list is
@@ -527,7 +518,7 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
-        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
+        self.free_bytes_total = 0;
     }
 
     /// Reset the arena without zeroing memory.
@@ -551,7 +542,7 @@ impl Arena {
         self.free_small.clear();
         self.free_large.clear();
         self.max_free_upper = 0;
-        self.free_list_epoch = self.free_list_epoch.wrapping_add(1);
+        self.free_bytes_total = 0;
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
