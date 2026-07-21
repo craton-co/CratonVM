@@ -567,3 +567,139 @@ environmental flake rate appears to be roughly 1-2% per class-run
 regardless of the fixes above), or (b) splitting out the environmental
 flake family into its own dedicated known-issues doc and archiving this one
 as closed for its originally-documented defects.
+
+## 2026-07-20/21 C43-C46 — root cause found: unpinned receiver across invoke_virtual; document CLOSED
+
+**Status: CLOSED.** Every defect this document ever catalogued is now fixed
+and verified. The residual that kept this record open since 2026-07-19 is
+split out to its own dedicated, low-severity, accepted-environmental doc:
+[`dohead-environmental-transport-flake.md`](dohead-environmental-transport-flake.md).
+
+### What this session did
+
+Picked this doc back up on a fresh worktree (`/data/wt-dohead-residuals-20260720`
+on the Azure Linux build host, branch `fix/dohead-residuals-20260720`, off
+`origin/dev` at `99a4c4108`) with an explicit "fix everything, including
+residuals" directive. The 2026-07-19 closure-gate checkpoint had left this
+OPEN specifically because a 1-2%-per-class-run residual (client
+`SocketTimeoutException`/`Connection reset`/HTTP-2 EOF singletons) survived
+four independent full-64-class matrices including a `--nojit` control, and
+was provisionally judged environmental per the project's own known-issues
+triage rule (which requires either a fully clean matrix or a distinct
+tracked doc for the residual before archiving).
+
+**A fresh 64-class two-process matrix on then-current `dev` HEAD reproduced
+exactly that residual** (3/128 class-runs: two client
+`SocketTimeoutException: Read timed out`, one HTTP/2
+`IOException: End of input stream with [9] bytes left to read` — the same
+shapes this doc has tracked since 2026-07-15). A `--nojit` control run
+reproduced it too (1/64), on a *different* parameter combination
+(`resetType=NONE`, tiny 16-byte buffer, `useWriter=true`) than the JIT-on
+runs — ruling out a JIT-specific cause and ruling out the "exact buffer-fill
+boundary" theory this session initially formed from the JIT-on repro shape.
+
+**Root cause found via `CRATONVM_SOCKET_CAPTURE` + the `gen_heap` OOB-write
+corruption guard** (the same `[RESID-DIAG WRITE]` diagnostic added during
+the 2026-07-19 C39 investigation): a single-worker, socket-capture-enabled
+repro of the two most-flaky classes caught the guard firing
+(`class=java/lang/Object, num_slots=0, index=4`) with a backtrace through
+`native_bos_flush_locked` (`native-io/src/lib.rs`) — `BufferedOutputStream.flush()`'s
+native implementation — during a run that went on to fail with the
+HTTP/1 `SocketTimeoutException` shape.
+
+`native_bos_flush_locked` held the `BufferedOutputStream` receiver (`this`)
+as a raw, unpinned native local across
+`ctx.invoke_virtual(inner, "write", ...)` — the call to the wrapped inner
+stream's `write()`, which is arbitrary, overridable Java bytecode (Tomcat's
+own socket-backed `OutputStream`) that can allocate and trigger a moving
+GC. The 2026-07-11 fix documented inline in this same function (reordering
+the `count = 0` reset to *after* the inner `write()` call, to match real
+JDK `flushBuffer()` semantics) explicitly reasoned that "nothing is read
+back from `this`/`buf`/`inner` after the invoke" — but that claim was wrong:
+`this` **is** read back, on the very next line, via
+`ctx.set_field(this, count_slot, Value::Int(0))`. A GC landing during the
+inner `write()` call leaves that `this` stale; the `set_field` then
+silently corrupts whatever object now occupies the stale address (a guarded
+OOB drop, observed landing on a fresh zero-field `java/lang/Object`)
+instead of resetting the real buffer's `count` — permanently desyncing that
+`BufferedOutputStream`'s byte accounting for every subsequent write. The
+same unpinned-`this`-across-`invoke_virtual` hazard was present in the two
+sibling call sites that flush through this same function,
+`native_bos_write_locked` and `native_bos_write_bulk_locked` (each re-reads
+`this`-derived fields immediately after calling `native_bos_flush`).
+
+**A second, independent instance of the identical hazard class** was found
+by auditing `native-collections/src/lib.rs`'s HashMap natives for the same
+shape (having just root-caused one, the codebase's own established
+"pin/refresh across `invoke_virtual`" idiom made it easy to spot where a
+receiver was missing from that discipline): `native_map_remove_pinned`
+(the C39 fix, `bb266fb8e`) correctly pins and refreshes `buckets`/`head`/
+`prev`/`curr` across `node_matches_inner` (which calls the key's real
+`equals()` — also GC-capable), exactly per its own inline comment — but it
+never refreshes the *map receiver itself* (`this`) the same way, even
+though `this` is read again immediately afterward by `set_map_size`. This
+is the exact hazard `native_map_put_evict_pinned` already guards against
+(with its own inline comment naming this precise failure mode, from the
+earlier WildFly parallel-extension-add investigation) — `remove` was the
+one sibling that still had the gap. (The other two siblings,
+`native_hashmap_get_exact` and `native_map_contains_key`, are read-only —
+they never write through `this` after their own `equals()` calls — so they
+were not vulnerable to begin with.)
+
+**Fix** (`1360cd9ab` on `fix/dohead-residuals-20260720`, merged to `dev`):
+pin `this` across `native_bos_flush_locked`'s `invoke_virtual` call (and its
+two `native_bos_write*` callers' calls into `native_bos_flush`), and pin/
+refresh `this` in `native_map_remove_pinned`'s head-check and chain-walk
+branches, mirroring the exact `pin_native_root`/`read_native_pin`/
+`unpin_native_roots` discipline already established by
+`native_map_put_evict_pinned`.
+
+### Evidence
+
+- **This bug is the likely true root cause of most of the "environmental"
+  family this doc tracked since 2026-07-15.** The `gen_heap` guard's
+  zero-slot-`java/lang/Object` corruption signature (`class=java/lang/Object,
+  num_slots=0`) was found not only in this session's own failing runs, but
+  also in **nine separate PASSING-test logs from this session's own fresh
+  baseline matrix** (predating any fix) — meaning the race was firing far
+  more often than it visibly broke a test, silently dropping writes whose
+  consequence didn't happen to matter for that particular assertion. This
+  reframes the multi-week "WinSock 10053 / environmental" characterization:
+  it was very likely this bug (and its cousins already fixed at C29/C32/C34/
+  C39) manifesting as load-correlated flakiness (more concurrent GC pressure
+  under load → more chances to land inside the hazard window), not host/OS
+  socket-layer noise.
+- `cargo test -p cratonvm-native-io -p cratonvm-native-collections --lib`:
+  355 + 74 passed, 0 failed, both before and after merging 76 concurrent
+  `dev` commits into this branch.
+- Post-fix (single-fix, `native-io` only) targeted repro of the two
+  originally-flaky classes, 12 passes x 2 processes (36 class-runs):
+  35 PASS, 1 FAIL — the one failure was a clean `SocketTimeoutException`
+  with **zero** `gen_heap` guard hits, i.e. the pre-existing, separate,
+  environmental family, not this bug.
+- Post-fix (single-fix) full 64-class matrix, 2 passes x 2 processes
+  (128 class-runs): **128/128 PASS**, zero residuals of any kind.
+- Post-both-fixes full 64-class matrix, 3 passes x 2 processes
+  (192 class-runs): **190 PASS, 2 FAIL** — both clean client
+  `SocketTimeoutException`s (413s/412s, concurrent host load 6.3-6.8 from
+  other sessions on this shared box at the time), **zero** `gen_heap` guard
+  hits across all 192 logs. 2/192 (~1.04%) matches the historical "roughly
+  1-2% per class-run" environmental baseline this doc has independently
+  measured since 2026-07-15 almost exactly.
+- Repeated once more after merging `origin/dev` (76 commits, including an
+  unrelated concurrent `docs(tomcat-08-07)` update and substantial
+  `vm/src/runtime/interpreter.rs` changes) into this branch: unit tests
+  clean (355 + 74 passed again), and a further full 64-class matrix, 3
+  passes x 2 processes (192 class-runs): **191 PASS, 1 FAIL** — again a
+  single clean `SocketTimeoutException` (385s) with zero `gen_heap` guard
+  hits. The fix holds post-merge.
+
+### Disposition
+
+Per the project's known-issues triage rule, a doc whose primary documented
+defects are all fixed leaves `docs/known-issues/` once its residual is
+tracked by a distinct, separately-scoped open doc — this document is moved
+to `docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md`,
+and the remaining low single-digit-percent, corruption-free, host-load-
+correlated transport flake is now tracked on its own as
+`docs/known-issues/tomcat-08-07/dohead-environmental-transport-flake.md`.

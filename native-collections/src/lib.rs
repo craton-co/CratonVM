@@ -1207,6 +1207,17 @@ fn chm_seg_lock_for(seg_id: i32) -> &'static parking_lot::RwLock<()> {
 struct ChmMonitorGuard<'a> {
     ctx: *mut (dyn NativeContext + 'static),
     seg: ObjectRef,
+    /// Native pin tracking the segment across moving collections while the
+    /// guard is held. GC-SAFETY fix (2026-07-21): the guarded body routinely
+    /// allocates (key hashCode/equals, map growth), so a moving GC can
+    /// relocate the segment BETWEEN acquire and drop; exiting with the
+    /// acquire-time address then misses the (remapped) monitor entirely and
+    /// LEAKS it as owned-forever -- live-captured as the residual WildFly
+    /// parallel-extension-add wedge (hunt2-a1: tid=29 owned a segment
+    /// monitor with no CHM frame on its stack, parked on the capability
+    /// write lock; every later toucher of that segment deadlocked). Drop
+    /// re-reads the pin and exits the CURRENT address.
+    pin: usize,
     /// Phantom borrow tying the guard's lifetime parameter `'a` to a
     /// surrounding scope at the type level. Using
     /// `fn() -> &'a mut dyn NativeContext` rather than `&'a mut …` directly
@@ -1219,6 +1230,7 @@ struct ChmMonitorGuard<'a> {
 
 impl<'a> ChmMonitorGuard<'a> {
     fn acquire(ctx: &mut dyn NativeContext, seg: ObjectRef) -> Self {
+        let pin = ctx.pin_native_root(seg);
         ctx.monitor_enter(seg);
         // SAFETY: the guard MUST be dropped before the `&mut dyn NativeContext`
         // borrow ends. We transmute away the lifetime so the guard doesn't
@@ -1234,6 +1246,7 @@ impl<'a> ChmMonitorGuard<'a> {
         ChmMonitorGuard {
             ctx: ctx_ptr_static,
             seg,
+            pin,
             _borrow: std::marker::PhantomData,
         }
     }
@@ -1257,7 +1270,9 @@ impl<'a> ChmMonitorGuard<'a> {
     /// `ObjectRef`/`Value` local it captured before this call through a pin
     /// (`pin_value`/`read_pinned_elem`) — for everything after this call.
     fn acquire_gc_safe(ctx: &mut dyn NativeContext, seg: ObjectRef) -> (Self, ObjectRef) {
+        let pin = ctx.pin_native_root(seg);
         let fixed = ctx.monitor_enter_gc_safe(seg);
+        let fixed = ctx.read_native_pin(pin, fixed);
         // SAFETY: identical lifetime-erasure contract to `acquire` above.
         let ctx_ptr: *mut dyn NativeContext = ctx;
         let ctx_ptr_static: *mut (dyn NativeContext + 'static) =
@@ -1266,6 +1281,7 @@ impl<'a> ChmMonitorGuard<'a> {
             ChmMonitorGuard {
                 ctx: ctx_ptr_static,
                 seg: fixed,
+                pin,
                 _borrow: std::marker::PhantomData,
             },
             fixed,
@@ -1290,9 +1306,14 @@ impl<'a> Drop for ChmMonitorGuard<'a> {
         // `AssertUnwindSafe` — `monitor_exit` does not maintain
         // invariants that would be broken by an unwinding caller.
         let ctx_ptr = self.ctx;
-        let seg = self.seg;
+        // GC-SAFETY (2026-07-21): exit the segment at its CURRENT address --
+        // see the `pin` field doc. The pin slot was remapped by any moving
+        // collection that ran while the guard was held.
+        let seg = unsafe { (*ctx_ptr).read_native_pin(self.pin, self.seg) };
+        let pin = self.pin;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             (*ctx_ptr).monitor_exit(seg);
+            (*ctx_ptr).unpin_native_roots(pin);
         }));
         if result.is_err() {
             eprintln!(
@@ -2007,6 +2028,13 @@ fn al_ensure_capacity(
     }
 
     al_set_data(ctx, this, new_buf);
+    if altrace_enabled() {
+        eprintln!(
+            "[altrace GROW] this={:p} old_cap={old_cap} new_cap={new_cap} new_buf={:p}",
+            this.as_ptr(),
+            new_buf.as_ptr()
+        );
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(new_buf)
 }
@@ -2312,6 +2340,42 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
+// ALTRACE (checkcast-corruption investigation, 20260721): env-gated
+// unconditional trace of every ArrayList add/get -- prints (this ptr, buf
+// ptr, index/size) so two concurrently-growing lists (e.g. `received` vs
+// `garbage` in JulGcStressRepro) can be told apart in the log and any
+// cross-contamination between their backing arrays caught at the exact
+// call that produced it.
+#[inline]
+fn altrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+}
+
+// ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
+// records what the element ACTUALLY IS at that moment (catches stale pointers
+// whose referent has been replaced by a foreign object after a moving GC).
+fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => {
+            let cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .unwrap_or_else(|| "<unknown-class>".to_string());
+            if cls == "java/lang/String" {
+                format!(
+                    "{:p} cls={cls} str={:?}",
+                    o.as_ptr(),
+                    ctx.read_string(o).unwrap_or_default()
+                )
+            } else {
+                format!("{:p} cls={cls}", o.as_ptr())
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2336,6 +2400,14 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         None => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(data, index as usize);
+    if altrace_enabled() {
+        let val_desc = altrace_describe(ctx, val);
+        eprintln!(
+            "[altrace GET] this={:p} buf={:p} index={index} size={size} val={val_desc}",
+            this.as_ptr(),
+            data.as_ptr(),
+        );
+    }
     Ok(Some(val))
 }
 
@@ -2382,6 +2454,14 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let buf = al_ensure_capacity(ctx, this, size + 1)?;
     let this = ctx.read_native_pin(this_pin, this);
     let elem = read_pinned_elem(ctx, elem_pin, elem);
+    if altrace_enabled() {
+        let elem_desc = altrace_describe(ctx, elem);
+        eprintln!(
+            "[altrace ADD] this={:p} buf={:p} at_index={size} elem={elem_desc}",
+            this.as_ptr(),
+            buf.as_ptr(),
+        );
+    }
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
     ctx.unpin_native_roots(this_pin);
@@ -6268,6 +6348,16 @@ fn native_map_remove_pinned(
         let head_matches = node_matches_inner(ctx, head, is_null_key, key_ref)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
+        // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
+        // investigation): the refresh above covers `head`/`buckets` but not
+        // `this` (the map object itself) -- `this` was only ever derived
+        // from `remove_pin_base` once, at function entry, before this
+        // GC-capable `equals()` call. A GC landing during it left `this`
+        // dangling, so the `set_map_size` below silently corrupted whatever
+        // object now sat at that stale address (guarded OOB drop) instead of
+        // updating the map's real `size` field. Re-derive `this` from its
+        // pin on every refresh, same as the other locals.
+        let this = ctx.read_native_pin(remove_pin_base, this);
         ctx.unpin_native_roots(buckets_pin); // pops head_pin too (pushed after it)
         if head_matches {
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
@@ -6313,6 +6403,9 @@ fn native_map_remove_pinned(
             let curr_matches = node_matches_inner(ctx, curr, is_null_key, key_ref)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
+            // GC SAFETY: same `this`-goes-stale hazard as the head check
+            // above -- re-derive it from `remove_pin_base` every iteration.
+            let this = ctx.read_native_pin(remove_pin_base, this);
             ctx.unpin_native_roots(prev_pin); // pops curr_pin too
             if curr_matches {
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
@@ -35178,6 +35271,18 @@ fn chm_seg_get(
         let node_value = read_pinned_elem(ctx, node_value_pin, node_value);
         if is_null_key {
             if matches!(node_key_field, Value::Object(None)) {
+                // CHM-mapper-deadlock fix (2026-07-21): a value that is the
+                // segment object itself is an in-flight `computeIfAbsent`
+                // RESERVATION (see `chm_compute_if_absent_absent_path`), not
+                // a real mapping — lock-free readers must treat it as absent,
+                // exactly like the JDK's `ReservationNode`.
+                let seg_now = ctx.read_native_pin(roots_base, seg);
+                if let Value::Object(Some(v)) = node_value {
+                    if std::ptr::eq(v.as_ptr(), seg_now.as_ptr()) {
+                        ctx.unpin_native_roots(roots_base);
+                        return Ok(None);
+                    }
+                }
                 ctx.unpin_native_roots(roots_base);
                 return Ok(Some(node_value));
             }
@@ -35191,6 +35296,15 @@ fn chm_seg_get(
             };
             if map_keys_equal(ctx, node_key, key)? {
                 let node_value = read_pinned_elem(ctx, node_value_pin, node_value);
+                // CHM-mapper-deadlock fix (2026-07-21): reservation markers
+                // read as absent — see the null-key arm above.
+                let seg_now = ctx.read_native_pin(roots_base, seg);
+                if let Value::Object(Some(v)) = node_value {
+                    if std::ptr::eq(v.as_ptr(), seg_now.as_ptr()) {
+                        ctx.unpin_native_roots(roots_base);
+                        return Ok(None);
+                    }
+                }
                 ctx.unpin_native_roots(roots_base);
                 return Ok(Some(node_value));
             }
@@ -35403,6 +35517,186 @@ fn native_chm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
 }
 
+/// CHM-mapper-deadlock fix (2026-07-21): `computeIfAbsent`'s mapping
+/// function must NOT run while holding the per-segment Java monitor.
+///
+/// The JDK runs the mapper under a PER-BIN lock (a `ReservationNode` placed
+/// in the empty bin), so operations on other keys never order against it.
+/// Our 16-way segment monitor is far coarser: running the mapper under it
+/// lets a mapper that takes an unrelated lock deadlock against that lock's
+/// holder doing a CHM op on a DIFFERENT key of the same segment. Live
+/// capture (WildFly `parallel-extension-add`, trace7-a2): tid=31's
+/// `NodeSubregistry.registerChild` mapper held segment monitor B and blocked
+/// on the `CapabilityRegistry` write lock, while tid=40 held that write lock
+/// and blocked on B from `registerPossibleCapability`'s `computeIfAbsent`
+/// \-- an AB-BA impossible on HotSpot, and the dominant cause of the
+/// "Could not start container" suite failure.
+///
+/// Reservation protocol (JDK `ReservationNode` equivalent):
+///   Phase 1 \-- under the segment monitor: if the key maps to another
+///     thread's reservation, `Object.wait` on the segment and re-check
+///     (same-key semantics preserved: at most one mapper per install);
+///     if a real value appeared, adopt it; otherwise install the SEGMENT
+///     OBJECT ITSELF as the reservation marker (user code can never store
+///     a segment as a value, and both copies are GC-remapped, so identity
+///     comparison stays sound across moving collections).
+///   Phase 2 \-- with NO monitor held: invoke the mapping function.
+///   Phase 3 \-- under the monitor again: if our reservation is still in
+///     place, replace it with the computed value (or remove it when the
+///     mapper returned null / threw), then `notifyAll` the segment so
+///     same-key waiters re-check. If a racing plain `put`/`remove` replaced
+///     the marker, the raced-in state wins (a small deviation from JDK
+///     ordering, which would have blocked that `put` on the bin lock \--
+///     accepted: the marker is never exposed and no mapper result is
+///     silently double-applied).
+///
+/// Lock-free readers observe the marker as ABSENT via the filter in
+/// `chm_seg_get` \-- the same visibility the JDK gives `ReservationNode`.
+fn chm_compute_if_absent_absent_path(
+    ctx: &mut dyn NativeContext,
+    roots_base: usize,
+    this: ObjectRef,
+    hash: i32,
+    key_pin: usize,
+    key: Value,
+    func_pin: usize,
+    func: Value,
+) -> MethodCallResult {
+    // ---- Phase 1: reserve (or adopt) under the segment monitor. ----
+    let this_now = ctx.read_native_pin(roots_base, this);
+    let Some(seg) = chm_segment_for(ctx, this_now, hash) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let seg_pin = ctx.pin_native_root(seg);
+    let entered = ctx.monitor_enter_gc_safe(seg);
+    let mut segc = ctx.read_native_pin(seg_pin, entered);
+    let mut adopted: Option<Value> = None;
+    let mut reserve_err: Option<MethodCallFailed> = None;
+    loop {
+        let key_now = read_pinned_elem(ctx, key_pin, key);
+        let cur = {
+            let _resize_flag = ChmResizeLockGuard::enter();
+            match native_map_get(ctx, &[Value::Object(Some(segc)), key_now]) {
+                Ok(v) => v,
+                Err(e) => {
+                    reserve_err = Some(e);
+                    break;
+                }
+            }
+        };
+        segc = ctx.read_native_pin(seg_pin, segc);
+        match cur {
+            Some(Value::Object(Some(v))) if std::ptr::eq(v.as_ptr(), segc.as_ptr()) => {
+                // Another thread's mapper is in flight for this key \--
+                // wait exactly like the JDK waits on the reserved bin.
+                let _ = ctx.monitor_wait(segc, Some(50));
+                segc = ctx.read_native_pin(seg_pin, segc);
+            }
+            Some(v @ Value::Object(Some(_))) => {
+                adopted = Some(v);
+                break;
+            }
+            _ => {
+                let key_now = read_pinned_elem(ctx, key_pin, key);
+                let _resize_flag = ChmResizeLockGuard::enter();
+                let marker = Value::Object(Some(segc));
+                if let Err(e) =
+                    native_map_put(ctx, &[Value::Object(Some(segc)), key_now, marker])
+                {
+                    reserve_err = Some(e);
+                }
+                segc = ctx.read_native_pin(seg_pin, segc);
+                break;
+            }
+        }
+    }
+    ctx.monitor_exit(segc);
+    ctx.unpin_native_roots(seg_pin);
+    if let Some(e) = reserve_err {
+        return Err(e);
+    }
+    if let Some(v) = adopted {
+        return Ok(Some(v));
+    }
+
+    // ---- Phase 2: run the mapping function with NO monitor held. ----
+    let func_now = read_pinned_elem(ctx, func_pin, func);
+    let key_now = read_pinned_elem(ctx, key_pin, key);
+    let mapped: Result<Option<Value>, MethodCallFailed> = match func_now {
+        Value::Object(Some(f)) => ctx.invoke_virtual(
+            f,
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[key_now],
+        ),
+        _ => Ok(Some(Value::Object(None))),
+    };
+    let mapped_val = match &mapped {
+        Ok(Some(v)) => *v,
+        _ => Value::Object(None),
+    };
+    let mapped_pin = pin_value(ctx, mapped_val);
+
+    // ---- Phase 3: commit under the monitor; wake same-key waiters. ----
+    let this_now = ctx.read_native_pin(roots_base, this);
+    let commit: Result<Value, MethodCallFailed> = match chm_segment_for(ctx, this_now, hash) {
+        None => Ok(Value::Object(None)),
+        Some(seg3) => {
+            let seg_pin = ctx.pin_native_root(seg3);
+            let entered = ctx.monitor_enter_gc_safe(seg3);
+            let mut segc = ctx.read_native_pin(seg_pin, entered);
+            let mut result: Result<Value, MethodCallFailed> = Ok(Value::Object(None));
+            let key_now = read_pinned_elem(ctx, key_pin, key);
+            let cur = {
+                let _resize_flag = ChmResizeLockGuard::enter();
+                native_map_get(ctx, &[Value::Object(Some(segc)), key_now])
+            };
+            segc = ctx.read_native_pin(seg_pin, segc);
+            match cur {
+                Err(e) => result = Err(e),
+                Ok(cur) => {
+                    let ours = matches!(
+                        cur,
+                        Some(Value::Object(Some(v))) if std::ptr::eq(v.as_ptr(), segc.as_ptr())
+                    );
+                    if ours {
+                        let mv = read_pinned_elem(ctx, mapped_pin, mapped_val);
+                        let key_now = read_pinned_elem(ctx, key_pin, key);
+                        let _resize_flag = ChmResizeLockGuard::enter();
+                        if mapped.is_ok() && !matches!(mv, Value::Object(None)) {
+                            match native_map_put(ctx, &[Value::Object(Some(segc)), key_now, mv]) {
+                                Ok(_) => result = Ok(mv),
+                                Err(e) => result = Err(e),
+                            }
+                        } else {
+                            match native_map_remove(ctx, &[Value::Object(Some(segc)), key_now]) {
+                                Ok(_) => result = Ok(Value::Object(None)),
+                                Err(e) => result = Err(e),
+                            }
+                        }
+                        segc = ctx.read_native_pin(seg_pin, segc);
+                    } else {
+                        // A racing mutator replaced our marker \-- its state
+                        // wins; surface whatever the map now holds.
+                        result = Ok(match cur {
+                            Some(v) => v,
+                            None => Value::Object(None),
+                        });
+                    }
+                }
+            }
+            let _ = ctx.monitor_notify_all(segc);
+            ctx.monitor_exit(segc);
+            ctx.unpin_native_roots(seg_pin);
+            result
+        }
+    };
+    match mapped {
+        Err(e) => Err(e),
+        Ok(_) => commit.map(Some),
+    }
+}
+
 fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -35441,24 +35735,9 @@ fn native_chm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             let key_now = read_pinned_elem(ctx, key_pin, key);
             match chm_seg_get(ctx, seg, key_now)? {
                 Some(existing) if !matches!(existing, Value::Object(None)) => Ok(Some(existing)),
-                _ => {
-                    let this = ctx.read_native_pin(roots_base, this);
-                    match chm_segment_for(ctx, this, hash) {
-                        Some(seg) => {
-                            let _resize_flag = ChmResizeLockGuard::enter();
-                            // GC-pausable contended wait — re-read the pinned
-                            // locals AFTER acquiring (see `acquire_gc_safe`).
-                            let (_guard, seg) = ChmMonitorGuard::acquire_gc_safe(ctx, seg);
-                            let key = read_pinned_elem(ctx, key_pin, key);
-                            let func = read_pinned_elem(ctx, func_pin, func);
-                            native_map_compute_if_absent(
-                                ctx,
-                                &[Value::Object(Some(seg)), key, func],
-                            )
-                        }
-                        None => Ok(Some(Value::Object(None))),
-                    }
-                }
+                _ => chm_compute_if_absent_absent_path(
+                    ctx, roots_base, this, hash, key_pin, key, func_pin, func,
+                ),
             }
         }
         None => Ok(Some(Value::Object(None))),

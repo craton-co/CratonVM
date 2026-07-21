@@ -12146,7 +12146,16 @@ fn native_bos_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // size 3) receiving chunks "foo","b","arb","a","z" instead of
         // "foo","bar","baz": the byte that triggered the flush skipped the
         // buffer entirely and arrived as its own 1-byte write.
-        native_bos_flush(ctx, args)?;
+        //
+        // GC SAFETY: `this` must be pinned across `native_bos_flush`, which
+        // invokes arbitrary overridable `OutputStream.write()` bytecode that
+        // can trigger a GC and move `this` (see native_bos_flush_locked for
+        // the full writeup of this hazard class).
+        let this_pin = ctx.pin_native_root(this);
+        let flush_result = native_bos_flush(ctx, args);
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        flush_result?;
         // Re-read `buf` after the flush's invoke_virtual rather than holding
         // the array oop across it (same stale-native-local discipline as
         // native_bos_flush_locked); flush reset `count` to 0.
@@ -12168,7 +12177,7 @@ fn native_bos_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
+    let mut this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
@@ -12204,7 +12213,16 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if len >= buf_len {
         // At least as large as the buffer: flush pending bytes, then hand the
         // caller's array to the inner stream as a single bulk write.
-        native_bos_flush(ctx, args)?;
+        //
+        // GC SAFETY: `this` must be pinned across `native_bos_flush`, which
+        // invokes arbitrary overridable `OutputStream.write()` bytecode that
+        // can trigger a GC and move `this` (see native_bos_flush_locked for
+        // the full writeup of this hazard class).
+        let this_pin = ctx.pin_native_root(this);
+        let flush_result = native_bos_flush(ctx, args);
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        flush_result?;
         let inner = match ctx.get_field(this, out_slot) {
             Value::Object(Some(o)) => o,
             _ => return Ok(None),
@@ -12227,7 +12245,16 @@ fn native_bos_write_bulk_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     if len > buf_len.saturating_sub(count) {
         // Not enough room: flush first (resets count to 0), then buffer.
-        native_bos_flush(ctx, args)?;
+        //
+        // GC SAFETY: pin `this` across `native_bos_flush` (see
+        // native_bos_flush_locked for the full writeup of this hazard
+        // class); the refreshed `this` must persist past this block since
+        // `buf`/`count_slot` below are re-derived from it.
+        let this_pin = ctx.pin_native_root(this);
+        let flush_result = native_bos_flush(ctx, args);
+        this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        flush_result?;
         count = 0;
     }
     // Re-read `buf` after any flush rather than holding the array oop across
@@ -12287,10 +12314,9 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // to the invoke (rooted for its duration regardless of when `count`
         // is reset), so moving the reset after the call does not reintroduce
         // the stale-native-local hazard the original comment was guarding
-        // against — nothing is read back from `this`/`buf`/`inner` after the
-        // invoke either way. This is a real, independently-justified fix
-        // (verified via 2 full WildFly domain-boot runs: no regression, same
-        // subsequent behavior otherwise) — NOTE it was found while
+        // against for `buf`/`inner`. This is a real, independently-justified
+        // fix (verified via 2 full WildFly domain-boot runs: no regression,
+        // same subsequent behavior otherwise) — NOTE it was found while
         // investigating `docs/known-issues/wildfly-domain-heap-corrupt-value-timeout.md`'s
         // WFLYHC0053 blocker, but is NOT that bug's root cause: the observed
         // byte value (152) that looked like corruption on first read is
@@ -12299,12 +12325,32 @@ fn native_bos_flush_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `lookupswitch` on 152/153), not a corrupted opcode — see that
         // doc's own write-up for the corrected mechanism and what's still
         // open.
-        ctx.invoke_virtual(
+        //
+        // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
+        // investigation): the claim above that "nothing is read back from
+        // `this`" after the invoke was wrong — `this` IS read back, right
+        // below, via `set_field`. `this` is held as a raw, unpinned native
+        // local across `inner.write()`, which is arbitrary overridable Java
+        // bytecode (any `OutputStream` subclass, e.g. Tomcat's socket
+        // stream) that can allocate and trigger a GC. A GC landing during
+        // that call moves `this`; the stale address then makes the
+        // `set_field` below silently corrupt whatever object now occupies
+        // it (a guarded OOB drop — observed landing on a fresh zero-field
+        // `java/lang/Object`) instead of resetting the real buffer's
+        // `count`, permanently desyncing this stream's byte accounting.
+        // Same class of bug as the `native_map_put`/`native_map_remove_pinned`
+        // GC hazard: pin `this` across the call and re-derive it from the
+        // pin afterward.
+        let this_pin = ctx.pin_native_root(this);
+        let write_result = ctx.invoke_virtual(
             inner,
             "write",
             "([BII)V",
             &[Value::Object(Some(buf)), Value::Int(0), Value::Int(count)],
-        )?;
+        );
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
+        write_result?;
         ctx.set_field(this, count_slot, Value::Int(0));
     }
     Ok(None)

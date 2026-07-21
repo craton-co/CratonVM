@@ -515,6 +515,21 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
 fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
+    // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
+    // cluster.md Bug B investigation): logs every call's receiver class and
+    // whether the loader-identity recovery path below (see the 2026-07-20
+    // comment further down, fixed once in 65d738bb5 for a different symptom)
+    // actually runs, vs. the bytecode constructor already having set the field.
+    // Ruled OUT as Bug B's cause: all 159 calls observed in that investigation
+    // showed fast_path=true, so the recovery path never even ran.
+    if std::env::var_os("CRATONVM_DBG_GOCBF").is_some() {
+        let rcid = ctx.class_id_of_object(receiver);
+        let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
+        eprintln!(
+            "[CRATONVM_DBG_GOCBF] receiver={:?} class={} fast_path={} current={:?}",
+            receiver, rname, matches!(current, Value::Object(Some(_))), current
+        );
+    }
     if let Value::Object(Some(bf)) = current {
         return bf;
     }
@@ -529,25 +544,62 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
     // If that also fails (e.g. its own <clinit> cascade NPEs), fall back to a
     // synthetic allocation so that downstream GETFIELD/PUTFIELD on the DLBF
     // still work (they're also overridden natively below).
-    let bf = (|| -> Option<ObjectRef> {
-        let obj = match ctx.new_object(DLBF) {
-            Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
-        };
-        // GC-safety: the `<init>` invocation can itself allocate; pin `obj`
-        // and re-read the forwarded reference before returning it.
-        let obj_pin = ctx.pin_native_root(obj);
-        // Invoke DefaultListableBeanFactory() no-arg constructor.
-        ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))])
-            .ok()?;
-        let obj = ctx.read_native_pin(obj_pin, obj);
-        ctx.unpin_native_roots(obj_pin);
-        Some(obj)
-    })()
-    .unwrap_or_else(|| {
-        // Fallback: synthetic allocation with generous field count.
-        crate::alloc_concurrent_synthetic(ctx, DLBF, 64)
-    });
+    //
+    // Loader identity (2026-07-20, WebFluxManagementChildContextConfiguration
+    // IntegrationTests#refreshSucceedsWithoutHealth): a plain name-based
+    // `ctx.new_object(DLBF)` always resolves the class through the GLOBAL/
+    // first-loaded (typically Application-loader) definer, regardless of
+    // which loader `receiver` (the `GenericApplicationContext`) itself
+    // belongs to. Under a Spring Boot `ModifiedClassPathClassLoader`-isolated
+    // test (`@ClassPathExclusions`), `receiver`'s own class is freshly
+    // reloaded under that child loader, and so is the child loader's own
+    // copy of `ObjectProvider`/`ObjectFactory` referenced by every `@Bean`
+    // factory method's parameter descriptor — but the DLBF instance this
+    // fallback minted stayed the Application loader's copy. Its own
+    // `ObjectFactory.class == descriptor.getDependencyType() || ObjectProvider
+    // .class == ...` identity check (`DefaultListableBeanFactory.
+    // resolveDependency`) then compares the Application loader's `ObjectProvider
+    // .class` against the child loader's parameter type and never matches,
+    // so an `ObjectProvider<TomcatConnectorCustomizer>` parameter with zero
+    // matching beans (by design — the whole point of `ObjectProvider`) falls
+    // through to strict required-dependency resolution and throws
+    // `NoSuchBeanDefinitionException` instead of returning an empty provider.
+    // Resolve DLBF near `receiver`'s own class first so the constructed
+    // factory belongs to the SAME (JVMS §5.3 defining-loader, name) identity
+    // as the rest of the isolated class graph.
+    let receiver_cid = ctx.class_id_of_object(receiver);
+    let dlbf_cid = ctx.class_id_by_name_near(DLBF, receiver_cid);
+    let bf = dlbf_cid
+        .and_then(|cid| {
+            ctx.new_object_initialized_with_class_id(cid, "()V", &[])
+                .ok()
+                .flatten()
+                .and_then(|v| match v {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                })
+        })
+        .or_else(|| {
+            (|| -> Option<ObjectRef> {
+                let obj = match ctx.new_object(DLBF) {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    _ => return None,
+                };
+                // GC-safety: the `<init>` invocation can itself allocate; pin `obj`
+                // and re-read the forwarded reference before returning it.
+                let obj_pin = ctx.pin_native_root(obj);
+                // Invoke DefaultListableBeanFactory() no-arg constructor.
+                ctx.invoke(DLBF, "<init>", "()V", &[Value::Object(Some(obj))])
+                    .ok()?;
+                let obj = ctx.read_native_pin(obj_pin, obj);
+                ctx.unpin_native_roots(obj_pin);
+                Some(obj)
+            })()
+        })
+        .unwrap_or_else(|| {
+            // Fallback: synthetic allocation with generous field count.
+            crate::alloc_concurrent_synthetic(ctx, DLBF, 64)
+        });
     let receiver = ctx.read_native_pin(receiver_pin, receiver);
     ctx.unpin_native_roots(receiver_pin);
 
@@ -1219,6 +1271,78 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "resolveBeanClass",
         "(Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         m3_abstract_bean_definition_resolve_bean_class,
+    );
+
+    // Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+    // IntegrationTests#refreshSucceedsWithoutHealth): `AbstractBeanDefinition.
+    // setBeanClass(Class)` is the common tail of EVERY bean-registration path
+    // that already holds a resolved `Class` object — including `Enable
+    // ConfigurationPropertiesRegistrar` → `ConfigurationPropertiesBeanRegistrar
+    // .createBeanDefinition` → `new AnnotatedGenericBeanDefinition(type)`, where
+    // `type` comes from `MergedAnnotation.getClassArray(...)` reading `@Enable
+    // ConfigurationProperties(ServerProperties.class)`'s value off a CACHED,
+    // already-materialised `TypeMappedAnnotation`. Root-caused via a stack-trace
+    // capture at this exact call site (confirmed the caller chain: `Enable
+    // ConfigurationPropertiesRegistrar.registerBeanDefinitions` → `Configuration
+    // PropertiesBeanRegistrar.{register,createBeanDefinition}` →
+    // `AnnotatedGenericBeanDefinition.<init>`).
+    //
+    // Under a Spring Boot `ModifiedClassPathClassLoader`-isolated test
+    // (`@ClassPathExclusions`), that materialised value can carry the
+    // Application-loader's copy of a class even though every OTHER read of the
+    // same annotation attribute (a fresh `Class.getDeclaredAnnotations()` call,
+    // traced separately) correctly resolves through `container_loader` to the
+    // isolated loader's own copy — some earlier, cached materialisation of the
+    // SAME `@EnableConfigurationProperties` instance apparently won. The two
+    // Class objects share a name but not an identity: the bean instantiated
+    // from this (wrong) `Class` later fails `Method.invoke`'s reflective
+    // argument-assignability check against a factory-method parameter type that
+    // WAS correctly resolved via `container_loader`, throwing
+    // `IllegalArgumentException("argument type mismatch")` at a completely
+    // unrelated call site.
+    //
+    // Fix: when the incoming `Class` belongs to no recorded user-defined loader
+    // (i.e. it resolved through the global/Application path) AND the CURRENT
+    // THREAD's context classloader is a user-defined loader — the isolated
+    // loader for the whole duration of a `ModifiedClassPathClassLoader`-forked
+    // test — prefer that loader's OWN copy of the same class name, mirroring
+    // the identical `resolve_class_id_via_tccl` pattern already applied to
+    // `resolve_bean_class_field`'s string-resolution fallback. A loader-owned
+    // `Class` (the overwhelmingly common case outside isolated-loader tests) is
+    // untouched — `resolve_class_id_via_tccl` only returns `Some` when the TCCL
+    // is genuinely user-defined and actually resolves the name, so this can
+    // only ever correct a loader-blind resolution, never override a
+    // legitimately-loader-owned one.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "setBeanClass",
+        "(Ljava/lang/Class;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let mut cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            if let Some(c) = cls {
+                if let Some(cid) = ctx.class_id_from_mirror(c) {
+                    if crate::classloader::defining_loader_for(cid.as_u32()).is_none() {
+                        if let Some(name) = ctx.class_name_of_id(cid) {
+                            if let Some(better_cid) = resolve_class_id_via_tccl(ctx, &name) {
+                                if better_cid != cid {
+                                    let mirror = ctx.get_class_mirror(better_cid);
+                                    cls = Some(mirror);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.set_field_by_name(this, "beanClass", Value::Object(cls));
+            Ok(None)
+        },
     );
 
     // sportme: the actual throw site is `AbstractBeanDefinition.getBeanClass()`,
@@ -2761,6 +2885,74 @@ enum BeanClassResolution {
     Placeholder,
 }
 
+/// Resolve `internal` through the CURRENT THREAD's context classloader when
+/// it is a user-defined (non-bootstrap/platform/app) loader, mirroring what
+/// real `ClassUtils.forName(name, beanClassLoader)` /
+/// `ClassUtils.getDefaultClassLoader()` would do when a bean factory's own
+/// `beanClassLoader` isn't explicitly threaded down to this native shim.
+///
+/// Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+/// IntegrationTests#refreshSucceedsWithoutHealth): `resolve_bean_class_field`
+/// (below) reads a `RootBeanDefinition`'s `beanClass` field, which can still
+/// be a bare `String` (not yet cached as a `Class` mirror) the first time
+/// this shim runs on it. The plain `ctx.class_id_by_name`/`ensure_class_
+/// initialized` global lookup always collapses to the FIRST-EVER loaded
+/// same-named class — under a Spring Boot `ModifiedClassPathClassLoader`-
+/// isolated test (`@ClassPathExclusions`), that's the plain Application
+/// loader's copy, not the isolated loader's own copy the surrounding test
+/// actually runs under (confirmed via `Thread.currentThread().
+/// getContextClassLoader()` being the isolated loader throughout such a
+/// test — the whole method re-runs under a swapped TCCL). A `ServerProperties`
+/// bean definition resolved this way then silently instantiates as the WRONG
+/// (Application-loader) class, one whose `Class` reference is unequal to the
+/// isolated loader's copy read everywhere else (annotation-driven `@Bean`
+/// factory-method parameter types, `ObjectProvider` identity checks, etc.) —
+/// surfacing much later as `IllegalArgumentException("argument type
+/// mismatch")` at a completely unrelated reflective `Method.invoke` site.
+/// Try the TCCL first, same as the real JDK/Spring default-classloader
+/// convention, before falling back to the global table.
+fn resolve_class_id_via_tccl(
+    ctx: &mut dyn NativeContext,
+    internal: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let tcl = ctx
+        .invoke(
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            &[],
+        )
+        .ok()
+        .flatten();
+    let loader = match tcl {
+        Some(Value::Object(Some(t))) => match ctx.invoke(
+            "java/lang/Thread",
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[Value::Object(Some(t))],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => l,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !crate::classloader::is_user_defined_loader(ctx, loader) {
+        return None;
+    }
+    let dotted = internal.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    let result = ctx.invoke_virtual(
+        loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    );
+    match result {
+        Ok(Some(Value::Object(Some(mirror)))) => ctx.class_id_from_mirror(mirror),
+        _ => None,
+    }
+}
+
 /// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
 /// `ClassId`, retrying with a `ClassUtils.forName`-style dot-vs-dollar
 /// nested-class fallback on failure: if the segment right after the
@@ -2774,6 +2966,9 @@ fn resolve_class_id_with_nested_retry(
     dotted: &str,
     internal: &str,
 ) -> Option<cratonvm_types::ClassId> {
+    if let Some(c) = resolve_class_id_via_tccl(ctx, internal) {
+        return Some(c);
+    }
     if let Some(c) = ctx.class_id_by_name(internal) {
         return Some(c);
     }

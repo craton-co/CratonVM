@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 use flate2::{Compress, Decompress, FlushCompress, FlushDecompress};
 
@@ -449,6 +449,77 @@ fn defl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> 
     Ok(None)
 }
 
+/// Shared compression core for all 4 `Deflater.deflate*` native overloads
+/// (bytes-bytes, bytes-buffer, buffer-bytes, buffer-buffer). Looks up the
+/// live `flate2::Compress` by `addr`, applies any pending level/strategy
+/// params, and compresses `input_data` into `output_buf`. Returns
+/// `(input_consumed, output_consumed, finished)` — `(0, 0, false)` when
+/// `addr` isn't registered (matches the pre-existing bytes-bytes behavior:
+/// a silent no-progress result rather than an error, since a caller that
+/// retries on 0 progress would otherwise spin).
+///
+/// JDK `Deflater` flush codes: 0=NO_FLUSH, 1=SYNC_FLUSH, 2=FULL_FLUSH,
+/// 4=FINISH (see `java.util.zip.Deflater.{NO,SYNC,FULL}_FLUSH` constants).
+/// Real streaming producers (e.g. Jetty's `GzipHttpOutputInterceptor`)
+/// depend on SYNC_FLUSH/FULL_FLUSH actually producing output mid-stream —
+/// previously the bytes-bytes native only ever emitted bytes on FINISH,
+/// buffering the whole body and never satisfying a caller that blocks
+/// waiting for a flush to make progress before it hands over more input.
+fn defl_do_compress(
+    addr: i64,
+    params: i32,
+    flush_code: i32,
+    input_data: &[u8],
+    output_buf: &mut [u8],
+    which: &str,
+) -> Result<(u32, u32, bool), MethodCallFailed> {
+    let flush = match flush_code {
+        1 => FlushCompress::Sync,
+        2 => FlushCompress::Full,
+        4 => FlushCompress::Finish,
+        _ => FlushCompress::None,
+    };
+
+    let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    let st = match tbl.get_mut(&addr) {
+        Some(s) => s,
+        None => {
+            if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+                eprintln!(
+                    "[DBG-DEFLATER] {which} addr={addr:#x} NOT FOUND in deflater_table (silent 0/0 return)"
+                );
+            }
+            return Ok((0, 0, false));
+        }
+    };
+
+    if st.finished {
+        // Matches real JDK: once finished, deflate() is a no-op until reset().
+        return Ok((0, 0, true));
+    }
+    if params != 0 {
+        // JDK packs params as: bit0=set, bits1..2=strategy, bits3..=level.
+        let level = flate2::Compression::new(defl_effective_level(params >> 3) as u32);
+        let _ = st.compress.set_level(level);
+    }
+
+    let total_in_before = st.compress.total_in();
+    let total_out_before = st.compress.total_out();
+    let status = st
+        .compress
+        .compress(input_data, output_buf, flush)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("Deflater compression failed: {:?}", e),
+        })?;
+    let input_consumed = (st.compress.total_in() - total_in_before) as u32;
+    let output_consumed = (st.compress.total_out() - total_out_before) as u32;
+    let finished = matches!(status, flate2::Status::StreamEnd);
+    if finished {
+        st.finished = true;
+    }
+    Ok((input_consumed, output_consumed, finished))
+}
+
 fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // this, long addr, byte[] in, int inOff, int inLen, byte[] out, int outOff, int outLen,
     // int flush, int params
@@ -467,55 +538,20 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => Vec::new(),
     };
     let mut output_buf = vec![0u8; out_len];
+    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+        eprintln!(
+            "[DBG-DEFLATER] deflateBytesBytes addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
+        );
+    }
 
-    // JDK `Deflater` flush codes: 0=NO_FLUSH, 1=SYNC_FLUSH, 2=FULL_FLUSH,
-    // 4=FINISH (see java.util.zip.Deflater.{NO,SYNC,FULL}_FLUSH constants).
-    // Real streaming producers (e.g. Jetty's GzipHttpOutputInterceptor)
-    // depend on SYNC_FLUSH/FULL_FLUSH actually producing output mid-stream —
-    // previously this native only ever emitted bytes on FINISH, buffering
-    // the whole body and never satisfying a caller that blocks waiting for
-    // a flush to make progress before it hands over more input.
-    let flush = match flush_code {
-        1 => FlushCompress::Sync,
-        2 => FlushCompress::Full,
-        4 => FlushCompress::Finish,
-        _ => FlushCompress::None,
-    };
-
-    let (input_consumed, output_consumed, finished) = {
-        let mut tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
-        let st = match tbl.get_mut(&addr) {
-            Some(s) => s,
-            None => return Ok(Some(Value::Long(0))),
-        };
-
-        if st.finished {
-            // Matches real JDK: once finished, deflate() is a no-op until reset().
-            (0u32, 0u32, true)
-        } else {
-            if params != 0 {
-                // JDK packs params as: bit0=set, bits1..2=strategy, bits3..=level.
-                let level = flate2::Compression::new(defl_effective_level(params >> 3) as u32);
-                let _ = st.compress.set_level(level);
-            }
-
-            let total_in_before = st.compress.total_in();
-            let total_out_before = st.compress.total_out();
-            let status = st
-                .compress
-                .compress(&input_data, &mut output_buf, flush)
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("Deflater compression failed: {:?}", e),
-                })?;
-            let input_consumed = (st.compress.total_in() - total_in_before) as u32;
-            let output_consumed = (st.compress.total_out() - total_out_before) as u32;
-            let finished = matches!(status, flate2::Status::StreamEnd);
-            if finished {
-                st.finished = true;
-            }
-            (input_consumed, output_consumed, finished)
-        }
-    };
+    let (input_consumed, output_consumed, finished) = defl_do_compress(
+        addr,
+        params,
+        flush_code,
+        &input_data,
+        &mut output_buf,
+        "deflateBytesBytes",
+    )?;
 
     if let Some(a) = output_arr {
         if output_consumed > 0 {
@@ -530,31 +566,168 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ))))
 }
 
-fn defl_direct_buffer_unsupported(which: &str) -> MethodCallResult {
-    Err(RuntimeError::NotImplemented {
-        feature: format!(
-            "Deflater.{which}: direct-ByteBuffer deflate is not supported \
-             (this VM has no raw-memory view of direct buffers); use an \
-             array-backed Deflater path"
-        ),
+/// `Deflater.deflateBytesBuffer(long addr, byte[] in, int inOff, int inLen,
+/// long outputAddr, int outLen, int flush, int params) -> long`. Input is a
+/// heap `byte[]`; output is a direct `ByteBuffer` — the JDK bytecode wrapper
+/// already resolved it to its native address before calling this native
+/// (`Buffer.address`, read the same way other native-buffer call sites in
+/// this codebase do via `NativeContext::copy_to_native_memory`). Was
+/// previously "not supported" (threw `NotImplemented`), which silently
+/// truncated every gzip/deflate response written through a direct output
+/// buffer to just its 10-byte gzip header — see
+/// docs/known-issues/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md
+/// (the `compressionOfResponseToGetRequest` residual: Jetty's
+/// `GzipHttpOutputInterceptor` calls exactly this overload).
+fn defl_deflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 1);
+    let input_arr = arg_obj(args, 2);
+    let in_off = arg_int(args, 3).max(0) as usize;
+    let in_len = arg_int(args, 4).max(0) as usize;
+    let output_addr = arg_long(args, 5);
+    let out_len = arg_int(args, 6).max(0) as usize;
+    let flush_code = arg_int(args, 7);
+    let params = arg_int(args, 8);
+
+    let input_data = match input_arr {
+        Some(a) => read_byte_array(ctx, a, in_off, in_len),
+        None => Vec::new(),
+    };
+    let mut output_buf = vec![0u8; out_len];
+    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+        eprintln!(
+            "[DBG-DEFLATER] deflateBytesBuffer addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
+        );
     }
-    .into())
+
+    let (input_consumed, output_consumed, finished) = defl_do_compress(
+        addr,
+        params,
+        flush_code,
+        &input_data,
+        &mut output_buf,
+        "deflateBytesBuffer",
+    )?;
+
+    if output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    {
+        return Err(RuntimeError::IOException {
+            message: format!("deflateBytesBuffer: invalid output buffer address {output_addr:#x}"),
+        }
+        .into());
+    }
+
+    Ok(Some(Value::Long(pack_deflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+    ))))
 }
 
-fn defl_deflate_bytes_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // input: byte[], output: direct ByteBuffer. Cannot write the direct output
-    // buffer, so returning packed zero would make Java retry forever.
-    defl_direct_buffer_unsupported("deflateBytesBuffer")
+/// `Deflater.deflateBufferBytes(long addr, long inputAddr, int inLen, byte[]
+/// out, int outOff, int outLen, int flush, int params) -> long`. Mirror of
+/// `deflateBytesBuffer` with input/output swapped: input is a direct
+/// `ByteBuffer` (already resolved to its native address), output a heap
+/// `byte[]`.
+fn defl_deflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 1);
+    let input_addr = arg_long(args, 2);
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let output_arr = arg_obj(args, 4);
+    let out_off = arg_int(args, 5).max(0) as usize;
+    let out_len = arg_int(args, 6).max(0) as usize;
+    let flush_code = arg_int(args, 7);
+    let params = arg_int(args, 8);
+
+    let mut input_data = vec![0u8; in_len];
+    if in_len > 0 && !ctx.copy_from_native_memory(input_addr, &mut input_data) {
+        return Err(RuntimeError::IOException {
+            message: format!("deflateBufferBytes: invalid input buffer address {input_addr:#x}"),
+        }
+        .into());
+    }
+    let mut output_buf = vec![0u8; out_len];
+    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+        eprintln!(
+            "[DBG-DEFLATER] deflateBufferBytes addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
+        );
+    }
+
+    let (input_consumed, output_consumed, finished) = defl_do_compress(
+        addr,
+        params,
+        flush_code,
+        &input_data,
+        &mut output_buf,
+        "deflateBufferBytes",
+    )?;
+
+    if let Some(a) = output_arr {
+        if output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        }
+    }
+
+    Ok(Some(Value::Long(pack_deflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+    ))))
 }
 
-fn defl_deflate_buffer_bytes(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // input: direct ByteBuffer, output: byte[]. Cannot read the direct input.
-    defl_direct_buffer_unsupported("deflateBufferBytes")
-}
+/// `Deflater.deflateBufferBuffer(long addr, long inputAddr, int inLen, long
+/// outputAddr, int outLen, int flush, int params) -> long`. Both input and
+/// output are direct `ByteBuffer`s (already resolved to native addresses) —
+/// the exact overload Jetty's `GzipHttpOutputInterceptor` calls when both
+/// its scratch input and the pooled network output buffer are direct (the
+/// common case for a real NIO connector). See `defl_deflate_bytes_buffer`'s
+/// doc comment for the bug this fixes.
+fn defl_deflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 1);
+    let input_addr = arg_long(args, 2);
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let output_addr = arg_long(args, 4);
+    let out_len = arg_int(args, 5).max(0) as usize;
+    let flush_code = arg_int(args, 6);
+    let params = arg_int(args, 7);
 
-fn defl_deflate_buffer_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Both sides are direct ByteBuffers.
-    defl_direct_buffer_unsupported("deflateBufferBuffer")
+    let mut input_data = vec![0u8; in_len];
+    if in_len > 0 && !ctx.copy_from_native_memory(input_addr, &mut input_data) {
+        return Err(RuntimeError::IOException {
+            message: format!("deflateBufferBuffer: invalid input buffer address {input_addr:#x}"),
+        }
+        .into());
+    }
+    let mut output_buf = vec![0u8; out_len];
+    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+        eprintln!(
+            "[DBG-DEFLATER] deflateBufferBuffer addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
+        );
+    }
+
+    let (input_consumed, output_consumed, finished) = defl_do_compress(
+        addr,
+        params,
+        flush_code,
+        &input_data,
+        &mut output_buf,
+        "deflateBufferBuffer",
+    )?;
+
+    if output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    {
+        return Err(RuntimeError::IOException {
+            message: format!("deflateBufferBuffer: invalid output buffer address {output_addr:#x}"),
+        }
+        .into());
+    }
+
+    Ok(Some(Value::Long(pack_deflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+    ))))
 }
 
 fn defl_get_adler(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -659,18 +832,25 @@ fn crc32_update_bytes_0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(new_crc as i32)))
 }
 
-fn crc32_update_byte_buffer_0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn crc32_update_byte_buffer_0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // private static native int updateByteBuffer0(int crc, long addr, int off, int len)
     //
-    // Direct ByteBuffers carry a raw memory address that our VM does not back
-    // with addressable bytes — we have no way to load the payload. Return the
-    // CRC unchanged so callers see a stable (but technically wrong) checksum
-    // rather than an UnsatisfiedLinkError. JAR loading uses the byte[] path,
-    // so this branch is exercised only by user code that explicitly hands a
-    // direct buffer to CRC32.update(ByteBuffer).
-    let crc = arg_int(args, 0);
-    let _ = args;
-    Ok(Some(Value::Int(crc)))
+    // `addr` is the direct buffer's resolved native base address (the caller
+    // already extracted it via ((DirectBuffer) buf).address()); `off`/`len`
+    // select the region to checksum, matching the byte[] overload's contract.
+    let crc = arg_int(args, 0) as u32;
+    let addr = arg_long(args, 1);
+    let off = arg_int(args, 2) as i64;
+    let len = arg_int(args, 3).max(0) as usize;
+    let mut bytes = vec![0u8; len];
+    if len > 0 && !ctx.copy_from_native_memory(addr + off, &mut bytes) {
+        return Err(RuntimeError::IOException {
+            message: "CRC32.updateByteBuffer0: failed to read native buffer memory".to_string(),
+        }
+        .into());
+    }
+    let new_crc = crc32_update_public(crc, &bytes);
+    Ok(Some(Value::Int(new_crc as i32)))
 }
 
 // ---------------------------------------------------------------------------
@@ -792,16 +972,147 @@ mod tests {
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 
-    fn assert_direct_deflate_unsupported(result: MethodCallResult) {
-        match result {
-            Err(cratonvm_types::error::MethodCallFailed::InternalError(
-                cratonvm_types::error::VmError::Runtime(RuntimeError::NotImplemented { feature }),
-            )) => assert!(
-                feature.contains("direct-ByteBuffer deflate"),
-                "unexpected NotImplemented feature text: {feature}"
-            ),
-            other => panic!("expected direct deflate NotImplemented error, got {other:?}"),
+    /// Unpacks a `Deflater.deflate*` result long into
+    /// `(inputConsumed, outputConsumed, finished)`.
+    fn unpack_deflate_result(packed: i64) -> (usize, usize, bool) {
+        let p = packed as u64;
+        (
+            (p & 0x7FFF_FFFF) as usize,
+            ((p >> 31) & 0x7FFF_FFFF) as usize,
+            (p >> 62) & 1 == 1,
+        )
+    }
+
+    fn assert_decompresses_to(compressed: &[u8], original: &[u8]) {
+        let mut decomp = Decompress::new(false);
+        let mut out = vec![0u8; 1024];
+        let status = decomp
+            .decompress(compressed, &mut out, FlushDecompress::Finish)
+            .expect("decompress ok");
+        let produced = decomp.total_out() as usize;
+        assert_eq!(&out[..produced], original);
+        assert!(matches!(status, flate2::Status::StreamEnd));
+    }
+
+    fn new_deflater(ctx: &mut dyn NativeContext) -> i64 {
+        match defl_init(ctx, &[Value::Int(6), Value::Int(0), Value::Int(1)])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(a) => a,
+            other => panic!("expected Long handle, got {other:?}"),
         }
+    }
+
+    /// Regression guard for the direct-ByteBuffer `Deflater.deflate*`
+    /// overloads (`deflateBytesBuffer`/`deflateBufferBytes`/
+    /// `deflateBufferBuffer`): these used to throw `NotImplemented`, then
+    /// were implemented for real (see `defl_deflate_bytes_buffer`'s doc
+    /// comment for the Jetty `GzipHttpOutputInterceptor` bug this fixed).
+    /// Exercise all three overloads end-to-end and confirm the compressed
+    /// output actually decompresses back to the original input, rather than
+    /// just checking that *some* non-error long comes back.
+    #[test]
+    fn direct_buffer_deflate_paths_produce_correct_output() {
+        let mut ctx = mock_ctx();
+        let original = b"hello hello hello hello hello world world world";
+
+        // deflateBytesBuffer: heap byte[] input, direct ByteBuffer output.
+        let addr = new_deflater(&mut ctx);
+        let input_arr = ctx.new_array(ArrayElementType::Byte, original.len());
+        for (i, b) in original.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i32));
+        }
+        let mut output_buf = vec![0u8; 1024];
+        let output_addr = output_buf.as_mut_ptr() as i64;
+        let packed = match defl_deflate_bytes_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(original.len() as i32),
+                Value::Long(output_addr),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBytesBuffer produced no output");
+        assert!(finished, "deflateBytesBuffer must report finished on FINISH");
+        assert_decompresses_to(&output_buf[..output_consumed], original);
+
+        // deflateBufferBytes: direct ByteBuffer input, heap byte[] output.
+        let addr = new_deflater(&mut ctx);
+        let mut input_buf = original.to_vec();
+        let input_addr = input_buf.as_mut_ptr() as i64;
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 1024);
+        let packed = match defl_deflate_buffer_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input_addr),
+                Value::Int(original.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBufferBytes produced no output");
+        assert!(finished, "deflateBufferBytes must report finished on FINISH");
+        let compressed = read_byte_array(&ctx, output_arr, 0, output_consumed);
+        assert_decompresses_to(&compressed, original);
+
+        // deflateBufferBuffer: both input and output are direct ByteBuffers.
+        let addr = new_deflater(&mut ctx);
+        let mut input_buf = original.to_vec();
+        let input_addr = input_buf.as_mut_ptr() as i64;
+        let mut output_buf = vec![0u8; 1024];
+        let output_addr = output_buf.as_mut_ptr() as i64;
+        let packed = match defl_deflate_buffer_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input_addr),
+                Value::Int(original.len() as i32),
+                Value::Long(output_addr),
+                Value::Int(1024),
+                Value::Int(4), // FINISH
+                Value::Int(0),
+            ],
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Value::Long(p) => p,
+            other => panic!("expected Long, got {other:?}"),
+        };
+        let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
+        assert_eq!(input_consumed, original.len());
+        assert!(output_consumed > 0, "deflateBufferBuffer produced no output");
+        assert!(finished, "deflateBufferBuffer must report finished on FINISH");
+        assert_decompresses_to(&output_buf[..output_consumed], original);
     }
 
     #[test]
@@ -840,14 +1151,6 @@ mod tests {
         // "abc" — CRC-32/IEEE = 0x352441C2.
         let running = crc32_step(0xFFFF_FFFF, b"abc");
         assert_eq!(!running, 0x3524_41C2);
-    }
-
-    #[test]
-    fn direct_buffer_deflate_paths_throw_instead_of_zero_progress() {
-        let mut ctx = mock_ctx();
-        assert_direct_deflate_unsupported(defl_deflate_bytes_buffer(&mut ctx, &[]));
-        assert_direct_deflate_unsupported(defl_deflate_buffer_bytes(&mut ctx, &[]));
-        assert_direct_deflate_unsupported(defl_deflate_buffer_buffer(&mut ctx, &[]));
     }
 
     /// `crc32_update_public` matches the JDK `CRC32.update*` contract:

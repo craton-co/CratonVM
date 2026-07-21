@@ -21,9 +21,9 @@ Prints `MISMATCH`/`CCE` lines and a final `REPRO: BUG REPRODUCED` /
 Exits 1 if any mismatch or `ClassCastException` was observed.
 
 Note: the key-generation loop (many distinct dynamically-defined `Class`
-objects) is itself subject to the unrelated JIT/OSR loop-duplication bug —
-see `../jit-osr-loop-duplicate-execution/`. `keys.size()` printed by this
-repro can come out LARGER than `numKeys` for large values on CratonVM with
-JIT on; that is a symptom of the OTHER bug, not this one. Pass
-`CRATONVM_JIT_OSR=0` (or keep `numKeys` under ~2000) if you need `keys.size()`
-to reliably equal `numKeys` while investigating a `Map`-specific question.
+objects) was previously ALSO subject to an unrelated JIT/OSR loop-duplication
+bug — see `docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`
+and its repro under `docs/internal/repros/jit-osr-loop-duplicate-execution/`.
+That bug is now FIXED on `dev`; `keys.size()` should equal `numKeys` again
+regardless of JIT/OSR state. If it does not on the tree you're using, you are
+likely on a pre-fix checkout.

@@ -1019,6 +1019,8 @@ impl GenerationalHeap {
                 num_slots_u32,
             );
             header.gc_flags |= compact_flag;
+            // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
+            // zeroed, 8-byte-aligned region of `total_size` bytes; writing the object header at its start is in-bounds.
             unsafe {
                 std::ptr::write(ptr as *mut ObjectHeader, header);
             }
@@ -1180,6 +1182,8 @@ impl GenerationalHeap {
                 length_u32,
                 length_u32,
             );
+            // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
+            // zeroed, 8-byte-aligned region of `total_size` bytes; writing the array header at its start is in-bounds.
             unsafe {
                 std::ptr::write(ptr as *mut ObjectHeader, header);
             }
@@ -1252,6 +1256,8 @@ impl GenerationalHeap {
                 length_u32,
                 length_u32,
             );
+            // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
+            // zeroed, 8-byte-aligned region of `total_size` bytes; writing the array header at its start is in-bounds.
             unsafe {
                 std::ptr::write(ptr as *mut ObjectHeader, header);
             }
@@ -1308,6 +1314,8 @@ impl GenerationalHeap {
                 num_slots_u32,
             );
             header.gc_flags |= compact_flag;
+            // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
+            // zeroed, 8-byte-aligned region of `total_size` bytes; writing the object header at its start is in-bounds.
             unsafe {
                 std::ptr::write(ptr as *mut ObjectHeader, header);
             }
@@ -1372,6 +1380,8 @@ impl GenerationalHeap {
                 length_u32,
                 length_u32,
             );
+            // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
+            // zeroed, 8-byte-aligned region of `total_size` bytes; writing the array header at its start is in-bounds.
             unsafe {
                 std::ptr::write(ptr as *mut ObjectHeader, header);
             }
@@ -1607,6 +1617,8 @@ impl GenerationalHeap {
             // already-panicking path, gated behind the same debug flag.
             let fwd_ptr = header.forwarding_address();
             let (fwd_class_id, fwd_kind) = if !fwd_ptr.is_null() {
+                // SAFETY: `fwd_ptr` is a non-null forwarding address (checked above) installed by evacuation,
+                // pointing at the object's live relocated header; read-only, diagnostic-only (stale-objref debug) path.
                 let fwd_header = unsafe { &*(fwd_ptr as *const ObjectHeader) };
                 (
                     fwd_header.class_id.as_u32(),
@@ -1737,8 +1749,61 @@ impl GenerationalHeap {
     }
 
     /// Get the identity hash code of a heap object.
+    ///
+    /// The JIT's inline `new` fast path (`jit/src/x64.rs`) deliberately
+    /// leaves this header field TLAB-zeroed rather than paying a mint on
+    /// every allocation, deferring to what its own comment calls a "lazy-
+    /// mint contract". This is that contract: when the stored value is 0,
+    /// mint a fresh one here and CAS it into the header so it becomes a
+    /// durable, GC-move-stable property of the object from this point on
+    /// (every mover in this file copies the header's bytes verbatim, so
+    /// once non-zero this field survives every future relocation). Without
+    /// this, callers that need a *stable* per-object key (e.g.
+    /// `native-builtins/src/keystore.rs`'s `store_id_by_identity`, or
+    /// `VarHandle` root dedup in `vm_exec.rs`) would otherwise have to
+    /// derive one from the object's current address — which silently goes
+    /// stale the moment a moving GC relocates the object. See
+    /// `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        self.get_header(obj_ref).identity_hash_code
+        let existing = self.get_header(obj_ref).identity_hash_code;
+        if existing != 0 {
+            return existing;
+        }
+        self.mint_identity_hash_code(obj_ref)
+    }
+
+    /// Lazily mint and durably install a non-zero identity hash for an
+    /// object whose header field is still 0. Safe to call concurrently:
+    /// the header field is written via a CAS from 0, so a losing racer's
+    /// mint is discarded and every caller (including the loser) converges
+    /// on the single value that actually ends up stored.
+    fn mint_identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
+        let minted = match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        };
+        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code`
+        // is a plain `i32` field at a fixed offset within `ObjectHeader` on
+        // every heap backend (see `types/src/heap_types.rs`). This is the
+        // sole writer that mutates this field post-allocation, and it only
+        // ever moves it 0 -> nonzero via CAS, so treating the field as an
+        // `AtomicI32` for this one operation cannot race with the plain
+        // (non-atomic) reads the rest of the codebase performs elsewhere: a
+        // naturally-aligned 4-byte load/store is already atomic at the ISA
+        // level, and no other writer can observe/produce a torn value. Same
+        // pragmatic accommodation this file already makes for `mark_word`
+        // (see the "Round-2 fix (T2-4)" comment on the GC-copy path above).
+        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code` is a naturally-aligned
+        // 4-byte field (full rationale in the block above), so this one CAS cannot tear or race the plain reads elsewhere.
+        unsafe {
+            let field_ptr =
+                std::ptr::addr_of_mut!((*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code);
+            let atomic = &*(field_ptr as *const AtomicI32);
+            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => minted,
+                Err(existing) => existing,
+            }
+        }
     }
 
     /// Conservative validity check for a *raw address* — used by NEW-1.5
@@ -1832,6 +1897,8 @@ impl GenerationalHeap {
         // reference. Conservative root scans can land on arbitrary arena words;
         // invalid `#[repr(u8)]` discriminants must be rejected as bytes, not
         // reached through a typed enum match.
+        // SAFETY: `raw` was confirmed inside a mapped heap region above (`in_region`), so the single-byte
+        // tag reads at the fixed `OBJECT_KIND`/`ARRAY_ELEMENT_TYPE` header offsets are in-bounds.
         let kind = unsafe { object_kind_from_tag(*raw.add(OBJECT_KIND_OFFSET)) }?;
         let _element_type =
             unsafe { array_element_type_from_tag(*raw.add(ARRAY_ELEMENT_TYPE_OFFSET)) }?;
@@ -2182,14 +2249,33 @@ impl GenerationalHeap {
             // against — widened from the original index-4/5-only guess to
             // any index once indices 0/1/3 were also observed correlating.
             if num_slots == 0 {
-                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
-                    .map(|(n, _)| n)
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                eprintln!(
-                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
-                    obj_ref.as_ptr(),
-                    std::backtrace::Backtrace::force_capture()
-                );
+                // RATE-LIMIT (2026-07-21): the WildFly real-JDK boot hits this
+                // shape on EVERY framework log line (a delegating stream whose
+                // field walk lands on a plain `Object`); an unconditional
+                // symbolized `Backtrace::force_capture()` per occurrence turned
+                // each boot into minutes of stderr spam. Keep the first few
+                // full backtraces (they carry the diagnostic value) and a
+                // count-only heartbeat afterwards.
+                static RESID_READ_DIAG_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = RESID_READ_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 || n.is_power_of_two() {
+                    let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| "<unresolved>".to_string());
+                    if n < 5 {
+                        eprintln!(
+                            "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                            obj_ref.as_ptr(),
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                    } else {
+                        eprintln!(
+                            "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p} (occurrence #{n}, backtrace suppressed)",
+                            obj_ref.as_ptr(),
+                        );
+                    }
+                }
             }
             return Value::Object(None);
         }
@@ -2203,6 +2289,8 @@ impl GenerationalHeap {
             if !is_ref {
                 return unsafe { read_slot(base) };
             }
+            // SAFETY: `base` points at the in-bounds reference slot validated above (`index < num_slots`
+            // so `off` is within the body); the 8-byte reference read there is sound.
             let v = unsafe { read_prim_element(base, 0, ArrayElementType::Reference) };
             // Unbox an AUTOBOX wrapper: a non-Object value stored into this
             // reference slot (CratonVM's synthetic collections type-pun a
@@ -2272,6 +2360,8 @@ impl GenerationalHeap {
                 // header word first so the imminent canary panic can be
                 // attributed to the STORED VALUE (vs the receiver, whose
                 // own get_header follows below).
+                // SAFETY: `v` is a non-null `ObjectRef` (matched `Object(Some(v))`), so reading its header word is
+                // sound; diagnostic-only (stale-objref debug) path.
                 let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
                 if peek.is_forwarded() {
                     eprintln!(
@@ -2408,11 +2498,22 @@ impl GenerationalHeap {
             // RESID-DIAG (dohead residuals investigation, 20260718): see the
             // matching comment in get_field's OOB guard above.
             if num_slots == 0 {
-                eprintln!(
-                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
-                    obj_ref.as_ptr(),
-                    std::backtrace::Backtrace::force_capture()
-                );
+                // RATE-LIMIT (2026-07-21): see the matching READ guard above.
+                static RESID_WRITE_DIAG_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = RESID_WRITE_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                        obj_ref.as_ptr(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                } else if n.is_power_of_two() {
+                    eprintln!(
+                        "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?} (occurrence #{n}, backtrace suppressed)",
+                        obj_ref.as_ptr(),
+                    );
+                }
             }
             return;
         }
@@ -2436,11 +2537,15 @@ impl GenerationalHeap {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
                         let wv = Value::Object(Some(wrapper));
+                        // SAFETY: `base` is the in-bounds reference slot validated above (`index < num_slots` so `off` is
+                        // within the body); writing a reference element there is sound.
                         unsafe { write_prim_element(base, 0, ArrayElementType::Reference, wv) };
                         self.write_barrier(obj_ref, wv);
                     }
                 }
             } else {
+                // SAFETY: `base` is the in-bounds primitive slot validated above (`index < num_slots` so `off` is
+                // within the body); writing the slot value there is sound.
                 unsafe { write_slot(base, value) };
                 self.write_barrier(obj_ref, value);
             }
@@ -2777,6 +2882,8 @@ impl GenerationalHeap {
         if crate::stale_objref_debug::enabled() {
             if let Value::Object(Some(v)) = value {
                 // Operand attribution — see the matching peek in `set_field`.
+                // SAFETY: `v` is a non-null `ObjectRef` (matched `Object(Some(v))`), so reading its header word is
+                // sound; diagnostic-only (stale-objref debug) path.
                 let peek = unsafe { &*(v.as_ptr() as *const ObjectHeader) };
                 if peek.is_forwarded() {
                     eprintln!(
@@ -5832,6 +5939,8 @@ impl GenerationalHeap {
                     // header — the real `ClassId(0)` container case, which
                     // parses normally below). Anomaly: unwind candidates since
                     // the last anchor and re-anchor at the next free block.
+                    // SAFETY: reads the first header word at `src`, already validated in-bounds
+                    // (`cursor < used`, from-space mapped, `>= HEADER_SIZE`) by the header deref above.
                     let word0 = unsafe { *(src as *const u64) };
                     let mut anomaly = false;
                     if word0 == 0 {
@@ -6156,6 +6265,8 @@ impl GenerationalHeap {
                                 continue;
                             }
                         }
+                        // SAFETY: reads the first header word at `obj`, already validated in-bounds
+                        // (`cursor < used`, from-space mapped, `>= HEADER_SIZE`) by the header deref above.
                         let word0 = unsafe { *(obj as *const u64) };
                         let mut anomaly = false;
                         if word0 == 0 {
@@ -6678,6 +6789,8 @@ impl GenerationalHeap {
             // free (the span may be a live-but-clobbered allocation whose
             // memory must not be double-served); skip to the next known
             // free-block anchor and resume on-grid there.
+            // SAFETY: reads the first header word at `obj_ptr` (`from_base + cursor`, `cursor < used`),
+            // already dereferenced in-bounds as a header above.
             let word0 = unsafe { *(obj_ptr as *const u64) };
             if word0 == 0 {
                 let limit = free_iter
@@ -6829,6 +6942,8 @@ impl GenerationalHeap {
                         // If the payload points into the young arena at an aligned
                         // object boundary, read its class_id to identify the referent.
                         let referent = if in_young && (payload as usize - from_base) % 8 == 0 {
+                            // SAFETY: `payload` was checked to point into the mapped from-space semi-space at an 8-aligned
+                            // boundary (`in_young` && `% 8 == 0`); read-only diagnostic ([A2]) header read.
                             let rh = unsafe { &*(payload as *const ObjectHeader) };
                             format!(
                                 "young referent class_id={} kind={} num_slots={}",
@@ -7721,6 +7836,8 @@ impl GenerationalHeap {
                             total_size,
                         );
                     }
+                    // SAFETY: `obj_ptr`/`total_size` are exactly the (base, size) pair `walk_objects` yielded for this
+                    // now-unmarked old-gen object, so returning that span to the free list is sound.
                     unsafe { old_gen.free(obj_ptr, total_size) };
                 }
             }
@@ -7802,6 +7919,8 @@ impl GenerationalHeap {
             // Unlisted zeroed span (see the sweep walk): zero words carry no
             // old-gen refs, so re-anchor at the next free block; the
             // remainder up to the anchor is conservatively word-scanned.
+            // SAFETY: reads the first header word at `obj_ptr` (`cursor < young_from.used()`),
+            // already dereferenced in-bounds as a header above.
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
@@ -7885,6 +8004,8 @@ impl GenerationalHeap {
         // of slots runs off the mapped region (SIGSEGV). An old object whose
         // extent leaves old gen is definitionally corrupt: skip the scan.
         let total = gen_object_total_size(header);
+        // SAFETY: `total >= HEADER_SIZE` here (first disjunct is false), so `obj_ptr.add(total - 1)` is the
+        // object's last-byte address; it is only range-checked by `contains`, never dereferenced.
         if total < HEADER_SIZE || !old_gen.contains(unsafe { obj_ptr.add(total - 1) }) {
             let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
             if n < 8 {
@@ -7972,6 +8093,8 @@ impl GenerationalHeap {
                     continue;
                 }
             }
+            // SAFETY: reads the first header word at `obj_ptr` (`cursor < young_from.used()`),
+            // already dereferenced in-bounds as a header above.
             let word0 = unsafe { *(obj_ptr as *const u64) };
             let mut anomaly = false;
             if word0 == 0 {
@@ -9066,6 +9189,8 @@ impl GenerationalHeap {
                 // zeroed span is not parseable — re-anchor at the next free
                 // block instead of breaking (which would silently drop every
                 // later object from the enumeration) or striding phantoms.
+                // SAFETY: reads the first header word at `ptr` (`offset < used`),
+                // already dereferenced in-bounds as a header above.
                 let word0 = unsafe { *(ptr as *const u64) };
                 let mut anomaly = false;
                 if word0 == 0 {
@@ -9808,6 +9933,8 @@ fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, boo
 /// `obj_ptr` must point to a valid, fully-initialized object/array header whose
 /// body is in-bounds for the slot ranges implied by `header`.
 #[inline]
+// SAFETY: callers uphold the `# Safety` contract above -- `obj_ptr` points at a valid,
+// fully-initialized header whose body is in-bounds for the slot ranges implied by `header`.
 pub(crate) unsafe fn for_each_ref_slot(
     obj_ptr: *mut u8,
     header: &ObjectHeader,
@@ -9856,6 +9983,8 @@ pub(crate) unsafe fn for_each_ref_slot(
 /// Same contract as [`for_each_ref_slot`]. A returned `Some(ptr)` must be a
 /// valid heap pointer.
 #[inline]
+// SAFETY: callers uphold the `# Safety` contract above (same as `for_each_ref_slot`);
+// any returned `Some(ptr)` is a valid heap pointer.
 pub(crate) unsafe fn forward_ref_slots(
     obj_ptr: *mut u8,
     header: &ObjectHeader,
@@ -10007,13 +10136,15 @@ fn skip_free_blocks(
 #[inline]
 fn zero_run_end(base: usize, start: usize, limit: usize) -> usize {
     let mut r = start;
-    // SAFETY (caller contract): the scanned range is mapped arena memory.
+    // SAFETY: (caller contract) the scanned range is mapped arena memory.
     while r + 8 <= limit && unsafe { *((base + r) as *const u64) } == 0 {
         r += 8;
     }
     if r < limit && limit - r < 8 {
         // Sub-word tail before `limit`: absorb it only if fully zero, so a
         // run ending exactly at a free-block boundary is reported as such.
+        // SAFETY: `[r, limit)` lies within `[start, limit)`, which the caller guarantees is mapped
+        // arena memory; the single-byte reads there are in-bounds.
         let all_zero = (r..limit).all(|i| unsafe { *((base + i) as *const u8) } == 0);
         if all_zero {
             r = limit;
@@ -10096,6 +10227,8 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         // is not parseable — re-anchor at the next free block (carries no
         // mark bits to clear) instead of striding it as phantom objects and
         // writing the mark-clear byte into live-object interiors.
+        // SAFETY: reads the first header word at `obj_ptr` (`cursor < used`),
+        // already dereferenced in-bounds as a header above.
         let word0 = unsafe { *(obj_ptr as *const u64) };
         let mut anomaly = false;
         if word0 == 0 {

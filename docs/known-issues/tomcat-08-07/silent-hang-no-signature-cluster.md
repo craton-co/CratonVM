@@ -790,16 +790,40 @@ commit) is out of scope for this session — it is exactly the kind of
 "larger, separate interpreter-throughput investigation" this doc's own
 history has already deferred twice (2026-07-13, 2026-07-19 deep-dive).
 
-**Recommendation for whoever picks this up next**: (1) bisect `dev` commits
-touching `vm/src/jit/helpers.rs`'s generic JIT-to-interpreter dispatch path
-between `4c97b9671` (2026-07-19) and now to check for an unrelated
-regression, ideally on a quiet host to rule out load confound; (2) if no
-regression is found, this becomes the doc's next real target: make
-JIT-caller → interpreted/blacklisted-callee dispatch closer in cost to a
-native interpreter-to-interpreter call (e.g. caching the resolved
-virtual-dispatch target per call site even for non-compiled callees, so at
-minimum the resolution work isn't repeated on every one of a million calls)
-— a real, scoped JIT-dispatch feature, not a quick fix.
+**`CRATONVM_JIT_OSR=0` control, and why the "JIT dispatch boundary" theory
+above is probably wrong too**: another concurrent session found an unrelated
+CRITICAL bug the same day — OSR-compiled loops crossing ~2000-3000 iterations
+silently RE-EXECUTE portions of their iterations (see
+`docs/known-issues/springboot/jit-osr-loop-duplicate-execution-silent-corruption.md`).
+`doHomebrew()`'s 1,000,000-iteration loop is OSR-compiled, so this looked
+like a very plausible explanation for the slowdown — tested it directly with
+`CRATONVM_JIT_OSR=0` (disables back-edge OSR, which should force
+`doHomebrew()`'s loop to run fully interpreted, since it's invoked too few
+times to ever cross the normal whole-method hotness threshold on its own).
+Result: `home-brew: 387056ms` — statistically identical to every other
+configuration tested (349-420s range across the 3 deopt-policy fix
+iterations, the `CRATONVM_JIT_DENY` control, and now this). **Ruled out**:
+not the OSR-duplicate-execution bug. More surprisingly, this also weakens
+the "JIT-caller-to-interpreted-callee dispatch is the tax" theory: with OSR
+off, `doHomebrew()` should be running FULLY interpreted (both caller and
+callee), which took just as long as every JIT-involved variant — suggesting
+whatever's actually slow here isn't specific to any JIT/interpreter boundary
+at all, and may be a broader interpreter-throughput or host-environment
+factor unrelated to `toAbsolute()`'s own compilability.
+
+**Recommendation for whoever picks this up next**: this residual is now
+LESS understood than it looked mid-session, not more — the working theories
+(recompile-adjacent, JIT-dispatch-boundary, OSR-duplicate-execution) have
+each been tested and ruled out in turn, leaving no confirmed culprit. (1) Get
+a genuinely quiet-host measurement (this Azure box's load average swung
+5.6-17.7 within a single session) of the SAME test at the SAME commit to
+separate host-load confound from a real regression; (2) if still slow on a
+quiet host, `perf`/instruction-count profile a plain, fully-interpreted run
+(`CRATONVM_DISABLE_JIT=1`) directly against the 2026-07-19 measurement's
+conditions to find what changed in raw interpreter throughput between then
+and now — the earlier CharChunk-vs-URI A/B framing may no longer be the
+right lens if the slowdown isn't specific to `toAbsolute()`'s own code
+shape.
 
 ### Stale-pointer / OOB-field-read residual: not re-investigated this session
 

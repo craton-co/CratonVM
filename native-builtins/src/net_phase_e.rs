@@ -9451,25 +9451,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
             }
             ctx.set_field(this, 1, Value::Int(1));
-            // Per-SSLContext mTLS identity: claim the identity staged by the
-            // keystore load that fed this context's KeyManager (same thread),
-            // and attach it to this SSLContext. createSSLEngine / createSocket
-            // then use THIS context's cert+key rather than the process-global
-            // slot, so an in-process server and client don't clobber each other.
-            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
-            // Stash the actual TrustManager objects passed here (may include a
-            // revocation-aware PKIXRevocationChecker attached by
-            // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
-            // X509TrustManager). rustls's own verifier only checks the
-            // certificate chain against a trust anchor — it never consults
-            // these — so without this, custom/OCSP/CRL trust managers are
-            // silently never invoked. Consulted post-handshake by
-            // `t27_tls::engine_run_trust_check`.
-            let tms_arr = match args.get(2) {
-                Some(Value::Object(Some(a))) => Some(*a),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
             // Stash the actual KeyManager objects too (may include a test
             // wrapper like Tomcat's `TrackingKeyManager`). rustls's own
             // client-cert path otherwise only ever presents one fixed
@@ -9483,6 +9464,32 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => Some(*a),
                 _ => None,
             };
+            // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
+            // the KeyManager[] this call actually received (immune to an
+            // intervening, unrelated SSLContext.init draining the
+            // thread-local first — see pemcertificates-clientauth-rustls-
+            // decrypterror); fall back to the thread-local "staged by the
+            // most recent KeyManagerFactory.init on this thread" mechanism
+            // when the KeyManager objects don't carry a recognizable id (e.g.
+            // a test wrapper). createSSLEngine / createSocket then use THIS
+            // context's cert+key rather than the process-global slot, so an
+            // in-process server and client don't clobber each other.
+            let resolved_identity =
+                crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_arr);
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
+            // Stash the actual TrustManager objects passed here (may include a
+            // revocation-aware PKIXRevocationChecker attached by
+            // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
+            // X509TrustManager). rustls's own verifier only checks the
+            // certificate chain against a trust anchor — it never consults
+            // these — so without this, custom/OCSP/CRL trust managers are
+            // silently never invoked. Consulted post-handshake by
+            // `t27_tls::engine_run_trust_check`.
+            let tms_arr = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
             crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             Ok(None)
         },

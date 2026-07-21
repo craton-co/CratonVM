@@ -2718,6 +2718,16 @@ pub(crate) fn native_class_is_assignable_from(
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+            && (this_name.contains("ObservationRegistry") || other_name.contains("ObservationRegistry"))
+        {
+            let this_cid = mirror_class_id(ctx, this);
+            let other_cid = mirror_class_id(ctx, other);
+            eprintln!(
+                "[OBSREG-DBG] isAssignableFrom this={:?}({} cid={:?}) other={:?}({} cid={:?})",
+                this, this_name, this_cid, other, other_name, other_cid
+            );
+        }
         if this_name.starts_with('[') || other_name.starts_with('[') {
             // Build descriptors. Non-array Class mirrors get an `L...;`
             // wrap to match the array_is_assignable contract; array
@@ -9548,6 +9558,38 @@ pub(crate) fn native_class_get_constructor(
 
 // --- Class.getInterfaces / Class.getModifiers ---
 
+/// Resolve a lambda proxy's functional-interface NAME to a `ClassId`,
+/// scoped to the lambda's own host (defining/enclosing) class's loader
+/// rather than the flat global store.
+///
+/// Residual 4 follow-up (2026-07-20, docs/known-issues/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md): both
+/// `native_class_get_interfaces` and `native_class_get_generic_interfaces`
+/// used a bare `ctx.class_id_by_name(&iface_name)` here — loader-blind.
+/// Scoping `typesig_to_real_type`'s LATER resolution (inside the generic
+/// branch) closed one race, but isolated runs could still occasionally hit
+/// the original failure under heavy host contention: `getInterfaces()` is
+/// commonly called before `getGenericInterfaces()` in the same reflective
+/// walk, and *this* lookup — for the exact same interface name — was never
+/// scoped at all. Whichever of these two call sites is the FIRST thing in
+/// the whole process to touch `iface_name` decides which loader's copy gets
+/// used everywhere downstream (both mint-or-reuse via the same flat global
+/// store); under different execution timing a different one can win the
+/// race. Scoping both to the lambda's own host loader removes the race
+/// instead of just moving it.
+fn lambda_functional_interface_id_loader_aware(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    iface_name: &str,
+) -> Option<ClassId> {
+    let host_id = ctx
+        .lambda_proxy_host(class_id)
+        .and_then(|host_name| ctx.class_id_by_name(&host_name));
+    host_id
+        .and_then(|host_id| ctx.class_id_by_name_near(iface_name, host_id))
+        .or_else(|| ctx.class_id_by_name(iface_name))
+}
+
 pub(crate) fn native_class_get_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -9632,7 +9674,9 @@ pub(crate) fn native_class_get_interfaces(
     // (SAM) interface. Return `[SAM]` so reflective type/listener matching that
     // walks `getInterfaces()` finds it (matches HotSpot's `$$Lambda` class).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
-        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+        if let Some(iface_id) =
+            lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
+        {
             let mirror = ctx.get_class_mirror(iface_id);
             let elem = ctx
                 .class_id_by_name("java/lang/Class")
@@ -12937,7 +12981,9 @@ pub(crate) fn native_class_get_generic_interfaces(
     // silently skipping the advisor (Spring's `AnnotationAwareAspectJAutoProxyCreator`
     // then never proxies the lambda bean at all).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
-        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+        if let Some(iface_id) =
+            lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
+        {
             // Prefer a real `ParameterizedType` (e.g. `ApplicationContextInitializer<
             // ConfigurableApplicationContext>`) when the functional interface is
             // itself generic — reflection-based generic-argument resolvers
@@ -12957,6 +13003,37 @@ pub(crate) fn native_class_get_generic_interfaces(
                     );
                 }
                 if let Some(sig) = sig {
+                    // Residual 4 (2026-07-20, docs/known-issues/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+                    // `sig` names the lambda's OWN functional interface (e.g.
+                    // Spring AOT's `AotApplicationContextInitializer<C>`) as its
+                    // raw type — `typesig_to_real_type` must resolve that name
+                    // to a `Class` mirror, and does so through
+                    // `class_id_in_generic_scope`'s current `GENERIC_DECL_SCOPE`.
+                    // Without a scope set here, that resolution is loader-blind
+                    // and can pick up whichever copy the flat global store
+                    // already holds (observed: the Application loader's copy)
+                    // instead of the lambda's own fork loader's copy — the same
+                    // gap already fixed for the "real class" branch above (see
+                    // its own `GenericDeclScope::new` a few lines up). Scope to
+                    // the lambda's host class (its defining/enclosing class,
+                    // already correctly fork-loader-resolved by the time the
+                    // lambda exists) so the interface name resolves in the same
+                    // loader context as the lambda itself.
+                    let host_name = ctx.lambda_proxy_host(class_id);
+                    let host_id = host_name.as_deref().and_then(|n| ctx.class_id_by_name(n));
+                    if dbg_lg {
+                        eprintln!(
+                            "[LAMBDA-GENERIC] host-scope class_id={class_id:?} host_name={host_name:?} host_id={host_id:?}"
+                        );
+                    }
+                    let _gscope = host_id.map(|host_id| ctx.get_class_mirror(host_id)).map(
+                        |host_mirror| {
+                            crate::generics::GenericDeclScope::new(Value::Object(Some(
+                                host_mirror,
+                            )))
+                        },
+                    );
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
@@ -15493,12 +15570,58 @@ pub(crate) fn native_class_get_declared_classes(
         // ask the VM to load it (without initializing вЂ” `load_class` calls
         // `load_class_concurrent`, which stops before <clinit>). Failures are
         // dropped, matching HotSpot's behaviour for missing inner classes.
-        let inner_id = match ctx.class_id_by_name(inner_class) {
+        // Use `class_id_by_name_near(inner_class, class_id)` rather than a
+        // plain by-name lookup: a nested class sharing its outer class's
+        // simple name across two loaders (e.g. Spring's
+        // `@CompileWithForkedClassLoader` re-defining an outer AND all its
+        // nested `@Configuration` classes under a fresh forked loader,
+        // alongside the original app-loader copies) must resolve to the
+        // SAME loader's copy as `this` outer class, not whichever loader's
+        // copy happens to sit first in the global flat lookup. Otherwise
+        // `getDeclaredClasses()` on the forked outer class returns the
+        // app-loader's nested classes, splitting identity for anything
+        // downstream that reads their annotations/enum constants (e.g. a
+        // `@Conditional` enum attribute compared by `==` against a value
+        // resolved through the forked loader elsewhere).
+        let inner_id = match ctx.class_id_by_name_near(inner_class, class_id) {
             Some(id) => Some(id),
-            None => match ctx.load_class(inner_class) {
-                Ok(_) => ctx.class_id_by_name(inner_class),
-                Err(_) => None,
-            },
+            None => {
+                // Not already loaded under the outer class's own loader.
+                // Drive that loader's `loadClass` DIRECTLY (JVMS §5.4.3
+                // initiating-loader semantics) before falling back to the
+                // global loader-blind `load_class` — mirrors
+                // `drive_defining_loader_load` in `vm/src/runtime/
+                // interpreter.rs`, unavailable here (crate-boundary), so
+                // reimplemented locally against `defining_loader_for`.
+                // Without this, a nested class that the outer class's
+                // loader has never been asked to load (e.g. Spring's
+                // `@CompileWithForkedClassLoader` outer config class gets
+                // its own fresh copy via a `ldc`, but nothing ever calls
+                // `forkedLoader.loadClass("...NestedConfig")` directly)
+                // falls straight to the global lookup and silently returns
+                // the FIRST same-named class some other loader registered.
+                let driven = crate::classloader::defining_loader_for(class_id.as_u32())
+                    .and_then(|loader_obj| {
+                        let dotted = inner_class.replace('/', ".");
+                        let name_obj = ctx.create_string(&dotted);
+                        match ctx.invoke_virtual(
+                            loader_obj,
+                            "loadClass",
+                            "(Ljava/lang/String;)Ljava/lang/Class;",
+                            &[Value::Object(Some(name_obj))],
+                        ) {
+                            Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
+                            _ => None,
+                        }
+                    });
+                match driven {
+                    Some(id) => Some(id),
+                    None => match ctx.load_class(inner_class) {
+                        Ok(_) => ctx.class_id_by_name_near(inner_class, class_id),
+                        Err(_) => None,
+                    },
+                }
+            }
         };
         if let Some(inner_id) = inner_id {
             declared.push(ctx.get_class_mirror(inner_id));

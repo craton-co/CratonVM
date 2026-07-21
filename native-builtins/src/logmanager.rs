@@ -2171,12 +2171,22 @@ fn native_jul_log_record_get_message(
         return Ok(Some(Value::Object(None)));
     };
     let record_id = ctx.get_field(*record, 1).as_long().unwrap_or_default();
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): switched
+    // from the interned `ctx.create_string(&text)` to the uninterned,
+    // headroom-checked `create_string_uninterned_gc_safe` -- the correct,
+    // established choice for a native caller producing a dynamic string
+    // (see that function's own doc comment). This alone does not fully
+    // close a residual, much rarer heap-corruption symptom found while
+    // verifying it; see docs/known-issues (or the linked follow-up task) for
+    // the open investigation. Also semantically more correct regardless:
+    // `LogRecord.getMessage()` is a dynamically produced string, not a
+    // literal, so it should not participate in the intern pool.
     let message = log_record_messages()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&record_id)
         .cloned()
-        .map(|text| ctx.create_string(&text));
+        .map(|text| ctx.create_string_uninterned_gc_safe(&text));
     Ok(Some(Value::Object(message)))
 }
 
@@ -2187,6 +2197,14 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     else {
         return Ok(None);
     };
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): `logger`
+    // and `handler` are used below across several `invoke_virtual`/
+    // `alloc_concurrent_synthetic` calls (arbitrary Java bytecode and heap
+    // allocation, both GC-capable) without ever being pinned -- same hazard
+    // class as the three JUL sibling functions already fixed. Pin both up
+    // front and re-derive them after every GC-capable call.
+    let logger_pin = ctx.pin_native_root(*logger);
+    let handler_pin = ctx.pin_native_root(*handler);
     let name = read_jul_logger_name(ctx, *logger);
     let is_root = name.is_empty();
     let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
@@ -2194,6 +2212,7 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
         handlers.push(handler.as_ptr() as u64);
     }
+    drop(all);
     if is_root && tomcat_classloader_log_manager_requested(ctx) {
         let loader_key = tomcat_context_loader_key(ctx);
         let mut roots = tomcat_juli_root_handler_registry()
@@ -2204,45 +2223,53 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
             entries.push(handler.as_ptr() as u64);
         }
     }
+    let logger = ctx.read_native_pin(logger_pin, *logger);
+    let handler = ctx.read_native_pin(handler_pin, *handler);
     // The compatibility map above is name-keyed for legacy synthetic JUL
     // callers. JULI must additionally retain handlers by logger identity:
     // two webapps may both configure the root logger named "" but with
     // independent FileHandlers. The delivery bridge consumes this side table.
-    let side_list = match crate::jul_logger_handlers_get(ctx, *logger) {
+    let side_list = match crate::jul_logger_handlers_get(ctx, logger) {
         Some(list) => list,
         None => {
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
             cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-            crate::jul_logger_handlers_set(ctx, *logger, list);
+            let list = ctx.read_native_pin(list_pin, list);
+            let logger = ctx.read_native_pin(logger_pin, logger);
+            crate::jul_logger_handlers_set(ctx, logger, list);
             list
         }
     };
+    let side_list_pin = ctx.pin_native_root(side_list);
     let size = match ctx.invoke_virtual(side_list, "size", "()I", &[])? {
         Some(Value::Int(size)) if size > 0 => size as usize,
         _ => 0,
     };
     let mut already_present = false;
     for index in 0..size {
+        let side_list = ctx.read_native_pin(side_list_pin, side_list);
+        let handler = ctx.read_native_pin(handler_pin, handler);
         if ctx.invoke_virtual(
             side_list,
             "get",
             "(I)Ljava/lang/Object;",
             &[Value::Int(index as i32)],
-        )? == Some(Value::Object(Some(*handler)))
+        )? == Some(Value::Object(Some(handler)))
         {
             already_present = true;
             break;
         }
     }
     if !already_present {
+        let side_list = ctx.read_native_pin(side_list_pin, side_list);
+        let handler = ctx.read_native_pin(handler_pin, handler);
         let _ = cratonvm_native_collections::native_al_add(
             ctx,
-            &[
-                Value::Object(Some(side_list)),
-                Value::Object(Some(*handler)),
-            ],
+            &[Value::Object(Some(side_list)), Value::Object(Some(handler))],
         )?;
     }
+    ctx.unpin_native_roots(logger_pin);
     Ok(None)
 }
 
@@ -2289,8 +2316,25 @@ fn publish_jul_handlers_src(
     let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
         return;
     };
-    // The record allocations below can move these; pin so each iteration
-    // re-reads the current addresses (native stale-local family).
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): this
+    // function is `publish_to_jul_handlers_src`'s sibling (same job, a
+    // different handler registry) and had the same unpinned-receiver-
+    // across-`invoke_virtual` hazard, but worse -- `record` and `handler`
+    // were never pinned at ALL (not even once), and `level`/`message`
+    // (this function's own parameters) were reused after the GC-capable
+    // `setMessage` call below without ever being pinned either. Caught via
+    // a hand-written `CRATONVM_DBG_GC_STRESS` repro that reliably produced
+    // heap corruption (a non-String object landing in a `List<String>`)
+    // even after the sibling function was fixed -- this function runs on
+    // every JUL log call too (`native_jul_logger_logp` calls both
+    // unconditionally) and was never touched by that earlier fix. Pin
+    // `level`/`message` up front (mirroring `publish_to_jul_handlers_src`),
+    // and pin `record`/`handler` immediately as each is obtained per
+    // iteration, refreshing every one of them from its pin before any use
+    // that follows a GC-capable call (`new_object`, `setMessage`,
+    // `publish`).
+    let level_pin = ctx.pin_native_root(level);
+    let message_pin = ctx.pin_native_root(message);
     let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
     let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
     let handlers = logger_handlers()
@@ -2307,7 +2351,13 @@ fn publish_jul_handlers_src(
         // SAFETY: handlers are strongly referenced by Java-side LogCapture for
         // the whole interval they are registered; this is the same stable-ref
         // convention used by the existing synthetic logger registry above.
+        // The reconstructed `ObjectRef` itself is still subject to the usual
+        // moving-GC staleness once any GC-capable call runs below, so pin it
+        // like every other live reference in this loop.
         let handler = unsafe { object_from_u64(addr) };
+        let handler_pin = ctx.pin_native_root(handler);
+        let level = ctx.read_native_pin(level_pin, level);
+        let message = ctx.read_native_pin(message_pin, message);
         // The real LogRecord constructor reaches private JDK state that is not
         // materialized on our compact JUL path. Handlers require the public
         // record fields, in particular `message`, so initialize that stable
@@ -2316,6 +2366,7 @@ fn publish_jul_handlers_src(
             Ok(Some(Value::Object(Some(record)))) => record,
             _ => continue,
         };
+        let record_pin = ctx.pin_native_root(record);
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
         // Real JDK LogRecord's instance layout is level, sequenceNumber,
@@ -2344,6 +2395,11 @@ fn publish_jul_handlers_src(
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(message))],
         );
+        // `setMessage` above can GC; refresh every reference touched again
+        // below before using any of them.
+        let record = ctx.read_native_pin(record_pin, record);
+        let message = ctx.read_native_pin(message_pin, message);
+        let handler = ctx.read_native_pin(handler_pin, handler);
         // sequenceNumber survives object forwarding and gives the side table a
         // stable identity across the moving collector.
         let record_id = next_log_record_id();
@@ -2363,6 +2419,7 @@ fn publish_jul_handlers_src(
                 break;
             }
         }
+        drop(messages);
         let _ = ctx.invoke_virtual(
             handler,
             "publish",
@@ -2370,11 +2427,7 @@ fn publish_jul_handlers_src(
             &[Value::Object(Some(record))],
         );
     }
-    if let Some((pin, _)) = src_cls_pin {
-        ctx.unpin_native_roots(pin);
-    } else if let Some((pin, _)) = src_mth_pin {
-        ctx.unpin_native_roots(pin);
-    }
+    ctx.unpin_native_roots(level_pin);
 }
 
 /// `java/util/logging/Logger.logp(Level, sourceClass, sourceMethod, msg)`
@@ -2417,6 +2470,39 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up, third
+    // layer of the same hazard): this function holds `this`/`level_obj`/
+    // `message_obj`/`src_cls_obj`/`src_mth_obj`/`throwable_obj` as raw,
+    // unpinned locals and passes the SAME raw values into TWO separate
+    // GC-capable helper calls in sequence (`publish_jul_handlers_src` then
+    // `publish_to_jul_handlers_src`, both of which allocate `LogRecord`s
+    // and `invoke_virtual` into arbitrary handler bytecode). Even with both
+    // of those helpers internally pinning their OWN parameters correctly
+    // (see their own GC SAFETY comments), a pin only protects the object
+    // it is given -- if the value handed in in the FIRST place is already
+    // stale (because it went unrefreshed across the first helper's
+    // GC-triggering calls), pinning it in the second helper just locks in
+    // the wrong object. Confirmed via a `CRATONVM_DBG_GC_STRESS` repro that
+    // still reproduced heap corruption with both helpers fixed. Pin every
+    // argument object up front and re-derive each one from its pin after
+    // the first `publish_jul_handlers_src` call, before it is used again.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
+    let message_pin = message_obj.map(|o| (ctx.pin_native_root(o), o));
+    let throwable_pin = throwable_obj.map(|o| (ctx.pin_native_root(o), o));
+    let src_cls_pin = src_cls_obj.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth_obj.map(|o| (ctx.pin_native_root(o), o));
+    // `pin_native_root` returns the pre-push stack index, and these six are
+    // pinned in a fixed sequential order above, so the smallest present
+    // index (the first of them that is `Some`) is the correct base for a
+    // single `unpin_native_roots` covering all of them at once.
+    let base_pin = this_pin
+        .map(|(p, _)| p)
+        .or_else(|| level_pin.map(|(p, _)| p))
+        .or_else(|| message_pin.map(|(p, _)| p))
+        .or_else(|| throwable_pin.map(|(p, _)| p))
+        .or_else(|| src_cls_pin.map(|(p, _)| p))
+        .or_else(|| src_mth_pin.map(|(p, _)| p));
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -2441,10 +2527,22 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // FINE specifically to assert a recoverable handshake underflow.
         "FINE" | "FINER" | "FINEST" => {
             publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
-            if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-                publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
+            let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let message_obj = message_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let src_cls_obj = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let src_mth_obj = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let result = if let (Some(logger), Some(level), Some(message)) =
+                (this, level_obj, message_obj)
+            {
+                publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)
+            } else {
+                Ok(None)
+            };
+            if let Some(base) = base_pin {
+                ctx.unpin_native_roots(base);
             }
-            return Ok(None);
+            return result;
         }
         other => other,
     };
@@ -2452,6 +2550,12 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
+    let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let message_obj = message_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let throwable_obj = throwable_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_cls_obj = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_mth_obj = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
@@ -2478,10 +2582,16 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
     }
-    if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj) {
-        publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)?;
+    let result = if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj)
+    {
+        publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)
+    } else {
+        Ok(None)
+    };
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
     }
-    Ok(None)
+    result
 }
 
 /// Deliver a native-intercepted JUL call to handlers added to the synthetic
@@ -2547,6 +2657,37 @@ fn publish_to_jul_handlers_src(
             Some(Value::Object(Some(record))) => record,
             _ => return Ok(None),
         };
+        // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): pin
+        // `record` immediately, before any of the field sets/invokes below.
+        // `record` used to go unpinned until just before the handler loop,
+        // well after `setMessage` (an `invoke_virtual` into real,
+        // overridable `LogRecord` bytecode that can allocate and trigger a
+        // moving GC) had already run and the subsequent `set_field(record,
+        // 1, ...)` had already used the stale, unpinned reference -- caught
+        // live via the `gen_heap` OOB-write corruption guard (backtrace
+        // through this exact `set_field(record, 1, ...)` call, `index=1`,
+        // landing on a fresh zero-field `java/lang/Object`). Same hazard
+        // class as `native_bos_flush_locked`
+        // (docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md).
+        let record_pin = ctx.pin_native_root(record);
+        // GC SAFETY (2026-07-21, JulGcStressRepro checkcast root cause): the
+        // LogRecord `<init>` native invoked by `new_object_initialized` above
+        // materializes a java/time/Instant (allocates -> can trigger a moving
+        // GC). `level`/`message` were last read from their pins BEFORE that
+        // call; if a GC fired inside the ctor it already moved the young
+        // message string AND fixed up the record's own `message` field during
+        // evacuation -- after which the raw field writes below would store the
+        // condemned from-space address right back over the corrected field.
+        // `getMessage()` is a plain field read (phases_early lr_get), so it
+        // then faithfully returns the poison: once young space is reset and
+        // reused the address reads as a zero-header object (checkcast
+        // "java.lang.Object cannot be cast to java.lang.String"), a foreign
+        // byte[], or a different, later string. Unlike `invoke_virtual`
+        // (whose entry barrier heals forwarded args), `set_field`/
+        // `set_field_by_name` are direct heap writes with no healing --
+        // re-derive both from their pins first.
+        let level = ctx.read_native_pin(level_pin, level);
+        let message = ctx.read_native_pin(message_pin, message);
         // The compact VM may not materialize the JDK's private LogRecord
         // layout through its constructor. FileHandler.isLoggable() and its
         // formatter consume the public level/message surface, so make that
@@ -2568,13 +2709,33 @@ fn publish_to_jul_handlers_src(
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(message))],
         );
+        // `setMessage` above can GC; refresh both `record` and `message`
+        // (the latter is also read again below, past the same call) before
+        // touching either again.
+        let record = ctx.read_native_pin(record_pin, record);
+        let message = ctx.read_native_pin(message_pin, message);
         let record_id = next_log_record_id();
         ctx.set_field(record, 1, Value::Long(record_id));
-        log_record_messages()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(record_id, ctx.read_string(message).unwrap_or_default());
-        let record_pin = ctx.pin_native_root(record);
+        {
+            let mut messages = log_record_messages()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            messages.insert(record_id, ctx.read_string(message).unwrap_or_default());
+            // Mirror the sibling registry's retention cap. Without it this
+            // identity-keyed delivery path -- the ONLY one that fires for a
+            // real `Logger.getLogger(...)` logger (the name-keyed sibling's
+            // lookup misses there, so its in-loop eviction never runs) --
+            // grows the process-global side table by one entry per log call,
+            // forever.
+            while messages.len() > 4096 {
+                let oldest = messages.keys().next().copied();
+                if let Some(oldest) = oldest {
+                    messages.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
         let handlers = ctx.read_native_pin(handlers_pin, handlers);
         let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
             Some(Value::Int(size)) if size > 0 => size as usize,
@@ -2603,6 +2764,12 @@ fn publish_to_jul_handlers_src(
             // FileHandler buffers output. The native publication bridge is
             // synchronous, so preserve JUL's observable completion contract
             // before the caller inspects its per-webapp log file.
+            //
+            // GC SAFETY: `publish` above is arbitrary, overridable Java
+            // bytecode that can GC; refresh `handler` from its pin before
+            // reusing it for `flush` below (same hazard class as the
+            // `record`/`message` fix above this loop).
+            let handler = ctx.read_native_pin(handler_pin, handler);
             let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
         }
         Ok(None)

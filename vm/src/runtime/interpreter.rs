@@ -4447,6 +4447,21 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_EXEC_FRAME_TRACE").is_some()
+        && method_name == "aotContributedInitializerStartsManagementContext"
+    {
+        let (cname, loader) = {
+            let cm = shared.class_manager.read();
+            (
+                cm.get_class(class_id).map(|c| c.name.to_string()),
+                cm.get_loader_id(class_id),
+            )
+        };
+        eprintln!(
+            "[EXEC-FRAME-TRACE] method={} class_id={:?} class_name={:?} loader={:?}",
+            method_name, class_id, cname, loader
+        );
+    }
     // S-bytebuddy r1 — Rust-side recursion guard.
     //
     // ByteBuddy's `JavaDispatcher.run()` performs deep reflection via
@@ -11409,9 +11424,9 @@ fn transfer_osr_exit_into_live_frame(
     }
 
     // Map reconstructed FrameValues → interpreter Values (Int / Long / Float /
-    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved /
-    // `Unsupported` → None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE
-    // any frame mutation so a reject can never half-write the frame.
+    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved →
+    // None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE any frame
+    // mutation so a reject can never half-write the frame.
     //
     // `ir_deopt_frame_values` is the 1:1 (NON-collapsing) mapper, which is exactly
     // what the in-place transfer needs: the locals snapshot is JVM-slot-indexed
@@ -11423,10 +11438,38 @@ fn transfer_osr_exit_into_live_frame(
     // `Frame::new_pooled`, uses the COLLAPSING `ir_deopt_locals` instead because
     // `copy_args_to_locals` re-expands a compact list; here there is no
     // re-expansion, so collapsing would mis-align the direct slot writes.
-    let locals = match ir_deopt_frame_values(&rframe.locals) {
-        Some(l) => l,
-        None => return bail("unmappable local"),
-    };
+    //
+    // FIX (jit-osr-loop-duplicate-execution, silent data corruption): a LOCAL
+    // slot's `FrameValue::Unsupported` must NOT reject the whole transfer the
+    // way an unmappable STACK slot does. `classify_local_kinds` (jit/src/x64.rs)
+    // is a coarse WHOLE-METHOD scan: a slot accessed as more than one JVM kind
+    // ANYWHERE in the method (e.g. an `int` loop counter whose slot is later
+    // reused, after the loop's scope ends, for an unrelated `long`) is always
+    // `Ambiguous` → `Unsupported`, at EVERY bci in that method, even ones where
+    // the reused slot provably cannot be read yet. The bytecode we're resuming
+    // already passed verification, which requires a fresh `store` before any
+    // `load` of a given logical local — so at the resume bci, an `Unsupported`
+    // slot is either genuinely dead (its old value is never read before being
+    // overwritten) or belongs to a not-yet-live disjoint reuse of the slot;
+    // either way its CURRENT value in the live frame is safe to leave in
+    // place. Previously this fell through to `bail("unmappable local")` on
+    // every method with any such slot, which discarded the whole transfer —
+    // even after the OSR'd loop had already run to completion with real,
+    // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
+    // resume from the STALE pre-OSR pc/locals, silently re-executing (and
+    // re-committing) every iteration since OSR entry. See
+    // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
+    let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
+    for v in &rframe.locals {
+        if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
+            locals.push(None);
+        } else {
+            match fv_to_value(v) {
+                Some(val) => locals.push(Some(val)),
+                None => return bail("unmappable local"),
+            }
+        }
+    }
     let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
         None => return bail("unmappable stack slot"),
@@ -11435,10 +11478,14 @@ fn transfer_osr_exit_into_live_frame(
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
     // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot,
-    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1.
+    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1. A `None` entry
+    // (an `Unsupported` source slot, see above) leaves that slot's existing live
+    // value untouched instead of writing anything.
     let frame = &mut thread.frames[frame_idx];
     for (i, v) in locals.iter().enumerate() {
-        frame.set_local_unchecked(i, *v);
+        if let Some(val) = v {
+            frame.set_local_unchecked(i, *val);
+        }
     }
     frame.stack.clear();
     for v in &stack_vals {
@@ -12664,12 +12711,62 @@ mod deopt_step3_tests {
         assert_eq!(frame.get_local(1), Value::Int(9));
     }
 
-    /// An unmappable slot (cat-2 `Unsupported`) rejects (returns `None`) and leaves
-    /// the live frame COMPLETELY untouched — the mapping happens before any
-    /// mutation, so a reject can never half-write the frame (the caller then safely
-    /// continues interpreting the pre-OSR state).
+    /// FIX (jit-osr-loop-duplicate-execution): an `Unsupported` LOCAL slot must
+    /// NOT reject the whole transfer. `classify_local_kinds` marks a slot
+    /// `Ambiguous` (→ `Unsupported`) whenever it is used as more than one JVM
+    /// kind ANYWHERE in the method — including a slot legally reused, after its
+    /// original local's scope ends, for an unrelated local (e.g. an `int` loop
+    /// counter's slot later reused for a `long`). The bytecode being resumed
+    /// already passed verification, which requires a fresh `store` before any
+    /// `load` of a given logical local, so an `Unsupported` slot's CURRENT live
+    /// value is always safe to leave untouched. Before this fix, ANY such slot
+    /// rejected the entire transfer — discarding real, already-committed OSR
+    /// side effects and forcing the interpreter to silently re-execute them
+    /// from stale pre-OSR state (the root cause documented in
+    /// docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
     #[test]
-    fn osr_exit_transfer_rejects_unmappable_without_mutating() {
+    fn osr_exit_transfer_tolerates_unmappable_local() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![FrameValue::Int(33)],
+            5,
+        );
+
+        let advanced = rframe(
+            vec![FrameValue::Int(99), FrameValue::Unsupported],
+            vec![],
+            8,
+        );
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            "an Unsupported LOCAL must not block the transfer"
+        );
+
+        let frame = &thread.frames[0];
+        // Mappable slot 0 is overwritten from the reconstructed state...
+        assert_eq!(frame.get_local(0), Value::Int(99));
+        // ...but the Unsupported slot 1 keeps its PRE-transfer live value
+        // (it is provably not yet readable in this scope — see doc comment).
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 8);
+        assert_eq!(frame.stack.len(), 0, "empty snapshot stack replaces the stale one");
+    }
+
+    /// An unmappable OPERAND STACK slot (unlike a local) still rejects the whole
+    /// transfer and leaves the live frame COMPLETELY untouched: stack values are
+    /// transient and about to be consumed, so there is no scope/verification
+    /// guarantee protecting a stale or fabricated value the way there is for a
+    /// local — the mapping happens before any mutation, so a reject can never
+    /// half-write the frame (the caller then safely continues interpreting the
+    /// pre-OSR state).
+    #[test]
+    fn osr_exit_transfer_rejects_unmappable_stack_without_mutating() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
@@ -12683,8 +12780,8 @@ mod deopt_step3_tests {
         );
 
         let bad = rframe(
-            vec![FrameValue::Int(99), FrameValue::Unsupported],
-            vec![],
+            vec![FrameValue::Int(99), FrameValue::Int(0)],
+            vec![FrameValue::Unsupported],
             8,
         );
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
@@ -14732,6 +14829,30 @@ fn execute_instruction(
                 shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
             }
             if field.is_volatile {
+                // CRATONVM_DBG_AQS_TRACE (2026-07-21): ledger entry for the
+                // synchronizer family's plain volatile state writes
+                // (`AQLS.setState` — the writer-exclusive release path),
+                // matching the CAS-side ledger in native_unsafe_cas_long.
+                if cratonvm_native_builtins::aqs_trace_enabled() {
+                    let cid = shared.heap.class_id_of(obj_ref);
+                    let cls = {
+                        let cm = shared.class_manager.read();
+                        cm.get_class(cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default()
+                    };
+                    if cls.starts_with("java/util/concurrent/locks/") {
+                        cratonvm_native_builtins::aqs_trace_line(&format!(
+                            "[AQS] tid={} putvol obj={:p} cls={} slot={} old={:?} new={:?}",
+                            thread.thread_id.0,
+                            obj_ref.as_ptr(),
+                            cls.rsplit('/').next().unwrap_or(cls.as_str()),
+                            field.field_index,
+                            old_value,
+                            value
+                        ));
+                    }
+                }
                 shared
                     .heap
                     .set_field_volatile(obj_ref, field.field_index, value);
@@ -14818,11 +14939,36 @@ fn execute_instruction(
             }
         }
         Instruction::Invokestatic(index) => {
-            match execute_invokestatic(shared, thread, frame_idx, *index)? {
+            // Mirrors the Invokevirtual/Invokespecial arm above: JDK-internal
+            // classes (java.xml/Xerces, java.util, java.io, …) run through
+            // this dispatcher rather than the raw-byte-peek fast loop at the
+            // top of `execute_frame` (which already consulted
+            // `execute_invokestatic_cached` — see its call site's history),
+            // so every invokestatic previously paid full method resolution
+            // on every single call: native-registry hash lookup,
+            // `force_native_over_real_jdk_bytecode` /
+            // `synthetic_stub_should_yield_to_real_bytecode` checks, a
+            // `split_method_descriptor` heap allocation, `class_manager`
+            // RwLock reads. `execute_invokestatic_cached` already exists and
+            // is exercised by the other dispatch loop; wiring it in here
+            // gives JDK-internal invokestatic call sites the same lock-free
+            // O(1) cache hit non-JDK bytecode and Invokevirtual/Invokespecial
+            // already enjoyed. A miss/edge-case (JVMTI redefine, synthetic
+            // stub upgrade) falls through to the exact same slow path used
+            // before this fix.
+            match execute_invokestatic_cached(shared, thread, frame_idx, *index)? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invokestatic(shared, thread, frame_idx, *index)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
@@ -16971,6 +17117,16 @@ fn execute_ldc(
                         })
                     })?
                     .to_string();
+                if std::env::var_os("CRATONVM_LDC_CLASSREF_TRACE").is_some()
+                    && (name.contains("ManagementContextAutoConfiguration")
+                        || name.contains("ManagementPortType")
+                        || name.contains("WebEndpointAutoConfiguration"))
+                {
+                    eprintln!(
+                        "[LDC-CLASSREF-TRACE] name={} frame_class_id={:?} frame_class_name={}",
+                        name, frame_class_id, class.name
+                    );
+                }
                 LdcValue::ClassRef(name)
             }
             ConstantPoolEntry::Dynamic {
@@ -17480,7 +17636,10 @@ fn resolve_class_loader_aware(
     // cold loadClass path below; everything else resolves globally.
     let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && (name.contains("EnvironmentPostProcessorsFactory")
-            || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
+            || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
+            || name.contains("ManagementContextAutoConfiguration")
+            || name.contains("ManagementPortType")
+            || name.contains("ChildManagementContextInitializerAotTests"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
@@ -17489,7 +17648,7 @@ fn resolve_class_loader_aware(
             .unwrap_or_default();
         let ref_loader = cm.get_loader_id(referencing_class_id);
         eprintln!(
-            "[LOADER-TRACE] resolve name={name} referencing_class={ref_name} referencing_loader={ref_loader:?}"
+            "[LOADER-TRACE] resolve name={name} referencing_class_id={referencing_class_id:?} referencing_class={ref_name} referencing_loader={ref_loader:?}"
         );
     }
     let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
@@ -18391,8 +18550,7 @@ fn push_invoke_return_value(
 /// non-existent submission, never ran the kernel, and left output
 /// arrays at their pre-launch zero values.
 #[inline]
-fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
-    let b = param_desc.as_bytes().first().copied().unwrap_or(b'L');
+fn coerce_invoke_arg_for_descriptor(b: u8, v: Value) -> Value {
     match b {
         b'L' | b'[' => coerce_value_for_return(v, b),
         b'J' => match v {
@@ -18460,7 +18618,14 @@ fn pop_coerced_invoke_args_virtual(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): `nth_param_tag_byte` replaces `split_method_descriptor`
+    // here — every caller of this Vec<String>/String-allocating parse only
+    // ever read the first byte of each parameter token (see
+    // `coerce_invoke_arg_for_descriptor`/`decode_arg_kind_aware`, both
+    // `u8`-only). This was the single dominant hot spot (confirmed via cdb
+    // stack sampling) behind a ~197x CratonVM-vs-HotSpot slowdown on
+    // method-call-heavy interpreted workloads (Xerces SAX parsing —
+    // see docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/).
     // BC SM2 fix (2026-05-28): use raw CompactValue + descriptor-aware
     // decode so a Long-collision-with-SUB_OBJECT bit pattern doesn't
     // round-trip through Value::Object and lose bits.
@@ -18485,18 +18650,14 @@ fn pop_coerced_invoke_args_virtual(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
+        b'L',
         tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18511,7 +18672,8 @@ fn pop_coerced_invoke_args_static(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor. `CompactValue::to_value()` would
     // mis-decode a Long whose bits collide with SUB_OBJECT as
@@ -18527,13 +18689,9 @@ fn pop_coerced_invoke_args_static(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18862,7 +19020,8 @@ fn execute_invoke_kind(
 
     let total_args = num_params + 1;
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // Pop slots as raw CompactValue and decode with the parameter descriptor
     // so a category-2 long whose NaN-box bit pattern collides with a tagged
     // sub-tag survives bit-exact. The prior `pop()` → `to_value()` decoded
@@ -18892,19 +19051,12 @@ fn execute_invoke_kind(
         );
     }
     let mut args = Vec::with_capacity(total_args);
-    args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
-        recv_val,
-    ));
+    args.push(coerce_invoke_arg_for_descriptor(b'L', recv_val));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     // Apply the same forwarding read barrier used by getfield to every
@@ -22318,7 +22470,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             // Loader-faithful owner resolution (gated): prefer the enclosing
             // loader's copy of the impl class when it diverges from the global.
-            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
                     .class_manager
@@ -22346,7 +22498,22 @@ pub(crate) fn try_lambda_dispatch(
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
             // Loader-faithful owner resolution (gated), same rationale as above.
-            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+            //
+            // Residual 4 (2026-07-20, docs/known-issues/springboot/
+            // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+            // this used the PASSIVE-only `lambda_impl_dispatch_override` (cache
+            // read, never drives a cold miss) with a loader-blind
+            // `load_class(name)` fallback — the exact InvokeStatic gap already
+            // fixed by `lambda_impl_dispatch_override_driven` (see that
+            // function's own doc comment), just never mirrored onto this sibling
+            // MethodHandleKind. A constructor-reference lambda
+            // (`SomeType::new`, e.g. Spring AOT's generated
+            // `AotApplicationContextInitializer::new` factory) whose impl class
+            // is the very FIRST thing touched from a fork loader's namespace hit
+            // the same loader-blind fallback and minted an Application-loader
+            // copy instead of the fork's own. (Independently fixed upstream on
+            // origin/dev with the same shape; kept in sync here.)
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
                     .class_manager
@@ -22492,10 +22659,13 @@ pub(crate) fn try_lambda_dispatch(
             }
         }
         MethodHandleKind::GetStatic => {
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
@@ -22558,10 +22728,13 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 .into());
             }
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
@@ -22804,6 +22977,43 @@ pub(crate) fn is_class_mirror_native_override(
                     "(Ljava/lang/String;)Ljava/lang/reflect/Field;"
                 )
         )
+}
+
+/// `java.lang.ClassValue#get`/`#remove` (see `classvalue_cache.rs` in
+/// native-builtins for the real implementation and why it must be a native
+/// override at all — `ClassValue`'s real bytecode depends on CASing a hidden
+/// field on `java.lang.Class` via `jdk.internal.misc.Unsafe`, not faithfully
+/// reproducible against CratonVM's `Class` mirrors).
+///
+/// Apache Groovy's `ClassInfo` registry (`ClassInfo.globalClassValue`, a
+/// `GroovyClassValueJava7`) is constructed via
+/// `GroovyClassValueFactory.createGroovyClassValue(ClassInfo::new)` — a
+/// constructor-reference-backed `ComputeValue` lambda — and `ClassInfo`'s own
+/// `getClassInfo`/`remove` static methods call `get`/`remove` on it. Ordinary
+/// bytecode invokes already prefer the registered native, but this call
+/// pattern (through the lambda-backed `ComputeValue` plumbing) can resolve
+/// through a dispatch path whose concrete-bytecode precedence needs this
+/// explicit shared gate — see docs/known-issues/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md Cluster C
+/// "Residual 5" (fixed under `--nojit` without this gate; JIT mode still hit
+/// the original always-null-returning symptom until this was added).
+pub(crate) fn is_classvalue_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let result = class_name == "java/lang/ClassValue"
+        && matches!(
+            (method_name, descriptor),
+            ("get", "(Ljava/lang/Class;)Ljava/lang/Object;") | ("remove", "(Ljava/lang/Class;)V")
+        );
+    if class_name == "java/lang/ClassValue" && std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some()
+    {
+        eprintln!(
+            "[classvalue-gate] is_classvalue_native_override({class_name}, {method_name}, {descriptor}) -> {result}"
+        );
+    }
+    result
 }
 
 pub(crate) fn is_reflection_access_native_override(
@@ -24124,6 +24334,22 @@ pub(crate) fn is_forkjoin_native_override(
                     "externalSubmit",
                     "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;"
                 )
+                // submit(Callable)/submit(Runnable)/submit(Runnable, T): left off
+                // the original allow-list, so real bytecode ran them against a pool
+                // whose commonPool() shortcut never populates queues/runState/mode —
+                // RejectedExecutionException at submissionQueue() (RealFjp.java).
+                | (
+                    "submit",
+                    "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/ForkJoinTask;"
+                )
+                | (
+                    "submit",
+                    "(Ljava/lang/Runnable;)Ljava/util/concurrent/ForkJoinTask;"
+                )
+                | (
+                    "submit",
+                    "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;"
+                )
                 | ("execute", "(Ljava/lang/Runnable;)V")
                 | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
         )
@@ -24142,6 +24368,7 @@ pub(crate) fn is_forkjoin_native_override(
             | ("join", "()Ljava/lang/Object;")
             | ("invoke", "()Ljava/lang/Object;")
             | ("get", "()Ljava/lang/Object;")
+            | ("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
             | ("getRawResult", "()Ljava/lang/Object;")
             | ("setRawResult", "(Ljava/lang/Object;)V")
             | ("isDone", "()Z")
@@ -24685,6 +24912,23 @@ fn force_native_over_real_jdk_bytecode(
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // BUG-W follow-up (2026-07-20): `java.lang.ClassValue.get()` has real JDK
+    // bytecode (relies on `Class.classValueMap`, which CratonVM's Class
+    // mirrors don't back) AND a registered native override (memoized
+    // `computeValue` dispatch — see the `get()`/`remove()` registrations in
+    // `native-builtins/src/phases_late.rs`). Any cached/precomputed dispatch
+    // decision that consults this allow-list instead of re-walking the
+    // ancestor chain at call time (the JIT's compiled-callsite native check,
+    // mirroring the interpreter's `try_stackless_invoke`/`invoke_or_native`
+    // walk) needs an explicit entry here or it silently keeps running the
+    // real bytecode forever, which is how Groovy's `ClassInfo.getClassInfo`
+    // NPE'd under `-Jit on` even after the native fix landed.
+    if class_name == "java/lang/ClassValue"
+        && method_name == "get"
+        && method_descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
+    {
+        return true;
+    }
     if class_name == "org/springframework/core/annotation/MergedAnnotation$Adapt"
         && method_name == "isIn"
         && method_descriptor
@@ -24850,6 +25094,9 @@ fn force_native_over_real_jdk_bytecode(
         return false;
     }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_classvalue_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // JFR's Type bootstrap table compares Class mirrors by reference.  A
@@ -26837,11 +27084,55 @@ pub(crate) fn should_force_registered_native_over_bytecode(
 ) -> bool {
     should_force_registered_native_over_bytecode_precomputed(
         shared,
-        force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor),
+        force_native_over_real_jdk_bytecode_memoized(class_name, method_name, method_descriptor),
         class_name,
         method_name,
         method_descriptor,
     )
+}
+
+/// Memoizing wrapper around [`force_native_over_real_jdk_bytecode`].
+///
+/// That function is a pure, ~55-branch sequential scan over hardcoded
+/// (class, method, descriptor) triples with no side effects and no
+/// dependency on mutable VM state -- its result for a given triple never
+/// changes for the lifetime of the process. `CachedBytecodeMethod
+/// ::force_native_cache` already memoizes it once per warm bytecode-PC
+/// invoke-cache entry, but every OTHER call path that reaches
+/// `should_force_registered_native_over_bytecode` -- reflective
+/// `Method.invoke()` dispatch (which has no bytecode PC to key an
+/// invoke-cache entry on), megamorphic/polymorphic call sites that never
+/// settle on one cached target, `invokespecial`, and interface-default
+/// dispatch -- re-ran the full scan on every single call with no
+/// memoization at all. Profiling `BeanRegistrationsAotContributionTests`
+/// (~54 min vs HotSpot's 13s for the same test, see
+/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
+/// section) found exactly this: `intercept_force_registered_native` ->
+/// `should_force_registered_native_over_bytecode` ->
+/// `force_native_over_real_jdk_bytecode` live at the top of repeated gdb
+/// stack samples, reached through deep `try_lambda_dispatch` recursion
+/// driven by Mockito's constructor-mock listener dispatch (reflective
+/// `Method.invoke()` on many distinct generated classes, so per-callsite
+/// caching never warms up). A global cache keyed by the exact same 3
+/// inputs is safe by construction -- the wrapped function reads no state
+/// beyond its own arguments, so there is nothing to invalidate.
+fn force_native_over_real_jdk_bytecode_memoized(
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+) -> bool {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+    type Key = (Box<str>, Box<str>, Box<str>);
+    static CACHE: OnceLock<Mutex<rustc_hash::FxHashMap<Key, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(rustc_hash::FxHashMap::default()));
+    let key: Key = (class_name.into(), method_name.into(), method_descriptor.into());
+    if let Some(&v) = cache.lock().get(&key) {
+        return v;
+    }
+    let v = force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor);
+    cache.lock().insert(key, v);
+    v
 }
 
 /// Same decision as [`should_force_registered_native_over_bytecode`], but
@@ -28683,15 +28974,23 @@ fn execute_invokestatic(
     if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
         && (method_class_name.contains("SpringFactoriesLoader")
             || method_class_name.contains("EnvironmentPostProcessorsFactory")
+            || method_class_name.contains("ManagementPortType")
             || (method_class_name.as_ref() == "org/springframework/util/ClassUtils" && method_name.as_ref() == "forName")
             || (method_class_name.as_ref() == "java/lang/Class" && method_name.as_ref() == "forName"))
     {
         let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let cur_name = shared
+            .class_manager
+            .read()
+            .get_class(current_class_id)
+            .map(|c| c.name.to_string());
         let resolved_loader = static_dispatch_class_id
             .and_then(|id| shared.class_manager.read().get_loader_id(id));
+        let global_id = shared.class_manager.read().get_loaded_class_id(&method_class_name);
+        let global_loader = global_id.and_then(|id| shared.class_manager.read().get_loader_id(id));
         eprintln!(
-            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?}",
-            method_class_name, method_name, current_class_id, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader
+            "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_class_name={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?} global_lookup_id={:?} global_lookup_loader={:?}",
+            method_class_name, method_name, current_class_id, cur_name, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader, global_id, global_loader
         );
     }
     if !is_native {
@@ -28732,7 +29031,17 @@ fn execute_invokestatic(
         ensure_class_initialized_shared(shared, thread, target_class_id)?;
     }
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
+    // This was the exact call site pinned by cdb stack sampling as the
+    // dominant hot spot behind the ~197x Xerces SAX-parse slowdown (every
+    // invokestatic re-parsed + heap-allocated a Vec<String> from scratch);
+    // the primary fix is wiring `execute_invokestatic_cached` into the main
+    // dispatch loop (see its call site's history) so this cold/miss path is
+    // only reached once per call site instead of on every call. Fixed here
+    // too since it's the same wasteful pattern and still runs on every
+    // cache miss (JVMTI redefine, synthetic-stub upgrade, first call).
+    //
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor so a Long whose bit pattern collides
     // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
@@ -28749,13 +29058,9 @@ fn execute_invokestatic(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     if let Some(res) = intercept_force_registered_native(
@@ -29008,10 +29313,7 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .pop_compact_with_long_mark()?;
     }
     let base = if with_receiver {
-        buf[0] = coerce_invoke_arg_for_descriptor(
-            "Ljava/lang/Object;",
-            cv_buf[0].0.decode_by_descriptor(b'L'),
-        );
+        buf[0] = coerce_invoke_arg_for_descriptor(b'L', cv_buf[0].0.decode_by_descriptor(b'L'));
         1
     } else {
         0
@@ -29023,8 +29325,10 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
         let (cv, is_long) = cv_buf[base + i];
-        buf[base + i] =
-            coerce_invoke_arg_for_descriptor(pd, decode_arg_kind_aware(cv, is_long, pd_byte));
+        buf[base + i] = coerce_invoke_arg_for_descriptor(
+            pd_byte,
+            decode_arg_kind_aware(cv, is_long, pd_byte),
+        );
     }
     Ok(&buf[..total])
 }
@@ -30035,6 +30339,40 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
+            // 2026-07-20) — never OSR a method containing `invokedynamic`. The
+            // 0xba codegen arm lowers every indy call site to an unconditional
+            // `DeoptReason::UnreachedCode` trap (it never links/inlines the
+            // bootstrap), so entering that site while OSR-compiled always
+            // bails. For a NORMAL (method-entry) compile that bail resumes by
+            // building a brand-new frame from scratch (no prior live frame to
+            // reconcile), which is precise. For OSR the bail must instead
+            // transfer the JIT-advanced state IN PLACE into the pre-existing
+            // live interpreter frame (`transfer_osr_exit_into_live_frame`) —
+            // and that transfer routinely fails: the operand-stack values
+            // live at an indy call site (its recipe/constant args) are exactly
+            // the kind of value the single-pass backend's per-site stack-slot
+            // classifier cannot always precisely re-type (see `FrameValue::
+            // Unsupported`'s doc in jit/src/deopt.rs), which correctly rejects
+            // the transfer rather than fabricate one. The OSR trigger then
+            // falls back to its "safe reject" default — resuming interpretation
+            // at the STALE pre-OSR back-edge pc/locals — which is only actually
+            // safe when the bail precedes any committed loop iteration. An indy
+            // trap reached *after* a hot loop that already ran to completion
+            // inside the OSR'd continuation (e.g. a `System.out.println("..." +
+            // n + ...)` immediately following the loop, "..." string-concat
+            // compiling to `invokedynamic`) violates that precondition: the
+            // loop's real side effects (already committed once, correctly, by
+            // the OSR'd code) get silently RE-EXECUTED by the interpreter from
+            // the stale resume state — e.g. an `ArrayList` ending up with extra
+            // duplicate elements with no exception anywhere. See
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // for the full repro and trace. Like `has_athrow` above,
+            // method-entry compilation (unaffected by this OSR-only bail path)
+            // remains available, so do NOT bail-list here.
+            if !scan.indy_ops.is_empty() {
                 return None;
             }
             // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
@@ -31452,20 +31790,20 @@ fn jit_invoke_targets_native_shadow(
     caller_class_id: ClassId,
     cp_idx: u16,
 ) -> bool {
-    let (target_class, method_name, descriptor, declaring_class) = {
+    let (target_class, method_name, descriptor, declaring_class, is_interface_ref) = {
         let cm = shared.class_manager.read();
         let Some(caller) = cm.get_class(caller_class_id) else {
             return true;
         };
-        let (class_index, nat_index) = match caller.constant_pool.get(cp_idx) {
+        let (class_index, nat_index, is_interface_ref) = match caller.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
                 class_index,
                 name_and_type_index,
-            })
-            | Some(ConstantPoolEntry::InterfaceMethodReference {
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
                 class_index,
                 name_and_type_index,
-            }) => (*class_index, *name_and_type_index),
+            }) => (*class_index, *name_and_type_index, true),
             _ => return true,
         };
         let Some(target_class) = caller
@@ -31492,7 +31830,7 @@ fn jit_invoke_targets_native_shadow(
         } else {
             None
         };
-        (target_class, method_name, descriptor, declaring_class)
+        (target_class, method_name, descriptor, declaring_class, is_interface_ref)
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
@@ -31508,13 +31846,39 @@ fn jit_invoke_targets_native_shadow(
             .find(declaring_class, &method_name, &descriptor)
             .is_some()
     });
-    if (direct || inherited) && crate::runtime::env_cache::dbg_jitc() {
+    // Interface-dispatch blind spot: for `invokeinterface`, `declaring_class`
+    // above is resolved by walking UP FROM THE INTERFACE (`find_method_recursive`
+    // starting at the CP-referenced interface's own class_id) — it can only ever
+    // land on that same interface (its own abstract/default declaration) or a
+    // super-INTERFACE. It can never see a concrete implementor's SUPERCLASS
+    // chain, because interfaces carry no knowledge of their implementors. So
+    // for a receiver that implements this interface but inherits the actual
+    // method body from an unrelated ancestor CLASS — exactly
+    // `org.codehaus.groovy.reflection.v7.GroovyClassValueJava7 implements
+    // GroovyClassValue, extends java.lang.ClassValue` inheriting `get()` from
+    // `ClassValue`, which IS natively registered — `direct`/`inherited` above
+    // both come back false even though the call is genuinely native-shadowed
+    // at every concrete receiver. Fall back to a cheap, class-blind "does ANY
+    // registered native have this exact (name, descriptor)" probe — the same
+    // idiom `might_have_method_descriptor` already serves as a pre-filter
+    // elsewhere (e.g. `execute_invokevirtual_vtable_fast`) — and treat a hit
+    // as a possible shadow. This can only ever ADD conservatism (a same-named,
+    // same-descriptor native for a genuinely unrelated interface is rare and
+    // merely costs a missed tier-up opportunity for that one caller, never a
+    // correctness bug).
+    let interface_blind_possible_shadow = is_interface_ref
+        && !direct
+        && !inherited
+        && shared
+            .native_methods
+            .might_have_method_descriptor(&method_name, &descriptor);
+    if (direct || inherited || interface_blind_possible_shadow) && crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
-            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={}",
-            target_class, method_name, descriptor, direct, inherited
+            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={} interface_blind={}",
+            target_class, method_name, descriptor, direct, inherited, interface_blind_possible_shadow
         );
     }
-    direct || inherited
+    direct || inherited || interface_blind_possible_shadow
 }
 
 fn jit_method_calls_native_shadowed(
@@ -36546,8 +36910,46 @@ fn execute_invokevirtual_cached(
                     // target for this receiver. `args_slice` is already decoded;
                     // on deopt/too-many-args we fall through to the interpreted
                     // frame push below (the operand stack is untouched).
+                    //
+                    // `!has_registered_native`: the comment above claims natives
+                    // are already excluded by this point, but that's only true
+                    // for FORCED natives (`intercept_force_registered_native_cached`
+                    // just above only fires when `force_native_over_real_jdk_bytecode`
+                    // says so). An ordinary, non-forced registered native — the
+                    // common case, which the interpreter's per-call dispatch
+                    // prefers over real bytecode by default — is invisible to
+                    // that check, so tier-up would compile the method's REAL
+                    // BYTECODE and, once compiled, EVERY future call through this
+                    // receiver class permanently bypasses the native (compiled
+                    // code doesn't re-run the interpreter's native-vs-bytecode
+                    // decision). Found 2026-07-20 via `java.lang.ClassValue#get`
+                    // (see `classvalue_cache.rs`/`is_classvalue_native_override`):
+                    // Apache Groovy's `ClassInfo` registry calls it thousands of
+                    // times per app boot — comfortably past the tier-up threshold
+                    // — and the real bytecode it silently switched to depends on
+                    // `Class.classValueMap`/`Unsafe` CAS machinery CratonVM
+                    // doesn't faithfully reproduce, reintroducing the exact
+                    // always-null symptom the native override exists to fix, but
+                    // ONLY under JIT (this tier-up is JIT-only) and ONLY once
+                    // warm — see docs/known-issues/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md
+                    // Cluster C "Residual 5". Reusing `native_callback_cache`
+                    // (already memoized per call site for the force-native path
+                    // above) keeps this a single extra hash lookup, not a
+                    // per-call cost.
+                    let has_registered_native = cached
+                        .native_callback_cache
+                        .get_or_init(|| {
+                            shared.native_methods.find(
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            )
+                        })
+                        .is_some();
                     if !is_special
                         && !cached.is_synchronized
+                        && !has_registered_native
                         && !crate::classloading::any_class_redefined()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
