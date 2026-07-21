@@ -913,3 +913,31 @@ the defect is in the remoting/SASL layer itself. **This needs its own doc and it
 investigation** (XNIO conduit / jboss-remoting framing + Elytron `LocalUser` server-side challenge
 comparison); it is the correct next target for anyone continuing the WildFly suite, but it is not a
 residual of the STW-takeover boot hang.
+
+### Rare residual wedge (~5%, different site — `Collections$SetFromMap` monitor)
+
+Post-fix verification across four binaries and 22 isolated boots on the final on-dev binary:
+**21/22 healthy** (hunt3 8/8, hunt4 3/4, gw1 10/10). The single wedge (hunt4-a2) was NOT the CHM
+segment monitor this session fixed — `CRATONVM_DBG_MONENTER` labeled it a monitor on a
+`java/util/Collections$SetFromMap` object (owner tid held it `entry_count=1` while ~130 waiters piled
+up). No CratonVM native ever monitors a `SetFromMap` (grep-confirmed), so this is a pure Java
+`synchronized(set)` held across a blocking op somewhere in `parallel-extension-add` — the same
+"monitor held across blocking" family, a different site. It did NOT reproduce in a dedicated 10-boot
+gdb-capture batch (`gw1`), so the owners stack was never captured. Left as a documented rare residual
+
+### Rare residual wedge (~5%, different site — `Collections$SetFromMap` monitor)
+
+Post-fix verification across four binaries and 22 isolated boots on the final on-dev binary:
+**21/22 healthy** (hunt3 8/8, hunt4 3/4, gw1 10/10). The single wedge (hunt4-a2) was NOT the CHM
+segment monitor this session fixed — `CRATONVM_DBG_MONENTER` labeled it a monitor on a
+`java/util/Collections$SetFromMap` object (owner tid held it `entry_count=1` while ~130 waiters piled
+up). No CratonVM native ever monitors a `SetFromMap` (grep-confirmed), so this is a pure Java
+`synchronized(set)` held across a blocking op somewhere in `parallel-extension-add` — the same
+"monitor held across blocking" family, a different site. It did NOT reproduce in a dedicated 10-boot
+gdb-capture batch (`gw1`), so the owner's stack was never captured. Left as a documented rare residual
+(task filed): whoever hits it should re-run `/data/probe-stw-20260720/gdbwedge.sh <bin> <tag> 20`
+(gdb-attaches the container the instant `[monenter-stall]` appears) to get the owner frame, then look
+for a WildFly/JBoss-Modules `synchronized` block that wraps a blocking registry/lock acquisition. Note
+this is moot for the suite until the separate `JBOSS-LOCAL-USER` SASL blocker
+(`docs/known-issues/wildfly-management-jboss-local-user-sasl-rejection.md`) is fixed — no test can
+pass through management auth regardless of boot health.
