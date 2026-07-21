@@ -100,20 +100,28 @@ investigation):** the ~7.8s/iteration figure above comes from a hand-rolled
 `main()` repro that, like this doc's methodology, calls the Spring code
 directly and **bypasses JUnit5's `Launcher`/Jupiter engine entirely**. The
 Jackson investigation found that routing the *same* kind of Spring work
-through the real JUnit5 launcher adds a large **additional** multiplier on
-top of the Spring-level cost — JUnit5's own reflective execution machinery
-(`InterceptingExecutableInvoker`/`InvocationInterceptorChain`, extension
-resolution, per-test `ConditionEvaluator` calls) is itself another
-dispatch-call-dense subsystem paying the same systemic per-call tax. This
-doc's own captured stacks also show real depth inside
+through the real JUnit5 launcher takes much longer than the hand-rolled
+figure alone would predict, but — important correction — a follow-up,
+further-isolated measurement (a Spring-free, 162-invocation no-op test class
+run through the real JUnit5 `Launcher`) showed JUnit5's own machinery is
+only **~8.3x** slower than HotSpot in isolation (5.56s vs. 667ms for 162
+trivial invocations) — much smaller than the ~40-75x raw per-call dispatch
+overhead, and **not**, on its own, the dominant cost. The numbers instead
+reconcile if the two costs **compound multiplicatively** rather than adding:
+Jackson's hand-rolled per-invocation cost (~2.47s) × the isolated JUnit5
+multiplier (~8.3x) ≈ 20.5s, matching that investigation's real-invocation
+estimate (~20s) closely. Applying the same reasoning here: this doc's own
+captured stacks show real depth inside
 `InterceptingExecutableInvoker`/`InvocationInterceptorChain` alongside the
 Spring-level frames (see the 156-frame dump excerpted above), so the true
 per-test cost for the 47 real (JUnit5-launched) tests in this class is
-likely **higher** than the flat ~7.8s hand-rolled figure — the 367s estimate
-above should be read as a lower bound, not a tight estimate. Not
-re-measured directly against the real JUnit5-launched class this session;
-see the Jackson doc for the A/B methodology to reproduce if a tighter number
-is needed.
+plausibly **~7.8s × ~8x ≈ 60s+ per test**, not just the flat ~7.8s
+hand-rolled figure — the 367s estimate above is likely a significant
+under-estimate rather than merely a lower bound. Not re-measured directly
+against the real JUnit5-launched class this session; see the Jackson doc's
+"Refinement" section for the full methodology and the (unconfirmed)
+stack-depth-dependent-cost hypothesis for *why* the two costs compound
+multiplicatively instead of adding.
 
 ### Where the flat ~2.5-3x per-context slowdown itself comes from
 

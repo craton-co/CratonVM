@@ -1,13 +1,16 @@
 # `JacksonAutoConfigurationTests` — severe (600s+) slowdown, not a hang/deadlock
 
-**Status: OPEN — root cause narrowed 2026-07-21 (see "Root cause narrowed"
-below), not fixed.** Originally found 2026-07-20, split out of
+**Status: OPEN — root cause narrowed 2026-07-21, refined further same day
+after isolating JUnit5's own overhead directly (see "Root cause narrowed"
+and "Refinement" below), not fixed.** Originally found 2026-07-20, split out
+of
 `docs/known-issues/springboot/otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang.md`
 (that doc's root cause is FIXED; this class was miscategorized into it).
 This update corrects the original doc's test-count claim (**74** total test
-methods, not 6 — see below) and adds a much sharper root-cause finding:
-**JUnit5's own reflective test-execution machinery, not Spring/Jackson bean
-creation, is the dominant cost.**
+methods, not 6 — see below). The headline finding: neither Spring/Jackson
+bean creation nor JUnit5's own execution machinery is individually
+catastrophic in isolation — the two appear to **compound multiplicatively**
+when nested together, which is what actually produces the 600s+ wall time.
 
 ## Symptom
 
@@ -67,28 +70,92 @@ goes, isolated with a decisive A/B:
    — genuinely still executing — just an order of magnitude slower than
    the equivalent hand-rolled call for the *same* bean-creation work.
 
-**Conclusion**: the Spring/Jackson-level work itself (context refresh, bean
-creation, `hasSingleBean` type matching) pays the same systemic ~40-75x
-per-call dispatch tax documented elsewhere in this repo (see
-[[reference_hashmap_native_call_dispatch_overhead_20260711]],
-[[reference_jit_invoke_cache_thrash_dispatch_heavy]], the `project_wire_tiered_manager`
-initiative) and is *not*, by itself, catastrophic — my 9-assertion hand-rolled
-repro proves that path alone stays well under the suite timeout even at 159
-invocations. The **additional**, much larger multiplier comes from routing
-those same invocations through JUnit5's own reflective execution machinery
-(`InterceptingExecutableInvoker`/`InvocationInterceptorChain`, extension
-resolution, `@ParameterizedTest`/`@EnumSource` argument-provider machinery,
-per-test `ConditionEvaluator` calls) — itself another reflection/dispatch-call-dense
-subsystem paying the exact same per-call tax, just with a much higher call
-count per test than plain Spring bean creation. This matches (and sharpens)
-a detail already visible in the sibling
+**Conclusion (as of the initial 2026-07-21 pass)**: the Spring/Jackson-level
+work itself (context refresh, bean creation, `hasSingleBean` type matching)
+pays the same systemic ~40-75x per-call dispatch tax documented elsewhere in
+this repo (see [[reference_hashmap_native_call_dispatch_overhead_20260711]],
+[[reference_jit_invoke_cache_thrash_dispatch_heavy]], the
+`project_wire_tiered_manager` initiative) and is *not*, by itself,
+catastrophic — the 9-assertion hand-rolled repro proves that path alone
+stays well under the suite timeout even at 159 invocations. The gap was
+provisionally attributed to JUnit5's own reflective execution machinery —
+**see the refinement below, which tests that attribution directly and finds
+it's only part of the story.**
+
+## Refinement (2026-07-21, same day): isolating JUnit5 alone shows it's ~8x, not the whole gap — the two costs compound multiplicatively
+
+Built a third, even more isolated probe: a trivial Spring-free/Jackson-free
+test class (`JUnit5MachineryProbe.java`) with the *same shape* as the real
+class — 30 plain `@Test` methods + 44 `@ParameterizedTest` methods each
+parameterized by 3 values (`@ValueSource(ints = {1,2,3})`, mirroring
+`MapperType`'s 3 values) — 162 total invocations, each doing nothing but
+trivial integer arithmetic. Ran this through the **real** JUnit5 `Launcher`
+(`LauncherDiscoveryRequestBuilder` + `selectClass` + `launcher.execute()`,
+the exact same API `SbRunner`/the suite runner uses), with precise
+`System.currentTimeMillis()` timing around `launcher.execute()`:
+
+| | HotSpot | CratonVM | Ratio |
+|---|---|---|---|
+| 162 no-op test invocations, `launcher.execute()` | 667ms (~4.1ms/test) | 5,555ms (~34.3ms/test) | **~8.3x** |
+
+**This refutes "JUnit5 machinery alone is the dominant cost"** as originally
+concluded above — 8.3x is much smaller than the ~40-75x raw per-call
+dispatch-overhead baseline, and nowhere near enough on its own to explain a
+process that doesn't finish even one parameterized invocation of a real test
+in 60-67s. JUnit5's own machinery, running genuinely empty test bodies, is
+*not* catastrophically slow on CratonVM.
+
+**But the numbers reconcile cleanly if the two costs compound
+multiplicatively rather than adding**: the hand-rolled Spring/Jackson-only
+repro cost ~2.47s/assertion (22,218ms / 9). The real class's `--stack-dump-on-timeout=60`
+run got through roughly one third of its 60-67s window per parameterized
+invocation of `definesMapper` (3 `MapperType` values sharing that window) —
+call it **~20s/real invocation**. `2.47s × 8.3 ≈ 20.5s` — matching the
+observed real-invocation estimate almost exactly. That is: JUnit5's own
+per-invocation overhead, when it *wraps* a test body that itself makes many
+Spring/Jackson native/reflective calls, doesn't just add its own ~8x-vs-HotSpot
+cost on top — it appears to **multiply** the wrapped code's own per-call tax,
+plausibly because JUnit5's `InterceptingExecutableInvoker`/`InvocationInterceptorChain`
+adds several dozen extra frames to the call stack for the *entire duration*
+of the wrapped test body, and CratonVM's per-native-call machinery
+(conservative JIT-frame root scanning, in particular — see
+[[reference_hashmap_native_call_dispatch_overhead_20260711]]) plausibly
+scales with stack depth/frame count, so every one of the many Spring/Jackson
+native calls *inside* the wrapped body pays a larger tax than the same call
+would sitting at a shallower stack depth outside JUnit5's wrapping.
+
+**Not confirmed directly** — this multiplicative-compounding explanation is
+inferred from the arithmetic lining up (2.47s × 8.3 ≈ 20.5s ≈ the observed
+~20s), not from direct profiling proof that conservative root-scanning cost
+(or any other specific mechanism) actually scales with stack depth in this
+codebase. That would be the natural next step: instrument or profile a
+single Spring/Jackson native call's cost at two different call-stack depths
+(e.g. called directly from `main()` vs. called from inside 50 extra
+pass-through Java frames) to confirm whether frame-count-dependent cost is
+the actual mechanism, independent of JUnit5 specifically.
+
+At **~20s/real invocation × 159 real invocations ≈ 3,180s** — this now
+overshoots the observed 600s+ timeout by 5x rather than sitting right at the
+edge, which is itself informative: it suggests either (a) not every
+invocation is as expensive as `definesMapper`'s (plausible — some of the 74
+methods do much less work per invocation), or (b) the "~20s per invocation"
+estimate, derived from a single 60-67s sample window, is itself a rough
+upper-bound proxy rather than a tight per-invocation average. Either way,
+the qualitative conclusion — cumulative real invocations, each paying a
+compounded (not merely additive) JUnit5×Spring/Jackson tax, comfortably
+exceed 600s — holds without needing any non-termination.
+
+This finding **generalizes**: it predicts that ANY Spring Boot test class
+combining (a) many test invocations and (b) reflection/native-call-heavy
+work per invocation (which describes most Spring context-refresh-per-test
+patterns) will show a similar compounding effect, not just Jackson or
+OAuth2ResourceServer specifically — worth checking the "test-method-count ×
+measured-per-context-cost" arithmetic assumes ADDITIVE JUnit5 overhead is
+being systematically UNDER-estimated across this repo's other
+"severe-slowdown" docs if they used a JUnit5-bypassing hand-rolled repro
+(as both this doc and
 [`oauth2resourceserverautoconfigurationtests-severe-slowdown.md`](oauth2resourceserverautoconfigurationtests-severe-slowdown.md)
-investigation, whose captured stacks also spent real depth inside
-`InterceptingExecutableInvoker`/`InvocationInterceptorChain` alongside the
-Spring-level cost — suggesting JUnit5's own invocation machinery, not any
-one library's bean-creation code, may be the dominant shared contributor
-across *most* of this repo's "severe slowdown, not a hang" Spring Boot test
-classes.
+did) rather than measuring real JUnit5-launched invocations directly.
 
 The `standardJsonMapperBuilderCustomizer` bean itself is unremarkable —
 its `@Bean` factory method is a two-line constructor call
@@ -151,6 +218,17 @@ compiled against the module's own `build/cratonvm-test-cp.txt`. Useful as a
 fast (~22s) regression canary for the Spring/Jackson-level cost in isolation
 from JUnit5 overhead.
 
+For the isolated JUnit5-machinery-only A/B (no Spring/Jackson at all):
+`JUnit5MachineryProbe.java` (162 trivial `@Test`/`@ParameterizedTest`
+invocations, no assertions beyond integer arithmetic) +
+`JUnit5ProbeRunner.java` (a ~30-line `main()` driving the real
+`org.junit.platform.launcher.Launcher` API directly), compiled against just
+the JUnit Platform/Jupiter jars — no Spring Boot module classpath needed at
+all, so this compiles and runs in seconds even outside a Gradle-built
+module. Both kept in this investigation's scratch dir, not checked into the
+repo; regenerate from this doc's description if needed (a `gen.sh` heredoc
+approach produced the 74-method probe class quickly).
+
 ## Impact
 
 Blocks `JacksonAutoConfigurationTests` (74 tests) from ever completing in the
@@ -160,11 +238,14 @@ the same [[project_wire_tiered_manager]] systemic dispatch-overhead
 initiative referenced by the sibling OAuth2ResourceServer doc — not attempted
 here for the same reason (hot, shared, correctness-critical dispatch/tier-up
 machinery needs that initiative's own established validation rigor, not a
-speculative single-session patch). A future session with bandwidth to
-profile JUnit5's own `InterceptingExecutableInvoker`/`InvocationInterceptorChain`/
-extension-resolution call paths specifically (rather than Spring/Jackson bean
-creation) is the most promising next step, since this doc's evidence points
-there as the dominant, currently-uninvestigated cost center.
+speculative single-session patch). The most promising concrete next step,
+per the "Refinement" section above, is confirming (or refuting) whether
+per-native-call cost in this codebase actually scales with Java call-stack
+depth/frame count — if so, that's a single, well-scoped mechanism that would
+explain the JUnit5×Spring/Jackson compounding effect (and plausibly other
+"severe slowdown" classes) without needing to profile JUnit5's own machinery
+in more detail (which, per the isolated 8.3x measurement here, is not
+pathological on its own).
 
 ## Affected classes
 
