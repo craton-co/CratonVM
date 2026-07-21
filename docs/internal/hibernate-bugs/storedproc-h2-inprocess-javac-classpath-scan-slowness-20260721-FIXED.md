@@ -255,14 +255,14 @@ fresh process and retained its normal JUnit timeout settings.
 
 | Mode | Class index | Result | Wall time |
 |---|---:|---|---:|
-| JIT | 0 | `ResultMappingTest`: 4/4 passed | 58.92s |
-| JIT | 1 | `StoredProcedureTest`: 4/4 passed | 61.01s |
-| JIT | 2 | SQL result-set mapping: 1/1 passed | 34.70s |
-| JIT | 3 | JPA result-set mapping: 1/1 passed | 22.55s |
-| `--nojit` | 0 | `ResultMappingTest`: 4/4 passed | 44.63s |
-| `--nojit` | 1 | `StoredProcedureTest`: 4/4 passed | 46.83s |
-| `--nojit` | 2 | SQL result-set mapping: 1/1 passed | 60.83s |
-| `--nojit` | 3 | JPA result-set mapping: 1/1 passed | 19.12s |
+| JIT | 0 | `ResultMappingTest`: 4/4 passed | 54.02s |
+| JIT | 1 | `StoredProcedureTest`: 4/4 passed | 54.34s |
+| JIT | 2 | SQL result-set mapping: 1/1 passed | 30.23s |
+| JIT | 3 | JPA result-set mapping: 1/1 passed | 17.59s |
+| `--nojit` | 0 | `ResultMappingTest`: 4/4 passed | 37.91s |
+| `--nojit` | 1 | `StoredProcedureTest`: 4/4 passed | 38.04s |
+| `--nojit` | 2 | SQL result-set mapping: 1/1 passed | 14.11s |
+| `--nojit` | 3 | JPA result-set mapping: 1/1 passed | 14.56s |
 
 All eight processes exited `0`; no class reached its former 120s JUnit or
 300s harness timeout.
