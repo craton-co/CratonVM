@@ -779,3 +779,165 @@ No code changes were needed this session (the fix was already on `dev`) — only
 out this doc. `git worktree remove` not run for `/data/wt-wildfly-stw-recur3-20260718`; probe artifacts
 (`probes/logs/`, `probes/summary.txt`, `probes/wf-standalone*`) left in place there for anyone who wants to
 re-verify.
+
+## Reopening 2026-07-20 → root causes found and FIXED 2026-07-21 (seventh session): the "STW takeover" signature was long gone — the round-9 mass failure was a CHM-mapper AB-BA deadlock plus a broken native logging path
+
+Round 9 (8 shards, `frozen-cratonvm-wildfly-bugbash-v8-20260720`, dev@~20260720) failed 185/197
+classes (155 "Could not start container", 28 client-side `OutOfMemoryError`, only 2 occurrences of the
+old STW warning — the doc's original signature is genuinely dead). A fresh factorized isolation
+campaign (client-on-real-JDK vs container-on-real-JDK, direct container boots with the exact
+Arquillian-captured cmdline, an env-gated AQS state-transition ledger `CRATONVM_DBG_AQS_TRACE`, and a
+monitor-stall attributor added to `CRATONVM_DBG_MONENTER`) found FIVE independent defects, all now
+fixed on `fix/wildfly-stw-goal-20260720`:
+
+1. **CHM `computeIfAbsent` mapper ran under the per-segment Java monitor → AB-BA deadlock with any
+   lock the mapper takes** — THE boot killer (~100% of round-9 "Could not start container").
+   Live-captured cycle (trace7-a2): tid=31's `NodeSubregistry.registerChild` mapper held segment
+   monitor B and blocked on the `CapabilityRegistry` write lock (`AbstractQueuedLongSynchronizer`
+   real bytecode, JDK 25 long-state AQS); tid=40 held that write lock inside
+   `registerPossibleCapability@76` and blocked on B via `possibleCapabilities.computeIfAbsent` — a
+   different key, impossible on HotSpot's per-bin `ReservationNode` locking, guaranteed with ~40
+   `parallel-extension-add` threads on our 16-way segments. This is exactly the residual the
+   2026-07-15 CHM session predicted ("the absent-key computeIfAbsent mapper still runs under the
+   segment monitor"). Fix (`native-collections/src/lib.rs`): JDK-equivalent reservation protocol —
+   Phase 1 installs the segment object itself as a per-key reservation marker under the monitor
+   (same-key racers `Object.wait` on the segment; adopt-on-arrival), Phase 2 runs the mapper with NO
+   monitor held, Phase 3 commits/removes the marker under the monitor + `notifyAll`. Lock-free
+   readers (`chm_seg_get`) treat a marker value as absent, mirroring `ReservationNode` visibility.
+
+2. **`System.setIn/Out/Err` override table held bare `ObjectRef`s in a process-global static — not a
+   GC root** (`native-builtins/src/lib.rs`). First moving GC after WildFly's early
+   `System.setOut(DelegatingPrintStream)` left the entry pointing at recycled memory
+   (`ClassId(0)`/`java/lang/Object`, `num_slots=0`) → every native-originated framework log line was
+   silently dropped (the historic "server.log stays empty" symptom) and, once the RESID-DIAG landed
+   (2026-07-18), each dropped line also printed a ~115-frame symbolized backtrace — thousands per
+   boot, the "SLOW_ACTIVE" CPU burn. Fix: entries now hold a persistent global root
+   (`add_global_root`/`resolve_global_root`) with release-on-replace; another instance of the
+   persistent-singleton-root defect class.
+
+3. **`with_stdio_print_lock` held across recursive Java execution** (`stream_write`/`stream_writeln`/
+   `native_printstream_write`/`write_int`): `surefire_forwarding_write` and
+   `route_write_through_out` run `invoke_virtual` (arbitrary bytecode: Java monitors, class_manager,
+   GC) under a global native mutex — live-gdb-captured 110-thread wedge (class_manager writer in
+   `wait_for_readers`, 8 readers queued, stdio-lock cycle). Fix: the mutex now brackets ONLY the raw
+   fd writes.
+
+4. **`emit_framework_log` wrote the override stream via the native fast path only** — for a
+   delegating stream whose sink is not field-reachable (WildFly `org.jboss.stdio`), output was
+   dropped even with a valid override. Fix: non-canonical override streams get a real
+   `println(String)` virtual dispatch (recursion-guarded, receiver-class-guarded, pin/refresh across
+   `create_string`), with the old native writeln as fallback.
+
+5. **Bogus `VerifyError: cannot override final method` for package-private finals across packages**
+   (`classloading/src/verifier.rs`): glassfish `ManagedScheduledThreadPoolExecutor.reject(Runnable)`
+   vs `j.u.c.ThreadPoolExecutor`'s package-private final `reject` — JVMS 5.4.5 says a
+   package-private method is not inherited across packages, so this is a new method, not an
+   override. Was failing `org.wildfly.ee.concurrent.scheduled-executor.default` at every boot.
+
+6. **`ChmMonitorGuard` leaked the segment monitor whenever a moving GC ran inside the guarded
+   body** (`native-collections/src/lib.rs`): the guard's `Drop` called `monitor_exit` with the
+   ObjectRef captured at acquire time; the guarded body routinely allocates (key `hashCode`/`equals`,
+   map growth), so a young collection could relocate the segment mid-section — the exit then missed
+   the (remapped) monitor and left it owned forever. Live-captured (hunt2-a1): tid=29 owned a
+   segment monitor with NO CHM frame anywhere on its stack, parked innocently on the capability
+   write lock; every later toucher of that segment deadlocked (~25-50% of boots even after fix #1).
+   Fix: the guard pins the segment on acquire and `Drop` exits via the pin-refreshed CURRENT
+   address. This closes the leak for every CHM mutator (`put`/`putIfAbsent`/`remove`/`replace`/
+   `merge`/`compute`/`computeIfPresent`) in one place.
+
+Also fixed: the unconditional `[RESID-DIAG READ/WRITE]` backtraces in `gc/src/gen_heap.rs` are now
+rate-limited (first 5 full backtraces, then count-only power-of-two heartbeats).
+
+### Verification
+
+- Isolated direct standalone boots (exact Arquillian-captured cmdline, JIT on, 256 MB default heap
+  cap): **8/8 boots reach a bound management port (9990) in 15 seconds** (`hunt3`, fix9 binary) vs
+  0/3 (fix7, one fix missing) and 3/4→2 wedges (fix8, guard leak still present) vs ~0% healthy on
+  the round-9 v8 binary.
+- `cargo test -p cratonvm-native-collections --lib`: 74/74. `cargo test -p cratonvm-vm --lib`:
+  2233 passed, 7 failed — all 7 in `jit::skip_list`, reproduced IDENTICALLY on the pristine fork
+  commit (`/data/wt-stw-baseline-skiplist.log`): pre-existing dev drift, not from this branch.
+
+New diagnostics kept (all env-gated, zero default cost): `CRATONVM_DBG_AQS_TRACE` (state-transition
+ledger for the j.u.c.locks synchronizer family — CAS long/object + volatile putfield, with
+pre-values), and the `CRATONVM_DBG_MONENTER` stall attributor (`[monenter-stall]` names the owner tid
+and the contested object's class after 10s).
+
+### Methodology notes for future sessions
+
+- The AQS ledger + per-object state reconstruction (stitching address epochs across GC moves by
+  matching `first_pre` to the previous epoch's final state) is what cracked this: it proved the
+  "leaked" lock was actually FREE and the waiters were enqueued on a different instance, then named
+  the exact holder/waiter tids. Scripts in `/data/probe-stw-20260720/` on the Azure host.
+- `--stack-dump-on-timeout` + the thread summary's `blocked=true` + `top=` line identifies a holder
+  blocked inside an invisible native frame; the monenter-stall label closes the loop.
+- pgrep/pkill self-match (pattern appears in your own ssh cmdline) repeatedly poisoned process
+  censuses this session — use `readlink /proc/*/exe` matching, not `pkill -f`.
+
+### Residuals (new, separately trackable, none block boot)
+
+- MSC `org.wildfly.undertow.server.default-server` fails with `IllegalStateException: Service
+  unavailable`; `org.wildfly.security.key-store.applicationKS` fails WFLYELY00004; infinispan
+  cache-container-configuration fails `ModuleNotFoundException: java.base`. Boot continues past all
+  three; impact on individual Arquillian classes TBD.
+- The round-9 client-side `OutOfMemoryError: Java heap space (new_object class_id 1634 fields 2)`
+  (28/197) is downstream of the never-succeeding startup: the surefire JVM (also CratonVM,
+  `-Xmx512m`, and `CRATONVM_DEFAULT_HEAP_MAX_MB=256` in the shard env) sits in
+  `ManagementClient.isServerInRunningState`'s ~60s poll loop while the container never reaches the
+  running state — first because of the boot wedge, now because of the SASL reject. Not separately
+  reproduced as a VM leak once boot/auth is the gating failure; expected to disappear when the
+  management-auth blocker is fixed.
+- WildFly's own log records still bypass the real logmanager handler pipeline (the
+  `org.jboss.logging.Logger` native intercepts route to `emit_framework_log` instead of `doLog`), so
+  `server.log` stays sparse — cosmetic for the suite, bad for debuggability.
+- `compute`/`computeIfPresent`/`merge` remappers still run under the segment monitor (only
+  `computeIfAbsent` got the reservation protocol — it is the only shape observed deadlocking).
+
+### The NEW dominant suite blocker (out of scope for this doc — a different subsystem)
+
+With the six boot fixes above, the container now **boots to a fully functional management endpoint**
+— curl against `:9990` returns a 302 to the console and completes the `jboss-remoting` HTTP upgrade
+(`101 Switching Protocols`, correct `Sec-JbossRemoting-Accept`). But Arquillian's own management
+client can no longer authenticate: every class now fails at `LifecycleException: Could not start
+container` whose root cause is `TimeoutException: Managed server was not started within [60] s`,
+downstream of a **`JBOSS-LOCAL-USER` SASL rejection** on the management remoting connection (client
+"SASL Negotiation Completed", server "rejected authentication"). This is a management
+remoting/Elytron-SASL protocol-fidelity bug, NOT a boot hang — it was completely masked for the
+entire history of this doc because the container never finished booting. Cleanly localized: a
+real-JDK `jboss-cli-client.jar` against the (healthy) CratonVM container times out during the
+post-upgrade remoting handshake (`WFLYPRT0023`), while a CratonVM client reaches SASL and is rejected
+— i.e. the CratonVM native XNIO/remoting stream diverges from the real jboss-remoting protocol after
+the HTTP upgrade. MicroProbes confirm the primitives underneath are sound (file byte-roundtrip OK,
+blocking-socket echo 40 KB bad=0, so the SASL challenge-file mechanism's building blocks work) —
+the defect is in the remoting/SASL layer itself. **This needs its own doc and its own
+investigation** (XNIO conduit / jboss-remoting framing + Elytron `LocalUser` server-side challenge
+comparison); it is the correct next target for anyone continuing the WildFly suite, but it is not a
+residual of the STW-takeover boot hang.
+
+### Rare residual wedge (~5%, different site — `Collections$SetFromMap` monitor)
+
+Post-fix verification across four binaries and 22 isolated boots on the final on-dev binary:
+**21/22 healthy** (hunt3 8/8, hunt4 3/4, gw1 10/10). The single wedge (hunt4-a2) was NOT the CHM
+segment monitor this session fixed — `CRATONVM_DBG_MONENTER` labeled it a monitor on a
+`java/util/Collections$SetFromMap` object (owner tid held it `entry_count=1` while ~130 waiters piled
+up). No CratonVM native ever monitors a `SetFromMap` (grep-confirmed), so this is a pure Java
+`synchronized(set)` held across a blocking op somewhere in `parallel-extension-add` — the same
+"monitor held across blocking" family, a different site. It did NOT reproduce in a dedicated 10-boot
+gdb-capture batch (`gw1`), so the owners stack was never captured. Left as a documented rare residual
+
+### Rare residual wedge (~5%, different site — `Collections$SetFromMap` monitor)
+
+Post-fix verification across four binaries and 22 isolated boots on the final on-dev binary:
+**21/22 healthy** (hunt3 8/8, hunt4 3/4, gw1 10/10). The single wedge (hunt4-a2) was NOT the CHM
+segment monitor this session fixed — `CRATONVM_DBG_MONENTER` labeled it a monitor on a
+`java/util/Collections$SetFromMap` object (owner tid held it `entry_count=1` while ~130 waiters piled
+up). No CratonVM native ever monitors a `SetFromMap` (grep-confirmed), so this is a pure Java
+`synchronized(set)` held across a blocking op somewhere in `parallel-extension-add` — the same
+"monitor held across blocking" family, a different site. It did NOT reproduce in a dedicated 10-boot
+gdb-capture batch (`gw1`), so the owner's stack was never captured. Left as a documented rare residual
+(task filed): whoever hits it should re-run `/data/probe-stw-20260720/gdbwedge.sh <bin> <tag> 20`
+(gdb-attaches the container the instant `[monenter-stall]` appears) to get the owner frame, then look
+for a WildFly/JBoss-Modules `synchronized` block that wraps a blocking registry/lock acquisition. Note
+this is moot for the suite until the separate `JBOSS-LOCAL-USER` SASL blocker
+(`docs/known-issues/wildfly-management-jboss-local-user-sasl-rejection.md`) is fixed — no test can
+pass through management auth regardless of boot health.
