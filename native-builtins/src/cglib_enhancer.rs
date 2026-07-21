@@ -18,7 +18,9 @@
 //! For each `@Configuration` Class<?> passed in we:
 //!
 //!   1. Synthesise a class file whose `this_class` is
-//!      `<OriginalName>$$EnhancerByCGLIB$$<counter>`.
+//!      `<OriginalName>$$SpringCGLIB$$<counter>` (Springs own naming
+//!      policy tag, not cglibs default EnhancerByCGLIB -- see
+//!      `build_enhancer_class`s doc comment).
 //!   2. Set `super_class` to the original `@Configuration` class so the new
 //!      class is a real subclass (`isAssignableFrom` works, `cast` works).
 //!   3. List `org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration`
@@ -64,7 +66,7 @@ use cratonvm_types::Value;
 static ENHANCER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-superclass-name suffix counters for `build_enhancer_class`'s
-/// `$$EnhancerByCGLIB$$<n>` names — real CGLIB's `DefaultNamingPolicy` keys
+/// `$$SpringCGLIB$$<n>` names -- Springs own `SpringNamingPolicy` keys
 /// its counter by the base class name, so the first proxy generated for any
 /// given `@Configuration` class always gets suffix `0`, no matter how many
 /// *other* classes were enhanced earlier in the same JVM/session. Using the
@@ -80,7 +82,7 @@ fn config_enhancer_counters() -> &'static Mutex<HashMap<String, u64>> {
     COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Next `$$EnhancerByCGLIB$$<n>` suffix for `super_internal_name`, starting
+/// Next `$$SpringCGLIB$$<n>` suffix for `super_internal_name`, starting
 /// at 0 for the first enhancement of any given class.
 fn next_config_enhancer_counter(super_internal_name: &str) -> u64 {
     let mut counters = config_enhancer_counters()
@@ -98,7 +100,7 @@ fn next_config_enhancer_counter(super_internal_name: &str) -> u64 {
 /// classloader) key and returns the SAME `Class` object on a repeat
 /// `Enhancer.createClass()` for an identical configuration, rather than
 /// generating a fresh numbered subclass every time. `cce_enhance` used to
-/// regenerate + `defineClass` a brand-new `$$EnhancerByCGLIB$$<n>` subclass
+/// regenerate + `defineClass` a brand-new `$$SpringCGLIB$$<n>` subclass
 /// on every call — harmless for ordinary bean creation (each instance is
 /// independent regardless of which identical-shape class it's an instance
 /// of) but wrong whenever code depends on repeated `enhance()` calls for the
@@ -108,8 +110,10 @@ fn next_config_enhancer_counter(super_internal_name: &str) -> u64 {
 /// `CglibConfiguration` is enhanced exactly once per JVM session — other
 /// test methods in the same class also register `CglibConfiguration` and
 /// enhance it independently, bumping the counter before this test runs.
-fn config_enhancer_class_cache() -> &'static Mutex<HashMap<u32, cratonvm_types::ClassId>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, cratonvm_types::ClassId>>> = OnceLock::new();
+type CachedEnhancerClass = (cratonvm_types::ClassId, String, std::sync::Arc<Vec<u8>>);
+
+fn config_enhancer_class_cache() -> &'static Mutex<HashMap<u32, CachedEnhancerClass>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, CachedEnhancerClass>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -322,6 +326,101 @@ fn emit_default_ctor(
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count (no StackMapTable; v52 lets us skip it)
 
     // attribute_info: name_index(u16), length(u32), info(bytes)
+    method.extend_from_slice(&code_attr_name_idx.to_be_bytes());
+    method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
+    method.extend_from_slice(&code_attr);
+    method
+}
+
+/// Emit a constructor matching `desc` that delegates to the superclass's
+/// same-descriptor constructor (`super(arg0, arg1, ...)`), mirroring what
+/// real CGLIB emits for EVERY non-private superclass constructor -- not
+/// just a no-arg one. Constructors are never inherited, so a superclass
+/// with no no-arg constructor (any `@Configuration` class using
+/// constructor injection, e.g. `AutowiredMixedCglibConfiguration
+/// (Environment env)`) needs its own matching constructor on the
+/// generated subclass; `emit_default_ctor`'s single hardcoded `()V`
+/// version left such proxies with no usable constructor at all --
+/// `Class.getConstructor(Environment.class)` failed with
+/// `NoSuchMethodException`, surfacing during AOT processing as
+/// `ConfigurationClassPostProcessor$...ProxyBeanRegistrationCodeFragments
+/// .proxyInstantiationDescriptor`'s `IllegalStateException: No matching
+/// constructor found on proxy class`.
+fn emit_ctor_for_descriptor(
+    cw: &mut ClassWriter,
+    init_name_idx: u16,
+    code_attr_name_idx: u16,
+    super_class_idx: u16,
+    desc: &str,
+) -> Vec<u8> {
+    let desc_idx = cw.add_utf8(desc);
+    let super_init_ref = cw.add_methodref(super_class_idx, "<init>", desc);
+
+    let params = parse_param_descriptors(desc);
+    let mut code = vec![0x2Au8]; // aload_0
+    let mut slot: u16 = 1;
+    for p in &params {
+        let load_op: u8 = match p.as_str() {
+            "I" | "Z" | "B" | "C" | "S" => 0x15, // iload
+            "J" => 0x16,                         // lload
+            "F" => 0x17,                         // fload
+            "D" => 0x18,                         // dload
+            _ => 0x19,                           // aload (reference/array)
+        };
+        code.push(load_op);
+        code.push(slot as u8);
+        slot += if p == "J" || p == "D" { 2 } else { 1 };
+    }
+    code.push(0xB7); // invokespecial
+    code.extend_from_slice(&super_init_ref.to_be_bytes());
+    code.push(0xB1); // return
+
+    // max_stack: `this` plus every argument, counting long/double as 2
+    // stack words -- matches how they sit on the stack right before the
+    // invokespecial consumes them all at once.
+    let max_stack = 1 + params
+        .iter()
+        .map(|p| if p == "J" || p == "D" { 2 } else { 1 })
+        .sum::<u16>();
+
+    wrap_method(init_name_idx, desc_idx, code_attr_name_idx, &code, max_stack, slot)
+}
+
+/// Emit a no-op `public static CGLIB$SET_STATIC_CALLBACKS([Lorg/springframework
+/// /cglib/proxy/Callback;)V` (and, separately, an identically-shaped
+/// `CGLIB$SET_THREAD_CALLBACKS`). Real CGLIB emits both on every class it
+/// generates; `Enhancer.isEnhanced()` / `registerCallbacks()` /
+/// `registerStaticCallbacks()` do a plain `Class.getDeclaredMethod(name,
+/// Callback[].class)` lookup for these EXACT names and throw
+/// `IllegalArgumentException("... is not an enhanced class")`
+/// (`Enhancer.setCallbacksHelper`) if either is missing -- observed via
+/// `ConfigurationClassUtils.initializeConfigurationClass`, which the
+/// generated bean-registration source calls unconditionally and which
+/// itself calls `Enhancer.registerStaticCallbacks(configClass, CALLBACKS)`.
+///
+/// This native reimplementation never stores or reads a callback array --
+/// the `@Bean` method overrides in `emit_bean_override` inline their
+/// container-dispatch logic directly, with no indirection through
+/// `Callback` objects -- so both setters are legitimately no-ops here;
+/// their only job is to satisfy this reflective "is this class enhanced"
+/// check.
+fn emit_noop_callback_setter(cw: &mut ClassWriter, name_idx: u16, code_attr_name_idx: u16) -> Vec<u8> {
+    let desc_idx = cw.add_utf8("([Lorg/springframework/cglib/proxy/Callback;)V");
+    let code: [u8; 1] = [0xB1]; // return
+    let mut method = Vec::new();
+    method.extend_from_slice(&0x0009u16.to_be_bytes()); // ACC_PUBLIC | ACC_STATIC
+    method.extend_from_slice(&name_idx.to_be_bytes());
+    method.extend_from_slice(&desc_idx.to_be_bytes());
+    method.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1 (Code)
+
+    let mut code_attr = Vec::new();
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // max_stack
+    code_attr.extend_from_slice(&1u16.to_be_bytes()); // max_locals (the Callback[] param, slot 0 -- static method, no `this`)
+    code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
+    code_attr.extend_from_slice(&code);
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
     method.extend_from_slice(&code_attr_name_idx.to_be_bytes());
     method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
     method.extend_from_slice(&code_attr);
@@ -625,16 +724,25 @@ fn emit_bean_factory_field(name_idx: u16, descriptor_idx: u16) -> Vec<u8> {
     field
 }
 
-/// Generate a fresh `<OriginalName>$$EnhancerByCGLIB$$<counter>` class
+/// Generate a fresh `<OriginalName>$$SpringCGLIB$$<counter>` class
 /// file as a `Vec<u8>` plus the chosen internal-name. The new class
 /// extends `super_internal_name` and implements
 /// [`SPRING_MARKER_IFACE`].
 fn build_enhancer_class(
     super_internal_name: &str,
     bean_methods: &[BeanMethod],
+    ctor_descriptors: &[String],
 ) -> (String, Vec<u8>) {
     let counter = next_config_enhancer_counter(super_internal_name);
-    let new_name = format!("{super_internal_name}$$EnhancerByCGLIB$${counter:x}");
+    // Real CGLIB's naming policy is overridden by Spring's own
+    // `SpringNamingPolicy` (see `newEnhancer()` in
+    // `ConfigurationClassEnhancer.java`): tag is "SpringCGLIB", not the
+    // default "EnhancerByCGLIB", and the suffix is a PLAIN decimal counter
+    // (not a hash/hex value). Generated bean-registration source references
+    // the proxy class by this exact name (e.g. `new Foo$$SpringCGLIB$$0(...)`),
+    // so a mismatched name here means "cannot find symbol" at compile time
+    // even though a class WAS generated -- just under the wrong name.
+    let new_name = format!("{super_internal_name}$$SpringCGLIB$${counter}");
 
     let mut cw = ClassWriter::new();
 
@@ -643,11 +751,11 @@ fn build_enhancer_class(
     let super_class_idx = cw.add_class(super_internal_name);
     let iface_idx = cw.add_class(SPRING_MARKER_IFACE);
 
-    // -- Method machinery: <init>, ()V, Code, and the super-ctor methodref.
+    // -- Method machinery: <init> name + Code attribute name. Each
+    // superclass constructor gets its own descriptor Utf8 + super methodref,
+    // added inside `emit_ctor_for_descriptor` below.
     let init_name_idx = cw.add_utf8("<init>");
-    let void_no_arg_desc_idx = cw.add_utf8("()V");
     let code_attr_name_idx = cw.add_utf8("Code");
-    let super_init_methodref = cw.add_methodref(super_class_idx, "<init>", "()V");
 
     // -- `$$beanFactory` field (type Object) + its Fieldref on THIS class.
     let bf_field_name_idx = cw.add_utf8("$$beanFactory");
@@ -660,22 +768,34 @@ fn build_enhancer_class(
     let set_bf_name_idx = cw.add_utf8("setBeanFactory");
     let set_bf_desc_idx = cw.add_utf8("(Lorg/springframework/beans/factory/BeanFactory;)V");
 
-    let ctor = emit_default_ctor(
-        init_name_idx,
-        void_no_arg_desc_idx,
-        code_attr_name_idx,
-        super_init_methodref,
-    );
+    // Every non-private superclass constructor gets a matching delegating
+    // constructor on the proxy (real CGLIB does the same for each one) --
+    // see `emit_ctor_for_descriptor`'s doc comment for why a single
+    // hardcoded `()V` ctor isn't enough.
+    let ctor_descs: Vec<String> = if ctor_descriptors.is_empty() {
+        vec!["()V".to_string()]
+    } else {
+        ctor_descriptors.to_vec()
+    };
+    let mut methods: Vec<Vec<u8>> = ctor_descs
+        .iter()
+        .map(|d| emit_ctor_for_descriptor(&mut cw, init_name_idx, code_attr_name_idx, super_class_idx, d))
+        .collect();
+
     let set_bean_factory = emit_set_bean_factory(
         set_bf_name_idx,
         set_bf_desc_idx,
         code_attr_name_idx,
         bf_field_ref,
     );
+    methods.push(set_bean_factory);
+
+    let set_static_callbacks_name_idx = cw.add_utf8("CGLIB$SET_STATIC_CALLBACKS");
+    methods.push(emit_noop_callback_setter(&mut cw, set_static_callbacks_name_idx, code_attr_name_idx));
+    let set_thread_callbacks_name_idx = cw.add_utf8("CGLIB$SET_THREAD_CALLBACKS");
+    methods.push(emit_noop_callback_setter(&mut cw, set_thread_callbacks_name_idx, code_attr_name_idx));
 
     let field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
-
-    let mut methods: Vec<Vec<u8>> = vec![ctor, set_bean_factory];
 
     if !bean_methods.is_empty() {
         // Shared constant-pool refs used by every @Bean override.
@@ -1950,8 +2070,79 @@ fn scan_bean_methods(
 /// `ConfigurationClassEnhancer.enhance(Class<?>, ClassLoader) → Class<?>`
 /// native intercept. Replaces the previous "return original" bypass with a
 /// real subclass produced by the minimal emitter above.
+/// Mirror real CGLIB's `ReflectUtils.defineClass` hook: invoke the
+/// currently-installed `ReflectUtils.generatedClassHandler` (a
+/// `BiConsumer<String, byte[]>`, `org/springframework/cglib/core/ReflectUtils`)
+/// with the new class's dotted name and raw class-file bytes, exactly like
+/// real cglib does right before it defines the class.
+///
+/// Spring AOT processing installs this hook for the DURATION of
+/// `processAheadOfTime` (`ApplicationContextAotGenerator
+/// .withCglibClassHandler` -> `ReflectUtils.setGeneratedClassHandler
+/// (CglibClassHandler::handleGeneratedClass)`) specifically to capture
+/// generated CGLIB proxy bytecode into `GenerationContext.getGeneratedFiles()`
+/// -- both so tests can assert on it directly
+/// (`ApplicationContextAotGeneratorTests.isRegisteredCglibClass`) and, more
+/// importantly, so the LATER `TestCompiler` compile step (and real runtime
+/// AOT-generated source) can resolve the proxy class by name: the generated
+/// bean-registration source references the proxy class directly (e.g.
+/// `new Foo$$SpringCGLIB$$0(...)`), and without its .class bytes on the
+/// compile classpath that reference fails with "cannot find symbol".
+///
+/// This native reimplementation bypasses the real `Enhancer`/`ReflectUtils`
+/// bytecode-generation path entirely (see the module doc comment), so
+/// without this explicit call the hook installed above never fires. No-op
+/// (silently) if `ReflectUtils` isn't loaded or no handler is currently
+/// installed -- both legitimate outside of AOT processing.
+fn notify_generated_class_handler(
+    ctx: &mut dyn NativeContext,
+    loader_id: u32,
+    new_name: &str,
+    bytes: &[u8],
+) {
+    let Some(reflect_utils_cid) = ctx
+        .class_id_by_name_and_loader("org/springframework/cglib/core/ReflectUtils", loader_id)
+        .or_else(|| ctx.class_id_by_name("org/springframework/cglib/core/ReflectUtils"))
+    else {
+        return;
+    };
+    let Some(field_idx) =
+        ctx.static_field_index_by_name(reflect_utils_cid, "generatedClassHandler")
+    else {
+        return;
+    };
+    let Value::Object(Some(handler)) = ctx.get_static_field(reflect_utils_cid, field_idx) else {
+        return;
+    };
+    let dotted_name = new_name.replace('/', ".");
+    let name_str = ctx.create_string(&dotted_name);
+    let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(byte_arr, 0, bytes);
+    let _ = ctx.invoke_virtual(
+        handler,
+        "accept",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        &[Value::Object(Some(name_str)), Value::Object(Some(byte_arr))],
+    );
+}
+
 fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver, args[1] = config Class, args[2] = ClassLoader.
+    //
+    // The receiver's OWN loader (not the config class's) is what scopes
+    // ReflectUtils.generatedClassHandler correctly for
+    // notify_generated_class_handler: under @CompileWithForkedClassLoader,
+    // each test method gets a fresh child loader for INFRASTRUCTURE classes
+    // (ConfigurationClassEnhancer, ReflectUtils, and this test's specific
+    // installed handler), while the config class being enhanced is often
+    // loaded by a SHARED/parent loader reused across many test methods.
+    let receiver_loader_id = match args.first() {
+        Some(Value::Object(Some(recv))) => {
+            let recv_cid = ctx.class_id_of_object(*recv);
+            ctx.loader_id_of_class(recv_cid) as u32
+        }
+        _ => 0,
+    };
     let cls_val = match args.get(1).cloned() {
         Some(v) => coerce_class_arg(v),
         None => {
@@ -1982,11 +2173,13 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // returns the SAME `Class` on a repeat `enhance()` call instead of
     // generating a fresh numbered subclass every time — see
     // `config_enhancer_class_cache`'s doc comment.
-    if let Some(&cached_id) = config_enhancer_class_cache()
+    let cached = config_enhancer_class_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&super_class_id.as_u32())
-    {
+        .cloned();
+    if let Some((cached_id, cached_name, cached_bytes)) = cached {
+        notify_generated_class_handler(ctx, receiver_loader_id, &cached_name, &cached_bytes);
         let mirror = ctx.get_class_mirror(cached_id);
         return Ok(Some(Value::Object(Some(mirror))));
     }
@@ -2002,7 +2195,19 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // the subclass bytes. Loader id 0 = application loader (same as every other
     // defineClass entry point in this codebase).
     let bean_methods = scan_bean_methods(ctx, super_class_id);
-    let (new_name, bytes) = build_enhancer_class(&super_name, &bean_methods);
+    // Real CGLIB emits one delegating constructor per non-private
+    // superclass constructor -- see `emit_ctor_for_descriptor`'s doc
+    // comment. Constructors are never inherited, so only `super_class_id`'s
+    // OWN declared ones matter (no superclass-chain walk, unlike
+    // `scan_bean_methods`).
+    const ACC_PRIVATE: u16 = 0x0002;
+    let ctor_descriptors: Vec<String> = ctx
+        .declared_methods(super_class_id)
+        .into_iter()
+        .filter(|m| m.name == "<init>" && m.access_flags & ACC_PRIVATE == 0)
+        .map(|m| m.descriptor)
+        .collect();
+    let (new_name, bytes) = build_enhancer_class(&super_name, &bean_methods, &ctor_descriptors);
 
     let opts = DefineClassFull {
         override_name: Some(new_name.clone()),
@@ -2010,17 +2215,19 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         ..Default::default()
     };
 
-    match ctx.define_class_full(&new_name, &bytes, 0, opts) {
+    let bytes_arc = std::sync::Arc::new(bytes);
+    match ctx.define_class_full(&new_name, &bytes_arc, 0, opts) {
         Ok(cid) => {
             config_enhancer_class_cache()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(super_class_id.as_u32(), cid);
+                .insert(super_class_id.as_u32(), (cid, new_name.clone(), bytes_arc.clone()));
             let mirror = ctx.get_class_mirror(cid);
             eprintln!(
                 "[CCE] enhance: defined {new_name} (super={super_name}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
                 bean_methods.len(),
             );
+            notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
