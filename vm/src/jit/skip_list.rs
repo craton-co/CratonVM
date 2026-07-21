@@ -120,6 +120,18 @@ pub enum SkipReason {
     /// Keep this symbol-completion method interpreted until its JIT lowering
     /// is understood.
     ClassFinderComplete,
+    /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
+    /// unconditionally reach an internal `invokedynamic` (lambda) call site
+    /// that `jit_scan` lowers to an always-deopt uncommon trap
+    /// (`DeoptReason::UnreachedCode`) on every single invocation, not just a
+    /// mispredicted rare path. Once JIT-compiled these factories provide zero
+    /// benefit (100% of calls deopt) while still paying compile and
+    /// reconstruct-and-resume costs. Keep them interpreted outright rather
+    /// than relying on the runtime give-up path, which does not reliably stop
+    /// re-invocation once a caller's own inline cache has already cached the
+    /// raw entry point (ES-PERF-20260719 testSlicesDense: 6928 deopt events
+    /// for `makeInt` alone in a single test run).
+    StreamMatchOpsUncommonTrap,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -361,6 +373,21 @@ fn should_skip_jit_internal(
     // invokeinterface PIC invalidation handles changing lambda receivers.
     if class_name == "java/util/Collections" && method_name == "indexedBinarySearch" {
         return Some(SkipReason::JavaUtilCollection);
+    }
+
+    // ES-PERF-20260719 (2026-07-21): see StreamMatchOpsUncommonTrap doc comment.
+    // Confirmed via CRATONVM_DBG_DEOPT against the real testSlicesDense
+    // workload: `makeInt` alone produced 6928 `reason=UnreachedCode
+    // action=MakeNotCompilable` deopt events in a single ~700s window, none
+    // of which stopped further re-invocation of the doomed compiled entry.
+    // `makeRef`/`makeLong`/`makeDouble` share the exact same factory-method
+    // shape (a MatchKind switch building a sink via an internal lambda) and
+    // are included defensively even though only `makeInt` was observed
+    // faulting in this workload.
+    if class_name == "java/util/stream/MatchOps"
+        && matches!(method_name, "makeInt" | "makeRef" | "makeLong" | "makeDouble")
+    {
+        return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
@@ -4441,6 +4468,41 @@ mod tests {
                 "T1.1.38 GATE: {cls}.{meth} must be JIT-eligible under Aggressive"
             );
         }
+    }
+
+    #[test]
+    fn stream_matchops_uncommon_trap_stays_interpreted() {
+        // ES-PERF-20260719: makeInt/makeRef/makeLong/makeDouble deopt on
+        // literally every call once JIT-compiled (an internal indy site
+        // lowers to an unconditional uncommon trap) — must stay skipped
+        // unconditionally, under both policies, regardless of allow-packages.
+        for meth in ["makeInt", "makeRef", "makeLong", "makeDouble"] {
+            assert_eq!(
+                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::StreamMatchOpsUncommonTrap)
+            );
+            assert_eq!(
+                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Aggressive),
+                Some(SkipReason::StreamMatchOpsUncommonTrap)
+            );
+            assert_eq!(
+                check_with(
+                    "java/util/stream/MatchOps",
+                    meth,
+                    false,
+                    true,
+                    SkipPolicy::Conservative,
+                    &["java/util/"],
+                ),
+                Some(SkipReason::StreamMatchOpsUncommonTrap),
+                "must not be liftable via CRATONVM_JIT_ALLOW_PACKAGES=java/util/"
+            );
+        }
+        // A sibling MatchOps method not in the targeted list stays eligible.
+        assert_eq!(
+            check("java/util/stream/MatchOps$MatchKind", "values", false, true, SkipPolicy::Conservative),
+            None
+        );
     }
 
     #[test]
