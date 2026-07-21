@@ -1017,6 +1017,24 @@ fn cl_real_load_class_base(
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
+    let __obsreg_dbg =
+        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal.contains("ObservationRegistry");
+    if __obsreg_dbg {
+        let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        let parent_field = ctx.get_field_by_name(this, "parent");
+        let parent_cls = match parent_field {
+            cratonvm_types::Value::Object(Some(p)) => ctx.class_name_of_id(ctx.class_id_of_object(p)),
+            _ => None,
+        };
+        let isolated = crate::classloader::url_classloader_isolated_from_app(ctx, this);
+        let platform_singleton = *crate::classloader::platform_loader_store_dbg()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        eprintln!(
+            "[OBSREG-DBG] cl_real_load_class_base ENTER this={:?} this_class={:?} name={} parent_field={:?} parent_class={:?} isolated_from_app={} platform_singleton={:?}",
+            this, this_cls, internal, parent_field, parent_cls, isolated, platform_singleton
+        );
+    }
 
     // The platform loader owns JDK modules, never application entries. The
     // flat class store is shared by every loader in CratonVM, so allowing its
