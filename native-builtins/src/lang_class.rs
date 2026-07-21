@@ -1773,6 +1773,26 @@ pub(crate) fn native_class_for_name(
         }),
         _ => None,
     };
+    // The three/four-argument Class.forName overload treats an explicit null
+    // loader as the bootstrap loader. This is observably different from
+    // having no loader routing available: our flat class store must not make
+    // application classes visible through a bootstrap-only lookup.
+    // Keep this check ahead of every loader/global fallback (including the
+    // Spring Boot nested-JAR rescue below). Those fallbacks are appropriate
+    // only after a non-null application loader participated in resolution.
+    let explicit_bootstrap_loader = matches!(args.get(2), Some(Value::Object(None)));
+    if explicit_bootstrap_loader && !crate::classloader::is_bootstrap_class_name(&internal_name) {
+        return Err(
+            cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: dotted_name,
+            }
+            .into(),
+        );
+    }
+    // The initialize flag belongs to the explicit-null-loader overload too.
+    // Loading a bootstrap class with initialize=false must not run clinit.
+    let bootstrap_initialize =
+        matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
     if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
         eprintln!(
             "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
@@ -2127,8 +2147,37 @@ pub(crate) fn native_class_for_name(
         );
     }
 
-    match ctx.ensure_class_initialized(&internal_name) {
-        Ok(class_id) => {
+    let global_resolution: Result<(ClassId, ObjectRef), MethodCallFailed> =
+        if explicit_bootstrap_loader && !bootstrap_initialize {
+            // load_class deliberately stops after load/link; unlike
+            // ensure_class_initialized, it preserves forName(false, null).
+            match ctx.load_class(&internal_name) {
+                Ok(Some(Value::Object(Some(mirror)))) => match ctx.class_id_from_mirror(mirror) {
+                    Some(class_id) => Ok((class_id, mirror)),
+                    None => Err(
+                        cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                            class_name: dotted_name.clone(),
+                        }
+                        .into(),
+                    ),
+                },
+                Ok(_) => Err(
+                    cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                        class_name: dotted_name.clone(),
+                    }
+                    .into(),
+                ),
+                Err(e) => Err(e),
+            }
+        } else {
+            match ctx.ensure_class_initialized(&internal_name) {
+                Ok(class_id) => Ok((class_id, ctx.get_class_mirror(class_id))),
+                Err(e) => Err(e),
+            }
+        };
+
+    match global_resolution {
+        Ok((class_id, mirror)) => {
             // WP2.10 вЂ” JDK 25 spec: hidden classes (created via
             // Lookup.defineHiddenClass) are NOT discoverable by name.
             // `Class.forName` must throw ClassNotFoundException for them
@@ -2148,7 +2197,6 @@ pub(crate) fn native_class_for_name(
                     class_id.as_u32()
                 );
             }
-            let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(e) => {
@@ -20435,6 +20483,50 @@ Implementation-Title: opensaml-core-api\r\n\
             Some(sentinel_cid),
             "Class.forName(String) must use caller loader before global lookup"
         );
+    }
+
+    #[test]
+    fn hibernate_for_name_explicit_null_loader_rejects_global_app_class() {
+        let mut ctx = mock_ctx();
+        let app_class = "org/hibernate/orm/test/util/SerializableThing";
+        ctx.ensure_class_initialized(app_class)
+            .expect("make application class globally discoverable");
+        let name = ctx.create_string("org.hibernate.orm.test.util.SerializableThing");
+        let err = native_class_for_name(
+            &mut ctx,
+            &[
+                Value::Object(Some(name)),
+                Value::Int(0),
+                Value::Object(None),
+            ],
+        )
+        .expect_err("bootstrap-only lookup must not see a flat-store application class");
+        assert!(
+            matches!(
+                err,
+                MethodCallFailed::ExceptionThrown(_) | MethodCallFailed::InternalError(_)
+            ),
+            "explicit null loader must surface ClassNotFoundException, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn hibernate_for_name_explicit_null_loader_keeps_bootstrap_class_visible() {
+        let mut ctx = mock_ctx();
+        let string_cid = ctx
+            .ensure_class_initialized("java/lang/String")
+            .expect("make bootstrap class discoverable");
+        let name = ctx.create_string("java.lang.String");
+        let resolved = native_class_for_name(
+            &mut ctx,
+            &[Value::Object(Some(name)), Value::Int(1), Value::Object(None)],
+        )
+        .expect("bootstrap class should resolve through null loader")
+        .expect("Class.forName should return a class mirror");
+        let Value::Object(Some(mirror)) = resolved else {
+            panic!("expected Class mirror, got {resolved:?}");
+        };
+        assert_eq!(ctx.class_id_from_mirror(mirror), Some(string_cid));
     }
 
     #[test]
