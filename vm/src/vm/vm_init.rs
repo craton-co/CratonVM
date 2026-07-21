@@ -2016,6 +2016,14 @@ impl SharedVm {
             // Keep the default CLI's real-JDK registration in sync with the
             // synthetic-feature build above.
             cratonvm_native_builtins::phases_late::register_p60_process_handle(&mut native_methods);
+            // `java.lang.ClassValue#get`/`#remove` (see `classvalue_cache.rs`)
+            // — needed here explicitly because this real-JDK-mode branch does
+            // NOT call `register_synthetic_overrides` (which is where this
+            // registration otherwise lives, via `register_p67_misc`), same
+            // "keep in sync" reasoning as `register_p60_process_handle` above.
+            cratonvm_native_builtins::classvalue_cache::register_classvalue_natives(
+                &mut native_methods,
+            );
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:

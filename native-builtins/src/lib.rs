@@ -8527,6 +8527,7 @@ pub mod charset;
 pub mod classloader_value_sidetable;
 #[cfg(feature = "experimental-jmx")]
 pub mod jmx;
+pub mod classvalue_cache;
 pub mod jfr;
 pub mod panama;
 pub mod panama_libffi;

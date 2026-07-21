@@ -42238,28 +42238,14 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
-    // java.lang.ClassValue — thread-safe lazily computed per-class values (Java 7)
-    let cv = "java/lang/ClassValue";
-    r.register(
-        cv,
-        "get",
-        "(Ljava/lang/Class;)Ljava/lang/Object;",
-        |_ctx, _args| {
-            // Simplified: always return null (real impl calls computeValue).
-            // NOTE (BUG-W, 2026-06-13): dispatching to the subclass
-            // `computeValue(type)` was tried and is the right direction, but
-            // does NOT fix the motivating case — `MethodHandleImpl$ArrayAccessor$1.
-            // computeValue` itself returns null because the deeper
-            // MethodHandle-intrinsics path (`getAccessor`/`makeIntrinsic`) is
-            // not implemented. Left as the null stub pending that work.
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(cv, "remove", "(Ljava/lang/Class;)V", |_ctx, _args| {
-        // ClassValue's get() always returns null (no computeValue wiring),
-        // so there's nothing cached to remove. Documented no-op.
-        Ok(None)
-    });
+    // java.lang.ClassValue — thread-safe lazily computed per-class values
+    // (Java 7). Real semantics (lazy `computeValue` dispatch + per-(instance,
+    // Class) caching) restored 2026-07-20; see `classvalue_cache.rs` (and
+    // `register_classvalue_natives`'s doc comment there for why this is a
+    // standalone entry point, not inlined here). See docs/known-issues/
+    // springboot/core-spring-boot-test-config-data-and-classpath-scan-cluster.md
+    // Cluster C "Residual 5".
+    crate::classvalue_cache::register_classvalue_natives(r);
 
     // java.lang.System additions
     r.register(
