@@ -31,6 +31,14 @@ smaller/individual differences not yet clustered.
 > loop iterations after an `invokedynamic` trap. **FIXED 2026-07-20** — see
 > [`../../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`](../../internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
 
+> Closure update (2026-07-20): `webclient-loopback-self-connect-timeout-os10060-cluster.md`
+> is fixed — closed, moved to
+> [`../../internal/springboot/webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md`](../../internal/springboot/webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md).
+> Root cause pinned to `SocketChannel.connect()`'s non-blocking
+> deferred-failure path falsely reporting synchronous success; already fixed
+> by `49d7834e9` (reactor-netty startup-hang residuals fix), confirmed via
+> reproduction rather than code reading alone.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -211,7 +219,7 @@ open each doc for the full picture):
 | `"literal:" + aPath` dead-dispatched to `Object.toString()` via `String.valueOf`/indy string concat | **FIXED 2026-07-19** — `String.valueOf(Object)`'s real `obj.toString()` call site never retargeted onto the receiver's actual class (CP-symbolic class `java/lang/Object` isn't interface/abstract); added a receiver-aware `toString()` check ahead of the resolved `class_name`; verified `ThymeleafReactiveAutoConfigurationTests` 21/21 (up from 20/21); moved to [`../../internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md`](../../internal/springboot/path-tostring-indy-stringconcat-dead-dispatch-FIXED.md) |
 | [`tls-sslbundle-trust-validation-gap-cluster.md`](tls-sslbundle-trust-validation-gap-cluster.md) | OPEN — found 2026-07-17 |
 | [`web-server-mockito-restub-no-op-cluster.md`](web-server-mockito-restub-no-op-cluster.md) | OPEN — found 2026-07-17 |
-| [`webclient-loopback-self-connect-timeout-os10060-cluster.md`](webclient-loopback-self-connect-timeout-os10060-cluster.md) | OPEN — found 2026-07-17, residual of the contextrunner-resource-cycle re-triage below |
+| `webclient-loopback-self-connect-timeout-os10060-cluster.md` | **FIXED 2026-07-20** — moved to [`../../internal/springboot/webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md`](../../internal/springboot/webclient-loopback-self-connect-timeout-os10060-cluster-FIXED.md); root cause pinned to `SocketChannel.connect()`'s non-blocking deferred-failure path (`native-io/src/socket_channel.rs`) falsely reporting synchronous success, hiding a real connect failure from Netty until an untyped raw OS error surfaced later on write — fixed by already-merged `49d7834e9`. Verified via 4 independent suite-runner runs (88/88 test methods clean) |
 | [`webmvc-error-forward-and-multiboot-timeout-cluster.md`](webmvc-error-forward-and-multiboot-timeout-cluster.md) | OPEN — found 2026-07-17 |
 | [`webmvc-test-anonymous-tostring-override-not-dispatched.md`](webmvc-test-anonymous-tostring-override-not-dispatched.md) | OPEN — found 2026-07-17 (hypothesis for the dispatch gap; the format |
 | [`webserversslbundletests-pkcs12-mac-verification-failure.md`](webserversslbundletests-pkcs12-mac-verification-failure.md) | OPEN — found 2026-07-17 |
