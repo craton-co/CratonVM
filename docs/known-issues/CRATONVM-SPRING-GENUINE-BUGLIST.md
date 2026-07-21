@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 56 confirmed genuine bugs remaining |
-| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`) |
+| **Status** | OPEN — 41 confirmed genuine bugs remaining |
+| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
 
 ## Summary
@@ -30,7 +30,98 @@ not CratonVM bugs) were not rerun individually here but the 263-class rerun
 included them — EMPTY count held steady at 73, consistent with them still
 being environmental.
 
-## Notable clusters (current state, 2026-07-20)
+## Notable clusters (current state, 2026-07-21)
+
+**15 classes fixed 2026-07-21, six independent root causes.** Fixed on
+branch `fix/genuine-buglist-56-20260720`, merged to `dev` at `693702a2a`.
+
+1. **`native-collections` Integer-key `HashMap`/`HashSet` fast-path overlay
+   (`DenseIntEntries`) iterated in raw dense-index (ascending key) order**
+   instead of real JDK's hash-bucket order (`(capacity - 1) & hash(key)`,
+   insertion-order tiebreak within a bucket) — broke `keySet()`/`values()`/
+   `entrySet()` iteration for any `HashSet<Integer>`/`HashMap<Integer, V>`.
+   Fixed `util.CollectionUtilsTests`, `core.annotation
+   .NestedRepeatableAnnotationsTests`, `beans.ConcurrentBeanWrapperTests`.
+2. **`StringJoiner.add(CharSequence)` only handled a literal `String`**
+   via `read_string`, silently turning any other `CharSequence` (e.g. a
+   `StringBuilder` — `AbstractSqlParameterSource.toString()` builds each
+   entry that way) into the literal text `"null"`. Falls back to invoking
+   the real `toString()` now. Fixed `jdbc.core.namedparam
+   .BeanPropertySqlParameterSourceTests`/`MapSqlParameterSourceTests`.
+3. **`FilterOutputStream.flush()`/`close()` used the generic
+   `ctx.invoke_virtual` native-context dispatcher**, which for a
+   dynamically-generated subclass receiver (a Mockito ByteBuddy
+   `...OutputStream$MockitoMock...` mock) can silently resolve to an
+   inherited default method instead of the receiver's own override, so
+   Mockito never saw the delegated call. Switched to
+   `invoke_virtual_bytecode_only`. Fixed `util.StreamUtilsTests`.
+4. **`proxy_invoke_handler`'s `InvocationHandler.invoke()` result was
+   never unboxed** for a primitive-returning proxy method. Harmless for a
+   single proxy layer, but a proxy wrapping ANOTHER dynamic proxy re-boxed
+   the already-boxed wrapper's object reference into a fresh wrapper's raw
+   `int` slot, corrupting the value. Fixed via the existing
+   `proxy_unbox_primitive_return` helper (previously only used by the
+   `AnnotationProxy` branch). Fixed `aop.framework.autoproxy
+   .BeanNameAutoProxyCreatorTests` (`proxyWithDoubleProxying`).
+5. **Classes with no bytecode of their own** (`cratonvm/internal/*`
+   synthetic wrappers, and real JDK types CratonVM represents directly as
+   an instance of their own interface's `ClassId`, e.g. `java.lang.reflect
+   .TypeVariable`) have exact-class natives that `find_method_recursive`'s
+   hierarchy walk can't see, landing on an inherited `java.lang.Object`
+   method instead (identity-hash `toString()` instead of e.g. `"[foo,
+   bar]"` or a `TypeVariable`'s name). Reflective `Method.invoke()` and any
+   native-code-initiated `ctx.invoke_virtual` hit this; ordinary bytecode
+   `invokevirtual` doesn't (the interpreter's own dispatch checks the
+   native registry first). Check the exact-class native first for this
+   namespace/shape before the hierarchy walk. Fixed `expression.spel
+   .MethodInvocationTests`/`SpelCompilationCoverageTests`,
+   `core.GenericTypeResolverTests`.
+6. **`HttpURLConnection.getLastModified()`/`getHeaderFieldDate()`
+   unconditionally returned 0/the fallback for any real http(s) URL**,
+   ignoring the actual response's `Last-Modified` header entirely. Added a
+   minimal RFC 1123 date parser and routed both accessors through the real
+   response headers. Also fixed a GC-safety bug in `huc_perform` (the
+   header array + per-header `String` + body `byte[]` allocations can
+   relocate `this`; needed pin/re-read, both inside `huc_perform` and in
+   its three callers) — improves header handling generally but does NOT
+   fully fix `core.io.ResourceTests`' `lastModified()` methods (see below).
+
+Also confirmed fixed as side effects (no source change needed, just
+re-verified): `jms.core.JmsTemplateTransactedTests`,
+`test.context.BootstrapUtilsTests`, `test.context.testng
+.TestNGConcurrencyTests`, `scheduling.quartz.QuartzSupportTests` (17
+found/9 succeeded/0 failed — the rest skipped, no failures; the
+`spring-context-support` module compile gap noted in the 2026-07-20 entry
+below is no longer reproducible against the current `spring-framework-
+recheck` checkout).
+
+Regression-checked: `cargo test -p cratonvm-vm --lib --release` — 2227
+passed / 9 failed post-merge (all 9 the pre-existing `runtime::lock_order`
+release-mode-only "should panic" assertions; the `jit::skip_list` env-
+gated failures present pre-merge are gone, fixed by unrelated concurrent
+work merged from `origin/dev`), no new failures.
+
+**Still open, not fixed by this session:**
+- `core.io.ResourceTests`: 2/68 methods (`remoteResourceExists`/
+  `remoteResourceExistsFallback`) still return `0` from `lastModified()`
+  for this specific `MockWebServer` HEAD-then-GET-fallback scenario,
+  despite fix 6 above correctly parsing the header in an isolated
+  `HttpURLConnection` probe — root cause not yet found; investigation was
+  cut short by host instability (an unplanned reboot, then heavy
+  concurrent load from other sessions causing repeated hangs on this
+  exact test class).
+- `core.retry.RetryPolicyTests`: 1/23 fails on a `toString()` regex
+  expecting `"Lambda"` in a composed `Predicate`'s class name; CratonVM
+  implements `Predicate.and()`/`or()`/`negate()` as named synthetic classes
+  (`Predicate$And`/`$Or`/`$Negate`) rather than synthesizing true lambdas —
+  a deliberate, widely-used design choice, not a bug worth touching for
+  one cosmetic assertion.
+- `jndi.JndiObjectFactoryBeanTests`: 1/25 fails
+  (`lookupWithExposeAccessContext` — Mockito verifies `context.close()`
+  called 2 times but sees 3, an extra close through an
+  `exposeAccessContext` JDK dynamic proxy) — not yet investigated.
+
+## Notable clusters (2026-07-20 session)
 
 **JMX — 26/26 fixed, cluster fully closed (2026-07-20).** The systemic
 `RequiredModelMBean` breakage flagged on 2026-07-17 was resolved for all but
@@ -274,14 +365,14 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `aop.framework.autoproxy.BeanNameAutoProxyCreatorTests` | FAIL | 8/9 | 8259ms |
-| `aop.support.MethodMatchersTests` | FAIL | 13/14 | 10851ms |
+| `aop.framework.autoproxy.BeanNameAutoProxyCreatorTests` | OK (2026-07-21 fix) | 9/9 | 5216ms |
+| `aop.support.MethodMatchersTests` | OK (2026-07-21 fix) | 14/14 | 2463ms |
 
 ### Beans
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `beans.ConcurrentBeanWrapperTests` | FAIL | 100/101 | 16852ms |
+| `beans.ConcurrentBeanWrapperTests` | OK (2026-07-21 fix) | 101/101 | 4027ms |
 | `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` | OK (2026-07-20 JIT fix) | 14/14 | 138189ms |
 | `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | FAIL (2026-07-20, major improvement, see above) | 31/34 | 324252ms |
 | `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | OK (2026-07-20 JIT fix, needs ~470s) | 47/47 | 466737ms |
@@ -306,8 +397,8 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `core.GenericTypeResolverTests` | FAIL | 24/25 | 2651ms |
-| `core.annotation.NestedRepeatableAnnotationsTests` | FAIL | 2/12 | 759ms |
+| `core.GenericTypeResolverTests` | OK (2026-07-21 fix) | 25/25 | 352ms |
+| `core.annotation.NestedRepeatableAnnotationsTests` | OK (2026-07-21 fix) | 12/12 | 230ms |
 | `core.io.ResourceTests` | FAIL | 66/68 | 4689ms |
 | `core.io.buffer.DataBufferTests` | TIMEOUT | 0/0 | 120000ms |
 | `core.retry.RetryPolicyTests` | FAIL | 22/23 | 828ms |
@@ -316,8 +407,8 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `expression.spel.MethodInvocationTests` | FAIL | 22/23 | 2158ms |
-| `expression.spel.SpelCompilationCoverageTests` | FAIL | 159/162 | 26105ms |
+| `expression.spel.MethodInvocationTests` | OK (2026-07-21 fix) | 23/23 | 1427ms |
+| `expression.spel.SpelCompilationCoverageTests` | OK (2026-07-21 fix) | 162/162 | 31969ms |
 
 ### Http
 
@@ -328,14 +419,14 @@ All 8 HTTP JSON/message-converter cluster classes fixed 2026-07-20 — see
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `jdbc.core.namedparam.BeanPropertySqlParameterSourceTests` | FAIL | 7/10 | 4631ms |
-| `jdbc.core.namedparam.MapSqlParameterSourceTests` | FAIL | 3/6 | 1118ms |
+| `jdbc.core.namedparam.BeanPropertySqlParameterSourceTests` | OK (2026-07-21 fix) | 10/10 | 547ms |
+| `jdbc.core.namedparam.MapSqlParameterSourceTests` | OK (2026-07-21 fix) | 6/6 | 77ms |
 
 ### Jms
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `jms.core.JmsTemplateTransactedTests` | FAIL | 51/52 | 13857ms |
+| `jms.core.JmsTemplateTransactedTests` | OK (2026-07-21, side effect) | 52/52 | 24492ms |
 
 ### Jndi
 
@@ -359,10 +450,7 @@ above. Removed from this table.
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `scheduling.quartz.QuartzSupportTests` | FAIL | 8/17 | 9296ms |
-
-(`QuartzSupportTests` not re-verified this session — see note above; kept as
-FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
+| `scheduling.quartz.QuartzSupportTests` | OK (2026-07-21, side effect) | 9/17 (8 skipped, 0 failed) | 6203ms |
 
 ### Scripting
 
@@ -374,7 +462,7 @@ FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `test.context.BootstrapUtilsTests` | FAIL | 22/23 | 9109ms |
+| `test.context.BootstrapUtilsTests` | OK (2026-07-21, side effect) | 23/23 | 1505ms |
 | `test.context.aot.AotIntegrationTests` | FAIL (2026-07-20, now completes, see above) | 0/4 | 56296ms |
 | `test.context.aot.TestClassScannerTests` | OK (2026-07-20 JIT fix) | 7/7 | 197691ms |
 | `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL (2026-07-20, improved, see above) | 2/4 | 148117ms |
@@ -382,15 +470,15 @@ FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 | `test.context.bean.override.mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` | FAIL | 4/6 | 16982ms |
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | FAIL | 0/2 | 918ms |
 | `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | TIMEOUT | 0/0 | 120000ms |
-| `test.context.testng.TestNGConcurrencyTests` | FAIL | 0/1 | 3669ms |
+| `test.context.testng.TestNGConcurrencyTests` | OK (2026-07-21, side effect) | 1/1 | 2439ms |
 | `test.web.servlet.assertj.MockMvcTesterIntegrationTests` | FAIL | 72/74 | 58069ms |
 
 ### Util
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `util.CollectionUtilsTests` | FAIL | 30/32 | 1016ms |
-| `util.StreamUtilsTests` | FAIL | 10/11 | 5019ms |
+| `util.CollectionUtilsTests` | OK (2026-07-21 fix) | 32/32 | 484ms |
+| `util.StreamUtilsTests` | OK (2026-07-21 fix) | 11/11 | 1402ms |
 
 ### Web
 
