@@ -1,6 +1,16 @@
 # `module/spring-boot-restclient`: two unrelated residuals
 
-**Status: Issue A FIXED 2026-07-18 (`b7309a005`), Issue B FIXED 2026-07-20**
+**Status: Issue A FIXED 2026-07-18 (`b7309a005`), Issue B FIXED 2026-07-20, `ObservationRegistry` residual FIXED (confirmed 2026-07-21)**
+
+## Update 2026-07-21: `ObservationRegistry` residual closed
+
+The `BeanDefinitionOverrideException` residual noted below (tracked in
+[`observationregistry-conditionalonmissingbean-classpathexclusions.md`](observationregistry-conditionalonmissingbean-classpathexclusions-FIXED.md))
+is now also fixed — see that doc for details. It turned out to already be
+fixed on `dev` by `65d738bb5`, an unrelated commit from a concurrent
+investigation session, discovered and confirmed via re-verification rather
+than a new fix authored in this pass. All residuals of this doc are now
+closed.
 
 ## Resolution
 
