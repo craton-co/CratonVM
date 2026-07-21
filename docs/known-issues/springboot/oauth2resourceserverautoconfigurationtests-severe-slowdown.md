@@ -94,6 +94,27 @@ timeout used by the suite runner, with zero individual test ever actually
 stuck. This fully and quantitatively explains the observed "HANG"
 classification without requiring any non-termination at all.
 
+**Addendum (2026-07-21, from the sibling
+[`jacksonautoconfigurationtests-severe-slowdown.md`](jacksonautoconfigurationtests-severe-slowdown.md)
+investigation):** the ~7.8s/iteration figure above comes from a hand-rolled
+`main()` repro that, like this doc's methodology, calls the Spring code
+directly and **bypasses JUnit5's `Launcher`/Jupiter engine entirely**. The
+Jackson investigation found that routing the *same* kind of Spring work
+through the real JUnit5 launcher adds a large **additional** multiplier on
+top of the Spring-level cost — JUnit5's own reflective execution machinery
+(`InterceptingExecutableInvoker`/`InvocationInterceptorChain`, extension
+resolution, per-test `ConditionEvaluator` calls) is itself another
+dispatch-call-dense subsystem paying the same systemic per-call tax. This
+doc's own captured stacks also show real depth inside
+`InterceptingExecutableInvoker`/`InvocationInterceptorChain` alongside the
+Spring-level frames (see the 156-frame dump excerpted above), so the true
+per-test cost for the 47 real (JUnit5-launched) tests in this class is
+likely **higher** than the flat ~7.8s hand-rolled figure — the 367s estimate
+above should be read as a lower bound, not a tight estimate. Not
+re-measured directly against the real JUnit5-launched class this session;
+see the Jackson doc for the A/B methodology to reproduce if a tighter number
+is needed.
+
 ### Where the flat ~2.5-3x per-context slowdown itself comes from
 
 Not specific to Spring Security or generics — this session also isolated a
