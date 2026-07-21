@@ -708,46 +708,132 @@ JUnit-free stress loop and two isolated slice-replay experiments.
     doc). A genuine unhandled OS-level fault in our own binary should have
     produced a WER entry the same way; it did not.
 
-**Honest conclusion**: real, reproducible-with-~10-minutes-effort residual,
-requiring substantial (~55+ test) cumulative interpreter/JVM state plus an
-SSL-test failure as an apparent trigger, but its actual kill mechanism
-evades every diagnostic technique tried (panic hook, `hs_err` writer, `cdb`
-live-attached launch, WER). Two non-exclusive possibilities remain open:
-(a) genuine external process termination on this heavily shared,
-multi-tenant Windows box (another concurrent session's cleanup script
-matching `cratonvm*.exe` by wildcard — see
-[[feedback_shared_host_blanket_process_kill]] — other sessions' differently
--named CratonVM processes were independently observed running throughout
-this window), or (b) a genuine internal bug whose kill path bypasses all of
-Rust's normal panic/abort/exit instrumentation (a raw Windows API call like
-`ExitProcess`/`TerminateProcess` from within CratonVM's own code, not found
-in this pass's `process::exit`/`abort` grep sweep — worth a targeted grep
-for `ExitProcess`/`TerminateProcess`/`kernel32` FFI calls next). **Not
-fixed — no code bug was conclusively identified.**
+## Resolved (2026-07-21, later same day): it's a genuine internal HANG, not a crash or external kill — caught live for the first time
 
-**Still OPEN / not yet done**:
-1. Grep for raw `ExitProcess`/`TerminateProcess` Win32 FFI calls (not just
-   `std::process::exit`/`abort`) as a possible internal, instrumentation
-   -bypassing kill path not yet checked.
-2. Re-verify whether this residual reproduces at all on a non-shared host
-   (or with this box's other sessions paused) — would distinguish
-   possibility (a) from (b) above definitively.
-3. If pursuing further, build a lightweight in-process heartbeat that logs
-   (with `fsync`) after every native call/test boundary, so whatever kills
-   the process — internal or external — leaves a forensic trail of the
-   last thing that happened; none of the passive techniques tried this
-   session (panic hooks, `cdb` attach, WER) caught anything.
+The "silent instantaneous death" framing above was wrong. Added a forensic
+liveness heartbeat (`vm/src/runtime/heartbeat_watch.rs`, opt-in via
+`CRATONVM_DBG_HEARTBEAT=<ms>`, armed from the launcher thread before
+`main-vm` spawns so it survives even if `main-vm` itself hangs — a
+permanent, reusable diagnostic tool, zero default behavior change, kept
+regardless of this residual's outcome) and reran the repro repeatedly.
+Confirmed via the heartbeat that when the "death" happens, it's genuinely
+instantaneous across all threads (heartbeat and Java stdout logging stop
+within ~100ms of each other every time) — but on one attempt the process
+was still alive (heartbeat ticking normally) with zero test progress for
+5+ minutes, sitting at the exact same test
+(`whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed`) that other runs had
+"died" at. **This is a genuine hang, not a crash** — every prior "silent
+death" observation was almost certainly this same hang, later killed by
+some external timeout (this session's own suite-runner `-TimeoutSec`, or a
+`Bash`-tool-level timeout on an earlier synchronous invocation) *after*
+the hang had already occurred, which is why post-mortem inspection never
+found any internal trace: there wasn't one to find, because nothing inside
+the process ever "died" on its own — something outside it eventually
+pulled the plug on an already-stuck process. This retroactively explains
+every earlier observation cleanly (no panic/hs_err/exit-banner because
+none of those code paths ever ran; instantaneous multi-thread death
+because an external `TerminateProcess` kills a whole process atomically;
+inconsistent position because different attempts had different external
+timeouts and different amounts of already-completed test progress by the
+time each one fired).
+
+**Caught the actual live hang and got a full symbol-resolved thread dump**
+(`cdb -pv -p <pid> -y <symdir> -lines -c "~*kb 30;qd"` — attach live,
+non-invasively, to a process that's still running rather than
+post-mortem). Only **5 threads exist in the whole process**: `main` (idle,
+joining `main-vm`), `heartbeat` (idle, sleeping between ticks),
+`cratonvm-jit-compiler` (idle, parked on its own condvar waiting for
+compile work — nothing queued), `Common-Cleaner` (JDK's own
+reference-processing thread), and `main-vm` (the interpreter thread
+running the actual test). **No Jetty server-side worker/acceptor/selector
+thread exists at all.**
+
+- `main-vm` is deep in legitimately-nested interpreted Java calls (400+
+  raw stack frames, mostly `execute_frame`/`execute_invoke_kind`/
+  `try_lambda_dispatch`/`invoke_on_class_shared_inner` — normal recursive
+  interpreter dispatch, including at least two nested `ArrayList.forEach`
+  lambda calls) that bottom out in
+  `cratonvm_native_builtins::native_lock_support_park` →
+  `cratonvm_vm::vm::vm_exec::impl$5::park` →
+  `cratonvm_vm::threading::jvm_thread::ParkState::park_interruptible` — a
+  plain `LockSupport.park()` call, genuinely waiting to be unparked (e.g.
+  the test's own blocking wait for an HTTP/2 response that will never
+  arrive because nothing exists to answer it).
+- `Common-Cleaner` is **not idle** — it is genuinely blocked in
+  `parking_lot::raw_rwlock::RawRwLock::lock_shared_slow` (the contended/
+  slow acquisition path, confirmed via a full symbol-resolved stack, not
+  just a generic wait), trying to take a **read lock on the global
+  `class_manager: RwLock<ClassManager>`** (`vm/src/vm/vm_init.rs:346`)
+  from inside `resolve_field_ref_loader_aware`
+  (`vm/src/runtime/interpreter.rs:18000`, itself reached from a plain
+  `getfield`/`putfield` dispatch in `execute_instruction`). None of the
+  other 4 live threads hold or are attempting this lock in their captured
+  stacks — the write-lock holder (or a queued writer causing reader
+  starvation, `parking_lot::RwLock`'s default policy) is **not among the
+  living threads**, strongly suggesting a **Jetty worker thread that has
+  since exited took this lock (or queued for it) and never released it
+  (or never had its wait removed from the queue)** — a lock-lifecycle bug
+  tied to abnormal/unusual thread teardown, not a simple AB-BA ordering
+  violation (this VM already has one *different*, previously-fixed
+  `class_manager`/`vtable_manager` AB-BA deadlock — see
+  [[reference_vtable_classmanager_lock_ordering_deadlock]] — this is not
+  that one; `class_manager` here is a bare `parking_lot::RwLock`, not
+  wrapped in the debug-only `OrderedRwLock` lock-order checker in
+  `vm/src/runtime/lock_order.rs`, so that checker would not catch this
+  even in a debug build).
+- Ruled out silent thread-creation failure as a cause of the missing
+  worker thread: `vm/src/vm/vm_exec.rs:6561`'s `Thread.start()`
+  implementation `.expect()`s on `std::thread::Builder::spawn()`'s result
+  — a real spawn failure panics loudly (`"failed to spawn child Java
+  thread (OS refused; check ulimit / thread count)"`) and would have
+  produced an `hs_err` log and a visible panic message, neither of which
+  ever appeared. Thread creation is not failing silently; whatever Jetty
+  worker thread should exist either finished normally (and, per the above,
+  apparently left a lock in a bad state on its way out) or was never
+  needed to begin with for reasons not yet established.
+
+**Still OPEN — this is now a well-scoped, concrete VM-core concurrency bug,
+not an environmental mystery.** Comparable in nature (and likely comparable
+in the dedicated-session effort it will take) to the existing
+`class_manager`/`vtable_manager` AB-BA deadlock in
+[[reference_vtable_classmanager_lock_ordering_deadlock]] — not attempted
+as a code fix in this pass; forcing one without being able to reliably
+reproduce and verify against a live hang risks introducing a new,
+harder-to-diagnose bug in VM-core locking code.
+
+**Next steps for whoever picks this up**:
+1. Reproduce the hang again with `CRATONVM_DBG_HEARTBEAT=100` set (already
+   in the codebase, zero setup) and, the moment `heartbeat.log` stops
+   advancing in test-progress terms but the process is still alive
+   (`tasklist`/`Get-Process` still shows it), immediately attach `cdb`
+   live (`-pv -p <pid> -y <symdir> -lines -c "~*kb 400;qd"`, or dump each
+   thread individually with `~Ns kb 400` for more headroom than `~*`) —
+   do NOT wait, the process does eventually get killed by something.
+2. Specifically hunt for every `class_manager.write()` call site
+   (11 files, `grep -rn "class_manager\.write()" vm/src`) reachable from
+   Jetty-connector/class-loading code, and check each one for a path where
+   the guard could be held across a call that can itself block forever or
+   where the owning thread could exit (return, be interrupted, or hit an
+   error path) without the guard's `Drop` running.
+3. Check why no Jetty server-side thread exists at the time of the hang at
+   all — was one ever created for this specific h2c connector, and if so,
+   where did it go? (`grep` for `QueuedThreadPool`-related thread-naming
+   patterns, or add temporary `CRATONVM_DBG_HEARTBEAT`-style logging to
+   `thread_start`/thread-exit paths to get a full birth/death audit trail
+   across a run that reaches the hang.)
 4. The analogous `Inflater` direct-buffer natives
-   (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in the
-   same file) are likely *also* unimplemented stubs (not yet checked/fixed
-   in this pass) — same risk class, not yet known to be hit by any test.
+   (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in
+   `native-builtins/src/zip_real.rs`) are likely *also* unimplemented
+   stubs (not yet checked/fixed in this pass) — same risk class as the
+   Deflater bug fixed earlier in this doc, not yet known to be hit by any
+   test.
 5. Diagnostic instrumentation left in place (opt-in, zero default behavior
    change): `CRATONVM_DBG_JAR`, `CRATONVM_DBG_CLASSPATH`,
    `CRATONVM_DBG_RESOURCE_TIMING`, `CRATONVM_DBG_DEFLATE`, `CRATONVM_DBG_SOCK`,
-   `CRATONVM_DBG_SOCK_BYTES`.
+   `CRATONVM_DBG_SOCK_BYTES`, `CRATONVM_DBG_HEARTBEAT`.
 6. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
-   `winget install Microsoft.WinDbg --source winget`) — no longer a
-   blocker for future sessions on this same machine; launching a suspect
-   process directly under it (rather than attach-after-the-fact sampling)
-   is a fast way to rule out hardware faults/aborts, but was NOT sufficient
-   to identify this residual's actual cause.
+   `winget install Microsoft.WinDbg --source winget`) — launching a
+   suspect process directly under it doesn't help for a genuine hang (only
+   for catching an actual exception), but non-invasively attaching to an
+   ALREADY-RUNNING, currently-hung process (per step 1 above) is what
+   finally identified this residual's actual shape.
