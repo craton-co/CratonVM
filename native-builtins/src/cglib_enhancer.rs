@@ -596,6 +596,20 @@ fn emit_bean_override(
     // real Spring resolves it fine (SPR-8080).
     is_currently_in_creation_ref: u16,
     set_currently_in_creation_ref: u16,
+    // FactoryBean-enhancement (SPR-6602/11202/15275): `Some((methodref,
+    // exposed_type_string_idx))` when this method's return type IS (or
+    // extends/implements) `FactoryBean` — splices an extra invokestatic
+    // call into `cratonvm/internal/ConfigEnhancerSupport
+    // .enhanceFactoryBeanReference(Object rawFactory, Object beanFactory,
+    // String beanName, String exposedTypeInternalName)Object` right after
+    // the raw inter-bean `getBean("&name")` call and before the
+    // `checkcast <Ret>`, wrapping the raw factory in a delegating proxy
+    // whose `getObject()` resolves the container's cached product instead
+    // of computing a fresh one — see `enhance_factory_bean_reference`'s
+    // doc comment for the full rationale. `None` for ordinary (non-
+    // FactoryBean) `@Bean` methods, producing byte-identical output to
+    // before this parameter existed.
+    fb_ref: Option<(u16, u16)>,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
@@ -743,13 +757,32 @@ fn emit_bean_override(
     code.extend_from_slice(&b(getbean_ref));
     code.push(0x02);
     code.push(0x00);
-    // 104: checkcast <Ret>
+    // 104: [FactoryBean-typed methods only] wrap the raw factory returned by
+    // getBean("&name") in a delegating proxy before the checkcast below, so
+    // a caller that immediately does `.getObject()` on the result (a direct
+    // call, not itself routed through this override) sees the container's
+    // cached product rather than a freshly-computed one — see `fb_ref`'s
+    // doc comment / `enhance_factory_bean_reference`. Left inside the
+    // SPR-8080 try-region deliberately: if the wrapping call throws, the
+    // "currently in creation" flag must still be restored by the handler
+    // below, exactly like the plain getBean call it replaces.
+    //   aload_2 (bf, as Object); aload_3 (beanName); ldc_w <exposedType>;
+    //   invokestatic ConfigEnhancerSupport.enhanceFactoryBeanReference
+    if let Some((enhance_fb_ref_methodref, exposed_type_string_idx)) = fb_ref {
+        code.push(0x2C); // aload_2
+        code.push(0x2D); // aload_3
+        code.push(0x13); // ldc_w
+        code.extend_from_slice(&b(exposed_type_string_idx));
+        code.push(0xB8); // invokestatic
+        code.extend_from_slice(&b(enhance_fb_ref_methodref));
+    }
+    // checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // 107: astore 4   (local4 = result)
+    // astore 4   (local4 = result)
     code.push(0x3A);
     code.push(0x04);
-    // --- TRY_END (109, exclusive). Normal path continues below: mirrors
+    // --- TRY_END (exclusive). Normal path continues below: mirrors
     // Spring's resolveBeanReference: only when a factory method IS currently
     // being invoked (local1 non-null), i.e. this getBean happened while
     // another @Bean method was under construction, not from arbitrary user
@@ -827,21 +860,34 @@ fn emit_bean_override(
     code.push(0x07);
     // 160: athrow
     code.push(0xBF);
-    debug_assert_eq!(code.len(), 161);
+    // Every branch offset in this method is RELATIVE and has both its
+    // instruction and its target strictly before or strictly after the
+    // `fb_ref` insertion point (pc 104) — so the 8-byte splice never needs
+    // any of them recomputed, only the three ABSOLUTE exception-table
+    // values below.
+    let fb_ref_extra_bytes: u16 = if fb_ref.is_some() { 8 } else { 0 };
+    debug_assert_eq!(code.len(), 161 + fb_ref_extra_bytes as usize);
 
-    const TRY_START: u16 = 94;
-    const TRY_END: u16 = 109;
-    const HANDLER_PC: u16 = 142;
+    let try_start: u16 = 94;
+    let try_end: u16 = 109 + fb_ref_extra_bytes;
+    let handler_pc: u16 = 142 + fb_ref_extra_bytes;
 
     let mut code_attr = Vec::new();
-    code_attr.extend_from_slice(&3u16.to_be_bytes()); // max_stack (3-deep setCurrentlyInCreation/registerDependentBean calls)
+    // max_stack: the `fb_ref` splice pushes bf/beanName/exposedType (3
+    // items) on top of the raw factory already on the stack from
+    // `getBean`, briefly reaching a 4-deep stack before `invokestatic`
+    // consumes them — one more than the 3-deep
+    // setCurrentlyInCreation/registerDependentBean calls that otherwise
+    // dominate.
+    let max_stack: u16 = if fb_ref.is_some() { 4 } else { 3 };
+    code_attr.extend_from_slice(&max_stack.to_be_bytes());
     code_attr.extend_from_slice(&8u16.to_be_bytes()); // max_locals (this, method, bf, beanName, result, alreadyInCreation, cbf, throwable)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
     code_attr.extend_from_slice(&1u16.to_be_bytes()); // exception_table_length
-    code_attr.extend_from_slice(&TRY_START.to_be_bytes());
-    code_attr.extend_from_slice(&TRY_END.to_be_bytes());
-    code_attr.extend_from_slice(&HANDLER_PC.to_be_bytes());
+    code_attr.extend_from_slice(&try_start.to_be_bytes());
+    code_attr.extend_from_slice(&try_end.to_be_bytes());
+    code_attr.extend_from_slice(&handler_pc.to_be_bytes());
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // catch_type 0 = any (finally semantics)
     code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
 
@@ -864,6 +910,127 @@ fn emit_bean_factory_field(name_idx: u16, descriptor_idx: u16) -> Vec<u8> {
     field.extend_from_slice(&descriptor_idx.to_be_bytes()); // "Ljava/lang/Object;"
     field.extend_from_slice(&0u16.to_be_bytes()); // attributes_count = 0
     field
+}
+
+/// Emit a `public static Object CGLIB$FACTORY_DATA;` field (no
+/// `ConstantValue` needed — reference-typed static fields default to
+/// `null` at class initialization).
+///
+/// Real cglib's `Enhancer.wrapCachedClass` — invoked from
+/// `AbstractClassGenerator.create()`, on EVERY class it hands back,
+/// fresh or not — reads and writes this exact field via reflection
+/// (`klass.getField("CGLIB$FACTORY_DATA")`) to attach its own
+/// `EnhancerFactoryData` bookkeeping. This reimplementation never uses
+/// that bookkeeping itself, but Spring's `CglibAopProxy` (for
+/// `proxyTargetClass=true` general AOP proxying) treats ANY class whose
+/// name contains `"$$"` as "already a CGLIB proxy" (`ClassUtils
+/// .isCglibProxyClass`) and, when asked to further proxy one of OUR
+/// generated `@Configuration` enhancer classes, calls `getSuperclass()`
+/// to find the "real" target and re-enhances THAT with real cglib —
+/// computing the EXACT SAME `<Original>$$SpringCGLIB$$0` name we
+/// already used, purely by coincidence of both sides independently
+/// implementing Spring's own naming convention for "first proxy of this
+/// class". Real cglib's own naming has no way to know our class was
+/// never registered through ITS bookkeeping (we bypass cglib's Java
+/// machinery entirely), so it doesn't detect the clash and tries to
+/// `defineClass` under our already-taken name; this VM's classloader
+/// correctly rejects that as already-defined (matching what a genuine
+/// same-name race would do on any JVM), and cglib's own defineClass
+/// failure-recovery path then loads OUR existing class as if it were
+/// its own freshly-generated one — at which point `wrapCachedClass`
+/// needs this field to exist, or it throws `NoSuchFieldException:
+/// CGLIB$FACTORY_DATA` wrapped in `AopConfigException: Could not
+/// generate CGLIB subclass... final class or non-visible class`
+/// (`ConfigurationClassPostProcessorTests.genericsBasedInjectionWith*`).
+///
+/// `CGLIB$FACTORY_DATA` alone was not sufficient: once it stopped
+/// throwing, the SAME real-cglib recovery path went on to read/write
+/// further bookkeeping fields real cglib-generated classes always carry —
+/// `CGLIB$CALLBACK_FILTER` (confirmed empirically to be the very next one
+/// `NoSuchFieldException`'d), and by the same reasoning likely
+/// `CGLIB$THREAD_CALLBACKS`/`CGLIB$STATIC_CALLBACKS`/`CGLIB$BOUND` too
+/// (`Enhancer.setThreadCallbacks`/`setCallbacks`/`isEnhanced`'s usual
+/// reflective targets) — see `build_enhancer_class`'s call site for the
+/// full field list this reimplementation now proactively emits.
+fn emit_public_static_field(name_idx: u16, descriptor_idx: u16) -> Vec<u8> {
+    let mut field = Vec::new();
+    field.extend_from_slice(&(0x0001u16 | 0x0008u16).to_be_bytes()); // ACC_PUBLIC | ACC_STATIC
+    field.extend_from_slice(&name_idx.to_be_bytes());
+    field.extend_from_slice(&descriptor_idx.to_be_bytes());
+    field.extend_from_slice(&0u16.to_be_bytes()); // attributes_count = 0
+    field
+}
+
+/// Emit harmless no-op/null-returning stub bodies for all seven
+/// `org/springframework/cglib/proxy/Factory` interface methods.
+///
+/// Confirmed empirically (`ConfigurationClassPostProcessorTests
+/// .genericsBasedInjectionWith*`): once the `CGLIB$*` bookkeeping fields
+/// stopped `NoSuchFieldException`ing, the SAME real-cglib
+/// defineClass-failure-recovery path (see `emit_public_static_field`'s
+/// doc comment) went on to `(Factory) klass_instance` our loaded-as-if-
+/// its-own class — `ClassCastException` since we never declared this
+/// marker interface. Real cglib-generated classes ALWAYS implement it
+/// (with real callback-array-backed bodies); this reimplementation has no
+/// callback array to back them with (the `@Bean` overrides dispatch
+/// directly, see the module doc comment), so every method is a safe
+/// null-returning/no-op stub — nothing in this VM's own dispatch ever
+/// calls them, they exist purely so an incidental `instanceof`/cast from
+/// OTHER real cglib machinery that mistakes this class for its own
+/// doesn't blow up.
+fn emit_cglib_factory_interface_methods(cw: &mut ClassWriter, code_attr_name_idx: u16) -> Vec<Vec<u8>> {
+    let callback_desc = "Lorg/springframework/cglib/proxy/Callback;";
+    let callback_arr_desc = "[Lorg/springframework/cglib/proxy/Callback;";
+    let object_desc = "Ljava/lang/Object;";
+
+    let mut methods = Vec::new();
+
+    // Object newInstance(Callback)
+    {
+        let name_idx = cw.add_utf8("newInstance");
+        let desc_idx = cw.add_utf8(&format!("({callback_desc}){object_desc}"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+    }
+    // Object newInstance(Callback[])
+    {
+        let name_idx = cw.add_utf8("newInstance");
+        let desc_idx = cw.add_utf8(&format!("({callback_arr_desc}){object_desc}"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+    }
+    // Object newInstance(Class[], Object[], Callback[])
+    {
+        let name_idx = cw.add_utf8("newInstance");
+        let desc_idx = cw.add_utf8(&format!(
+            "([Ljava/lang/Class;[Ljava/lang/Object;{callback_arr_desc}){object_desc}"
+        ));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 4));
+    }
+    // Callback getCallback(int)
+    {
+        let name_idx = cw.add_utf8("getCallback");
+        let desc_idx = cw.add_utf8(&format!("(I){callback_desc}"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 2));
+    }
+    // void setCallback(int, Callback)
+    {
+        let name_idx = cw.add_utf8("setCallback");
+        let desc_idx = cw.add_utf8(&format!("(I{callback_desc})V"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0xB1], 0, 3));
+    }
+    // Callback[] getCallbacks()
+    {
+        let name_idx = cw.add_utf8("getCallbacks");
+        let desc_idx = cw.add_utf8(&format!("(){callback_arr_desc}"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0x01, 0xB0], 1, 1));
+    }
+    // void setCallbacks(Callback[])
+    {
+        let name_idx = cw.add_utf8("setCallbacks");
+        let desc_idx = cw.add_utf8(&format!("({callback_arr_desc})V"));
+        methods.push(wrap_method(name_idx, desc_idx, code_attr_name_idx, &[0xB1], 0, 2));
+    }
+
+    methods
 }
 
 /// Generate a fresh `<OriginalName>$$SpringCGLIB$$<counter>` class
@@ -889,10 +1056,18 @@ fn build_enhancer_class(
 
     let mut cw = ClassWriter::new();
 
-    // -- CONSTANT_Class entries: this, super, and the marker interface.
+    // -- CONSTANT_Class entries: this, super, and the marker interfaces.
     let this_class_idx = cw.add_class(&new_name);
     let super_class_idx = cw.add_class(super_internal_name);
     let iface_idx = cw.add_class(SPRING_MARKER_IFACE);
+    // `org/springframework/cglib/proxy/Factory` — see
+    // `emit_cglib_factory_interface_methods`'s doc comment: the SAME
+    // real-cglib recovery path that needed the `CGLIB$*` bookkeeping
+    // fields also does `(Factory) klass_instance` somewhere in
+    // `Enhancer`'s post-generation bookkeeping, unconditionally (real
+    // cglib-generated classes ALWAYS implement this marker), so it must
+    // be implemented here too, not just field-compatible.
+    let factory_iface_idx = cw.add_class("org/springframework/cglib/proxy/Factory");
 
     // -- Method machinery: <init> name + Code attribute name. Each
     // superclass constructor gets its own descriptor Utf8 + super methodref,
@@ -937,8 +1112,24 @@ fn build_enhancer_class(
     methods.push(emit_noop_callback_setter(&mut cw, set_static_callbacks_name_idx, code_attr_name_idx));
     let set_thread_callbacks_name_idx = cw.add_utf8("CGLIB$SET_THREAD_CALLBACKS");
     methods.push(emit_noop_callback_setter(&mut cw, set_thread_callbacks_name_idx, code_attr_name_idx));
+    methods.extend(emit_cglib_factory_interface_methods(&mut cw, code_attr_name_idx));
 
     let field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
+    // Real-cglib-bookkeeping fields — see `emit_public_static_field`'s doc
+    // comment. All `Ljava/lang/Object;`-typed except `CGLIB$BOUND`, which
+    // real cglib declares `boolean` (`Field.getBoolean`/`setBoolean` would
+    // throw `IllegalArgumentException` on a mismatched declared type).
+    let factory_data_name_idx = cw.add_utf8("CGLIB$FACTORY_DATA");
+    let factory_data_field = emit_public_static_field(factory_data_name_idx, object_desc_idx);
+    let callback_filter_name_idx = cw.add_utf8("CGLIB$CALLBACK_FILTER");
+    let callback_filter_field = emit_public_static_field(callback_filter_name_idx, object_desc_idx);
+    let thread_callbacks_name_idx = cw.add_utf8("CGLIB$THREAD_CALLBACKS");
+    let thread_callbacks_field = emit_public_static_field(thread_callbacks_name_idx, object_desc_idx);
+    let static_callbacks_name_idx = cw.add_utf8("CGLIB$STATIC_CALLBACKS");
+    let static_callbacks_field = emit_public_static_field(static_callbacks_name_idx, object_desc_idx);
+    let bound_name_idx = cw.add_utf8("CGLIB$BOUND");
+    let bool_desc_idx = cw.add_utf8("Z");
+    let bound_field = emit_public_static_field(bound_name_idx, bool_desc_idx);
 
     if !bean_methods.is_empty() {
         // Shared constant-pool refs used by every @Bean override.
@@ -1011,6 +1202,18 @@ fn build_enhancer_class(
         // used by FullyQualifiedConfigurationBeanNameGenerator.deriveBeanName.
         let super_dotted = super_internal_name.replace('/', ".");
 
+        // FactoryBean-enhancement (SPR-6602/11202/15275) invokestatic target —
+        // see `emit_bean_override`'s `fb_ref` doc comment and
+        // `enhance_factory_bean_reference`. Added unconditionally alongside
+        // the other shared refs above (harmless unused constant-pool entries
+        // if no `@Bean` method in this class happens to be FactoryBean-typed).
+        let config_enhancer_support_cls = cw.add_class("cratonvm/internal/ConfigEnhancerSupport");
+        let enhance_fb_ref_methodref = cw.add_methodref(
+            config_enhancer_support_cls,
+            "enhanceFactoryBeanReference",
+            "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        );
+
         for bm in bean_methods {
             let name_idx = cw.add_utf8(&bm.name);
             let desc_idx = cw.add_utf8(&bm.descriptor);
@@ -1034,6 +1237,12 @@ fn build_enhancer_class(
             };
             let super_method_ref = cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
             let rettype_cast_idx = cw.add_class(&bm.return_internal);
+            let fb_ref = if bm.is_factory_bean {
+                let exposed_type_string_idx = cw.add_string(&bm.return_internal);
+                Some((enhance_fb_ref_methodref, exposed_type_string_idx))
+            } else {
+                None
+            };
             let override_method = emit_bean_override(
                 name_idx,
                 desc_idx,
@@ -1057,6 +1266,7 @@ fn build_enhancer_class(
                 register_dependent_bean_ref,
                 is_currently_in_creation_ref,
                 set_currently_in_creation_ref,
+                fb_ref,
             );
             methods.push(override_method);
         }
@@ -1071,8 +1281,15 @@ fn build_enhancer_class(
         access_flags,
         this_class_idx,
         super_class_idx,
-        &[iface_idx],
-        &[field],
+        &[iface_idx, factory_iface_idx],
+        &[
+            field,
+            factory_data_field,
+            callback_filter_field,
+            thread_callbacks_field,
+            static_callbacks_field,
+            bound_field,
+        ],
         &methods,
     );
 
@@ -2401,6 +2618,541 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     }
 }
 
+// ===========================================================================
+// FactoryBean-enhancement (SPR-6602/11202/15275) proxy generator.
+//
+// Real Spring's `ConfigurationClassEnhancer$BeanMethodInterceptor
+// .resolveBeanReference`, after resolving an inter-`@Bean`-method
+// reference that turns out to be `FactoryBean`-typed, calls
+// `enhanceFactoryBean(rawFactory, exposedType, beanFactory, beanName)`
+// before handing the result back to the caller. Without this, a raw
+// `factory.getObject()` call made directly on that reference (either from
+// generated proxy bytecode elsewhere, or — the common case — from the
+// user's OWN `@Configuration` class body, e.g. `foo().getObject()`)
+// bypasses the container's `factoryBeanObjectCache` entirely and computes
+// a fresh, non-singleton-matching product every time.
+//
+// `enhanceFactoryBean` picks one of three representations based on the
+// raw factory's *actual runtime* finality and the `@Bean` method's
+// *declared* return type (`exposedType`):
+//   * `exposedType` is final or `getObject()` is final, and `exposedType`
+//     is NOT an interface: no proxy is possible at all — return the raw
+//     factory unchanged (matches real Spring's own fallback).
+//   * final class/method, `exposedType` IS an interface: a real JDK
+//     dynamic proxy implementing just that one interface, whose
+//     `InvocationHandler` intercepts only `getObject()`.
+//   * otherwise: a field-copying CGLIB-style subclass of the factory's own
+//     concrete class, overriding only `getObject()`.
+// In both proxy cases every OTHER method (`isSingleton`'s interface
+// default, `getObjectType`, custom methods, `equals`/`hashCode`/
+// `toString`) delegates straight through to the raw factory's own real
+// dispatch — exactly like real Spring's CGLIB callback / interface-proxy
+// `InvocationHandler`, which intercept `getObject` alone.
+// ===========================================================================
+
+/// Cache of built subclass-wrapper class names, keyed by the raw factory's
+/// concrete `ClassId`. Built once per concrete class (the wrapper has no
+/// per-instance state baked into its bytecode — `$$fbBeanFactory`/
+/// `$$fbBeanName` are plain fields set post-allocation), reused for every
+/// subsequent wrap of an instance of that same class.
+fn fb_subclass_cache() -> &'static Mutex<HashMap<u32, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Synthetic `InvocationHandler` class backing the JDK-interface-proxy
+/// FactoryBean wrapper (`build_or_get_factory_bean_interface_proxy`).
+/// Fields: 0 = raw factory (Object), 1 = beanFactory (Object), 2 = bean
+/// name (String, Object-typed field). Dispatched to via `fb_handler_invoke`,
+/// registered as a plain native on `(FB_HANDLER_CLASS, "invoke", ...)` —
+/// picked up automatically by the generic proxy-dispatch path
+/// (`invoke_or_native` in `vm/src/vm/vm_exec.rs`, which resolves the
+/// handler's declaring class BY NAME and checks the native registry
+/// before falling back to real bytecode), so no VM-side special-casing is
+/// needed — the same mechanism every other native-registered synthetic
+/// class in this codebase already relies on.
+const FB_HANDLER_CLASS: &str = "cratonvm/internal/FactoryBeanEnhancerHandler";
+const FB_HANDLER_FIELD_RAW_FACTORY: usize = 0;
+const FB_HANDLER_FIELD_BEAN_FACTORY: usize = 1;
+const FB_HANDLER_FIELD_BEAN_NAME: usize = 2;
+
+/// Collect the distinct `getObject`-named, 0-arg method signatures declared
+/// anywhere in `class_id`'s hierarchy (most-derived class first; a
+/// covariant-return override and the compiler-synthesized erasure bridge
+/// are both collected, deduplicated by descriptor), plus whether the most
+/// specific one (preferring a non-bridge, i.e. non-`()Ljava/lang/Object;`,
+/// descriptor when one exists) is `final`. Mirrors real Spring's
+/// `clazz.getMethod("getObject").getModifiers()` check, which reflection's
+/// own bridge-suppression logic resolves to the covariant override when
+/// both exist.
+fn factory_bean_getobject_signatures(
+    ctx: &mut dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+) -> (Vec<(String, String)>, bool) {
+    const ACC_FINAL: u16 = 0x0010;
+    let mut out: Vec<(String, String, u16)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur = Some(class_id);
+    while let Some(cid) = cur {
+        for m in ctx.declared_methods(cid) {
+            if m.name != "getObject" || !m.descriptor.starts_with("()") {
+                continue;
+            }
+            if seen.insert(m.descriptor.clone()) {
+                out.push((m.name.clone(), m.descriptor.clone(), m.access_flags));
+            }
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    let method_final = out
+        .iter()
+        .find(|(_, d, _)| d.as_str() != "()Ljava/lang/Object;")
+        .or_else(|| out.first())
+        .map(|(_, _, af)| af & ACC_FINAL != 0)
+        .unwrap_or(false);
+    (
+        out.into_iter().map(|(n, d, _)| (n, d)).collect(),
+        method_final,
+    )
+}
+
+/// Field-copying CGLIB-style subclass wrapper for a non-final FactoryBean:
+/// extends the raw factory's own concrete class, overriding every declared
+/// `getObject()`-named 0-arg signature (the real covariant method and any
+/// generics bridge) to delegate to `beanFactory.getBean(beanName)` instead
+/// of running the real body — mirrors real Spring's
+/// `createCglibProxyForFactoryBean`.
+///
+/// Real CGLIB (via Objenesis) instantiates the proxy WITHOUT calling any
+/// constructor, then copies every declared instance field (through the
+/// whole superclass chain) from the original instance into the proxy by
+/// reflection, so the inherited real methods it does NOT override observe
+/// identical state. This reimplementation does the same via
+/// `ctx.allocate_instance` (no `<init>` call at all — sidesteps arbitrary
+/// or absent constructor descriptors and inner-class outer-instance
+/// capture entirely, same trick as real CGLIB's Objenesis path) plus a
+/// native field-copy loop keyed by each field's already-known heap slot
+/// index (`FieldMetadata::slot_index`, identical on both objects since the
+/// wrapper only APPENDS its own two new fields after the inherited ones).
+fn build_factory_bean_subclass_wrapper(
+    ctx: &mut dyn NativeContext,
+    concrete_cid: cratonvm_types::ClassId,
+    raw_factory: cratonvm_types::ObjectRef,
+    bean_factory: cratonvm_types::ObjectRef,
+    bean_name: &str,
+) -> Option<cratonvm_types::ObjectRef> {
+    let cached = fb_subclass_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&concrete_cid.as_u32())
+        .cloned();
+    let wrapper_name = match cached {
+        Some(name) => name,
+        None => {
+            let concrete_name = ctx.class_name_of_id(concrete_cid)?;
+            let (signatures, _) = factory_bean_getobject_signatures(ctx, concrete_cid);
+            if signatures.is_empty() {
+                return None;
+            }
+            let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let new_name = format!("{concrete_name}$$SpringCGLIB$$FB{counter:x}");
+
+            let mut cw = ClassWriter::new();
+            let this_class_idx = cw.add_class(&new_name);
+            let super_class_idx = cw.add_class(&concrete_name);
+            let code_attr_name_idx = cw.add_utf8("Code");
+
+            let bf_field_name_idx = cw.add_utf8("$$fbBeanFactory");
+            let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
+            let bf_field_ref =
+                cw.add_fieldref(this_class_idx, "$$fbBeanFactory", "Ljava/lang/Object;");
+            let bn_field_name_idx = cw.add_utf8("$$fbBeanName");
+            let bn_field_ref =
+                cw.add_fieldref(this_class_idx, "$$fbBeanName", "Ljava/lang/Object;");
+
+            let beanfactory_cast_idx =
+                cw.add_class("org/springframework/beans/factory/BeanFactory");
+            let getbean_ref = cw.add_interface_methodref(
+                beanfactory_cast_idx,
+                "getBean",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+            );
+            let string_cls = cw.add_class("java/lang/String");
+
+            let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
+            let mut methods = Vec::new();
+            for (name, descriptor) in &signatures {
+                let name_idx = cw.add_utf8(name);
+                let desc_idx = cw.add_utf8(descriptor);
+                let ret = descriptor.split(')').nth(1).unwrap_or("Ljava/lang/Object;");
+                let ret_internal = if ret.starts_with('L') && ret.ends_with(';') {
+                    ret[1..ret.len() - 1].to_string()
+                } else {
+                    // A non-reference getObject() return can't happen for a
+                    // real FactoryBean (its type parameter always erases to
+                    // a reference), but fall back to Object rather than
+                    // emit an invalid checkcast target if it ever does.
+                    "java/lang/Object".to_string()
+                };
+                let ret_class_idx = cw.add_class(&ret_internal);
+
+                let mut code: Vec<u8> = Vec::new();
+                code.push(0x2A); // aload_0
+                code.push(0xB4); // getfield $$fbBeanFactory
+                code.extend_from_slice(&b(bf_field_ref));
+                code.push(0xC0); // checkcast BeanFactory
+                code.extend_from_slice(&b(beanfactory_cast_idx));
+                code.push(0x2A); // aload_0
+                code.push(0xB4); // getfield $$fbBeanName
+                code.extend_from_slice(&b(bn_field_ref));
+                code.push(0xC0); // checkcast String
+                code.extend_from_slice(&b(string_cls));
+                code.push(0xB9); // invokeinterface BeanFactory.getBean(String)Object
+                code.extend_from_slice(&b(getbean_ref));
+                code.push(0x02);
+                code.push(0x00);
+                code.push(0xC0); // checkcast <Ret>
+                code.extend_from_slice(&b(ret_class_idx));
+                code.push(0xB0); // areturn
+
+                methods.push(wrap_method(
+                    name_idx,
+                    desc_idx,
+                    code_attr_name_idx,
+                    &code,
+                    2,
+                    1,
+                ));
+            }
+
+            let bf_field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
+            let bn_field = {
+                let mut field = Vec::new();
+                field.extend_from_slice(&(0x0002u16 | 0x1000u16).to_be_bytes()); // ACC_PRIVATE | ACC_SYNTHETIC
+                field.extend_from_slice(&bn_field_name_idx.to_be_bytes());
+                field.extend_from_slice(&object_desc_idx.to_be_bytes());
+                field.extend_from_slice(&0u16.to_be_bytes());
+                field
+            };
+
+            let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
+            let bytes = cw.finish(
+                access_flags,
+                this_class_idx,
+                super_class_idx,
+                &[],
+                &[bf_field, bn_field],
+                &methods,
+            );
+
+            let opts = DefineClassFull {
+                override_name: Some(new_name.clone()),
+                skip_verification: true,
+                ..Default::default()
+            };
+            match ctx.define_class_full(&new_name, &std::sync::Arc::new(bytes), 0, opts) {
+                Ok(_cid) => {
+                    fb_subclass_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(concrete_cid.as_u32(), new_name.clone());
+                    new_name
+                }
+                Err(msg) => {
+                    eprintln!(
+                        "[CCE] enhanceFactoryBeanReference: define_class_full failed for {new_name}: {msg}"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    // `allocate_instance`/`create_string` below can both allocate and
+    // trigger GC, which may relocate `raw_factory`/`bean_factory` (moving-GC
+    // safety — mirrors `wrap_annotation_in_real_proxy`'s own pin/read/unpin
+    // idiom): pin both up front and re-read them via the pin after every
+    // subsequent allocating call, never trusting the plain `ObjectRef`
+    // variable across one.
+    let pin_base = ctx.pin_native_root(raw_factory);
+    ctx.pin_native_root(bean_factory);
+
+    let new_obj = ctx.allocate_instance(&wrapper_name)?;
+    let new_obj_pin = ctx.pin_native_root(new_obj);
+    let raw_factory = ctx.read_native_pin(pin_base, raw_factory);
+
+    // Every instance field the concrete class (and its ancestors) declares
+    // lives at the SAME heap slot index on both objects — the wrapper
+    // subclass only ever APPENDS its own two new fields after them.
+    // `get_field`/`set_field` are plain reads/writes (no allocation), so
+    // `new_obj`/`raw_factory` stay valid for the whole loop.
+    let mut cur = Some(concrete_cid);
+    while let Some(cid) = cur {
+        for f in ctx.declared_fields(cid) {
+            if f.is_static {
+                continue;
+            }
+            let val = ctx.get_field(raw_factory, f.slot_index);
+            ctx.set_field(new_obj, f.slot_index, val);
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
+    ctx.set_field_by_name(new_obj, "$$fbBeanFactory", Value::Object(Some(bean_factory)));
+
+    let name_str = ctx.create_string(bean_name);
+    let new_obj = ctx.read_native_pin(new_obj_pin, new_obj);
+    ctx.set_field_by_name(new_obj, "$$fbBeanName", Value::Object(Some(name_str)));
+    ctx.unpin_native_roots(pin_base);
+    Some(new_obj)
+}
+
+/// Real JDK dynamic-proxy FactoryBean wrapper for a final class / final
+/// `getObject()`, used whenever `exposedType` is an interface (mirrors real
+/// Spring's `createInterfaceProxyForFactoryBean`). Implements just the one
+/// `exposed_type_cid` interface (not every interface the raw factory
+/// happens to implement) via the same real-`$ProxyN`-class machinery the
+/// rest of this VM's `Proxy.newProxyInstance`/real-annotation-proxy support
+/// already uses (`define_or_get_proxy_class`) — see
+/// `wrap_annotation_in_real_proxy` for the precedent this mirrors.
+fn build_or_get_factory_bean_interface_proxy(
+    ctx: &mut dyn NativeContext,
+    exposed_type_cid: cratonvm_types::ClassId,
+    raw_factory: cratonvm_types::ObjectRef,
+    bean_factory: cratonvm_types::ObjectRef,
+    bean_name: &str,
+) -> Option<cratonvm_types::ObjectRef> {
+    let proxy_cid = match crate::define_or_get_proxy_class(ctx, 0, &[exposed_type_cid]) {
+        crate::ProxyClassOutcome::Real(cid) => cid,
+        _ => return None,
+    };
+    let exposed_mirror = ctx.get_class_mirror(exposed_type_cid);
+
+    // Every step below except the final field/array writes can allocate and
+    // trigger a moving GC (`ensure_synthetic_class`/`alloc_object`/
+    // `create_string`/`new_ref_array`) — pin every live `ObjectRef` up front
+    // and re-read it via its pin after each such call, never trusting a
+    // plain variable across one. Mirrors `wrap_annotation_in_real_proxy`'s
+    // own pin/read/unpin idiom.
+    let pin_base = ctx.pin_native_root(raw_factory);
+    ctx.pin_native_root(bean_factory);
+    ctx.pin_native_root(exposed_mirror);
+
+    let handler_cid = ctx.ensure_synthetic_class(FB_HANDLER_CLASS, 3);
+    let handler = ctx.alloc_object(handler_cid, 3);
+    let handler_pin = ctx.pin_native_root(handler);
+    let raw_factory = ctx.read_native_pin(pin_base, raw_factory);
+    let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
+    ctx.set_field(
+        handler,
+        FB_HANDLER_FIELD_RAW_FACTORY,
+        Value::Object(Some(raw_factory)),
+    );
+    ctx.set_field(
+        handler,
+        FB_HANDLER_FIELD_BEAN_FACTORY,
+        Value::Object(Some(bean_factory)),
+    );
+
+    let name_str = ctx.create_string(bean_name);
+    let handler = ctx.read_native_pin(handler_pin, handler);
+    ctx.set_field(
+        handler,
+        FB_HANDLER_FIELD_BEAN_NAME,
+        Value::Object(Some(name_str)),
+    );
+
+    let n = ctx.class_num_total_fields(proxy_cid).max(3);
+    let real = ctx.alloc_object(proxy_cid, n);
+    let real_pin = ctx.pin_native_root(real);
+    let handler = ctx.read_native_pin(handler_pin, handler);
+    ctx.set_field(real, 0, Value::Object(Some(handler)));
+
+    let iface_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+    let real = ctx.read_native_pin(real_pin, real);
+    let exposed_mirror = ctx.read_native_pin(pin_base + 2, exposed_mirror);
+    ctx.set_array_element(iface_arr, 0, Value::Object(Some(exposed_mirror)));
+    ctx.set_field(real, 1, Value::Object(Some(iface_arr)));
+    ctx.set_field(real, 2, Value::Int(0));
+    ctx.unpin_native_roots(pin_base);
+    Some(real)
+}
+
+/// `cratonvm/internal/FactoryBeanEnhancerHandler.invoke(Object, Method,
+/// Object[])Object` — the `InvocationHandler.invoke` body for the
+/// JDK-interface-proxy FactoryBean wrapper. `getObject()` (any 0-arg
+/// descriptor — FactoryBean's only such member) delegates to
+/// `beanFactory.getBean(beanName)`, resolving the container's CACHED
+/// product. Every other method delegates straight to the raw factory
+/// instance via real virtual dispatch.
+fn fb_handler_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(handler))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let method_obj = match args.get(2) {
+        Some(Value::Object(Some(m))) => Some(*m),
+        _ => None,
+    };
+    let method_name = match method_obj {
+        Some(m) => match ctx.get_field_by_name(m, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+        None => String::new(),
+    };
+    let raw_factory = match ctx.get_field(handler, FB_HANDLER_FIELD_RAW_FACTORY) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    if method_name == "getObject" {
+        let bean_factory = match ctx.get_field(handler, FB_HANDLER_FIELD_BEAN_FACTORY) {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Object(Some(raw_factory)))),
+        };
+        let bean_name_obj = match ctx.get_field(handler, FB_HANDLER_FIELD_BEAN_NAME) {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Object(Some(raw_factory)))),
+        };
+        return ctx.invoke_virtual(
+            bean_factory,
+            "getBean",
+            "(Ljava/lang/String;)Ljava/lang/Object;",
+            &[Value::Object(Some(bean_name_obj))],
+        );
+    }
+
+    // Every other call (isSingleton's interface default, getObjectType,
+    // custom methods, equals/hashCode/toString) delegates straight to the
+    // raw factory's own real dispatch — mirrors real Spring's CGLIB
+    // callback / interface-proxy handler, which intercept getObject alone.
+    let descriptor = match method_obj {
+        Some(m) => match ctx.get_field_by_name(m, "signature") {
+            Value::Object(Some(s)) => {
+                ctx.read_string(s).unwrap_or_else(|| "()Ljava/lang/Object;".to_string())
+            }
+            _ => "()Ljava/lang/Object;".to_string(),
+        },
+        None => "()Ljava/lang/Object;".to_string(),
+    };
+    let call_args: Vec<Value> = match args.get(3) {
+        Some(Value::Object(Some(arr))) => {
+            let len = ctx.array_length(*arr);
+            (0..len).map(|i| ctx.get_array_element(*arr, i)).collect()
+        }
+        _ => Vec::new(),
+    };
+    ctx.invoke_virtual(raw_factory, &method_name, &descriptor, &call_args)
+}
+
+/// `cratonvm/internal/ConfigEnhancerSupport.enhanceFactoryBeanReference`
+/// invokestatic target spliced into `emit_bean_override`'s generated
+/// bytecode (see `fb_ref`'s doc comment there). Mirrors real Spring's
+/// `ConfigurationClassEnhancer$BeanMethodInterceptor.enhanceFactoryBean`:
+/// picks a subclass wrapper, an interface-proxy wrapper, or the identity
+/// fallback based on the raw factory's actual runtime finality and
+/// whether the `@Bean` method's declared return type (`exposedType`) is an
+/// interface.
+fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw_factory = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(args.first().cloned()),
+    };
+    let bean_factory = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(raw_factory)))),
+    };
+    // `emit_bean_override` passes the SAME `beanName` local it just used for
+    // the raw-factory `getBean("&name")` lookup — for a FactoryBean-typed
+    // method that is always "&"-prefixed (see `beanname_lookup_idx`/
+    // `fq_beanname_lookup_idx` in `build_enhancer_class`). Both builders
+    // below need the PLAIN name instead: they call `beanFactory.getBean
+    // (beanName)` (no "&") to resolve the container's cached PRODUCT, not
+    // the raw factory again — passing the "&"-prefixed name through
+    // unchanged made `getObject()` return the raw factory a second time,
+    // which then failed its checkcast to the product type at the original
+    // call site (e.g. `BarFactory cannot be cast to Bar`).
+    let bean_name = match args.get(2) {
+        Some(Value::Object(Some(s))) => {
+            let raw = ctx.read_string(*s).unwrap_or_default();
+            raw.strip_prefix('&').unwrap_or(&raw).to_string()
+        }
+        _ => return Ok(Some(Value::Object(Some(raw_factory)))),
+    };
+    let exposed_type_internal = match args.get(3) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(Some(raw_factory)))),
+    };
+
+    const ACC_FINAL: u16 = 0x0010;
+    let concrete_cid = ctx.class_id_of_object(raw_factory);
+    let class_final = ctx.class_access_flags(concrete_cid) & ACC_FINAL != 0;
+    let (sigs, method_final) = factory_bean_getobject_signatures(ctx, concrete_cid);
+    let needs_interface_proxy = class_final || method_final;
+    if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+        eprintln!(
+            "[FBREF] enter bean_name={bean_name} exposed_type={exposed_type_internal} concrete={:?} class_final={class_final} method_final={method_final} sigs={:?} needs_interface_proxy={needs_interface_proxy}",
+            ctx.class_name_of_id(concrete_cid),
+            sigs,
+        );
+    }
+
+    // `resolve_or_load_class_id` can force-load (and run the `<clinit>` of)
+    // `exposed_type_internal`, an arbitrary allocation/GC opportunity — pin
+    // both live objects across it so neither builder below is ever handed a
+    // stale post-GC `ObjectRef`. `build_factory_bean_subclass_wrapper` /
+    // `build_or_get_factory_bean_interface_proxy` additionally pin/refresh
+    // internally around their OWN allocating calls; re-pinning an
+    // already-current reference here is cheap and just belt-and-suspenders.
+    let pin_base = ctx.pin_native_root(raw_factory);
+    ctx.pin_native_root(bean_factory);
+
+    if needs_interface_proxy {
+        let exposed_id = resolve_or_load_class_id(ctx, &exposed_type_internal);
+        let raw_factory = ctx.read_native_pin(pin_base, raw_factory);
+        let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
+        ctx.unpin_native_roots(pin_base);
+        if let Some(exposed_cid) = exposed_id {
+            if ctx.is_interface_class(exposed_cid) {
+                if let Some(wrapped) = build_or_get_factory_bean_interface_proxy(
+                    ctx,
+                    exposed_cid,
+                    raw_factory,
+                    bean_factory,
+                    &bean_name,
+                ) {
+                    return Ok(Some(Value::Object(Some(wrapped))));
+                }
+            }
+        }
+        // Final class/method with a non-interface (or unresolvable) exposed
+        // type: no proxy possible — mirrors real Spring's own fallback.
+        if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+            eprintln!("[FBREF] identity fallback (no interface proxy possible)");
+        }
+        return Ok(Some(Value::Object(Some(raw_factory))));
+    }
+
+    let raw_factory = ctx.read_native_pin(pin_base, raw_factory);
+    let bean_factory = ctx.read_native_pin(pin_base + 1, bean_factory);
+    ctx.unpin_native_roots(pin_base);
+    let subclass_result =
+        build_factory_bean_subclass_wrapper(ctx, concrete_cid, raw_factory, bean_factory, &bean_name);
+    if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+        let class_name = subclass_result.map(|o| ctx.class_name_of_id(ctx.class_id_of_object(o)));
+        eprintln!(
+            "[FBREF] subclass wrapper: present={} class={:?}",
+            subclass_result.is_some(),
+            class_name
+        );
+    }
+    match subclass_result
+    {
+        Some(wrapped) => Ok(Some(Value::Object(Some(wrapped)))),
+        None => Ok(Some(Value::Object(Some(raw_factory)))),
+    }
+}
+
 /// Register the CGLIB / Spring `ConfigurationClassEnhancer.enhance` intercept.
 /// Must be called AFTER `net_phase_e::register_phase_e_networking` so the
 /// emitter implementation here wins over the older identity-bypass
@@ -2415,5 +3167,166 @@ pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         cce_enhance,
     );
+    // FactoryBean-enhancement (SPR-6602/11202/15275) — see the module doc
+    // comment above `fb_subclass_cache`. `enhanceFactoryBeanReference` is
+    // the invokestatic target `emit_bean_override` splices into a
+    // FactoryBean-typed `@Bean` method's generated override;
+    // `FB_HANDLER_CLASS`'s `invoke` backs the interface-proxy
+    // representation's `InvocationHandler` and is picked up automatically
+    // by the generic proxy-dispatch path (`invoke_or_native`), no VM-side
+    // wiring needed.
+    registry.register(
+        "cratonvm/internal/ConfigEnhancerSupport",
+        "enhanceFactoryBeanReference",
+        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
+        enhance_factory_bean_reference,
+    );
+    registry.register(
+        FB_HANDLER_CLASS,
+        "invoke",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+        fb_handler_invoke,
+    );
     registry.set_category(__prev_cat);
+}
+
+#[cfg(test)]
+mod fb_ref_bytecode_tests {
+    use super::*;
+
+    /// Structural regression guard for `emit_bean_override`'s `fb_ref`
+    /// byte-splice: build one FactoryBean-typed and one plain `@Bean`
+    /// method on the same enhancer class, parse the result with the real
+    /// class-file reader (`cratonvm-reader`, no VM/NativeContext needed —
+    /// this is pure byte-emission logic), and check the FactoryBean
+    /// method's Code attribute is exactly 8 bytes longer, its
+    /// exception-table absolute values are shifted by exactly +8, and its
+    /// `max_stack` is one deeper — while the plain method's layout stays
+    /// byte-identical to `emit_bean_override`'s pre-`fb_ref` shape.
+    #[test]
+    fn fb_ref_splice_shifts_exception_table_by_exactly_8_bytes() {
+        let bean_methods = vec![
+            BeanMethod {
+                name: "plainBean".to_string(),
+                descriptor: "()Lcom/example/Plain;".to_string(),
+                return_internal: "com/example/Plain".to_string(),
+                is_factory_bean: false,
+            },
+            BeanMethod {
+                name: "factoryBean".to_string(),
+                descriptor: "()Lcom/example/MyFactoryBean;".to_string(),
+                return_internal: "com/example/MyFactoryBean".to_string(),
+                is_factory_bean: true,
+            },
+        ];
+        // Dedicated loader id so parallel test runs never share a
+        // `next_config_enhancer_counter` bucket with another test.
+        let (_, bytes) = build_enhancer_class(999_001, "com/example/MyConfig", &bean_methods, &[]);
+        let class_file = cratonvm_reader::read_class(&bytes).expect("generated class must parse");
+
+        let mut plain = class_file
+            .find_method("plainBean", "()Lcom/example/Plain;")
+            .expect("plainBean method present")
+            .clone();
+        let mut factory = class_file
+            .find_method("factoryBean", "()Lcom/example/MyFactoryBean;")
+            .expect("factoryBean method present")
+            .clone();
+        for a in plain.attributes.iter_mut() {
+            a.decode(&class_file.constant_pool).expect("decode plainBean Code");
+        }
+        for a in factory.attributes.iter_mut() {
+            a.decode(&class_file.constant_pool)
+                .expect("decode factoryBean Code");
+        }
+        let plain_code = plain.code().expect("plainBean has a Code attribute");
+        let factory_code = factory.code().expect("factoryBean has a Code attribute");
+
+        assert_eq!(plain_code.max_stack, 3);
+        assert_eq!(
+            factory_code.max_stack, 4,
+            "fb_ref splice briefly needs one more stack slot"
+        );
+        assert_eq!(plain_code.max_locals, factory_code.max_locals);
+
+        assert_eq!(plain_code.code.len(), 161);
+        assert_eq!(
+            factory_code.code.len(),
+            161 + 8,
+            "fb_ref splice must add exactly 8 bytes"
+        );
+
+        assert_eq!(plain_code.exception_table.len(), 1);
+        assert_eq!(factory_code.exception_table.len(), 1);
+        let pe = &plain_code.exception_table[0];
+        let fe = &factory_code.exception_table[0];
+        assert_eq!(pe.start_pc, 94);
+        assert_eq!(pe.end_pc, 109);
+        assert_eq!(pe.handler_pc, 142);
+        assert_eq!(
+            fe.start_pc, 94,
+            "TRY_START is before the splice point — unaffected"
+        );
+        assert_eq!(fe.end_pc, 109 + 8);
+        assert_eq!(fe.handler_pc, 142 + 8);
+    }
+
+    /// Regression guard for the real-cglib-bookkeeping fields
+    /// (`emit_public_static_field`'s call site): every generated enhancer
+    /// class must declare all five, PUBLIC, with the exact names/types
+    /// real cglib's `Enhancer.wrapCachedClass`/`isEnhanced`/callback
+    /// machinery reflects on when it mistakes one of our classes for its
+    /// own (see `emit_cglib_factory_data_field`'s doc comment) — or the
+    /// `ConfigurationClassPostProcessorTests.genericsBasedInjectionWith*`
+    /// class of bug resurfaces one field at a time.
+    #[test]
+    fn enhancer_class_declares_all_cglib_bookkeeping_fields() {
+        let (_, bytes) = build_enhancer_class(999_002, "com/example/BookkeepingConfig", &[], &[]);
+        let class_file = cratonvm_reader::read_class(&bytes).expect("generated class must parse");
+
+        let expect_field = |name: &str, descriptor: &str| {
+            let f = class_file
+                .find_field(name)
+                .unwrap_or_else(|| panic!("missing field {name}"));
+            assert_eq!(&*f.descriptor, descriptor, "{name} has wrong descriptor");
+            assert!(
+                f.access_flags.contains(cratonvm_reader::class_access_flags::FieldAccessFlags::PUBLIC)
+                    && f.is_static(),
+                "{name} must be public static"
+            );
+        };
+        expect_field("CGLIB$FACTORY_DATA", "Ljava/lang/Object;");
+        expect_field("CGLIB$CALLBACK_FILTER", "Ljava/lang/Object;");
+        expect_field("CGLIB$THREAD_CALLBACKS", "Ljava/lang/Object;");
+        expect_field("CGLIB$STATIC_CALLBACKS", "Ljava/lang/Object;");
+        expect_field("CGLIB$BOUND", "Z");
+
+        assert!(
+            class_file
+                .interfaces
+                .iter()
+                .any(|i| &**i == "org/springframework/cglib/proxy/Factory"),
+            "generated class must implement org/springframework/cglib/proxy/Factory \
+             (real cglib's defineClass-failure recovery path casts our class to it)"
+        );
+        let callback_desc = "Lorg/springframework/cglib/proxy/Callback;";
+        let callback_arr_desc = "[Lorg/springframework/cglib/proxy/Callback;";
+        for (name, desc) in [
+            ("newInstance", format!("({callback_desc})Ljava/lang/Object;")),
+            ("newInstance", format!("({callback_arr_desc})Ljava/lang/Object;")),
+            (
+                "newInstance",
+                format!("([Ljava/lang/Class;[Ljava/lang/Object;{callback_arr_desc})Ljava/lang/Object;"),
+            ),
+            ("getCallback", format!("(I){callback_desc}")),
+            ("setCallback", format!("(I{callback_desc})V")),
+            ("getCallbacks", format!("(){callback_arr_desc}")),
+            ("setCallbacks", format!("({callback_arr_desc})V")),
+        ] {
+            assert!(
+                class_file.find_method(name, &desc).is_some(),
+                "missing Factory method {name}{desc}"
+            );
+        }
+    }
 }

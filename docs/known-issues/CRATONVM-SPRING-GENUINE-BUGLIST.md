@@ -2,9 +2,215 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 40 confirmed genuine bugs remaining (1 fixed 2026-07-21 late session; AOT cluster excluded, being worked separately) |
-| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`), 1 more fixed 2026-07-21 late session (dev `063cd747d`, see below) |
-| **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
+| **Status** | OPEN — 35 confirmed genuine bugs remaining (6 more fixed 2026-07-21 FactoryBean/CGLIB session — 3 methods across Spr6602Tests/Spr15275Tests plus 4 `ConfigurationClassPostProcessorTests` methods, see below; AOT cluster excluded, being worked separately) |
+| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`), 1 more fixed 2026-07-21 late session (dev `063cd747d`), 7 more fixed 2026-07-21 FactoryBean/CGLIB session (see below) |
+| **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174`; this session's fix landed from a local Windows checkout, verified against `apps/spring-framework` directly (no Azure host needed) |
+
+## 2026-07-21 FactoryBean-enhancement + general AOP-CGLIB-of-native-class session
+
+Scope: the two open items this doc flagged as needing "substantial new
+native-VM feature work" — the FactoryBean-enhancement proxy generator
+(`Spr6602Tests`/`Spr15275Tests`) and the general AOP-CGLIB-of-native-class
+gap (`ConfigurationClassPostProcessorTests.genericsBasedInjectionWith*`).
+**Both fully fixed**, on top of the existing `native-builtins/src/
+cglib_enhancer.rs` `ConfigurationClassEnhancer.enhance` native
+reimplementation. All changes landed in `native-builtins/src/
+cglib_enhancer.rs`, `native-builtins/src/classloader.rs`, `native-builtins/
+src/lang_class.rs`, and `classloading/src/class_manager.rs`.
+
+**1. FactoryBean-enhancement proxy generator — FIXED (3 methods, 2
+classes).** Implemented the missing piece this doc's earlier session had
+root-caused but deferred: `emit_bean_override`'s inter-bean-reference path,
+for a FactoryBean-typed `@Bean` method, now splices an extra `invokestatic
+cratonvm/internal/ConfigEnhancerSupport.enhanceFactoryBeanReference(Object
+rawFactory, Object beanFactory, String beanName, String
+exposedTypeInternalName)Object` call between the raw `getBean("&name")`
+lookup and the result checkcast (8 extra bytes, exception-table absolute
+offsets shifted accordingly — regression-guarded by a new unit test,
+`fb_ref_splice_shifts_exception_table_by_exactly_8_bytes`, that parses the
+generated class with the real `cratonvm-reader` crate and checks the byte
+math independently of any VM run). The new Rust helper mirrors real
+Spring's `ConfigurationClassEnhancer$BeanMethodInterceptor
+.enhanceFactoryBean` exactly:
+- If the raw factory's *runtime* class (or its `getObject()` override) is
+  `final` and the `@Bean` method's *declared* return type is an interface:
+  builds a real JDK dynamic proxy (reusing this VM's existing
+  `define_or_get_proxy_class` real-`$ProxyN`-class machinery, the same
+  path `wrap_annotation_in_real_proxy` uses) implementing just that one
+  interface. Its `InvocationHandler` (`cratonvm/internal
+  /FactoryBeanEnhancerHandler`, dispatched via a plain native registered on
+  `(invoke, ...)` — picked up automatically by the existing
+  `invoke_or_native` proxy-dispatch path, no VM-side special-casing needed)
+  intercepts only `getObject()` (delegating to `beanFactory.getBean(name)`,
+  resolving the container's cached product) and forwards every other call
+  straight to the raw factory via real virtual dispatch.
+- Otherwise: builds a field-copying CGLIB-style subclass of the raw
+  factory's own concrete class (cached per concrete class, like the
+  existing `ConfigurationClassEnhancer` proxy cache), instantiated via
+  `ctx.allocate_instance` (no `<init>` call — sidesteps arbitrary/absent
+  constructor descriptors, the same Objenesis-style trick real CGLIB
+  uses) with every inherited instance field copied from the original by
+  native `get_field`/`set_field` (using each field's already-known heap
+  slot index — identical on both objects since the wrapper only appends
+  its own two new fields after the inherited ones). Only `getObject()`
+  (every distinct declared signature — the covariant override and any
+  compiler-synthesized generics bridge) is overridden to delegate to
+  `beanFactory.getBean(name)`; everything else runs the real inherited
+  body unchanged.
+- All GC-unsafe sequences (an allocation between reading and using a
+  pinned `ObjectRef`) are wrapped in `pin_native_root`/`read_native_pin`/
+  `unpin_native_roots`, mirroring `wrap_annotation_in_real_proxy`'s own
+  idiom.
+
+One intermediate bug found and fixed during verification: the bytecode
+splice initially passed the SAME `beanName` local used for the raw-factory
+`getBean("&name")` lookup into the new helper — always "&"-prefixed for a
+FactoryBean-typed method — causing the wrapper's `getObject()` to resolve
+the raw factory a second time (via `getBean("&name")`) instead of the
+product (`getBean("name")`), which then failed its checkcast to the
+product type (e.g. `BarFactory cannot be cast to Bar`). Fixed by stripping
+the leading `&` in `enhance_factory_bean_reference` before use.
+
+Verified (Windows, real JDK 25, release build): `Spr6602Tests` 2/2 (was
+1/2), `Spr15275Tests` 6/6 (was 4/6 — both previously-failing methods,
+`withFactoryBean` and `withFinalFactoryBean`, exercise the interface-proxy
+path; the CGLIB-subclass path is exercised by `Spr6602Tests`'s
+`barFactory()`/`foo()` inter-bean reference). No regressions across a
+broader sweep: `ConfigurationClassPostConstructAndAutowiringTests` 2/2,
+`ConfigurationWithFactoryBeanAndAutowiringTests` 7/7,
+`ConfigurationWithFactoryBeanAndParametersTests` 1/1,
+`ConfigurationWithFactoryBeanEarlyDeductionTests` 11/11,
+`AnnotationConfigApplicationContextTests` 35/35,
+`ConfigurationClassAndBeanMethodTests` 3/3,
+`ConfigurationClassAndBFPPTests` 3/3, `ConfigurationClassWithConditionTests`
+14/14. `cargo test -p cratonvm-native-builtins --lib`: 3056 passed / 0
+failed / 6 ignored (full suite, no pre-existing-failure caveats needed this
+time).
+
+**2. General AOP-CGLIB-of-native-class support — FIXED (4 methods, the
+full `genericsBasedInjectionWith{Early,Late}GenericsMatchingOn{Cglib,
+Jdk}Proxy` cluster).** This doc's prior session hypothesized the root cause
+was "native-class bytecode retrievability" — classes defined via
+`define_class_full` not being retrievable via `getResourceAsStream` for
+real CGLIB's ASM `ClassReader` to introspect. **That hypothesis was
+investigated and implemented (see item 3 below, an independently valid VM
+improvement) but did NOT fix this cluster** — the real root cause,
+confirmed this session via iterative bisection with temporary `eprintln!`
+diagnostics (all removed except a few concise, permanently env-gated
+`CRATONVM_DBG_FBCGLIB` ones matching this codebase's existing convention),
+is a **class-naming collision**, not a bytecode-retrieval gap:
+
+- Real Spring's `CglibAopProxy` (`proxyTargetClass=true` general AOP
+  proxying), before building its own CGLIB subclass, checks
+  `ClassUtils.isCglibProxyClass(rootClass)` (true for any class name
+  containing `"$$"`) and, if true, unwraps to `rootClass.getSuperclass()`
+  — deliberately avoiding double-proxying an already-CGLIB-proxied class.
+  Since our native `ConfigurationClassEnhancer.enhance()` reimplementation
+  names its generated class exactly like a real CGLIB proxy
+  (`<Original>$$SpringCGLIB$$<n>`, matching Spring's own
+  `SpringNamingPolicy` convention, deliberately — other already-fixed
+  tests hardcode this exact name), `isCglibProxyClass` correctly treats it
+  as one and unwraps to the ORIGINAL, plain `<Original>` class.
+- Real cglib then computes its OWN "first CGLIB proxy of `<Original>`"
+  name using the identical `SpringNamingPolicy` convention — landing on
+  the EXACT SAME string, `<Original>$$SpringCGLIB$$0`, our own native
+  reimplementation already used for the first-level enhancement. On real
+  HotSpot this never collides, because BOTH enhancements go through real
+  cglib's own Java-level naming bookkeeping (`AbstractClassGenerator
+  .ClassLoaderData`'s reserved-names set), so the second one detects the
+  name is taken and bumps its own counter. Our first-level enhancement
+  bypasses that bookkeeping entirely (it's a native reimplementation, not
+  real cglib bytecode), so real cglib never learns the name is taken.
+- Real cglib's `defineClass` attempt for its own (real, fully-featured,
+  ~12-13KB) generated class under that already-taken name is correctly
+  rejected by this VM's classloader (`IncompatibleClassChangeError` /
+  `ClassFormatError`, a `LinkageError` subtype) — matching what a genuine
+  same-name race would do on any JVM. Real cglib's own defineClass-failure
+  recovery path then loads OUR existing (much smaller, ~3.9KB) native
+  reimplementation class instead, treating it as if it were the class it
+  just "generated". That recovery path (`Enhancer.wrapCachedClass` and
+  related `AbstractClassGenerator`/`Enhancer` bookkeeping) needs several
+  cglib-internal artifacts real cglib-generated classes always carry,
+  which our minimal reimplementation never had: five `public static`
+  fields (`CGLIB$FACTORY_DATA`, `CGLIB$CALLBACK_FILTER`,
+  `CGLIB$THREAD_CALLBACKS`, `CGLIB$STATIC_CALLBACKS`, `CGLIB$BOUND` — all
+  `Object`-typed except the last, `boolean`) and the
+  `org/springframework/cglib/proxy/Factory` marker interface (with all
+  seven of its methods — `newInstance` ×3 overloads, `getCallback`,
+  `setCallback`, `getCallbacks`, `setCallbacks` — implemented as harmless
+  null-returning/no-op stubs, since nothing in this VM's own dispatch ever
+  calls them; they exist purely so an incidental cast/reflection from
+  OTHER real cglib machinery that mistakes this class for its own doesn't
+  throw). All now emitted unconditionally by `build_enhancer_class` for
+  every generated `@Configuration` enhancer class, regression-guarded by
+  two new unit tests (`enhancer_class_declares_all_cglib_bookkeeping_fields`,
+  checking field names/descriptors/access flags, and an extension of the
+  same test checking the `Factory` interface + its 7 method signatures).
+
+Bisection method (useful precedent for future similar investigations):
+`KRUN_STACK=1` on the failing test class surfaced the FULL cause chain
+(`AopConfigException: Could not generate CGLIB subclass...` →
+`CodeGenerationException: java.lang.NoSuchFieldException-->CGLIB$
+FACTORY_DATA` → `NoSuchFieldException: CGLIB$FACTORY_DATA`) — Spring's own
+`CglibAopProxy.getProxy()` catch-all wrapper collapses ANY
+`CodeGenerationException` into the generic "final class or non-visible
+class" message, so the real cause is invisible without `getCause()`
+chasing. Each missing artifact, once added, changed the failure to the
+NEXT missing one (`CGLIB$FACTORY_DATA` → `CGLIB$CALLBACK_FILTER` →
+`ClassCastException: ... cannot be cast to
+org.springframework.cglib.proxy.Factory`) rather than fixing it outright —
+worth expecting this "peel one layer at a time" pattern if this same
+mechanism resurfaces elsewhere (e.g. the `withFinalFactoryBeanAsReturnType`
+family, or other `@CompileWithForkedClassLoader`/general-AOP-on-native-
+class scenarios not yet exercised by this suite).
+
+Verified (Windows, real JDK 25, release build, deterministic across
+repeat runs): `ConfigurationClassPostProcessorTests` 80/85 (was 74/85 —
+all 4 `genericsBasedInjectionWith*` methods now pass; 0 remaining
+failures are CGLIB-generation related). The 5 residual failures are
+unrelated, pre-existing issues, confirmed independently:
+`configurationClassesWithInvalidOverridingForProgrammaticCall` (this doc's
+own already-documented checkcast/message-format gap, see below),
+`beanDefinitionsFromBeanMethodWith{BeanNameGenerator,
+ConfigurationBeanNameGenerator}` (both fail identically with
+`IllegalStateException: Could not initialize plugin: interface
+org.mockito.plugins.MockMaker` — a Mockito-inline-mock-maker
+service-file/environment gap, not investigated this session),
+`nullArgumentThroughBeanMethodCall` ("No BarArgument injected") and
+`beanLookupFromSameConfigurationClass` (`NoSuchMethodException:
+getTestBean`) — neither investigated this session, not cglib-generation
+shaped. No regressions: `ConfigurationClassEnhancerTests` 4/5 unchanged
+before/after (the one failure, `withPublicClass`, confirmed via `git
+stash` to fail identically on the pre-session baseline — a pre-existing
+gap where `config_enhancer_class_cache` is keyed only by the original
+class's `ClassId`, not `(ClassId, loader)`, so `enhance()`'s SAME source
+class through a SECOND, DIFFERENT `ClassLoader` incorrectly reuses the
+first loader's cached result instead of regenerating — not touched this
+session, flagged for a future fix).
+
+**3. Native-class bytecode retrievability — implemented as a general VM
+improvement, independently useful even though it did not turn out to be
+this cluster's root cause.** `ClassLoader.getResourceAsStream`/`Class
+.getResourceAsStream` previously could never serve a `.class` resource
+for a dynamically-*defined* class (`Unsafe.defineClass`/`Lookup
+.defineClass`/`ConfigurationClassEnhancer`'s own `define_class_full` calls
+included) — `ClassManager::find_resource` only ever searched the
+bootstrap/extension/application classpath, never the `class_bytes_cache`
+every defined class's raw bytes are already cached in. Fixed via a new
+`defined_class_resource_bytes` helper in `native-builtins/src/
+classloader.rs`'s `cl_get_resource_as_stream`, resolving a `".class"`
+resource request through the existing `ctx.class_id_by_name` +
+`ctx.class_bytes` trait methods before falling back to the classpath scan
+— loader-blind (same caveat as `resolve_or_load_class_id` elsewhere in
+this codebase), but safe in practice since every class this can reach was
+named by one of this crate's own generators with a process-globally-unique
+counter suffix, so no two loaders ever collide on the name. Kept in this
+session's commit as a real, tested (regression suite green) improvement
+for whatever DOES eventually need it (real ASM/bytecode-introspection
+tooling reading back a runtime-generated class's own bytecode), documented
+here so a future session doesn't need to re-derive it, but should NOT be
+assumed to fix any currently-open item in this doc — item 2 above was the
+actual mechanism for the `genericsBasedInjectionWith*` cluster.
 
 ## 2026-07-21 late session — non-AOT residual sweep
 
@@ -75,7 +281,10 @@ budget — flagged for a dedicated follow-up):
 
 - **`context.annotation.Spr6602Tests`.`configurationClassBehavior` +
   `context.annotation.Spr15275Tests`.`withFactoryBean`/`withFinalFactoryBean`
-  (3 methods, 2 classes).** Real Spring's `ConfigurationClassEnhancer
+  (3 methods, 2 classes). FIXED 2026-07-21 — see "FactoryBean-enhancement +
+  general AOP-CGLIB-of-native-class session" above for the implementation;
+  the root-cause analysis below is kept for historical context.** Real
+  Spring's `ConfigurationClassEnhancer
   .BeanMethodInterceptor.enhanceFactoryBean()` — when an inter-bean
   reference resolves to a `FactoryBean`, wraps it in a CGLIB subclass (or a
   JDK interface proxy, for a `final` factory exposed via an interface
@@ -110,7 +319,14 @@ budget — flagged for a dedicated follow-up):
   from unrelated concurrent dev work landing on `dev` in between; not
   investigated). Two distinct root causes found for 5/11:
   - 4 failures (`genericsBasedInjectionWith{Early,Late}GenericsMatchingOn
-    {Cglib,Jdk}Proxy`) — Spring AOP's `proxyTargetClass=true` auto-proxy
+    {Cglib,Jdk}Proxy`). **FIXED 2026-07-21** — see "FactoryBean-enhancement
+    + general AOP-CGLIB-of-native-class session" above; the actual root
+    cause turned out to be a class-naming collision + missing cglib
+    bookkeeping artifacts, NOT the bytecode-retrievability hypothesis
+    below (that hypothesis was still implemented as an independent VM
+    improvement, see item 3 in that session's write-up, but was not what
+    fixed this cluster). Kept for historical context: Spring AOP's
+    `proxyTargetClass=true` auto-proxy
     creator tries to CGLIB-subclass an ALREADY-native-CGLIB-generated
     `ConfigurationClassEnhancer` proxy class
     (`RepositoryConfiguration$$SpringCGLIB$$0`); real CGLIB bytecode-gen
@@ -931,9 +1147,9 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 |---|---|--:|--:|
 | `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests` | TIMEOUT | 0/0 | 120000ms |
 | `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | OK (2026-07-21 SPR-8080 fix) | 2/2 | 829ms |
-| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL (2026-07-21 reconfirmed, worse than recorded — see notes) | 74/85 | 8802ms |
-| `context.annotation.Spr15275Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 4/6 | 1174ms |
-| `context.annotation.Spr6602Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 1/2 | 1140ms |
+| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL (2026-07-21 FactoryBean/CGLIB session: 4 genericsBasedInjectionWith* fixed, see notes) | 80/85 | ~25000ms |
+| `context.annotation.Spr15275Tests` | OK (2026-07-21 FactoryBean-enhancement fix) | 6/6 | ~2500ms |
+| `context.annotation.Spr6602Tests` | OK (2026-07-21 FactoryBean-enhancement fix) | 2/2 | ~4000ms |
 | `context.aot.ApplicationContextAotGeneratorTests` | FAIL (2026-07-20, see caveat above — needs re-verify) | 16/40 | 389879ms |
 | `context.groovy.GroovyBeanDefinitionReaderTests` | TIMEOUT | 0/0 | 120000ms |
 

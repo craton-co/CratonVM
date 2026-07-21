@@ -5531,6 +5531,9 @@ pub(crate) fn native_class_get_declared_field(
         }
     };
     let target_name = ctx.read_string(name_obj).unwrap_or_default();
+    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+        eprintln!("[FBCGLIB-DBG] Class.getDeclaredField({target_name})");
+    }
 
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
@@ -9199,6 +9202,11 @@ pub(crate) fn native_class_get_field(
             .into())
         }
     };
+
+    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+        let cname = ctx.class_name_of_id(class_id);
+        eprintln!("[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}");
+    }
 
     // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
     // resolved hierarchy walk. `getField` keys on `(class_id, name, "")`
