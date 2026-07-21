@@ -92,27 +92,106 @@ benefit for this test — no reason to carry the extra unproven-safety risk.
 dominant cost driver for `testSlicesDense`, so there's no more upside in
 chasing it further here).
 
-**Finding 2** (not investigated further, real risk if touched): the
-*separate* `java/util/*` package ban in the same skip list (a documented
-hash-table-loop regalloc miscompile, unrelated to `LUCENE-POSTINGS.1`) also
-force-interprets hot JDK collection methods this test uses heavily
-(`Arrays.rangeCheck`, `BitSet.wordIndex`/`get`, `Objects.checkIndex`,
-`Arrays.compareUnsigned`). This ban was **not** re-verified or lifted —
-unlike the Lucene ban, it guards a different, still-real miscompile, and
-touching it needs its own dedicated investigation, not an afterthought here.
+**Finding 2, 2026-07-21 update: investigated, fixed, and CLOSED as a dead
+end for this doc — same pattern as the Lucene ban.** The premise above was
+wrong on two counts, found by actually reading `vm/src/jit/skip_list.rs`
+instead of trusting its own module-doc summary table:
 
-**Status of the actual performance question: still open.** Both leads
-investigated this session turned out not to be the dominant cost. Whoever
-picks this up next should not re-litigate the Lucene-ban question (closed,
-see above) — either investigate the `java/util/*` ban's actual impact on
-this test (carefully — it protects a real correctness bug), or do the
-`CRATONVM_DBG_JIT_METHOD_STATS=1` profiling pass directly against
-`testSlicesDense` itself (not just the faster `testSlicesSparseWithFilter`
-proxy) to see whether the hot-but-stuck-interpreter picture looks
-meaningfully different once the Lucene ban is out of the way, or whether
-raw interpreted-bytecode throughput on the surviving `java/util/*`-banned
-methods (or something else entirely — GC, I/O, algorithmic cost) now
-dominates.
+1. The description here ("a documented hash-table-loop regalloc
+   miscompile") was describing a DIFFERENT, older, already-narrowed ban
+   (the `T1.1.g` `is_known_miscompile` targeted list — `HashMap`
+   put/get/resize, `WeakHashMap` iterators, the AQS/CLQ families — gated
+   behind a GPR-local-homes allocator flag that's been default-OFF since
+   2026-07-04). The ban actually force-interpreting `Arrays`/`BitSet`/
+   `Objects`/every other `java/util/*` class for THIS test was a different,
+   *later* rule: `HIB-LONGTAIL.1` (commit `94ecd110b`, 2026-07-15), added as
+   a throughput workaround for an unrelated Hibernate H2/ANTLR test
+   scenario. It banned `org/h2/*`, `org/antlr/v4/runtime/*`, **and**
+   `java/util/*` (minus regex) as three independent unconditional terms —
+   not "only when combined", despite the comment's framing — so it silently
+   force-interpreted java.util in *every* test in the suite, ES included,
+   regardless of whether H2/ANTLR were anywhere in the picture.
+2. It was never actually a correctness guard to begin with: the Hibernate
+   longtail's real root cause (see
+   [`hib-generic-timeout-hang-longtail-resolved-20260715.md`](../../internal/fixed-suite-bugs/hib-generic-timeout-hang-longtail-resolved-20260715.md))
+   was the executor-compatibility bridge returning placeholder
+   `FutureTask`s, fixed in the SAME commit as the skip-list change. The
+   java.util term was never load-bearing for that fix — and it had been
+   silently breaking 7 of `skip_list.rs`'s own unit tests
+   (`tier1_skip_list_no_blanket_java_util_ban` and friends, which predate
+   `HIB-LONGTAIL.1` and assert the exact opposite) ever since it landed.
+
+**Fix**: narrowed `HIB-LONGTAIL.1` to just `org/h2/` + `org/antlr/v4/runtime/`
+(dropped the `java/util/` term entirely — dev commit `0bdd62344`). All 58
+`skip_list` unit tests pass (7 previously broken, now fixed).
+
+**But lifting it did not measurably speed up `testSlicesDense` either** —
+same non-result as the Lucene ban. Direct `CRATONVM_DBG_JIT_METHOD_STATS=1`
+profiling of the real `testSlicesDense` (not just the sparse proxy) confirms
+why: with java.util JIT-eligible, its `hot_but_stuck_in_interpreter` list is
+now **exclusively** `org/apache/lucene/*` methods (`AssertingLeafReader`,
+`BlockPackedReaderIterator`, `ByteArrayDataInput`, `Lucene90DocValuesProducer`,
+etc. — the same population Finding 1 already identified and closed). No
+`java/util/*` method appears in the top 30 stuck methods once the ban is
+lifted — the Lucene ban alone already accounts for the whole
+force-interpreted population that matters at this test's scale.
+
+**A real, independent bug WAS found and fixed along the way, also not the
+dominant cost but worth fixing regardless**: profiling with the newly-lifted
+java.util surface turned up `java/util/stream/MatchOps.makeInt` deoptimizing
+6928 times in a single ~700s window (`CRATONVM_DBG_DEOPT=1`), every single
+time with `reason=UnreachedCode action=MakeNotCompilable` — an internal
+`invokedynamic` (lambda) site inside the method that `jit_scan` lowers to an
+unconditional-deopt uncommon trap, so once JIT-compiled this factory method
+deopts on *every* call, and the runtime give-up mechanism (`jit_skip_set` /
+`mark_jit_bail_listed`) never actually stopped re-invocation (almost
+certainly because callers' own inline caches keep jumping straight to the
+already-primed, doomed raw entry point, bypassing the bail-list check —
+same general class of gap flagged in
+`docs/feature-designs/jit-local-exception-handlers.md`'s RBC.6 investigation
+for the `VIRTUAL_DISPATCH_CACHE` fast path). Added a targeted permanent
+skip-list entry for `MatchOps.{makeInt,makeRef,makeLong,makeDouble}`
+(`StreamMatchOpsUncommonTrap`, dev commit `b416011bc`), same pattern as the
+existing `Collections.indexedBinarySearch` (ES812) entry just above it in
+the file.
+This eliminated the deopt storm entirely (`deopts: 10604 → 1`,
+`c2_bailouts: 10601 → 0`) but — consistent with the java.util finding above
+— did not move `testSlicesDense`'s wall-clock time (822.7s before vs. 822.7s
+after; the storm was real wasted work, just not enough of it relative to the
+test's total cost to matter at this scale). Worth fixing on its own merits
+(it's a genuine, previously-undiscovered JIT tiering bug — the give-up
+mechanism not sticking), independent of this doc.
+
+**2026-07-21 timing note — the `~600-602s` figure in this doc's "Symptom"
+section above no longer reproduces on this host and should not be trusted as
+a tight regression baseline.** Three same-day A/B/C measurements — this
+session's fully-fixed binary, an unmodified current-`dev` binary, and a
+binary built from the EXACT commit (`fa91ef9e5`) this doc's 2026-07-19
+investigation used — all measured `testSlicesDense` at 822.6–823.2s (within
+0.6s of each other). Since the doc-era commit itself no longer reproduces
+602s today, the ~37% gap vs. the originally-documented figure is host/day
+environmental variance (this is a heavily shared, multi-tenant Azure box —
+see `azure-host-disk-full-flapping` / load-average notes elsewhere), **not**
+a code regression from any of the ~40 commits that landed between
+2026-07-19 and 2026-07-21. Do not git-bisect this gap; it was checked and
+doesn't bisect (identical timing at both the old and new commit, measured
+back-to-back on the same host state).
+
+**Status of the actual performance question: still open, but both
+originally-flagged leads (Lucene ban, java/util ban) are now conclusively
+closed as non-dominant.** The `hot_but_stuck_in_interpreter` population is
+consistently and exclusively `org/apache/lucene/*` across every
+configuration tested (java.util banned or not, MatchOps deopting or not).
+Whoever picks this up next should not re-litigate either ban (both
+independently confirmed lifting them doesn't help) and should instead either
+(a) profile the JIT-compiled `org/apache/lucene/*` code paths themselves for
+whether the *compiled* code is throughput-bound rather than the interpreted
+fraction, (b) look at GC/allocation pressure or I/O (the doc's own earlier
+"something else entirely" guess, never investigated), or (c) accept that
+closing the full ~60x gap to HotSpot (13.5s) requires safely compiling the
+Lucene hot path at scale — a materially bigger undertaking (the postings
+corruption bug LUCENE-POSTINGS.1 guards against) than anything tractable as
+a "residual" of this doc.
 
 ## Repro
 
@@ -129,7 +208,10 @@ $CP  = (Get-Content "$ES\server\build\craton-testcp.txt" | ForEach-Object { $_.T
   org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatSlicedVectorQueryTests
 ```
 
-Expect `Time: ~600s` and a suite-timeout-shaped JUnit failure (or `OK` if
-`-Dtests.timeoutSuite` is raised past ~610000). Use a `--stack-dump-on-timeout`
-value comfortably above 600s if you want to rule out a real hang rather than
-just observing the expected slow completion.
+Expect `Time:` somewhere in the 600-825s range (varies by host day/load — see
+the 2026-07-21 timing note above, don't treat a specific number as a tight
+regression signal) and a suite-timeout-shaped JUnit failure (or `OK` if
+`-Dtests.timeoutSuite` is raised past the actual completion time, currently
+~825000 on this host). Use a `--stack-dump-on-timeout` value comfortably
+above that if you want to rule out a real hang rather than just observing
+the expected slow completion.
