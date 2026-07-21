@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: FIXED under interpreter execution, in isolation (2026-07-20, fourth investigation session) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end (`-Jit off`) when run in isolation — verified deterministically 3 times. Two caveats found while confirming this at scale, both NOT yet fully root-caused: (1) under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature — a JIT-specific dispatch gap, see "Residual 6"; (2) under heavy parallel-sweep host contention even with `-Jit off`, Residual 4's original failure was observed to recur once — the loader-identity race the fix closes is real and reproducible, but may not be the only one in this family, see Residual 4's "Verified, but load-dependent" note.**
+**Status: FIXED under interpreter execution (2026-07-20/21, fourth+fifth investigation sessions) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed, unconditionally, including under heavy parallel-sweep host contention. `SpringBootContextLoaderAotTests` PASSES end-to-end under `-Jit off` — verified 10+ times across isolated and 3-way/6-way concurrent-process stress runs with no failures. (An earlier version of this doc reported an apparent "load-dependent" recurrence of Residual 4 under contention; that was a methodology error in the investigating session — its parallel-sweep test runs silently used a stale pre-fix binary due to an environment-variable-propagation bug in how the test runner was invoked, not a real second race. See Residual 4's note below for detail and the general lesson.) One caveat remains open and IS real: under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature — a JIT-specific dispatch gap, confirmed with a verified-fresh binary, see "Residual 6".**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -307,23 +307,47 @@ the SAM-generic-type machinery Residual 3's fix added:
   `AotApplicationContextInitializer::new`-style factories). This didn't turn
   out to be the actual fix for this specific failure (the two `generics.rs`/
   `lang_class.rs` fixes above were), but it closes a real, structurally
-  identical gap for the sibling dispatch kind and is kept.
+  identical gap for the sibling dispatch kind and is kept — dev independently
+  landed the same fix concurrently, confirming it was worth having.
+- `lang_class.rs` (fifth investigation session, 2026-07-21): a third
+  loader-blind lookup, `ctx.class_id_by_name(&iface_name)` resolving a
+  lambda's SAM interface's own `ClassId` (used both by
+  `native_class_get_interfaces` — `Class.getInterfaces()` — and as
+  `lambda_functional_interface_generic_type`'s starting `iface_id` in
+  `native_class_get_generic_interfaces`), was hardened the same way via a
+  new shared `lambda_functional_interface_id_loader_aware` helper scoped to
+  `ctx.lambda_proxy_host`. Not proven to be load-bearing for this specific
+  failure (see the correction below), but it's the same real gap pattern and
+  a legitimate hardening regardless.
 
-**Verified, but load-dependent:** with all three fixes, `SpringBootContextLoaderAotTests`
-PASSES end-to-end under `-Jit off` **in isolation** — reproduced 3 times
-independently (91.7s, 92.1s, 88.0s). Running it as part of a large parallel
-sweep (`-Subtrees core -Parallel 6`, ~570 classes, heavy multi-process CPU
-contention on this shared host — 8 concurrent `cratonvm`/`cargo` processes
-observed) reproduced the *original* pre-fix `IllegalStateException` once.
-This is consistent with the whole bug family's nature — "which resolution
-touches a class name first" is inherently a race, and the fixes above close
-the specific races found by tracing an isolated run; a differently-timed
-race under heavy contention can still let some other, not-yet-identified
-loader-blind touch point win first. **Residual 4 is fixed for the traced
-race** but may not be fully load-independent — re-verify in isolation
-(`-Parallel 1`) before treating a future occurrence under a busy host as a
-regression, and treat a *reproducible-in-isolation* recurrence as a sign
-there is a second, distinct race still open in this same family.
+**Verified, unconditionally — the "load-dependent" finding in an earlier
+version of this doc was a methodology error, corrected 2026-07-21.** An
+earlier investigating session ran `SpringBootContextLoaderAotTests` inside a
+large parallel sweep (`-Subtrees core -Parallel 6`, ~570 classes) via
+`powershell.exe -Command "$env:CV_BIN=...; & run-spring-boot-suite.ps1 ..."`
+launched from a Bash background job, saw the *original* pre-fix
+`IllegalStateException` recur, and concluded Residual 4 had a second,
+load-dependent race. It did not: `$env:CV_BIN` set **inside** a
+`powershell.exe -Command` string invoked **from Bash** does not reliably
+reach the child `run-spring-boot-suite.ps1` process — the runner silently
+fell through to its `target\release\cratonvm-spring-boot-suite.exe`
+auto-copy fallback, which is only refreshed from `cratonvm.exe` when it
+doesn't already exist. A copy of that file created hours earlier (build
+`build4`/`build5`, before the Residual 4 fixes even fully landed) was still
+sitting in `target\release\`, and every subsequent stress run in that
+session silently ran against it — confirmed post hoc by checking each run's
+own `craton exe=` log line, which named the stale file every time. Passing
+`-Exe <absolute path>` explicitly (highest-priority resolution, ahead of
+`$env:CV_BIN`) instead of relying on the environment variable makes this
+class of error impossible; re-running the exact same stress shape with `-Exe`
+set explicitly — 3-way, then 6-way concurrent `-Parallel 1`-style isolated
+processes racing each other, 9 runs total — **PASSED every single time**.
+**General lesson for future sessions**: launching `run-spring-boot-suite.ps1`
+via `powershell.exe -Command "..."` from a *backgrounded Bash* command is
+unreliable for environment-variable propagation; always pass `-Exe` with an
+absolute path instead of `$env:CV_BIN` when doing this, and always check the
+run's own `craton exe=` log line before trusting a "surprising" result from
+a test invoked this way.
 
 ### Residual 5 (FIXED, fourth investigation session): Groovy `ClassInfo.getClassInfo(Class)` returns `null`, unrelated to loader identity
 
@@ -416,7 +440,7 @@ JIT-specific call-target resolution for a native method inherited by a
 receiver from a superclass reached via `invokeinterface` (`vm/src/jit/`), or
 instrument it directly rather than continuing to guess at allow-list gaps.
 
-### Regression check (fourth investigation session, 2026-07-20)
+### Regression check (fourth investigation session, 2026-07-20; corrected fifth session, 2026-07-21)
 
 Re-ran the full `core/spring-boot-test` module (81 test classes; the extra
 one relative to the third session's 80 is enumeration noise, not a new
@@ -435,19 +459,26 @@ outside `core/spring-boot-test` (logging/config/YAML/SSL — no overlap with
 `ClassValue` or lambda-generics call paths) were compared against a
 same-session baseline and are out of this doc's scope — flagged here only so
 a future session doesn't mistake them for something this session touched.
-A separate, dedicated full-module run under `-Jit off` (same 573-class
-`-Subtrees core` sweep, `-Parallel 6`) showed the SAME 3 divergences —
-including `SpringBootContextLoaderAotTests` **FAIL**, with the *original*
-pre-Residual-4-fix `IllegalStateException` signature. This is the parallel-
-sweep contention case described in Residual 4's "Verified, but
-load-dependent" note: 3 independent isolated (`-Parallel 1`,
-single-class-list) runs on the same binary all PASS, so the fix is real, but
-a full 573-class `-Parallel 6` sweep on this shared, contended host was
-sufficient to flip the timing-sensitive race the fix closes into a
-still-open sibling race at least once. Not a regression from this session's
-changes (the pre-fix binary fails this same way unconditionally, isolated
-or not) — flagged here so a future full-sweep run isn't mistaken for
-Residual 4 having regressed; re-verify any recurrence in isolation first.
+
+A `-Jit off` full-module run in the fourth session appeared to show
+`SpringBootContextLoaderAotTests` **FAIL** with the *original*
+pre-Residual-4-fix `IllegalStateException`, prompting an incorrect
+"load-dependent second race" conclusion. **Corrected in the fifth session
+(2026-07-21)**: that run's own log line
+(`craton exe=...\cratonvm-spring-boot-suite.exe`) shows it silently used a
+stale binary from hours earlier, not the session's actual fix — see the
+"Verified, unconditionally" note under Residual 4 above for the full
+explanation. Re-running the identical 573-class `-Subtrees core -Jit off
+-Parallel 6` sweep with the binary passed explicitly via `-Exe` (confirmed
+fresh via its own `craton exe=` log line) shows `SpringBootContextLoaderAotTests`
+**PASS**, matching the HotSpot baseline exactly — it is no longer one of the
+divergences. The only 3 divergences from baseline in this corrected run are
+the same 2 pre-existing failures plus one new one, unrelated to this
+session's changes: `UriBuilderFactoryWebConnectionHtmlUnitDriverTests`
+**HANG** (300s timeout; an HtmlUnit/HTTP-client test, no overlap with
+`ClassValue` or lambda-generics — almost certainly the same shared-host
+CPU-contention class of artifact as `DuplicateJsonObjectContextCustomizerFactoryTests`'s
+flakiness, not investigated further as out of this doc's scope).
 
 ## Cluster D — missing `"random"` PropertySource — FIXED (upstream, before this session)
 
@@ -466,6 +497,6 @@ The originally-hypothesized "regression-in-place-of-fix" (SSLSocketFactory fix c
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerWithLegacySwitchTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `SpringBootTestCustomConfigNameTests` — **FIXED** (Cluster B)
-- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, in isolation** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED this session, PASSES end-to-end, 3/3 isolated runs); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a new, separate, not-yet-root-caused JIT dispatch gap; **also OPEN under heavy parallel-sweep host contention even with `-Jit off`** — see Residual 4's "Verified, but load-dependent" note, a second, distinct, not-yet-identified race in the same loader-identity family
+- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, unconditionally** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED, PASSES end-to-end — verified isolated and under 3-way/6-way concurrent-process contention, 10+ runs, no failures); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a real, separate, not-yet-root-caused JIT dispatch gap (confirmed with a verified-fresh binary, not a methodology artifact)
 - `core/spring-boot-test` | `SpringBootContextLoaderTests` — **FIXED**, 26/26 (Cluster D)
 - `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce in isolation; flaky under parallel-load regression runs (Cluster E, see update above) — unrelated to this session's changes

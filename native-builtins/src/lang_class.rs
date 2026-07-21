@@ -9558,6 +9558,38 @@ pub(crate) fn native_class_get_constructor(
 
 // --- Class.getInterfaces / Class.getModifiers ---
 
+/// Resolve a lambda proxy's functional-interface NAME to a `ClassId`,
+/// scoped to the lambda's own host (defining/enclosing) class's loader
+/// rather than the flat global store.
+///
+/// Residual 4 follow-up (2026-07-20, docs/known-issues/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md): both
+/// `native_class_get_interfaces` and `native_class_get_generic_interfaces`
+/// used a bare `ctx.class_id_by_name(&iface_name)` here — loader-blind.
+/// Scoping `typesig_to_real_type`'s LATER resolution (inside the generic
+/// branch) closed one race, but isolated runs could still occasionally hit
+/// the original failure under heavy host contention: `getInterfaces()` is
+/// commonly called before `getGenericInterfaces()` in the same reflective
+/// walk, and *this* lookup — for the exact same interface name — was never
+/// scoped at all. Whichever of these two call sites is the FIRST thing in
+/// the whole process to touch `iface_name` decides which loader's copy gets
+/// used everywhere downstream (both mint-or-reuse via the same flat global
+/// store); under different execution timing a different one can win the
+/// race. Scoping both to the lambda's own host loader removes the race
+/// instead of just moving it.
+fn lambda_functional_interface_id_loader_aware(
+    ctx: &mut dyn NativeContext,
+    class_id: ClassId,
+    iface_name: &str,
+) -> Option<ClassId> {
+    let host_id = ctx
+        .lambda_proxy_host(class_id)
+        .and_then(|host_name| ctx.class_id_by_name(&host_name));
+    host_id
+        .and_then(|host_id| ctx.class_id_by_name_near(iface_name, host_id))
+        .or_else(|| ctx.class_id_by_name(iface_name))
+}
+
 pub(crate) fn native_class_get_interfaces(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -9642,7 +9674,9 @@ pub(crate) fn native_class_get_interfaces(
     // (SAM) interface. Return `[SAM]` so reflective type/listener matching that
     // walks `getInterfaces()` finds it (matches HotSpot's `$$Lambda` class).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
-        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+        if let Some(iface_id) =
+            lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
+        {
             let mirror = ctx.get_class_mirror(iface_id);
             let elem = ctx
                 .class_id_by_name("java/lang/Class")
@@ -12947,7 +12981,9 @@ pub(crate) fn native_class_get_generic_interfaces(
     // silently skipping the advisor (Spring's `AnnotationAwareAspectJAutoProxyCreator`
     // then never proxies the lambda bean at all).
     if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
-        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+        if let Some(iface_id) =
+            lambda_functional_interface_id_loader_aware(ctx, class_id, &iface_name)
+        {
             // Prefer a real `ParameterizedType` (e.g. `ApplicationContextInitializer<
             // ConfigurableApplicationContext>`) when the functional interface is
             // itself generic — reflection-based generic-argument resolvers
@@ -12984,15 +13020,20 @@ pub(crate) fn native_class_get_generic_interfaces(
                     // already correctly fork-loader-resolved by the time the
                     // lambda exists) so the interface name resolves in the same
                     // loader context as the lambda itself.
-                    let _gscope = ctx
-                        .lambda_proxy_host(class_id)
-                        .and_then(|host_name| ctx.class_id_by_name(&host_name))
-                        .map(|host_id| ctx.get_class_mirror(host_id))
-                        .map(|host_mirror| {
+                    let host_name = ctx.lambda_proxy_host(class_id);
+                    let host_id = host_name.as_deref().and_then(|n| ctx.class_id_by_name(n));
+                    if dbg_lg {
+                        eprintln!(
+                            "[LAMBDA-GENERIC] host-scope class_id={class_id:?} host_name={host_name:?} host_id={host_id:?}"
+                        );
+                    }
+                    let _gscope = host_id.map(|host_id| ctx.get_class_mirror(host_id)).map(
+                        |host_mirror| {
                             crate::generics::GenericDeclScope::new(Value::Object(Some(
                                 host_mirror,
                             )))
-                        });
+                        },
+                    );
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
