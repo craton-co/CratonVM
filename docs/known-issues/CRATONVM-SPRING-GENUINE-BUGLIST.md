@@ -74,6 +74,108 @@ grew slightly from the original 12 (picked up `test.context.aot.AotIntegrationTe
 (`beans`, `context`, `orm`, `test`, `web` sections, all `TIMEOUT`/`LOADERR`
 rows).
 
+## AOT cluster — 2026-07-20 evening session (JIT miscompilation root-cause + fixes)
+
+**Two genuine, previously-unknown JIT miscompilation bugs found and fixed**
+(dev `a8165d607`), plus a fresh from-scratch rebaseline of the whole
+15-class AOT cluster against the fix. This is a different root cause
+family than the loader-identity bugs fixed 2026-07-15/16 — those were
+real and are still in place, but a *separate* defect in the JIT's x64
+lowering of two `com.sun.tools.javac` methods was independently
+corrupting most of the compile-heavy AOT codegen tests whenever
+`TestCompiler` ran enough in-process `javac` invocations in one JVM
+(each AOT test method does its own `getTask().call()`; a whole-class run
+is 20-50+ such calls in one process).
+
+**Root-caused with a Spring-free, ~40-line standalone repro**
+(`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped
+in a plain Java `main`, no Spring/JUnit involved) — reproduces
+deterministically at the 20th call every time, isolating this
+entirely from Spring/AOT-specific machinery:
+
+1. **`com.sun.tools.javac.jvm.ClassReader.readClass`** — once
+   tier-compiled, throws `NullPointerException: Cannot read field "kind"
+   because "sym" is null` from inside `Symbol.packge`, reached via
+   `ClassReader.readClass -> readClassBuffer -> readClassFile ->
+   ClassFinder.fillIn -> Modules$1.complete` (module-graph symbol
+   completion during `Modules.setupAllModules`). Confirmed JIT-only
+   (`--nojit` / `CRATONVM_JIT_THRESHOLD=100000` both prevent it) and
+   bisected to this exact method via `CRATONVM_JIT_BISECT_SKIP=
+   com/sun/tools/javac/jvm/ClassReader.readClass`. Fixed by adding it to
+   the JIT interpreter-fallback skip-list (`vm/src/jit/skip_list.rs`,
+   `SkipReason::ClassReaderReadClass`).
+2. **`com.sun.tools.javac.code.ClassFinder.complete`** — a second,
+   distinct residual in the same scenario, surfacing even with (1)
+   fixed. Two symptoms: a `-Werror`/`@SuppressWarnings("deprecation")`
+   false positive (the suppression annotation IS present in the
+   generated source but real javac's `-Werror` still fails the
+   compile), and outright duplicated tokens in generated source (e.g.
+   `import import org.springframework.aot.generate.Generated;`).
+   Bisected the same way (`CRATONVM_JIT_DENY=
+   com/sun/tools/javac/code/ClassFinder` then `CRATONVM_JIT_BISECT_SKIP=
+   .../ClassFinder.complete`). Fixed via
+   `SkipReason::ClassFinderComplete`.
+
+Both fixes are narrowly scoped (single named method each), regression-
+checked (`cargo test -p cratonvm-vm --lib --release`: 2218 passed / 17
+failed, byte-identical to the documented pre-existing lock_order/
+skip_list release-mode baseline both before and after), and merged to
+`dev` (`a8165d607`).
+
+**Rebaseline after the fix** (fresh worktree, from-scratch
+`spring-framework-recheck` checkout — see host-state note below — real
+JDK 25, per-class timeouts raised to 300-550s since interpreter-fallback
+adds real overhead to these compile-heavy tests):
+
+| Class | Before | After | Notes |
+|---|---|---|---:|
+| `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` | TIMEOUT | **OK 14/14** | fixed |
+| `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | TIMEOUT/LOADERR | **OK 47/47** | fixed (needs ~470s, not 120-350s) |
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | TIMEOUT | **OK 44/44** | fixed (needs ~460s) |
+| `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | LOADERR | **OK 26 found/24 succ/0 fail** (2 skip) | fixed |
+| `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` | TIMEOUT (FAIL 8/2/6 historically) | **OK 8/8** | fixed |
+| `test.context.aot.TestClassScannerTests` | TIMEOUT | **OK 7/7** | fixed |
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | TIMEOUT | **genuine, severe performance defect — do not call this "not a bug".** Confirmed passing 14/14 given ~54 minutes (`3242228ms`, prior fix `765149408`). Measured HotSpot on the SAME classpath/JDK this session: **`13126ms` (13.1s)**. That's roughly **247x slower than HotSpot** for a real, ordinary Spring AOT test — not "some interpreter overhead", a severe throughput regression. It's a *different category* of bug (interpreter/JIT dispatch throughput, not a correctness defect) and will keep showing as TIMEOUT under any practical suite ceiling regardless, but it deserves a dedicated interpreter-throughput investigation, not a shrug. Round 7b's live profiling (2026-07-15) found 24x-deep recursive `try_lambda_dispatch -> execute_invoke_kind -> execute_frame -> execute -> invoke_on_class_shared[_inner]` cycles via Mockito constructor-mock dispatch (`native_al_for_each`/`asl_delegate_snapshot`) as the hot path — that's where a throughput fix should start. |
+| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | LOADERR | FAIL **34/31/3** (was effectively 34/16/18 pre-fix) | major improvement; 3 residuals are the SAME duplicated-token/content-corruption shape as fix (2) above but NOT YET isolated to a specific method — `--nojit` makes this class fully 34/34, so it's confirmed JIT, just an unidentified third culprit. Next step: repeat the `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP` bisection from this session on the 3 remaining methods (`generateBeanDefinitionMethodWhenInnerBeanGeneratesMethod`, `generateBeanDefinitionMethodWhenBeanIsInJavaPackage`, `generateBeanDefinitionMethodWithDeprecatedGenericElementInTargetClass` — the last is the SAME duplicated-import bug, not a distinct deprecation issue despite the name). |
+| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | FAIL **40/16/24** (historically 40/25/15 before this session, pre-existing) | **worse in absolute count than the pre-existing baseline** — this class was already documented (2026-07-16 doc) as having heavy cross-test-contamination/JIT-timing sensitivity (bisection experiments this session also showed a "deny whole javac package" run flipping which specific methods failed between successive runs). Needs its own dedicated bisection session; do not assume this is a regression from the 2 fixes above without first re-verifying with `--nojit` (expected to pass ~40/40 if genuinely the same JIT family — not yet confirmed this session, ran out of time). |
+| `test.context.aot.AotIntegrationTests` | TIMEOUT | FAIL **4/0/2** | now completes (was hanging); both failures are `TestContextAotException: Failed to generate AOT artifacts for test classes [...]` wrapping a nested cause not yet unwrapped — needs `KRUN_STACK=1`+full stack trace to find the real cause. |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL 0/4 | FAIL **4/2/2** | improved (0→2 passing); 1 residual is `TestContextAotException` for `WebSpringVintageTests` (same shape as AotIntegrationTests above, possibly shared cause), 1 is `AssertionError: [Proxy hint for GreetingService] ... did not` (a genuine RuntimeHints registration gap, likely unrelated to the javac JIT bugs). |
+| `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | TIMEOUT | FAIL **5/3/2** | now completes; **NEW finding, NOT JIT-related** (confirmed via `--nojit`, identical 3/5 either way): `java.lang.ArrayStoreException: arraycopy: source element at index 0 is not assignable to destination component type` inside `tools.jackson.databind.util.ArrayBuilders.insertInListNoDup`, thrown while creating the `httpServiceProxyRegistry` bean. Not yet root-caused — likely a reflection/generic-array-creation type bug feeding Jackson a wrongly-typed array, upstream of the `arraycopy` covariance check (which is behaving correctly by rejecting it). |
+| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL 3/5 | FAIL **3/5** (unchanged count, but the ORIGINAL `ClassCastException: Class cannot be cast to String[]` this doc documented as fixed 2026-07-16 is confirmed gone) | same `ArrayStoreException` as the sibling class above — shared root cause, 2 methods (`basicListingWithAot`, `basicScanWithAot`). The previously-documented JDK24+ `java.lang.classfile.ClassFile` host gap does NOT explain this (host now runs real JDK 25 throughout this session's testing, which has that API). |
+| `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | FAIL 1/2 | FAIL 1/2 (unchanged) | **out of scope** — verified this is a `@PostConstruct`/`@Autowired` circular-init bean-lifecycle bug (`UnsatisfiedDependencyException` on `setTestBean`), nothing to do with AOT code generation. Likely miscategorized into this doc's AOT-cluster table originally; leave for a bean-lifecycle investigation, not this cluster. |
+| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL 82/85 | FAIL 82/85 (unchanged) | **out of scope** — verified failures are CGLIB proxy method lookup (`NoSuchMethodException: getTestBean`), `@Bean` null-argument handling, config-override validation — none touch AOT/TestCompiler. Do not confuse with the separately-named, already-fixed `ConfigurationClassPostProcessorAotContributionTests` (see the 2026-07-15/16 loader-identity docs) — this is a different class. |
+
+**Host-state gotchas hit and fixed this session** (worth knowing for
+whoever continues): the shared `spring-framework-recheck` checkout used
+for classpath generation had (a) a corrupted `spring-aop/src` tree
+(283 of 314 `.java` files — the `aop.target` package was entirely
+missing, breaking `spring-orm` compilation) and (b) a `spring-beans`
+jar with one mismatched class-file entry (`AbstractBeanDefinition.class`
+containing `BeanDefinition`'s bytecode) plus several modules' test-
+fixtures jars (`*-test-fixtures.jar`) simply absent from `build/libs`.
+Both were fixed by restoring `spring-aop/src` from the known-good
+Windows reference checkout and force-rebuilding the affected jars
+(`--rerun-tasks`). Neither was a CratonVM bug — both were host/checkout
+corruption (plausibly from the same disk-pressure-driven "harvester"
+process documented elsewhere in this repo's known-issues history) — but
+they were initially indistinguishable from real compile failures and
+cost real investigation time before being ruled out. **Always verify
+the classpath/checkout integrity first** when a whole cluster of
+AOT/compile-based tests shows the exact same `CompilationException`
+shape.
+
+**Recommended next steps for whoever continues this cluster:**
+1. Bisect `BeanDefinitionMethodGeneratorTests`'s 3rd JIT residual the
+   same way (this session's `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP`
+   technique on `com/sun/tools/javac/*`).
+2. Re-verify `ApplicationContextAotGeneratorTests` with `--nojit` first
+   to confirm/refute it's the same JIT family before any other work.
+3. Get the full stack trace (`KRUN_STACK=1`) for `AotIntegrationTests`'s
+   and `TestContextAotGeneratorIntegrationTests`'s `TestContextAotException`
+   causes — the outer wrapper hides the real defect.
+4. Root-cause the new `ArrayStoreException`/Jackson `ArrayBuilders`
+   finding shared by both `web.service.registry.*` classes.
+
 **`test.context.jdbc.*` cluster — fully fixed (0 remain).** All 25 classes
 that were uniformly failing behind Spring's `ApplicationContext` failure
 threshold circuit-breaker now pass. Whatever landed in the last 3 days
@@ -180,12 +282,12 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
 | `beans.ConcurrentBeanWrapperTests` | FAIL | 100/101 | 16852ms |
-| `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` | TIMEOUT | 0/0 | 120000ms |
-| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | LOADERR | 0/0 | 2351ms |
-| `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | TIMEOUT | 0/0 | 120000ms |
-| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | TIMEOUT | 0/0 | 120000ms |
-| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | 0/0 | 120000ms |
-| `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | LOADERR | 0/0 | 345ms |
+| `beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests` | OK (2026-07-20 JIT fix) | 14/14 | 138189ms |
+| `beans.factory.aot.BeanDefinitionMethodGeneratorTests` | FAIL (2026-07-20, major improvement, see above) | 31/34 | 324252ms |
+| `beans.factory.aot.BeanDefinitionPropertiesCodeGeneratorTests` | OK (2026-07-20 JIT fix, needs ~470s) | 47/47 | 466737ms |
+| `beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests` | OK (2026-07-20 JIT fix, needs ~460s) | 44/44 | 456855ms |
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT (severe perf defect — ~247x slower than HotSpot, see above) | 0/0 | 350000ms |
+| `beans.factory.aot.InstanceSupplierCodeGeneratorTests` | OK (2026-07-20 JIT fix) | 24/26 | 225204ms |
 | `beans.factory.xml.XmlBeanFactoryTests` | FAIL | 85/95 | 85837ms |
 
 ### Context
@@ -197,7 +299,7 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 | `context.annotation.ConfigurationClassPostProcessorTests` | FAIL | 82/85 | 20126ms |
 | `context.annotation.Spr15275Tests` | FAIL | 4/6 | 2038ms |
 | `context.annotation.Spr6602Tests` | FAIL | 1/2 | 1229ms |
-| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | 0/0 | 120000ms |
+| `context.aot.ApplicationContextAotGeneratorTests` | FAIL (2026-07-20, see caveat above — needs re-verify) | 16/40 | 389879ms |
 | `context.groovy.GroovyBeanDefinitionReaderTests` | TIMEOUT | 0/0 | 120000ms |
 
 ### Core
@@ -245,7 +347,7 @@ All 8 HTTP JSON/message-converter cluster classes fixed 2026-07-20 — see
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` | TIMEOUT | 0/0 | 120000ms |
+| `orm.jpa.support.PersistenceAnnotationBeanPostProcessorAotContributionTests` | OK (2026-07-20 JIT fix) | 8/8 | 136535ms |
 | `orm.jpa.support.PersistenceInjectionTests` | FAIL | 26/27 | 11461ms |
 
 ### Scheduling
@@ -273,9 +375,9 @@ FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
 | `test.context.BootstrapUtilsTests` | FAIL | 22/23 | 9109ms |
-| `test.context.aot.AotIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
-| `test.context.aot.TestClassScannerTests` | TIMEOUT | 0/0 | 120000ms |
-| `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL | 0/4 | 83845ms |
+| `test.context.aot.AotIntegrationTests` | FAIL (2026-07-20, now completes, see above) | 0/4 | 56296ms |
+| `test.context.aot.TestClassScannerTests` | OK (2026-07-20 JIT fix) | 7/7 | 197691ms |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL (2026-07-20, improved, see above) | 2/4 | 148117ms |
 | `test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests` | FAIL | 3/5 | 27473ms |
 | `test.context.bean.override.mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` | FAIL | 4/6 | 16982ms |
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | FAIL | 0/2 | 918ms |
@@ -300,8 +402,8 @@ FAIL/8/17 from the 2026-07-20 reconfirmation rerun.)
 | `web.reactive.function.client.WebClientIntegrationTests` | FAIL | 168/170 | 47143ms |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
-| `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | TIMEOUT | 0/0 | 120000ms |
-| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL | 3/5 | 100617ms |
+| `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | FAIL (2026-07-20, now completes, NEW bug found, see above) | 3/5 | 51669ms |
+| `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL (original CCE confirmed gone, new shared bug, see above) | 3/5 | 54239ms |
 | `web.servlet.config.MvcNamespaceTests` | FAIL | 24/25 | 24938ms |
 | `web.servlet.config.annotation.ViewResolutionIntegrationTests` | FAIL | 6/7 | 29415ms |
 | `web.servlet.view.groovy.GroovyMarkupViewTests` | FAIL | 9/10 | 28950ms |

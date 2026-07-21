@@ -43520,16 +43520,18 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // transfers, a Java-supplied TrustManager is retained only in the
             // synthetic fields and HttpURLConnection silently falls back to
             // the platform verifier.
-            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
+            let kms_array = match km_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            let resolved_identity =
+                crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_array);
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
             let tms_array = match tm_arg {
                 Value::Object(Some(array)) => Some(array),
                 _ => None,
             };
             crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
-            let kms_array = match km_arg {
-                Value::Object(Some(array)) => Some(array),
-                _ => None,
-            };
             crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
             Ok(None)
         },
@@ -45237,6 +45239,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .get(2)
                 .map(|value| crate::keystore::read_password(ctx, value))
                 .unwrap_or_default();
+            if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+                let this_ih = obj_arg(args, 0)
+                    .map(|t| ctx.identity_hash_code(t))
+                    .unwrap_or(0);
+                eprintln!(
+                    "[dbg-tls-auth] kmf(phases_late).init(KeyStore) this_ih={} ks_id={} password_len={}",
+                    this_ih,
+                    crate::keystore::keystore_id_from_object(ctx, *ks),
+                    key_password.len()
+                );
+            }
             crate::keystore::keystore_set_pending_km_identity_with_password(
                 ctx,
                 *ks,

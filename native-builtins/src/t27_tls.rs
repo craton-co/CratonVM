@@ -455,10 +455,45 @@ pub(crate) fn attach_key_managers_to_ctx(
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
 /// roots onto the SSLContext object's per-context slots.
-pub(crate) fn attach_pending_identity_to_ctx(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
+///
+/// `resolved_km_identity` is the identity resolved DIRECTLY from the actual
+/// `KeyManager[]` this `SSLContext.init` call received (via
+/// `x509_manager::resolved_identity_pem_for_key_manager_array`), when the
+/// caller could trace it.
+/// It takes priority over the thread-local `PENDING_KM_IDENTITY`, which is
+/// only "whichever `KeyManagerFactory.init` ran most recently on this
+/// thread" -- correct when a KMF.init is immediately followed by its own
+/// SSLContext.init, but wrong when Netty/Reactor Netty builds more than one
+/// SSLContext from more than one KeyManagerFactory before either is actually
+/// used (e.g. a protocol-support probe context built ahead of the real one):
+/// an intervening, unrelated SSLContext.init can drain the thread-local
+/// before the context that actually needs it ever consumes it, silently
+/// leaving that context — and every engine created from it — with no
+/// identity at all (see pemcertificates-clientauth-rustls-decrypterror).
+/// The thread-local is drained unconditionally either way so it never leaks
+/// into a later, unrelated SSLContext.init.
+pub(crate) fn attach_pending_identity_to_ctx(
+    ctx: &mut dyn NativeContext,
+    ctx_obj: ObjectRef,
+    resolved_km_identity: Option<(String, String)>,
+) {
     let key = ctx_obj_key(ctx, ctx_obj);
-    if let Some(ident) = take_pending_km_identity() {
+    let pending = take_pending_km_identity();
+    if let Some(ident) = resolved_km_identity.or(pending) {
+        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+            eprintln!(
+                "[dbg-tls-auth] attach_pending_identity_to_ctx key={} STORING km identity key_pem_len={} cert_pem_len={}",
+                key,
+                ident.1.len(),
+                ident.0.len()
+            );
+        }
         ctx_identity_table().lock().insert(key, ident);
+    } else if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        eprintln!(
+            "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending km identity to store",
+            key
+        );
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
         if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
@@ -4438,7 +4473,7 @@ mod tests {
         let ctx = fake_object_ref(1);
         let mut mock_ctx = crate::test_utils::mock_ctx();
         set_pending_tm_trust_roots(vec![ca_der.clone()]);
-        attach_pending_identity_to_ctx(&mut mock_ctx, ctx);
+        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None);
 
         assert!(ctx_identity(&mut mock_ctx, ctx).is_none());
         let selected = selected_context_trust_roots().expect("context trust roots selected");

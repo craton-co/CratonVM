@@ -2718,6 +2718,16 @@ pub(crate) fn native_class_is_assignable_from(
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+            && (this_name.contains("ObservationRegistry") || other_name.contains("ObservationRegistry"))
+        {
+            let this_cid = mirror_class_id(ctx, this);
+            let other_cid = mirror_class_id(ctx, other);
+            eprintln!(
+                "[OBSREG-DBG] isAssignableFrom this={:?}({} cid={:?}) other={:?}({} cid={:?})",
+                this, this_name, this_cid, other, other_name, other_cid
+            );
+        }
         if this_name.starts_with('[') || other_name.starts_with('[') {
             // Build descriptors. Non-array Class mirrors get an `L...;`
             // wrap to match the array_is_assignable contract; array

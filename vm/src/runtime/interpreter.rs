@@ -11409,9 +11409,9 @@ fn transfer_osr_exit_into_live_frame(
     }
 
     // Map reconstructed FrameValues → interpreter Values (Int / Long / Float /
-    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved /
-    // `Unsupported` → None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE
-    // any frame mutation so a reject can never half-write the frame.
+    // Double / Object / Undefined via `fv_to_value`; virtual / unresolved →
+    // None ⇒ reject). Pure Rust; no Java allocation. Done BEFORE any frame
+    // mutation so a reject can never half-write the frame.
     //
     // `ir_deopt_frame_values` is the 1:1 (NON-collapsing) mapper, which is exactly
     // what the in-place transfer needs: the locals snapshot is JVM-slot-indexed
@@ -11423,10 +11423,38 @@ fn transfer_osr_exit_into_live_frame(
     // `Frame::new_pooled`, uses the COLLAPSING `ir_deopt_locals` instead because
     // `copy_args_to_locals` re-expands a compact list; here there is no
     // re-expansion, so collapsing would mis-align the direct slot writes.
-    let locals = match ir_deopt_frame_values(&rframe.locals) {
-        Some(l) => l,
-        None => return bail("unmappable local"),
-    };
+    //
+    // FIX (jit-osr-loop-duplicate-execution, silent data corruption): a LOCAL
+    // slot's `FrameValue::Unsupported` must NOT reject the whole transfer the
+    // way an unmappable STACK slot does. `classify_local_kinds` (jit/src/x64.rs)
+    // is a coarse WHOLE-METHOD scan: a slot accessed as more than one JVM kind
+    // ANYWHERE in the method (e.g. an `int` loop counter whose slot is later
+    // reused, after the loop's scope ends, for an unrelated `long`) is always
+    // `Ambiguous` → `Unsupported`, at EVERY bci in that method, even ones where
+    // the reused slot provably cannot be read yet. The bytecode we're resuming
+    // already passed verification, which requires a fresh `store` before any
+    // `load` of a given logical local — so at the resume bci, an `Unsupported`
+    // slot is either genuinely dead (its old value is never read before being
+    // overwritten) or belongs to a not-yet-live disjoint reuse of the slot;
+    // either way its CURRENT value in the live frame is safe to leave in
+    // place. Previously this fell through to `bail("unmappable local")` on
+    // every method with any such slot, which discarded the whole transfer —
+    // even after the OSR'd loop had already run to completion with real,
+    // committed side effects (e.g. `ArrayList.add`) — and let the interpreter
+    // resume from the STALE pre-OSR pc/locals, silently re-executing (and
+    // re-committing) every iteration since OSR entry. See
+    // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md.
+    let mut locals: Vec<Option<Value>> = Vec::with_capacity(rframe.locals.len());
+    for v in &rframe.locals {
+        if matches!(v, cratonvm_jit::deopt::FrameValue::Unsupported) {
+            locals.push(None);
+        } else {
+            match fv_to_value(v) {
+                Some(val) => locals.push(Some(val)),
+                None => return bail("unmappable local"),
+            }
+        }
+    }
     let stack_vals = match ir_deopt_frame_values(&rframe.stack) {
         Some(s) => s,
         None => return bail("unmappable stack slot"),
@@ -11435,10 +11463,14 @@ fn transfer_osr_exit_into_live_frame(
     // Overwrite the live frame IN PLACE. No Java allocation here, so the
     // reconstructed oops remain valid and are rooted by the frame's slots the moment
     // they are written. The locals snapshot is JVM-slot-indexed (one entry per slot,
-    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1.
+    // cat-2 as its two-slot pair), so slot `i` ← `locals[i]` is 1:1. A `None` entry
+    // (an `Unsupported` source slot, see above) leaves that slot's existing live
+    // value untouched instead of writing anything.
     let frame = &mut thread.frames[frame_idx];
     for (i, v) in locals.iter().enumerate() {
-        frame.set_local_unchecked(i, *v);
+        if let Some(val) = v {
+            frame.set_local_unchecked(i, *val);
+        }
     }
     frame.stack.clear();
     for v in &stack_vals {
@@ -12664,12 +12696,62 @@ mod deopt_step3_tests {
         assert_eq!(frame.get_local(1), Value::Int(9));
     }
 
-    /// An unmappable slot (cat-2 `Unsupported`) rejects (returns `None`) and leaves
-    /// the live frame COMPLETELY untouched — the mapping happens before any
-    /// mutation, so a reject can never half-write the frame (the caller then safely
-    /// continues interpreting the pre-OSR state).
+    /// FIX (jit-osr-loop-duplicate-execution): an `Unsupported` LOCAL slot must
+    /// NOT reject the whole transfer. `classify_local_kinds` marks a slot
+    /// `Ambiguous` (→ `Unsupported`) whenever it is used as more than one JVM
+    /// kind ANYWHERE in the method — including a slot legally reused, after its
+    /// original local's scope ends, for an unrelated local (e.g. an `int` loop
+    /// counter's slot later reused for a `long`). The bytecode being resumed
+    /// already passed verification, which requires a fresh `store` before any
+    /// `load` of a given logical local, so an `Unsupported` slot's CURRENT live
+    /// value is always safe to leave untouched. Before this fix, ANY such slot
+    /// rejected the entire transfer — discarding real, already-committed OSR
+    /// side effects and forcing the interpreter to silently re-execute them
+    /// from stale pre-OSR state (the root cause documented in
+    /// docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md).
     #[test]
-    fn osr_exit_transfer_rejects_unmappable_without_mutating() {
+    fn osr_exit_transfer_tolerates_unmappable_local() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let cached = minimal_cached();
+        seed_live_frame(
+            &shared,
+            &mut thread,
+            &cached,
+            vec![FrameValue::Int(11), FrameValue::Int(22)],
+            vec![FrameValue::Int(33)],
+            5,
+        );
+
+        let advanced = rframe(
+            vec![FrameValue::Int(99), FrameValue::Unsupported],
+            vec![],
+            8,
+        );
+        assert!(
+            transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &advanced).is_some(),
+            "an Unsupported LOCAL must not block the transfer"
+        );
+
+        let frame = &thread.frames[0];
+        // Mappable slot 0 is overwritten from the reconstructed state...
+        assert_eq!(frame.get_local(0), Value::Int(99));
+        // ...but the Unsupported slot 1 keeps its PRE-transfer live value
+        // (it is provably not yet readable in this scope — see doc comment).
+        assert_eq!(frame.get_local(1), Value::Int(22));
+        assert_eq!(frame.pc, 8);
+        assert_eq!(frame.stack.len(), 0, "empty snapshot stack replaces the stale one");
+    }
+
+    /// An unmappable OPERAND STACK slot (unlike a local) still rejects the whole
+    /// transfer and leaves the live frame COMPLETELY untouched: stack values are
+    /// transient and about to be consumed, so there is no scope/verification
+    /// guarantee protecting a stale or fabricated value the way there is for a
+    /// local — the mapping happens before any mutation, so a reject can never
+    /// half-write the frame (the caller then safely continues interpreting the
+    /// pre-OSR state).
+    #[test]
+    fn osr_exit_transfer_rejects_unmappable_stack_without_mutating() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
@@ -12683,8 +12765,8 @@ mod deopt_step3_tests {
         );
 
         let bad = rframe(
-            vec![FrameValue::Int(99), FrameValue::Unsupported],
-            vec![],
+            vec![FrameValue::Int(99), FrameValue::Int(0)],
+            vec![FrameValue::Unsupported],
             8,
         );
         assert!(transfer_osr_exit_into_live_frame(&shared, &mut thread, 0, &bad).is_none());
@@ -14818,11 +14900,36 @@ fn execute_instruction(
             }
         }
         Instruction::Invokestatic(index) => {
-            match execute_invokestatic(shared, thread, frame_idx, *index)? {
+            // Mirrors the Invokevirtual/Invokespecial arm above: JDK-internal
+            // classes (java.xml/Xerces, java.util, java.io, …) run through
+            // this dispatcher rather than the raw-byte-peek fast loop at the
+            // top of `execute_frame` (which already consulted
+            // `execute_invokestatic_cached` — see its call site's history),
+            // so every invokestatic previously paid full method resolution
+            // on every single call: native-registry hash lookup,
+            // `force_native_over_real_jdk_bytecode` /
+            // `synthetic_stub_should_yield_to_real_bytecode` checks, a
+            // `split_method_descriptor` heap allocation, `class_manager`
+            // RwLock reads. `execute_invokestatic_cached` already exists and
+            // is exercised by the other dispatch loop; wiring it in here
+            // gives JDK-internal invokestatic call sites the same lock-free
+            // O(1) cache hit non-JDK bytecode and Invokevirtual/Invokespecial
+            // already enjoyed. A miss/edge-case (JVMTI redefine, synthetic
+            // stub upgrade) falls through to the exact same slow path used
+            // before this fix.
+            match execute_invokestatic_cached(shared, thread, frame_idx, *index)? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
-                _ => {}
+                CachedCallResult::Handled => {}
+                CachedCallResult::CacheMiss => {
+                    match execute_invokestatic(shared, thread, frame_idx, *index)? {
+                        CachedCallResult::FramePushed => {
+                            return Ok(InstructionResult::FramePushed);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
@@ -18391,8 +18498,7 @@ fn push_invoke_return_value(
 /// non-existent submission, never ran the kernel, and left output
 /// arrays at their pre-launch zero values.
 #[inline]
-fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
-    let b = param_desc.as_bytes().first().copied().unwrap_or(b'L');
+fn coerce_invoke_arg_for_descriptor(b: u8, v: Value) -> Value {
     match b {
         b'L' | b'[' => coerce_value_for_return(v, b),
         b'J' => match v {
@@ -18460,7 +18566,14 @@ fn pop_coerced_invoke_args_virtual(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): `nth_param_tag_byte` replaces `split_method_descriptor`
+    // here — every caller of this Vec<String>/String-allocating parse only
+    // ever read the first byte of each parameter token (see
+    // `coerce_invoke_arg_for_descriptor`/`decode_arg_kind_aware`, both
+    // `u8`-only). This was the single dominant hot spot (confirmed via cdb
+    // stack sampling) behind a ~197x CratonVM-vs-HotSpot slowdown on
+    // method-call-heavy interpreted workloads (Xerces SAX parsing —
+    // see docs/known-issues/repros/xerces-sax-manysmallfiles-slowdown/).
     // BC SM2 fix (2026-05-28): use raw CompactValue + descriptor-aware
     // decode so a Long-collision-with-SUB_OBJECT bit pattern doesn't
     // round-trip through Value::Object and lose bits.
@@ -18485,18 +18598,14 @@ fn pop_coerced_invoke_args_virtual(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
+        b'L',
         tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18511,7 +18620,8 @@ fn pop_coerced_invoke_args_static(
 ) -> Result<(Vec<Value>, Arc<str>), MethodCallFailed> {
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor. `CompactValue::to_value()` would
     // mis-decode a Long whose bits collide with SUB_OBJECT as
@@ -18527,13 +18637,9 @@ fn pop_coerced_invoke_args_static(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
     Ok((args, method_descriptor))
 }
@@ -18862,7 +18968,8 @@ fn execute_invoke_kind(
 
     let total_args = num_params + 1;
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
     // Pop slots as raw CompactValue and decode with the parameter descriptor
     // so a category-2 long whose NaN-box bit pattern collides with a tagged
     // sub-tag survives bit-exact. The prior `pop()` → `to_value()` decoded
@@ -18892,19 +18999,12 @@ fn execute_invoke_kind(
         );
     }
     let mut args = Vec::with_capacity(total_args);
-    args.push(coerce_invoke_arg_for_descriptor(
-        "Ljava/lang/Object;",
-        recv_val,
-    ));
+    args.push(coerce_invoke_arg_for_descriptor(b'L', recv_val));
     for i in 0..num_params {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let (cv, is_long) = tmp_cv[i + 1];
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     // Apply the same forwarding read barrier used by getfield to every
@@ -22318,7 +22418,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             // Loader-faithful owner resolution (gated): prefer the enclosing
             // loader's copy of the impl class when it diverges from the global.
-            let class_id = match lambda_impl_dispatch_override(shared, &call_site) {
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
                     .class_manager
@@ -22359,7 +22459,8 @@ pub(crate) fn try_lambda_dispatch(
             // `AotApplicationContextInitializer::new` factory) whose impl class
             // is the very FIRST thing touched from a fork loader's namespace hit
             // the same loader-blind fallback and minted an Application-loader
-            // copy instead of the fork's own.
+            // copy instead of the fork's own. (Independently fixed upstream on
+            // origin/dev with the same shape; kept in sync here.)
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
@@ -22506,10 +22607,13 @@ pub(crate) fn try_lambda_dispatch(
             }
         }
         MethodHandleKind::GetStatic => {
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
@@ -22572,10 +22676,13 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 .into());
             }
-            let class_id = shared
-                .class_manager
-                .write()
-                .load_class(&call_site.impl_handle.class_name)?;
+            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
+                Some(cid) => cid,
+                None => shared
+                    .class_manager
+                    .write()
+                    .load_class(&call_site.impl_handle.class_name)?,
+            };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.class_manager.read();
@@ -24803,6 +24910,16 @@ fn force_native_over_real_jdk_bytecode(
         && method_name == "readConstant"
         && method_descriptor
             == "(Ljava/io/DataInput;)Lorg/apache/tomcat/util/bcel/classfile/Constant;"
+    {
+        return true;
+    }
+    // 995ff48c (Tomcat silent-hang scanner fix): interpreted per-byte read
+    // dispatch dominated the scanner's hot path. `<init>`/mark/reset/skip/...
+    // still run their real-JDK bytecode so buffer/mark state stays
+    // bytecode-owned; only the two read overloads are forced native.
+    if class_name == "java/io/BufferedInputStream"
+        && method_name == "read"
+        && matches!(method_descriptor, "([BII)I" | "()I")
     {
         return true;
     }
@@ -28753,7 +28870,17 @@ fn execute_invokestatic(
         ensure_class_initialized_shared(shared, thread, target_class_id)?;
     }
 
-    let (param_descs, _) = split_method_descriptor(&method_descriptor);
+    // PERF (2026-07-21): see `pop_coerced_invoke_args_virtual` — same
+    // non-allocating `nth_param_tag_byte` swap for `split_method_descriptor`.
+    // This was the exact call site pinned by cdb stack sampling as the
+    // dominant hot spot behind the ~197x Xerces SAX-parse slowdown (every
+    // invokestatic re-parsed + heap-allocated a Vec<String> from scratch);
+    // the primary fix is wiring `execute_invokestatic_cached` into the main
+    // dispatch loop (see its call site's history) so this cold/miss path is
+    // only reached once per call site instead of on every call. Fixed here
+    // too since it's the same wasteful pattern and still runs on every
+    // cache miss (JVMTI redefine, synthetic-stub upgrade, first call).
+    //
     // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
     // with the parameter descriptor so a Long whose bit pattern collides
     // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
@@ -28770,13 +28897,9 @@ fn execute_invokestatic(
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
     for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
-        let pd = param_descs
-            .get(i)
-            .map(|s| s.as_str())
-            .unwrap_or("Ljava/lang/Object;");
-        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let pd_byte = nth_param_tag_byte(&method_descriptor, i);
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
-        args.push(coerce_invoke_arg_for_descriptor(pd, v));
+        args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
 
     if let Some(res) = intercept_force_registered_native(
@@ -29029,10 +29152,7 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .pop_compact_with_long_mark()?;
     }
     let base = if with_receiver {
-        buf[0] = coerce_invoke_arg_for_descriptor(
-            "Ljava/lang/Object;",
-            cv_buf[0].0.decode_by_descriptor(b'L'),
-        );
+        buf[0] = coerce_invoke_arg_for_descriptor(b'L', cv_buf[0].0.decode_by_descriptor(b'L'));
         1
     } else {
         0
@@ -29044,8 +29164,10 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
         let (cv, is_long) = cv_buf[base + i];
-        buf[base + i] =
-            coerce_invoke_arg_for_descriptor(pd, decode_arg_kind_aware(cv, is_long, pd_byte));
+        buf[base + i] = coerce_invoke_arg_for_descriptor(
+            pd_byte,
+            decode_arg_kind_aware(cv, is_long, pd_byte),
+        );
     }
     Ok(&buf[..total])
 }
@@ -30056,6 +30178,40 @@ fn compile_osr_artifact(
             // JIT-return exception drains) remains available, so do NOT
             // bail-list here.
             if scan.has_athrow {
+                return None;
+            }
+            // RBC.7 (jit-osr-loop-duplicate-execution, silent data corruption,
+            // 2026-07-20) — never OSR a method containing `invokedynamic`. The
+            // 0xba codegen arm lowers every indy call site to an unconditional
+            // `DeoptReason::UnreachedCode` trap (it never links/inlines the
+            // bootstrap), so entering that site while OSR-compiled always
+            // bails. For a NORMAL (method-entry) compile that bail resumes by
+            // building a brand-new frame from scratch (no prior live frame to
+            // reconcile), which is precise. For OSR the bail must instead
+            // transfer the JIT-advanced state IN PLACE into the pre-existing
+            // live interpreter frame (`transfer_osr_exit_into_live_frame`) —
+            // and that transfer routinely fails: the operand-stack values
+            // live at an indy call site (its recipe/constant args) are exactly
+            // the kind of value the single-pass backend's per-site stack-slot
+            // classifier cannot always precisely re-type (see `FrameValue::
+            // Unsupported`'s doc in jit/src/deopt.rs), which correctly rejects
+            // the transfer rather than fabricate one. The OSR trigger then
+            // falls back to its "safe reject" default — resuming interpretation
+            // at the STALE pre-OSR back-edge pc/locals — which is only actually
+            // safe when the bail precedes any committed loop iteration. An indy
+            // trap reached *after* a hot loop that already ran to completion
+            // inside the OSR'd continuation (e.g. a `System.out.println("..." +
+            // n + ...)` immediately following the loop, "..." string-concat
+            // compiling to `invokedynamic`) violates that precondition: the
+            // loop's real side effects (already committed once, correctly, by
+            // the OSR'd code) get silently RE-EXECUTED by the interpreter from
+            // the stale resume state — e.g. an `ArrayList` ending up with extra
+            // duplicate elements with no exception anywhere. See
+            // docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md
+            // for the full repro and trace. Like `has_athrow` above,
+            // method-entry compilation (unaffected by this OSR-only bail path)
+            // remains available, so do NOT bail-list here.
+            if !scan.indy_ops.is_empty() {
                 return None;
             }
             // RBC.6b (dohead-residuals, 2026-07-18) — never OSR a method with
@@ -36006,6 +36162,46 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
+        // JVMTI redefine guard — the VtableManager entry's `resolved_method`
+        // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
+        // staleness tracking of its own (unlike `CachedInvokeTarget`, which
+        // carries a `RedefineGate` checked on every hit). A class's OWN
+        // vtable is refreshed when IT is redefined (`redefine_class` calls
+        // `vtable_install_adapter` for that class), but a SUBCLASS's vtable
+        // — which copies/inherits the slot from its declaring ancestor at
+        // the time the subclass's own vtable was built, typically at
+        // ordinary class-load time, long before any agent runs — is never
+        // transitively refreshed. So once a receiver's vtable has cached an
+        // inherited slot, a LATER redefinition of the DECLARING ancestor
+        // (e.g. Mockito's inline mock maker weaving advice into a spied
+        // class's whole hierarchy) leaves this entry pointing at the
+        // pre-redefinition bytecode forever — permanently and silently
+        // bypassing the woven advice for any call site that reaches this
+        // fast path before ever going through `execute_invokevirtual_cached`
+        // / `populate_virtual_invoke_cache` (whose `RedefineGate` entries
+        // stay sound). Observed as: `given(spy.get(k)).willReturn(...)`
+        // stubs are silently ignored — `MockMethodAdvice.handle()` is never
+        // even entered — for any call to `spy.get(k)` reached via a call
+        // site whose declared receiver type is an INTERFACE the concrete
+        // spied class doesn't directly implement (so its own invokevirtual
+        // call sites warm the sound tier-1 cache first, but an unrelated
+        // 3rd-party class's invokeinterface call site never does before
+        // hitting this stale entry). See
+        // docs/known-issues/springboot/mockito-inline-nested-selfcall-stub-bypass.md.
+        //
+        // Fix: same guard already used for the native-shadow decision a few
+        // lines above (`receiver_redefined`) — if the entry's OWN declaring
+        // class has ever been redefined, this snapshot cannot be trusted;
+        // cede to the slow, redefine-aware path instead of trusting it.
+        if crate::classloading::any_class_redefined()
+            && shared
+                .class_manager
+                .read()
+                .class_redefine_generation(cached.declaring_class_id)
+                > 0
+        {
+            return Ok(CachedCallResult::CacheMiss);
+        }
         let is_native = entry.is_native;
         // Lock-order fix: drop the `vtable_manager` read guard BEFORE
         // taking `class_manager` below. `vtable_install_adapter` (called
