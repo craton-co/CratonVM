@@ -619,37 +619,68 @@ before this fix (the class always hung around cycle 18-19 first) — a
 fourth instance in this investigation of a residual that was masked by an
 earlier-blocking bug.
 
-## Investigated further (2026-07-21) — almost certainly NOT a CratonVM bug; likely this shared host's known cross-session process-kill hazard
+## Investigated further (2026-07-21) — real and reproducible, but root cause NOT identified; every obvious internal-bug signature ruled out
 
-Ran the full class 4 more times (2 plain, 1 with a per-test
+Ran the full class 6 more times total (2 plain, 1 with a per-test
 `TestExecutionListener` reporting exactly which test was running via
-`STARTING_TEST`/`FINISHED_TEST` lines, 1 launched directly under `cdb`).
-Findings that together rule out every internal-bug hypothesis tried:
+`STARTING_TEST`/`FINISHED_TEST` lines, 1 launched directly under `cdb`,
+plus 1 more after pulling in a real, independently-discovered, directly
+relevant fix from a concurrent session — see below). Also ran a raw
+JUnit-free stress loop and two isolated slice-replay experiments.
 
-- **Crash position is wildly inconsistent, not "~60 cycles"**: test #4, #60,
-  #61, #67 across 4 runs — and a 5th run (under `cdb`) completed all the
-  way to test #73 with **no crash at all**. A real per-cycle resource leak
-  or deterministic bug would not vary this much run to run.
+- **Crash position varies (test #4, #60, #61, #67) but is NOT fully
+  random**: two separate runs of the exact same rebuilt binary (one under
+  `cdb`, one plain) both died at the exact same test,
+  `whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed`, immediately after
+  `sslKeyAlias()` FAILED — the earlier claim in this doc that the `cdb` run
+  "completed cleanly to test #73" was a misreading of that log; it died at
+  the same test, silently, exactly like the others. So position is at
+  least partially reproducible for a given binary/test-order, not purely
+  random — but different binaries/sessions land at different positions.
 - **A raw, JUnit-free stress loop** (`JettyCycleStress.java`: plain
   `factory.getWebServer(...)` + start + GET + stop + destroy in a tight
   loop, no SSL) ran **150 cycles with no crash** — handle/thread counts
-  grew modestly (~50%) but never anything catastrophic.
-- **Correlation with a failing SSL test is real but not causal**: in 3 of 4
-  runs the crash immediately followed an SSL test failing
-  (`pkcs12KeyStoreAndTrustStoreFromBundle`,
+  grew modestly (~50%) but never anything catastrophic. SSL involvement
+  seems to matter, not just cycle count.
+- **Correlation with a failing SSL test is consistent**: in every crash
+  observed, the test immediately before the crash was an SSL-related test
+  that FAILED (`pkcs12KeyStoreAndTrustStoreFromBundle`,
   `sslNeedsClientAuthenticationSucceedsWithClientCertificate`,
-  `basicSslFromClassPath`, each failing with a genuine, separate
-  `SSLHandshakeException: handshake read: connection reset by peer` bug —
-  itself real and already covered by this codebase's many other tracked
-  SSL/rustls residuals). But an isolated 2-test repro of exactly
-  `pkcs12KeyStoreAndTrustStoreFromBundle` + the next test did **not**
-  reproduce the crash — SSL tests are simply the *slowest* tests in the
-  class (more wall-clock exposure window), which alone would produce this
-  correlation without any causal link.
-- **Zero internal crash signature of any kind**, checked directly:
+  `basicSslFromClassPath`, `sslKeyAlias` — each failing with a genuine,
+  separate `SSLHandshakeException: handshake read: connection reset by
+  peer` bug, itself real and already covered by this codebase's many other
+  tracked SSL/rustls residuals). But this does NOT reproduce standalone:
+  - An isolated 2-test repro (`pkcs12KeyStoreAndTrustStoreFromBundle` +
+    the next test, and separately `sslKeyAlias` +
+    `whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed`) ran clean both
+    times.
+  - A 14-test slice replaying the *entire* run of tests immediately
+    surrounding one confirmed crash point (positions ~55-67, ending in the
+    exact same `sslKeyAlias` → `whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed`
+    pair that crashed in the full run) also ran clean — `tests=14 failed=3`,
+    no crash. **The crash needs the FULL accumulated state of running
+    ~55+ preceding tests first — replaying just the local window around
+    the trigger is not enough**, ruling out a simple "this one test pair is
+    broken" explanation.
+- **Tested against a real, independently-fixed, directly-relevant bug —
+  did NOT resolve it.** A concurrent session merged
+  `fix(vm): close GC-unstable objref_key side-table keys in t27_tls.rs`
+  (dev commit `5dd7a7b18`) while this investigation was in progress: it
+  fixed exactly the kind of defect this investigation was homing in on —
+  `ssl_server_socket_states`, `sock_alpn_table`, and
+  `session_peer_certs_table` (all in `native-builtins/src/t27_tls.rs`)
+  were keyed by `objref_key()`, a hash of an `ObjectRef`'s *raw current
+  pointer* — unstable under this VM's moving young-gen GC, so a lookup
+  could silently collide with a stale entry from an unrelated,
+  already-freed object now occupying the same address. Merged that fix
+  into this branch, rebuilt, and re-ran the full class: **it crashed again,
+  at the exact same test** (`whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed`,
+  immediately after `sslKeyAlias` FAILED). That fix was real and worth
+  having, but it is not the (or not the only) cause of this residual.
+- **Zero internal crash signature of any kind**, checked directly, across
+  every run:
   - No `hs_err_pid<pid>.log` ever written (the installed Rust panic hook —
-    `vm/src/runtime/crash_handler.rs` — writes one on every panic; there
-    is none in any of the 4 crash runs' working directory).
+    `vm/src/runtime/crash_handler.rs` — writes one on every panic).
   - No `"panicked at"` / `"thread panicked"` text in any crash log.
   - No `"[cratonvm] main-vm run() returned Ok/Err"` banner
     (`vm-cli/src/main.rs`) — meaning the main-vm thread's `run()` call
@@ -659,11 +690,12 @@ Findings that together rule out every internal-bug hypothesis tried:
     `System.exit`/`Runtime.exit` call).
   - Launching the class **directly under `cdb`**
     (`cdb -g -G -c "g;.lastevent;kv;~*kv;q" <exe> <args>`) never stopped on
-    an exception — the process exited cleanly from cdb's perspective
-    (module-unload-at-exit messages only, no exception dump). This rules
-    out access violations, stack overflows, illegal instructions, and
+    an exception — the process exited from cdb's perspective with only
+    module-unload-at-exit messages, no exception dump. This rules out
+    access violations, stack overflows, illegal instructions, and
     `std::process::abort()`/fastfail (`__fastfail` reliably breaks into an
-    attached debugger; it did not here).
+    attached debugger; it did not here) — at least for the specific crash
+    `cdb` happened to observe.
   - **Windows Error Reporting has zero entries for this session's renamed
     binary** (`cratonvm-spring-boot-suite.exe`) across the entire
     investigation window, checked via
@@ -673,44 +705,49 @@ Findings that together rule out every internal-bug hypothesis tried:
     `cratonvm-classvalue-jit-dispatch-20260721.exe`, and plain `cratonvm.exe`
     with a genuine `BEX64`/`c0000409` fastfail crash — see
     [[project_classvalue_residual5_jit_tierup_20260721]], unrelated to this
-    doc). If any of *our* runs had genuinely faulted at the OS level, WER
-    would show an entry for our binary too, exactly like it does for
-    theirs. It does not.
+    doc). A genuine unhandled OS-level fault in our own binary should have
+    produced a WER entry the same way; it did not.
 
-**Conclusion**: this residual shows every sign of being an **external
-process termination** (something outside the process — most plausibly
-another concurrent session's cleanup script on this heavily shared,
-multi-tenant Windows box — see
-[[feedback_shared_host_blanket_process_kill]]) rather than a bug in
-CratonVM's own code. Multiple *other* sessions' differently-named
-CratonVM processes were independently observed running (and, per WER,
-genuinely crashing) on this same box throughout this investigation window
-(via plain `tasklist`, and confirmed by the WER entries above) —
-consistent with a wildcard/bare-name `taskkill`/`Stop-Process` from one of
-them occasionally catching an unrelated `cratonvm*.exe` process, including
-this session's, without any trace surviving inside the killed process.
-
-**Not fixed — there was no code bug found to fix.** Recommend, for whoever
-revisits this: reproduce on an isolated, non-shared host (or with the
-box's other sessions paused) before spending further effort chasing an
-in-process cause; if it reproduces there too, this conclusion is wrong and
-the investigation should restart from the `cdb`-attached-launch technique
-above (it is the fastest way to get a definitive answer either way).
+**Honest conclusion**: real, reproducible-with-~10-minutes-effort residual,
+requiring substantial (~55+ test) cumulative interpreter/JVM state plus an
+SSL-test failure as an apparent trigger, but its actual kill mechanism
+evades every diagnostic technique tried (panic hook, `hs_err` writer, `cdb`
+live-attached launch, WER). Two non-exclusive possibilities remain open:
+(a) genuine external process termination on this heavily shared,
+multi-tenant Windows box (another concurrent session's cleanup script
+matching `cratonvm*.exe` by wildcard — see
+[[feedback_shared_host_blanket_process_kill]] — other sessions' differently
+-named CratonVM processes were independently observed running throughout
+this window), or (b) a genuine internal bug whose kill path bypasses all of
+Rust's normal panic/abort/exit instrumentation (a raw Windows API call like
+`ExitProcess`/`TerminateProcess` from within CratonVM's own code, not found
+in this pass's `process::exit`/`abort` grep sweep — worth a targeted grep
+for `ExitProcess`/`TerminateProcess`/`kernel32` FFI calls next). **Not
+fixed — no code bug was conclusively identified.**
 
 **Still OPEN / not yet done**:
-1. Re-verify whether this residual reproduces at all on a non-shared host
-   — everything above points to "no," but this session couldn't test that
-   directly.
-2. The analogous `Inflater` direct-buffer natives
+1. Grep for raw `ExitProcess`/`TerminateProcess` Win32 FFI calls (not just
+   `std::process::exit`/`abort`) as a possible internal, instrumentation
+   -bypassing kill path not yet checked.
+2. Re-verify whether this residual reproduces at all on a non-shared host
+   (or with this box's other sessions paused) — would distinguish
+   possibility (a) from (b) above definitively.
+3. If pursuing further, build a lightweight in-process heartbeat that logs
+   (with `fsync`) after every native call/test boundary, so whatever kills
+   the process — internal or external — leaves a forensic trail of the
+   last thing that happened; none of the passive techniques tried this
+   session (panic hooks, `cdb` attach, WER) caught anything.
+4. The analogous `Inflater` direct-buffer natives
    (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in the
    same file) are likely *also* unimplemented stubs (not yet checked/fixed
    in this pass) — same risk class, not yet known to be hit by any test.
-3. Diagnostic instrumentation left in place (opt-in, zero default behavior
+5. Diagnostic instrumentation left in place (opt-in, zero default behavior
    change): `CRATONVM_DBG_JAR`, `CRATONVM_DBG_CLASSPATH`,
    `CRATONVM_DBG_RESOURCE_TIMING`, `CRATONVM_DBG_DEFLATE`, `CRATONVM_DBG_SOCK`,
    `CRATONVM_DBG_SOCK_BYTES`.
-4. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
+6. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
    `winget install Microsoft.WinDbg --source winget`) — no longer a
    blocker for future sessions on this same machine; launching a suspect
    process directly under it (rather than attach-after-the-fact sampling)
-   is the technique that finally got a definitive (negative) answer here.
+   is a fast way to rule out hardware faults/aborts, but was NOT sufficient
+   to identify this residual's actual cause.
