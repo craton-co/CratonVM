@@ -6238,12 +6238,28 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     .identity_override
                     .as_ref()
                     .map(|(cert, key)| (cert.as_str(), key.as_str()));
-                build_client_config_ex(
+                // Unlike the server branch below (which already threads
+                // `state.enabled_ciphers` through
+                // `build_server_config_single_cert_ex_ciphers`), this client
+                // branch built its `ClientConfig` with the plain default
+                // cipher provider regardless of any cipher-suite restriction
+                // the caller configured (`SSLEngine.setEnabledCipherSuites`/
+                // `setSSLParameters` — see `register_apply_parameters`'s
+                // `setSSLParameters` handler). A deliberately-mismatched
+                // client cipher restriction was therefore silently ignored:
+                // the client engine still offered its full default cipher
+                // list, which generally overlaps with whatever the server
+                // is restricted to, so the handshake succeeded instead of
+                // failing with `SSLHandshakeException` as real-JDK does
+                // (`connectWithSslBundleAndOptionsMismatch`).
+                let provider = cipher_provider_for(&state.enabled_ciphers);
+                build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
                     ClientAuthMode::Fixed(client_auth),
                     revocation,
                     use_java_trust_manager,
+                    provider,
                 )?
             }
         };
@@ -8043,6 +8059,40 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     with_engine(id, |s| {
                         s.alpn_protocols = list.into_iter().map(|s| s.into_bytes()).collect();
                     });
+                }
+                // Apache HttpComponents 5 (and Tomcat's NioEndpoint, for its
+                // ALPN/client-auth-capable connectors) configure TLS options
+                // via an `SSLParameters` object passed to
+                // `SSLEngine.setSSLParameters()`, not the legacy
+                // `setEnabledCipherSuites`/`setEnabledProtocols` setters (see
+                // `setEnabledCipherSuites` above, and the analogous fix for
+                // the SSLSocket path in `phases_late.rs`'s
+                // `stash_pending_layered_socket`/`setSSLParameters`/
+                // `setEnabledCipherSuites` registrations). Without this, a
+                // cipher-suite restriction set this way was silently
+                // dropped: the engine kept its full default cipher list, so
+                // a deliberately-mismatched client/server cipher
+                // configuration (`connectWithSslBundleAndOptionsMismatch`)
+                // still found a common cipher and the handshake succeeded
+                // instead of failing with `SSLHandshakeException` as
+                // real-JDK does.
+                if let Ok(Some(Value::Object(Some(arr)))) =
+                    ctx.invoke_virtual(*p, "getCipherSuites", "()[Ljava/lang/String;", &[])
+                {
+                    let len = ctx.array_length(arr);
+                    let mut ciphers = Vec::with_capacity(len);
+                    for i in 0..len {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
+                            if let Some(name) = ctx.read_string(s) {
+                                ciphers.push(name);
+                            }
+                        }
+                    }
+                    if !ciphers.is_empty() {
+                        with_engine(id, |s| {
+                            s.enabled_ciphers = ciphers;
+                        });
+                    }
                 }
                 // Tomcat configures client-cert auth via
                 // `SSLParameters.setNeed/WantClientAuth` + `engine.setSSLParameters`,
