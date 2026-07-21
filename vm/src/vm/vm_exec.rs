@@ -8403,6 +8403,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
+            if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                let global_id = self.shared.class_manager.read().get_loaded_class_id(&class_name);
+                eprintln!(
+                    "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
+                    method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
+                );
+            }
             if needs_exact_class_dispatch {
                 invoke_on_class_shared(
                     self.shared,

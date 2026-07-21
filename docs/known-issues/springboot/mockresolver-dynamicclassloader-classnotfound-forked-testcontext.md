@@ -338,21 +338,88 @@ env-var-gated `eprintln!` trace that fired zero times for
 provably reached (the class IS loaded, `getDeclaredClasses()` reflects it
 correctly), it is provably NOT any of the five paths above. Remaining
 candidates for a follow-up session, roughly in order of suspicion:
-1. `native_method_invoke`'s (`native-builtins/src/lang_class.rs:6371+`)
-   `use_virtual_dispatch` branch (`ctx.invoke_virtual`, ~line 6747) — the
-   path taken for THIS test method (an ordinary, non-static, non-private
-   instance method reflectively invoked via `Method.invoke`). Contrast with
-   the SAME function's `else` branch a little further down (~line 6798-6823,
-   comment "Use the Method object's OWN already-resolved declaring ClassId…"),
-   which ALREADY has a fix for exactly this dual-loader-identity problem —
-   but only for the STATIC-method dispatch branch. The instance/virtual-
-   dispatch branch has no equivalent protection; worth checking whether
-   `ctx.invoke_virtual` (`vm/src/vm/vm_exec.rs:7735`, which resolves via
-   `find_method_recursive` — itself precise, walks by exact `ClassId`, looks
-   clean on inspection) or something between it and the pushed frame ends up
-   binding the new frame's `class_id`/constant-pool-resolution context to a
-   stale or wrong identity for a *reflectively re-invoked* method whose
-   receiver's class was freshly (re)loaded this run.
+1. ~~`native_method_invoke`'s (`native-builtins/src/lang_class.rs:6371+`)
+   `use_virtual_dispatch` branch~~ — **traced through by hand this session
+   and looks sound, but not yet DISPROVEN by a live trace (only by static
+   code reading)**: added a diagnostic print of `this.getClass().getClassLoader()`
+   as the very first statement of `aotContributedInitializerStartsManagementContext`
+   itself (compiled into a side directory, run standalone) — confirms the
+   RECEIVER executing the test method is genuinely the forked-loader
+   instance (`this.getClass().getClassLoader()` prints
+   `CompileWithForkedClassLoaderClassLoader@...`, matching
+   `TCCL@methodStart`), ruling out "Method.invoke was called against a
+   stale app-loader receiver" as the explanation. `ctx.invoke_virtual`
+   (`vm/src/vm/vm_exec.rs:7735`) → the non-lambda branch's
+   `needs_exact_class_dispatch` gate (~line 8398, `resolved_from_receiver
+   && (... || get_loaded_class_id(&class_name) != Some(receiver_class_id))`)
+   → `invoke_on_class_shared` (~line 13613) → `find_method_recursive` →
+   `interpreter::execute(..., declaring_class_id, ...)` (~line 17911) all
+   read as correctly threading the PRECISE `receiver_class_id` through by
+   hand-tracing the code, with no obvious name-collapse point — but this
+   was NOT verified with a live trace of `declaring_class_id`/the pushed
+   frame's actual `class_id` at the point `aotContributedInitializerStartsManagementContext`
+   itself starts executing. **That is the single most valuable next
+   diagnostic**: an `eprintln!` right where `interpreter::execute` pushes
+   the new frame (or at the top of `execute()` itself), printing
+   `declaring_class_id` and its loader, guarded on
+   `method_name == "aotContributedInitializerStartsManagementContext"` —
+   if that ClassId is already wrong (app-loader) at frame-push time, the
+   bug is upstream of `execute_ldc` as expected and somewhere in this
+   dispatch chain despite it reading clean; if it's correctly forked at
+   frame-push time, the bug is NOT in dispatch at all and must be in
+   constant-pool/instruction representation itself (candidate 2).
+
+   **Done this session** (no rebuild wasted — this was the single most
+   informative trace added): put that exact `eprintln!` at the very top of
+   `interpreter::execute` (`vm/src/runtime/interpreter.rs:4442`, guarded on
+   `method_name == "aotContributedInitializerStartsManagementContext"`,
+   env var `CRATONVM_EXEC_FRAME_TRACE`). **Zero hits — including with
+   `--nojit`.** This is a bigger finding than it first looks: it means
+   `aotContributedInitializerStartsManagementContext`'s bytecode is NEVER
+   executed via the canonical `interpreter::execute` entry point at all,
+   for either the app-loader or forked-loader copy, for the whole test run.
+   Combined with `execute_ldc` also never firing, the reflective
+   `Method.invoke` call for THIS test method must be dispatching through a
+   path that never reaches `interpreter::execute`/`execute_ldc` — i.e.
+   `native_method_invoke`'s `use_virtual_dispatch` branch's
+   `needs_exact_class_dispatch` gate (`vm/src/vm/vm_exec.rs:8398`) is
+   probably evaluating **false** here (contrary to the by-hand trace
+   through the code above, which assumed it would be true), sending
+   dispatch through `self.invoke_or_native(&class_name, ...)` instead of
+   `invoke_on_class_shared` — and `invoke_or_native`
+   (`vm/src/vm/vm_exec.rs`, a large separate function starting somewhere
+   around line 10500, not read in detail this session) apparently has ITS
+   OWN separate bytecode-execution call site that doesn't funnel through
+   `interpreter::execute`. **This is now the concrete next step**: trace
+   (or read) `invoke_or_native`'s own dispatch/execute call, and/or add an
+   `eprintln!` right at `native_method_invoke`'s `needs_exact_class_dispatch`
+   check (`vm/src/vm/vm_exec.rs:8398`) to see which branch it actually
+   takes and what `get_loaded_class_id(&class_name)` vs `receiver_class_id`
+   evaluate to for this exact call — that will show directly whether the
+   gate itself is the bug (evaluating false when it should be true) or
+   whether `invoke_or_native` has its own separate loader-identity gap.
+
+   **Done this session too — deepens the mystery further.** Added that
+   exact trace at `vm_exec.rs:8398` (env var `CRATONVM_NEEDS_EXACT_TRACE`)
+   and rebuilt. **Also zero hits** — even though the EXISTING
+   `CRATONVM_IAE_TRACE` hook a little earlier in `native_method_invoke`
+   (`native-builtins/src/lang_class.rs:6744`) confirms
+   `native_method_invoke` DOES run for this exact call and computes
+   `is_static=false use_virtual=true` (so it does take the
+   `ctx.invoke_virtual(recv, ...)` branch at ~line 6770). So: `invoke_virtual`
+   is entered, but returns from somewhere BEFORE reaching line 8398 —
+   through the lambda-proxy branch (shouldn't apply — the receiver is an
+   ordinary object), the `java.lang.reflect.Proxy$Instance`/annotation-proxy
+   special cases (also shouldn't apply), or some other early-return between
+   the "not lambda" branch's start (~line 8188) and line 8398 not read
+   closely this session. **Next diagnostic** for whoever picks this up:
+   put a bare unconditional `eprintln!` (or a counter) at the very top of
+   the "not lambda" branch (right after the `else {` around line 8188,
+   before `resolved_from_receiver`/`class_name` get computed), guarded on
+   the same method-name check, to confirm execution even gets that far —
+   then walk forward from there line by line (there's a lot of code between
+   8188 and 8398 this session did not read in detail) rather than jumping
+   straight to the gate as this session did.
 2. A parsed-classfile/constant-pool structure interning or dedup mechanism
    keyed by content (bytes) rather than by `ClassId` — if CratonVM ever
    reuses the SAME `Arc`/`Rc`-shared `ClassFileMethod`/constant-pool data

@@ -4447,6 +4447,21 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_EXEC_FRAME_TRACE").is_some()
+        && method_name == "aotContributedInitializerStartsManagementContext"
+    {
+        let (cname, loader) = {
+            let cm = shared.class_manager.read();
+            (
+                cm.get_class(class_id).map(|c| c.name.to_string()),
+                cm.get_loader_id(class_id),
+            )
+        };
+        eprintln!(
+            "[EXEC-FRAME-TRACE] method={} class_id={:?} class_name={:?} loader={:?}",
+            method_name, class_id, cname, loader
+        );
+    }
     // S-bytebuddy r1 — Rust-side recursion guard.
     //
     // ByteBuddy's `JavaDispatcher.run()` performs deep reflection via
