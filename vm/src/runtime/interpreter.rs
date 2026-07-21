@@ -31773,20 +31773,20 @@ fn jit_invoke_targets_native_shadow(
     caller_class_id: ClassId,
     cp_idx: u16,
 ) -> bool {
-    let (target_class, method_name, descriptor, declaring_class) = {
+    let (target_class, method_name, descriptor, declaring_class, is_interface_ref) = {
         let cm = shared.class_manager.read();
         let Some(caller) = cm.get_class(caller_class_id) else {
             return true;
         };
-        let (class_index, nat_index) = match caller.constant_pool.get(cp_idx) {
+        let (class_index, nat_index, is_interface_ref) = match caller.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
                 class_index,
                 name_and_type_index,
-            })
-            | Some(ConstantPoolEntry::InterfaceMethodReference {
+            }) => (*class_index, *name_and_type_index, false),
+            Some(ConstantPoolEntry::InterfaceMethodReference {
                 class_index,
                 name_and_type_index,
-            }) => (*class_index, *name_and_type_index),
+            }) => (*class_index, *name_and_type_index, true),
             _ => return true,
         };
         let Some(target_class) = caller
@@ -31813,7 +31813,7 @@ fn jit_invoke_targets_native_shadow(
         } else {
             None
         };
-        (target_class, method_name, descriptor, declaring_class)
+        (target_class, method_name, descriptor, declaring_class, is_interface_ref)
     };
 
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
@@ -31829,13 +31829,39 @@ fn jit_invoke_targets_native_shadow(
             .find(declaring_class, &method_name, &descriptor)
             .is_some()
     });
-    if (direct || inherited) && crate::runtime::env_cache::dbg_jitc() {
+    // Interface-dispatch blind spot: for `invokeinterface`, `declaring_class`
+    // above is resolved by walking UP FROM THE INTERFACE (`find_method_recursive`
+    // starting at the CP-referenced interface's own class_id) — it can only ever
+    // land on that same interface (its own abstract/default declaration) or a
+    // super-INTERFACE. It can never see a concrete implementor's SUPERCLASS
+    // chain, because interfaces carry no knowledge of their implementors. So
+    // for a receiver that implements this interface but inherits the actual
+    // method body from an unrelated ancestor CLASS — exactly
+    // `org.codehaus.groovy.reflection.v7.GroovyClassValueJava7 implements
+    // GroovyClassValue, extends java.lang.ClassValue` inheriting `get()` from
+    // `ClassValue`, which IS natively registered — `direct`/`inherited` above
+    // both come back false even though the call is genuinely native-shadowed
+    // at every concrete receiver. Fall back to a cheap, class-blind "does ANY
+    // registered native have this exact (name, descriptor)" probe — the same
+    // idiom `might_have_method_descriptor` already serves as a pre-filter
+    // elsewhere (e.g. `execute_invokevirtual_vtable_fast`) — and treat a hit
+    // as a possible shadow. This can only ever ADD conservatism (a same-named,
+    // same-descriptor native for a genuinely unrelated interface is rare and
+    // merely costs a missed tier-up opportunity for that one caller, never a
+    // correctness bug).
+    let interface_blind_possible_shadow = is_interface_ref
+        && !direct
+        && !inherited
+        && shared
+            .native_methods
+            .might_have_method_descriptor(&method_name, &descriptor);
+    if (direct || inherited || interface_blind_possible_shadow) && crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
-            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={}",
-            target_class, method_name, descriptor, direct, inherited
+            "[cratonvm-jitc] native-shadow target={}.{}{} direct={} inherited={} interface_blind={}",
+            target_class, method_name, descriptor, direct, inherited, interface_blind_possible_shadow
         );
     }
-    direct || inherited
+    direct || inherited || interface_blind_possible_shadow
 }
 
 fn jit_method_calls_native_shadowed(
