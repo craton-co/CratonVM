@@ -56,11 +56,7 @@ standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `
 host (EPYC 9V45, SMT), pinned to logical CPU 13 with `taskset`, as medians of
 5 alternating freshly-launched JDK/CratonVM process pairs against Temurin JDK
 25.0.3 C2 and a CratonVM candidate at default settings. Checksums matched on
-every run. The 10M-HashMap and 100K-String/Regex size-variant rows are
-single alternating JDK/CratonVM pairs (added 2026-07-18; checksums
-1549999915000000 and 5000050000, exact on both sides — the 10M case
-exercises the materialized-map fallback and GC under the default-ON
-TLAB-refill triggers). The shared host carried load ~7-10 during this
+every run. The shared host carried load ~7-10 during this
 sweep (vs ~5 for the previous table): both columns inflate together, but CratonVM's
 memory-heavy rows inflate more, so rows unchanged by this round (Fibonacci,
 Sieve, Matrix) moved within the ±10-15% contention noise band — their
