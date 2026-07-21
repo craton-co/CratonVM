@@ -94,6 +94,35 @@ timeout used by the suite runner, with zero individual test ever actually
 stuck. This fully and quantitatively explains the observed "HANG"
 classification without requiring any non-termination at all.
 
+**Addendum (2026-07-21, from the sibling
+[`jacksonautoconfigurationtests-severe-slowdown.md`](jacksonautoconfigurationtests-severe-slowdown.md)
+investigation):** the ~7.8s/iteration figure above comes from a hand-rolled
+`main()` repro that, like this doc's methodology, calls the Spring code
+directly and **bypasses JUnit5's `Launcher`/Jupiter engine entirely**. The
+Jackson investigation found that routing the *same* kind of Spring work
+through the real JUnit5 launcher takes much longer than the hand-rolled
+figure alone would predict, but — important correction — a follow-up,
+further-isolated measurement (a Spring-free, 162-invocation no-op test class
+run through the real JUnit5 `Launcher`) showed JUnit5's own machinery is
+only **~8.3x** slower than HotSpot in isolation (5.56s vs. 667ms for 162
+trivial invocations) — much smaller than the ~40-75x raw per-call dispatch
+overhead, and **not**, on its own, the dominant cost. The numbers instead
+reconcile if the two costs **compound multiplicatively** rather than adding:
+Jackson's hand-rolled per-invocation cost (~2.47s) × the isolated JUnit5
+multiplier (~8.3x) ≈ 20.5s, matching that investigation's real-invocation
+estimate (~20s) closely. Applying the same reasoning here: this doc's own
+captured stacks show real depth inside
+`InterceptingExecutableInvoker`/`InvocationInterceptorChain` alongside the
+Spring-level frames (see the 156-frame dump excerpted above), so the true
+per-test cost for the 47 real (JUnit5-launched) tests in this class is
+plausibly **~7.8s × ~8x ≈ 60s+ per test**, not just the flat ~7.8s
+hand-rolled figure — the 367s estimate above is likely a significant
+under-estimate rather than merely a lower bound. Not re-measured directly
+against the real JUnit5-launched class this session; see the Jackson doc's
+"Refinement" section for the full methodology and the (unconfirmed)
+stack-depth-dependent-cost hypothesis for *why* the two costs compound
+multiplicatively instead of adding.
+
 ### Where the flat ~2.5-3x per-context slowdown itself comes from
 
 Not specific to Spring Security or generics — this session also isolated a
@@ -160,19 +189,37 @@ initiative.
 
 ## Suggested next steps
 
+**Update (2026-07-21, from the Jackson sibling doc's follow-up): root cause
+now CONFIRMED**, not just hypothesized. It's `update_root_snapshot`
+(`vm/src/runtime/interpreter.rs:2763`) rebuilding its GC-root snapshot from
+scratch on every native call — an O(stack-depth) cost that the existing
+`CRATONVM_ROOTSNAP_CACHE` (already default-ON in this suite runner) only
+partially amortizes, and only affects *interpreted* call chains (JUnit5's
+`InterceptingExecutableInvoker`/`InvocationInterceptorChain` essentially
+never tier up, so every layer is a real frame subject to this cost). Full
+mechanism, empirical confirmation, and the already-scoped (but deliberately
+deferred, high-risk) fix are written up in
+[`jacksonautoconfigurationtests-severe-slowdown.md`](jacksonautoconfigurationtests-severe-slowdown.md)'s
+"Root cause CONFIRMED" section and
+`docs/internal/tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md`'s
+"Fix lever #1". The items below are superseded by that finding except #1,
+which still stands as the practical suite-level workaround until that fix
+lands:
+
 1. This class doesn't need a CratonVM code fix to be "correct" — it already
    is. The suite-runner-level question (raise this class's timeout budget,
    or accept it as a known slow-but-passing class once `--stack-dump-on-timeout`-based
    triage rules it out as a real hang) is a suite-configuration decision, not
    a VM bug fix.
-2. Whoever next picks up [[project_wire_tiered_manager]] can use this doc's
-   `IdentityHashProbe`/`GenericTypeIdentityProbe`-style microbenchmarks
-   (Spring-free, ~10 lines, no suite/Gradle dependency) as a fast, isolated
-   regression canary for per-call dispatch overhead — much cheaper to iterate
-   on than rebuilding and re-running the full Spring Boot test suite.
-3. If/when that initiative lands a fix, re-run this class's repro; the
-   47×~7.8s arithmetic above predicts it should drop comfortably under 300s
-   once per-call dispatch overhead is closer to HotSpot's.
+2. ~~Whoever next picks up [[project_wire_tiered_manager]] can use this doc's
+   `IdentityHashProbe`/`GenericTypeIdentityProbe`-style microbenchmarks~~ —
+   superseded; the actual mechanism is now pinned to `update_root_snapshot`
+   specifically, not generic per-call dispatch overhead. Use
+   `ReflectiveInvokeProbe.java` (Jackson doc) instead as the targeted
+   regression canary — it reproduces the scaling in ~1 second, no
+   Spring/Gradle dependency.
+3. If/when doc 04's fix lever #1 lands, re-run this class's repro; the
+   47×~7.8s arithmetic above predicts it should drop comfortably under 300s.
 
 ## Affected classes
 
