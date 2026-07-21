@@ -3755,6 +3755,22 @@ impl NativeMethodRegistry {
                         "externalSubmit",
                         "(Ljava/util/concurrent/ForkJoinTask;)Ljava/util/concurrent/ForkJoinTask;",
                     )
+                    // submit(Callable)/submit(Runnable)/submit(Runnable, T): left off
+                    // the original allow-list, so real bytecode ran them against a pool
+                    // whose commonPool() shortcut never populates queues/runState/mode —
+                    // RejectedExecutionException at submissionQueue() (RealFjp.java).
+                    | (
+                        "submit",
+                        "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
+                    | (
+                        "submit",
+                        "(Ljava/lang/Runnable;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
+                    | (
+                        "submit",
+                        "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/ForkJoinTask;",
+                    )
             );
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
@@ -3785,6 +3801,7 @@ impl NativeMethodRegistry {
                     | ("join", "()Ljava/lang/Object;")
                     | ("invoke", "()Ljava/lang/Object;")
                     | ("get", "()Ljava/lang/Object;")
+                    | ("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
                     | ("getRawResult", "()Ljava/lang/Object;")
                     | ("setRawResult", "(Ljava/lang/Object;)V")
                     | ("isDone", "()Z")
