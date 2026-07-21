@@ -1026,7 +1026,7 @@ fn discover_providers(
                         // deliberately exposes method-scoped SPI descriptors
                         // this way.
                         let fs_path = percent_decode(
-                            ext_str.strip_prefix("file:").unwrap_or(&entry_path),
+                            &file_url_path_to_fs_path(&ext_str).unwrap_or(entry_path.clone()),
                         );
                         if let Ok(bytes) = std::fs::read(&fs_path) {
                             parse_provider_lines(&bytes, &mut providers);
@@ -2453,6 +2453,20 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use crate::test_utils::mock_ctx;
+
+    #[test]
+    fn file_url_path_preserves_windows_drive_letter() {
+        assert_eq!(
+            file_url_path_to_fs_path(
+                "file:/C:/craton/CratonVM/hibernate-core/META-INF/services/example.Service"
+            ),
+            Some("C:/craton/CratonVM/hibernate-core/META-INF/services/example.Service".to_string())
+        );
+        assert_eq!(
+            file_url_path_to_fs_path("file:/tmp/service%20descriptor"),
+            Some("/tmp/service descriptor".to_string())
+        );
+    }
 
     #[test]
     fn provider_name_validation_accepts_fqn() {

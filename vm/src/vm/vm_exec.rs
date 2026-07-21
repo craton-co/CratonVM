@@ -3727,6 +3727,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn is_executing_instance_method(
+        &self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+    ) -> bool {
+        let receiver = self.shared.heap.load_and_forward(receiver);
+        self.thread.frames.iter().rev().any(|frame| {
+            if frame.method_name() != method_name || frame.method_descriptor() != descriptor {
+                return false;
+            }
+            matches!(
+                frame.get_local(0),
+                Value::Object(Some(this)) if self.shared.heap.load_and_forward(this) == receiver
+            )
+        })
+    }
+
     fn dbg_set_watch_cell(&mut self, addr: usize) {
         cratonvm_gc::heap::set_dynamic_watch(addr);
         crate::runtime::crash_handler::arm_generic_heap_watch(addr);

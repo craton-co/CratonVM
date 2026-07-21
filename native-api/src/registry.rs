@@ -856,6 +856,22 @@ pub trait NativeContext {
         false
     }
 
+    /// Whether the current Java execution stack already contains the exact
+    /// instance method on `receiver`.
+    ///
+    /// Native shadows occasionally need to distinguish a native-first virtual
+    /// entry from an `invokespecial` delegation made by real bytecode already
+    /// executing in an override. The default is deliberately conservative for
+    /// lightweight test contexts, which do not own a live Java frame stack.
+    fn is_executing_instance_method(
+        &self,
+        _receiver: ObjectRef,
+        _method_name: &str,
+        _descriptor: &str,
+    ) -> bool {
+        false
+    }
+
     /// Capture the current Java call stack without retaining it. Used by
     /// StackWalker and caller-sensitive helpers.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
