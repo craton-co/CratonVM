@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: PARTIALLY FIXED (2026-07-20) — Clusters A, B, D, E confirmed fixed upstream (verified against dev tip, HotSpot-matching PASS); Cluster C's originally-documented NPE is now FIXED (root-caused, third investigation session), plus 2 further residuals discovered along the way are also FIXED. `SpringBootContextLoaderAotTests` still does not fully pass: after merging forward with the latest dev, it now hits a fifth, unrelated-bug-family residual (Groovy `ClassInfo`/`ReflectionCache`, see Cluster C "Residual 5") before ever reaching the fourth (`AotApplicationContextInitializer` loader identity, "Residual 4") — neither is yet root-caused.**
+**Status: FIXED under interpreter execution, in isolation (2026-07-20, fourth investigation session) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end (`-Jit off`) when run in isolation — verified deterministically 3 times. Two caveats found while confirming this at scale, both NOT yet fully root-caused: (1) under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature — a JIT-specific dispatch gap, see "Residual 6"; (2) under heavy parallel-sweep host contention even with `-Jit off`, Residual 4's original failure was observed to recur once — the loader-identity race the fix closes is real and reproducible, but may not be the only one in this family, see Residual 4's "Verified, but load-dependent" note.**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -225,7 +225,7 @@ New `NativeContext` trait method: `lambda_call_site_descriptors` (returns the
 SAM method name/erased descriptor + instantiated descriptor for a lambda
 proxy `ClassId`, implemented in `vm/src/vm/vm_exec.rs`).
 
-### Residual 4 (OPEN, newly discovered): `AotApplicationContextInitializer` itself ends up Application-loader-owned
+### Residual 4 (FIXED, fourth investigation session): `AotApplicationContextInitializer` itself ends up Application-loader-owned
 
 With residuals 1–3 fixed, `SpringBootContextLoaderAotTests` progresses
 further still (`SpringApplication.applyInitializers` → `resolveTypeArgument`
@@ -263,18 +263,69 @@ probe from Spring's AOT code generator (`TestContextAotGenerator`/
 `loadContextForAotProcessing` phase, outside the fork's own execution
 context.
 
-**Not yet root-caused to a specific file:line.** Next step for whoever picks
-this up: repeat the same tracing technique used for residuals 1–3 in this
-doc — add a `CRATONVM_DBG_*`-gated `eprintln!` at
-`resolve_class_loader_aware`/`drive_defining_loader_load`/
-`execute_invokestatic`'s `static_dispatch_class_id` computation, filtered to
-`AotApplicationContextInitializer`, and reproduce via
-`apps/spring-boot-suite-runner/run-spring-boot-suite.ps1 -ClassList
-onlyone.tsv` (module `core/spring-boot-test`, class
-`SpringBootContextLoaderAotTests`) to find exactly which resolution first
-mints its Application-loader-owned `ClassId`.
+**Root cause (fourth investigation session, 2026-07-20):** hypothesis 1 from
+the original writeup ("another static-method-reference lambda") was correct,
+just one MethodHandleKind off. `CRATONVM_DBG_LAMBDA_GENERIC=1` tracing showed
+the loader-blind resolution actually happens in TWO places, both reached via
+the SAM-generic-type machinery Residual 3's fix added:
 
-### Residual 5 (OPEN, distinct bug family, found post-merge): Groovy `ClassInfo.getClassInfo(Class)` returns `null`, unrelated to loader identity
+1. `native-builtins/src/lang_class.rs`'s lambda branch of
+   `native_class_get_generic_interfaces` calls
+   `crate::generics::typesig_to_real_type(ctx, &sig)` to turn the lambda's own
+   functional-interface signature (e.g.
+   `AotApplicationContextInitializer<ConfigurableApplicationContext>`) into a
+   real `Type`, but never establishes a `GenericDeclScope` first — unlike the
+   "real class" branch a few lines up, which does. `typesig_to_real_type`
+   resolves the interface's own name via `class_id_in_generic_scope`, whose
+   `near` anchor comes from that scope; with no scope set, `near=None` and it
+   falls straight to the loader-blind global lookup — observed
+   (`decl_present=false near=None ... global=Some(ClassId(4623))`) picking up
+   whichever copy the flat store already held (the Application loader's).
+2. `native-builtins/src/generics.rs`'s `lambda_functional_interface_generic_type`
+   walks the interface's `extends` chain (needed here because
+   `AotApplicationContextInitializer<C> extends ApplicationContextInitializer<C>`
+   merely forwards `C`, never redeclaring the SAM) via a bare
+   `ctx.class_id_by_name(next_name)` — also loader-blind.
+
+**Fix:**
+- `lang_class.rs`: before calling `typesig_to_real_type` in the lambda
+  branch, resolve the lambda's host class (`ctx.lambda_proxy_host(class_id)`,
+  already correctly fork-loader-resolved by the time the lambda exists — it's
+  not a first-touch) and wrap the call in
+  `GenericDeclScope::new(Value::Object(Some(host_mirror)))`, mirroring the
+  "real class" branch's own scoping.
+- `generics.rs`: the `extends`-chain walk now tries
+  `ctx.class_id_by_name_near(next_name, current_id)` first, falling back to
+  the loader-blind `class_id_by_name` only on a miss — same pattern as every
+  other loader-aware resolution in this cluster.
+- `interpreter.rs`: also mirrored the already-fixed `InvokeStatic` lambda-impl
+  loader gap (`lambda_impl_dispatch_override_driven`, Residual-1's own fix)
+  onto the sibling `MethodHandleKind::NewInvokeSpecial` case in
+  `try_lambda_dispatch`, which had the exact same passive-cache-then-loader-blind-fallback
+  shape for constructor-reference lambdas
+  (`SomeType::new`, the mechanism behind AOT-generated
+  `AotApplicationContextInitializer::new`-style factories). This didn't turn
+  out to be the actual fix for this specific failure (the two `generics.rs`/
+  `lang_class.rs` fixes above were), but it closes a real, structurally
+  identical gap for the sibling dispatch kind and is kept.
+
+**Verified, but load-dependent:** with all three fixes, `SpringBootContextLoaderAotTests`
+PASSES end-to-end under `-Jit off` **in isolation** — reproduced 3 times
+independently (91.7s, 92.1s, 88.0s). Running it as part of a large parallel
+sweep (`-Subtrees core -Parallel 6`, ~570 classes, heavy multi-process CPU
+contention on this shared host — 8 concurrent `cratonvm`/`cargo` processes
+observed) reproduced the *original* pre-fix `IllegalStateException` once.
+This is consistent with the whole bug family's nature — "which resolution
+touches a class name first" is inherently a race, and the fixes above close
+the specific races found by tracing an isolated run; a differently-timed
+race under heavy contention can still let some other, not-yet-identified
+loader-blind touch point win first. **Residual 4 is fixed for the traced
+race** but may not be fully load-independent — re-verify in isolation
+(`-Parallel 1`) before treating a future occurrence under a busy host as a
+regression, and treat a *reproducible-in-isolation* recurrence as a sign
+there is a second, distinct race still open in this same family.
+
+### Residual 5 (FIXED, fourth investigation session): Groovy `ClassInfo.getClassInfo(Class)` returns `null`, unrelated to loader identity
 
 Before merging this branch forward, Residual 4 above (traced against dev
 `fba145c60`, this branch's original base) was the observed failure. After
@@ -307,26 +358,96 @@ everything documented above). No existing `docs/known-issues` entry covers
 this exact `ClassInfo.getClassInfo` NPE (a *different* Groovy MetaClass gap
 than `docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md`,
 which is an unbounded-loop hang in `TypeResolver`/`Introspector`, not an NPE
-in `ClassInfo`). Not investigated further this session — flagged here as a
-new, separate discovery for follow-up; Residual 4 above may or may not still
-exist further down the chain once this one is fixed.
+in `ClassInfo`).
 
-### Regression check (third investigation session, 2026-07-20)
+**Root cause (fourth investigation session, 2026-07-20):**
+`org.codehaus.groovy.reflection.v7.GroovyClassValueJava7 extends
+java.lang.ClassValue<T>`, and `ClassInfo.getClassInfo(Class)` is
+`globalClassValue.get(cls)` — real `java.lang.ClassValue.get()`.
+`native-builtins/src/phases_late.rs` registered `java/lang/ClassValue.get`
+as a **native stub that always returned `null`** instead of dispatching to
+the receiver's `computeValue(Class)` override (documented separately in
+`docs/internal/CRATONVM_BUGS/BUG-W-classvalue-get-null-stub.md`, whose own
+"routing to `computeValue` doesn't help" conclusion was scoped to a
+*different* target — `MethodHandleImpl$ArrayAccessor$1.computeValue`, which
+fails for an unrelated reason, unimplemented MethodHandle array-access
+intrinsics). For Groovy's `ClassInfo$1.computeValue` — plain
+`new ClassInfo(type); GlobalClassSet.add(...); return classInfo` — dispatching
+to `computeValue` is exactly correct and sufficient.
 
-All fixes above were verified against the full `core/spring-boot-test`
-module (80 test classes) on both CratonVM (with the fixes) and a real
-HotSpot baseline for the same class list: **77/80 PASS on both**, identical
-2 pre-existing `EMPTY` classes (abstract base classes with no runnable
-tests), no regressions. The 2 additional CratonVM-only failures
+**Fix:** `get()` now dispatches to `computeValue(Class)` via
+`ctx.invoke_virtual` **with memoization** (the earlier attempt dropped it;
+real `ClassValue.get()` calls `computeValue` **at most once** per
+`(instance, Class)` and caches the result forever after — Groovy's
+`MetaClassRegistryImpl`/`ExpandoMetaClass` mutate a `ClassInfo` in place and
+depend on that same-instance identity on every later `getClassInfo(cls)`
+call). The cache is keyed by
+`(identity_hash_code(this), identity_hash_code(cls))` — both stable across a
+moving GC, so unlike most process-global object caches in this crate, the
+*keys* need no pointer-remap bookkeeping; only the cached *values* are
+reported as GC roots and remapped (`gc_scan_classvalue_cache_roots` /
+`gc_update_classvalue_cache_refs` in `phases_late.rs`, wired into
+`roots.rs`/`gc.rs`, cleared on VM (re)creation via `reset_classvalue_cache`
+in `vm_init.rs`).
+
+**Verified:** with the fix, `SpringBootContextLoaderAotTests` no longer hits
+this NPE under `-Jit off` and instead progresses straight to (now also
+fixed) Residual 4.
+
+**Residual 6 (OPEN, newly discovered): the same fix doesn't take effect under `-Jit on`.**
+Under the suite's default `-Jit on`, `SpringBootContextLoaderAotTests` still
+fails with this exact NPE — deterministic across repeated runs, both before
+and after the Residual 4 fixes above (which are semantically independent and
+correctly took effect under both JIT settings once reached). Two dispatch-gate
+allow-lists that are known to need a matching entry for a class that has both
+real JDK bytecode and a registered native override —
+`force_native_over_real_jdk_bytecode` (`interpreter.rs`) and the
+`check_override` gate inside `invoke_on_class_shared_inner`
+(`vm_exec.rs`) — were both given a `java/lang/ClassValue.get` entry as a
+plausible fix; neither changed the outcome, and `CRATONVM_JIT_OSR=0` (the
+escape hatch for the unrelated, already-tracked
+`reference_jit_osr_loop_duplicate_execution` critical bug) didn't either.
+**Not yet root-caused.** Whatever dispatch path a JIT-compiled *caller* of
+`ClassValue.get()` uses to decide native-vs-bytecode, it is provably
+different from the interpreter's `try_stackless_invoke`/`invoke_or_native`
+ancestor walk (confirmed correct and sufficient by the `-Jit off` PASS) and
+doesn't consult either of the two allow-lists above. Next step: find the
+JIT-specific call-target resolution for a native method inherited by a
+receiver from a superclass reached via `invokeinterface` (`vm/src/jit/`), or
+instrument it directly rather than continuing to guess at allow-list gaps.
+
+### Regression check (fourth investigation session, 2026-07-20)
+
+Re-ran the full `core/spring-boot-test` module (81 test classes; the extra
+one relative to the third session's 80 is enumeration noise, not a new
+class) on CratonVM with all of this session's fixes, `-Jit on`, against the
+same-day HotSpot baseline used previously: **exact match except the same 2
+pre-existing CratonVM-only failures already documented above
 (`ImportsContextCustomizerFactoryTests`,
-`DuplicateJsonObjectContextCustomizerFactoryTests`) were confirmed
-**pre-existing** — they reproduce identically (same failure signature) against
-the unmodified dev-tip binary, unrelated to any of the fixes in this
-session. `SpringBootContextLoaderAotTests` is the sole remaining failure;
-as of this branch merging forward with the latest `origin/dev` (see Residual
-5 above), it is now blocked earlier, on Residual 5, rather than Residual 4
-or the originally-documented NPE — both of which this session's 3 fixes
-still resolve correctly.
+`DuplicateJsonObjectContextCustomizerFactoryTests` — both reproduce
+identically, unrelated to this session's changes) plus
+`SpringBootContextLoaderAotTests` itself (blocked on Residual 6 under
+`-Jit on` only)** — no new regressions. The broader `core` Gradle subtree
+(573 classes across `core/spring-boot`, `-autoconfigure`,
+`-docker-compose`, `-test`, `-test-autoconfigure`, `-testcontainers`) was
+also swept incidentally via `-Subtrees core`; none of its ~50 failures
+outside `core/spring-boot-test` (logging/config/YAML/SSL — no overlap with
+`ClassValue` or lambda-generics call paths) were compared against a
+same-session baseline and are out of this doc's scope — flagged here only so
+a future session doesn't mistake them for something this session touched.
+A separate, dedicated full-module run under `-Jit off` (same 573-class
+`-Subtrees core` sweep, `-Parallel 6`) showed the SAME 3 divergences —
+including `SpringBootContextLoaderAotTests` **FAIL**, with the *original*
+pre-Residual-4-fix `IllegalStateException` signature. This is the parallel-
+sweep contention case described in Residual 4's "Verified, but
+load-dependent" note: 3 independent isolated (`-Parallel 1`,
+single-class-list) runs on the same binary all PASS, so the fix is real, but
+a full 573-class `-Parallel 6` sweep on this shared, contended host was
+sufficient to flip the timing-sensitive race the fix closes into a
+still-open sibling race at least once. Not a regression from this session's
+changes (the pre-fix binary fails this same way unconditionally, isolated
+or not) — flagged here so a future full-sweep run isn't mistaken for
+Residual 4 having regressed; re-verify any recurrence in isolation first.
 
 ## Cluster D — missing `"random"` PropertySource — FIXED (upstream, before this session)
 
@@ -334,15 +455,17 @@ still resolve correctly.
 
 **Verified 2026-07-20: all 26/26 tests PASS**, including `propertySourceOrdering` (`"random"` now correctly present in the property-source list). Not re-root-caused. No action needed.
 
-## Cluster E — `DuplicateJsonObjectContextCustomizerFactoryTests` HANG — REFUTED (does not reproduce)
+## Cluster E — `DuplicateJsonObjectContextCustomizerFactoryTests` HANG — REFUTED (does not reproduce), but FLAKY under parallel load
 
 The originally-hypothesized "regression-in-place-of-fix" (SSLSocketFactory fix causing a real-but-blocked network hang instead of the original crash) does **not** reproduce. **Verified 2026-07-20: PASSES in 1.3-2.5s**, no hang. The `org.json:json:20140107` coordinate used by `@ClassPathOverrides` on this test is already present in `~/.m2/repository` (with a matching `_remote.repositories` marker for `central`), and Aether resolves it from the local cache without needing network I/O in this environment. No action needed; the earlier hang was likely either already fixed alongside another SSL/TLS fix landed between 2026-07-17 and now, or was itself a transient/environmental artifact of that specific rerun.
+
+**Update (fourth investigation session, 2026-07-20):** re-observed as `FAIL` (not hang) during the full-module regression run at `-Parallel 6` — `org.junit.platform.launcher.core.DiscoveryIssueException: ... could not be resolved`, a JUnit-Platform test-discovery-level error, not a CratonVM runtime failure, and not reproduced when this doc's target class was run in isolation. Consistent with `@ClassPathOverrides`' Aether resolution racing with 5 sibling processes over the same local `.m2` cache/lockfile under parallel load — see `reference_shared_host_multitenant_confound` — not a regression from this session's fixes. Re-verify in isolation (`-Parallel 1`) before treating any future occurrence as a real bug.
 
 ## Affected classes (updated status)
 
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `ConfigDataApplicationContextInitializerWithLegacySwitchTests` — **FIXED** (Cluster A)
 - `core/spring-boot-test` | `SpringBootTestCustomConfigNameTests` — **FIXED** (Cluster B)
-- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **OPEN residual** (Cluster C; originally-documented NPE + 2 more residuals FIXED this session; blocked on a 5th, unrelated-bug-family residual — see Cluster C "Residual 5" — with a 4th, distinct, not-yet-root-caused loader-identity residual still waiting behind it, see "Residual 4")
+- `core/spring-boot-test` | `SpringBootContextLoaderAotTests` — **FIXED under `-Jit off`, in isolation** (Cluster C; originally-documented NPE + Residuals 1–5 all FIXED this session, PASSES end-to-end, 3/3 isolated runs); **OPEN under `-Jit on`** (the suite default) — see "Residual 6", a new, separate, not-yet-root-caused JIT dispatch gap; **also OPEN under heavy parallel-sweep host contention even with `-Jit off`** — see Residual 4's "Verified, but load-dependent" note, a second, distinct, not-yet-identified race in the same loader-identity family
 - `core/spring-boot-test` | `SpringBootContextLoaderTests` — **FIXED**, 26/26 (Cluster D)
-- `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce (Cluster E)
+- `core/spring-boot-test` | `DuplicateJsonObjectContextCustomizerFactoryTests` — **FIXED** / does not reproduce in isolation; flaky under parallel-load regression runs (Cluster E, see update above) — unrelated to this session's changes

@@ -22446,6 +22446,21 @@ pub(crate) fn try_lambda_dispatch(
         MethodHandleKind::NewInvokeSpecial => {
             // Constructor reference: allocate object, call <init>, return the object.
             // Loader-faithful owner resolution (gated), same rationale as above.
+            //
+            // Residual 4 (2026-07-20, docs/known-issues/springboot/
+            // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+            // this used the PASSIVE-only `lambda_impl_dispatch_override` (cache
+            // read, never drives a cold miss) with a loader-blind
+            // `load_class(name)` fallback — the exact InvokeStatic gap already
+            // fixed by `lambda_impl_dispatch_override_driven` (see that
+            // function's own doc comment), just never mirrored onto this sibling
+            // MethodHandleKind. A constructor-reference lambda
+            // (`SomeType::new`, e.g. Spring AOT's generated
+            // `AotApplicationContextInitializer::new` factory) whose impl class
+            // is the very FIRST thing touched from a fork loader's namespace hit
+            // the same loader-blind fallback and minted an Application-loader
+            // copy instead of the fork's own. (Independently fixed upstream on
+            // origin/dev with the same shape; kept in sync here.)
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
@@ -24789,6 +24804,23 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // BUG-W follow-up (2026-07-20): `java.lang.ClassValue.get()` has real JDK
+    // bytecode (relies on `Class.classValueMap`, which CratonVM's Class
+    // mirrors don't back) AND a registered native override (memoized
+    // `computeValue` dispatch — see the `get()`/`remove()` registrations in
+    // `native-builtins/src/phases_late.rs`). Any cached/precomputed dispatch
+    // decision that consults this allow-list instead of re-walking the
+    // ancestor chain at call time (the JIT's compiled-callsite native check,
+    // mirroring the interpreter's `try_stackless_invoke`/`invoke_or_native`
+    // walk) needs an explicit entry here or it silently keeps running the
+    // real bytecode forever, which is how Groovy's `ClassInfo.getClassInfo`
+    // NPE'd under `-Jit on` even after the native fix landed.
+    if class_name == "java/lang/ClassValue"
+        && method_name == "get"
+        && method_descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
+    {
         return true;
     }
     if class_name == "org/springframework/core/annotation/MergedAnnotation$Adapt"

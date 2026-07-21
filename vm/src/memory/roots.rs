@@ -652,6 +652,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      companion in `gc.rs` (`gc_update_locale_refs`).
     cratonvm_native_builtins::gc_scan_locale_roots(&mut roots);
 
+    // 18c. `java.lang.ClassValue` memoization cache (BUG-W) — cached
+    //      `computeValue(Class)` results live only in a process-global
+    //      side-table in `native-builtins/src/phases_late.rs`, invisible to
+    //      every scan above. Without rooting them a moving GC can
+    //      reclaim/relocate a cached value while a later `ClassValue.get()`
+    //      keeps handing back the stale `ObjectRef`. Remap companion in
+    //      `gc.rs` (`gc_update_classvalue_cache_refs`).
+    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(&mut roots);
+
     // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
     //     state machine references Java objects (the `Service` instance whose
     //     `start()`/`stop()` we invoke, the synthetic `ServiceController`
