@@ -18,6 +18,89 @@ use rustc_hash::FxHashMap;
 use crate::threading::jvm_thread::{GcBlockState, ParkState, ThreadId};
 use crate::types::ObjectRef;
 
+// ---------------------------------------------------------------------------
+// CRATONVM_DBG_THREADREG_PERF — cumulative cost instrumentation for the
+// full-registry-walk functions called on every GC / STW pause
+// (`collect_all_root_snapshots`, `alive_count_and_os_tids`,
+// `alive_count_blocked_and_os_tids`). Investigating a CratonVM-specific
+// per-alive-thread VM overhead gap (Cluster B,
+// docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md):
+// real HotSpot finishes a test class that briefly accumulates ~750 mostly-
+// idle threads in 6s; CratonVM takes 25-300+s for the identical thread
+// count. This measures which of these O(N) walkers actually dominates
+// wall-clock, rather than guessing from a stack dump. Zero cost when unset
+// (one relaxed atomic load per call to check the gate).
+mod threadreg_perf {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var("CRATONVM_DBG_THREADREG_PERF")
+                .map(|v| {
+                    let t = v.trim();
+                    !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    pub struct Counters {
+        calls: AtomicU64,
+        nanos: AtomicU64,
+        entries: AtomicU64,
+        name: &'static str,
+        started_report: AtomicBool,
+    }
+
+    impl Counters {
+        pub const fn new(name: &'static str) -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                nanos: AtomicU64::new(0),
+                entries: AtomicU64::new(0),
+                name,
+                started_report: AtomicBool::new(false),
+            }
+        }
+
+        /// Time a closure, accumulating (call count, nanos, entries scanned).
+        /// `entries` is the registry size AT THIS CALL (not a running total) —
+        /// used to report an average N alongside cumulative cost. Prints a
+        /// running summary every 200 calls so a long test run shows progress
+        /// without waiting for process exit (which this diagnostic-only VM
+        /// mostly doesn't reach cleanly on a hang anyway).
+        #[inline]
+        pub fn time<R>(&self, entries: usize, f: impl FnOnce() -> R) -> R {
+            if !enabled() {
+                return f();
+            }
+            let start = Instant::now();
+            let r = f();
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+            let nanos = self.nanos.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
+            let total_entries = self.entries.fetch_add(entries as u64, Ordering::Relaxed)
+                + entries as u64;
+            if calls == 1 || calls % 50 == 0 {
+                self.started_report.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "[threadreg-perf] {} calls={} total_ms={:.1} avg_us={:.1} avg_registry_size={:.0} last_registry_size={}",
+                    self.name,
+                    calls,
+                    nanos as f64 / 1_000_000.0,
+                    (nanos as f64 / 1000.0) / calls as f64,
+                    total_entries as f64 / calls as f64,
+                    entries,
+                );
+            }
+            r
+        }
+    }
+}
+
 /// An entry in the thread registry for one JVM thread.
 struct ThreadEntry {
     /// Human-readable name.
@@ -1231,6 +1314,13 @@ impl ThreadRegistry {
     /// it alive) — the target would then raise a reclaimed object. The
     /// matching remap is in `update_thread_objs_after_gc` (gc.rs step 21).
     pub fn collect_all_root_snapshots(&self) -> Vec<ObjectRef> {
+        static PERF: threadreg_perf::Counters =
+            threadreg_perf::Counters::new("collect_all_root_snapshots");
+        let len = self.threads.lock().len();
+        PERF.time(len, || self.collect_all_root_snapshots_inner())
+    }
+
+    fn collect_all_root_snapshots_inner(&self) -> Vec<ObjectRef> {
         let threads = self.threads.lock();
         let mut all_roots = Vec::new();
         for entry in threads.values() {
@@ -1544,6 +1634,13 @@ impl ThreadRegistry {
     /// the startup gate; if an STW is already active, the child waits it out via
     /// `arrive_and_wait_excluded` first.
     pub fn alive_count_and_os_tids(&self) -> (usize, Vec<u32>) {
+        static PERF: threadreg_perf::Counters =
+            threadreg_perf::Counters::new("alive_count_and_os_tids");
+        let len = self.threads.lock().len();
+        PERF.time(len, || self.alive_count_and_os_tids_inner())
+    }
+
+    fn alive_count_and_os_tids_inner(&self) -> (usize, Vec<u32>) {
         let threads = self.threads.lock();
         let mut n = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
@@ -1598,6 +1695,13 @@ impl ThreadRegistry {
     /// `GcBarrierInner::excluded_blocked`'s doc for why per-thread identity,
     /// not just a count, is required for a race-free arrival decision.
     pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
+        static PERF: threadreg_perf::Counters =
+            threadreg_perf::Counters::new("alive_count_blocked_and_os_tids");
+        let len = self.threads.lock().len();
+        PERF.time(len, || self.alive_count_blocked_and_os_tids_inner())
+    }
+
+    fn alive_count_blocked_and_os_tids_inner(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
         let threads = self.threads.lock();
         let mut alive = 0usize;
         let mut blocked = 0usize;
