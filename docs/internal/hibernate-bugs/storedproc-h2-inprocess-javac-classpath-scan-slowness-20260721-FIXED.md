@@ -1,9 +1,13 @@
 # H2 stored-procedure tests — in-process `javac` compile of the `CREATE ALIAS` body is catastrophically slow under CratonVM (hangs/near-timeouts, not a deadlock)
 
-**Status:** OPEN, genuine CratonVM performance defect, reproduced in isolation
-(solo, single-class, `-Dcraton.batch=1`). Root cause narrowed to a specific
-call chain; the exact Rust-side hot loop responsible for the per-call
-overhead is not yet identified (follow-up work, see bottom).
+**Status:** FIXED on `dev` (verified 2026-07-21).
+This document preserves the historical failure evidence from the stale
+`7aed580f`-based binary.
+
+**Resolution:** `829c7bcf4` (`perf(interpreter): wire the missing invokestatic
+inline cache + drop per-call descriptor allocation`, 2026-07-20) is an
+ancestor of current `dev` and removes the repeated real-JDK dispatch work
+that amplified the `javac` classpath walk into timeout-scale latency.
 
 **Tests (4, all sharing the identical mechanism):**
 - `org.hibernate.orm.test.sql.storedproc.ResultMappingTest` — HANG (rc=124, 300s harness cap)
@@ -242,3 +246,23 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout 200 \
 
 For a stack dump instead of just a kill, use `--stack-dump-on-timeout <secs>`
 in place of `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` (see above).
+
+## Final verification (2026-07-21)
+
+Azure host `20.83.144.174`, clean current-`dev` release build, real JDK 25,
+and the harness's full ~241-jar `common.args` classpath; every class used a
+fresh process and retained its normal JUnit timeout settings.
+
+| Mode | Class index | Result | Wall time |
+|---|---:|---|---:|
+| JIT | 0 | `ResultMappingTest`: 4/4 passed | 58.92s |
+| JIT | 1 | `StoredProcedureTest`: 4/4 passed | 61.01s |
+| JIT | 2 | SQL result-set mapping: 1/1 passed | 34.70s |
+| JIT | 3 | JPA result-set mapping: 1/1 passed | 22.55s |
+| `--nojit` | 0 | `ResultMappingTest`: 4/4 passed | 44.63s |
+| `--nojit` | 1 | `StoredProcedureTest`: 4/4 passed | 46.83s |
+| `--nojit` | 2 | SQL result-set mapping: 1/1 passed | 60.83s |
+| `--nojit` | 3 | JPA result-set mapping: 1/1 passed | 19.12s |
+
+All eight processes exited `0`; no class reached its former 120s JUnit or
+300s harness timeout.
