@@ -2666,11 +2666,15 @@ pub(crate) fn native_array_new_array(
     // `Object[]` and CCE'd on the `(Value[][])` checkcast. Resolve via
     // `mirror_class_name` first (handles array + ordinary classes), keeping the
     // old readers as a fallback for legacy/unit-test mirrors.
-    let comp_name = match args.first() {
-        Some(Value::Object(Some(mirror))) => crate::lang_class::mirror_class_name(&*ctx, *mirror)
+    let comp_mirror = match args.first() {
+        Some(Value::Object(Some(mirror))) => Some(*mirror),
+        _ => None,
+    };
+    let comp_name = match comp_mirror {
+        Some(mirror) => crate::lang_class::mirror_class_name(&*ctx, mirror)
             .filter(|s| !s.is_empty())
-            .or_else(|| ctx.read_string(*mirror))
-            .or_else(|| match ctx.get_field(*mirror, 1) {
+            .or_else(|| ctx.read_string(mirror))
+            .or_else(|| match ctx.get_field(mirror, 1) {
                 Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
                 _ => None,
             })
@@ -2702,8 +2706,27 @@ pub(crate) fn native_array_new_array(
             // Reference array вЂ” resolve the component class. `ensure_class_initialized`
             // synthesizes array-descriptor components (`[L...;`) on demand, so a
             // multi-dimensional template yields the correct nested array type.
-            let comp_id = ctx
-                .ensure_class_initialized(&comp_name)
+            //
+            // Prefer the component mirror's OWN ClassId (`mirror_class_id`,
+            // reverse-map lookup) over re-resolving by name:
+            // `ensure_class_initialized` has no loader context here, so for
+            // a class name registered under more than one ClassId it can
+            // silently pick the wrong one. Observed for Jackson's
+            // `KeyDeserializers` interface in the AOT `web.service.registry`
+            // suite: `old.getClass().getComponentType()` correctly names the
+            // interface, but re-resolving that name here returned a SECOND,
+            // distinct ClassId for the "same" class, so the freshly
+            // allocated array's component type disagreed with the ClassId
+            // already tagging `old`'s elements and `System.arraycopy`
+            // correctly rejected the mismatch with `ArrayStoreException`.
+            // Falling back to the name-based lookup only when the mirror
+            // isn't in the reverse map at all (synthesized/legacy mirrors)
+            // preserves the multi-dimensional-array-descriptor synthesis
+            // this function otherwise relies on `ensure_class_initialized`
+            // for.
+            let comp_id = comp_mirror
+                .and_then(|m| crate::lang_class::mirror_class_id(&*ctx, m))
+                .or_else(|| ctx.ensure_class_initialized(&comp_name).ok())
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             ctx.new_ref_array(comp_id, length)
         }

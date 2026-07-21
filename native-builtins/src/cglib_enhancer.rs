@@ -65,30 +65,48 @@ use cratonvm_types::Value;
 /// CGLIB's own `KeyFactory.generateName` counter.
 static ENHANCER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Per-superclass-name suffix counters for `build_enhancer_class`'s
-/// `$$SpringCGLIB$$<n>` names -- Springs own `SpringNamingPolicy` keys
-/// its counter by the base class name, so the first proxy generated for any
-/// given `@Configuration` class always gets suffix `0`, no matter how many
-/// *other* classes were enhanced earlier in the same JVM/session. Using the
-/// single global `ENHANCER_COUNTER` here (shared with the unrelated
-/// `$$SpringCGLIB$$LM*`/`$$SpringCGLIB$$RM*` lookup/replace-method enhancers)
-/// made every class's suffix depend on unrelated enhancement activity
-/// elsewhere in the same test run, breaking
+/// Per-(defining-classloader, superclass-name) suffix counters for
+/// `build_enhancer_class`'s `$$SpringCGLIB$$<n>` names -- Springs own
+/// `SpringNamingPolicy` keys its counter by the base class name, so the
+/// first proxy generated for any given `@Configuration` class always gets
+/// suffix `0`, no matter how many *other* classes were enhanced earlier in
+/// the same JVM/session. Using the single global `ENHANCER_COUNTER` here
+/// (shared with the unrelated `$$SpringCGLIB$$LM*`/`$$SpringCGLIB$$RM*`
+/// lookup/replace-method enhancers) made every class's suffix depend on
+/// unrelated enhancement activity elsewhere in the same test run, breaking
 /// `AnnotationConfigApplicationContextTests.refreshForAotRegisterHintsForCglibProxy`,
 /// which hardcodes the literal expected name `...$$SpringCGLIB$$0` for the
 /// first (and only) proxy of its `CglibConfiguration` class.
-fn config_enhancer_counters() -> &'static Mutex<HashMap<String, u64>> {
-    static COUNTERS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+///
+/// Keying by class name ALONE is still wrong for suites like
+/// `ApplicationContextAotGeneratorTests`, where several `@Test` methods
+/// each enhance their OWN fixture class that happens to share the simple
+/// name `CglibConfiguration` (`@CompileWithForkedClassLoader` gives each
+/// test method a fresh child loader, so these are genuinely distinct
+/// `ClassId`s / distinct `Class` tokens, not repeat enhancements of one
+/// class) — under the pure name-keyed counter, the second and third such
+/// test methods observed in the SAME `KRun` batch inherited the first
+/// method's already-incremented counter and got suffix `1`/`2` instead of
+/// the `0` every one of them independently expects. Real CGLIB's own
+/// generated-name/cache state (`AbstractClassGenerator`) lives in a
+/// per-`ClassLoader` map, so a fresh loader always starts a fresh count —
+/// mirror that here by keying on `(defining_loader_id, super_internal_name)`
+/// instead of the name alone.
+fn config_enhancer_counters() -> &'static Mutex<HashMap<(u32, String), u64>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<(u32, String), u64>>> = OnceLock::new();
     COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Next `$$SpringCGLIB$$<n>` suffix for `super_internal_name`, starting
-/// at 0 for the first enhancement of any given class.
-fn next_config_enhancer_counter(super_internal_name: &str) -> u64 {
+/// Next `$$SpringCGLIB$$<n>` suffix for `super_internal_name` as loaded by
+/// `super_loader_id`, starting at 0 for the first enhancement of any given
+/// (loader, class) pair.
+fn next_config_enhancer_counter(super_loader_id: u32, super_internal_name: &str) -> u64 {
     let mut counters = config_enhancer_counters()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let counter = counters.entry(super_internal_name.to_string()).or_insert(0);
+    let counter = counters
+        .entry((super_loader_id, super_internal_name.to_string()))
+        .or_insert(0);
     let value = *counter;
     *counter += 1;
     value
@@ -853,11 +871,12 @@ fn emit_bean_factory_field(name_idx: u16, descriptor_idx: u16) -> Vec<u8> {
 /// extends `super_internal_name` and implements
 /// [`SPRING_MARKER_IFACE`].
 fn build_enhancer_class(
+    super_loader_id: u32,
     super_internal_name: &str,
     bean_methods: &[BeanMethod],
     ctor_descriptors: &[String],
 ) -> (String, Vec<u8>) {
-    let counter = next_config_enhancer_counter(super_internal_name);
+    let counter = next_config_enhancer_counter(super_loader_id, super_internal_name);
     // Real CGLIB's naming policy is overridden by Spring's own
     // `SpringNamingPolicy` (see `newEnhancer()` in
     // `ConfigurationClassEnhancer.java`): tag is "SpringCGLIB", not the
@@ -2348,7 +2367,9 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .filter(|m| m.name == "<init>" && m.access_flags & ACC_PRIVATE == 0)
         .map(|m| m.descriptor)
         .collect();
-    let (new_name, bytes) = build_enhancer_class(&super_name, &bean_methods, &ctor_descriptors);
+    let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
+    let (new_name, bytes) =
+        build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 
     let opts = DefineClassFull {
         override_name: Some(new_name.clone()),

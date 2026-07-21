@@ -89,31 +89,64 @@ targeted. A speculative fast-path fix built on that (now-disproven)
 hypothesis was implemented, tested, found ineffective, and reverted — not
 merged.
 
-**Working hypothesis for the new residual (not confirmed, not fixed)**:
-`webSessionManager`'s actual `@Bean` method implementation likely lives on
-`org.springframework.web.reactive.config.WebFluxConfigurationSupport` (a
-`spring-webflux` FRAMEWORK class that `EnableWebFluxConfiguration` extends),
-attributed to the leaf `@Configuration` class in Spring's bean-origin
-tracking. If framework classes are not reloaded per Spring Boot
-`ModifiedClassPathClassLoader`-isolated test (only application/autoconfigure
-classes on the modified test classpath are), that method's own `ObjectProvider`
-constant-pool reference stays the Application loader's copy even though the
-`DefaultListableBeanFactory` now correctly resolves to the isolated loader —
-the reverse-shaped mismatch from the original bug. Not verified this
-session — whoever picks this up should confirm which class actually declares
-`webSessionManager`'s bytecode and trace its own loader identity the same
-way the `ServerProperties` fix's stack-trace shim did.
+## Update 2026-07-21 (fifth session, same day) — new residual narrowed significantly; a SECOND stale-materialisation of the SAME general bug class, not yet fixed
+
+The framework-class hypothesis above was checked and **disproven**:
+`webSessionManager(ObjectProvider<WebSessionIdResolver>)` is declared
+DIRECTLY on `WebFluxAutoConfiguration$EnableWebFluxConfiguration` itself
+(`WebFluxAutoConfiguration.java:405`, `@Configuration(proxyBeanMethods =
+false)` — so no CGLIB enhancement/subclassing is in play either), not
+inherited from any spring-webflux framework superclass.
+
+**Narrowed via a temporary native trace** on `create_method_object` (fires
+for the `webSessionManager` method specifically, printing the declaring
+class's loader and the resolved `ObjectProvider` parameter's loader) plus
+the existing `setBeanClass` trace, filtered to WebFlux-related class names:
+**TWO separate `EnableWebFluxConfiguration` class materialisations coexist**
+within the same isolated test run — one with `loader=None` (global/
+Application, the wrong one) and one with `loader=Some(<isolated loader
+ptr>)` (correct). Each gets its OWN freshly-built `webSessionManager` Method
+object via `create_method_object`, and each Method's `ObjectProvider`
+parameter type is *correctly* loader-anchored to ITS OWN declaring class
+(`descriptor_to_class_mirror_via_loader`, confirmed working exactly as
+designed) — i.e. the wrong-loader Method genuinely has a wrong-loader
+`ObjectProvider`, and the correct-loader Method genuinely has a
+correct-loader `ObjectProvider`. The existing `setBeanClass` fix (this
+session, above) DOES correct the wrong copy's `beanClass` field when it's
+registered — but the wrong-loader `EnableWebFluxConfiguration` class (and
+therefore its own already-built `webSessionManager` Method, with the
+already-wrong `ObjectProvider` reference baked in) evidently still gets
+used for the actual bean creation that fails, despite the correction.
+
+**This is the SAME general bug class as the `ServerProperties` fix above**
+(a stale/duplicate materialisation of a `Class` value read from an
+annotation attribute — here `@Import({EnableWebFluxConfiguration.class})`
+on `WebFluxAutoConfiguration`, resolved via the identical
+`annotation_element_to_java_typed`/`Class` arm, `container_loader`-threaded
+and confirmed correct when read fresh — coexisting with an earlier, stale,
+wrong-loader materialisation of the same Class value), but it manifests one
+layer deeper: fixing the CONSUMER-side chokepoint (`setBeanClass`) that
+worked for `ServerProperties` is not sufficient here, because the wrong
+copy's own reflective Method metadata (built via `create_method_object`
+before the correction ever runs) persists and gets used independently of
+the bean definition's `beanClass` field.
 
 **Next steps for whoever picks this up:**
-1. Confirm which class's bytecode declares `webSessionManager(ObjectProvider<WebSessionIdResolver>)`
-   (likely `WebFluxConfigurationSupport`) and whether CratonVM resolves it to
-   the isolated loader or the Application loader under this test.
-2. If the framework-class hypothesis holds, decide the right general fix:
-   either make `DefaultListableBeanFactory.resolveDependency`'s
-   `ObjectFactory.class == descriptor.getDependencyType()` comparison
-   loader-tolerant (name + assignability rather than strict identity) for
-   this narrow case, or ensure the relevant framework classes are resolved
-   consistently with the DLBF's own loader.
+1. Find where the WRONG (`loader=None`) `EnableWebFluxConfiguration` class
+   materialisation actually gets consumed for the failing bean's actual
+   creation — likely a cached `java.lang.reflect.Method` reference on the
+   `RootBeanDefinition` (Spring's `resolvedConstructorOrFactoryMethod`
+   field / `setResolvedFactoryMethod`), populated before `setBeanClass`'s
+   correction runs. A native shim on whatever Spring API caches/reads that
+   field (mirroring the `setBeanClass` stack-trace technique — see
+   [[reference_setbeanclass_shim_loader_identity_pattern]] in the working
+   memory of the session that found this) should pinpoint it directly.
+2. Alternatively, find and fix the true root: why does
+   `@Import({EnableWebFluxConfiguration.class})`'s Class-value resolution
+   (read via `ConfigurationClassParser.collectImports`/`getAnnotationAttributes`
+   off `WebFluxAutoConfiguration`, itself confirmed correctly isolated) ever
+   produce a wrong-loader materialisation in the first place, rather than
+   patching every downstream consumer one at a time.
 3. Re-run `refreshSucceedsWithoutHealth` after any fix; if it passes, re-run
    this doc's full class list plus the cross-referenced docs' classes to
    check for a shared fix.
