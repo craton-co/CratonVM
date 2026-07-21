@@ -1418,7 +1418,16 @@ pub(crate) fn monitor_enter_blocking(
             // census recorded (not this thread's guess) can say which.
             let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
         }
-        m.block_enter(tid);
+        if dbg_mon_dump {
+            let cls = {
+                let cid = shared.heap.class_id_of(obj);
+                let cm = shared.class_manager.read();
+                cm.get_class(cid).map(|c| c.name.to_string())
+            };
+            m.block_enter_labeled(tid, cls.as_deref());
+        } else {
+            m.block_enter(tid);
+        }
         drop(blk);
     }
     if dbg_mon_dump {
@@ -3676,21 +3685,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
-        // asserts non-zero ("hash must be nonzero"). The heap's stored hash
-        // could be 0 in pathological cases (counter wrap, zero-initialised
-        // header from forwarding, etc.), so guard the return value here.
-        let h = self.shared.heap.identity_hash_code(obj);
-        if h == 0 {
-            // Mix the object pointer to provide a stable, non-zero fallback.
-            let p = obj.as_ptr() as usize;
-            let mixed = (p as u32 ^ (p >> 32) as u32) as i32;
-            if mixed == 0 {
-                0x7FFF_FFFF
-            } else {
-                mixed
-            }
-        } else {
-            h
+        // asserts non-zero ("hash must be nonzero").
+        //
+        // The heap itself now lazily mints and durably CASes a non-zero hash
+        // into the object's header the first time it's asked (see
+        // `GenerationalHeap`/`G1Collector`/`ZgcRealHeap::identity_hash_code`),
+        // which is what makes the value GC-move-stable — every mover copies
+        // the header's bytes verbatim once non-zero. This used to be handled
+        // HERE instead, by deriving a value from the object's *current*
+        // address whenever the header read back 0: that value silently went
+        // stale the instant a moving GC relocated the object (which happens
+        // routinely — the JIT's inline `new` fast path in `jit/src/x64.rs`
+        // leaves this field TLAB-zeroed on every allocation it makes, so
+        // this was not a rare fallback but the common case for JIT-hot
+        // allocation sites). Any per-object identity-keyed side table built
+        // on the old, address-derived value would silently stop finding its
+        // own entries after the first GC move — see
+        // `docs/internal/fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
+        // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
+        //
+        // What remains here is now just a last-resort guard against a 0
+        // making it back out of the heap at all (it shouldn't, but this
+        // keeps the "never 0" contract airtight regardless).
+        match self.shared.heap.identity_hash_code(obj) {
+            0 => i32::MAX,
+            h => h,
         }
     }
 
@@ -16247,6 +16266,11 @@ fn invoke_on_class_shared_inner(
                             descriptor,
                         )
                         || crate::runtime::interpreter::is_class_mirror_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_classvalue_native_override(
                             class_name,
                             method_name,
                             descriptor,

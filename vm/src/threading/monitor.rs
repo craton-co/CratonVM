@@ -449,6 +449,10 @@ impl Monitor {
     /// If the monitor is owned by another thread, this blocks until the
     /// monitor is released.
     fn enter(&self, thread_id: ThreadId) {
+        self.enter_labeled(thread_id, None)
+    }
+
+    fn enter_labeled(&self, thread_id: ThreadId, dbg_label: Option<&str>) {
         let mut state = self.state.lock();
         // Wait until the monitor is either unowned or owned by us.
         if mon_enter_dump_enabled() {
@@ -457,12 +461,28 @@ impl Monitor {
             // deadlocked here. Emits the blocked thread's frames once (the
             // snapshot was deposited by `monitor_enter` before this call).
             let mut dumped = false;
+            let mut spins: u64 = 0;
             while state.owner.is_some() && state.owner != Some(thread_id) {
                 self.entry_condvar
                     .wait_for(&mut state, std::time::Duration::from_millis(5));
                 if !dumped && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire) {
                     emit_wait_site_frames(thread_id);
                     dumped = true;
+                }
+                // CRATONVM_DBG_MONENTER stall attribution (2026-07-21): a
+                // waiter stuck for whole seconds names the current owner so
+                // wedge captures identify the holder directly.
+                spins += 1;
+                if spins % 2000 == 0 {
+                    eprintln!(
+                        "[monenter-stall] waiter_tid={} monitor={:p} owner={:?} entry_count={} waited_ms={} obj={}",
+                        thread_id.0,
+                        self as *const _,
+                        state.owner.map(|o| o.0),
+                        state.entry_count,
+                        spins * 5,
+                        dbg_label.unwrap_or("?")
+                    );
                 }
             }
         } else {
@@ -511,7 +531,15 @@ impl Monitor {
     /// `expected` wedges the whole VM (the H2 TestScript three-way STW
     /// deadlock: owner waits GC, contender waits owner, GC waits contender).
     pub(crate) fn block_enter(&self, thread_id: ThreadId) {
-        self.enter(thread_id);
+        self.enter_labeled(thread_id, None);
+    }
+
+    /// `block_enter` with a debug label naming the contested object
+    /// (class name / identity), shown in the CRATONVM_DBG_MONENTER stall
+    /// print so wedge captures identify WHAT is being fought over, not
+    /// just which Monitor struct.
+    pub(crate) fn block_enter_labeled(&self, thread_id: ThreadId, label: Option<&str>) {
+        self.enter_labeled(thread_id, label);
     }
 
     /// Release this monitor for the given thread.

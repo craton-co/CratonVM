@@ -1,5 +1,32 @@
 # Group 04 — Embedded-server deployment throughput wall  (OPEN, dominant)
 
+> ## 2026-07-21 CROSS-CONFIRMATION — same mechanism independently rediscovered from Spring Boot JUnit5 test severe-slowdown reports, not just Tomcat deploy
+>
+> A completely separate investigation (Spring Boot suite "severe slowdown,
+> not a hang" triage —
+> `docs/known-issues/springboot/jacksonautoconfigurationtests-severe-slowdown.md`
+> and `oauth2resourceserverautoconfigurationtests-severe-slowdown.md`)
+> independently converged on this exact same `update_root_snapshot`
+> mechanism, via a different trigger: **JUnit5's own
+> `InterceptingExecutableInvoker`/`InvocationInterceptorChain` reflective
+> invocation machinery**, present in every JUnit5-launched test, not just
+> Tomcat's Digester-driven reflective deploy. Empirically confirmed with a
+> synthetic nested-`Method.invoke()`-chain microbenchmark
+> (`ReflectiveInvokeProbe.java`, no Spring/Tomcat/Gradle dependency,
+> reproduces the scaling in ~1 second): cost scales ~1x → 2.9x as reflective
+> nesting depth goes 1 → 10 layers (JIT on, flags off); `CRATONVM_ROOTSNAP_CACHE=1`
+> reduces this to ~1.8-1.9x but does not eliminate it, matching this doc's
+> own "~2.4x only, not ~11x" finding for churning/reflection-heavy stacks
+> below. Also confirmed the two other existing flags
+> (`CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT`, `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC`)
+> add no further measurable improvement for this specific call shape. This
+> raises the priority of "Fix lever #1" below: it's not just the biggest
+> blocker to a green Tomcat suite, it plausibly explains a chunk of the
+> Spring Boot suite's "severe slowdown, not a hang" population too — any
+> class with many `@Test`/`@ParameterizedTest` methods, each triggering
+> reflection-heavy interpreted work (Spring bean creation, in that suite's
+> case), pays this same tax on every JUnit5-mediated invocation.
+
 > ## ✅ 2026-06-15 RE-VERIFICATION — both FUNCTIONAL sub-problems are fixed; remainder is pure interpreter throughput
 >
 > Re-measured on `dev` (fresh worktree `CratonVM-tcbug0609`, branch
