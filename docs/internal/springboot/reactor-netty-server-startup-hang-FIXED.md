@@ -185,10 +185,11 @@ see the residual doc for why.
 `NettyReactiveWebServerFactoryTests` via `run-spring-boot-suite.ps1`
 (`-Exe` pointing at a release build with all fixes above, real suite-runner
 environment): **34/36 tests pass** (was: HANG, 0/36 ever ran). The two
-remaining failures are unrelated, deeper bugs — filed separately:
+remaining failures at the time were unrelated, deeper bugs — filed
+separately:
 
-- [`sslWithPemCertificates` `rustls DecryptError`](../../known-issues/springboot/pemcertificates-clientauth-rustls-decrypterror.md)
-- [`whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed` HPACK decode failure](../../known-issues/springboot/h2c-priorknowledge-hpack-headerblock-decode-failure.md)
+- [`sslWithPemCertificates` `rustls DecryptError`](pemcertificates-clientauth-rustls-decrypterror-FIXED.md) — **FIXED 2026-07-20**, now 35/36
+- [`whenHttp2IsEnabledAndSslIsDisabledThenH2cCanBeUsed` HPACK decode failure](../../known-issues/springboot/h2c-priorknowledge-hpack-headerblock-decode-failure.md) — still OPEN
 
 ## Affected classes
 

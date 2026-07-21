@@ -6063,9 +6063,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // concrete HTTP connection without response state and returns EOF.
             if let Some(raw_path) = ext.strip_prefix("file:") {
                 let decoded = uri_percent_decode(raw_path);
-                let mut path = decoded.trim_start_matches('/').to_string();
+                // POSIX: the URL's decoded path (e.g. `/data/data/...`) IS
+                // the absolute filesystem path already -- keep it intact.
+                // Windows: strip the leading `/` and, for the MSYS/Cygwin-
+                // style `/c/...` form (no colon), reinject the drive-letter
+                // colon (`c/foo` -> `c:/foo`) so `new File(path)` resolves.
+                // A prior version unconditionally stripped every leading
+                // `/` before this cfg split existed, which silently broke
+                // POSIX absolute-path resolution (see
+                // docs/known-issues/tomcat-08-07/silent-hang-no-signature-
+                // cluster.md). That fix was itself silently reverted by a
+                // stale-branch merge (b90ecea19, 2026-07-20) that carried
+                // an older, pre-fix copy of this function back into dev --
+                // restoring it here, same shape as the original fix.
                 #[cfg(windows)]
-                {
+                let path = {
+                    let mut path = decoded.trim_start_matches('/').to_string();
                     let bytes = path.as_bytes();
                     if bytes.len() >= 2
                         && bytes[0].is_ascii_alphabetic()
@@ -6073,7 +6086,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     {
                         path.insert(1, ':');
                     }
-                }
+                    path
+                };
+                #[cfg(not(windows))]
+                let path = decoded.clone();
                 let file = match ctx.new_object("java/io/File")? {
                     Some(Value::Object(Some(o))) => o,
                     _ => return Err(ioex("URL.openConnection: allocate File")),
@@ -9322,25 +9338,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
             }
             ctx.set_field(this, 1, Value::Int(1));
-            // Per-SSLContext mTLS identity: claim the identity staged by the
-            // keystore load that fed this context's KeyManager (same thread),
-            // and attach it to this SSLContext. createSSLEngine / createSocket
-            // then use THIS context's cert+key rather than the process-global
-            // slot, so an in-process server and client don't clobber each other.
-            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this);
-            // Stash the actual TrustManager objects passed here (may include a
-            // revocation-aware PKIXRevocationChecker attached by
-            // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
-            // X509TrustManager). rustls's own verifier only checks the
-            // certificate chain against a trust anchor — it never consults
-            // these — so without this, custom/OCSP/CRL trust managers are
-            // silently never invoked. Consulted post-handshake by
-            // `t27_tls::engine_run_trust_check`.
-            let tms_arr = match args.get(2) {
-                Some(Value::Object(Some(a))) => Some(*a),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
             // Stash the actual KeyManager objects too (may include a test
             // wrapper like Tomcat's `TrackingKeyManager`). rustls's own
             // client-cert path otherwise only ever presents one fixed
@@ -9354,6 +9351,32 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => Some(*a),
                 _ => None,
             };
+            // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
+            // the KeyManager[] this call actually received (immune to an
+            // intervening, unrelated SSLContext.init draining the
+            // thread-local first — see pemcertificates-clientauth-rustls-
+            // decrypterror); fall back to the thread-local "staged by the
+            // most recent KeyManagerFactory.init on this thread" mechanism
+            // when the KeyManager objects don't carry a recognizable id (e.g.
+            // a test wrapper). createSSLEngine / createSocket then use THIS
+            // context's cert+key rather than the process-global slot, so an
+            // in-process server and client don't clobber each other.
+            let resolved_identity =
+                crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_arr);
+            crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
+            // Stash the actual TrustManager objects passed here (may include a
+            // revocation-aware PKIXRevocationChecker attached by
+            // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
+            // X509TrustManager). rustls's own verifier only checks the
+            // certificate chain against a trust anchor — it never consults
+            // these — so without this, custom/OCSP/CRL trust managers are
+            // silently never invoked. Consulted post-handshake by
+            // `t27_tls::engine_run_trust_check`.
+            let tms_arr = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
             crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             Ok(None)
         },
