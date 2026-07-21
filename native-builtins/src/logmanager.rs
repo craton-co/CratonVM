@@ -2171,12 +2171,22 @@ fn native_jul_log_record_get_message(
         return Ok(Some(Value::Object(None)));
     };
     let record_id = ctx.get_field(*record, 1).as_long().unwrap_or_default();
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): switched
+    // from the interned `ctx.create_string(&text)` to the uninterned,
+    // headroom-checked `create_string_uninterned_gc_safe` -- the correct,
+    // established choice for a native caller producing a dynamic string
+    // (see that function's own doc comment). This alone does not fully
+    // close a residual, much rarer heap-corruption symptom found while
+    // verifying it; see docs/known-issues (or the linked follow-up task) for
+    // the open investigation. Also semantically more correct regardless:
+    // `LogRecord.getMessage()` is a dynamically produced string, not a
+    // literal, so it should not participate in the intern pool.
     let message = log_record_messages()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&record_id)
         .cloned()
-        .map(|text| ctx.create_string(&text));
+        .map(|text| ctx.create_string_uninterned_gc_safe(&text));
     Ok(Some(Value::Object(message)))
 }
 
@@ -2187,6 +2197,14 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     else {
         return Ok(None);
     };
+    // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): `logger`
+    // and `handler` are used below across several `invoke_virtual`/
+    // `alloc_concurrent_synthetic` calls (arbitrary Java bytecode and heap
+    // allocation, both GC-capable) without ever being pinned -- same hazard
+    // class as the three JUL sibling functions already fixed. Pin both up
+    // front and re-derive them after every GC-capable call.
+    let logger_pin = ctx.pin_native_root(*logger);
+    let handler_pin = ctx.pin_native_root(*handler);
     let name = read_jul_logger_name(ctx, *logger);
     let is_root = name.is_empty();
     let mut all = logger_handlers().lock().unwrap_or_else(|e| e.into_inner());
@@ -2194,6 +2212,7 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
     if !handlers.iter().any(|&addr| addr == handler.as_ptr() as u64) {
         handlers.push(handler.as_ptr() as u64);
     }
+    drop(all);
     if is_root && tomcat_classloader_log_manager_requested(ctx) {
         let loader_key = tomcat_context_loader_key(ctx);
         let mut roots = tomcat_juli_root_handler_registry()
@@ -2204,45 +2223,53 @@ fn native_jul_logger_add_handler(ctx: &mut dyn NativeContext, args: &[Value]) ->
             entries.push(handler.as_ptr() as u64);
         }
     }
+    let logger = ctx.read_native_pin(logger_pin, *logger);
+    let handler = ctx.read_native_pin(handler_pin, *handler);
     // The compatibility map above is name-keyed for legacy synthetic JUL
     // callers. JULI must additionally retain handlers by logger identity:
     // two webapps may both configure the root logger named "" but with
     // independent FileHandlers. The delivery bridge consumes this side table.
-    let side_list = match crate::jul_logger_handlers_get(ctx, *logger) {
+    let side_list = match crate::jul_logger_handlers_get(ctx, logger) {
         Some(list) => list,
         None => {
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
             cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
-            crate::jul_logger_handlers_set(ctx, *logger, list);
+            let list = ctx.read_native_pin(list_pin, list);
+            let logger = ctx.read_native_pin(logger_pin, logger);
+            crate::jul_logger_handlers_set(ctx, logger, list);
             list
         }
     };
+    let side_list_pin = ctx.pin_native_root(side_list);
     let size = match ctx.invoke_virtual(side_list, "size", "()I", &[])? {
         Some(Value::Int(size)) if size > 0 => size as usize,
         _ => 0,
     };
     let mut already_present = false;
     for index in 0..size {
+        let side_list = ctx.read_native_pin(side_list_pin, side_list);
+        let handler = ctx.read_native_pin(handler_pin, handler);
         if ctx.invoke_virtual(
             side_list,
             "get",
             "(I)Ljava/lang/Object;",
             &[Value::Int(index as i32)],
-        )? == Some(Value::Object(Some(*handler)))
+        )? == Some(Value::Object(Some(handler)))
         {
             already_present = true;
             break;
         }
     }
     if !already_present {
+        let side_list = ctx.read_native_pin(side_list_pin, side_list);
+        let handler = ctx.read_native_pin(handler_pin, handler);
         let _ = cratonvm_native_collections::native_al_add(
             ctx,
-            &[
-                Value::Object(Some(side_list)),
-                Value::Object(Some(*handler)),
-            ],
+            &[Value::Object(Some(side_list)), Value::Object(Some(handler))],
         )?;
     }
+    ctx.unpin_native_roots(logger_pin);
     Ok(None)
 }
 
