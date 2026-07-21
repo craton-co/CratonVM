@@ -72308,9 +72308,24 @@ pub(crate) fn transition_real_executor_to_shutdown(
     // Preserve the JDK shutdown ordering while keeping the existing native
     // transition for real ThreadPoolExecutor receivers.
     let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
-    // `onShutdown()` may have emptied the queue. Run the real finalization
-    // path so it signals the termination condition immediately when there are
-    // no workers left, rather than waiting for a later worker-exit callback.
+    // BUG-H2-HANG-0721 / onShutdown() finalization: the real
+    // `ThreadPoolExecutor.shutdown()` body ends with an unconditional
+    // `tryTerminate()` call (see JDK source) -- this is the ONLY thing that
+    // ever moves a pool whose workerCount is *already* zero at shutdown()
+    // time (never used, or already fully drained -- e.g. `onShutdown()`
+    // above may have just emptied the queue) from SHUTDOWN to
+    // TIDYING/TERMINATED and fires `termination.signalAll()`. When
+    // workerCount > 0, `processWorkerExit()` (real bytecode, runs when each
+    // interrupted worker actually exits) eventually calls its own
+    // `tryTerminate()` and self-heals -- but a pool with zero workers has no
+    // worker left to ever run that path, so without this call here the pool
+    // is stuck in SHUTDOWN forever and `awaitTermination()` (real bytecode,
+    // genuinely blocks on `termination.awaitNanos`) hangs for the full
+    // requested timeout. H2's `Utils.shutdownExecutor` calls
+    // `awaitTermination(1, TimeUnit.DAYS)`, so this is an effectively
+    // permanent hang for the extremely common "FileStore closed before its
+    // background serialization/save executor ever ran a task" case (most
+    // H2 TestDb-based tests hit this on deleteDb()/close()).
     let _ = ctx.invoke_special_bytecode_only(
         "java/util/concurrent/ThreadPoolExecutor",
         "tryTerminate",
