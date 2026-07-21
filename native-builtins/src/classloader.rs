@@ -5496,6 +5496,33 @@ fn loader_local_resource_urls(
     urls
 }
 
+/// Per-(loader-namespace-id, class-name) locks serializing concurrent
+/// `ucl_try_define_local_class` attempts for the SAME class through the SAME
+/// `URLClassLoader` instance.
+///
+/// Without this, two threads racing to load the same not-yet-defined class
+/// through the same loader (e.g. Spring Boot's
+/// `OnClassCondition$ThreadedOutcomesResolver`, which evaluates
+/// autoconfiguration conditions on a background thread pool while the main
+/// thread needs the same framework classes through the same
+/// `ModifiedClassPathClassLoader`) can both pass the "not yet defined" check
+/// below before either calls `define_class_full`. The second call then hits
+/// a genuine but spurious `IncompatibleClassChangeError`
+/// ("already defined by <this> loader") wrapped as a `NoClassDefFoundError`
+/// -- exactly the check-then-act race a real JVM's per-class
+/// `getClassLoadingLock` exists to prevent. Keyed by loader namespace id
+/// (not the loader `ObjectRef`, which the entry-point pin/GC dance below
+/// makes awkward to hash) plus class name, so unrelated loaders defining a
+/// same-named class concurrently are never serialized against each other.
+fn url_classloader_define_locks() -> &'static Mutex<
+    std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>,
+> {
+    static INSTANCE: OnceLock<
+        Mutex<std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>>,
+    > = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Try to resolve `URLClassLoader.findClass(name)` from the receiver's own
 /// URL set (local filesystem paths and/or real HTTP(S) fetches) and define
 /// the resulting class under that receiver's loader namespace.
@@ -5518,6 +5545,65 @@ pub(crate) fn ucl_try_define_local_class(
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
+
+    // Serialize concurrent definers of this exact (loader, name) pair -- see
+    // `url_classloader_define_locks`. `loader` is freshly passed in by the
+    // caller (not yet pinned across any GC-unsafe window), so reading its
+    // namespace id here is exactly as safe as the `find_loaded_class_for_loader`
+    // probe just above.
+    let define_lock_id = loader_namespace_id(ctx, loader);
+    let define_lock_key = (define_lock_id, internal_name.to_string());
+    let define_lock = {
+        let mut locks = url_classloader_define_locks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(define_lock_key)
+            .or_insert_with(|| {
+                std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()))
+            })
+            .clone()
+    };
+    let (define_lock_mutex, define_lock_cvar) = &*define_lock;
+    let mut in_progress = define_lock_mutex
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    while *in_progress {
+        let (guard, timeout) = define_lock_cvar
+            .wait_timeout(in_progress, std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| e.into_inner());
+        in_progress = guard;
+        // The other thread may have finished defining it (success -- return
+        // its result) or failed (we should try ourselves rather than loop
+        // forever on a definition that will never arrive).
+        if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
+            return Some(Ok(Some(Value::Object(Some(mirror)))));
+        }
+        if timeout.timed_out() {
+            break;
+        }
+    }
+    *in_progress = true;
+    drop(in_progress);
+
+    /// Clears the in-progress flag and wakes any waiters, including on an
+    /// unwind, so a panic mid-define doesn't strand other threads on the
+    /// 30s wait forever.
+    struct DefineInProgressGuard<'a> {
+        mutex: &'a Mutex<bool>,
+        cvar: &'a std::sync::Condvar,
+    }
+    impl<'a> Drop for DefineInProgressGuard<'a> {
+        fn drop(&mut self) {
+            let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
+            *in_progress = false;
+            self.cvar.notify_all();
+        }
+    }
+    let _define_in_progress_guard = DefineInProgressGuard {
+        mutex: define_lock_mutex,
+        cvar: define_lock_cvar,
+    };
 
     let resource_name = format!("{internal_name}.class");
     let paths = loader_constructor_url_paths(ctx, loader);
