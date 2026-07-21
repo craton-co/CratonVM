@@ -614,24 +614,93 @@ progressed cleanly through **60 server-start/stop cycles in 571s** (vs. the
 pre-fix baseline of 17-18 cycles before an indefinite hang) — a large,
 real improvement — then the process **terminated abnormally (exit code 1,
 no panic message, no `SBRUNNER_RESULT`)** immediately after starting its
-61st server instance (an `h2c`-enabled connector). Neither
-`compressionOfResponseToPostRequest` (discovery position 61) nor
-`whenHttp2IsEnabledAndSslIsDisabledThenHttp11CanStillBeUsed` (position 63,
-also h2c) reproduces the crash when run in isolation — **this is a
-cumulative/state-leak crash that only manifests after ~60 prior
-server-start cycles in the same process**, not a per-test bug. It was
-never reached before this fix (the class always hung around cycle 18-19
-first) — a fourth instance in this investigation of a residual that was
-masked by an earlier-blocking bug. **New OPEN residual, not investigated
-further in this pass** — needs its own cdb-sampling/crash-dump
-investigation in a fresh session, ideally reproduced via a tight loop of
-just the last ~10-15 tests before the crash point to shorten the
-iteration cycle (60 cycles × ~9.5s/cycle ≈ 570s per attempt otherwise).
+61st server instance (an `h2c`-enabled connector). It was never reached
+before this fix (the class always hung around cycle 18-19 first) — a
+fourth instance in this investigation of a residual that was masked by an
+earlier-blocking bug.
+
+## Investigated further (2026-07-21) — almost certainly NOT a CratonVM bug; likely this shared host's known cross-session process-kill hazard
+
+Ran the full class 4 more times (2 plain, 1 with a per-test
+`TestExecutionListener` reporting exactly which test was running via
+`STARTING_TEST`/`FINISHED_TEST` lines, 1 launched directly under `cdb`).
+Findings that together rule out every internal-bug hypothesis tried:
+
+- **Crash position is wildly inconsistent, not "~60 cycles"**: test #4, #60,
+  #61, #67 across 4 runs — and a 5th run (under `cdb`) completed all the
+  way to test #73 with **no crash at all**. A real per-cycle resource leak
+  or deterministic bug would not vary this much run to run.
+- **A raw, JUnit-free stress loop** (`JettyCycleStress.java`: plain
+  `factory.getWebServer(...)` + start + GET + stop + destroy in a tight
+  loop, no SSL) ran **150 cycles with no crash** — handle/thread counts
+  grew modestly (~50%) but never anything catastrophic.
+- **Correlation with a failing SSL test is real but not causal**: in 3 of 4
+  runs the crash immediately followed an SSL test failing
+  (`pkcs12KeyStoreAndTrustStoreFromBundle`,
+  `sslNeedsClientAuthenticationSucceedsWithClientCertificate`,
+  `basicSslFromClassPath`, each failing with a genuine, separate
+  `SSLHandshakeException: handshake read: connection reset by peer` bug —
+  itself real and already covered by this codebase's many other tracked
+  SSL/rustls residuals). But an isolated 2-test repro of exactly
+  `pkcs12KeyStoreAndTrustStoreFromBundle` + the next test did **not**
+  reproduce the crash — SSL tests are simply the *slowest* tests in the
+  class (more wall-clock exposure window), which alone would produce this
+  correlation without any causal link.
+- **Zero internal crash signature of any kind**, checked directly:
+  - No `hs_err_pid<pid>.log` ever written (the installed Rust panic hook —
+    `vm/src/runtime/crash_handler.rs` — writes one on every panic; there
+    is none in any of the 4 crash runs' working directory).
+  - No `"panicked at"` / `"thread panicked"` text in any crash log.
+  - No `"[cratonvm] main-vm run() returned Ok/Err"` banner
+    (`vm-cli/src/main.rs`) — meaning the main-vm thread's `run()` call
+    never even returned; something killed the process out from under it,
+    not through its own normal or error exit path.
+  - No `"[cratonvm] System.exit(N) called"` banner (rules out a Java-level
+    `System.exit`/`Runtime.exit` call).
+  - Launching the class **directly under `cdb`**
+    (`cdb -g -G -c "g;.lastevent;kv;~*kv;q" <exe> <args>`) never stopped on
+    an exception — the process exited cleanly from cdb's perspective
+    (module-unload-at-exit messages only, no exception dump). This rules
+    out access violations, stack overflows, illegal instructions, and
+    `std::process::abort()`/fastfail (`__fastfail` reliably breaks into an
+    attached debugger; it did not here).
+  - **Windows Error Reporting has zero entries for this session's renamed
+    binary** (`cratonvm-spring-boot-suite.exe`) across the entire
+    investigation window, checked via
+    `Get-WinEvent -FilterHashtable @{LogName='Application';Id=1000,1001,1002}`
+    — while it DOES have entries for *other concurrent sessions'* CratonVM
+    binaries on this same box in the same time window (e.g.
+    `cratonvm-classvalue-jit-dispatch-20260721.exe`, and plain `cratonvm.exe`
+    with a genuine `BEX64`/`c0000409` fastfail crash — see
+    [[project_classvalue_residual5_jit_tierup_20260721]], unrelated to this
+    doc). If any of *our* runs had genuinely faulted at the OS level, WER
+    would show an entry for our binary too, exactly like it does for
+    theirs. It does not.
+
+**Conclusion**: this residual shows every sign of being an **external
+process termination** (something outside the process — most plausibly
+another concurrent session's cleanup script on this heavily shared,
+multi-tenant Windows box — see
+[[feedback_shared_host_blanket_process_kill]]) rather than a bug in
+CratonVM's own code. Multiple *other* sessions' differently-named
+CratonVM processes were independently observed running (and, per WER,
+genuinely crashing) on this same box throughout this investigation window
+(via plain `tasklist`, and confirmed by the WER entries above) —
+consistent with a wildcard/bare-name `taskkill`/`Stop-Process` from one of
+them occasionally catching an unrelated `cratonvm*.exe` process, including
+this session's, without any trace surviving inside the killed process.
+
+**Not fixed — there was no code bug found to fix.** Recommend, for whoever
+revisits this: reproduce on an isolated, non-shared host (or with the
+box's other sessions paused) before spending further effort chasing an
+in-process cause; if it reproduces there too, this conclusion is wrong and
+the investigation should restart from the `cdb`-attached-launch technique
+above (it is the fastest way to get a definitive answer either way).
 
 **Still OPEN / not yet done**:
-1. The new cumulative crash-after-60-cycles residual above — needs a fresh
-   investigation (crash dump/cdb, not a simple isolated-test repro since
-   isolation doesn't reproduce it).
+1. Re-verify whether this residual reproduces at all on a non-shared host
+   — everything above points to "no," but this session couldn't test that
+   directly.
 2. The analogous `Inflater` direct-buffer natives
    (`inflateBytesBuffer`/`inflateBufferBytes`/`inflateBufferBuffer` in the
    same file) are likely *also* unimplemented stubs (not yet checked/fixed
@@ -642,4 +711,6 @@ iteration cycle (60 cycles × ~9.5s/cycle ≈ 570s per attempt otherwise).
    `CRATONVM_DBG_SOCK_BYTES`.
 4. `cdb`/WinDbg is installed on this box (`Microsoft.WinDbg` via
    `winget install Microsoft.WinDbg --source winget`) — no longer a
-   blocker for future sessions on this same machine.
+   blocker for future sessions on this same machine; launching a suspect
+   process directly under it (rather than attach-after-the-fact sampling)
+   is the technique that finally got a definitive (negative) answer here.
