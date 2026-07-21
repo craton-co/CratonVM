@@ -673,6 +673,8 @@ mod tests {
             num_params: 0,
             is_synchronized: false,
             is_static: false,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -728,6 +730,7 @@ mod tests {
             self_call_stack_guard: 0x1140,
             region_bounds_addr: 0x1148,
             native_stack_floor_fn: 0x1150,
+            ldc_string: 0x1158,
         }
     }
 
@@ -950,6 +953,7 @@ mod tests {
             self_call_stack_guard: 0,
             region_bounds_addr: 0,
             native_stack_floor_fn: 0,
+            ldc_string: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1125,8 +1129,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 50.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 50);
+        // And the macro-driven count is the canonical 51.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 51);
     }
 
     #[test]
@@ -1374,6 +1378,11 @@ mod tests {
                 "native_stack_floor_fn",
                 std::mem::offset_of!(JitRuntimeHelpers, native_stack_floor_fn),
             ),
+            (
+                50,
+                "ldc_string",
+                std::mem::offset_of!(JitRuntimeHelpers, ldc_string),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1410,8 +1419,8 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 40 RequiredPtr + 5
-        // Offset + 5 OptionalPtr = 49. A new field whose classification
+        // The macro must classify every field. 41 RequiredPtr + 5
+        // Offset + 5 OptionalPtr = 51. A new field whose classification
         // is omitted will fail to compile (the macro requires both
         // arms); this test pins the *counts* so a reclassification
         // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
@@ -1427,7 +1436,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::OptionalPtr)
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
-        assert_eq!(req, 40, "required-pointer count drifted");
+        assert_eq!(req, 41, "required-pointer count drifted");
         assert_eq!(opt, 5, "optional-pointer count drifted");
         assert_eq!(off, 5, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
@@ -1471,7 +1480,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(names.len(), 40);
+        assert_eq!(names.len(), 41);
         for name in names {
             let mut h = make_helpers();
             // Zero the field by name via a match — the macro doesn't
@@ -1504,7 +1513,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_required_null_reports_every_name() {
         // Zero EVERY required pointer at once: `null_pointers()` must
-        // return the complete set of 40 required-field names (and
+        // return the complete set of 41 required-field names (and
         // `validate()` must reject). This complements the per-field
         // sweep above — it proves the validator does not stop at the
         // first miss and that the offset/optional fields (left non-zero
@@ -1517,7 +1526,7 @@ mod tests {
             .filter(|e| e.kind == FieldKind::RequiredPtr)
             .map(|e| e.name)
             .collect();
-        assert_eq!(required.len(), 40, "expected 40 required pointers");
+        assert_eq!(required.len(), 41, "expected 41 required pointers");
         // throw_exception is the round-10 addition — pin it explicitly so
         // a regression that drops it from the required set is caught here
         // and not just by the count.
@@ -1546,6 +1555,12 @@ mod tests {
         assert!(
             required.contains(&"jit_drem"),
             "jit_drem must be a required (null-rejected) pointer",
+        );
+        // ldc_string is the interned-String-materialization helper for
+        // compiled `ldc` sites — pin it explicitly for the same reason.
+        assert!(
+            required.contains(&"ldc_string"),
+            "ldc_string must be a required (null-rejected) pointer",
         );
 
         for name in &required {
@@ -1624,6 +1639,7 @@ mod tests {
             "dispatch_threw" => h.dispatch_threw = 0,
             "jit_frem" => h.jit_frem = 0,
             "jit_drem" => h.jit_drem = 0,
+            "ldc_string" => h.ldc_string = 0,
             other => panic!("unknown required-pointer field name in test: {}", other),
         }
     }

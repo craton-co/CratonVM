@@ -148,6 +148,9 @@ mod mock {
         fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
             None
         }
+        fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
+            None
+        }
         fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
             false
         }

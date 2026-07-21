@@ -397,7 +397,7 @@ fn forward_jit_arg_at(
     if raw == 0 || (raw as u64 & 0x7) != 0 || (raw as u64) >= (1u64 << 48) {
         return;
     }
-    // The JIT calling convention guarantees that descriptor-declared
+    // SAFETY: the JIT calling convention guarantees that descriptor-declared
     // references are live object pointers at this boundary; the canonicality
     // checks above reject immediate/tagged values before constructing ObjectRef.
     let object = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };
@@ -3877,7 +3877,16 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
 // the field. Returns `None` when initialization already succeeded (or the
 // per-thread JIT context isn't available — mirrors `jit_getstatic`'s same
 // defensive fallback), meaning the caller should proceed with the write.
+//
+// `unsafe` purely to match the calling-convention contract of its `pub
+// unsafe extern "C"` callers (the five `jit_putstatic_*` helpers, e.g.
+// `jit_putstatic_int` just below) — every argument here is a safe
+// reference/value already validated at that boundary.
 #[inline]
+// SAFETY: must run on the JIT-execution thread, which every
+// `jit_putstatic_*` caller guarantees — that's the only precondition
+// `jit_thread_mut()`'s per-thread context lookup and
+// `set_jit_pending_exception` depend on here.
 unsafe fn jit_putstatic_class_init_guard(vm: &SharedVm, class_id_raw: i64) -> Option<i64> {
     let class_id = ClassId::new(class_id_raw as u32);
     if let Some((thread, _guard)) = jit_thread_mut() {
