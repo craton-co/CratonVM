@@ -1332,6 +1332,23 @@ struct VirtualDispatchTarget {
 /// receiver id would poison later inline-cache hits.
 ///
 /// SAFETY: `vm` must be live; `receiver` must be a valid heap reference.
+/// Residual-6 diagnosis (env-gated, `CRATONVM_TRACE_CLASSVALUE`): true when
+/// the `ClassValue.get(Class)` dispatch-trace probes should fire. Cached so
+/// the hot dispatch path pays two slice compares + one bool load.
+pub(crate) fn cv_trace_enabled() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+}
+
+/// Residual-6 diagnosis: does this invoke-info describe the
+/// `get(Ljava/lang/Class;)Ljava/lang/Object;` signature the `ClassValue`
+/// native answers? (Class-blind on purpose — the probe wants every route.)
+fn cv_trace_match(info: &JitInvokeInfo) -> bool {
+    info.method_name == "get"
+        && info.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
+        && cv_trace_enabled()
+}
+
 unsafe fn virtual_dispatch_target_for_receiver(
     vm: &SharedVm,
     receiver: ObjectRef,
@@ -4240,6 +4257,27 @@ unsafe fn jit_typecheck_resolve(
         }
     }
 
+    // Loader-duplication fallback (Residual 6,
+    // `SpringBootContextLoaderAotTests`): this helper resolves the target by
+    // NAME through the flat global `find_class_by_name`, which returns ONE
+    // winner even when the same class was defined twice by two loaders (e.g.
+    // Spring's AOT-processing child loader re-defining Groovy's `ClassInfo`).
+    // The receiver's `ClassId` then never equals the resolved target's and the
+    // id-based checks above wrongly refuse a cast the interpreter's
+    // loader-faithful CP resolution would pass — under `checkcast` that
+    // surfaced as a SILENT null (see `jit_checkcast`), observed live as
+    // `ClassInfo.getClassInfo()` returning null only under `-Jit on`. Fall
+    // back to a name-based hierarchy walk (supers + interfaces), mirroring
+    // the accepted `is_subclass_of_by_name` tradeoff used for exception
+    // catch_type resolution.
+    if vm
+        .class_manager
+        .read()
+        .is_assignable_to_name(obj_class_id, class_name)
+    {
+        return true;
+    }
+
     // Name-based fallback for synthetic classes whose interface relationships
     // are encoded in `synthetic_implements` rather than in the class hierarchy.
     if crate::runtime::interpreter::synthetic_implements_public(vm, obj_class_id, class_name) {
@@ -4306,19 +4344,39 @@ pub unsafe extern "C" fn jit_checkcast(
     // is already false, so this also covers the original null check. Valid
     // objects always pass (8-aligned, ≤47-bit); zero false positives.
     if !cratonvm_types::plausible_heap_pointer(obj_ptr as u64) {
+        if obj_ptr != 0 && cv_trace_enabled() {
+            eprintln!(
+                "[cv-checkcast-fail] implausible obj {:#x} -> silent null",
+                obj_ptr
+            );
+        }
         return 0;
     }
     // Defensive: an unresolved typecheck site (no class_name attached) must
     // not silently allow the cast. Return 0 so the JIT-compiled code observes
     // a "failed cast" and falls back to the interpreter exception path.
     if class_name_len <= 0 || class_name_ptr.is_null() {
+        if cv_trace_enabled() {
+            eprintln!(
+                "[cv-checkcast-fail] unresolved site, obj {:#x} -> silent null",
+                obj_ptr
+            );
+        }
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
-        None => return 0,
+        None => {
+            if cv_trace_enabled() {
+                eprintln!(
+                    "[cv-checkcast-fail] obj {:#x} FAILED is_object_address -> silent null",
+                    obj_ptr
+                );
+            }
+            return 0;
+        }
     };
     // SAFETY: class_name_ptr is non-null (checked above) and class_name_len > 0.
     // The pointer comes from the JIT string table which outlives this call.
@@ -4345,6 +4403,22 @@ pub unsafe extern "C" fn jit_checkcast(
     if jit_typecheck_resolve(vm, obj_class_id, &mut obj_ref, class_name, true) {
         obj_ref.as_ptr() as i64
     } else {
+        if cv_trace_enabled() {
+            let cm = vm.class_manager.read();
+            let obj_cls_name = cm
+                .get_class(obj_class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<none>".into());
+            let target_cid = cm.find_class_by_name(class_name);
+            eprintln!(
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?} -> silent null",
+                obj_ptr,
+                obj_class_id.as_u32(),
+                obj_cls_name,
+                class_name,
+                target_cid.map(|c| c.as_u32())
+            );
+        }
         0
     }
 }
@@ -6796,7 +6870,23 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     } else {
         None
     };
+    let cv_trace = cv_trace_match(info);
+    if cv_trace {
+        let mut bits = [0i64; 4];
+        if num_args > 0 && !(args_ptr as *const i64).is_null() {
+            for (i, b) in bits.iter_mut().enumerate().take((num_args as usize).min(4)) {
+                *b = *(args_ptr as *const i64).add(i);
+            }
+        }
+        eprintln!(
+            "[cv-mic-entry] cp_class={} num_args={} a0={:#x} a1={:#x}",
+            info.class_name, num_args, bits[0], bits[1]
+        );
+    }
     if num_args < 0 || (num_args > 0 && (args_ptr as *const i64).is_null()) {
+        if cv_trace {
+            eprintln!("[cv-mic-earlyout] bad num_args/args_ptr -> silent 0");
+        }
         return 0;
     }
     let args_slice = if num_args == 0 {
@@ -6818,10 +6908,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let (thread, _jit_thread_guard) = match jit_thread_mut() {
         Some(t) => t,
-        None => return 0,
+        None => {
+            if cv_trace {
+                eprintln!("[cv-mic-earlyout] no jit thread -> silent 0");
+            }
+            return 0;
+        }
     };
 
     if args_slice.is_empty() {
+        if cv_trace {
+            eprintln!("[cv-mic-earlyout] empty args -> silent 0");
+        }
         return 0;
     }
     if args_slice.len() == 2
@@ -6859,6 +6957,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // avoids the `ObjectRef::from_raw` alignment panic.
     let receiver_bits = receiver_raw as u64;
     if (receiver_bits & 0x7) != 0 || receiver_bits >= (1u64 << 48) {
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-earlyout] misaligned/tagged receiver {:#x} -> silent 0",
+                receiver_bits
+            );
+        }
         return 0;
     }
     // SAFETY: receiver_bits is non-zero, 8-byte aligned, and within the
@@ -6919,6 +7023,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                         } else {
                             None
                         };
+                        if cv_trace && validated.is_none() {
+                            eprintln!(
+                                "[cv-mic-decode] arg bits {:#x} FAILED is_object_address -> downgraded to null",
+                                bits
+                            );
+                        }
                         match validated {
                             Some(obj) => Value::Object(Some(obj)),
                             None => Value::Object(None),
@@ -7191,6 +7301,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // coherent companion to this receiver; resolve from the receiver
         // itself until there is a callable entry to use.
         let class_name = dispatch_target.class_name;
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-hit-noentry] resolved_class={} recv_cid={} cacheable={}",
+                class_name, receiver_cid, cacheable_receiver
+            );
+        }
 
         // `decode_values` yields exactly `[receiver, args...]` — the full
         // argument vector `invoke_or_native` expects. (This path previously
@@ -7311,6 +7427,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             }
         };
 
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-hit-result] is_null={}",
+                matches!(result, Some(Value::Object(None)) | None)
+            );
+        }
         return match result {
             Some(Value::Int(v)) => v as i64,
             Some(Value::Long(v)) => v,
@@ -7328,6 +7450,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let dispatch_target = virtual_dispatch_target_for_receiver(vm, receiver_ref, info);
     let cacheable_receiver = dispatch_target.cacheable_receiver;
     let class_name = dispatch_target.class_name;
+    if cv_trace {
+        eprintln!(
+            "[cv-mic-miss] resolved_class={} recv_cid={} cacheable={}",
+            class_name, receiver_cid, cacheable_receiver
+        );
+    }
 
     mic_prof::bump(&mic_prof::MIC_MISS);
     // Try to compile callee for cached entry. Resolve by the RECEIVER's class
@@ -7448,6 +7576,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
     };
 
+    if cv_trace {
+        eprintln!(
+            "[cv-mic-miss-result] is_null={}",
+            matches!(result, Some(Value::Object(None)) | None)
+        );
+    }
     match result {
         Some(Value::Int(v)) => v as i64,
         Some(Value::Long(v)) => v,
