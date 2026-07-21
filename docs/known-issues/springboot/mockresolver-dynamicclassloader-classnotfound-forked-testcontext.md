@@ -1,11 +1,15 @@
 # Mockito `MockResolver` plugin `ClassNotFoundException` inside Spring's `@CompileWithForkedClassLoader` test context
 
-**Status: OPEN — found 2026-07-20, investigated further 2026-07-20 (2nd session).
-No deterministic repro found; likely timing/GC-pressure-dependent rather than
-a clean classloader-delegation defect. Do NOT assume this is a simple
-"missing native override" bug — every faithful isolated reconstruction of
-the mechanism has worked correctly on CratonVM. See "2026-07-20 session 2"
-below before spending more time on the classloader-delegation hypothesis.**
+**Status: OPEN — found 2026-07-20, investigated 2026-07-20 (session 2),
+root-caused further 2026-07-21 (session 3). Session 2's "likely GC-timing-
+dependent, not reproducible" verdict is SUPERSEDED — session 3 found a
+100% deterministic, non-timing-dependent repro (a different symptom on the
+SAME test: `AssertJMultipleFailuresError: expected 2 but was 1`, not the
+`ClassNotFoundException` from session 1) and, via direct A/B comparison
+against real HotSpot, confirmed it is a genuine CratonVM class-identity bug,
+not test flakiness. The exact internal mechanism is still NOT pinpointed —
+see "2026-07-21 session 3" below for what's ruled out and the precise next
+step for a follow-up session.**
 
 ## Symptom
 
@@ -210,31 +214,223 @@ symptoms of ordinary test flakiness on an overloaded shared host rather than
 distinct CratonVM bugs at all. **Do not trust further repro attempts on this
 box without first checking `tasklist`/CPU load is low.**
 
+## 2026-07-21 session 3 — 100% deterministic repro found; root mechanism narrowed via real-HotSpot A/B; NOT yet fixed
+
+Picked this back up per session 2's "re-run on a quiet host first" next
+step. Host load was moderate (~30-80%, fluctuating with other concurrent
+sessions) — re-ran `ChildManagementContextInitializerAotTests` repeatedly on
+a fresh worktree/binary (`CratonVM-mockresolver-forked-classloader-20260721`,
+branch `fix/mockresolver-forked-classloader-20260721`, binary
+`cratonvm-mockresolver-forked-classloader-20260721.exe`, branched from
+current `dev` tip `5c5718ff0`, well past session 1/2's `d999dc76f`).
+
+**The `ClassNotFoundException` from session 1 did not reproduce even once
+this session** (8+ runs). Every run instead hit the `AssertJMultipleFailuresError:
+expected 2 but was 1` mode from session 2 — **100% of the time, completely
+deterministically**, including across a from-scratch rebuild with added
+instrumentation. This is the opposite of session 2's conclusion ("every
+piece in isolation works, GC-timing dependent") — the aggregate failure mode
+is NOT flaky; only the mix session 2 saw under heavy host load was noisy.
+
+**Root cause, precisely characterized (not yet pinned to an exact line):**
+
+The test's only assertion (`numberOfOccurrences("WebServer started", 2)`)
+fails because the management (child) `ApplicationContext` never gets
+created at all — `ChildManagementContextInitializer.start()` is never
+invoked, because `ManagementContextAutoConfiguration.DifferentManagementContextConfiguration`
+(the nested `@Configuration` class whose `@Bean childManagementContextInitializer()`
+registers it) is never activated, because its guarding condition —
+`@ConditionalOnManagementPort(ManagementPortType.DIFFERENT)`, backed by
+`OnManagementPortCondition.getMatchOutcome()` — evaluates to **NO MATCH even
+though `ManagementPortType.get(environment)` correctly computes `DIFFERENT`**
+(confirmed both values print as `DIFFERENT` via temporary
+`System.err.println`/`toString()` diagnostics patched directly into
+`ManagementPortType`/`OnManagementPortCondition`/`ManagementContextAutoConfiguration`,
+compiled into a side directory and classpath-prepended ahead of the real
+jar — see "Reproducing this session's diagnostics" below).
+
+The `NO MATCH` happens because `actualType == requiredType` (a plain enum
+`==` in `OnManagementPortCondition`) is **false** despite both printing
+`DIFFERENT` — **`requiredType.getClass() != actualType.getClass()`: two
+distinct `Class<ManagementPortType>` objects exist in the same JVM
+process**, one defined by `jdk.internal.loader.ClassLoaders$AppClassLoader`
+(`requiredType`, sourced from `metadata.getIntrospectedClass()` — a
+REFLECTION-based `StandardAnnotationMetadata` reading the real, already-
+loaded `ManagementContextAutoConfiguration$DifferentManagementContextConfiguration`
+class object) and one defined by
+`org.springframework.core.test.tools.CompileWithForkedClassLoaderClassLoader`
+(`actualType`, from `OnManagementPortCondition`'s own `ManagementPortType.get()`
+call — `OnManagementPortCondition` itself is loaded via that forked loader,
+per `context.getClassLoader()`, which Spring's `ConditionEvaluator` always
+uses to resolve `@Conditional`'s condition-implementation class name,
+independent of which loader defined the *candidate* class the condition is
+being evaluated for).
+
+**This generalizes the original doc's finding**: it is not specific to
+Mockito's plugin loader or `SpringMockResolver` (a *library* class) — the
+exact same forked-vs-app dual-definition mechanism also splits the identity
+of `ManagementPortType`, an ordinary **application** class from this
+module's own main sources, with a completely different, non-Mockito-related
+symptom (a silently-skipped bean registration, not an exception).
+
+**Confirmed via direct A/B against real HotSpot** (JDK 25,
+`C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot`, running the
+SAME instrumented classes + same classpath, invoked directly with `java`
+instead of through `SbRunner`/CratonVM): the test **passes** on HotSpot
+(`SBRUNNER_RESULT tests=1 failed=0`), and the SAME diagnostic prints show
+`metadata.getIntrospectedClass()` for `DifferentManagementContextConfiguration`
+is **also** loaded via `CompileWithForkedClassLoaderClassLoader` on HotSpot
+— i.e. on HotSpot, `ManagementContextAutoConfiguration` and its nested
+`@Configuration` classes are consistently resolved through the SAME forked
+loader as `OnManagementPortCondition`/`ManagementPortType`
+(`requiredType.getClass() == actualType.getClass()` → `sameClass=true`),
+while on CratonVM they split across two different loaders. **This proves
+the split is a genuine CratonVM defect, not inherent to how
+`@CompileWithForkedClassLoader` works** — some code path that runs the
+REFLECTIVELY RE-INVOKED test method's body (`context.register(ManagementContextAutoConfiguration.class, ...)`
+is a `ldc <class>` literal inside `aotContributedInitializerStartsManagementContext`'s
+own bytecode) is, on CratonVM only, resolving that `ldc` against the WRONG
+(original/app-loader) class identity instead of the actually-executing
+(forked-loader-reloaded) copy of the test class that real HotSpot uses.
+
+**Ruled out as the entry point** (each confirmed with a live, rebuilt,
+env-var-gated `eprintln!` trace that fired zero times for
+`ManagementContextAutoConfiguration`/`ManagementPortType`/
+`WebEndpointAutoConfiguration` across multiple repro runs, including with
+`--nojit`):
+- `execute_ldc`'s `ConstantPoolEntry::ClassReference` arm
+  (`vm/src/runtime/interpreter.rs`, both the `Ldc` and `LdcW` bytecode
+  forms funnel through this one function) — traced unconditionally, zero
+  hits. Rules out plain interpreted `ldc`/`ldc_w` as the resolution site.
+- `resolve_class_loader_aware` (the loader-faithful `CONSTANT_Class`
+  resolver used by `ldc`/`new`/`checkcast`/`instanceof`) — zero hits via its
+  existing `CRATONVM_DBG_LOADER_TRACE` hook (extended with these class
+  names for this session).
+- `execute_invokestatic` (the slow/uncached `invokestatic` path, which has
+  its own loader-aware `self_class_id`/`static_dispatch_class_id` logic —
+  see the `Self-call identity fix` and `Sibling static owners` comments
+  around `vm/src/runtime/interpreter.rs:28906-28927`) — zero hits via its
+  existing `CRATONVM_INVOKESTATIC_LOADER_TRACE` hook (extended similarly).
+  `ManagementPortType.get()` never reaches this path either — it's served
+  from `execute_invokestatic_cached`'s thread-local `invoke_cache` on every
+  observed call, including what should be the first (cold) call for a
+  freshly-forked `OnManagementPortCondition` class — worth revisiting if a
+  future session suspects `thread.invoke_cache`'s `(caller_class_id,
+  cp_index)` keying.
+- `Class.forName`/`ClassUtils.forName` (native, `lang_class.rs`'s
+  `native_class_for_name`) — traced via the EXISTING `CRATONVM_FORNAME_TRACE`
+  hook. Confirms `ChildManagementContextInitializerAotTests` itself gets
+  resolved via `Class.forName` **twice**, with two DIFFERENT loader object
+  pointers (consistent with the "test method is reflectively re-invoked via
+  a fresh forked-loader copy of the test class" mechanism JUnit5's
+  `CompileWithForkedClassLoaderExtension.interceptTestMethod` —
+  an `InvocationInterceptor` — must be using), and that `OnManagementPortCondition`
+  is loaded via the SECOND (forked) loader pointer — but
+  `ManagementContextAutoConfiguration`/its nested classes are NEVER passed
+  through `Class.forName` at all, ruling this out as their resolution path.
+- JIT: re-ran the SAME repro with `--nojit` — bug persists identically
+  (`sameClass=false`, same loaders, same failure). Rules out a JIT-compiled-
+  method cache as the cause.
+
+**Still unidentified**: whatever mechanism DOES resolve
+`ManagementContextAutoConfiguration.class` (and its nested classes) inside
+`aotContributedInitializerStartsManagementContext`'s bytecode — it is
+provably reached (the class IS loaded, `getDeclaredClasses()` reflects it
+correctly), it is provably NOT any of the five paths above. Remaining
+candidates for a follow-up session, roughly in order of suspicion:
+1. `native_method_invoke`'s (`native-builtins/src/lang_class.rs:6371+`)
+   `use_virtual_dispatch` branch (`ctx.invoke_virtual`, ~line 6747) — the
+   path taken for THIS test method (an ordinary, non-static, non-private
+   instance method reflectively invoked via `Method.invoke`). Contrast with
+   the SAME function's `else` branch a little further down (~line 6798-6823,
+   comment "Use the Method object's OWN already-resolved declaring ClassId…"),
+   which ALREADY has a fix for exactly this dual-loader-identity problem —
+   but only for the STATIC-method dispatch branch. The instance/virtual-
+   dispatch branch has no equivalent protection; worth checking whether
+   `ctx.invoke_virtual` (`vm/src/vm/vm_exec.rs:7735`, which resolves via
+   `find_method_recursive` — itself precise, walks by exact `ClassId`, looks
+   clean on inspection) or something between it and the pushed frame ends up
+   binding the new frame's `class_id`/constant-pool-resolution context to a
+   stale or wrong identity for a *reflectively re-invoked* method whose
+   receiver's class was freshly (re)loaded this run.
+2. A parsed-classfile/constant-pool structure interning or dedup mechanism
+   keyed by content (bytes) rather than by `ClassId` — if CratonVM ever
+   reuses the SAME `Arc`/`Rc`-shared `ClassFileMethod`/constant-pool data
+   for two `defineClass` calls that happen to submit byte-identical class
+   files (exactly what happens here: the forked loader's `findClass`
+   fallback reads and defines the SAME `.class` bytes the app loader
+   already defined), any resolved-reference cache living on that shared
+   structure would leak across the two otherwise-distinct `ClassId`s. Not
+   directly located this session (searched `classloading/src/class_manager.rs`
+   and `class.rs` for evidence of this and found none obviously — the
+   `ConstantPoolEntry::ClassReference` variant itself carries only a raw
+   name, no resolved-cache field — but a decoded-`Instruction` cache
+   elsewhere in the interpreter, populated once per method and reused
+   across invocations, was NOT ruled out and is the most likely remaining
+   candidate given `execute_ldc` is proven unreached).
+
+### Reproducing this session's diagnostics
+
+The instrumentation lives only in the (uncommitted, disposable) worktree
+`CratonVM-mockresolver-forked-classloader-20260721/diag/` this session —
+not checked in, since it's throwaway `System.err.println` patches to real
+JDK/Spring classes, not a CratonVM fix. To reconstruct: copy
+`ChildManagementContextInitializer.java`, `ManagementPortType.java`,
+`ManagementContextAutoConfiguration.java`, `OnManagementPortCondition.java`
+(all from `apps/spring-boot/module/spring-boot-actuator-autoconfigure/src/main/java/org/springframework/boot/actuate/autoconfigure/web/server/`)
+and `MockServletWebServer.java`, `MockServletWebServerFactory.java` (from
+`apps/spring-boot/module/spring-boot-web-server/src/testFixtures/java/org/springframework/boot/web/server/servlet/`)
+into a side directory, add diagnostic prints (class-loader identity,
+`requiredType`/`actualType` reference-equality + `getClass()`/loader dumps
+in `OnManagementPortCondition.getMatchOutcome`), `javac` them against the
+module's `cratonvm-test-cp.txt`, and run `SbRunner` with that side directory
+PREPENDED on the classpath (ahead of the real jar) so the patched classes
+shadow the real ones — both via `cratonvm.exe` and via plain `java.exe`
+(real JDK) for the A/B comparison. The three Rust-side traces added this
+session (`CRATONVM_LDC_CLASSREF_TRACE` in `execute_ldc`, an extended
+`CRATONVM_DBG_LOADER_TRACE` guard in `resolve_class_loader_aware`, and an
+extended `CRATONVM_INVOKESTATIC_LOADER_TRACE` guard in `execute_invokestatic`
+— all additive, env-var-gated, zero behavior change when unset) ARE
+committed on this branch and available for reuse.
+
 ## Next steps for a follow-up session
 
-1. **Re-run on a quiet host first**, before any more diagnosis — confirm the
-   failure-mode distribution (ClassNotFoundException vs assertion failure vs
-   pass) is stable, not host-load noise.
-2. If `ClassNotFoundException` still reproduces on a quiet host: since every
-   piece in isolation works, the next candidate is GC-timing, not
-   classloader logic. Run the REAL failing test (not an isolated probe, this
-   needs the full concurrent/GC pressure) with `--verbose:gc` and/or a
-   temporary `eprintln!` in `cl_get_resource_as_stream`
-   (`native-builtins/src/classloader.rs`) guarded on the resource path
-   containing "SpringMockResolver", to capture the ACTUAL receiver
-   classloader's identity/state at failure time — something an isolated
-   probe cannot fake, since it never reaches that exact concurrent state.
-3. If the assertion failure (`expected: 2 but was: 1` management contexts)
-   reproduces independently of the `ClassNotFoundException`, it may be a
-   SEPARATE, genuine timing bug in dual-context startup worth its own doc —
-   don't conflate the two just because they're in the same test class.
-4. The 5 probe classes from this session
+1. Start from candidate 1 above (`native_method_invoke`'s virtual-dispatch
+   branch / `ctx.invoke_virtual` / frame setup for a reflectively re-invoked
+   instance method) — add a trace at the point a new frame is pushed for a
+   virtually-dispatched call, confirm whether the pushed frame's `class_id`
+   matches the receiver's actual (forked) `ClassId` or a stale one.
+2. If that's clean, hunt for a decoded-`Instruction`/bytecode cache that
+   might be shared by content-hash across the two `defineClass` calls
+   (candidate 2) — this is the most likely remaining explanation given
+   `execute_ldc` (the function that would consume such a cache miss) is
+   proven never reached for these names.
+3. Once the exact resolution site is found, the fix is almost certainly the
+   same *shape* as the already-existing "Use the Method object's OWN
+   already-resolved declaring ClassId" fix in `native_method_invoke`'s
+   static-method branch, or the same shape as the already-fixed
+   `reference_vtable_fast_dispatch_redefine_staleness` bug (a cache/lookup
+   not scoped precisely enough to the exact `ClassId`, collapsing two
+   structurally-identical-but-distinct classes onto one) — extend whichever
+   mechanism is found to be loader/ClassId-precise rather than name- or
+   content-keyed.
+4. The `ClassNotFoundException` from session 1 remains formally
+   unreproduced since session 2 (3 sessions, 0 repros since 2026-07-20
+   session 1's original 3-4/4). It may already be fixed as a side effect of
+   unrelated `dev` progress since `d999dc76f`, or may need very specific
+   timing this session's runs didn't hit. Do not spend further time chasing
+   it specifically — if it resurfaces, it's likely the SAME root mechanism
+   (dual class identity under `@CompileWithForkedClassLoader`) manifesting
+   as an exception instead of a silently-skipped bean, once `Mockito`'s
+   static init happens to run inside a frame with the wrong identity instead
+   of `OnManagementPortCondition`'s enum comparison.
+5. The 5 probe classes from session 2
    (`ForkProbe.java`/`ForkProbe2.java`/`ForkProbe3.java`/`ForkProbe4.java`,
-   package `org.springframework.core.test.tools`) are NOT currently checked
-   into the repo (they all passed, so there was nothing to preserve as a
-   failing repro) — if a future session wants them as a starting point for
-   building a GC-pressure variant, they're straightforward to reconstruct
-   from this doc's description; each is ~30-60 lines.
+   package `org.springframework.core.test.tools`) are still available at
+   `docs/known-issues/repros/mockresolver-forked-classloader/` if useful,
+   though session 3's finding suggests they wouldn't reproduce this specific
+   bug anyway (they don't exercise a reflectively re-invoked TEST METHOD
+   itself, only direct classloading/compile calls).
 
 ## Affected classes
 
