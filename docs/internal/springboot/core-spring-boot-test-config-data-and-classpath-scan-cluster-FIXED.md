@@ -774,9 +774,28 @@ known to this doc: `DuplicateJsonObjectContextCustomizerFactoryTests`
 contention — PASSES in isolation, matching Cluster E's disposition) and
 `ImportsContextCustomizerFactoryTests`
 (`contextCustomizerEqualsAndHashCodeConsidersComponentScan`, 1 of 8
-tests, reproduces in isolation under BOTH JIT modes — a real, separate
-annotation-identity bug, tracked in its own follow-up investigation, not
-part of this doc's clusters). **No new regressions in either mode.**
+tests, reproduced in isolation under BOTH JIT modes — a real, separate
+annotation-identity bug, not part of this doc's clusters). **No new
+regressions in either mode.**
+
+**Update (same day, later):** `ImportsContextCustomizerFactoryTests` is
+also now **FIXED** — root-caused independently in this session to a
+synthesized-annotation-proxy `hashCode`/`equals` dispatch gap inside the
+native `HashSet`/`HashMap` overlay (two value-equal Spring
+`SynthesizedMergedAnnotationInvocationHandler` proxies hashed by identity
+when the hashing ran through the collections native, so
+`ContextCustomizerKey`'s two key sets compared unequal; a 40-line
+standalone repro — two `synthesize()`d `@ComponentScan`s in a `HashSet` —
+isolated it), and closed by the concurrently-landed dev commit
+`2184973c8` ("fix(genuine56): 6 root-cause bugs across HashMap ordering,
+StringJoiner, proxy dispatch, and HTTP headers"). Verified after merging
+that commit: **8/8 tests PASS under both `-Jit on` and `-Jit off`**.
+With this, every failure this doc has ever named is closed: the only
+remaining non-PASS results in the final full-module confirmation sweep
+are the two `Abstract*Tests` EMPTY entries (enumeration noise) and the
+environment-only parallel-load flakes
+(`DuplicateJsonObjectContextCustomizerFactoryTests` Aether race /
+HtmlUnit-family hangs), all of which PASS in isolation.
 
 ### Regression check (fourth investigation session, 2026-07-20; corrected fifth/sixth session, 2026-07-21)
 
