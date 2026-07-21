@@ -4411,13 +4411,47 @@ pub unsafe extern "C" fn jit_checkcast(
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_class_by_name(class_name);
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?} -> silent null",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
                 obj_class_id.as_u32(),
                 obj_cls_name,
                 class_name,
                 target_cid.map(|c| c.as_u32())
             );
+        }
+        // A definitive refusal — the object's class is known and provably not
+        // assignable — must throw ClassCastException per JVMS §6.5.checkcast,
+        // NOT silently hand the compiled caller a null (the old behavior,
+        // which converted every genuine type error into downstream data
+        // corruption — and is what kept Residual 6 invisible for seven
+        // sessions). Stash the CCE and return the i64::MIN sentinel; the
+        // codegen's post-helper check (`emit_post_invoke_exception_check`)
+        // routes it through the standard pending-exception drain. The
+        // stale/implausible-pointer and unresolved-site branches above keep
+        // the old fail-soft `0` — there the object's type is UNKNOWABLE, and
+        // throwing would turn tolerated stale-reference reads into new
+        // failures.
+        if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
+            let obj_cls_name = vm
+                .class_manager
+                .read()
+                .get_class(obj_class_id)
+                .map(|c| c.name.replace('/', "."))
+                .unwrap_or_else(|| "<unknown>".into());
+            let msg = format!(
+                "class {} cannot be cast to class {}",
+                obj_cls_name,
+                class_name.replace('/', ".")
+            );
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/ClassCastException",
+                Some(&msg),
+            ) {
+                set_jit_pending_exception(exc);
+                return i64::MIN;
+            }
         }
         0
     }
