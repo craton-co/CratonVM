@@ -1781,7 +1781,18 @@ pub(crate) fn native_class_for_name(
     // Spring Boot nested-JAR rescue below). Those fallbacks are appropriate
     // only after a non-null application loader participated in resolution.
     let explicit_bootstrap_loader = matches!(args.get(2), Some(Value::Object(None)));
-    if explicit_bootstrap_loader && !crate::classloader::is_bootstrap_class_name(&internal_name) {
+    // A null loader normally restricts Class.forName to JDK bootstrap classes.
+    // Instrumentation.appendToBootstrapClassLoaderSearch deliberately extends
+    // that namespace at runtime, however: Mockito injects its
+    // MockMethodDispatcher into such a JAR and immediately resolves it via
+    // Class.forName(name, false, null).  Rejecting it before the class manager
+    // sees the appended search path makes a successfully appended class appear
+    // absent.  The recorded set is populated only from the actual appended
+    // JAR, so it does not widen bootstrap visibility to application classes.
+    if explicit_bootstrap_loader
+        && !crate::classloader::is_bootstrap_class_name(&internal_name)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal_name)
+    {
         return Err(
             cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
