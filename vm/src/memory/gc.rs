@@ -88,6 +88,24 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<u
 
 /// Update all root locations in the VM state after a GC collection.
 ///
+// ALTRACE (julgc-rootscan investigation 20260721): env-gated helpers shared
+// across the vm crate for the deterministic GC-stress corruption hunt.
+pub(crate) fn altrace_enabled_vm() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+}
+
+pub(crate) fn watch_addr() -> Option<usize> {
+    use std::sync::OnceLock;
+    static W: OnceLock<Option<usize>> = OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_WATCHADDR")
+            .ok()
+            .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    })
+}
+
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
@@ -119,6 +137,14 @@ pub fn update_all_roots(
     // object handle in sync with a move and prune traces for collected
     // throwables before any early return for a non-relocating sweep.
     shared.remap_and_sweep_throwable_stack_traces(pointer_map);
+    if std::env::var_os("CRATONVM_DBG_ALTRACE").is_some() {
+        eprintln!(
+            "[altrace GC] count={} moved={} tid={}",
+            shared.heap.collection_count(),
+            pointer_map.len(),
+            thread.thread_id.0
+        );
+    }
     if pointer_map.is_empty() {
         return;
     }
@@ -221,6 +247,16 @@ pub fn update_all_roots(
         }
     }
 
+    if let Some(w) = watch_addr() {
+        let fwd = pointer_map.get(&w).copied();
+        let back = pointer_map
+            .iter()
+            .find_map(|(k, v)| (*v == w).then_some(*k));
+        eprintln!(
+            "[watch] GC#{} addr=0x{w:x} moved_to={fwd:x?} moved_from={back:x?}",
+            shared.heap.collection_count()
+        );
+    }
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.heap);

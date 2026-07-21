@@ -1981,6 +1981,13 @@ fn al_ensure_capacity(
     }
 
     al_set_data(ctx, this, new_buf);
+    if altrace_enabled() {
+        eprintln!(
+            "[altrace GROW] this={:p} old_cap={old_cap} new_cap={new_cap} new_buf={:p}",
+            this.as_ptr(),
+            new_buf.as_ptr()
+        );
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(new_buf)
 }
@@ -2286,6 +2293,42 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
 
+// ALTRACE (checkcast-corruption investigation, 20260721): env-gated
+// unconditional trace of every ArrayList add/get -- prints (this ptr, buf
+// ptr, index/size) so two concurrently-growing lists (e.g. `received` vs
+// `garbage` in JulGcStressRepro) can be told apart in the log and any
+// cross-contamination between their backing arrays caught at the exact
+// call that produced it.
+#[inline]
+fn altrace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+}
+
+// ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
+// records what the element ACTUALLY IS at that moment (catches stale pointers
+// whose referent has been replaced by a foreign object after a moving GC).
+fn altrace_describe(ctx: &mut dyn NativeContext, v: Value) -> String {
+    match v {
+        Value::Object(Some(o)) => {
+            let cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .unwrap_or_else(|| "<unknown-class>".to_string());
+            if cls == "java/lang/String" {
+                format!(
+                    "{:p} cls={cls} str={:?}",
+                    o.as_ptr(),
+                    ctx.read_string(o).unwrap_or_default()
+                )
+            } else {
+                format!("{:p} cls={cls}", o.as_ptr())
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2310,6 +2353,14 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         None => return Ok(Some(Value::Object(None))),
     };
     let val = ctx.get_array_element(data, index as usize);
+    if altrace_enabled() {
+        let val_desc = altrace_describe(ctx, val);
+        eprintln!(
+            "[altrace GET] this={:p} buf={:p} index={index} size={size} val={val_desc}",
+            this.as_ptr(),
+            data.as_ptr(),
+        );
+    }
     Ok(Some(val))
 }
 
@@ -2356,6 +2407,14 @@ pub fn native_al_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let buf = al_ensure_capacity(ctx, this, size + 1)?;
     let this = ctx.read_native_pin(this_pin, this);
     let elem = read_pinned_elem(ctx, elem_pin, elem);
+    if altrace_enabled() {
+        let elem_desc = altrace_describe(ctx, elem);
+        eprintln!(
+            "[altrace ADD] this={:p} buf={:p} at_index={size} elem={elem_desc}",
+            this.as_ptr(),
+            buf.as_ptr(),
+        );
+    }
     ctx.set_array_element(buf, size, elem);
     al_set_size(ctx, this, (size + 1) as i32);
     ctx.unpin_native_roots(this_pin);

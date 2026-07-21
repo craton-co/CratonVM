@@ -1170,6 +1170,20 @@ fn safe_native_call_impl(
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
             }
+            if crate::memory::gc::altrace_enabled_vm() {
+                if let Value::Object(Some(o)) = v {
+                    let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let cid = shared.heap.class_id_of(*o);
+                    let cname = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("<cid={cid:?}>"));
+                    eprintln!("[altrace NRET] callee={callee} v={:p} cls={cname}", o.as_ptr());
+                }
+            }
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             let exc_is_current = shared
