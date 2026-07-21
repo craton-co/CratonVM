@@ -132,7 +132,7 @@ not a defect in this fix** — confirmed by building `dev` at `99a4c4108`
 removed: it already shows 15/32 failures running the ORIGINAL, pre-fix
 `PropertiesLauncherTests` code. `--nojit` does not change the result (rules
 out a JIT-codegen cause). See
-[`propertieslauncher-jarloading-cluster-broad-regression-jit-halfgap-suspected.md`](../../known-issues/springboot/propertieslauncher-jarloading-cluster-broad-regression-jit-halfgap-suspected.md)
+[`propertieslauncher-jarloading-cluster-broad-regression-FIXED.md`](propertieslauncher-jarloading-cluster-broad-regression-FIXED.md)
 for the bisection evidence gathered so far. If re-verifying this fix on a
 current checkout, expect the wider cluster's failures to still be present;
 only the 4 tests this fix specifically targets should be judged by whether

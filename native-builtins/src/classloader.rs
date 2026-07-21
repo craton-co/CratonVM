@@ -1508,7 +1508,7 @@ pub fn cl_load_class_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     cl_load_class(ctx, args)
 }
 
-fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
+pub(crate) fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
     // The real named `parent` field is populated by name in exactly ONE
     // place (the bootstrap app loader's own construction, see
     // `alloc_classloader`) — every ordinary `ClassLoader`/`URLClassLoader`
