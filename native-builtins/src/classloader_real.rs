@@ -1136,11 +1136,7 @@ fn cl_real_load_class_base(
     // app classes under the child loader, diverging from HotSpot). Built-in
     // loaders and bootstrap class names also keep the fast global path. Opt-out:
     // `CRATONVM_CL_BOOTSTRAP_SCOPED=0`.
-    let parent = match ctx.get_field_by_name(this, "parent") {
-        Value::Object(Some(parent)) => Some(parent),
-        Value::Object(None) | Value::Int(0) | Value::Long(0) => None,
-        _ => None,
-    };
+    let parent = crate::classloader::classloader_parent(ctx, this);
     let parent_is_null = parent.is_none();
     // The platform loader can load JDK modules but not application/test
     // classes. Do not let the flat global class store impersonate an app parent.
@@ -1246,6 +1242,13 @@ fn cl_real_load_class_base(
         }
     }
 
+    // URLClassLoader searches its recorded URLs after parent delegation. The
+    // helper is a no-op for loaders without recorded URLs, and subclasses do
+    // not always expose their inherited URLClassLoader identity here.
+    if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+        return result;
+    }
+
     // 2. Custom-classloader extension point: if the receiver overrides
     //    `findClass`, the JVM `loadClass` contract requires us to call it.
     //    `invoke_virtual` resolves on the receiver's actual class, so this
@@ -1305,6 +1308,23 @@ fn cl_real_load_class_base(
     Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
         exc,
     ))
+}
+
+/// Invoke the real-mode base `ClassLoader.loadClass(String, boolean)` bridge
+/// from a registered subclass native without re-entering subclass dispatch.
+pub(crate) fn cl_real_load_class_base_from_args(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let name_obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    cl_real_load_class_base(ctx, this, name_obj)
 }
 
 /// Real-JDK-mode `URLClassLoader.findClass(String)`.

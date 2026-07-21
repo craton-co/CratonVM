@@ -144,6 +144,11 @@ pub enum SkipReason {
     /// is sufficient. Keep `add` interpreted until the x64 lowering bug is
     /// understood.
     JavaPoetCodeBlockBuilderAdd,
+    /// Spring Boot's `ModifiedClassPathClassLoader.loadClass` can spin in its
+    /// nested class-path exclusion path once tier-compiled. Keep this one
+    /// test-support loader method interpreted until its JIT lowering is
+    /// understood.
+    SpringBootModifiedClassPathLoader,
     /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
     /// unconditionally reach an internal `invokedynamic` (lambda) call site
     /// that `jit_scan` lowers to an always-deopt uncommon trap
@@ -503,6 +508,27 @@ fn should_skip_jit_internal(
     // package name below differs from the upstream library's own source.
     if class_name == "org/springframework/javapoet/CodeBlock$Builder" && method_name == "add" {
         return Some(SkipReason::JavaPoetCodeBlockBuilderAdd);
+    }
+
+    // SPRINGBOOT-WITHOUT-JACKSON.2 (2026-07-21):
+    // `RestClientTestWithoutJacksonIntegrationTests` and
+    // `WebClientTestWithoutJacksonIntegrationTests` execute their actual test
+    // body under Spring Boot's `ModifiedClassPathClassLoader`, which removes
+    // every `jackson-*.jar` then re-launches the test. With JIT enabled the
+    // WebClient variant intermittently stops making progress during the inner
+    // boot's configuration-property cache update. A 480-second watchdog shows
+    // the active main thread at `PropertiesPropertySource.getPropertyNames` ->
+    // `SpringIterableConfigurationPropertySource$Cache.tryUpdate`, ending in
+    // four nested calls to this exact `loadClass` method. The identical test
+    // passes with `--nojit` (260.4s) and with this method alone supplied to
+    // `CRATONVM_JIT_BISECT_SKIP` (199.0s), which isolates the tiered body rather
+    // than a Spring context cache or monitor deadlock. Keep the method
+    // interpreted; it is cold test-support infrastructure and the guard does
+    // not affect ordinary application class loading.
+    if class_name == "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader"
+        && method_name == "loadClass"
+    {
+        return Some(SkipReason::SpringBootModifiedClassPathLoader);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
@@ -1225,9 +1251,31 @@ fn should_skip_jit_internal(
         // in place too). So lifting THIS ban was never what was unsafe — but
         // since doing so also produced zero measured benefit (didn't speed up
         // `testSlicesDense`), it stays banned regardless: no upside to justify
-        // the unproven risk. Re-verify against the ORIGINAL AIOOBE repro (this
-        // comment's first paragraph) before ever lifting it again. Liftable
-        // for investigation via `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
+        // the unproven risk.
+        //
+        // 2026-07-21 re-verification #2 (after `0bdd62344`/java.util narrowing
+        // and `b416011bc`/MatchOps fixes landed — neither was in place for the
+        // "zero measured benefit" finding above): re-ran with both fixes on
+        // `dev`. `testSlicesDense` now DOES show a real ~26% speedup with the
+        // ban lifted (2572s vs. 3457s, same seed/session) and no visible
+        // correctness issue on that specific test. But `ES812PostingsFormatTests`
+        // (this ban's own original correctness repro, 32-test class) FAILS with
+        // the ban lifted: an uncaught `IllegalArgumentException: fromIndex(4) >
+        // toIndex(0)` in `RandomPostingsTester`, plus an
+        // `IllegalMonitorStateException` ("thread does not own the monitor") on
+        // `IndexWriter.doWait`'s implicit monitorexit at frame-pop (the `B8`
+        // diagnostic in `runtime/interpreter.rs`) — NEITHER of which reproduce
+        // with the ban left in place (control run: clean `OK (32 tests)`, same
+        // seed). This is a DIFFERENT correctness gap than the original
+        // AIOOBE/SIGSEGV this ban was created for — a JIT-vs-synchronized-method
+        // monitor-handling bug specific to `IndexWriter`'s synchronized wait
+        // loop — but it is real, reproducible, and currently unfixed. THE BAN
+        // MUST STAY. See
+        // `docs/known-issues/elasticsearch-suite/ES-PERF-20260719-testSlicesDense-interpreter-throughput.md`'s
+        // 2026-07-21 section for the full writeup. Do not re-lift based on the
+        // testSlicesDense speed win alone — that test doesn't exercise the
+        // synchronized-method path that breaks. Liftable for investigation via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`.
         if class_name.starts_with("org/apache/lucene/")
             && !package_allowed("org/apache/lucene/", allow_packages)
         {
@@ -3231,6 +3279,32 @@ mod tests {
         assert_eq!(
             check("Foo", "bar", false, false, SkipPolicy::Aggressive),
             Some(SkipReason::UnnamedThread)
+        );
+    }
+
+    #[test]
+    fn spring_boot_modified_classpath_loader_is_always_interpreted() {
+        let class_name =
+            "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader";
+        assert_eq!(
+            check(
+                class_name,
+                "loadClass",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::SpringBootModifiedClassPathLoader)
+        );
+        assert_eq!(
+            check(class_name, "loadClass", false, true, SkipPolicy::Aggressive),
+            Some(SkipReason::SpringBootModifiedClassPathLoader),
+            "the guard must survive aggressive-policy validation runs"
+        );
+        assert_eq!(
+            check(class_name, "findClass", false, true, SkipPolicy::Aggressive),
+            None,
+            "only loadClass is implicated by the isolated JIT residual"
         );
     }
 

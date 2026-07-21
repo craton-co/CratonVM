@@ -1,6 +1,10 @@
 # ES PERF — `testSlicesDense` (IVFKnn) is genuinely slow under CratonVM, not hung or corrupt
 
-Status: OPEN (performance only — not a hang, not a correctness bug)
+Status: OPEN (performance only — not a hang, not a correctness bug in the
+unmodified default configuration). 2026-07-21: lifting the LUCENE-POSTINGS.1
+JIT ban (env-var only, no code change) gives a real ~26% testSlicesDense
+speedup but surfaces a genuine, separate JIT correctness gap on broader
+Lucene coverage — the ban stays in place; see the dated section below.
 
 Split out from
 [`ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md`](../../internal/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b-FIXED.md)
@@ -192,6 +196,84 @@ closing the full ~60x gap to HotSpot (13.5s) requires safely compiling the
 Lucene hot path at scale — a materially bigger undertaking (the postings
 corruption bug LUCENE-POSTINGS.1 guards against) than anything tractable as
 a "residual" of this doc.
+
+## 2026-07-21 (later session) — host-degradation re-baseline + Lucene-ban re-test
+
+**Host-degradation finding (not a code regression).** A fresh re-baseline this
+session found `testSlicesDense` reproducibly failing with
+`OutOfMemoryError: Java heap space` at both 2g and 4g heap (the doc's own
+documented config), taking ~1800-2150s before OOMing — dramatically worse
+than this doc's own 822.6-823.2s clean-completion figures from earlier the
+same day. Bisection-by-elimination ruled out a code regression:
+
+- Reverted the one plausible recent GC-adjacent commit
+  (`ce4871079`, "perf(gc): make Arena::free_list_bytes() unconditionally
+  O(1)") — OOM reproduced identically (2151s), refuting it.
+- Built and ran the *exact* commit (`fa91ef9e5`) this doc's own 2026-07-21
+  A/B/C measurement used to get 822.6s clean — it **also** OOM'd under
+  today's host state (1745s, same failure signature). This conclusively
+  shows the failure is host-environment-driven, not a `dev` regression:
+  unchanged, previously-verified-clean code fails differently depending on
+  the day's contention level on this shared box.
+- Needed to raise the heap to 16g before a clean pass was achieved at all;
+  even then the passing run took 3457s (baseline, ban intact) — roughly 4.2x
+  the documented 822s. One run at 8g heap was killed by an external
+  `SIGTERM` after ~50 minutes with zero progress logged (not this VM's own
+  `--stack-dump-on-timeout` watchdog, not a JVM-reported OOM) — consistent
+  with this being a heavily shared, actively-contended host today (load
+  average climbed to 11.52 (15m) with 9 concurrent logged-in sessions during
+  this investigation).
+
+**Takeaway:** do not trust any single-run wall-clock number on this host as
+a regression signal without also sanity-checking host load — this session's
+numbers (1745-3457s across identical/near-identical code) show the swing can
+be 2-4x on a single day, dwarfing the previously-documented ~37% variance.
+
+**Lucene-ban-lift re-test — real throughput gain, but a real correctness
+regression on broader coverage; ban must stay.** With both the java.util
+narrowing (`0bdd62344`) and the MatchOps deopt-storm fix (`b416011bc`) now on
+`dev` (neither was in place for this doc's original "lifting the ban doesn't
+help" Finding 1), re-tested `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/lucene/`
+against current `dev` HEAD (`5aae2661e`), same seed, same host session (back
+to back with the 16g baseline for a same-conditions comparison):
+
+- `testSlicesDense`: passed (`OK (1 test)`), and **~26% faster** than the
+  ban-intact baseline (2572s vs. 3457s, both at 16g heap, same run session).
+  No exceptions, no corruption signature in the log.
+- `ES812PostingsFormatTests` (the ban's own original correctness repro,
+  32-test class, broader coverage) — **failed** with the ban lifted: an
+  uncaught `java.lang.IllegalArgumentException: fromIndex(4) > toIndex(0)`
+  in two `org.apache.lucene.tests.index.RandomPostingsTester$TestThread`
+  worker threads, plus a
+  `[cratonvm_vm::runtime::interpreter] implicit monitorexit on
+  synchronized-method-frame-pop failed` warning (the `B8` diagnostic at
+  `vm/src/runtime/interpreter.rs:6994-7015`) on
+  `org/apache/lucene/index/IndexWriter.doWait` reporting
+  `IllegalMonitorStateException: thread Thread-2 does not own the monitor`
+  — before the run was externally killed (`Killed`, not this VM's own
+  timeout) at ~1227s.
+- **Control run, same class/seed, ban left in place (default Conservative
+  policy, no env var): `OK (32 tests)`, clean, no monitor warning, no
+  exception, completed in 1730s.** This isolates the failure to the ban
+  being lifted — it is not a pre-existing/unrelated flake in this test class.
+
+**Conclusion: the ban is still correctness-load-bearing, just not for the
+originally-documented reason.** The 2026-07-19 re-investigation's belief that
+"the ORIGINAL correctness justification for this ban is therefore probably
+gone" (see the `LUCENE-POSTINGS.1` comment in `vm/src/jit/skip_list.rs`) is
+superseded: there is a *different*, currently-live JIT correctness gap
+around synchronized-method monitor handling (`IndexWriter.doWait`, which
+implements a `synchronized` bounded-wait loop) that only surfaces once
+Lucene is JIT-eligible, plus a downstream `RandomPostingsTester` failure
+plausibly caused by the same underlying corruption. **Do not lift
+`LUCENE-POSTINGS.1` based on the testSlicesDense speed win alone** — it does
+not exercise the code path that breaks. Whoever picks this up next should
+root-cause the synchronized-method-monitor interaction with JIT-compiled
+`org/apache/lucene/index/IndexWriter` methods (starting from
+`vm/src/runtime/interpreter.rs`'s `B8` monitor-frame-pop diagnostic and
+whatever JIT-compiled call path reaches `IndexWriter.doWait`) before
+attempting to lift the ban again — that fix, not another re-verification
+pass, is the actual remaining blocker on the throughput side of this doc.
 
 ## Repro
 
