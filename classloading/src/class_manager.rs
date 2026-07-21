@@ -2772,6 +2772,14 @@ impl ClassManager {
         if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
             return Some(candidate);
         }
+        if std::env::var("CRATONVM_DBG_DUPCLASS").is_ok() {
+            eprintln!(
+                "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?}                  -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
+                candidate,
+                self.class_store.get(candidate).map(|c| c.loader_id),
+                name,
+            );
+        }
         None
     }
 
