@@ -43219,7 +43219,7 @@ fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRe
     // on THIS session object doesn't spuriously see "no certificate" — see
     // `t27_tls::record_client_peer_chain` doc comment.
     if let Some(chain) = crate::servlet::s2_tls_peer_cert_chain_der(tls_id) {
-        crate::t27_tls::record_client_peer_chain(session, chain);
+        crate::t27_tls::record_client_peer_chain(ctx, session, chain);
     }
     session
 }
@@ -43969,7 +43969,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // throws `SSLPeerUnverifiedException` even though the handshake
         // itself succeeded.
         if let Some(chain) = crate::t27_tls::rustls_client_peer_cert_chain_der(stream_id) {
-            crate::t27_tls::record_client_peer_chain(session, chain);
+            crate::t27_tls::record_client_peer_chain(ctx, session, chain);
         }
         ctx.set_field(socket, NEW13_SOCK_SESSION, Value::Object(Some(session)));
         Ok(real_tls_id)
