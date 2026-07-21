@@ -10,14 +10,21 @@ recurrence of this bug.**
 
 Cluster B — the broader intermittent hang/crash across all 7 classes
 (~20-40% rate, no single deterministic trigger point, affecting a different
-random class on every batch) is **NOT fixed** and was **not investigated**
-this session beyond ruling it out as the cause of Cluster A. It is very
-likely the same underlying class of bug already tracked as OPEN in
+random class on every batch) is **STILL NOT FIXED**, but its root cause is
+now substantially narrowed (see the Cluster B section below): confirmed via
+a direct HotSpot A/B comparison to be a **CratonVM-specific per-alive-thread
+VM overhead scaling gap** (real HotSpot handles the same few-hundred-thread
+peak this test class produces in 6 seconds; CratonVM takes 25-300+ seconds
+for the identical thread count), NOT a `ThreadRegistry` dead-entry
+data-structure bug as a concurrent session's investigation first suggested —
+that theory was checked against the actual dump composition and found
+insufficient (the dominant 960/1292 threads in the reference dump are
+genuinely alive, not evictable dead entries). It is very likely related to
+the same underlying class of bug already tracked as OPEN in
 `docs/known-issues/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md`'s
 sibling finding (`JettyServletWebServerFactoryTests` cumulative crash at
-cycle 61) — a resource/state leak across repeated embedded-Tomcat
-start/stop cycles in one process, not something specific to any one client
-library or to TLS.
+cycle 61), but neither is fixed — both need a profiling-first approach (see
+below), not another stack-dump-driven guess.
 
 ## Scope
 
@@ -293,12 +300,102 @@ described, undiagnosed, for `JettyServletWebServerFactoryTests`'s cumulative
 crash at cycle 61
 (see `docs/known-issues/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals.md`'s
 "MOSTLY FIXED" history, and the separate untracked memory note on that
-class's own residual). **Not investigated further this session** — Cluster A
-(deterministic, 100% reproducible) was the tractable target; Cluster B needs
-its own dedicated crash-catching session (ideally with the same
-`--stack-dump-on-timeout`/live-thread-dump technique used here, applied at
-the exact moment of one of these sporadic failures — hard to catch given
-non-determinism).
+class's own residual).
+
+**Follow-up pass (same day, after Cluster A's fix landed): root cause
+NARROWED, one prior theory RULED OUT with hard data, no fix attempted.**
+
+A concurrent, independent session (branch
+`fix/tomcat-keystore-certchain-residual-20260721`, doc
+`docs/internal/springboot/httpcomponentsclienthttpconnectorbuildertests-certchain-residual-and-teardown-hang-OPEN.md`)
+captured a live `--stack-dump-on-timeout` dump during a Cluster B hang on
+`HttpComponentsClientHttpConnectorBuilderTests` and found **1292 registered
+threads** in `vm/src/threading/thread_registry.rs`'s `ThreadRegistry` for a
+class that runs only 28 sub-tests — `ThreadRegistry::mark_dead` never
+removes an entry from the backing map, only flips an `AtomicBool`, so every
+thread the process has ever spawned stays registered forever. That session
+proposed this as the likely root cause (both for the HANG flavor, via
+O(N)-registry-walk cost scaling with total historical thread count across
+many functions, and the CRASH flavor, speculatively) but did not attempt a
+fix, correctly judging it too broad/risky to land speculatively.
+
+**Picked back up and re-examined the actual composition of that 1292-thread
+dump** (still on disk, `.ksid-repro/results/stackdump1/` in that session's
+worktree) rather than taking the summary at face value:
+
+```
+960  httpclient-dispatch-N   (943 alive=true, 17 alive=false)
+200  http-nio-auto-N-exec-M / https-jsse-nio-auto-N-exec-M  (0 alive=true, 200 alive=false)
+132  everything else (Catalina-utility, container, httpclient-main, main)
+```
+
+**The dominant contributor (960/1292, 74%) is Apache HttpComponents 5's own
+`SingleCoreIOReactor` dispatch threads — and 943 of those 960 are ALIVE, not
+dead.** 28 sub-tests × ~34 reactor threads per `HttpComponentsClientHttpConnectorBuilderTests`
+sub-test (a fresh `CloseableHttpAsyncClient`/IO reactor per test, apparently
+never `.close()`d) accounts almost exactly for the 960 figure. Only Tomcat's
+own `*-exec-*` executor-pool threads (200/1292, 15%) are genuinely dead
+entries eligible for any eviction-style fix — the concurrent session's own
+text undersold this split ("32 live httpclient-dispatch-N entries" in their
+prose does not match their own dump's actual 960/943 figures).
+
+**This means an `ThreadRegistry` dead-entry-eviction fix — the natural next
+step the concurrent session's finding points to — would only ever shrink the
+registry by ~15%, not enough to plausibly explain a 10x+ (25s → 300s timeout)
+slowdown if the dominant driver is the 960 genuinely-alive entries, which
+cannot be evicted (they are correctly alive; every one legitimately needs
+GC-root scanning).** Did not implement that fix given this — it would very
+likely land as real-but-insufficient, the same shape of outcome the
+`t27_tls.rs` `gc_stable_objref_key` fix already had for this exact
+investigation.
+
+**Decisive follow-up check: does real HotSpot also accumulate hundreds of
+threads for this class?** Ran the identical class under `-Vm hotspot`,
+live-sampling thread count via `Get-Process`:
+
+```
+t=1.5s   threads=130
+t=3.6s   threads=754
+completed: PASS in 6.0s total
+```
+
+**Yes — HotSpot peaks at a similar ~750 threads (confirming the
+leaked-reactor-thread behavior is inherent to this test class / library,
+present on every JVM, not a CratonVM-specific resource leak) — but finishes
+the entire 28-sub-test class in 6 SECONDS**, vs. CratonVM's best-case ~25-30s
+(already 4-5x slower on a clean PASS) and worst-case 300s timeout (HANG) or
+silent exit (CRASH). This rules out "CratonVM fails to close/shut down these
+reactors when real JDK does" as the mechanism — HotSpot doesn't close them
+either, it just doesn't care, because per-alive-OS-thread bookkeeping is
+cheap enough there for a brief ~750-thread peak to be a non-event.
+
+**Corrected characterization of Cluster B**: this is not a data-structure
+correctness bug (no entries need evicting to fix it) and not a
+resource-leak bug in the traditional sense (the leak is real but harmless on
+every JVM that isn't CratonVM) — it is a **CratonVM-specific per-alive-thread
+VM overhead scaling gap**. Something that runs per-alive-thread — most
+likely `ThreadRegistry::collect_all_root_snapshots` (called every GC,
+acquires up to 5 separate `Mutex`es per alive entry:
+`root_snapshot`/`jmx_contended_monitor`/`jmx_waiting_monitor`/
+`jmx_locked_monitors`/`jmx_locked_synchronizers`) and/or the STW barrier's
+per-thread accounting (`alive_count_and_os_tids`/
+`alive_count_blocked_and_os_tids`, also O(N) full-registry walks on every
+pause), and/or the raw cost of native OS thread creation/teardown itself on
+Windows — costs enough per thread that a few hundred concurrently-alive
+threads turn into real, multi-minute (sometimes indefinite) slowdown, where
+the identical thread count is a non-event for HotSpot.
+
+**Not fixed this session** — this is a VM-wide performance/architecture
+question (why is CratonVM's per-thread bookkeeping cost so much higher than
+HotSpot's under high alive-thread-count, and which specific piece dominates)
+rather than a bounded, low-risk correctness patch, and deserves its own
+dedicated profiling session (attach a sampling profiler — `perf`/ETW/
+`samply` — to a run climbing past a few hundred threads and see which
+function's self-time scales with thread count; the `release-with-debug`
+profile already used throughout this investigation carries the symbols
+needed) rather than more guessing from stack dumps alone. Whoever picks this
+up next should start there, not with a `ThreadRegistry` eviction patch —
+that path has now been checked and shown insufficient on its own.
 
 ## Fixes landed this session (both real, independent bugs)
 
