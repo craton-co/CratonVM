@@ -660,15 +660,15 @@ hook (199.0s). CratonVM now permanently keeps that single cold test-support
 method interpreted (`SkipReason::SpringBootModifiedClassPathLoader`); ordinary
 application class loading and `findClass` remain JIT-eligible.
 
-Final clean release validation used
-`cratonvm-restclient-webclient-withoutjackson-fixed-20260721.exe`
-(`03B50E4D40797EFE6A1CE4562C94C1E18F855A54A522405211144378D60EEE56`), serial
+Final current-`dev` integration validation used
+`cratonvm-restclient-webclient-withoutjackson-integrated-20260721.exe`
+(`96257DC8DCCBEA671D60AB13B3F66047D3149AB19904E9C48A347F7952CC766D`), serial
 execution, and the real Spring Boot fixture at `C:\craton\CratonVM\apps\spring-boot`:
 
 | Mode | RestClient test | WebClient test |
 |---|---:|---:|
-| Craton JIT | PASS, 101.5s | PASS, 122.6s |
-| Craton `--nojit` | PASS, 109.2s | PASS, 117.7s |
+| Craton JIT | PASS, 107.2s | PASS, 121.2s |
+| Craton `--nojit` | PASS, 124.3s | PASS, 163.2s |
 | HotSpot JIT baseline | PASS, 4.7s | PASS, 5.0s |
 
 Focused unit coverage:
