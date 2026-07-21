@@ -42239,25 +42239,80 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     });
 
     // java.lang.ClassValue — thread-safe lazily computed per-class values (Java 7)
+    //
+    // BUG-W (2026-06-13): `get()` was a native stub that always returned null
+    // instead of invoking the subclass's `computeValue(type)` override and
+    // caching the result. That breaks any `ClassValue` consumer relying on the
+    // real once-per-(instance,Class) memoization contract — concretely,
+    // Groovy's `ClassInfo.getClassInfo(Class)` (backed by
+    // `GroovyClassValueJava7 extends ClassValue`) always got back `null`,
+    // producing a `ReflectionCache.getCachedClass` NPE during
+    // `GroovySystem.<clinit>` (see docs/known-issues/springboot/
+    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md,
+    // Cluster C "Residual 5"). Dispatching to `computeValue` WITHOUT caching
+    // was tried and reverted at the time (see the BUG-W doc's "Update") because
+    // it didn't fix that doc's own MethodHandle-intrinsics target — but a
+    // cache-less dispatch is itself semantically wrong: real `ClassValue.get()`
+    // calls `computeValue` AT MOST ONCE per (instance, Class) and returns the
+    // SAME cached object on every later call. Groovy's `ClassInfo` in
+    // particular depends on that identity — `MetaClassRegistryImpl`/
+    // `ExpandoMetaClass` mutate a `ClassInfo` in place (`setStrongMetaClass`
+    // etc.) and expect the same instance back from every later
+    // `getClassInfo(cls)`; recomputing on every call would silently discard
+    // that state.
+    //
+    // Cache key: `(identity_hash_code(this), identity_hash_code(cls))` — both
+    // stable across a moving GC (same rationale as `zo_buf_key` above), so the
+    // KEY side needs no pointer-remap bookkeeping. The cached VALUE
+    // `ObjectRef`s live only in this process-global mutex (invisible to the
+    // normal root scans) and are reported/remapped like the other
+    // process-global singleton caches in this crate — see
+    // `gc_scan_classvalue_cache_roots` / `gc_update_classvalue_cache_refs`
+    // (wired into `roots.rs` / `gc.rs`) and `reset_classvalue_cache` (wired
+    // into VM creation, mirrors `lang_system::reset_system_singletons`).
     let cv = "java/lang/ClassValue";
     r.register(
         cv,
         "get",
         "(Ljava/lang/Class;)Ljava/lang/Object;",
-        |_ctx, _args| {
-            // Simplified: always return null (real impl calls computeValue).
-            // NOTE (BUG-W, 2026-06-13): dispatching to the subclass
-            // `computeValue(type)` was tried and is the right direction, but
-            // does NOT fix the motivating case — `MethodHandleImpl$ArrayAccessor$1.
-            // computeValue` itself returns null because the deeper
-            // MethodHandle-intrinsics path (`getAccessor`/`makeIntrinsic`) is
-            // not implemented. Left as the null stub pending that work.
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => *c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let key = classvalue_key(ctx, this, cls);
+            if let Some(v) = classvalue_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+            {
+                return Ok(Some(Value::Object(Some(*v))));
+            }
+            let result = ctx.invoke_virtual(
+                this,
+                "computeValue",
+                "(Ljava/lang/Class;)Ljava/lang/Object;",
+                &[Value::Object(Some(cls))],
+            )?;
+            if let Some(Value::Object(Some(v))) = result {
+                classvalue_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, v);
+            }
+            Ok(result)
         },
     );
-    r.register(cv, "remove", "(Ljava/lang/Class;)V", |_ctx, _args| {
-        // ClassValue's get() always returns null (no computeValue wiring),
-        // so there's nothing cached to remove. Documented no-op.
+    r.register(cv, "remove", "(Ljava/lang/Class;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(cls))) = args.get(1).copied() {
+            let key = classvalue_key(ctx, this, cls);
+            classvalue_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
         Ok(None)
     });
 
@@ -42335,6 +42390,72 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         |ctx, _args| p57_alloc_enum(ctx, "java/lang/System$Logger$Level", "OFF", 6),
     );
     r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// java.lang.ClassValue memoization cache — see the `get()`/`remove()`
+// registrations in `register_p67_misc` above (BUG-W) for the full rationale.
+//
+// Keyed by `(identity_hash_code(ClassValue instance), identity_hash_code(Class))`
+// — both stable across a moving GC, so only the cached VALUE `ObjectRef`s
+// (not the keys) need root-reporting/remap bookkeeping. Mirrors the
+// `lang_system::system_env_store`/`gc_scan_system_singleton_roots` singleton
+// pattern: cleared on VM (re)creation, scanned as GC roots, and remapped
+// post-collection.
+// ---------------------------------------------------------------------------
+
+fn classvalue_key(ctx: &dyn NativeContext, this: ObjectRef, cls: ObjectRef) -> (u64, u64) {
+    (
+        ctx.identity_hash_code(this) as u32 as u64,
+        ctx.identity_hash_code(cls) as u32 as u64,
+    )
+}
+
+fn classvalue_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), ObjectRef>>
+{
+    static CLASSVALUE_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u64, u64), ObjectRef>>,
+    > = std::sync::OnceLock::new();
+    CLASSVALUE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// GC root scan hook for the `ClassValue` memoization cache — reports every
+/// cached computed value so the GC keeps it live across compaction. Wired
+/// into `roots.rs` alongside `lang_system::gc_scan_system_singleton_roots`.
+pub fn gc_scan_classvalue_cache_roots(out: &mut Vec<ObjectRef>) {
+    let cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
+    for v in cache.values() {
+        out.push(*v);
+    }
+}
+
+/// Post-GC remap for the `ClassValue` memoization cache (companion to
+/// [`gc_scan_classvalue_cache_roots`]). Only the cached values need
+/// remapping — the keys are identity-hash-based and stable across a moving
+/// collection. Wired into `gc.rs` alongside
+/// `lang_system::gc_update_system_singleton_refs`.
+pub fn gc_update_classvalue_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
+    for v in cache.values_mut() {
+        let old_addr = v.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *v = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
+/// Clear the `ClassValue` memoization cache. Called when creating a new VM to
+/// avoid stale `ObjectRef`s from a previous VM instance (mirrors
+/// `lang_system::reset_system_singletons`).
+pub fn reset_classvalue_cache() {
+    classvalue_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 // =============================================================================

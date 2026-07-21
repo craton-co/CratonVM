@@ -12957,6 +12957,32 @@ pub(crate) fn native_class_get_generic_interfaces(
                     );
                 }
                 if let Some(sig) = sig {
+                    // Residual 4 (2026-07-20, docs/known-issues/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md):
+                    // `sig` names the lambda's OWN functional interface (e.g.
+                    // Spring AOT's `AotApplicationContextInitializer<C>`) as its
+                    // raw type — `typesig_to_real_type` must resolve that name
+                    // to a `Class` mirror, and does so through
+                    // `class_id_in_generic_scope`'s current `GENERIC_DECL_SCOPE`.
+                    // Without a scope set here, that resolution is loader-blind
+                    // and can pick up whichever copy the flat global store
+                    // already holds (observed: the Application loader's copy)
+                    // instead of the lambda's own fork loader's copy — the same
+                    // gap already fixed for the "real class" branch above (see
+                    // its own `GenericDeclScope::new` a few lines up). Scope to
+                    // the lambda's host class (its defining/enclosing class,
+                    // already correctly fork-loader-resolved by the time the
+                    // lambda exists) so the interface name resolves in the same
+                    // loader context as the lambda itself.
+                    let _gscope = ctx
+                        .lambda_proxy_host(class_id)
+                        .and_then(|host_name| ctx.class_id_by_name(&host_name))
+                        .map(|host_id| ctx.get_class_mirror(host_id))
+                        .map(|host_mirror| {
+                            crate::generics::GenericDeclScope::new(Value::Object(Some(
+                                host_mirror,
+                            )))
+                        });
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");

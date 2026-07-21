@@ -656,6 +656,12 @@ pub fn update_all_roots(
     //      Locale → SIGSEGV).
     cratonvm_native_builtins::gc_update_locale_refs(pointer_map);
 
+    // 18c. `java.lang.ClassValue` memoization cache (companion to roots.rs
+    //      step 18c). Repoint cached `computeValue(Class)` results to their
+    //      relocated addresses so `ClassValue.get()` keeps returning the live
+    //      object after a moving GC.
+    cratonvm_native_builtins::phases_late::gc_update_classvalue_cache_refs(pointer_map);
+
     // 19. JBoss MSC container-held service objects (the `Service` instance,
     //     synthetic `ServiceController` mirror, child `ServiceTarget`, in-flight
     //     `StartContext`) cached in a process-global side-table in

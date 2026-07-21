@@ -1353,6 +1353,8 @@ impl SharedVm {
         // Reset cached System.getenv()/getProperties() singletons too, so a new
         // VM never returns a stale ObjectRef from a previous instance.
         cratonvm_native_builtins::lang_system::reset_system_singletons();
+        // Reset the ClassValue memoization cache (BUG-W) for the same reason.
+        cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
