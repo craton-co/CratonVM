@@ -3019,6 +3019,18 @@ impl ClassManager {
                 bytes.len()
             );
         }
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+            && (name.contains("ObservationRegistry")
+                || name.contains("RestClientObservationAutoConfigurationWithoutMetricsTests")
+                || name.contains("TestObservationRegistry"))
+        {
+            eprintln!(
+                "[OBSREG-DBG] define_class name={} loader_id={:?} bytes_len={}",
+                name,
+                loader_id,
+                bytes.len()
+            );
+        }
         // WP2.3: Reject too-short / non-CAFEBABE bytes up-front with a
         // typed ClassFormatError. The reader will catch malformed
         // bytes too, but a stronger pre-check produces clearer error

@@ -26,6 +26,11 @@ fn platform_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     INSTANCE.get_or_init(|| Mutex::new(None))
 }
 
+/// Temporary debug-only accessor (CRATONVM_DBG_OBSREG investigation).
+pub(crate) fn platform_loader_store_dbg() -> &'static Mutex<Option<ObjectRef>> {
+    platform_loader_store()
+}
+
 fn app_loader_store() -> &'static Mutex<Option<ObjectRef>> {
     static INSTANCE: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(None))
@@ -1322,7 +1327,33 @@ pub(crate) fn find_loaded_class_for_loader(
     this: ObjectRef,
     internal_name: &str,
 ) -> Option<ObjectRef> {
-    if !is_user_defined_loader(ctx, this) {
+    let __obsreg_dbg =
+        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal_name.contains("ObservationRegistry");
+    let __is_user_defined = is_user_defined_loader(ctx, this);
+    if __obsreg_dbg {
+        eprintln!(
+            "[OBSREG-DBG] find_loaded_class_for_loader(this={:?}, name={}) is_user_defined={}",
+            this, internal_name, __is_user_defined
+        );
+    }
+    let __result = find_loaded_class_for_loader_inner(ctx, this, internal_name, __is_user_defined);
+    if __obsreg_dbg {
+        let cid = __result.map(|m| ctx.class_id_of_object(m));
+        eprintln!(
+            "[OBSREG-DBG] find_loaded_class_for_loader(this={:?}, name={}) -> {:?} (class_id={:?})",
+            this, internal_name, __result, cid
+        );
+    }
+    __result
+}
+
+fn find_loaded_class_for_loader_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal_name: &str,
+    is_user_defined: bool,
+) -> Option<ObjectRef> {
+    if !is_user_defined {
         return ctx.class_id_by_name(internal_name).and_then(|cid| {
             // A generated proxy is checked via `proxy_hidden_from` — loader-identity
             // and delegation aware — REGARDLESS of `loader_id_of_class(cid)`. Proxy
@@ -1650,6 +1681,38 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
+    let __obsreg_dbg =
+        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal.contains("ObservationRegistry");
+    if __obsreg_dbg {
+        let parent = classloader_parent(ctx, this);
+        let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        let parent_cls = parent.map(|p| ctx.class_name_of_id(ctx.class_id_of_object(p)));
+        eprintln!(
+            "[OBSREG-DBG] cl_load_class_base_delegation ENTER this={:?} this_class={:?} parent={:?} parent_class={:?} name={}",
+            this, this_cls, parent, parent_cls, internal
+        );
+    }
+    let __result = cl_load_class_base_delegation_inner(ctx, this, name_obj, &internal);
+    if __obsreg_dbg {
+        let cid = match &__result {
+            Ok(Some(Value::Object(Some(m)))) => Some(ctx.class_id_of_object(*m)),
+            _ => None,
+        };
+        eprintln!(
+            "[OBSREG-DBG] cl_load_class_base_delegation EXIT this={:?} name={} -> {:?} (class_id={:?})",
+            this, internal, __result, cid
+        );
+    }
+    __result
+}
+
+fn cl_load_class_base_delegation_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_obj: ObjectRef,
+    internal: &str,
+) -> MethodCallResult {
+    let internal = internal.to_string();
     // HIB-CV-24 / SBR-14 -- honor a supplied child/isolated `ClassLoader`.
     //
     // CratonVM stands in for `ClassLoader.loadClass` with this native (it keeps no
