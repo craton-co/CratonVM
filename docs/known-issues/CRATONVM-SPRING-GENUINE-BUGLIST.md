@@ -2,9 +2,233 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — 41 confirmed genuine bugs remaining |
-| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`) |
+| **Status** | OPEN — 40 confirmed genuine bugs remaining (1 fixed 2026-07-21 late session; AOT cluster excluded, being worked separately) |
+| **Captured** | 2026-07-17 (initial full-suite triage, dev `213d93ea`), reconfirmed 2026-07-20 (dev `8719dca85`), 15 more fixed 2026-07-21 (dev `693702a2a`), 1 more fixed 2026-07-21 late session (dev `063cd747d`, see below) |
 | **Worktree** | `/data/wt-spring-full-suite-20260717` (branch `chore/spring-full-suite-20260717`), Azure host `20.83.144.174` |
+
+## 2026-07-21 late session — non-AOT residual sweep
+
+Scope: every OPEN class in this doc EXCLUDING the AOT cluster (both the
+strict `*.aot.*`-package classes and the wider set of TIMEOUT classes swept
+into that investigation's narrative — `core.io.buffer.DataBufferTests`,
+`scripting.groovy.GroovyScriptFactoryTests`,
+`context.groovy.GroovyBeanDefinitionReaderTests`,
+`context.annotation.ComponentScanParserBeanDefinitionDefaultsTests`,
+`test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests`,
+`web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests`/
+`RequestMappingMessageConversionIntegrationTests`, and
+`web.service.registry.*` — left alone per explicit instruction, another
+session (`wt-aot-cluster-20260721`, branch `fix/aot-cluster-residuals-20260721`)
+is actively working that cluster). Worktree
+`/data/wt-spring-genuine-residuals-20260721` (branch
+`fix/spring-genuine-buglist-residuals-20260721`), binary
+`cratonvm-springresid-v2.bin`.
+
+**1 genuine bug fixed.** `native-builtins/src/cglib_enhancer.rs`'s
+`emit_bean_override` (the native `ConfigurationClassEnhancer` `@Bean`-method
+proxy-override bytecode emitter) implemented the
+`isCurrentlyInvokedFactoryMethod` → `super.<name>()` /
+inter-bean-reference → `getBean(name)` dichotomy from real Spring's
+`BeanMethodInterceptor.intercept`, but never replicated
+`resolveBeanReference`'s SPR-8080 reentrancy guard: temporarily clearing
+`ConfigurableBeanFactory.setCurrentlyInCreation(beanName, false)` around the
+inter-bean `getBean()` call (restored in a `finally`) whenever that bean
+name was already marked "currently in creation" by an enclosing
+`getSingleton()` further up the call stack. Without it, a `@PostConstruct`
+method on a `@Configuration` class that called one of its own sibling
+`@Bean` methods — when that factory bean's OWN creation was triggered as a
+side effect of resolving the `@Bean` method's product as a dependency
+elsewhere (e.g. `Config2` registered before `Config1`, so `Config1` gets
+created while the container is mid-`getSingleton("beanMethod", ...)`) —
+tripped a spurious `BeanCurrentlyInCreationException` that real Spring
+resolves fine. Fixed by adding the same temporarily-clear/finally-restore
+dance as hand-written JVM bytecode (new locals for `alreadyInCreation`/`cbf`/
+the caught throwable, one new exception-table entry covering just the
+`getBean()` call, mirroring `resolveBeanReference`'s `try/finally` exactly).
+Fixes `context.annotation.ConfigurationClassPostConstructAndAutowiringTests`
+.`originalReproCase` (2/2, was 1/2). No regression: reran
+`ConfigurationClassPostProcessorTests`/`Spr15275Tests`/`Spr6602Tests` and a
+22-class `context.annotation.*Configuration*` sweep (all unchanged vs.
+pre-fix baseline), plus `cargo test -p cratonvm-vm --lib --release`
+(2227 passed / 10 failed — 8 pre-existing lock_order release-mode-only
+"should panic" assertions plus 2 confirmed-pre-existing/flaky via a
+git-stash A/B: `enforcement_active_in_debug_builds` fails deterministically
+in ANY release build regardless of code changes (it literally asserts
+`cfg!(debug_assertions)`), `native::jni::tests::process_vm_publish_and_resolve`
+passed in isolation and is unrelated to this crate — both confirmed
+unaffected by this fix). Landed on `dev` at `063cd747d`
+(`fix/spring-genuine-buglist-residuals-20260721`).
+
+**3 classes confirmed already fixed as side effects of other concurrent
+dev work** (no code change needed, stable across repeat runs):
+`web.context.request.RequestScopeTests` (0/7 → 7/7),
+`web.servlet.view.groovy.GroovyMarkupViewTests` (9/10 → 10/10). Also
+`web.client.RestClientIntegrationTests` (226/230 → 227/230, 2 fail + 1
+abort remain), `web.client.RestTemplateIntegrationTests` (118/125 → 119/125,
+3 fail + 3 abort remain), and `web.reactive.function.client
+.WebClientIntegrationTests` (168/170 unchanged, now 1 fail + 1 skip)
+improved but did not fully clear — see residuals below.
+
+**Root-caused but NOT fixed this session** (each would need substantial new
+native-VM feature work or live/gdb tracing beyond this session's time
+budget — flagged for a dedicated follow-up):
+
+- **`context.annotation.Spr6602Tests`.`configurationClassBehavior` +
+  `context.annotation.Spr15275Tests`.`withFactoryBean`/`withFinalFactoryBean`
+  (3 methods, 2 classes).** Real Spring's `ConfigurationClassEnhancer
+  .BeanMethodInterceptor.enhanceFactoryBean()` — when an inter-bean
+  reference resolves to a `FactoryBean`, wraps it in a CGLIB subclass (or a
+  JDK interface proxy, for a `final` factory exposed via an interface
+  return type) whose `getObject()` delegates to the container's cached
+  product (`beanFactory.getBean(name)`) instead of the factory's real
+  `getObject()` body — has no native-reimplementation equivalent here;
+  `emit_bean_override` only ever does the plain `getBean(&name)`/
+  `getBean(name)` dichotomy (already correctly chooses `&name` for
+  FactoryBean-typed methods, just returns the RAW factory instead of an
+  enhanced one), so a raw `factory.getObject()` call bypasses the
+  container's `factoryBeanObjectCache` entirely, returning a fresh
+  (non-singleton-matching) product instance. Confirmed via
+  `Spr6602Tests`'s exact failure (`bar1` from the container's cache !=
+  `foo.bar` from the raw uncached `getObject()` call). A full fix needs:
+  (1) a new dynamic-subclass-or-interface-proxy generator reusing this
+  file's `ClassWriter`; (2) `ctx.allocate_instance(name)` +
+  `ctx.set_field_by_name(...)` to sidestep constructor-descriptor/
+  anonymous-class-outer-instance-capture problems entirely (no `<init>`
+  call needed at all — same trick real CGLIB's Objenesis path uses); (3) a
+  new `invokestatic` dispatch target from the generated bytecode into this
+  new Rust helper. **(3) was the main open uncertainty and is now
+  RESOLVED**: `ctx.ensure_synthetic_class(...)` (see
+  `native-builtins/src/lang_system.rs`'s `cratonvm/internal/UnmodifiableMap`
+  for a working precedent) confirms purely-synthetic invokestatic targets
+  with no real `.class` bytes ARE supported by this VM, so a
+  `cratonvm/internal/ConfigEnhancerSupport.enhanceFactoryBeanReference(...)`
+  -style helper is a safe, proven pattern here — just not implemented.
+- **`context.annotation.ConfigurationClassPostProcessorTests`** (11/85
+  fail, unchanged from this session's own pre-fix baseline — note this is
+  DOWN from the doc's previously-recorded 82/85/3-fail state, i.e. 8 MORE
+  failures appeared here between 2026-07-21's earlier session and this one,
+  from unrelated concurrent dev work landing on `dev` in between; not
+  investigated). Two distinct root causes found for 5/11:
+  - 4 failures (`genericsBasedInjectionWith{Early,Late}GenericsMatchingOn
+    {Cglib,Jdk}Proxy`) — Spring AOP's `proxyTargetClass=true` auto-proxy
+    creator tries to CGLIB-subclass an ALREADY-native-CGLIB-generated
+    `ConfigurationClassEnhancer` proxy class
+    (`RepositoryConfiguration$$SpringCGLIB$$0`); real CGLIB bytecode-gen
+    (there's no native AOP-CGLIB-proxy reimplementation anywhere in
+    `native-builtins`, unlike `ConfigurationClassEnhancer.enhance` — general
+    AOP CGLIB subclassing of ordinary classes must therefore be working via
+    REAL CGLIB bytecode execution today) then fails with cglib's own
+    generic `Could not generate CGLIB subclass... Common causes of this
+    problem include using a final class or a non-visible class`. Most
+    likely cause: classes defined via `define_class_full` (this file's
+    `build_enhancer_class`) don't expose retrievable `.class` bytes via
+    `getResourceAsStream`/similar for real CGLIB's ASM-based
+    `ClassReader` to introspect when asked to subclass one of them a
+    SECOND time. This is a general VM-level gap (native-class bytecode
+    retrievability for reflective/ASM tooling), not specific to this file
+    — needs investigation in `classloader.rs`/`classloader_real.rs`.
+  - 1 failure (`configurationClassesWithInvalidOverridingForProgrammaticCall`)
+    — `emit_bean_override`'s inter-bean-reference path does a raw JVM
+    `checkcast <Ret>` after `getBean()`, throwing a bare
+    `ClassCastException` on type mismatch instead of replicating real
+    Spring's `resolveBeanReference` `ClassUtils.isAssignableValue` check +
+    descriptive `IllegalStateException` (`"@Bean method X.y called as bean
+    reference for type [...] but overridden by non-compatible bean
+    instance of type [...]. Overriding bean of same name declared in:
+    ..."`). Full replacement bytecode designed in detail (instanceof+null
+    check inside the existing SPR-8080 try-region, `StringBuilder` message
+    build using a Rust-precomputed static prefix + `Class.getName()`/
+    `Object.getClass()` reflective calls for the dynamic parts, throw
+    `IllegalStateException`) but not implemented — mechanical, ~90 more
+    bytes, all new constant-pool entries are straightforward reuses of
+    patterns already in this file. This ALSO throws a customer-visible raw
+    `ClassCastException` instead of Spring's real message ANYWHERE an
+    inter-bean `@Bean` reference resolves to an incompatible override
+    anywhere else in the suite — likely affects more than just this one
+    test, worth fixing first in a follow-up.
+  - Remaining 6/11 failures not investigated at all this session.
+- **`jndi.JndiObjectFactoryBeanTests`.`lookupWithExposeAccessContext`**
+  (24/25). Confirmed the exact expected math from real
+  `JndiObjectFactoryBean`/`JndiObjectTargetSource`/
+  `JndiContextExposingInterceptor` source: 1 `Context.close()` from
+  `JndiObjectTargetSource.afterPropertiesSet()`'s eager `lookup()`, + 1 from
+  the single ELIGIBLE proxied invocation (`setAge`, interface-declared).
+  `equals()`/`hashCode()` should be short-circuited by `JdkDynamicAopProxy`
+  before ever reaching the interceptor; `toString()` reaches it but
+  `isEligible()` should return `false` since its `Method.getDeclaringClass()
+  == Object.class`. CratonVM produces 3 closes (1 extra) — needs live/gdb
+  tracing of the native `java.lang.reflect.Proxy` invocation-handler
+  dispatch to find which of the three incorrectly gets routed through with
+  a non-`Object` declaring class (or isn't fast-path short-circuited);
+  static grep of `native-builtins` found no obvious culprit.
+- **`orm.jpa.support.PersistenceInjectionTests`.
+  `publicExtendedPersistenceContextSetterWithSerialization`** (26/27).
+  `DummyInvocationHandler.closed` stays `false` after a `SimpleMapScope`
+  Java-serialization round-trip + `serialized.close()`. Involves a
+  scope-destruction-callback object (likely wrapping the
+  `ExtendedEntityManagerCreator`-generated `EntityManager` proxy) needing
+  to survive Java serialization and still correctly invoke `close()` post-
+  deserialization — deep cross-cutting serialization+scope+JPA-proxy
+  interaction, not traced to a specific native gap.
+- **`test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests`
+  + the sibling `.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests`**
+  (3/5 and 4/6 — same 2 method names fail identically in both, one shared
+  root cause). A Mockito-mocked `StringBuilder` (final class, inline mock
+  maker) correctly answers `length()`/`isEmpty()`-style calls but
+  `.substring(0)` returns `""` instead of Mockito's default-answer `null`
+  — `substring` isn't being intercepted at all (falls through to real,
+  empty-buffer bytecode). Likely the same family as this repo's other
+  documented Mockito inline-redefine gaps (redefine only covering the
+  concrete mocked class's own declared methods, missing ones inherited from
+  `java.lang.AbstractStringBuilder`).
+- **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
+  (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
+  `MultipleFailuresError` ("Test Event Statistics", 2 failures);
+  `rejectTestsInParallelWithInstancePerClassAndRecordApplicationEvents`
+  fails a plain `AssertionError`. JUnit parallel-execution × Spring
+  TestContext `ApplicationEvents` recording interaction, not investigated.
+- **`test.web.servlet.assertj.MockMvcTesterIntegrationTests`** (72/74) —
+  `debugUsesSystemOutByDefault`/`debugCanPrintToCustomOutputStream` both
+  fail plain `AssertionError`s (`MockMvcTester`'s `.debug()`/`.print()`
+  output-stream-capture assertions). Not investigated.
+- **`web.servlet.config.MvcNamespaceTests`.`customConversionService`**
+  (24/25) and **`web.servlet.config.annotation.ViewResolutionIntegrationTests`
+  .`freemarkerWithExplicitDefaultEncodingAndContentType`** (6/7) — single
+  plain-`AssertionError` failures each, not investigated.
+- **`web.socket.messaging.StompWebSocketIntegrationTests`** (14/16 per the
+  2026-07-20 baseline) — NOT re-verified with full detail this session; a
+  200s rerun timed out (this test spins up a real embedded Tomcat per test
+  method across 16 methods, and the host was under heavy concurrent load
+  from several other sessions' builds/test-runs during this rerun attempt).
+  No regression expected from anything touched this session, but the exact
+  current pass count needs reconfirming with a longer timeout when the host
+  is quieter.
+
+**Confirmed unchanged / out of scope, no action taken:**
+`core.io.ResourceTests` (66/68, same 2 `remoteResourceExists*` methods the
+doc already flagged), `core.retry.RetryPolicyTests` (22/23, doc's own
+"deliberate design choice, not worth fixing" stands),
+`scheduling.quartz.QuartzSupportTests` (doc's own "environmental,
+`spring-context-support` doesn't compile against the shared checkout"
+stands), `beans.factory.xml.XmlBeanFactoryTests` (10/95, unchanged, doc
+already has detailed root-causing for 2/10 pointing at a `try_build_replace
+_override` `super_cid` class-resolution bug upstream of this file, likely
+the same loader-identity family documented elsewhere in this repo's
+history).
+
+**Host note:** `/data/tmp/cores` (7.6GB of stale 2026-07-17 core dumps) was
+cleared at the start of this session to relieve disk pressure (29G free
+after, was 21G). The shared `spring-framework-recheck` checkout used for
+classpath generation currently has uncommitted local modifications to
+`spring-aop`/`spring-context` (`git status` shows deletions matching the
+"corrupted `spring-aop/src` tree" symptom documented in the 2026-07-20 AOT
+session) — NOT touched or fixed this session (shared resource, another
+session may be mid-use); none of the modules this session's target classes
+live in (`spring-core`/`spring-context`/`spring-web`/`spring-webflux`/
+`spring-webmvc`/`spring-websocket`/`spring-orm`/`spring-context-support`/
+`spring-test`) needed rebuilding, so this didn't block anything, but
+whoever continues should check `git status` there before trusting a
+`spring-aop`/`spring-orm` rebuild.
 
 ## Summary
 
@@ -559,10 +783,10 @@ anomaly (previously FAIL despite 43/43 methods passing) is now a clean OK
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
 | `context.annotation.ComponentScanParserBeanDefinitionDefaultsTests` | TIMEOUT | 0/0 | 120000ms |
-| `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | FAIL | 1/2 | 412ms |
-| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL | 82/85 | 20126ms |
-| `context.annotation.Spr15275Tests` | FAIL | 4/6 | 2038ms |
-| `context.annotation.Spr6602Tests` | FAIL | 1/2 | 1229ms |
+| `context.annotation.ConfigurationClassPostConstructAndAutowiringTests` | OK (2026-07-21 SPR-8080 fix) | 2/2 | 829ms |
+| `context.annotation.ConfigurationClassPostProcessorTests` | FAIL (2026-07-21 reconfirmed, worse than recorded — see notes) | 74/85 | 8802ms |
+| `context.annotation.Spr15275Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 4/6 | 1174ms |
+| `context.annotation.Spr6602Tests` | FAIL (2026-07-21, root-caused, deferred — see notes) | 1/2 | 1140ms |
 | `context.aot.ApplicationContextAotGeneratorTests` | FAIL (2026-07-20, see caveat above — needs re-verify) | 16/40 | 389879ms |
 | `context.groovy.GroovyBeanDefinitionReaderTests` | TIMEOUT | 0/0 | 120000ms |
 
@@ -657,18 +881,18 @@ above. Removed from this table.
 
 | Class | Status | Pass/Total | Elapsed |
 |---|---|--:|--:|
-| `web.client.RestClientIntegrationTests` | FAIL | 226/230 | 96436ms |
-| `web.client.RestTemplateIntegrationTests` | FAIL | 118/125 | 88728ms |
-| `web.context.request.RequestScopeTests` | FAIL | 0/7 | 1300ms |
-| `web.reactive.function.client.WebClientIntegrationTests` | FAIL | 168/170 | 47143ms |
+| `web.client.RestClientIntegrationTests` | FAIL (2026-07-21, improved via side effect) | 227/230 | ~30000ms |
+| `web.client.RestTemplateIntegrationTests` | FAIL (2026-07-21, improved via side effect) | 119/125 | ~20000ms |
+| `web.context.request.RequestScopeTests` | OK (2026-07-21, side effect) | 7/7 | 1700ms |
+| `web.reactive.function.client.WebClientIntegrationTests` | FAIL (2026-07-21, reconfirmed, 1 fail + 1 skip) | 168/170 | 23337ms |
 | `web.reactive.result.method.annotation.CrossOriginAnnotationIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | TIMEOUT | 0/0 | 120000ms |
 | `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests` | FAIL (2026-07-20, now completes, NEW bug found, see above) | 3/5 | 51669ms |
 | `web.service.registry.ImportHttpServiceRegistrarTests` | FAIL (original CCE confirmed gone, new shared bug, see above) | 3/5 | 54239ms |
-| `web.servlet.config.MvcNamespaceTests` | FAIL | 24/25 | 24938ms |
-| `web.servlet.config.annotation.ViewResolutionIntegrationTests` | FAIL | 6/7 | 29415ms |
-| `web.servlet.view.groovy.GroovyMarkupViewTests` | FAIL | 9/10 | 28950ms |
-| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL | 14/16 | 105475ms |
+| `web.servlet.config.MvcNamespaceTests` | FAIL (2026-07-21, reconfirmed, not investigated) | 24/25 | 24938ms |
+| `web.servlet.config.annotation.ViewResolutionIntegrationTests` | FAIL (2026-07-21, reconfirmed, not investigated) | 6/7 | 29415ms |
+| `web.servlet.view.groovy.GroovyMarkupViewTests` | OK (2026-07-21, side effect) | 10/10 | 21827ms |
+| `web.socket.messaging.StompWebSocketIntegrationTests` | FAIL (not re-verified 2026-07-21, host load prevented reconfirmation, see notes) | 14/16 | 105475ms |
 
 ## Raw data
 
