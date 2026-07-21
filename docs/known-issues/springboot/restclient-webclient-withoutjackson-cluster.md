@@ -1,8 +1,9 @@
 # `*TestWithoutJacksonIntegrationTests`: two-bug cluster under `@ClassPathExclusions("jackson-*.jar")`
 
 **Status: Bug A FIXED 2026-07-21. Bug B OPEN — found 2026-07-21, extensively
-re-investigated 2026-07-21 (session #2, see below) — narrowed significantly
-but still not root-caused.**
+re-investigated 2026-07-21 (sessions #2 and #3, see below) — narrowed to an
+extremely small surface (confirmed NOT a classloading/reflection-identity
+bug, confirmed NOT a context-cache-reuse bug) but still not root-caused.**
 
 ## Symptom
 
@@ -418,6 +419,187 @@ specific* commit's fixes as sufficient on their own. Still worth checking
 topology (its own loader-identity resolution — bug #6's pattern, resolving
 via the wrong receiver's loader — is exactly the shape of bug this whole
 investigation keeps circling back to).
+
+### 2026-07-21 follow-up session #3 — settled the context-identity question, then chased and RULED OUT classloading/reflection entirely
+
+Picked up session #2's top-priority next step ("settle the context/bean-factory
+identity question definitively"). Continued in the same worktree
+(`C:\craton\CratonVM-resttemplatebuilder-bugb-20260721`), merged latest `dev`
+in along the way (see the `01690055c` note above — checked and ruled out).
+All scratch edits below were reverted and jars/binaries rebuilt from pristine
+sources before this session ended.
+
+**1. Context/bean-factory identity — SETTLED, not a reuse bug.**
+
+`ObjectRef`'s `Debug` output is a **raw, GC-moving pointer**
+(`types/src/value.rs`: "This will be replaced with a proper GC-managed
+pointer in Phase 6. For now it's a simple wrapper around a raw pointer.").
+Comparing raw pointers across a GC boundary is unreliable — a collected
+object's address can legitimately be reused for an unrelated later
+allocation, which is exactly what produced session #2's "the outer boot's
+context is being reused!" observation. Re-ran the identical repro 3x in a
+row with `identity_hash_code` (GC-safe) logging added to
+`get_or_create_bean_factory`, **plus a `getBeanDefinitionCount()` probe on
+the returned factory** to make reuse-vs-fresh unambiguous even to a casual
+read of the log. All 3 runs agree, precisely:
+
+- The context/factory pair actively being queried in the window spanning the
+  `ModifiedClassPathClassLoader` boundary (confirmed via `ExampleWebClientApplication`'s
+  fresh `<clinit>` under that loader) is a **single, stable identity** (same
+  `identity_hash_code` before AND after the boundary) — i.e. it genuinely
+  *is* one continuous object across that span. This is expected/correct: the
+  same `AnnotationConfigApplicationContext` naturally exists for a while
+  before and after its own `ExampleWebClientApplication` primary source
+  finishes loading.
+- Its `getBeanDefinitionCount()` grows deterministically and identically in
+  all 3 runs: `0→1→2→3→4→6→7→8→33`, then **stays at 33 for the remainder of
+  the run** (many repeated polls, all reading 33) — this *is* the inner
+  (failing) boot's own factory, building up its own bean set from scratch,
+  not a stale reused one (a genuinely-reused, already-populated outer
+  factory would start at a high number, not climb from 0).
+- A **separate**, later, genuinely-different context (different identity
+  hash, `getBeanDefinitionCount()`=64) appears afterward, well past the
+  failure — this is the outer/`AppClassLoader` boot's own context,
+  confirmed unrelated.
+
+**Conclusion: no context or bean-factory reuse across the loader boundary.**
+The inner boot builds its own, correctly-scoped `DefaultListableBeanFactory`
+from an empty start. Session #2's contrary-looking readings were a raw-
+pointer/GC-timing artifact, not a real bug — corrected here with a reliable
+method for any future session that needs to re-check loader/context
+identity (`identity_hash_code`, never raw `ObjectRef` pointers, across any
+window that might span a GC).
+
+**2. `restTemplateBuilder`'s bean definition genuinely IS registered on that exact (correct, non-reused) factory — reached 33/33, count doesn't lie.**
+
+Added a temporary trace-and-delegate diagnostic (dual-gated native override
+on the *concrete* `DefaultListableBeanFactory.registerBeanDefinition`,
+always delegating to the real bytecode via `ctx.invoke_virtual_bytecode_only`
+so it's behavior-preserving — reusable technique, see session #2's notes for
+the dual-gate mechanics) tagged with the receiver's `identity_hash_code` so
+registrations can be tied to a *specific* factory instance rather than
+inferred from log position. On the exact factory instance identified above
+(the inner boot's own, freshly-built-from-0 one), the **full, correctly
+jackson-free** registration sequence completes, ending at `mockRestServiceServer`
+(the expected last bean for this test) and **including `restTemplateBuilder`
+and `restTemplateBuilderConfigurer`** at their expected positions (right
+after `org.springframework.boot.restclient.autoconfigure.RestTemplateAutoConfiguration`).
+This directly contradicts session #2's belief that registration silently
+produces nothing on the inner boot — that belief was based on a diagnostic
+window that (per point 1) was accidentally reading the outer/reused-looking
+pointer at the wrong moment, not a real absence of registration.
+
+**3. `RestTemplateBuilder`'s reflective type resolution (`Method.getReturnType()`
+for the `@Bean restTemplateBuilder(...)` factory method, and the equivalent
+`Constructor.getParameterTypes()` for `ExampleRestTemplateService`'s
+constructor) also resolves CORRECTLY — ruled out as the cause too, after
+initially looking exactly like it.**
+
+`native-builtins/src/lang_class.rs::descriptor_to_class_mirror_via_loader`
+is the shared helper both `create_method_object` and `create_constructor_object`
+use to resolve a reflected member's parameter/return types through the
+*declaring class's own loader* rather than the flat global class store (its
+own doc comment describes fixing an near-identical Hibernate bug this exact
+way). Its `"loadClass-via-defining-loader"` branch (reached when
+`class_id_defined_by_loader_exact` hasn't recorded an exact per-loader copy
+yet) calls the loader's `loadClass` via `ctx.invoke_virtual(...)`. Tracing
+this specific call showed it consistently returning a mirror with
+CratonVM-internal `class_id=12` for `RestTemplateBuilder` — which, given
+every *other* loader-identity bug in this codebase's history involves a
+stale/wrong-loader class id, looked exactly like the smoking gun. **It was a
+red herring.** Two independent fix attempts were tried and built:
+
+- Adding `ModifiedClassPathClassLoader` to an existing hardcoded
+  fast-path in `vm/src/vm/vm_exec.rs`'s `invoke_virtual` (a precedented
+  pattern — `org/springframework/core/test/tools/DynamicClassLoader` already
+  has an identical entry, with a comment describing the *exact* same bug
+  shape: "the normal receiver resolver can retain the inherited JDK body
+  before the base native gate sees it, collapsing this lookup to the global
+  same-named class").
+- Calling `native-builtins/src/classloader.rs::cl_load_class` (the Rust
+  implementation backing `ClassLoader.loadClass`) directly instead of
+  through any virtual-dispatch layer, bypassing the dispatch-decision
+  question entirely.
+- Calling `ctx.invoke_virtual_bytecode_only(loader, "loadClass", ...)`
+  instead — deliberately forcing the loader's *real, compiled* `loadClass`
+  bytecode to run (verified this **is** real, correct bytecode — see next
+  paragraph).
+
+**None of the three changed the test's outcome — same failure, byte for
+byte** — which forced a much more careful check of what "`class_id=12`"
+actually means. `apps/spring-boot`'s `ModifiedClassPathClassLoader` is
+**Spring Boot's own test-support source** (`test-support/spring-boot-test-support/
+src/main/java/org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader.java`)
+— unlike `spring-context`/`spring-beans`, this is buildable, in-repo, real
+source, not an opaque binary dependency. Added `System.err.println`
+instrumentation directly to its real `loadClass(String)` override (rebuilt
+via `gradlew -p test-support\spring-boot-test-support jar` — the same
+build-via-jar-not-testClasses trap as the methodology note below, this
+module has the identical failure mode) and to the `invoke_virtual_bytecode_only`
+fix attempt, printing `System.identityHashCode(...)` (Java-level, GC-agnostic
+identity) on both sides. **They match exactly, every single call** (e.g.
+Rust-side `result_idhash=717910` == Java-side `identityHashCode(class)=717910`,
+consistently across repeated runs) — i.e. the `invoke_virtual_bytecode_only`
+fix attempt genuinely does return the *exact same* `Class` object that
+`ModifiedClassPathClassLoader.loadClass()`'s real, correctly-loader-scoped
+bytecode legitimately produces. **CratonVM's internal `class_id` is
+evidently a shared/structural identifier reused across multiple, genuinely-
+distinct-at-the-Java-level `Class` mirror objects** (plausibly an
+intentional memory optimization for structurally-identical bytecode) — `class_id`
+equality/difference is **not** a reliable proxy for "same vs. different
+loader-scoped `Class` object" the way this investigation (and several past
+ones in this codebase, per the loader-identity bug pattern) assumed.
+**Any future native-side diagnostic comparing class identity across loaders
+must use `identity_hash_code`/Java-level identity, never raw `class_id`.**
+
+**Net result: registration is correct, the factory is correct/not reused,
+and BOTH the factory method's return type AND the constructor parameter's
+type resolve to the exact same, correctly-loader-scoped `RestTemplateBuilder`
+Class object.** By every mechanism this investigation has been able to
+inspect from the native side, Spring's `getBeanNamesForType(RestTemplateBuilder.class)`
+*should* succeed. It doesn't. The defect must be somewhere this
+investigation hasn't reached yet — almost certainly inside
+`AbstractBeanFactory`/`DefaultListableBeanFactory`/`ConstructorResolver`'s
+own type-matching bytecode (unmodifiable binary `spring-beans`, so only
+native-side tracing — not scratch Java edits — can observe it further), or
+in some other narrow gap in Spring's bean-creation sequencing that hasn't
+been isolated yet.
+
+**All three fix attempts were reverted** (none resolved the bug, and none
+were regression-tested broadly enough to land as a real fix candidate on
+their own merits, even though the `invoke_virtual_bytecode_only` variant is
+demonstrably *more correct* for this one call site — worth reconsidering as
+a real fix in a future session specifically focused on classloader dispatch
+correctness, independent of Bug B).
+
+**Next steps, in order of likely value (supersedes session #2's list):**
+
+1. **Trace inside real Spring's own bean-creation/type-matching bytecode.**
+   Since `spring-beans`/`spring-context` are binary (can't scratch-edit),
+   the only remaining tool is native-side tracing of whatever CratonVM code
+   backs the methods `DefaultListableBeanFactory.doGetBeanNamesForType` /
+   `AbstractAutowireCapableBeanFactory.predictBeanType` /
+   `getTypeForFactoryMethod` actually call into (if any — they may be pure,
+   unintercepted real bytecode, in which case the right lever is a
+   trace-and-delegate native override on `DefaultListableBeanFactory
+   .getBeanNamesForType(Class, boolean, boolean)` itself, mirroring the
+   `registerBeanDefinition` technique from this session — that would show
+   directly whether `restTemplateBuilder` is even being *considered* as a
+   candidate, and if so, at what point it gets rejected).
+2. **Check whether `@Lazy` interacts with `predictBeanType` differently
+   than expected.** Both `restTemplateBuilderConfigurer` and
+   `restTemplateBuilder` are `@Lazy` — session #1 ruled out "the bean method
+   never executes" and this session rules out "the type can't be resolved",
+   but neither session has directly confirmed *how* `predictBeanType`
+   handles a lazy factory-method bean's type prediction (it must succeed
+   WITHOUT invoking the method, by construction) under this specific loader
+   topology — worth checking whether removing `@Lazy` (scratch, temporary)
+   changes the outcome, which would cheaply localize the defect to the
+   lazy-type-prediction path specifically vs. a more general one.
+3. Confirm against real HotSpot that this test passes there (still not
+   explicitly re-verified across 3 sessions now).
+4. Check `WebClientTestWithoutJacksonIntegrationTests`'s exact failure mode
+   independently — still not individually confirmed in any session.
 
 ### Methodology note (costly lesson this session — save future time)
 

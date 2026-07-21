@@ -6551,6 +6551,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // the collector can never read a dangling pointer.
                 shared_arc.thread_registry.clear_tlab_addr(tid);
                 shared_arc.thread_registry.mark_dead(tid);
+                // A thread that terminated while blocked inside a native call
+                // made from within a `synchronized` region never executes its
+                // `monitorexit` bytecode — sweep anything it still holds so no
+                // future locker waits forever (see
+                // `MonitorTable::release_monitors_held_by`). Exclude
+                // `term_monitor`: this thread deliberately still owns it here
+                // so the notify below can wake `Thread.join()` waiters — the
+                // blanket sweep must not force-release it first, or the
+                // notify silently no-ops as `NotOwner` (lost-wakeup bug, see
+                // `release_monitors_held_by_except`'s doc comment).
+                shared_arc
+                    .monitors
+                    .release_monitors_held_by_except(tid, term_monitor.as_ref());
             });
 
             if let Some(monitor) = term_monitor {
@@ -7067,9 +7080,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if thread_id == 0 {
             return;
         }
-        self.shared
-            .thread_registry
-            .mark_dead(crate::threading::jvm_thread::ThreadId(thread_id));
+        let tid = crate::threading::jvm_thread::ThreadId(thread_id);
+        self.shared.thread_registry.mark_dead(tid);
+        self.shared.monitors.release_monitors_held_by(tid);
     }
 
     /// T19_K2 вЂ” Attach a `Box<JoinHandle<()>>` to an already-registered
@@ -19028,6 +19041,56 @@ mod tests {
             ctx.record_printed_line("World".to_string());
         }
         assert_eq!(thread.printed_lines, vec!["Hello", "World"]);
+    }
+
+    /// Regression test for the reverted `unregister_native_thread` monitor
+    /// release: a thread that dies while blocked inside a native call made
+    /// from within a `synchronized` region never executes its `monitorexit`
+    /// bytecode. Without `release_monitors_held_by` in the unregister path,
+    /// the monitor stays owned by the dead thread forever and every future
+    /// `monitorenter` on that object blocks indefinitely.
+    #[test]
+    fn unregister_native_thread_releases_monitors_held_by_the_dying_thread() {
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let native_tid = {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.register_native_thread("dying-native-thread", true, 0)
+        };
+        // The native thread enters a monitor (simulating `synchronized (obj)
+        // { blockingNativeCall(); }`) and then dies without ever calling
+        // monitorexit. `release_monitors_held_by` only scans INFLATED
+        // monitors (a thin-locked, uncontended object isn't tracked there),
+        // so force inflation the same way a real blocked-in-native-call
+        // thread would have -- `enter()`'s plain thin-lock fast path would
+        // never exercise the code this test targets.
+        let (_monitor, contended) = shared
+            .monitors
+            .enter_inflated_or_contend(obj, ThreadId(native_tid))
+            .expect("inflate");
+        assert!(!contended, "fresh monitor should be acquired immediately");
+        assert!(shared.monitors.holds(obj, ThreadId(native_tid)));
+        {
+            let mut ctx = NativeContextImpl {
+                shared: &shared,
+                thread: &mut thread,
+            };
+            ctx.unregister_native_thread(native_tid);
+        }
+        assert!(
+            !shared.monitors.holds(obj, ThreadId(native_tid)),
+            "a dead thread must not still be recorded as holding the monitor"
+        );
+        // A different thread must now be able to acquire the same object's
+        // monitor without blocking.
+        let other_tid = ThreadId(native_tid + 1);
+        shared.monitors.enter(obj, other_tid);
+        assert!(shared.monitors.holds(obj, other_tid));
+        assert!(shared.monitors.exit(obj, other_tid).is_ok());
     }
 
     #[test]
