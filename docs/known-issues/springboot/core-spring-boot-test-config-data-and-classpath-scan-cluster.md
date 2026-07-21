@@ -1,6 +1,6 @@
 # core/spring-boot-test — config-data loading gaps, duplicate classpath scan results, missing PropertySource
 
-**Status: FIXED under interpreter execution, in isolation (2026-07-20, fourth investigation session) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end (`-Jit off`) when run in isolation — verified deterministically 3 times. Two caveats found while confirming this at scale, both NOT yet fully root-caused: (1) under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature — a JIT-specific dispatch gap, see "Residual 6"; (2) under heavy parallel-sweep host contention even with `-Jit off`, Residual 4's original failure was observed to recur once — the loader-identity race the fix closes is real and reproducible, but may not be the only one in this family, see Residual 4's "Verified, but load-dependent" note.**
+**Status: FIXED under interpreter execution, in isolation (2026-07-20, fourth investigation session) — Clusters A, B, D, E confirmed fixed upstream; Cluster C's originally-documented NPE plus Residuals 1–5 are now ALL fixed. `SpringBootContextLoaderAotTests` PASSES end-to-end (`-Jit off`) when run in isolation — verified deterministically 3 times. Two caveats found while confirming this at scale, both NOT yet fully root-caused: (1) under `-Jit on` (the suite's default), the class still fails with Residual 5's original NPE signature — a JIT-specific dispatch gap, see "Residual 6"; (2) under heavy parallel-sweep host contention even with `-Jit off`, Residual 4's original failure was observed to recur once — the loader-identity race the fix closes is real and reproducible, but may not be the only one in this family, see Residual 4's "Verified, but load-dependent" note. **Fifth investigation session (2026-07-21)**: independently re-confirmed Residual 6 (JIT dispatch gap), found + fixed one real, general contributing bug (a JIT instance-method tier-up path that could silently and permanently bypass ANY registered-but-non-forced native, the 4th occurrence of this bug shape in this interpreter — see Residual 6's update below) — this closes a real gap and causes no regressions, but does NOT by itself resolve Residual 6's exact symptom; still OPEN.**
 
 Originally six `core/spring-boot-test` classes failing/hanging via 5 distinct signatures, found 2026-07-17 and none root-caused at the time. Re-verified 2026-07-20 in worktree `fix/sb-configdata-classpath-scan-cluster-20260719` (branched from dev `54003fb83`, merged forward to dev `91ee66ca7`): the doc was stale — dev had already fixed Clusters A, B, D, and E independently since 2026-07-17. Only Cluster C's original signature was also stale (already-changed failure) and needed fresh investigation, which found two genuine CratonVM interpreter/native bugs (now fixed) plus one further, deeper residual (still open).
 
@@ -415,6 +415,71 @@ doesn't consult either of the two allow-lists above. Next step: find the
 JIT-specific call-target resolution for a native method inherited by a
 receiver from a superclass reached via `invokeinterface` (`vm/src/jit/`), or
 instrument it directly rather than continuing to guess at allow-list gaps.
+
+**Update (fifth investigation session, 2026-07-21, worktree
+`fix/groovy-classinfo-loaderid-residuals-20260720`): independently
+rediscovered this same residual, found and fixed one real, general
+contributing bug, but it does NOT by itself resolve this exact symptom.**
+
+Traced with `CRATONVM_TRACE_CLASSVALUE=1` (a new, permanent, env-gated
+`eprintln!` added to the `get`/`remove` natives themselves — orthogonal to
+and independent of the two dispatch-gate allow-lists this doc's fourth
+session already tried): confirmed the native is called ~2500 times per run
+under `-Jit on` and NEVER once returns `null` — the native's own logic is
+provably correct. This rules out the native itself and narrows the gap to
+dispatch/caching specifically, consistent with the fourth session's
+conclusion.
+
+One real, general interpreter bug WAS found and fixed along the way:
+`vm/src/runtime/interpreter.rs`'s `execute_invokevirtual_cached` instance-
+method JIT tier-up (`bug-03 layer B`) JIT-compiles a hot instance method's
+real bytecode once its per-call-site counter crosses a threshold, and its
+own comment claims natively-overridden methods are excluded by that point —
+true only for FORCED natives (the two allow-lists this doc's fourth session
+already tried); an ordinary, non-forced registered native (the default case
+— natives shadow bytecode by default elsewhere in the interpreter) was
+invisible to it, so tier-up could compile-and-permanently-cache a method's
+REAL bytecode, silently bypassing its native forever afterward for that
+receiver class (compiled code doesn't re-run the interpreter's native-vs-
+bytecode decision per call). This is at least the 4th independent occurrence
+of the identical bug shape across different caching subsystems in this
+interpreter — see the "Cached bytecode bypasses native dispatch, which must
+retain precedence" comment already present at the lambda-impl bytecode
+cache (`interpreter.rs`, `try_lambda_dispatch`'s cache) and the "third
+occurrence of the same gap" comment at the JIT-callee compiler used by
+`jit_invoke_dispatch` — worth a systemic audit of every
+`CachedBytecodeMethod`/`jit_cache` construction site for the same missing
+guard. Fixed generically (reusing the already-memoized
+`cached.native_callback_cache`, so zero extra per-call cost) with a
+`has_registered_native` guard before the tier-up decision — this exact bug
+shape can no longer bite ANY natively-overridden instance method that
+becomes tier-up-eligible, not just `ClassValue.get`. Verified via a full
+`core/spring-boot-test` module regression (80 classes, both `-Jit off` and
+`-Jit on`): identical PASS/FAIL sets in both modes, no regressions.
+
+**But it did not, by itself, fix `ClassValue.get()`'s JIT symptom** — the
+exact NPE still reproduces under `-Jit on` with this fix applied. Isolating
+further requires execution-level tracing beyond what static reading of the
+dispatch code can settle. This session narrowed it to
+`execute_invokevirtual_cached`'s per-call-site `thread.invoke_cache` (keyed
+by `(caller_class_id, cp_index, is_special)`), which resolves to one of
+`CachedInvokeTarget::VirtualNative` (native, unconditional — where the
+~2500 successful calls above are believed to come from) or
+`::VirtualBytecode` (interpreted/compiled real bytecode — where BOTH
+dispatch-gate allow-lists AND the new tier-up guard only apply) — but NOT
+which of the two `ClassInfo.getClassInfo`'s one `invokeinterface
+GroovyClassValue.get` call site actually resolves to under `-Jit on`, nor
+why that might differ from `-Jit off`, nor whether it's a first-resolution
+bug or (again) a loader-duplication artifact — this whole doc's recurring
+theme. **Next step for whoever picks this up**: trace
+`thread.invoke_cache.get`/`.insert` (or add a temporary
+`CRATONVM_DBG_*`-gated print at the `VirtualNative`/`VirtualBytecode` match
+arms in `execute_invokevirtual_cached`) filtered to
+`class_name == "java/lang/ClassValue"`, comparing a `-Jit on` run against a
+`-Jit off` run of the exact same test to see which variant gets cached and
+from where — this is a more targeted continuation of the "JIT-specific
+call-target resolution" next step above, now with a concrete enum split to
+instrument rather than an unbounded `vm/src/jit/` search.
 
 ### Regression check (fourth investigation session, 2026-07-20)
 

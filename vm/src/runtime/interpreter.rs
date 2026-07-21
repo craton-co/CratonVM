@@ -22927,6 +22927,43 @@ pub(crate) fn is_class_mirror_native_override(
         )
 }
 
+/// `java.lang.ClassValue#get`/`#remove` (see `classvalue_cache.rs` in
+/// native-builtins for the real implementation and why it must be a native
+/// override at all — `ClassValue`'s real bytecode depends on CASing a hidden
+/// field on `java.lang.Class` via `jdk.internal.misc.Unsafe`, not faithfully
+/// reproducible against CratonVM's `Class` mirrors).
+///
+/// Apache Groovy's `ClassInfo` registry (`ClassInfo.globalClassValue`, a
+/// `GroovyClassValueJava7`) is constructed via
+/// `GroovyClassValueFactory.createGroovyClassValue(ClassInfo::new)` — a
+/// constructor-reference-backed `ComputeValue` lambda — and `ClassInfo`'s own
+/// `getClassInfo`/`remove` static methods call `get`/`remove` on it. Ordinary
+/// bytecode invokes already prefer the registered native, but this call
+/// pattern (through the lambda-backed `ComputeValue` plumbing) can resolve
+/// through a dispatch path whose concrete-bytecode precedence needs this
+/// explicit shared gate — see docs/known-issues/springboot/
+/// core-spring-boot-test-config-data-and-classpath-scan-cluster.md Cluster C
+/// "Residual 5" (fixed under `--nojit` without this gate; JIT mode still hit
+/// the original always-null-returning symptom until this was added).
+pub(crate) fn is_classvalue_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let result = class_name == "java/lang/ClassValue"
+        && matches!(
+            (method_name, descriptor),
+            ("get", "(Ljava/lang/Class;)Ljava/lang/Object;") | ("remove", "(Ljava/lang/Class;)V")
+        );
+    if class_name == "java/lang/ClassValue" && std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some()
+    {
+        eprintln!(
+            "[classvalue-gate] is_classvalue_native_override({class_name}, {method_name}, {descriptor}) -> {result}"
+        );
+    }
+    result
+}
+
 pub(crate) fn is_reflection_access_native_override(
     class_name: &str,
     method_name: &str,
@@ -24988,6 +25025,9 @@ fn force_native_over_real_jdk_bytecode(
         return false;
     }
     if is_class_mirror_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_classvalue_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     // JFR's Type bootstrap table compares Class mirrors by reference.  A
@@ -36723,8 +36763,46 @@ fn execute_invokevirtual_cached(
                     // target for this receiver. `args_slice` is already decoded;
                     // on deopt/too-many-args we fall through to the interpreted
                     // frame push below (the operand stack is untouched).
+                    //
+                    // `!has_registered_native`: the comment above claims natives
+                    // are already excluded by this point, but that's only true
+                    // for FORCED natives (`intercept_force_registered_native_cached`
+                    // just above only fires when `force_native_over_real_jdk_bytecode`
+                    // says so). An ordinary, non-forced registered native — the
+                    // common case, which the interpreter's per-call dispatch
+                    // prefers over real bytecode by default — is invisible to
+                    // that check, so tier-up would compile the method's REAL
+                    // BYTECODE and, once compiled, EVERY future call through this
+                    // receiver class permanently bypasses the native (compiled
+                    // code doesn't re-run the interpreter's native-vs-bytecode
+                    // decision). Found 2026-07-20 via `java.lang.ClassValue#get`
+                    // (see `classvalue_cache.rs`/`is_classvalue_native_override`):
+                    // Apache Groovy's `ClassInfo` registry calls it thousands of
+                    // times per app boot — comfortably past the tier-up threshold
+                    // — and the real bytecode it silently switched to depends on
+                    // `Class.classValueMap`/`Unsafe` CAS machinery CratonVM
+                    // doesn't faithfully reproduce, reintroducing the exact
+                    // always-null symptom the native override exists to fix, but
+                    // ONLY under JIT (this tier-up is JIT-only) and ONLY once
+                    // warm — see docs/known-issues/springboot/
+                    // core-spring-boot-test-config-data-and-classpath-scan-cluster.md
+                    // Cluster C "Residual 5". Reusing `native_callback_cache`
+                    // (already memoized per call site for the force-native path
+                    // above) keeps this a single extra hash lookup, not a
+                    // per-call cost.
+                    let has_registered_native = cached
+                        .native_callback_cache
+                        .get_or_init(|| {
+                            shared.native_methods.find(
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            )
+                        })
+                        .is_some();
                     if !is_special
                         && !cached.is_synchronized
+                        && !has_registered_native
                         && !crate::classloading::any_class_redefined()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
