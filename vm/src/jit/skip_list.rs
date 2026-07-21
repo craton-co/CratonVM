@@ -144,6 +144,11 @@ pub enum SkipReason {
     /// is sufficient. Keep `add` interpreted until the x64 lowering bug is
     /// understood.
     JavaPoetCodeBlockBuilderAdd,
+    /// Spring Boot's `ModifiedClassPathClassLoader.loadClass` can spin in its
+    /// nested class-path exclusion path once tier-compiled. Keep this one
+    /// test-support loader method interpreted until its JIT lowering is
+    /// understood.
+    SpringBootModifiedClassPathLoader,
     /// `java/util/stream/MatchOps.makeInt/makeRef/makeLong/makeDouble`
     /// unconditionally reach an internal `invokedynamic` (lambda) call site
     /// that `jit_scan` lowers to an always-deopt uncommon trap
@@ -503,6 +508,27 @@ fn should_skip_jit_internal(
     // package name below differs from the upstream library's own source.
     if class_name == "org/springframework/javapoet/CodeBlock$Builder" && method_name == "add" {
         return Some(SkipReason::JavaPoetCodeBlockBuilderAdd);
+    }
+
+    // SPRINGBOOT-WITHOUT-JACKSON.2 (2026-07-21):
+    // `RestClientTestWithoutJacksonIntegrationTests` and
+    // `WebClientTestWithoutJacksonIntegrationTests` execute their actual test
+    // body under Spring Boot's `ModifiedClassPathClassLoader`, which removes
+    // every `jackson-*.jar` then re-launches the test. With JIT enabled the
+    // WebClient variant intermittently stops making progress during the inner
+    // boot's configuration-property cache update. A 480-second watchdog shows
+    // the active main thread at `PropertiesPropertySource.getPropertyNames` ->
+    // `SpringIterableConfigurationPropertySource$Cache.tryUpdate`, ending in
+    // four nested calls to this exact `loadClass` method. The identical test
+    // passes with `--nojit` (260.4s) and with this method alone supplied to
+    // `CRATONVM_JIT_BISECT_SKIP` (199.0s), which isolates the tiered body rather
+    // than a Spring context cache or monitor deadlock. Keep the method
+    // interpreted; it is cold test-support infrastructure and the guard does
+    // not affect ordinary application class loading.
+    if class_name == "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader"
+        && method_name == "loadClass"
+    {
+        return Some(SkipReason::SpringBootModifiedClassPathLoader);
     }
 
     // Bisection hook (development only): `CRATONVM_JIT_BISECT_SKIP` is a
@@ -3231,6 +3257,32 @@ mod tests {
         assert_eq!(
             check("Foo", "bar", false, false, SkipPolicy::Aggressive),
             Some(SkipReason::UnnamedThread)
+        );
+    }
+
+    #[test]
+    fn spring_boot_modified_classpath_loader_is_always_interpreted() {
+        let class_name =
+            "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader";
+        assert_eq!(
+            check(
+                class_name,
+                "loadClass",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
+            Some(SkipReason::SpringBootModifiedClassPathLoader)
+        );
+        assert_eq!(
+            check(class_name, "loadClass", false, true, SkipPolicy::Aggressive),
+            Some(SkipReason::SpringBootModifiedClassPathLoader),
+            "the guard must survive aggressive-policy validation runs"
+        );
+        assert_eq!(
+            check(class_name, "findClass", false, true, SkipPolicy::Aggressive),
+            None,
+            "only loadClass is implicated by the isolated JIT residual"
         );
     }
 

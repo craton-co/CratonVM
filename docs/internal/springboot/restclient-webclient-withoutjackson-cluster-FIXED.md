@@ -1,9 +1,8 @@
 # `*TestWithoutJacksonIntegrationTests`: two-bug cluster under `@ClassPathExclusions("jackson-*.jar")`
 
-**Status: Bug A FIXED 2026-07-21. Bug B OPEN — found 2026-07-21, extensively
-re-investigated 2026-07-21 (sessions #2 and #3, see below) — narrowed to an
-extremely small surface (confirmed NOT a classloading/reflection-identity
-bug, confirmed NOT a context-cache-reuse bug) but still not root-caused.**
+**Status: FIXED 2026-07-21. Bug A (concurrent `URLClassLoader.findClass`
+double-define) and Bug B (JIT-compiled `ModifiedClassPathClassLoader.loadClass`
+non-progress) are both closed.**
 
 ## Symptom
 
@@ -640,5 +639,39 @@ is not a classloading exception.
 
 | Module | Class | Status |
 |---|---|---|
-| `module/spring-boot-restclient-test` | `org.springframework.boot.restclient.test.autoconfigure.RestClientTestWithoutJacksonIntegrationTests` | Bug A fixed; Bug B OPEN |
-| `module/spring-boot-webclient-test` | `org.springframework.boot.webclient.test.autoconfigure.WebClientTestWithoutJacksonIntegrationTests` | Bug A fixed; Bug B OPEN |
+| `module/spring-boot-restclient-test` | `org.springframework.boot.restclient.test.autoconfigure.RestClientTestWithoutJacksonIntegrationTests` | PASS — fixed |
+| `module/spring-boot-webclient-test` | `org.springframework.boot.webclient.test.autoconfigure.WebClientTestWithoutJacksonIntegrationTests` | PASS — fixed |
+
+## Final resolution (2026-07-21)
+
+The remaining Bug B was a **JIT-only non-progress defect** in Spring Boot
+test-support's `ModifiedClassPathClassLoader.loadClass(String)`. Its
+`@ClassPathExclusions("jackson-*.jar")` re-launch path intermittently reached
+the inner Boot startup and then stopped advancing in
+`PropertiesPropertySource.getPropertyNames` →
+`SpringIterableConfigurationPropertySource$Cache.tryUpdate`, with four nested
+frames of this exact `loadClass` method. A 480-second VM watchdog showed the
+main thread actively executing that stack, not blocked on a context-cache or
+monitor.
+
+The exact class passed with `--nojit` (260.4s) and with only
+`ModifiedClassPathClassLoader.loadClass` supplied through the JIT bisection
+hook (199.0s). CratonVM now permanently keeps that single cold test-support
+method interpreted (`SkipReason::SpringBootModifiedClassPathLoader`); ordinary
+application class loading and `findClass` remain JIT-eligible.
+
+Final clean release validation used
+`cratonvm-restclient-webclient-withoutjackson-fixed-20260721.exe`
+(`03B50E4D40797EFE6A1CE4562C94C1E18F855A54A522405211144378D60EEE56`), serial
+execution, and the real Spring Boot fixture at `C:\craton\CratonVM\apps\spring-boot`:
+
+| Mode | RestClient test | WebClient test |
+|---|---:|---:|
+| Craton JIT | PASS, 101.5s | PASS, 122.6s |
+| Craton `--nojit` | PASS, 109.2s | PASS, 117.7s |
+| HotSpot JIT baseline | PASS, 4.7s | PASS, 5.0s |
+
+Focused unit coverage:
+`jit::skip_list::tests::spring_boot_modified_classpath_loader_is_always_interpreted`
+passes and ensures the guard applies under both conservative and aggressive
+JIT policies while leaving `findClass` outside this new rule.
