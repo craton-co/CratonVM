@@ -1258,6 +1258,78 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         m3_abstract_bean_definition_resolve_bean_class,
     );
 
+    // Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+    // IntegrationTests#refreshSucceedsWithoutHealth): `AbstractBeanDefinition.
+    // setBeanClass(Class)` is the common tail of EVERY bean-registration path
+    // that already holds a resolved `Class` object — including `Enable
+    // ConfigurationPropertiesRegistrar` → `ConfigurationPropertiesBeanRegistrar
+    // .createBeanDefinition` → `new AnnotatedGenericBeanDefinition(type)`, where
+    // `type` comes from `MergedAnnotation.getClassArray(...)` reading `@Enable
+    // ConfigurationProperties(ServerProperties.class)`'s value off a CACHED,
+    // already-materialised `TypeMappedAnnotation`. Root-caused via a stack-trace
+    // capture at this exact call site (confirmed the caller chain: `Enable
+    // ConfigurationPropertiesRegistrar.registerBeanDefinitions` → `Configuration
+    // PropertiesBeanRegistrar.{register,createBeanDefinition}` →
+    // `AnnotatedGenericBeanDefinition.<init>`).
+    //
+    // Under a Spring Boot `ModifiedClassPathClassLoader`-isolated test
+    // (`@ClassPathExclusions`), that materialised value can carry the
+    // Application-loader's copy of a class even though every OTHER read of the
+    // same annotation attribute (a fresh `Class.getDeclaredAnnotations()` call,
+    // traced separately) correctly resolves through `container_loader` to the
+    // isolated loader's own copy — some earlier, cached materialisation of the
+    // SAME `@EnableConfigurationProperties` instance apparently won. The two
+    // Class objects share a name but not an identity: the bean instantiated
+    // from this (wrong) `Class` later fails `Method.invoke`'s reflective
+    // argument-assignability check against a factory-method parameter type that
+    // WAS correctly resolved via `container_loader`, throwing
+    // `IllegalArgumentException("argument type mismatch")` at a completely
+    // unrelated call site.
+    //
+    // Fix: when the incoming `Class` belongs to no recorded user-defined loader
+    // (i.e. it resolved through the global/Application path) AND the CURRENT
+    // THREAD's context classloader is a user-defined loader — the isolated
+    // loader for the whole duration of a `ModifiedClassPathClassLoader`-forked
+    // test — prefer that loader's OWN copy of the same class name, mirroring
+    // the identical `resolve_class_id_via_tccl` pattern already applied to
+    // `resolve_bean_class_field`'s string-resolution fallback. A loader-owned
+    // `Class` (the overwhelmingly common case outside isolated-loader tests) is
+    // untouched — `resolve_class_id_via_tccl` only returns `Some` when the TCCL
+    // is genuinely user-defined and actually resolves the name, so this can
+    // only ever correct a loader-blind resolution, never override a
+    // legitimately-loader-owned one.
+    registry.register(
+        "org/springframework/beans/factory/support/AbstractBeanDefinition",
+        "setBeanClass",
+        "(Ljava/lang/Class;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let mut cls = match args.get(1) {
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
+            };
+            if let Some(c) = cls {
+                if let Some(cid) = ctx.class_id_from_mirror(c) {
+                    if crate::classloader::defining_loader_for(cid.as_u32()).is_none() {
+                        if let Some(name) = ctx.class_name_of_id(cid) {
+                            if let Some(better_cid) = resolve_class_id_via_tccl(ctx, &name) {
+                                if better_cid != cid {
+                                    let mirror = ctx.get_class_mirror(better_cid);
+                                    cls = Some(mirror);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ctx.set_field_by_name(this, "beanClass", Value::Object(cls));
+            Ok(None)
+        },
+    );
+
     // sportme: the actual throw site is `AbstractBeanDefinition.getBeanClass()`,
     // which throws ISE("Bean class name [%s] has not been resolved into an
     // actual Class") when beanClass is a String (not yet resolved). This used
@@ -2798,6 +2870,74 @@ enum BeanClassResolution {
     Placeholder,
 }
 
+/// Resolve `internal` through the CURRENT THREAD's context classloader when
+/// it is a user-defined (non-bootstrap/platform/app) loader, mirroring what
+/// real `ClassUtils.forName(name, beanClassLoader)` /
+/// `ClassUtils.getDefaultClassLoader()` would do when a bean factory's own
+/// `beanClassLoader` isn't explicitly threaded down to this native shim.
+///
+/// Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
+/// IntegrationTests#refreshSucceedsWithoutHealth): `resolve_bean_class_field`
+/// (below) reads a `RootBeanDefinition`'s `beanClass` field, which can still
+/// be a bare `String` (not yet cached as a `Class` mirror) the first time
+/// this shim runs on it. The plain `ctx.class_id_by_name`/`ensure_class_
+/// initialized` global lookup always collapses to the FIRST-EVER loaded
+/// same-named class — under a Spring Boot `ModifiedClassPathClassLoader`-
+/// isolated test (`@ClassPathExclusions`), that's the plain Application
+/// loader's copy, not the isolated loader's own copy the surrounding test
+/// actually runs under (confirmed via `Thread.currentThread().
+/// getContextClassLoader()` being the isolated loader throughout such a
+/// test — the whole method re-runs under a swapped TCCL). A `ServerProperties`
+/// bean definition resolved this way then silently instantiates as the WRONG
+/// (Application-loader) class, one whose `Class` reference is unequal to the
+/// isolated loader's copy read everywhere else (annotation-driven `@Bean`
+/// factory-method parameter types, `ObjectProvider` identity checks, etc.) —
+/// surfacing much later as `IllegalArgumentException("argument type
+/// mismatch")` at a completely unrelated reflective `Method.invoke` site.
+/// Try the TCCL first, same as the real JDK/Spring default-classloader
+/// convention, before falling back to the global table.
+fn resolve_class_id_via_tccl(
+    ctx: &mut dyn NativeContext,
+    internal: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let tcl = ctx
+        .invoke(
+            "java/lang/Thread",
+            "currentThread",
+            "()Ljava/lang/Thread;",
+            &[],
+        )
+        .ok()
+        .flatten();
+    let loader = match tcl {
+        Some(Value::Object(Some(t))) => match ctx.invoke(
+            "java/lang/Thread",
+            "getContextClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            &[Value::Object(Some(t))],
+        ) {
+            Ok(Some(Value::Object(Some(l)))) => l,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !crate::classloader::is_user_defined_loader(ctx, loader) {
+        return None;
+    }
+    let dotted = internal.replace('/', ".");
+    let name_obj = ctx.create_string(&dotted);
+    let result = ctx.invoke_virtual(
+        loader,
+        "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name_obj))],
+    );
+    match result {
+        Ok(Some(Value::Object(Some(mirror)))) => ctx.class_id_from_mirror(mirror),
+        _ => None,
+    }
+}
+
 /// Resolve `internal` (the plain dot-to-slash conversion of `dotted`) to a
 /// `ClassId`, retrying with a `ClassUtils.forName`-style dot-vs-dollar
 /// nested-class fallback on failure: if the segment right after the
@@ -2811,6 +2951,9 @@ fn resolve_class_id_with_nested_retry(
     dotted: &str,
     internal: &str,
 ) -> Option<cratonvm_types::ClassId> {
+    if let Some(c) = resolve_class_id_via_tccl(ctx, internal) {
+        return Some(c);
+    }
     if let Some(c) = ctx.class_id_by_name(internal) {
         return Some(c);
     }
