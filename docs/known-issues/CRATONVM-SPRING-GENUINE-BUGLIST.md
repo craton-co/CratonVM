@@ -120,6 +120,37 @@ work merged from `origin/dev`), no new failures.
   (`lookupWithExposeAccessContext` — Mockito verifies `context.close()`
   called 2 times but sees 3, an extra close through an
   `exposeAccessContext` JDK dynamic proxy) — not yet investigated.
+- `beans.factory.xml.XmlBeanFactoryTests`: 10/95 still fail (unchanged from
+  the 2026-07-20 reconfirmation). Root-caused 2 of the 10
+  (`overrideMethodByArgTypeAttribute`/`overrideMethodByArgTypeElement`,
+  `<replaced-method>`/`ReplaceOverride` with `<arg-type>` overload
+  disambiguation) partway: `native-builtins::spring_startup_bootstrap
+  ::try_build_replace_override` mapped `methodName -> replacerBeanName`
+  by NAME ONLY, ignoring `<arg-type>` entirely -- fixed by reading each
+  `ReplaceOverride`'s real `getTypeIdentifiers()` (Spring 6.2.9+) and
+  replicating `ReplaceOverride.matches(Method)`'s exact algorithm
+  (overloaded-name arg-substring matching) in
+  `jvm_descriptor_param_types_dot_notation`/`jvm_type_to_java_name`. This
+  fix is real and landed (more correct than before for the general
+  multi-overload-with-different-replacers case), but did NOT close these
+  2 tests: traced with `CRATONVM_DBG_REPLOVR` to find the true blocker --
+  `try_build_replace_override`'s `super_cid` parameter resolves to the
+  WRONG class entirely for these 2 beans (`org/springframework/beans
+  /factory/xml/SerializableMethodReplacerCandidate`, an unrelated helper
+  class from a different test method in the same file, instead of the
+  bean's actual declared class `OverrideOneMethod` -- confirmed via
+  `javap` that the real `OverrideOneMethod.class` correctly has all 3
+  `replaceMe()`/`replaceMe(int)`/`replaceMe(String)` overloads). This is a
+  class-resolution/caching bug upstream of `try_build_replace_override`
+  (in whatever resolves a `RootBeanDefinition`'s declared class to a
+  `ClassId` before this function is called) -- likely the same family as
+  other loader-identity/class-resolution bugs documented elsewhere in
+  this repo's history, but not yet traced to its own root cause. The
+  other 8/10 `XmlBeanFactoryTests` failures (`rejectsOverrideOfBogusMethodName`,
+  `classNotFoundWithDefaultBeanClassLoader`,
+  `replaceNonOverloadedInterfaceMethodWithoutSpecifyingExplicitArgTypes`,
+  and the 3 CGLIB config-class-adjacent `context.annotation.*` failures
+  below) were not investigated this session.
 
 ## Notable clusters (2026-07-20 session)
 

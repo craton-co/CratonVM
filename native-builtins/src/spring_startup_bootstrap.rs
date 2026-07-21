@@ -2453,6 +2453,78 @@ fn try_build_method_injection(
 /// the subclass directly (see `cglib_enhancer::build_replace_override_subclass`).
 /// Returns `Some(instance)` when at least one replaced method was overridden,
 /// `None` to fall through to the ordinary instantiation path.
+/// A single JVM descriptor type (e.g. `I`, `Ljava/lang/String;`, `[I`) to the
+/// dot-notation name `Class.getName()` would produce (`"int"`,
+/// `"java.lang.String"`, `"[I"`), for `ReplaceOverride.matches(Method)`-style
+/// substring matching against `<arg-type>` fragments -- see
+/// `try_build_replace_override` below.
+fn jvm_type_to_java_name(desc: &str) -> String {
+    let mut dims = 0usize;
+    let mut rest = desc;
+    while let Some(r) = rest.strip_prefix('[') {
+        dims += 1;
+        rest = r;
+    }
+    let base = match rest.chars().next() {
+        Some('L') => rest[1..rest.len().saturating_sub(1)].replace('/', "."),
+        Some('I') => "int".to_string(),
+        Some('J') => "long".to_string(),
+        Some('Z') => "boolean".to_string(),
+        Some('B') => "byte".to_string(),
+        Some('C') => "char".to_string(),
+        Some('S') => "short".to_string(),
+        Some('F') => "float".to_string(),
+        Some('D') => "double".to_string(),
+        _ => rest.to_string(),
+    };
+    if dims == 0 {
+        base
+    } else {
+        // Real `Class.getName()` for an array type keeps the descriptor
+        // shape (`[I`, `[Ljava.lang.String;`) rather than the plain-English
+        // primitive name. Array params are rare for this feature; this is
+        // close enough for the substring match below to behave correctly.
+        let prefix: String = "[".repeat(dims);
+        match rest.chars().next() {
+            Some('L') => format!("{prefix}L{base};"),
+            _ => format!("{prefix}{rest}"),
+        }
+    }
+}
+
+/// Split a JVM method descriptor's parameter section into per-parameter
+/// dot-notation type names (see `jvm_type_to_java_name`).
+fn jvm_descriptor_param_types_dot_notation(descriptor: &str) -> Vec<String> {
+    let Some(open) = descriptor.find('(') else {
+        return Vec::new();
+    };
+    let Some(close) = descriptor.find(')') else {
+        return Vec::new();
+    };
+    let params = &descriptor[open + 1..close];
+    let bytes = params.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'L' {
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            i += 1; // include ';'
+        } else {
+            i += 1; // primitive: single char
+        }
+        if start < i {
+            result.push(jvm_type_to_java_name(&params[start..i]));
+        }
+    }
+    result
+}
+
 fn try_build_replace_override(
     ctx: &mut dyn NativeContext,
     mbd: ObjectRef,
@@ -2485,9 +2557,17 @@ fn try_build_replace_override(
 
     let super_internal = ctx.class_name_of_id(super_cid)?;
 
-    // Collect (methodName → replacerBeanName) for every ReplaceOverride.
+    // Collect (methodName -> [ReplaceOverride configs]) -- a name can have
+    // MORE THAN ONE `<replaced-method>` entry when `<arg-type>` disambiguates
+    // between overloads (see `overrideMethodByArgTypeAttribute`/`Element` in
+    // `XmlBeanFactoryTests`), so this must be a name -> Vec, not name -> single
+    // replacer.
+    struct ReplaceOverrideCfg {
+        type_identifiers: Vec<String>,
+        replacer_bean_name: String,
+    }
     let mbd = ctx.read_native_pin(mbd_pin, mbd);
-    let mut replacers: HashMap<String, String> = HashMap::new();
+    let mut replacers: HashMap<String, Vec<ReplaceOverrideCfg>> = HashMap::new();
     if let Ok(Some(Value::Object(Some(mo)))) = ctx.invoke_virtual(
         mbd,
         "getMethodOverrides",
@@ -2518,10 +2598,10 @@ fn try_build_replace_override(
                     if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
                         continue;
                     }
-                    // GC-safety: `getMethodName`/`getMethodReplacerBeanName`
-                    // below can each trigger a collection that relocates
-                    // `ovr` (used again by the next call); pin per-
-                    // iteration and release before continuing to the next
+                    // GC-safety: `getMethodName`/`getMethodReplacerBeanName`/
+                    // `getTypeIdentifiers` below can each trigger a collection
+                    // that relocates `ovr` (used again by the next call); pin
+                    // per-iteration and release before continuing to the next
                     // `i`.
                     let ovr_pin = ctx.pin_native_root(ovr);
                     let mname =
@@ -2548,9 +2628,41 @@ fn try_build_replace_override(
                             continue;
                         }
                     };
+                    // `<arg-type>` fragments (e.g. "String", "java.lang.Exc")
+                    // used to disambiguate an overloaded method name -- see
+                    // `ReplaceOverride.matches(Method)`'s real algorithm,
+                    // which this mirrors below. Added in Spring 6.2.9
+                    // specifically so callers other than CGLIB (i.e. us)
+                    // could read them back out.
+                    let mut type_identifiers: Vec<String> = Vec::new();
+                    let ovr = ctx.read_native_pin(ovr_pin, ovr);
+                    if let Ok(Some(Value::Object(Some(list)))) =
+                        ctx.invoke_virtual(ovr, "getTypeIdentifiers", "()Ljava/util/List;", &[])
+                    {
+                        let list_pin = ctx.pin_native_root(list);
+                        let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+                            Ok(Some(Value::Int(n))) => n,
+                            _ => 0,
+                        };
+                        for j in 0..size {
+                            let list = ctx.read_native_pin(list_pin, list);
+                            if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                                list,
+                                "get",
+                                "(I)Ljava/lang/Object;",
+                                &[Value::Int(j)],
+                            ) {
+                                type_identifiers.push(ctx.read_string(s).unwrap_or_default());
+                            }
+                        }
+                        ctx.unpin_native_roots(list_pin);
+                    }
                     ctx.unpin_native_roots(ovr_pin);
                     if !mname.is_empty() {
-                        replacers.insert(mname, rname);
+                        replacers.entry(mname).or_default().push(ReplaceOverrideCfg {
+                            type_identifiers,
+                            replacer_bean_name: rname,
+                        });
                     }
                 }
                 ctx.unpin_native_roots(arr_pin);
@@ -2566,17 +2678,21 @@ fn try_build_replace_override(
     // single override (the most-derived declaration wins — first seen walking
     // from the bean class upward).
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    struct Candidate {
+        name: String,
+        descriptor: String,
+        access_flags: u16,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
         for m in ctx.declared_methods(cid) {
             if m.name.starts_with('<') {
                 continue;
             }
-            let replacer = match replacers.get(&m.name) {
-                Some(r) => r.clone(),
-                None => continue,
-            };
+            if !replacers.contains_key(&m.name) {
+                continue;
+            }
             if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
                 != 0
             {
@@ -2585,13 +2701,50 @@ fn try_build_replace_override(
             if !seen.insert((m.name.clone(), m.descriptor.clone())) {
                 continue;
             }
-            specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+            candidates.push(Candidate {
                 name: m.name.clone(),
                 descriptor: m.descriptor.clone(),
-                replacer_bean_name: replacer,
+                access_flags: m.access_flags,
             });
         }
         cursor = ctx.superclass_of(cid);
+    }
+    // A name is "overloaded" (in `ReplaceOverride.matches`'s sense) iff more
+    // than one candidate method shares it -- matches Spring's own
+    // `RootBeanDefinition.prepareMethodOverride` computation
+    // (`ClassUtils.getMethodCountForName(clazz, mo.getMethodName()) > 1`).
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for c in &candidates {
+        *name_counts.entry(c.name.clone()).or_insert(0) += 1;
+    }
+    let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
+    for c in &candidates {
+        let cfgs = &replacers[&c.name];
+        let is_overloaded = name_counts.get(&c.name).copied().unwrap_or(0) > 1;
+        let param_types = jvm_descriptor_param_types_dot_notation(&c.descriptor);
+        // First `ReplaceOverride` config whose type identifiers match this
+        // candidate's actual parameter types, mirroring
+        // `ReplaceOverride.matches(Method)`: an unoverloaded name always
+        // matches (arg types irrelevant); an overloaded name requires an
+        // exact-arity, per-parameter substring match.
+        let matched = cfgs.iter().find(|cfg| {
+            if !is_overloaded {
+                return true;
+            }
+            cfg.type_identifiers.len() == param_types.len()
+                && cfg
+                    .type_identifiers
+                    .iter()
+                    .zip(param_types.iter())
+                    .all(|(ident, pty)| pty.contains(ident.as_str()))
+        });
+        let Some(cfg) = matched else { continue };
+        let _ = c.access_flags; // already filtered above
+        specs.push(crate::cglib_enhancer::ReplaceMethodSpec {
+            name: c.name.clone(),
+            descriptor: c.descriptor.clone(),
+            replacer_bean_name: cfg.replacer_bean_name.clone(),
+        });
     }
     if specs.is_empty() {
         return None;
