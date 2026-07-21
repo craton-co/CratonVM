@@ -7757,6 +7757,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let proxies = self.shared.lambda_proxies.read();
             proxies.get(&receiver_class_id).cloned()
         };
+        if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+            && method_name == "aotContributedInitializerStartsManagementContext"
+        {
+            eprintln!(
+                "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
+                method_name, receiver_class_id, call_site.is_some()
+            );
+        }
 
         // Keep the receiver and arguments rooted across the dispatch decision:
         // the selected lambda body can allocate immediately after this block.
@@ -8185,6 +8193,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
+            if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                eprintln!("[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch", method_name);
+            }
             // Not a lambda-dispatch call after all (the receiver wasn't a
             // recognized proxy, or the `.filter()` predicate above rejected
             // it) -- release the pins from the GC-safety block above. Refresh

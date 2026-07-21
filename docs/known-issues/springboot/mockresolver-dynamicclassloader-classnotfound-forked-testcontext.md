@@ -1,13 +1,21 @@
 # Mockito `MockResolver` plugin `ClassNotFoundException` inside Spring's `@CompileWithForkedClassLoader` test context
 
 **Status: OPEN — found 2026-07-20, investigated 2026-07-20 (session 2),
-root-caused further 2026-07-21 (session 3). Session 2's "likely GC-timing-
-dependent, not reproducible" verdict is SUPERSEDED — session 3 found a
-100% deterministic, non-timing-dependent repro (a different symptom on the
-SAME test: `AssertJMultipleFailuresError: expected 2 but was 1`, not the
-`ClassNotFoundException` from session 1) and, via direct A/B comparison
-against real HotSpot, confirmed it is a genuine CratonVM class-identity bug,
-not test flakiness. The exact internal mechanism is still NOT pinpointed —
+root-caused and PARTIALLY FIXED 2026-07-21 (session 3). Session 2's "likely
+GC-timing-dependent, not reproducible" verdict is SUPERSEDED — session 3
+found a 100% deterministic, non-timing-dependent repro (a different symptom
+on the SAME test: `AssertJMultipleFailuresError: expected 2 but was 1`, not
+the `ClassNotFoundException` from session 1), root-caused it precisely to
+`Class.getDeclaredClasses()` resolving nested classes through a loader-blind
+lookup (fixed, see "Fix landed" below), and — after that fix let previously
+DEAD code run for the first time — uncovered a SEPARATE, second bug in
+generated-class-name plumbing for nested AOT management-context generation
+(`public class class`/`public void void(...)` — literally-malformed
+generated Java, NOT yet fixed). The test still fails; do not close this doc.
+See "2026-07-21 session 3 continued — fix landed, second bug found" below.
+The paragraph immediately below (original session-3 "not yet pinpointed"
+writeup) is preserved for its diagnostic value but is SUPERSEDED by the
+"continued" section further down, which found the actual site —
 see "2026-07-21 session 3" below for what's ruled out and the precise next
 step for a follow-up session.**
 
@@ -460,19 +468,199 @@ extended `CRATONVM_INVOKESTATIC_LOADER_TRACE` guard in `execute_invokestatic`
 — all additive, env-var-gated, zero behavior change when unset) ARE
 committed on this branch and available for reuse.
 
+## 2026-07-21 session 3 continued — root cause found and fixed; second bug uncovered
+
+**Process note first, because it cost most of this continued session and is
+worth not repeating**: every `cargo build` after the very first one in this
+session had been silently no-op'ing. The rebuild command was `cmd /c
+'"...\vcvars64.bat" && ... && cd /d <worktree> && cargo build ...'` issued
+through the **Bash tool** — this is exactly
+[[reference_bash_tool_cmd_c_msys_trap]]: Git-Bash/MSYS mangles `cmd`'s `/c`
+flag (worse, with a `cd /d <drive-letter-path>` segment in the string, per
+that memory's "non-deterministic trigger" note) and the whole invocation
+silently degrades to an interactive `cmd.exe` banner + bare prompt — no
+error, exit code still reported as 0 by the wrapping tool call. `cratonvm.exe`
+kept the FIRST build's mtime through six subsequent "successful" rebuilds;
+every `eprintln!` trace added in this window (`CRATONVM_LDC_CLASSREF_TRACE`,
+the `resolve_class_loader_aware`/`execute_invokestatic` guard extensions,
+`CRATONVM_EXEC_FRAME_TRACE`, `CRATONVM_NEEDS_EXACT_TRACE`,
+`CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE`) reported "zero hits" not because
+those code paths were unreached, but because **the binary being tested
+never contained them**. All of the "ruled out" conclusions attributed to
+those traces earlier in this doc are therefore unverified, not
+disproven — the paths may well be fine (the eventual real trace, below,
+suggests they are), but treat that whole stretch as informative context,
+not fact. **Lesson applied**: switched to the **PowerShell tool** for every
+`vcvars64.bat`/`cmd /c` build chain from this point on (per the memory's
+"working fix"), verified with `stat -c "%y %n" target/release/cratonvm.exe`
+that the mtime actually advanced and the log ended with `Finished \`release\`
+profile` before trusting any subsequent result. Every trace result below is
+from a build verified this way.
+
+With a genuinely rebuilt binary, the SAME traces immediately told a clean,
+consistent story: `invoke_virtual` IS entered (not lambda), the loader-
+identity gate at `vm_exec.rs:8398` DOES correctly select
+`invoke_on_class_shared` with the receiver's own (forked) `ClassId`,
+`interpreter::execute` DOES push the frame for
+`aotContributedInitializerStartsManagementContext` with the correct forked
+`class_id` and `loader=Some(UserDefined(3))`, and `execute_ldc` DOES resolve
+its `ldc ManagementContextAutoConfiguration.class` through
+`resolve_class_loader_aware` with the correct forked `referencing_class_id`
+— which correctly drives the forked loader's own `loadClass` and gets back
+a **forked** `ManagementContextAutoConfiguration`. Every step in the
+dispatch chain for the OUTER class was already correct — candidate 1 from
+the earlier (stale-binary) writeup is a dead end, not a real lead.
+
+The actual bug is one level down: **`Class.getDeclaredClasses()`**
+(`native_class_get_declared_classes`,
+`native-builtins/src/lang_class.rs:15537`) resolves each NESTED class
+(`SameManagementContextConfiguration`, `DifferentManagementContextConfiguration`,
+`LocalManagementPortPropertySource`) via a plain, loader-blind
+`ctx.class_id_by_name(inner_class)` — a straight call to
+`ClassManager::find_class_by_name`, which only walks the builtin
+bootstrap→extension→application delegation chain (see
+`get_loaded_class_id`/`get_loaded_class_id_for_requester` in
+`classloading/src/class_manager.rs:1871+`) and never even looks at
+user-defined loaders. So even though `ManagementContextAutoConfiguration`
+itself (the OUTER class, resolved via the correct, loader-aware `ldc` path
+above) is the FORKED copy, asking IT for its declared/nested classes
+returned the APP LOADER's copies of those nested classes — confirmed
+directly: `metadata.getIntrospectedClass()` for
+`DifferentManagementContextConfiguration` printed
+`jdk.internal.loader.ClassLoaders$AppClassLoader`, while
+`OnManagementPortCondition`/`ManagementPortType.get()` (reached via a
+completely different path — `Class.forName(name, context.getClassLoader())`,
+already loader-aware) printed the forked loader — two provably-different
+`Class<ManagementPortType>` objects, so the `==` check in
+`OnManagementPortCondition.getMatchOutcome()` silently failed.
+
+There's an EXISTING, precedented fix for exactly this shape:
+`NativeContext::class_id_by_name_near(name, near)`
+(`native-api/src/registry.rs:1496`) — its own doc comment describes this
+exact bug class almost verbatim (a Hibernate ByteBuddy-reloaded
+`@EmbeddedId` class collapsing to the wrong loader's copy). It wasn't wired
+up in `getDeclaredClasses()`. **Fix, in two parts** (both needed —
+verified the first alone was insufficient):
+
+1. Swap `ctx.class_id_by_name(inner_class)` for
+   `ctx.class_id_by_name_near(inner_class, class_id)` (`class_id` = the
+   OUTER class being reflected on) for the "already loaded" fast path. This
+   alone did NOT fix the test: `class_id_by_name_near` only prefers an
+   ALREADY-loaded same-loader copy; if the forked loader was never actually
+   asked to load `DifferentManagementContextConfiguration` (nothing else in
+   the run happens to trigger that — the outer class gets its own forked
+   identity via a directly-executed `ldc`, but Java-level reflection on it
+   via `getDeclaredClasses()` never itself calls `loadClass` on anything),
+   there IS no forked-loader copy yet to prefer, and the lookup still fell
+   through to the global (app-loader) one.
+2. So, for a lookup miss, DRIVE the outer class's own defining loader's
+   `loadClass(String)` directly (JVMS §5.4.3 initiating-loader semantics) —
+   the same pattern `drive_defining_loader_load` uses in
+   `vm/src/runtime/interpreter.rs`, reimplemented locally in
+   `native-builtins` (that function is private to the `vm` crate; `native-
+   builtins` sits below it in the dependency graph and can't call it
+   directly, but has the same building blocks —
+   `crate::classloader::defining_loader_for` for the loader object,
+   `ctx.invoke_virtual(loader_obj, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", ...)`
+   to actually drive it) — BEFORE falling back to the global, loader-blind
+   `ctx.load_class(inner_class)`. This is what actually made the forked
+   loader mint its own `DifferentManagementContextConfiguration` (via its
+   `findClass` fallback — the raw byte-read-and-`defineClass` mechanism
+   from the very top of this doc, this time correctly triggered).
+
+**Verified fixed**: re-ran the diagnostic build with both parts of the fix.
+`OnManagementPortCondition`'s `sameClass` print flipped from `false` to
+`true` for BOTH `DifferentManagementContextConfiguration` and
+`SameManagementContextConfiguration`, `requiredType`/`actualType` now share
+one `Class` object, and `@ConditionalOnManagementPort(DIFFERENT)` correctly
+MATCHES. **This part of the bug is genuinely fixed** — landed in
+`native-builtins/src/lang_class.rs` on this branch.
+
+**The test still fails, on a different, previously-unreachable error.**
+With the condition now correctly matching, `DifferentManagementContextConfiguration`'s
+bean gets registered for the first time ever under CratonVM for this test,
+which drives `ChildManagementContextInitializer.processAheadOfTime()` (the
+`BeanRegistrationAotProcessor` override) to run its own NESTED AOT
+generation pass for the management child context
+(`new ApplicationContextAotGenerator().processAheadOfTime(this.managementContext, managementGenerationContext)`
+inside `AotContribution.applyTo`, see `ChildManagementContextInitializer.java`
+near the end of this doc's earlier reading). That nested pass's generated
+source is malformed:
+
+```
+@@Generated
+public class class implements ApplicationContextInitializer<GenericApplicationContext> {
+  @@Override
+  public void void((GenericApplicationContext  applicationContext) {
+```
+
+Note the literal Java keywords used as identifiers (`class class`, `void
+void`), doubled `@@Generated`/`@@Override` annotations, and a doubled `((`
+in the method signature — this is javapoet-generated code where the
+GENERATED class name and method name came back empty/null, so the template
+literally inserted the modifier keywords with nothing after them. This
+throws `com.thoughtworks.qdox.parser.ParseException: syntax error @[15,14]`
+inside `SourceFile.getClassName()` when Spring's `TestCompiler` tries to
+QDox-parse the generated content to derive its class name — i.e. it never
+even reaches `javac`. This is a SECOND, INDEPENDENT CratonVM bug (almost
+certainly in how a nested/secondary `ApplicationContextAotGenerator.processAheadOfTime`
+pass derives or returns its generated `ClassName`, or in whatever CratonVM
+reflection/String machinery javapoet's `TypeSpec`/`MethodSpec` builders rely
+on for name formatting) — NOT a consequence of the `getDeclaredClasses()`
+fix being wrong, but a pre-existing gap that the `getDeclaredClasses()` bug
+had been accidentally masking by keeping this whole code path dead (the
+condition always evaluated NO MATCH before, so `DifferentManagementContextConfiguration`,
+and everything downstream of it including this nested AOT pass, never ran
+at all under CratonVM until now).
+
+**This doc stays OPEN.** The `getDeclaredClasses()` fix is real, safe, and
+worth keeping (fixes a genuine, general loader-identity bug, not just this
+test), but the test's own assertion still fails on the newly-exposed second
+bug. A follow-up session should start from the malformed-generated-source
+symptom above — find where `ApplicationContextAotGenerator.processAheadOfTime`'s
+returned `ClassName` (or whatever javapoet consumes to name the generated
+class/method) comes back empty specifically for this NESTED/secondary AOT
+pass (the OUTER `processAheadOfTime` call at the top of the test works
+fine — its own generated sources dumped cleanly in this doc's earlier
+session-3 "generated sources" excerpt — so whatever's different about the
+nested pass, triggered from inside a `BeanRegistrationAotProcessor`
+callback rather than directly from the test, is the next thing to isolate).
+
 ## Next steps for a follow-up session
 
-1. Start from candidate 1 above (`native_method_invoke`'s virtual-dispatch
+**Superseded**: the numbered candidates below (1-3, from the stale-binary
+stretch of session 3) turned out to be dead ends once traced with a
+genuinely rebuilt binary — `invoke_virtual`/`execute_ldc`/frame setup are
+all correct for the outer class. The real bug (`getDeclaredClasses()`) is
+described and FIXED in "session 3 continued" above. **Start here instead**:
+
+0. Isolate the malformed-generated-source bug ("session 3 continued"'s
+   `public class class` / `public void void(...)` symptom) — this is now
+   the ONLY thing standing between this test and passing. Suggested
+   approach: write a minimal standalone repro that calls
+   `new ApplicationContextAotGenerator().processAheadOfTime(...)` on a
+   plain `GenericApplicationContext` from INSIDE a
+   `BeanRegistrationAotProcessor.processAheadOfTime` callback (mirroring
+   `ChildManagementContextInitializer`'s exact shape) rather than directly
+   from a test method, and dump the `ClassName` it returns — compare against
+   the OUTER, directly-invoked call's `ClassName`, which works fine. Prime
+   suspects: something about `RegisteredBean`/`BeanRegistrationCode`
+   context available to the OUTER call but not reconstructed correctly for
+   a nested call issued from inside a processor callback, or a CratonVM
+   naming/reflection utility javapoet depends on (`Class.getSimpleName()`,
+   `String` formatting, or similar) behaving differently when called from
+   that nested stack depth/context.
+1. (Superseded — kept for record) Start from candidate 1 above (`native_method_invoke`'s virtual-dispatch
    branch / `ctx.invoke_virtual` / frame setup for a reflectively re-invoked
    instance method) — add a trace at the point a new frame is pushed for a
    virtually-dispatched call, confirm whether the pushed frame's `class_id`
    matches the receiver's actual (forked) `ClassId` or a stale one.
-2. If that's clean, hunt for a decoded-`Instruction`/bytecode cache that
+2. (Superseded — kept for record) If that's clean, hunt for a decoded-`Instruction`/bytecode cache that
    might be shared by content-hash across the two `defineClass` calls
    (candidate 2) — this is the most likely remaining explanation given
    `execute_ldc` (the function that would consume such a cache miss) is
    proven never reached for these names.
-3. Once the exact resolution site is found, the fix is almost certainly the
+3. (Superseded — kept for record) Once the exact resolution site is found, the fix is almost certainly the
    same *shape* as the already-existing "Use the Method object's OWN
    already-resolved declaring ClassId" fix in `native_method_invoke`'s
    static-method branch, or the same shape as the already-fixed
