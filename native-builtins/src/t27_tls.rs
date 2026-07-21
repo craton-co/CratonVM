@@ -6809,6 +6809,66 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 // Native registrations (WP5.1 + WP5.4)
 // -----------------------------------------------------------------------------
 
+/// Build a synthetic `SSLSession` reflecting `id`'s negotiated (or, before/
+/// outside a handshake, best-effort default) cipher/protocol/ALPN state.
+/// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
+/// registration for why real JDK's `getHandshakeSession()` cannot be left
+/// un-intercepted on this engine implementation.
+fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRef {
+    let (proto, cipher, alpn) = with_engine(id, |s| {
+        let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
+            Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
+            Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+            _ => "TLSv1.3",
+        };
+        let cipher = s
+            .conn
+            .as_ref()
+            .and_then(|c| c.negotiated_cipher_suite())
+            .map(|cs| format!("{:?}", cs.suite()))
+            .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
+        let alpn = s.negotiated_alpn.clone().unwrap_or_default();
+        (proto.to_string(), cipher, alpn)
+    })
+    .unwrap_or_else(|| {
+        (
+            "TLSv1.3".into(),
+            "TLS_AES_256_GCM_SHA384".into(),
+            String::new(),
+        )
+    });
+    // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
+    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
+    let cipher_s = ctx.create_string(&cipher);
+    let proto_s = ctx.create_string(&proto);
+    let alpn_s = ctx.create_string(&alpn);
+    ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
+    ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
+    ctx.set_field(ses, 2, Value::Int(1));
+    ctx.set_field(ses, 3, Value::Object(None));
+    ctx.set_field(ses, 4, Value::Int(-1));
+    ctx.set_field(
+        ses,
+        5,
+        Value::Long(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        ),
+    );
+    ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
+    // Associate the peer (client) cert chain with this session object so
+    // SSLSession.getPeerCertificates() can return it for mTLS auth.
+    let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
+    if !peer_chain.is_empty() {
+        session_peer_certs_table()
+            .lock()
+            .insert(gc_stable_objref_key(ctx, ses), peer_chain);
+    }
+    ses
+}
+
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -7180,58 +7240,43 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(ctx, this);
-            let (proto, cipher, alpn) = with_engine(id, |s| {
-                let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
-                    Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
-                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
-                    _ => "TLSv1.3",
-                };
-                let cipher = s
-                    .conn
-                    .as_ref()
-                    .and_then(|c| c.negotiated_cipher_suite())
-                    .map(|cs| format!("{:?}", cs.suite()))
-                    .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".into());
-                let alpn = s.negotiated_alpn.clone().unwrap_or_default();
-                (proto.to_string(), cipher, alpn)
-            })
-            .unwrap_or_else(|| {
-                (
-                    "TLSv1.3".into(),
-                    "TLS_AES_256_GCM_SHA384".into(),
-                    String::new(),
-                )
-            });
-            // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
-            let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
-            let cipher_s = ctx.create_string(&cipher);
-            let proto_s = ctx.create_string(&proto);
-            let alpn_s = ctx.create_string(&alpn);
-            ctx.set_field(ses, 0, Value::Object(Some(cipher_s)));
-            ctx.set_field(ses, 1, Value::Object(Some(proto_s)));
-            ctx.set_field(ses, 2, Value::Int(1));
-            ctx.set_field(ses, 3, Value::Object(None));
-            ctx.set_field(ses, 4, Value::Int(-1));
-            ctx.set_field(
-                ses,
-                5,
-                Value::Long(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
-                ),
-            );
-            ctx.set_field(ses, 6, Value::Object(Some(alpn_s)));
-            // Associate the peer (client) cert chain with this session object so
-            // SSLSession.getPeerCertificates() can return it for mTLS auth.
-            let peer_chain = with_engine(id, |s| s.peer_cert_chain_der.clone()).unwrap_or_default();
-            if !peer_chain.is_empty() {
-                session_peer_certs_table()
-                    .lock()
-                    .insert(gc_stable_objref_key(ctx, ses), peer_chain);
-            }
-            Ok(Some(Value::Object(Some(ses))))
+            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
+                ctx, id,
+            )))))
+        },
+    );
+
+    // getHandshakeSession() — real `SSLEngineImpl.getHandshakeSession()` reads
+    // a real, JDK-internal `conContext` field that CratonVM's engine never
+    // populates (handshake state lives entirely in `EngineState`/
+    // `engine_registry()`, not on the real bytecode object) — un-intercepted,
+    // it NPEs ("Cannot read field \"handshakeContext\" because
+    // \"this.conContext\" is null"). Found via Jetty's
+    // `SslConnection.getBufferSize()` -> `getApplicationBufferSize()` ->
+    // `sslEngine.getHandshakeSession()`, called while sizing buffers for a
+    // brand-new client connection — i.e. BEFORE `beginHandshake()`/`wrap()`
+    // ever run, so `state.conn` is still `None` at this point. Jetty's own
+    // exception handling here (`ManagedSelector$Accept.run()`'s
+    // catch-Throwable) silently drops the failure (logs at DEBUG only, never
+    // reaches the connection's promise), which is why this specific NPE
+    // manifested as an indefinite hang/silent-exit crash rather than a
+    // visible test failure — see
+    // docs/known-issues/springboot/http-client-connector-teardown-hang-crash.md.
+    // Real JDK's `getHandshakeSession()` returns the session being
+    // negotiated (or null outside a handshake); returning the same
+    // best-effort synthetic session `getSession()` already builds (complete
+    // with graceful "no negotiation yet" defaults) is sufficient for every
+    // caller in this codebase's suites, which only use it for buffer sizing.
+    r.register(
+        cls_impl,
+        "getHandshakeSession",
+        "()Ljavax/net/ssl/SSLSession;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = engine_id_or_alloc(ctx, this);
+            Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
+                ctx, id,
+            )))))
         },
     );
 
