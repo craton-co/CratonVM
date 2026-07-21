@@ -398,6 +398,27 @@ should be clean (verify with `grep -rn CVDBG apps/spring-boot/module/spring-boot
 5. Check `WebClientTestWithoutJacksonIntegrationTests`'s exact failure mode
    independently — still not individually confirmed in either session.
 
+**Checked and ruled out (same session, after the above):** dev commit
+`01690055c` ("fix(vm): six compounding bugs in the native
+ConfigurationClassEnhancer proxy", landed on `dev` mid-session, unrelated —
+found while syncing this branch) fixes CGLIB `@Configuration`-class
+enhancement bugs in `native-builtins/src/cglib_enhancer.rs`, including a
+loader-identity bug (bug #6 in that commit) in the same thematic space as
+this investigation. Given the strong overlap, merged latest `dev` into this
+branch and re-ran the repro against a rebuilt binary — **the failure is
+byte-for-byte identical** (same `NoSuchBeanDefinitionException` for
+`RestTemplateBuilder`, same `UnsatisfiedDependencyException` wrapping it).
+That commit's fixes are exercised via `@CompileWithForkedClassLoader`
+(a different loader topology, forking loaders per-test-method for
+CGLIB/`ReflectUtils` infrastructure specifically) rather than
+`ModifiedClassPathClassLoader`, so this null result doesn't rule out CGLIB
+enhancement as *a* contributing bug family here — it only rules out *that
+specific* commit's fixes as sufficient on their own. Still worth checking
+`cglib_enhancer.rs` directly against the `ModifiedClassPathClassLoader`
+topology (its own loader-identity resolution — bug #6's pattern, resolving
+via the wrong receiver's loader — is exactly the shape of bug this whole
+investigation keeps circling back to).
+
 ### Methodology note (costly lesson this session — save future time)
 
 `apps/spring-boot`'s Gradle modules are consumed via their **built JAR**
