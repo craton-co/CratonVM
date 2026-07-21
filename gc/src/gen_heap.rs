@@ -2182,14 +2182,33 @@ impl GenerationalHeap {
             // against — widened from the original index-4/5-only guess to
             // any index once indices 0/1/3 were also observed correlating.
             if num_slots == 0 {
-                let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
-                    .map(|(n, _)| n)
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                eprintln!(
-                    "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
-                    obj_ref.as_ptr(),
-                    std::backtrace::Backtrace::force_capture()
-                );
+                // RATE-LIMIT (2026-07-21): the WildFly real-JDK boot hits this
+                // shape on EVERY framework log line (a delegating stream whose
+                // field walk lands on a plain `Object`); an unconditional
+                // symbolized `Backtrace::force_capture()` per occurrence turned
+                // each boot into minutes of stderr spam. Keep the first few
+                // full backtraces (they carry the diagnostic value) and a
+                // count-only heartbeat afterwards.
+                static RESID_READ_DIAG_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = RESID_READ_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 || n.is_power_of_two() {
+                    let diag_class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
+                        .map(|(n, _)| n)
+                        .unwrap_or_else(|| "<unresolved>".to_string());
+                    if n < 5 {
+                        eprintln!(
+                            "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p}\n{}",
+                            obj_ref.as_ptr(),
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                    } else {
+                        eprintln!(
+                            "[RESID-DIAG READ] class={diag_class_name} index={index} num_slots={num_slots} obj={:p} (occurrence #{n}, backtrace suppressed)",
+                            obj_ref.as_ptr(),
+                        );
+                    }
+                }
             }
             return Value::Object(None);
         }
@@ -2408,11 +2427,22 @@ impl GenerationalHeap {
             // RESID-DIAG (dohead residuals investigation, 20260718): see the
             // matching comment in get_field's OOB guard above.
             if num_slots == 0 {
-                eprintln!(
-                    "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
-                    obj_ref.as_ptr(),
-                    std::backtrace::Backtrace::force_capture()
-                );
+                // RATE-LIMIT (2026-07-21): see the matching READ guard above.
+                static RESID_WRITE_DIAG_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = RESID_WRITE_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?}\n{}",
+                        obj_ref.as_ptr(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                } else if n.is_power_of_two() {
+                    eprintln!(
+                        "[RESID-DIAG WRITE] class={class_name} index={index} num_slots={num_slots} obj={:p} value={value:?} (occurrence #{n}, backtrace suppressed)",
+                        obj_ref.as_ptr(),
+                    );
+                }
             }
             return;
         }

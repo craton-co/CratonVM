@@ -14814,6 +14814,30 @@ fn execute_instruction(
                 shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
             }
             if field.is_volatile {
+                // CRATONVM_DBG_AQS_TRACE (2026-07-21): ledger entry for the
+                // synchronizer family's plain volatile state writes
+                // (`AQLS.setState` — the writer-exclusive release path),
+                // matching the CAS-side ledger in native_unsafe_cas_long.
+                if cratonvm_native_builtins::aqs_trace_enabled() {
+                    let cid = shared.heap.class_id_of(obj_ref);
+                    let cls = {
+                        let cm = shared.class_manager.read();
+                        cm.get_class(cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default()
+                    };
+                    if cls.starts_with("java/util/concurrent/locks/") {
+                        cratonvm_native_builtins::aqs_trace_line(&format!(
+                            "[AQS] tid={} putvol obj={:p} cls={} slot={} old={:?} new={:?}",
+                            thread.thread_id.0,
+                            obj_ref.as_ptr(),
+                            cls.rsplit('/').next().unwrap_or(cls.as_str()),
+                            field.field_index,
+                            old_value,
+                            value
+                        ));
+                    }
+                }
                 shared
                     .heap
                     .set_field_volatile(obj_ref, field.field_index, value);
