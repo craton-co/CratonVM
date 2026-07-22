@@ -3,10 +3,14 @@
 ## Status
 **FIXED** — 2026-07-22, `dev` (branch `fix/h2-nsme-crossclass-dispatch-20260722`). Both
 clusters' `NoSuchMethodError` symptom is eliminated and root-caused to file:line
-precision. **Residual**: the 3 Cluster B test classes still fail end-to-end after
-this fix, but for a newly-exposed, unrelated, separately-tracked reason (see
-"Residuals uncovered by this fix" below) — the NSME itself, which is this doc's
-actual subject, is gone in all 8 originally-affected classes.
+precision. **Update (same day)**: the `writeChars` residual noted below for
+Cluster B is also now fixed (see
+`bug-h2-dataoutputstream-writechars-data-loss-FIXED.md`) — `TestServlet` and
+`TestJakartaServlet` now fully pass. `TestWeb` (the 3rd Cluster B class)
+still fails, but on a further, confirmed-unrelated issue (see
+`bug-h2-testweb-logout-connectexception-mismatch.md`) — the NSME itself,
+which is this doc's actual subject, is gone in all 8 originally-affected
+classes, and 6 of the 8 now fully pass end-to-end.
 
 ## Severity
 **HIGH** — `NoSuchMethodError` for a method that plainly doesn't exist on
@@ -180,41 +184,13 @@ native object construction); they are independently tracked:
 - **`TestWeb`/`TestServlet`/`TestJakartaServlet`**: all three use H2's own
   embedded TCP protocol (`org.h2.server.TcpServer`) to connect to a
   same-process database. Root-caused via a standalone `-trace`-enabled
-  repro (not part of the H2 suite, see the repro below) to
-  **`java.io.DataOutputStream.writeChars(String)` silently writing zero
-  bytes** — confirmed via an isolated `ByteArrayOutputStream` repro with no
-  networking, H2, or Socket code involved at all. This truncates every H2
-  TCP-protocol handshake packet (database name, original URL, etc.), so the
-  server misreads a later length-prefixed field as garbage and its
-  `Transfer.readString()` throws `OutOfMemoryError: Requested array size
-  exceeds VM limit` while attempting to allocate a `StringBuilder` of that
-  garbage size; the client sees the connection close and reports
-  `EOFException: Unexpected EOF`. This is a **generic, unrelated
-  `DataOutputStream` bug** (writeChar singular, writeInt, writeBoolean, etc.
-  all work correctly — only the String-arg `writeChars` loses data), not
-  filed as its own doc as of this writing; flagging here with a precise
-  repro for whoever picks it up next.
-  ```java
-  // Minimal repro, no H2/sockets:
-  ByteArrayOutputStream bos = new ByteArrayOutputStream();
-  DataOutputStream dos = new DataOutputStream(bos);
-  dos.writeChars("abc");
-  dos.flush();
-  System.out.println(bos.toByteArray().length); // real JDK: 6. CratonVM: 0.
-  ```
-  `java/io/DataOutputStream` (`native-io/src/lib.rs:8448`) has native
-  overrides for `write`/`writeBoolean`/`writeByte`/`writeShort`/
-  `writeChar`(singular)/`writeInt`/`writeLong`/`writeFloat`/`writeDouble`/
-  `flush`/`close`/`size`, but **no override for `writeChars(String)`** — so
-  it falls through to real JDK bytecode, which reads `this.out` (correctly
-  populated at the real field slot by `native_dos_init`, confirmed not a
-  slot-collision case — `DOS_FIELD_OUT=0` genuinely matches real
-  `FilterOutputStream.out`'s index) and loops `out.write(...)` per
-  character — yet nothing lands in the target stream, with **no exception
-  raised at all**, even with `--nojit`. Not yet isolated to an exact
-  interpreter defect (real bytecode loop-with-two-calls-per-iteration
-  writing through an inherited field?), just precisely reproduced and ruled
-  out as a slot-collision/Socket/H2-specific issue.
+  repro to **`java.io.DataOutputStream.writeChars(String)` silently writing
+  zero bytes** (`native_dos_init` never allocated JDK 25's `writeBuffer`
+  scratch field, which real `writeChars` bytecode depends on) — **FIXED**,
+  see `bug-h2-dataoutputstream-writechars-data-loss-FIXED.md` for the full
+  writeup. `TestServlet`/`TestJakartaServlet` now fully pass. `TestWeb`
+  still fails, but on a confirmed-different, narrower issue — see
+  `bug-h2-testweb-logout-connectexception-mismatch.md`.
 
 ## Repro (still valid — now reproduces the residual, not the original NSME)
 ```bash
