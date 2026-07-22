@@ -1781,7 +1781,10 @@ pub(crate) fn native_class_for_name(
     // Spring Boot nested-JAR rescue below). Those fallbacks are appropriate
     // only after a non-null application loader participated in resolution.
     let explicit_bootstrap_loader = matches!(args.get(2), Some(Value::Object(None)));
-    if explicit_bootstrap_loader && !crate::classloader::is_bootstrap_class_name(&internal_name) {
+    if explicit_bootstrap_loader
+        && !crate::classloader::is_bootstrap_class_name(&internal_name)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal_name)
+    {
         return Err(
             cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,

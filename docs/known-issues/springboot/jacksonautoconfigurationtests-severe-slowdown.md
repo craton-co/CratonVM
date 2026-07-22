@@ -351,3 +351,21 @@ Likely affects any Spring Boot test class with a large number of
 for the sibling case (47 tests, Spring Security instead of Jackson, same
 "severe slowdown, not a hang" shape, same suspected JUnit5-machinery
 contribution).
+
+## Follow-up (2026-07-21): native-return root publication fixed, Jackson remains open
+
+The OAuth2 follow-up implemented the previously deferred part of the shared
+root-snapshot hypothesis: ordinary object-returning native calls and
+native-thrown Java exceptions now retain `native_pending_return` until a
+collector-visible safepoint or blocking transition, rather than rebuilding a
+full root snapshot while the mutator remains runnable. The OAuth2 class now
+passes its normal 300-second budget in both modes (208.115s JIT, 209.166s
+no-JIT, 52/52 tests).
+
+This class was re-run against that same unique release binary under the same
+normal 300-second limit and still timed out in both modes (JIT 300.138s;
+no-JIT 300.087s). A 360-second JIT diagnostic also continued making real
+JUnit progress rather than deadlocking. Therefore the native-return snapshot
+path was a real shared contributor, but it is not sufficient to close the
+remaining Jackson throughput issue. Keep this document OPEN; do not use the
+OAuth2 closure as evidence that Jackson is fixed.
