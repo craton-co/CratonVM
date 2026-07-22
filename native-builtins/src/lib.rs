@@ -12247,17 +12247,28 @@ fn antlr_parser_delegate_transition(
     let names = antlr_names_for_object(ctx, config);
     let descriptor =
         antlr_parser_transition_delegate_descriptor(names, transition_name, bools.len());
+    // `predTransition` / `precedenceTransition` execute Java bytecode and may
+    // allocate.  These three graph objects are then used to resume the native
+    // closure walk, so retain GC-remapped copies for the duration of the call.
+    let simulator_pin = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let transition_pin = ctx.pin_native_root(transition);
     let mut args = Vec::with_capacity(2 + bools.len());
+    let simulator = ctx.read_native_pin(simulator_pin, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let transition = ctx.read_native_pin(transition_pin, transition);
     args.push(Value::Object(Some(config)));
     args.push(Value::Object(Some(transition)));
     args.extend(bools.iter().map(|value| antlr_bool(*value)));
-    match ctx.invoke_virtual(simulator, method_name, &descriptor, &args)? {
+    let result = ctx.invoke_virtual(simulator, method_name, &descriptor, &args);
+    ctx.unpin_native_roots(simulator_pin);
+    match result? {
         Some(Value::Object(obj)) => Ok(obj),
         _ => Ok(None),
     }
 }
 
-fn native_antlr_parser_get_epsilon_target(
+fn native_antlr_parser_get_epsilon_target_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -12328,6 +12339,33 @@ fn native_antlr_parser_get_epsilon_target(
         _ => None,
     };
     Ok(Some(Value::Object(target)))
+}
+
+fn native_antlr_parser_get_epsilon_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let config = obj_arg(args, 1)?;
+    let transition = obj_arg(args, 2)?;
+    // Several branches call Java and then return to the native closure walk.
+    // Keep the graph endpoints in one contiguous pin frame, and always unwind
+    // it even when the Java call propagates an exception.
+    let pin_base = ctx.pin_native_root(this);
+    let config_pin = ctx.pin_native_root(config);
+    let transition_pin = ctx.pin_native_root(transition);
+    let rooted = [
+        Value::Object(Some(ctx.read_native_pin(pin_base, this))),
+        Value::Object(Some(ctx.read_native_pin(config_pin, config))),
+        Value::Object(Some(ctx.read_native_pin(transition_pin, transition))),
+        args.get(3).cloned().unwrap_or(Value::Int(0)),
+        args.get(4).cloned().unwrap_or(Value::Int(0)),
+        args.get(5).cloned().unwrap_or(Value::Int(0)),
+        args.get(6).cloned().unwrap_or(Value::Int(0)),
+    ];
+    let result = native_antlr_parser_get_epsilon_target_impl(ctx, &rooted);
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn antlr_parser_merge_cache(
@@ -12446,7 +12484,7 @@ fn antlr_parser_native_get_epsilon_target(
     }
 }
 
-fn antlr_parser_closure_checking_stop_state_impl(
+fn antlr_parser_closure_checking_stop_state_unrooted(
     ctx: &mut dyn NativeContext,
     simulator: ObjectRef,
     config: ObjectRef,
@@ -12467,11 +12505,20 @@ fn antlr_parser_closure_checking_stop_state_impl(
             if !antlr_prediction_context_is_empty(ctx, context) {
                 let size = antlr_prediction_context_size(ctx, context);
                 for index in 0..size {
+                    // A previous recursive edge can collect.  Fetch the
+                    // context again through the rooted config before reading
+                    // this slot instead of retaining a raw graph reference.
+                    let Some(context) = antlr_atn_config_context(ctx, config) else {
+                        continue;
+                    };
                     let return_state = antlr_prediction_context_return_state(ctx, context, index);
                     if return_state == ANTLR_EMPTY_RETURN_STATE {
                         if full_ctx {
                             let names = antlr_names_for_object(ctx, config);
                             let empty = antlr_empty_instance(ctx, names)?;
+                            let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+                                continue;
+                            };
                             let next_config = antlr_alloc_atn_config(
                                 ctx,
                                 names,
@@ -12551,7 +12598,7 @@ fn antlr_parser_closure_checking_stop_state_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn antlr_parser_closure_impl(
+fn antlr_parser_closure_unrooted(
     ctx: &mut dyn NativeContext,
     simulator: ObjectRef,
     config: ObjectRef,
@@ -12570,6 +12617,11 @@ fn antlr_parser_closure_impl(
         antlr_parser_add_config(ctx, simulator, configs, config)?;
     }
 
+    // `add` can allocate.  Re-read `state` from the rooted config before
+    // dereferencing its transition array.
+    let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+        return Ok(None);
+    };
     let transition_count =
         match native_antlr_atn_state_get_number_of_transitions(ctx, &[Value::Object(Some(state))])?
         {
@@ -12590,9 +12642,16 @@ fn antlr_parser_closure_impl(
             }
         }
 
+        // The prior iteration (and the loop-entry predicate above) may have
+        // allocated.  Do not carry the old raw ATNState reference across it.
+        let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+            continue;
+        };
         let Some(transition) = antlr_atn_state_transition_ref(ctx, state, transition_index)? else {
             continue;
         };
+        let transition_pin = ctx.pin_native_root(transition);
+        let transition = ctx.read_native_pin(transition_pin, transition);
         let continue_collecting =
             collect_predicates && !antlr_transition_is_action(ctx, transition);
         // `inContext` mirrors real ANTLR's `getEpsilonTarget(config, t, collectPredicates,
@@ -12616,13 +12675,29 @@ fn antlr_parser_closure_impl(
             treat_eof_as_epsilon,
         )?
         else {
+            ctx.unpin_native_roots(transition_pin);
             continue;
         };
+        // The epsilon target itself is often a freshly allocated config.  It
+        // must remain rooted while the native walk adds it to Java sets and
+        // recursively resumes prediction.
+        let next_config_pin = ctx.pin_native_root(next_config);
+        let next_config = ctx.read_native_pin(next_config_pin, next_config);
 
         let mut next_depth = depth;
+        // `getEpsilonTarget` can collect; reload the state through the rooted
+        // config before using it below.
+        let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+            ctx.unpin_native_roots(transition_pin);
+            continue;
+        };
         if antlr_state_is_rule_stop(ctx, state) {
             if let Some(dfa) = antlr_parser_dfa(ctx, simulator) {
                 if antlr_dfa_is_precedence(ctx, dfa) {
+                    let Some(dfa) = antlr_parser_dfa(ctx, simulator) else {
+                        ctx.unpin_native_roots(transition_pin);
+                        continue;
+                    };
                     let outermost =
                         antlr_int_field(ctx, transition, "outermostPrecedenceReturn", 1);
                     if Some(outermost) == antlr_dfa_start_rule(ctx, dfa) {
@@ -12633,6 +12708,7 @@ fn antlr_parser_closure_impl(
             let reaches = antlr_atn_config_reaches(ctx, next_config).saturating_add(1);
             antlr_atn_config_set_reaches(ctx, next_config, reaches);
             if !antlr_set_add_object(ctx, closure_busy, next_config)? {
+                ctx.unpin_native_roots(transition_pin);
                 continue;
             }
             antlr_set_field_value(ctx, configs, "dipsIntoOuterContext", 6, Value::Int(1));
@@ -12640,6 +12716,7 @@ fn antlr_parser_closure_impl(
         } else if !antlr_transition_is_epsilon(ctx, transition)
             && !antlr_set_add_object(ctx, closure_busy, next_config)?
         {
+            ctx.unpin_native_roots(transition_pin);
             continue;
         }
 
@@ -12647,7 +12724,7 @@ fn antlr_parser_closure_impl(
             next_depth = next_depth.saturating_add(1);
         }
 
-        antlr_parser_closure_checking_stop_state_impl(
+        let result = antlr_parser_closure_checking_stop_state_impl(
             ctx,
             simulator,
             next_config,
@@ -12657,10 +12734,86 @@ fn antlr_parser_closure_impl(
             full_ctx,
             next_depth,
             treat_eof_as_epsilon,
-        )?;
+        );
+        ctx.unpin_native_roots(transition_pin);
+        result?;
     }
 
     Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn antlr_parser_closure_checking_stop_state_impl(
+    ctx: &mut dyn NativeContext,
+    simulator: ObjectRef,
+    config: ObjectRef,
+    configs: ObjectRef,
+    closure_busy: ObjectRef,
+    collect_predicates: bool,
+    full_ctx: bool,
+    depth: i32,
+    treat_eof_as_epsilon: bool,
+) -> MethodCallResult {
+    // Every recursive closure step may allocate or invoke Java.  The four
+    // arguments form the live prediction graph, so keep one balanced native
+    // root frame around the complete step rather than trusting raw ObjectRefs
+    // across a moving collection.
+    let pin_base = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let configs_pin = ctx.pin_native_root(configs);
+    let closure_busy_pin = ctx.pin_native_root(closure_busy);
+    let simulator = ctx.read_native_pin(pin_base, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let configs = ctx.read_native_pin(configs_pin, configs);
+    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let result = antlr_parser_closure_checking_stop_state_unrooted(
+        ctx,
+        simulator,
+        config,
+        configs,
+        closure_busy,
+        collect_predicates,
+        full_ctx,
+        depth,
+        treat_eof_as_epsilon,
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn antlr_parser_closure_impl(
+    ctx: &mut dyn NativeContext,
+    simulator: ObjectRef,
+    config: ObjectRef,
+    configs: ObjectRef,
+    closure_busy: ObjectRef,
+    collect_predicates: bool,
+    full_ctx: bool,
+    depth: i32,
+    treat_eof_as_epsilon: bool,
+) -> MethodCallResult {
+    let pin_base = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let configs_pin = ctx.pin_native_root(configs);
+    let closure_busy_pin = ctx.pin_native_root(closure_busy);
+    let simulator = ctx.read_native_pin(pin_base, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let configs = ctx.read_native_pin(configs_pin, configs);
+    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let result = antlr_parser_closure_unrooted(
+        ctx,
+        simulator,
+        config,
+        configs,
+        closure_busy,
+        collect_predicates,
+        full_ctx,
+        depth,
+        treat_eof_as_epsilon,
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn native_antlr_parser_closure_checking_stop_state(
@@ -12842,9 +12995,13 @@ fn antlr_parser_reachable_target(
     transition: ObjectRef,
     symbol: i32,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let simulator_pin = ctx.pin_native_root(simulator);
+    let transition_pin = ctx.pin_native_root(transition);
+    let simulator = ctx.read_native_pin(simulator_pin, simulator);
     let max_token_type = antlr_parser_atn(ctx, simulator)
         .map(|atn| antlr_int_field(ctx, atn, "maxTokenType", 6))
         .unwrap_or(i32::MAX);
+    let transition = ctx.read_native_pin(transition_pin, transition);
     let matches = match native_antlr_transition_matches(
         ctx,
         &[
@@ -12857,11 +13014,14 @@ fn antlr_parser_reachable_target(
         Some(Value::Int(v)) => v != 0,
         _ => false,
     };
-    if matches {
-        Ok(antlr_transition_target(ctx, transition))
+    let target = if matches {
+        let transition = ctx.read_native_pin(transition_pin, transition);
+        antlr_transition_target(ctx, transition)
     } else {
-        Ok(None)
-    }
+        None
+    };
+    ctx.unpin_native_roots(simulator_pin);
+    Ok(target)
 }
 
 fn antlr_atn_next_tokens_contains_epsilon(
@@ -13017,6 +13177,11 @@ fn native_antlr_parser_compute_reach_set(
             _ => 0,
         };
         for transition_index in 0..transition_count {
+            // Matching a previous edge can allocate.  Reacquire the state
+            // from the pinned config before indexing `transitions` again.
+            let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+                continue;
+            };
             let Some(transition) = antlr_atn_state_transition_ref(ctx, state, transition_index)?
             else {
                 continue;
@@ -72429,53 +72594,56 @@ pub(crate) fn transition_real_executor_to_shutdown(
     ctx: &mut dyn NativeContext,
     executor: ObjectRef,
 ) -> MethodCallResult {
+    // This bridge calls into Java several times (AtomicInteger, the executor
+    // hooks, and finally ThreadPoolExecutor.tryTerminate).  Keep both the
+    // receiver and `ctl` rooted across those calls; otherwise a moving
+    // collection can leave the final invokespecial targeting a stale
+    // executor, observed as an intermittent `this.ctl == null` while JUnit
+    // closes its ScheduledThreadPoolExecutor timeout resource.
+    let executor_pin = ctx.pin_native_root(executor);
+    let executor = ctx.read_native_pin(executor_pin, executor);
     let Value::Object(Some(ctl)) = ctx.get_field_by_name(executor, "ctl") else {
+        ctx.unpin_native_roots(executor_pin);
         return Ok(None);
     };
-    let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
-        Some(Value::Int(value)) => value,
-        _ => return Ok(None),
-    };
-    // ThreadPoolExecutor packs run state in the high 3 bits and worker count
-    // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
-    let shutdown = current & 0x1fff_ffff;
-    let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
-    // A graceful ThreadPoolExecutor shutdown must wake idle workers so they
-    // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
-    // worker blocked in LinkedBlockingQueue.take().
-    let _ = interrupt_executor_workers(ctx, executor);
-    // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue. Its
-    // real `onShutdown()` removes cancelled delayed tasks (including JUnit's
-    // cancelled timeout watchdog); without it, the queue stays nonempty until
-    // the original timeout expires and `awaitTermination()` cannot finish.
-    // Preserve the JDK shutdown ordering while keeping the existing native
-    // transition for real ThreadPoolExecutor receivers.
-    let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
-    // BUG-H2-HANG-0721 / onShutdown() finalization: the real
-    // `ThreadPoolExecutor.shutdown()` body ends with an unconditional
-    // `tryTerminate()` call (see JDK source) -- this is the ONLY thing that
-    // ever moves a pool whose workerCount is *already* zero at shutdown()
-    // time (never used, or already fully drained -- e.g. `onShutdown()`
-    // above may have just emptied the queue) from SHUTDOWN to
-    // TIDYING/TERMINATED and fires `termination.signalAll()`. When
-    // workerCount > 0, `processWorkerExit()` (real bytecode, runs when each
-    // interrupted worker actually exits) eventually calls its own
-    // `tryTerminate()` and self-heals -- but a pool with zero workers has no
-    // worker left to ever run that path, so without this call here the pool
-    // is stuck in SHUTDOWN forever and `awaitTermination()` (real bytecode,
-    // genuinely blocks on `termination.awaitNanos`) hangs for the full
-    // requested timeout. H2's `Utils.shutdownExecutor` calls
-    // `awaitTermination(1, TimeUnit.DAYS)`, so this is an effectively
-    // permanent hang for the extremely common "FileStore closed before its
-    // background serialization/save executor ever ran a task" case (most
-    // H2 TestDb-based tests hit this on deleteDb()/close()).
-    let _ = ctx.invoke_special_bytecode_only(
-        "java/util/concurrent/ThreadPoolExecutor",
-        "tryTerminate",
-        "()V",
-        &[Value::Object(Some(executor))],
-    )?;
-    Ok(None)
+    let ctl_pin = ctx.pin_native_root(ctl);
+    let result = (|| {
+        let ctl = ctx.read_native_pin(ctl_pin, ctl);
+        let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+            Some(Value::Int(value)) => value,
+            _ => return Ok(None),
+        };
+        // ThreadPoolExecutor packs run state in the high 3 bits and worker
+        // count below. SHUTDOWN is run-state 0, so retain only the worker
+        // count bits.
+        let shutdown = current & 0x1fff_ffff;
+        let ctl = ctx.read_native_pin(ctl_pin, ctl);
+        let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
+        // A graceful ThreadPoolExecutor shutdown must wake idle workers so
+        // they observe SHUTDOWN and leave getTask().  Merely updating ctl
+        // leaks every worker blocked in LinkedBlockingQueue.take().
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = interrupt_executor_workers(ctx, executor);
+        // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue.
+        // Its real `onShutdown()` removes cancelled delayed tasks (including
+        // JUnit's cancelled timeout watchdog); without it, the queue stays
+        // nonempty until the original timeout expires and awaitTermination()
+        // cannot finish.
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
+        // A zero-worker pool has no worker-exit path to call tryTerminate(),
+        // so finalize it explicitly after the shutdown hook.
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "tryTerminate",
+            "()V",
+            &[Value::Object(Some(executor))],
+        )?;
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(executor_pin);
+    result
 }
 
 /// Log a message only if the logger's current level allows `method_level`.
