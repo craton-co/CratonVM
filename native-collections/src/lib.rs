@@ -32457,47 +32457,49 @@ fn native_tm_head_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix: `tree_compare` (user Comparator
-        // dispatch) and `native_tm_put` (comparator dispatch + possible
-        // array growth) can both run arbitrary interpreted bytecode and
-        // trigger a moving GC. `data`/`result`/`comparator`/`to_key` were
-        // bare locals reused across every iteration without being
-        // refreshed — pin them up front and re-read after each
-        // GC-triggering call. See
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut comparator = comparator;
-        let comparator_pin = pin_value(ctx, comparator);
-        let mut to_key = to_key;
-        let to_key_pin = pin_value(ctx, to_key);
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            let cmp = tree_compare(ctx, &comparator, k, to_key)?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-            if cmp >= 0 {
-                break;
-            }
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+    // BUGFIX (bug-h2-treemap-tailmap-headmap-view-corruption.md): the source
+    // map's entries must be read via `tm_collect_pairs`, the SAME fast/array-
+    // mode-aware helper `keySet`/`values`/`entrySet`/`forEach`/`iterator` use.
+    // `tm_state()` alone reads only the array-mode `TM_FIELD_DATA` side-table
+    // slot, which for a natural-order/fast-mode map (the common case: no
+    // custom Comparator, String/Integer/Long keys) is the harmless-looking
+    // but never-written 32-null-slot buffer `native_tm_init` eagerly
+    // allocates on construction -- `TM_FIELD_SIZE` IS mirrored for fast-mode
+    // maps (so legacy size readers work), but that empty buffer is not, so
+    // `tm_state()` returned a real (mirrored) `size` paired with `size` worth
+    // of phantom null keys read out of an array that fast-mode puts never
+    // touched. Iterating those phantom nulls made `headMap` compare `null`
+    // against `to_key` on the very first entry and immediately `break`
+    // (spuriously-empty view), and made `tailMap` repeatedly `put(null, ...)`
+    // into the result (each such put replacing the prior null entry, since
+    // they all compare equal), producing a corrupt one-entry-with-null-key
+    // result instead of the real matching entries.
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut to_key = to_key;
+    let to_key_pin = pin_value(ctx, to_key);
+    for (k, v) in pairs {
+        let cmp = tree_compare(ctx, &comparator, k, to_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        if cmp >= 0 {
+            break;
         }
-        ctx.unpin_native_roots(data_pin);
+        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
     }
+    ctx.unpin_native_roots(result_pin);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -32508,40 +32510,33 @@ fn native_tm_tail_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(None))),
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix: same hazard as `native_tm_head_map`
-        // — `tree_compare`/`native_tm_put` can trigger a moving GC.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut comparator = comparator;
-        let comparator_pin = pin_value(ctx, comparator);
-        let mut from_key = from_key;
-        let from_key_pin = pin_value(ctx, from_key);
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            let cmp = tree_compare(ctx, &comparator, k, from_key)?;
-            data = ctx.read_native_pin(data_pin, data);
+    // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
+    // aware `tm_collect_pairs`, not `tm_state()` directly.
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut from_key = from_key;
+    let from_key_pin = pin_value(ctx, from_key);
+    for (k, v) in pairs {
+        let cmp = tree_compare(ctx, &comparator, k, from_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        if cmp >= 0 {
+            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
             result = ctx.read_native_pin(result_pin, result);
             comparator = read_pinned_elem(ctx, comparator_pin, comparator);
             from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-            if cmp >= 0 {
-                let v = ctx.get_array_element(data, i * 2 + 1);
-                native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-                data = ctx.read_native_pin(data_pin, data);
-                result = ctx.read_native_pin(result_pin, result);
-                comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-                from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-            }
         }
-        ctx.unpin_native_roots(data_pin);
     }
+    ctx.unpin_native_roots(result_pin);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -32553,53 +32548,186 @@ fn native_tm_sub_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     };
     let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
     let to_key = args.get(2).copied().unwrap_or(Value::Object(None));
-    let (data_opt, size, comparator) = tm_state(ctx, this);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
     let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
     let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
     tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
     tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
     tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
-    if let Some(data) = data_opt {
-        // Family-1 stale-ObjectRef fix: same hazard as `native_tm_head_map`.
-        let data_pin = ctx.pin_native_root(data);
-        let result_pin = ctx.pin_native_root(result);
-        let mut data = data;
-        let mut comparator = comparator;
-        let comparator_pin = pin_value(ctx, comparator);
-        let mut from_key = from_key;
-        let from_key_pin = pin_value(ctx, from_key);
-        let mut to_key = to_key;
-        let to_key_pin = pin_value(ctx, to_key);
-        for i in 0..(size as usize) {
-            let k = ctx.get_array_element(data, i * 2);
-            let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-            if cmp_lo < 0 {
-                continue;
-            }
-            let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-            if cmp_hi >= 0 {
-                break;
-            }
-            let v = ctx.get_array_element(data, i * 2 + 1);
-            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
-            data = ctx.read_native_pin(data_pin, data);
-            result = ctx.read_native_pin(result_pin, result);
-            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
-            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
-            to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+    // BUGFIX: see `native_tm_head_map` above -- read via the fast/array-mode-
+    // aware `tm_collect_pairs`, not `tm_state()` directly.
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut from_key = from_key;
+    let from_key_pin = pin_value(ctx, from_key);
+    let mut to_key = to_key;
+    let to_key_pin = pin_value(ctx, to_key);
+    for (k, v) in pairs {
+        let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        if cmp_lo < 0 {
+            continue;
         }
-        ctx.unpin_native_roots(data_pin);
+        let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        if cmp_hi >= 0 {
+            break;
+        }
+        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
     }
+    ctx.unpin_native_roots(result_pin);
+    Ok(Some(Value::Object(Some(result))))
+}
+
+// --- NavigableMap range views (`headMap`/`tailMap`/`subMap` with inclusive
+// flags). Real JDK `TreeMap.headMap(K,boolean)`/`tailMap(K,boolean)`/
+// `subMap(K,boolean,K,boolean)` bytecode builds an `AscendingSubMap` that
+// navigates the *real* `root`/`comparator` fields -- but a natively-managed
+// TreeMap keeps its entries in the `tm_fast_table`/`tm_array_table`
+// side-tables (see the fast/array-mode doc block above `TM_FIELD_DATA`) and
+// never populates the real red-black tree, so that bytecode sees an
+// always-null `root` and the resulting view is unconditionally empty
+// (same family as `bug-h2-treemap-tailmap-headmap-view-corruption.md`'s
+// 1-arg headMap/tailMap/subMap gap, just reached via real bytecode instead
+// of a wrong native read). Drive these from `tm_collect_pairs` exactly like
+// the 1-arg `native_tm_head_map`/`tail_map`/`sub_map` above, mirroring the
+// `native_ts_*_set_inclusive` pattern already used for TreeSet's NavigableSet
+// views.
+fn native_tm_head_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let to_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let inclusive = arg_bool(args, 2);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
+    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut to_key = to_key;
+    let to_key_pin = pin_value(ctx, to_key);
+    for (k, v) in pairs {
+        let cmp = tree_compare(ctx, &comparator, k, to_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        // Ascending order: once we pass the upper bound, stop.
+        let stop = if inclusive { cmp > 0 } else { cmp >= 0 };
+        if stop {
+            break;
+        }
+        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+    }
+    ctx.unpin_native_roots(result_pin);
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_tm_tail_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let inclusive = arg_bool(args, 2);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
+    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut from_key = from_key;
+    let from_key_pin = pin_value(ctx, from_key);
+    for (k, v) in pairs {
+        let cmp = tree_compare(ctx, &comparator, k, from_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        let keep = if inclusive { cmp >= 0 } else { cmp > 0 };
+        if keep {
+            native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+            result = ctx.read_native_pin(result_pin, result);
+            comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+            from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        }
+    }
+    ctx.unpin_native_roots(result_pin);
+    Ok(Some(Value::Object(Some(result))))
+}
+
+fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let from_key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let from_inclusive = arg_bool(args, 2);
+    let to_key = args.get(3).copied().unwrap_or(Value::Object(None));
+    let to_inclusive = arg_bool(args, 4);
+    let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
+    let mut result = alloc_synthetic(ctx, "java/util/TreeMap", TM_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TM_DEFAULT_CAPACITY * 2);
+    tm_set_slot(ctx, result, TM_FIELD_DATA, Value::Object(Some(buf)));
+    tm_set_slot(ctx, result, TM_FIELD_SIZE, Value::Int(0));
+    tm_set_slot(ctx, result, TM_FIELD_COMPARATOR, comparator);
+    let pairs = tm_collect_pairs(ctx, this);
+    let result_pin = ctx.pin_native_root(result);
+    let mut comparator = comparator;
+    let comparator_pin = pin_value(ctx, comparator);
+    let mut from_key = from_key;
+    let from_key_pin = pin_value(ctx, from_key);
+    let mut to_key = to_key;
+    let to_key_pin = pin_value(ctx, to_key);
+    for (k, v) in pairs {
+        let cmp_lo = tree_compare(ctx, &comparator, k, from_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        let below = if from_inclusive { cmp_lo < 0 } else { cmp_lo <= 0 };
+        if below {
+            continue;
+        }
+        let cmp_hi = tree_compare(ctx, &comparator, k, to_key)?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+        let above = if to_inclusive { cmp_hi > 0 } else { cmp_hi >= 0 };
+        if above {
+            break;
+        }
+        native_tm_put(ctx, &[Value::Object(Some(result)), k, v])?;
+        result = ctx.read_native_pin(result_pin, result);
+        comparator = read_pinned_elem(ctx, comparator_pin, comparator);
+        from_key = read_pinned_elem(ctx, from_key_pin, from_key);
+        to_key = read_pinned_elem(ctx, to_key_pin, to_key);
+    }
+    ctx.unpin_native_roots(result_pin);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -34047,6 +34175,24 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         c,
+        "headMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_head_map_inclusive,
+    );
+    registry.register(
+        c,
+        "tailMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_tail_map_inclusive,
+    );
+    registry.register(
+        c,
+        "subMap",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_sub_map_inclusive,
+    );
+    registry.register(
+        c,
         "computeIfAbsent",
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
         native_tm_compute_if_absent,
@@ -34169,6 +34315,24 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
         "pollLastEntry",
         "()Ljava/util/Map$Entry;",
         native_tm_poll_last_entry,
+    );
+    registry.register(
+        nm,
+        "headMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_head_map_inclusive,
+    );
+    registry.register(
+        nm,
+        "tailMap",
+        "(Ljava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_tail_map_inclusive,
+    );
+    registry.register(
+        nm,
+        "subMap",
+        "(Ljava/lang/Object;ZLjava/lang/Object;Z)Ljava/util/NavigableMap;",
+        native_tm_sub_map_inclusive,
     );
     registry.set_category(__prev_cat);
 }
