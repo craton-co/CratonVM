@@ -455,7 +455,7 @@ fn is_abstract_string_builder_capacity_copy(ctx: &mut dyn NativeContext) -> bool
 fn is_abstract_string_builder_append_copy(ctx: &mut dyn NativeContext) -> bool {
     let trace = ctx.capture_stack_trace(0);
     let mut string_get_bytes = false;
-    let mut asb_append = false;
+    let mut asb_compact_copy = false;
 
     for entry in &trace {
         let class_name = entry.class_name.as_ref();
@@ -463,12 +463,17 @@ fn is_abstract_string_builder_append_copy(ctx: &mut dyn NativeContext) -> bool {
         if class_name == "java/lang/String" && method_name == "getBytes" {
             string_get_bytes = true;
         }
-        if class_name == "java/lang/AbstractStringBuilder" && method_name == "append" {
-            asb_append = true;
+        // `String.getBytes(byte[], ?)` feeds both append and insert in JDK 25.
+        // Our synthetic builders intentionally retain a char[] backing, so either
+        // compact-string helper needs the same byte-to-char bridge.
+        if class_name == "java/lang/AbstractStringBuilder"
+            && matches!(method_name, "append" | "insert")
+        {
+            asb_compact_copy = true;
         }
     }
 
-    string_get_bytes && asb_append
+    string_get_bytes && asb_compact_copy
 }
 
 pub(crate) fn native_thread_current_thread(
