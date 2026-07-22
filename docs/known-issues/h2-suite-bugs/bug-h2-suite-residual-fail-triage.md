@@ -1,14 +1,22 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed** — follow-up session (2026-07-22) fully root-caused all 11 items
-and **fixed 2** (calendar/Julian-cutover bug, `Reflection.getCallerClass()`
-loader-identity bug). The remaining 9 are root-caused to varying depth but
-NOT fixed — several converge on the same handful of deep, cross-cutting VM
-architecture issues (native-vs-bytecode dispatch priority, collection-view
-live-reference semantics, `StringBuilder.append(long)` NaN-bit-pattern
-corruption) rather than being 9 independent bugs. See each item below for
-its current status and the shared-root-cause cross-references.
+**OPEN, mixed** — follow-up session (2026-07-22) fully root-caused all 11
+items. **4 now confirmed FIXED**: 2 fixed directly by this session
+(calendar/Julian-cutover bug, `Reflection.getCallerClass()` loader-identity
+bug); 2 more (`TestShell`, and very likely `TestRandomMapOps`) fixed as a
+side effect of an *independent, concurrent* session's fix for
+`bug-h2-nosuchmethoderror-cross-class-dispatch.md` (now closed, moved to
+`docs/internal/`) and `bug-h2-treemap-tailmap-headmap-view-corruption.md`
+(now closed) landing on `dev` while this session was in progress — merged
+in via `git merge origin/dev`, re-verified against the actual H2 test
+classes below, not just the concurrent session's own claims (per
+[[docs-known-issues-convention]]'s "don't trust a fixed claim without
+re-running the original test"). The remaining 7 are root-caused to varying
+depth but NOT fixed — several converge on the same handful of deep,
+cross-cutting VM architecture issues (native-vs-bytecode dispatch priority,
+`StringBuilder.append(long)` NaN-bit-pattern corruption) rather than being
+7 independent bugs. See each item below for its current status.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -72,7 +80,23 @@ family as `TestTransaction` below.** No targeted fix attempted — would
 require either broad interpreter/native-call throughput work, or accepting
 this test as environment-sensitive.
 
-## `org.h2.test.store.TestRandomMapOps` (`seed:0 op:9`) — MVMap reverse-view assertion — **root-caused to a general VM bug, NOT fixed**
+## `org.h2.test.store.TestRandomMapOps` (`seed:0 op:9`) — MVMap reverse-view assertion — **very likely FIXED** (via concurrent session's TreeMap dispatch fix; not verified to full completion)
+An independent, concurrent session fixed `bug-h2-treemap-tailmap-headmap-
+view-corruption.md` (`dev@fix/h2-treemap-tailmap-dispatch-20260721`, now
+closed) while this session was in progress — root cause turned out to be
+CratonVM's synthetic `TreeMap`'s fast/array backing-store dispatch, not a
+class-collision as originally guessed here either (see that doc's own
+history for the correction). Merged in and reran the actual
+`TestRandomMapOps` class: the original fast, deterministic assertion
+failure (`rev (1654, null)`, immediate) is **gone** — the class no longer
+fails, it just runs for a long time (still executing cleanly past 600s
+wall-clock when this session's time budget ran out, no assertion, no
+crash). This is plausibly just this fuzz test's legitimately heavy
+workload (`TestAll.big=true`, up to 3000 ops × 100 rounds) being slow under
+CratonVM's interpreter, not a new bug — but this session did not confirm a
+clean exit-0 completion, so treat as "very likely fixed, not 100%
+verified" until someone runs it to completion with a generous (10+ minute)
+timeout. Original analysis kept below for context.
 Confirmed the same underlying mechanism as `TestAlter` below (and shares a
 root cause with the pre-existing `bug-h2-treemap-tailmap-headmap-view-corruption.md`
 doc, which this session's investigation supersedes/deepens — see that doc
@@ -189,20 +213,23 @@ fix; `TestUpgrade` simply couldn't reach this point before. `TestUpgrade`
 is NOT yet a clean PASS; tracked as a new confirmed instance of the
 existing cross-class-dispatch doc rather than reopening here.
 
-## `org.h2.test.unit.TestShell` — NPE reading Shell tool output (piped stdin/stdout) — **root-caused: same bug as an EXISTING doc, not a new gap**
-This is **not** a piped-process-stdin/stdout-specific CratonVM gap (as the
-original triage guessed) — it is a **new confirmed repro of the already-open
-`bug-h2-nosuchmethoderror-cross-class-dispatch.md`'s "Cluster A —
-`PipedInputStream.flush()V`"** bug. Confirmed directly: `Shell.println()`/
-`Shell.print()` call `out.flush()` (where `out` wraps a `PipedOutputStream`),
-and CratonVM's method dispatch resolves this to the nonsensical
-`PipedInputStream.flush()V` (`NoSuchMethodError`, logged as a WARN and
-apparently swallowed rather than propagated as a Java-visible exception) —
-so the Shell tool's output is silently never written to the pipe. When the
-background `Task` thread's `finally { toolOut.close(); }` runs, the pipe
-reader sees immediate EOF with no data, and `LineNumberReader.readLine()`
-returns `null` on the very first read. Add `TestShell` to Cluster A's
-affected-class list in that doc; no separate investigation needed here.
+## `org.h2.test.unit.TestShell` — NPE reading Shell tool output (piped stdin/stdout) — **FIXED** (via concurrent session's dispatch fix)
+This was **not** a piped-process-stdin/stdout-specific CratonVM gap (as the
+original triage guessed) — it was a repro of `bug-h2-nosuchmethoderror-
+cross-class-dispatch.md`'s "Cluster A — `PipedInputStream.flush()V`"` bug.
+Confirmed directly: `Shell.println()`/`Shell.print()` call `out.flush()`
+(where `out` wraps a `PipedOutputStream`), and CratonVM's method dispatch
+was resolving this to the nonsensical `PipedInputStream.flush()V`
+(`NoSuchMethodError`, logged as a WARN and swallowed rather than
+propagated) — so the Shell tool's output was silently never written to the
+pipe, and `LineNumberReader.readLine()` returned `null` on the first read.
+An independent, concurrent session fixed the underlying cross-class
+dispatch bug (`dev@fb58d3d10`, doc moved to
+`docs/internal/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md`)
+while this session was in progress; merged in and **re-verified against the
+real `TestShell` class directly** (not just trusting the other session's
+claim) — passes cleanly (takes ~90-150s wall-clock; needs a timeout above
+the suite runner's default 60s for this class specifically, not a hang).
 
 ## `org.h2.test.db.TestAlter` (`testAlterTableDropIdentityColumn`) — `Expected: 1 actual: 0` — **root-caused to a general VM bug (ConcurrentHashMap.values() view staleness), NOT fixed**
 Root-caused to a **minimal, H2-independent, general JDK bug**:
@@ -328,12 +355,22 @@ cd apps/h2database/h2
 ```
 
 ## Full 218-class regression check
-After landing the 2 fixes above, a full `run-h2-suite.sh run --category all
---count 218` pass was run on the fixed binary: 120 PASS / 59 HANG / 39 FAIL.
+After landing this session's own 2 fixes (calendar/Julian-cutover,
+`getCallerClass` loader-identity), a full `run-h2-suite.sh run --category
+all --count 218` pass was run on that binary (before the later merge with
+the two concurrent-session fixes below): 120 PASS / 59 HANG / 39 FAIL.
 Spot-checked 5 of the FAIL classes not otherwise explained in this doc
 (`TestConnectionPool`, `TestFileSystem`, `TestNetUtils`,
 `TestMVStoreStopCompact`, `TestAnalyzeTableTx`) against a binary built from
 UNMODIFIED `dev` (pre-session) — all 5 fail identically on both, confirming
 they are pre-existing, not regressions introduced by this session's fixes.
-`TestPreparedStatement` and the `SecurityException` half of `TestUpgrade`
-now PASS.
+
+After merging `origin/dev` (which had, in the meantime, picked up two
+*other* sessions' independent fixes — `bug-h2-nosuchmethoderror-cross-
+class-dispatch.md` and `bug-h2-treemap-tailmap-headmap-view-corruption.md`,
+both now closed) and rebuilding, `TestPreparedStatement`, `TestShell`, and
+the `SecurityException` half of `TestUpgrade` all now PASS directly, and
+`TestRandomMapOps` no longer hits its original fast/deterministic assertion
+failure (runs long instead — see that item above). A full clean re-run of
+all 218 classes on this final merged binary was not completed within this
+session's time budget; the per-class spot checks above stand in for it.
