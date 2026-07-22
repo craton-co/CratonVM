@@ -82,8 +82,8 @@ mod threadreg_perf {
             let elapsed = start.elapsed().as_nanos() as u64;
             let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
             let nanos = self.nanos.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
-            let total_entries = self.entries.fetch_add(entries as u64, Ordering::Relaxed)
-                + entries as u64;
+            let total_entries =
+                self.entries.fetch_add(entries as u64, Ordering::Relaxed) + entries as u64;
             if calls == 1 || calls % 50 == 0 {
                 self.started_report.store(true, Ordering::Relaxed);
                 eprintln!(

@@ -29,7 +29,9 @@ use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;
-use crate::lang_string::{native_string_hash_code, register_phase52_string_buffer};
+use crate::lang_string::{
+    native_string_hash_code, native_string_to_lower_case, register_phase52_string_buffer,
+};
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero,
@@ -18975,6 +18977,18 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(len1 as i32 - len2 as i32)))
     });
+
+    // `String.toLowerCase(Locale)` delegates here for compact Latin-1
+    // Strings. The generic bytecode path allocates a transient String on each
+    // lookup and is disproportionately expensive under the moving collector.
+    // Reuse the String-level implementation, which preserves the unchanged
+    // receiver and alternates distinct cached results for changed ASCII input.
+    r.register(
+        c,
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| native_string_to_lower_case(ctx, &args[..1]),
+    );
 
     // static char getChar(byte[] val, int index)
     r.register(c, "getChar", "([BI)C", |ctx, args| {

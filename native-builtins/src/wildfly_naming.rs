@@ -780,12 +780,7 @@ fn native_initial_context_get_environment(
         }
     };
     let incoming = initial_context_env(ctx, this);
-    let env = environment_with_property(
-        ctx,
-        incoming,
-        "java.naming.factory.initial",
-        &factory,
-    );
+    let env = environment_with_property(ctx, incoming, "java.naming.factory.initial", &factory);
     Ok(Some(env))
 }
 
@@ -891,12 +886,7 @@ fn configured_initial_context(
     // equivalent explicit environment so it can instantiate the configured
     // factory instead of throwing NoInitialContextException.
     let incoming = initial_context_env(ctx, this);
-    let env = environment_with_property(
-        ctx,
-        incoming,
-        "java.naming.factory.initial",
-        &factory,
-    );
+    let env = environment_with_property(ctx, incoming, "java.naming.factory.initial", &factory);
     match ctx.invoke(
         "javax/naming/spi/NamingManager",
         "getInitialContext",

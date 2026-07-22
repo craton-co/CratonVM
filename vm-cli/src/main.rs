@@ -1485,7 +1485,11 @@ fn run() -> Result<()> {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
-        if std::env::var("CRATONVM_DBG_JIT_METHOD_STATS").ok().as_deref() == Some("1") {
+        if std::env::var("CRATONVM_DBG_JIT_METHOD_STATS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             cratonvm_jit::tiered::dump_method_stats_to_stderr();
         }
     });

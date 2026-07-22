@@ -122,7 +122,9 @@ fn populate_sfi(
     // is not reliably found by `class_id_by_name` from deep inside that same
     // `<clinit>` (observed via `SpringFactoriesLoader`/`EntityManagerFactoryUtils`
     // calling `LogFactory.getLog()` from their own static initializers).
-    let cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
+    let cid = entry
+        .class_id
+        .or_else(|| ctx.class_id_by_name(&entry.class_name));
     let dotted = match cid {
         Some(c) => crate::lang_class::dotted_class_name(c, &entry.class_name),
         None => std::sync::Arc::from(entry.class_name.replace('/', ".")),

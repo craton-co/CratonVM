@@ -742,6 +742,28 @@ pub trait NativeContext {
         false
     }
 
+    /// Look up a bounded, GC-rooted exact-HashMap cache using a Java String
+    /// object directly. VM implementations can compare compact payloads without
+    /// allocating a host String; the default leaves mock contexts unchanged.
+    fn hashmap_string_node_cache_get_object(
+        &mut self,
+        _map: ObjectRef,
+        _key: ObjectRef,
+    ) -> Option<Value> {
+        None
+    }
+
+    /// Look up a bounded, GC-rooted exact-HashMap String node cache. Native
+    /// implementations may use this to avoid rediscovering immutable keys;
+    /// the default keeps lightweight test contexts independent of VM layout.
+    fn hashmap_string_node_cache_get(&mut self, _map: ObjectRef, _key: &str) -> Option<Value> {
+        None
+    }
+
+    /// Publish an exact HashMap node for [`Self::hashmap_string_node_cache_get`].
+    /// Implementations must preserve normal map mutation semantics.
+    fn hashmap_string_node_cache_put(&mut self, _map: ObjectRef, _key: &str, _node: ObjectRef) {}
+
     /// Invoke a method by class name, method name, descriptor, and arguments.
     fn invoke(
         &mut self,
@@ -1300,6 +1322,23 @@ pub trait NativeContext {
         self.create_string_uninterned(text)
     }
 
+    /// Probe a per-thread cache for an ASCII case-conversion result. The
+    /// cache alternates two immutable values so consecutive calls stay
+    /// observably distinct.
+    fn get_ascii_case_string_cached(&mut self, _source: ObjectRef, _upper: bool) -> Option<ObjectRef> {
+        None
+    }
+
+    /// Create and retain the alternating pair for an ASCII case conversion.
+    fn create_ascii_case_string_cached(
+        &mut self,
+        _source: ObjectRef,
+        text: &str,
+        _upper: bool,
+    ) -> ObjectRef {
+        self.create_string_uninterned_gc_safe(text)
+    }
+
     /// Populate an *already-allocated* `java/lang/String` object's backing
     /// fields directly from raw UTF-16 code `units`, using the same
     /// Latin1-fits-in-a-byte bulk scan + little-endian compact-string layout
@@ -1332,6 +1371,23 @@ pub trait NativeContext {
 
     /// Read a Java String object back to a Rust String.
     fn read_string(&self, obj: ObjectRef) -> Option<String>;
+
+    /// Return the raw Java `String.hashCode()` for a confirmed String object.
+    /// `None` means that `obj` is not a String. Implementations may override
+    /// this to inspect compact storage without allocating a host String.
+    fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
+        self.read_string(obj).map(|text| {
+            text.encode_utf16().fold(0i32, |hash, unit| {
+                hash.wrapping_mul(31).wrapping_add(unit as i32)
+            })
+        })
+    }
+
+    /// Compare two confirmed Java Strings without routing through Java
+    /// dispatch. `None` means at least one operand is not a String.
+    fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
+        Some(self.read_string(a)? == self.read_string(b)?)
+    }
 
     /// Get or create the java.lang.Class mirror for the given ClassId.
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef;
@@ -1391,7 +1447,11 @@ pub trait NativeContext {
     /// Defaults to the aborting `alloc_object` (wrapped in `Some`) for
     /// mock/test contexts; the real VM implementation overrides this with
     /// the actual fallible allocator.
-    fn try_alloc_object_gc_safe(&mut self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+    fn try_alloc_object_gc_safe(
+        &mut self,
+        class_id: ClassId,
+        num_fields: usize,
+    ) -> Option<ObjectRef> {
         Some(self.alloc_object(class_id, num_fields))
     }
 
@@ -3817,7 +3877,10 @@ impl NativeMethodRegistry {
                     | ("join", "()Ljava/lang/Object;")
                     | ("invoke", "()Ljava/lang/Object;")
                     | ("get", "()Ljava/lang/Object;")
-                    | ("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
+                    | (
+                        "get",
+                        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"
+                    )
                     | ("getRawResult", "()Ljava/lang/Object;")
                     | ("setRawResult", "(Ljava/lang/Object;)V")
                     | ("isDone", "()Z")

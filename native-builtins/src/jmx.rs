@@ -819,7 +819,7 @@ fn native_object_name_is_domain_pattern(
     let text = object_name_text(ctx, this);
     let (domain, _, _) = object_name_parts(&text);
     Ok(Some(Value::Int(
-        (domain.contains('*') || domain.contains('?')) as i32,
+        (object_name_has_unquoted_wildcard(&domain)) as i32,
     )))
 }
 
@@ -848,13 +848,25 @@ fn native_object_name_is_property_pattern(
     let (_, props, is_plist_pattern) = object_name_parts(&text);
     let value_pattern = props
         .iter()
-        .any(|(_, v)| v.contains('*') || v.contains('?'));
+        .any(|(_, v)| object_name_has_unquoted_wildcard(v));
     Ok(Some(Value::Int((is_plist_pattern || value_pattern) as i32)))
 }
 
 /// `ObjectName.isPattern()`: true iff the domain contains a wildcard or the
 /// name is a property pattern (property-list pattern, e.g. `"d:k=v,*"`, or a
 /// property-value pattern, e.g. `"d:k=*"`).
+fn object_name_has_unquoted_wildcard(text: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if escaped { escaped = false; continue; }
+        if ch == '\\' && quoted { escaped = true; continue; }
+        if ch == '"' { quoted = !quoted; continue; }
+        if !quoted && matches!(ch, '*' | '?') { return true; }
+    }
+    false
+}
+
 fn native_object_name_is_pattern(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -862,10 +874,10 @@ fn native_object_name_is_pattern(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let text = object_name_text(ctx, this);
     let (domain, props, is_plist_pattern) = object_name_parts(&text);
-    let domain_pattern = domain.contains('*') || domain.contains('?');
+    let domain_pattern = object_name_has_unquoted_wildcard(&domain);
     let value_pattern = props
         .iter()
-        .any(|(_, v)| v.contains('*') || v.contains('?'));
+        .any(|(_, v)| object_name_has_unquoted_wildcard(v));
     Ok(Some(Value::Int(
         (domain_pattern || is_plist_pattern || value_pattern) as i32,
     )))
@@ -3034,7 +3046,9 @@ fn alloc_snapshot_thread_info(
     ctx.set_field_by_name(info, "threadId", Value::Long(snapshot.thread_id));
     if let Some((thread_pin, thread)) = thread_pin {
         let thread = ctx.read_native_pin(thread_pin, thread);
-        if let Ok(Some(state)) = ctx.invoke_virtual(thread, "getState", "()Ljava/lang/Thread$State;", &[]) {
+        if let Ok(Some(state)) =
+            ctx.invoke_virtual(thread, "getState", "()Ljava/lang/Thread$State;", &[])
+        {
             ctx.set_field_by_name(info, "threadState", state);
         }
         ctx.unpin_native_roots(thread_pin);
@@ -3057,7 +3071,11 @@ fn alloc_snapshot_thread_info(
         let lock_info = alloc_jmx_lock_info(ctx, lock, snapshot.lock_class_name.as_deref());
         let info = ctx.read_native_pin(info_pin, info);
         ctx.set_field_by_name(info, "lock", Value::Object(Some(lock_info)));
-        let lock_name = ctx.create_string(&jmx_lock_name(ctx, lock, snapshot.lock_class_name.as_deref()));
+        let lock_name = ctx.create_string(&jmx_lock_name(
+            ctx,
+            lock,
+            snapshot.lock_class_name.as_deref(),
+        ));
         let lock_name_pin = ctx.pin_native_root(lock_name);
         let lock_name = ctx.read_native_pin(lock_name_pin, lock_name);
         let info = ctx.read_native_pin(info_pin, info);

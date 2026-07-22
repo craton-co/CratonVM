@@ -2008,9 +2008,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             // Record the request regardless of the fd's current registry
             // state. If the fd is still `Unbound` (pre-`connect0`) this is
             // the ONLY record of it — see `net_pending_nonblocking`.
-            net_pending_nonblocking()
-                .write()
-                .insert(fd, !blocking);
+            net_pending_nonblocking().write().insert(fd, !blocking);
             let map = net_sockets().read();
             match map.get(&fd) {
                 Some(NetSocketHandle::Stream(stream)) => {

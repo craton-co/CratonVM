@@ -1111,13 +1111,7 @@ fn java_hashmap_iteration_order(keys: &[String]) -> Vec<String> {
     let mut indexed: Vec<(usize, usize, &String)> = keys
         .iter()
         .enumerate()
-        .map(|(insertion_index, key)| {
-            (
-                java_hashmap_bucket(key, capacity),
-                insertion_index,
-                key,
-            )
-        })
+        .map(|(insertion_index, key)| (java_hashmap_bucket(key, capacity), insertion_index, key))
         .collect();
     // Ascending bucket index; entries within the same bucket keep their
     // original (insertion) order, matching Java 8+ HashMap's tail-append
@@ -3674,7 +3668,10 @@ fn first_identity_pem_from_state(state: &KeyManagerState) -> Option<(String, Str
 }
 
 fn first_preferred_alias(state: &KeyManagerState) -> Option<String> {
-    for by_key_type in [&state.client_aliases_by_key_type, &state.server_aliases_by_key_type] {
+    for by_key_type in [
+        &state.client_aliases_by_key_type,
+        &state.server_aliases_by_key_type,
+    ] {
         let mut key_types: Vec<&String> = by_key_type.keys().collect();
         key_types.sort();
         for kt in key_types {
@@ -4178,11 +4175,7 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
                 key_password.len()
             );
         }
-        crate::keystore::keystore_set_pending_km_identity_with_password(
-            ctx,
-            *ks,
-            &key_password,
-        );
+        crate::keystore::keystore_set_pending_km_identity_with_password(ctx, *ks, &key_password);
     }
     let ks_id = match args.get(1) {
         Some(Value::Object(Some(ks))) => read_keystore_id(ctx, *ks),

@@ -344,8 +344,12 @@ fn socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // (WSAEADDRNOTAVAIL) — see the matching substitution and rationale in
     // `native-io/src/socket_channel.rs::sc_connect_inner`.
     let ip = match ip {
-        std::net::IpAddr::V4(v4) if v4.is_unspecified() => std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
-        std::net::IpAddr::V6(v6) if v6.is_unspecified() => std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => {
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => {
+            std::net::IpAddr::V6(Ipv6Addr::LOCALHOST)
+        }
         other => other,
     };
     let sa = SocketAddr::new(ip, port as u16);

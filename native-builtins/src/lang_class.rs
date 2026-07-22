@@ -607,12 +607,7 @@ fn check_reflection_module_access(
     target_class_name: &str,
     accessible_override: bool,
 ) -> Result<(), String> {
-    check_reflection_module_access_with_target_id(
-        ctx,
-        target_class_name,
-        None,
-        accessible_override,
-    )
+    check_reflection_module_access_with_target_id(ctx, target_class_name, None, accessible_override)
 }
 
 /// Exact-identity variant of [`check_reflection_module_access`]. A reflective
@@ -1802,17 +1797,22 @@ pub(crate) fn native_class_for_name(
     }
     // The initialize flag belongs to the explicit-null-loader overload too.
     // Loading a bootstrap class with initialize=false must not run clinit.
-    let bootstrap_initialize =
-        matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
+    let bootstrap_initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
     if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
         eprintln!(
             "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
-            dotted_name, args.len(), args, effective_loader.is_some()
+            dotted_name,
+            args.len(),
+            args,
+            effective_loader.is_some()
         );
         if let Some((loader, _init)) = effective_loader {
             let lcid = ctx.class_id_of_object(loader);
             let lname = ctx.class_name_of_id(lcid).unwrap_or_default();
-            eprintln!("[FORNAME-TRACE] loader_class={} loader_obj={:?}", lname, loader);
+            eprintln!(
+                "[FORNAME-TRACE] loader_class={} loader_obj={:?}",
+                lname, loader
+            );
         }
     }
 
@@ -1877,11 +1877,9 @@ pub(crate) fn native_class_for_name(
         // (here, misleading) `loadClass` bytecode entirely when the answer
         // is already known.
         if crate::classloader::is_user_defined_loader(ctx, loader) {
-            if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(
-                ctx,
-                loader,
-                &internal_name,
-            ) {
+            if let Some(mirror) =
+                crate::classloader::find_loaded_class_for_loader(ctx, loader, &internal_name)
+            {
                 if initialize {
                     if let Some(cid) = ctx.class_id_from_mirror(mirror) {
                         ctx.initialize_class(cid)?;
@@ -2778,7 +2776,8 @@ pub(crate) fn native_class_is_assignable_from(
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
         if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-            && (this_name.contains("ObservationRegistry") || other_name.contains("ObservationRegistry"))
+            && (this_name.contains("ObservationRegistry")
+                || other_name.contains("ObservationRegistry"))
         {
             let this_cid = mirror_class_id(ctx, this);
             let other_cid = mirror_class_id(ctx, other);
@@ -3292,7 +3291,10 @@ pub(crate) fn descriptor_to_class_mirror_via_loader(
         while let Some(rest) = component.strip_prefix('[') {
             component = rest;
         }
-        if let Some(inner) = component.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        if let Some(inner) = component
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+        {
             let loader_id = ctx.loader_id_of_class(declaring_class_id);
             if loader_id >= 3
                 && ctx
@@ -6256,6 +6258,23 @@ pub(crate) fn method_modifiers_value(
     ctx: &dyn NativeContext,
     method_obj: cratonvm_types::ObjectRef,
 ) -> Value {
+    // JDK-private Method copies can retain a truncated `modifiers` field.
+    // Prefer the loaded declaring member's exact class-file metadata.
+    if let (Value::Object(Some(clazz)), Value::Object(Some(name))) = (
+        method_clazz_value(ctx, method_obj),
+        method_name_value(ctx, method_obj),
+    ) {
+        if let (Some(class_id), Some(name)) = (mirror_class_id(ctx, clazz), ctx.read_string(name)) {
+            let descriptor = method_descriptor_for_invoke(ctx, method_obj);
+            if let Some(method) = ctx
+                .declared_methods(class_id)
+                .into_iter()
+                .find(|method| method.name == name && method.descriptor == descriptor)
+            {
+                return Value::Int(method.access_flags as i32);
+            }
+        }
+    }
     method_int_field_value_or_legacy(ctx, method_obj, "modifiers", METHOD_LEGACY_SLOT_MODIFIERS)
 }
 
@@ -12982,7 +13001,9 @@ pub(crate) fn native_class_get_type_parameters(
         // one already exists for (this, tp.name); only build+cache a new one
         // on first request.
         let tv = crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
-            .unwrap_or_else(|| crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this))));
+            .unwrap_or_else(|| {
+                crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+            });
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }
@@ -13176,7 +13197,9 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok() && this_name.contains("ApplicationContextInitializer") {
+    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+        && this_name.contains("ApplicationContextInitializer")
+    {
         eprintln!(
             "[LAMBDA-GENERIC] getGenericInterfaces ENTRY this_name={this_name} class_id={class_id:?}"
         );
@@ -13263,7 +13286,12 @@ pub(crate) fn native_class_get_generic_interfaces(
                 ctx.lambda_call_site_descriptors(class_id)
             {
                 let sig = crate::generics::lambda_functional_interface_generic_type(
-                    ctx, iface_id, &iface_name, &sam_name, &sam_desc, &inst_desc,
+                    ctx,
+                    iface_id,
+                    &iface_name,
+                    &sam_name,
+                    &sam_desc,
+                    &inst_desc,
                 );
                 if dbg_lg {
                     eprintln!(
@@ -13295,13 +13323,14 @@ pub(crate) fn native_class_get_generic_interfaces(
                             "[LAMBDA-GENERIC] host-scope class_id={class_id:?} host_name={host_name:?} host_id={host_id:?}"
                         );
                     }
-                    let _gscope = host_id.map(|host_id| ctx.get_class_mirror(host_id)).map(
-                        |host_mirror| {
+                    let _gscope =
+                        host_id
+                            .map(|host_id| ctx.get_class_mirror(host_id))
+                            .map(|host_mirror| {
                             crate::generics::GenericDeclScope::new(Value::Object(Some(
                                 host_mirror,
                             )))
-                        },
-                    );
+                            });
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
@@ -14125,9 +14154,10 @@ fn t19_h10_class_manifest_attr(
     // however; the class-path index is the authoritative fallback and still
     // resolves the JAR containing this precise internal class name.
     let class_name = ctx.class_name_of_id(class_id);
-    let package_path = class_name
-        .as_deref()
-        .and_then(|name| name.rsplit_once('/').map(|(package, _)| format!("{package}/")));
+    let package_path = class_name.as_deref().and_then(|name| {
+        name.rsplit_once('/')
+            .map(|(package, _)| format!("{package}/"))
+    });
     let code_base = ctx.class_code_base(class_id).unwrap_or_default();
     let url = if code_base.is_empty() || code_base.starts_with("class:") {
         class_name
@@ -14167,12 +14197,9 @@ fn t19_h10_class_manifest_attr(
                 std::path::PathBuf::from(format!("/{}", outer_path))
             };
             if outer_pb.is_file() {
-                if let Some(val) = nested_jar_manifest_attr(
-                    &outer_pb,
-                    inner_entry,
-                    package_path.as_deref(),
-                    attr,
-                ) {
+                if let Some(val) =
+                    nested_jar_manifest_attr(&outer_pb, inner_entry, package_path.as_deref(), attr)
+                {
                     return Some(val);
                 }
             }
@@ -15058,7 +15085,9 @@ pub(crate) fn native_class_get_canonical_name(
             if let Some(display_name) =
                 spring_configuration_cglib_display_name(ctx, class_id, &name)
             {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&display_name.replace('/', "."))))));
+                return Ok(Some(Value::Object(Some(
+                    ctx.create_string(&display_name.replace('/', ".")),
+                ))));
             }
         }
     }
@@ -15121,7 +15150,9 @@ pub(crate) fn native_class_get_type_name(
             if let Some(display_name) =
                 spring_configuration_cglib_display_name(ctx, class_id, &name)
             {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&display_name.replace('/', "."))))));
+                return Ok(Some(Value::Object(Some(
+                    ctx.create_string(&display_name.replace('/', ".")),
+                ))));
             }
         }
     }
@@ -15868,8 +15899,8 @@ pub(crate) fn native_class_get_declared_classes(
                 // `forkedLoader.loadClass("...NestedConfig")` directly)
                 // falls straight to the global lookup and silently returns
                 // the FIRST same-named class some other loader registered.
-                let driven = crate::classloader::defining_loader_for(class_id.as_u32())
-                    .and_then(|loader_obj| {
+                let driven = crate::classloader::defining_loader_for(class_id.as_u32()).and_then(
+                    |loader_obj| {
                         let dotted = inner_class.replace('/', ".");
                         let name_obj = ctx.create_string(&dotted);
                         match ctx.invoke_virtual(
@@ -15881,7 +15912,8 @@ pub(crate) fn native_class_get_declared_classes(
                             Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
                             _ => None,
                         }
-                    });
+                    },
+                );
                 match driven {
                     Some(id) => Some(id),
                     None => match ctx.load_class(inner_class) {
@@ -19546,11 +19578,7 @@ Implementation-Title: opensaml-core-api\r\n\
         let attrs = parse_package_manifest(manifest);
 
         assert_eq!(
-            manifest_attr_for_package(
-                &attrs,
-                Some("org/opensaml/core/"),
-                "Implementation-Version"
-            )
+            manifest_attr_for_package(&attrs, Some("org/opensaml/core/"), "Implementation-Version")
             .as_deref(),
             Some("5.2.1")
         );
@@ -20195,7 +20223,11 @@ Implementation-Title: opensaml-core-api\r\n\
             Some(Value::Object(Some(array))) => array,
             other => panic!("expected Constructor[] result, got {other:?}"),
         };
-        assert_eq!(ctx.array_length(array), 2, "only public constructors belong in getConstructors()");
+        assert_eq!(
+            ctx.array_length(array),
+            2,
+            "only public constructors belong in getConstructors()"
+        );
 
         let mut arities = Vec::new();
         for i in 0..ctx.array_length(array) {
@@ -20203,7 +20235,10 @@ Implementation-Title: opensaml-core-api\r\n\
                 Value::Object(Some(ctor)) => ctor,
                 other => panic!("expected Constructor at index {i}, got {other:?}"),
             };
-            assert_eq!(ctx.get_field_by_name(ctor, "modifiers"), Value::Int(ACC_PUBLIC as i32));
+            assert_eq!(
+                ctx.get_field_by_name(ctor, "modifiers"),
+                Value::Int(ACC_PUBLIC as i32)
+            );
             let params = match ctx.get_field_by_name(ctor, "parameterTypes") {
                 Value::Object(Some(params)) => params,
                 other => panic!("Constructor.parameterTypes must be non-null, got {other:?}"),
@@ -20752,7 +20787,11 @@ Implementation-Title: opensaml-core-api\r\n\
         let name = ctx.create_string("java.lang.String");
         let resolved = native_class_for_name(
             &mut ctx,
-            &[Value::Object(Some(name)), Value::Int(1), Value::Object(None)],
+            &[
+                Value::Object(Some(name)),
+                Value::Int(1),
+                Value::Object(None),
+            ],
         )
         .expect("bootstrap class should resolve through null loader")
         .expect("Class.forName should return a class mirror");

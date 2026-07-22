@@ -1197,7 +1197,10 @@ fn safe_native_call_impl(
                         .get_class(cid)
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("<cid={cid:?}>"));
-                    eprintln!("[altrace NRET] callee={callee} v={:p} cls={cname}", o.as_ptr());
+                    eprintln!(
+                        "[altrace NRET] callee={callee} v={:p} cls={cname}",
+                        o.as_ptr()
+                    );
                 }
             }
         }
@@ -3285,6 +3288,95 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
         })
 }
 
+/// Whether an object is the real bootstrap `java/lang/String` class.
+fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
+    if shared.heap.kind_of(object) != ObjectKind::Object {
+        return false;
+    }
+    shared
+        .class_manager
+        .read()
+        .get_class(shared.heap.class_id_of(object))
+        .is_some_and(|class| class.name.as_ref() == "java/lang/String")
+}
+
+/// Return the raw Java String hash directly from compact storage.
+fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32> {
+    if !is_real_java_string(shared, object) {
+        return None;
+    }
+    let (Value::Object(Some(bytes)), Value::Int(coder)) =
+        (shared.heap.get_field(object, 0), shared.heap.get_field(object, 1))
+    else { return None; };
+    if !matches!(coder, 0 | 1)
+        || shared.heap.array_element_type(bytes) != Some(ArrayElementType::Byte) { return None; }
+    let ptr = shared.heap.array_data_ptr(bytes)?;
+    let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, shared.heap.array_length(bytes)) };
+    let mut hash = 0i32;
+    if coder == 0 {
+        for &byte in raw { hash = hash.wrapping_mul(31).wrapping_add(byte as i32); }
+    } else {
+        if raw.len() & 1 != 0 { return None; }
+        for unit in raw.chunks_exact(2) {
+            hash = hash.wrapping_mul(31).wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
+        }
+    }
+    Some(hash)
+}
+
+/// Compare final compact `java.lang.String` instances without creating a
+/// host `String`. Cache entries originate only from confirmed String keys; the
+/// class-id equality guard therefore also rejects unrelated objects that happen
+/// to expose a similar field layout.
+fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectRef) -> bool {
+    if left == right {
+        return true;
+    }
+    if shared.heap.class_id_of(left) != shared.heap.class_id_of(right) {
+        return false;
+    }
+    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) =
+        (shared.heap.get_field(left, 0), shared.heap.get_field(left, 1))
+    else {
+        return false;
+    };
+    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) =
+        (shared.heap.get_field(right, 0), shared.heap.get_field(right, 1))
+    else {
+        return false;
+    };
+    if !matches!(left_coder, 0 | 1)
+        || !matches!(right_coder, 0 | 1)
+        || shared.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
+        || shared.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
+    {
+        return false;
+    }
+    let (Some(left_ptr), Some(right_ptr)) = (
+        shared.heap.array_data_ptr(left_bytes),
+        shared.heap.array_data_ptr(right_bytes),
+    ) else {
+        return false;
+    };
+    let left_len = shared.heap.array_length(left_bytes);
+    let right_len = shared.heap.array_length(right_bytes);
+    let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
+    let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
+    if left_coder == right_coder {
+        return left_raw == right_raw;
+    }
+    let (latin, utf16) = if left_coder == 0 {
+        (left_raw, right_raw)
+    } else {
+        (right_raw, left_raw)
+    };
+    utf16.len() == latin.len().saturating_mul(2)
+        && latin
+            .iter()
+            .zip(utf16.chunks_exact(2))
+            .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
+}
+
 impl<'a> NativeContext for NativeContextImpl<'a> {
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
@@ -3643,6 +3735,98 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .jni_global_refs
             .lock()
             .remove(handle as crate::native::jni::JObject)
+    }
+
+    fn hashmap_string_node_cache_get_object(
+        &mut self,
+        map: ObjectRef,
+        key: ObjectRef,
+    ) -> Option<Value> {
+        let mut index = 0;
+        while index < self.thread.jit_hashmap_string_node_cache.len() {
+            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
+            if entry.map != map {
+                index += 1;
+                continue;
+            }
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if mod_count != entry.mod_count {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            }
+            let Value::Object(Some(node_key)) = self.shared.heap.get_field(entry.node, 1) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if compact_java_strings_equal(self.shared, key, node_key) {
+                return Some(self.shared.heap.get_field(entry.node, 2));
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn hashmap_string_node_cache_get(&mut self, map: ObjectRef, key: &str) -> Option<Value> {
+        let mut index = 0;
+        while index < self.thread.jit_hashmap_string_node_cache.len() {
+            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
+            if entry.map != map || entry.key != key {
+                index += 1;
+                continue;
+            }
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if mod_count != entry.mod_count {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            }
+            return Some(self.shared.heap.get_field(entry.node, 2));
+        }
+        None
+    }
+
+    fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
+        let class_id = self.shared.heap.class_id_of(map);
+        let fields = self.shared.class_manager.read();
+        let Some(mod_count_slot) = resolve_field_index_in_hierarchy(
+            class_id,
+            "modCount",
+            &fields.class_store,
+        ) else {
+            return;
+        };
+        drop(fields);
+        let Value::Int(mod_count) = self.shared.heap.get_field(map, mod_count_slot) else {
+            return;
+        };
+        if let Some(entry) = self
+            .thread
+            .jit_hashmap_string_node_cache
+            .iter_mut()
+            .find(|entry| entry.map == map && entry.key == key)
+        {
+            entry.node = node;
+            entry.mod_count_slot = mod_count_slot;
+            entry.mod_count = mod_count;
+            return;
+        }
+        if self.thread.jit_hashmap_string_node_cache.len() >= 32 {
+            self.thread.jit_hashmap_string_node_cache.remove(0);
+        }
+        self.thread.jit_hashmap_string_node_cache.push(
+            crate::threading::jvm_thread::JitHashMapStringNodeCacheEntry {
+                map,
+                node,
+                key: key.to_owned(),
+                mod_count_slot,
+                mod_count,
+            },
+        );
     }
 
     fn invoke(
@@ -5055,11 +5239,69 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
         }
-        super::create_java_string_uninterned(self.shared, text)
+        super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
+    }
+
+    fn get_ascii_case_string_cached(&mut self, source: ObjectRef, upper: bool) -> Option<ObjectRef> {
+        let entry = self
+            .thread
+            .string_case_cache
+            .iter_mut()
+            .find(|entry| entry.source == source && entry.upper == upper)?;
+        let result = if entry.next { entry.second } else { entry.first };
+        entry.next = !entry.next;
+        Some(result)
+    }
+
+    fn create_ascii_case_string_cached(
+        &mut self,
+        source: ObjectRef,
+        text: &str,
+        upper: bool,
+    ) -> ObjectRef {
+        if let Some(result) = self.get_ascii_case_string_cached(source, upper) {
+            return result;
+        }
+
+        // Keep source and the first result rooted across the second allocation:
+        // the allocation slow path is allowed to request a moving young GC.
+        let base = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(source);
+        let first = self.create_string_uninterned_gc_safe(text);
+        self.thread.native_pin_roots.push(first);
+        let second = self.create_string_uninterned_gc_safe(text);
+        let source = self.thread.native_pin_roots[base];
+        let first = self.thread.native_pin_roots[base + 1];
+        self.thread.native_pin_roots.truncate(base);
+
+        if self.thread.string_case_cache.len() >= 32 {
+            self.thread.string_case_cache.remove(0);
+        }
+        self.thread.string_case_cache.push(
+            crate::threading::jvm_thread::StringCaseCacheEntry {
+                source,
+                upper,
+                first,
+                second,
+                next: true,
+            },
+        );
+        first
     }
 
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         super::populate_java_string_fields(self.shared, this, units)
+    }
+
+    fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
+        compact_java_string_hash(self.shared, obj)
+    }
+
+    fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
+        if !is_real_java_string(self.shared, a) || !is_real_java_string(self.shared, b) {
+            return None;
+        }
+        Some(compact_java_strings_equal(self.shared, a, b))
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -6727,6 +6969,35 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.thread_registry.frame_trace_of(tid)
     }
 
+    fn thread_jmx_snapshot(
+        &self,
+        thread_obj: ObjectRef,
+    ) -> Option<cratonvm_native_api::ThreadJmxSnapshot> {
+        let registry_tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        let thread_id = read_java_thread_tid(self.shared, thread_obj)
+            .unwrap_or(registry_tid.0) as i64;
+        let thread_name = match self.get_field_by_name(thread_obj, "name") {
+            Value::Object(Some(name)) => super::read_java_string(&self.shared.heap, name),
+            _ => None,
+        }
+        .unwrap_or_else(|| format!("Thread-{thread_id}"));
+        let thread_status = match self.thread_run_state(thread_obj) {
+            1 => 0x0001, // RUNNABLE
+            2 => 0x0002, // TERMINATED
+            3 => 0x0010, // WAITING
+            4 => 0x0400, // BLOCKED_ON_MONITOR_ENTER
+            _ => 0,
+        };
+        Some(cratonvm_native_api::ThreadJmxSnapshot {
+            thread_object: Some(thread_obj),
+            thread_id,
+            thread_name,
+            thread_status,
+            stack_trace: self.thread_stack_trace(thread_obj),
+            ..Default::default()
+        })
+    }
+
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
             if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
@@ -7881,7 +8152,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             eprintln!(
                 "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
-                method_name, receiver_class_id, call_site.is_some()
+                method_name,
+                receiver_class_id,
+                call_site.is_some()
             );
         }
 
@@ -8315,7 +8588,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
-                eprintln!("[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch", method_name);
+                eprintln!(
+                    "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch",
+                    method_name
+                );
             }
             // Not a lambda-dispatch call after all (the receiver wasn't a
             // recognized proxy, or the `.filter()` predicate above rejected
@@ -8538,7 +8814,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
-                let global_id = self.shared.class_manager.read().get_loaded_class_id(&class_name);
+                let global_id = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&class_name);
                 eprintln!(
                     "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
                     method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
@@ -14021,7 +14301,10 @@ fn invoke_on_class_shared_inner(
         // `GenericTypeResolver`-based debug output. Once a class's real
         // bytecode loads, `is_synthetic_stub` flips false and this check
         // naturally stops applying to it.
-        if let Some(callback) = shared.native_methods.find(&class_name, method_name, descriptor) {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14107,11 +14390,11 @@ fn invoke_on_class_shared_inner(
                 | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
         )
     {
-        if let Some(callback) = shared.native_methods.find(
-            "javax/net/ssl/SSLSocketFactory",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("javax/net/ssl/SSLSocketFactory", method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14143,11 +14426,11 @@ fn invoke_on_class_shared_inner(
                 | ("getWantClientAuth", "()Z")
         )
     {
-        if let Some(callback) = shared.native_methods.find(
-            "javax/net/ssl/SSLSocket",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("javax/net/ssl/SSLSocket", method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14235,8 +14518,7 @@ fn invoke_on_class_shared_inner(
                 "javax/net/ssl/SSLServerSocketFactory"
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
-                if let Some(callback) =
-                    shared
+                if let Some(callback) = shared
                         .native_methods
                         // The real JDK factory carries its SSLContext in the
                         // same first instance slot consumed by the bridge.

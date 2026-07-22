@@ -161,6 +161,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(obj_ref);
     }
 
+    // 4d. Direct JIT HashMap node cache. Both refs remain valid across a
+    // moving collection because this scan and gc.rs remap them with the thread.
+    for entry in &thread.jit_hashmap_string_node_cache {
+        roots.push(entry.map);
+        roots.push(entry.node);
+    }
+    for entry in &thread.string_case_cache {
+        roots.extend([entry.source, entry.first, entry.second]);
+    }
+
     // 5. Interned string pool — all interned String objects
     {
         let string_pool = shared.string_pool.read();

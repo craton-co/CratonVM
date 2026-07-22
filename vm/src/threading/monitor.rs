@@ -1654,7 +1654,11 @@ impl MonitorTable {
     /// forever even though the joined thread's `alive` flag is already false
     /// (the exact "worker alive=false, joiner stuck in `Thread.join()`"
     /// lost-wakeup signature).
-    pub fn release_monitors_held_by_except(&self, thread_id: ThreadId, except: Option<&Arc<Monitor>>) {
+    pub fn release_monitors_held_by_except(
+        &self,
+        thread_id: ThreadId,
+        except: Option<&Arc<Monitor>>,
+    ) {
         let monitors = self.monitors.lock().expect("monitors registry poisoned");
         for monitor in monitors.values() {
             if let Some(exc) = except {
@@ -1864,7 +1868,9 @@ mod tests {
         let tid_a = ThreadId(1);
         let tid_b = ThreadId(2);
 
-        let (monitor, contended) = table.enter_inflated_or_contend(obj, tid_a).expect("inflate");
+        let (monitor, contended) = table
+            .enter_inflated_or_contend(obj, tid_a)
+            .expect("inflate");
         assert!(!contended, "fresh monitor should be acquired immediately");
         assert!(monitor.is_held_by(tid_a));
 
@@ -1886,7 +1892,9 @@ mod tests {
         let tid_a = ThreadId(1);
         let tid_b = ThreadId(2);
 
-        let (monitor, _) = table.enter_inflated_or_contend(obj, tid_a).expect("inflate");
+        let (monitor, _) = table
+            .enter_inflated_or_contend(obj, tid_a)
+            .expect("inflate");
         // Releasing a thread that owns nothing here must not disturb A's hold.
         table.release_monitors_held_by(tid_b);
         assert!(monitor.is_held_by(tid_a));

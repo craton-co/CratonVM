@@ -1796,8 +1796,9 @@ impl GenerationalHeap {
         // SAFETY: `obj_ref` points at a live object header; `identity_hash_code` is a naturally-aligned
         // 4-byte field (full rationale in the block above), so this one CAS cannot tear or race the plain reads elsewhere.
         unsafe {
-            let field_ptr =
-                std::ptr::addr_of_mut!((*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code);
+            let field_ptr = std::ptr::addr_of_mut!(
+                (*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code
+            );
             let atomic = &*(field_ptr as *const AtomicI32);
             match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => minted,
@@ -5454,9 +5455,8 @@ impl GenerationalHeap {
         // the pre-oracle robustness property that a truncated oracle walk
         // (corrupt header mid-arena) cannot silently unroot every precise
         // edge above the truncation point.
-        let mut mark_young_precise = |ptr: *mut u8,
-                                      worklist: &mut Vec<*mut u8>,
-                                      side_marks: &mut FxHashSet<usize>| {
+        let mut mark_young_precise =
+            |ptr: *mut u8, worklist: &mut Vec<*mut u8>, side_marks: &mut FxHashSet<usize>| {
             let addr = ptr as usize;
             if !in_young(addr) {
                 return;
@@ -7329,7 +7329,10 @@ impl GenerationalHeap {
         } else if !dead_regions.is_empty() {
             tracing::debug!(
                 spans = dead_regions.len(),
-                bytes = reclaimed_regions.iter().map(|(_, size)| *size).sum::<usize>(),
+                bytes = reclaimed_regions
+                    .iter()
+                    .map(|(_, size)| *size)
+                    .sum::<usize>(),
                 "GC: retaining dead young spans during non-moving reclamation probe"
             );
         }
@@ -9772,10 +9775,7 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
     // Arena allocations reserve an 8-byte-aligned footprint. Compact object
     // bodies need not be naturally aligned, so their trailing padding belongs
     // to the object for every linear collector walk.
-    raw_size
-        .checked_add(7)
-        .map(|size| size & !7)
-        .unwrap_or(0)
+    raw_size.checked_add(7).map(|size| size & !7).unwrap_or(0)
 }
 
 /// Compute a pointer to the slot at `index` within an object/array.
@@ -10641,7 +10641,10 @@ mod tests {
         );
         let ordinary_cycle =
             next_young_gc_is_guaranteed_non_moving(false, false, false, false, false, false);
-        assert!(!ordinary_cycle, "JIT-quiescent collection is moving by default");
+        assert!(
+            !ordinary_cycle,
+            "JIT-quiescent collection is moving by default"
+        );
         assert!(
             next_young_gc_is_guaranteed_non_moving(true, false, false, false, false, false),
             "live JIT frames require the default non-moving collector",
@@ -11064,7 +11067,10 @@ mod tests {
         }
 
         // Dead object's memory was reclaimed (zeroed + on the free list).
-        assert!(result.stats.bytes_freed > 0, "dead object must be reclaimed");
+        assert!(
+            result.stats.bytes_freed > 0,
+            "dead object must be reclaimed"
+        );
         // SAFETY: `dead_ptr` is inside the young arena; reading its
         // (now-freed, zeroed) header is a valid in-bounds read.
         let dead_header = unsafe { &*(dead_ptr as *const ObjectHeader) };
@@ -11076,7 +11082,11 @@ mod tests {
 
         // A fresh allocation must succeed and reuse the reclaimed hole.
         let reused = heap.alloc_object(ClassId::new(7), 1);
-        assert_eq!(reused.as_ptr(), dead_ptr, "new allocation should reuse the swept hole");
+        assert_eq!(
+            reused.as_ptr(),
+            dead_ptr,
+            "new allocation should reuse the swept hole"
+        );
         heap.set_field(reused, 0, Value::Int(555));
         assert_eq!(heap.get_field(reused, 0).as_int(), Some(555));
 

@@ -367,7 +367,6 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
     targets
 }
 
-
 /// RBC.6 local-handler-safety fix v2 — proper CFG-based "definitely
 /// assigned" forward dataflow, replacing an earlier raw-pc-order
 /// approximation in `jit/src/lib.rs::local_handler_reads_unsafe_local`
@@ -2232,7 +2231,15 @@ mod tests {
         // use was at pc0, and local 1 was just overwritten at pc3 without a
         // subsequent read before the method returns.
         assert_eq!(live_at[4] & (1 << 0), 0, "local 0 dead after its only use");
-        assert_eq!(live_at[4] & (1 << 1), 0, "local 1 dead after being overwritten");
-        assert_ne!(live_at[4] & (1 << 2), 0, "local 2 live at the iload_2 that reads it");
+        assert_eq!(
+            live_at[4] & (1 << 1),
+            0,
+            "local 1 dead after being overwritten"
+        );
+        assert_ne!(
+            live_at[4] & (1 << 2),
+            0,
+            "local 2 live at the iload_2 that reads it"
+        );
     }
 }

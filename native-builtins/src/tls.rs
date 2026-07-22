@@ -2468,9 +2468,24 @@ pub fn engine_negotiated_alpn(engine_id: i32) -> Option<String> {
 pub(crate) fn register_conscrypt_native_bridges(r: &mut NativeMethodRegistry) {
     let prev = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    r.register("org/conscrypt/NativeCrypto", "clinit", "()V", native_conscrypt_clinit);
-    r.register("org/conscrypt/NativeCrypto", "get_cipher_names", "(Ljava/lang/String;)[Ljava/lang/String;", native_conscrypt_get_cipher_names);
-    r.register("org/conscrypt/NativeCrypto", "EVP_has_aes_hardware", "()I", native_conscrypt_has_aes_hardware);
+    r.register(
+        "org/conscrypt/NativeCrypto",
+        "clinit",
+        "()V",
+        native_conscrypt_clinit,
+    );
+    r.register(
+        "org/conscrypt/NativeCrypto",
+        "get_cipher_names",
+        "(Ljava/lang/String;)[Ljava/lang/String;",
+        native_conscrypt_get_cipher_names,
+    );
+    r.register(
+        "org/conscrypt/NativeCrypto",
+        "EVP_has_aes_hardware",
+        "()I",
+        native_conscrypt_has_aes_hardware,
+    );
     r.set_category(prev);
 }
 
@@ -2485,10 +2500,9 @@ fn native_conscrypt_get_cipher_names(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(ctx.new_array(
-        ArrayElementType::Reference,
-        0,
-    )))))
+    Ok(Some(Value::Object(Some(
+        ctx.new_array(ArrayElementType::Reference, 0),
+    ))))
 }
 
 fn native_conscrypt_has_aes_hardware(

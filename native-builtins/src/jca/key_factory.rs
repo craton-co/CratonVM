@@ -166,8 +166,8 @@ struct KpgObjKeyEntry {
     generation: u32,
 }
 
-fn kpg_obj_key_registry() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>>
-{
+fn kpg_obj_key_registry(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>> {
     use std::sync::OnceLock;
     static R: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<KpgObjKeyEntry>>>> =
         OnceLock::new();
@@ -513,7 +513,12 @@ fn der_spec_algorithm_oid(der: &[u8], is_private: bool) -> Option<Vec<u8>> {
 /// with that field layout, already relied on elsewhere in this file, e.g.
 /// the PKCS#1-vs-PKCS#8 RSA sniff in `kf_generate_private`). A concrete algo
 /// (or an unrecognised/unparseable spec) passes through unchanged.
-fn resolve_curve_algo(ctx: &mut dyn NativeContext, algo: i32, spec: ObjectRef, is_private: bool) -> i32 {
+fn resolve_curve_algo(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    spec: ObjectRef,
+    is_private: bool,
+) -> i32 {
     if algo != ALGO_XDH_GENERIC && algo != ALGO_EDDSA_GENERIC {
         return algo;
     }
@@ -559,18 +564,14 @@ fn drive_eddsa_or_xdh_keyfactory(
 ) -> Option<MethodCallResult> {
     if !matches!(
         algo,
-        ALGO_ED25519
-            | ALGO_ED448
-            | ALGO_X25519
-            | ALGO_X448
-            | ALGO_XDH_GENERIC
-            | ALGO_EDDSA_GENERIC
+        ALGO_ED25519 | ALGO_ED448 | ALGO_X25519 | ALGO_X448 | ALGO_XDH_GENERIC | ALGO_EDDSA_GENERIC
     ) {
         return None;
     }
     let is_private = engine == "engineGeneratePrivate";
     let resolved = resolve_curve_algo(ctx, algo, spec, is_private);
-    let spi = eddsa_keyfactory_spi_class(resolved).or_else(|| xdh_keyfactory_spi_class(resolved))?;
+    let spi =
+        eddsa_keyfactory_spi_class(resolved).or_else(|| xdh_keyfactory_spi_class(resolved))?;
     Some(drive_keyspec_spi(ctx, spi, spec, engine, ret_desc))
 }
 
@@ -802,8 +803,8 @@ fn drive_real_rsa_pss_keyfactory(
 ) -> MethodCallResult {
     let pin = ctx.pin_native_root(spec);
     let result = (|| {
-        let kf = match ctx.new_object_initialized("sun/security/rsa/RSAKeyFactory$PSS", "()V", &[])?
-        {
+        let kf =
+            match ctx.new_object_initialized("sun/security/rsa/RSAKeyFactory$PSS", "()V", &[])? {
             Some(Value::Object(Some(o))) => o,
             _ => {
                 return Err(RuntimeError::NotImplemented {
@@ -1909,7 +1910,8 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let algo = get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
+    let algo =
+        get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     });
@@ -2149,7 +2151,8 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
-    let algo = get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
+    let algo =
+        get_kf_algo(ctx, this).unwrap_or_else(|| match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
         _ => -1,
     });
@@ -3026,7 +3029,8 @@ mod tests {
             let mut ctx = crate::test_utils::MockNativeContext::new();
             let der = pkcs8_stub(oid);
             let arr = alloc_byte_array(&mut ctx, &der);
-            let spec = alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+            let spec =
+                alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
             ctx.set_field(spec, 0, Value::Object(Some(arr)));
             let generic = if expected == ALGO_X25519 || expected == ALGO_X448 {
                 ALGO_XDH_GENERIC
@@ -3042,9 +3046,13 @@ mod tests {
         // Concrete algos pass through unchanged regardless of the spec.
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let arr = alloc_byte_array(&mut ctx, &[]);
-        let spec = alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
+        let spec =
+            alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1);
         ctx.set_field(spec, 0, Value::Object(Some(arr)));
-        assert_eq!(resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true), ALGO_ED25519);
+        assert_eq!(
+            resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true),
+            ALGO_ED25519
+        );
         assert_eq!(resolve_curve_algo(&mut ctx, ALGO_RSA, spec, true), ALGO_RSA);
     }
 

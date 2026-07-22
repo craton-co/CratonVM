@@ -81,7 +81,8 @@ fn register_derby_embedded_connection_native(registry: &mut NativeMethodRegistry
     const INTERNAL_DRIVER: &str = "org/apache/derby/iapi/jdbc/InternalDriver";
     const CONNECT: &str = "(Ljava/lang/String;Ljava/util/Properties;I)Ljava/sql/Connection;";
     const GET_ATTRIBUTES: &str = "(Ljava/lang/String;Ljava/util/Properties;)Lorg/apache/derby/iapi/services/io/FormatableProperties;";
-    const NEW_CONNECTION: &str = "(Ljava/lang/String;Ljava/util/Properties;)Lorg/apache/derby/impl/jdbc/EmbedConnection;";
+    const NEW_CONNECTION: &str =
+        "(Ljava/lang/String;Ljava/util/Properties;)Lorg/apache/derby/impl/jdbc/EmbedConnection;";
     registry.register(INTERNAL_DRIVER, "connect", CONNECT, |ctx, args| {
         let this = crate::obj_arg(args, 0)?;
         let is_memory_url = match args.get(1) {

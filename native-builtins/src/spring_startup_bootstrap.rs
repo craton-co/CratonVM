@@ -527,7 +527,10 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
         let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
         eprintln!(
             "[CRATONVM_DBG_GOCBF] receiver={:?} class={} fast_path={} current={:?}",
-            receiver, rname, matches!(current, Value::Object(Some(_))), current
+            receiver,
+            rname,
+            matches!(current, Value::Object(Some(_))),
+            current
         );
     }
     if let Value::Object(Some(bf)) = current {
@@ -2808,7 +2811,10 @@ fn try_build_replace_override(
                     }
                     ctx.unpin_native_roots(ovr_pin);
                     if !mname.is_empty() {
-                        replacers.entry(mname).or_default().push(ReplaceOverrideCfg {
+                        replacers
+                            .entry(mname)
+                            .or_default()
+                            .push(ReplaceOverrideCfg {
                             type_identifiers,
                             replacer_bean_name: rname,
                         });

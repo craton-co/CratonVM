@@ -19,7 +19,10 @@ fn java_home() -> Option<PathBuf> {
 fn compiled_classes() -> Option<PathBuf> {
     option_env!("CRATONVM_TEST_CLASSES_DIR")
         .map(PathBuf::from)
-        .filter(|path| path.join("cratonvm/UrlClassLoaderResourceDelegation.class").exists())
+        .filter(|path| {
+            path.join("cratonvm/UrlClassLoaderResourceDelegation.class")
+                .exists()
+        })
 }
 
 #[test]

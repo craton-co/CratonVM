@@ -1485,7 +1485,10 @@ fn native_source_wakeup_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             );
         }
     }
-    xnio_tcp_dbg!("wakeup_reads id={id:?} queued_for_poller={}", channel.is_some());
+    xnio_tcp_dbg!(
+        "wakeup_reads id={id:?} queued_for_poller={}",
+        channel.is_some()
+    );
     Ok(None)
 }
 

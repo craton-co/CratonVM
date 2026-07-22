@@ -3144,6 +3144,13 @@ pub static HASHMAP_PUT_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Static `StringLatin1.toLowerCase` helper for the compact-string hot path.
+pub static STRING_LATIN1_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static STRING_LOCALE_LOWER_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static CONCURRENT_HASHMAP_GET_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Register the exact-HashMap thin direct-call helpers (called once from the
 /// VM's `build_helpers`).
@@ -3152,6 +3159,15 @@ pub fn set_hashmap_put_direct_fn(addr: usize) {
 }
 pub fn set_hashmap_get_direct_fn(addr: usize) {
     HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_string_latin1_lower_direct_fn(addr: usize) {
+    STRING_LATIN1_LOWER_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_string_locale_lower_direct_fn(addr: usize) {
+    STRING_LOCALE_LOWER_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn set_concurrent_hashmap_get_direct_fn(addr: usize) {
+    CONCURRENT_HASHMAP_GET_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Register the `Integer.intValue` thin direct-call helper (called once from
@@ -3746,13 +3762,11 @@ impl JitMICSlot {
         // Publish entry_ptr BEFORE class_id so the inline cache reader (which
         // checks class_id first, then loads entry_ptr) never observes a class
         // id paired with stale target metadata.
-        self.cached_entry_ptr
-            .store(entry_ptr, Ordering::Release);
+        self.cached_entry_ptr.store(entry_ptr, Ordering::Release);
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
             .store(needs_context, Ordering::Relaxed);
-        self.cached_class_id
-            .store(class_id, Ordering::Release);
+        self.cached_class_id.store(class_id, Ordering::Release);
     }
 
     /// Drop only the compiled-entry half of the MIC.
@@ -5981,12 +5995,8 @@ fn local_handler_reads_unsafe_local(
     let dbg = std::env::var_os("CRATONVM_DBG_RBC6").is_some();
     for entry in exception_table {
         let handler_pc = entry.handler_pc as usize;
-        let unsafe_found = regalloc::handler_has_unsafe_local_read(
-            code,
-            code_len,
-            handler_pc,
-            initial_safe_slots,
-        );
+        let unsafe_found =
+            regalloc::handler_has_unsafe_local_read(code, code_len, handler_pc, initial_safe_slots);
         if unsafe_found {
             if dbg {
                 eprintln!(
@@ -6262,8 +6272,10 @@ fn try_compile_inner(
             );
         }
         if unsafe_local {
-            *backend_attempted = true;
-            return None;
+            // The single-pass backend can preserve the full local state at a
+            // post-invoke exceptional exit. Request that path instead of
+            // reconstructing a handler from parameters only.
+            x64::set_precise_exception_frame_request(true);
         }
     }
 
@@ -7102,6 +7114,30 @@ fn try_compile_inner(
                     // identity-cache and pending-return rooting contracts.
                     if direct_jit_callee_calls_enabled
                         && invoke_kind == 3
+                        && class_name == "java/lang/StringLatin1"
+                        && method_name == "toLowerCase"
+                        && descriptor == "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;"
+                    {
+                        let entry = STRING_LATIN1_LOWER_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if entry != 0 {
+                            needs_heap = true;
+                            direct_calls.push((
+                                pc,
+                                JitDirectCall {
+                                    entry,
+                                    needs_context: true,
+                                    num_params: 3,
+                                    return_type: b'L',
+                                    guard_class_id: 0,
+                                },
+                            ));
+                            continue;
+                        }
+                    }
+
+                    if direct_jit_callee_calls_enabled
+                        && invoke_kind == 3
                         && class_name == "java/lang/Integer"
                         && method_name == "valueOf"
                         && descriptor == "(I)Ljava/lang/Integer;"
@@ -7268,13 +7304,59 @@ fn try_compile_inner(
                         continue;
                     }
                 }
+                if direct_jit_callee_calls_enabled
+                    && invoke_kind == 2
+                    && class_name == "java/util/concurrent/ConcurrentMap"
+                    && method_name == "get"
+                    && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
+                {
+                    let entry = CONCURRENT_HASHMAP_GET_DIRECT_FN
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if entry != 0 {
+                        needs_heap = true;
+                        direct_calls.push((pc, JitDirectCall {
+                            entry, needs_context: true, num_params: 1,
+                            return_type: b'L', guard_class_id: 0,
+                        }));
+                        continue;
+                    }
+                }
+
+                if direct_jit_callee_calls_enabled
+                    && invoke_kind == 0
+                    && class_name == "java/lang/String"
+                    && method_name == "toLowerCase"
+                    && descriptor == "(Ljava/util/Locale;)Ljava/lang/String;"
+                {
+                    let entry = STRING_LOCALE_LOWER_DIRECT_FN
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if entry != 0 {
+                        needs_heap = true;
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
+                        continue;
+                    }
+                }
                 // Exact-HashMap `put`/`get` thin direct calls (see
                 // `HASHMAP_PUT_DIRECT_FN`): guard-free registration — the
                 // helper verifies the receiver's exact class at runtime and
                 // routes everything non-exact/non-overlay to the generic
                 // dispatcher, so a subclass receiver keeps full virtual
                 // semantics.
-                if invoke_kind == 0 && class_name == "java/util/HashMap" {
+                if (invoke_kind == 0 && class_name == "java/util/HashMap")
+                    || (invoke_kind == 2
+                        && class_name == "java/util/Map"
+                        && method_name == "get"
+                        && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;")
+                {
                     let recognized = if method_name == "put"
                         && descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"
                     {
@@ -8610,10 +8692,15 @@ mod tests {
             Some("com/sun/org/apache/xerces/internal/")
         );
         assert_eq!(
-            xerces_schema_jit_deny_prefix("com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar"),
+            xerces_schema_jit_deny_prefix(
+                "com.sun.org.apache.xerces.internal.impl.xs.SchemaGrammar"
+            ),
             Some("com.sun.org.apache.xerces.internal.")
         );
-        assert_eq!(xerces_schema_jit_deny_prefix("com/sun/org/apache/xml/internal/Foo"), None);
+        assert_eq!(
+            xerces_schema_jit_deny_prefix("com/sun/org/apache/xml/internal/Foo"),
+            None
+        );
     }
 
     #[test]
@@ -11156,7 +11243,10 @@ mod tests {
 
     #[test]
     fn indy_arg_type_tags_one_tag_per_compact_slot() {
-        assert_eq!(count_param_slots("(IJDF)V"), indy_arg_type_tags("(IJDF)V").len());
+        assert_eq!(
+            count_param_slots("(IJDF)V"),
+            indy_arg_type_tags("(IJDF)V").len()
+        );
         assert_eq!(indy_arg_type_tags("(IJDF)V"), vec![b'I', b'J', b'D', b'F']);
     }
 
