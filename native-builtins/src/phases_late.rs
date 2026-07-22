@@ -6519,12 +6519,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     // Supplementary FileSystem methods that are abstract in real JDK and may
     // be invoked on the synthetic default-FS object.
+    //
+    // Was an unconditional `EmptySet` — real HotSpot's default `FileSystem`
+    // never reports zero supported views (that's a Windows-only default-FS
+    // possibility that doesn't apply here since we're always backed by a
+    // real host filesystem). An empty set made `Files.setPosixFilePermissions`
+    // → `getFileAttributeView(path, PosixFileAttributeView.class)` a
+    // pointless lookup for callers that pre-check via
+    // `fs.supportedFileAttributeViews().contains("posix")`, and is the
+    // upstream symptom of the `Files.setPosixFilePermissions`
+    // `UnsupportedOperationException` (H2 `FilePathDisk.setReadOnly`/
+    // `TestFileSystem.testSetReadOnly`/`TestTraceSystem.testReadOnly`).
+    // Report the same view-name set HotSpot reports on each platform. A
+    // mounted-jar/runtime-image (virtual) FileSystem has no POSIX-attribute
+    // filesystem backing it, so it keeps reporting none.
     r.register(
         fs_class,
         "supportedFileAttributeViews",
         "()Ljava/util/Set;",
-        |ctx, _args| {
-            let s = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+        |ctx, args| {
+            let is_virtual = matches!(obj_arg(args, 0), Ok(this)
+                if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
+                    || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))));
+            if is_virtual {
+                let s = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+                return Ok(Some(Value::Object(Some(s))));
+            }
+            let names: &[&str] = if cfg!(windows) {
+                &["basic", "dos", "acl", "owner", "user"]
+            } else {
+                // Matches HotSpot on Linux exactly (confirmed via
+                // `p.getFileSystem().supportedFileAttributeViews()`):
+                // `[owner, dos, basic, posix, user, unix]` — `dos` is
+                // included even on Linux (emulated via xattrs since JDK 15).
+                &["owner", "dos", "basic", "posix", "user", "unix"]
+            };
+            // `build_string_set` (naive synthetic array/size/capacity layout)
+            // silently prints/iterates as empty under real-JDK mode — real
+            // `AbstractCollection.toString()`/`HashSet.iterator()` bytecode
+            // reads the REAL `HashSet.map` field expecting a real `HashMap`,
+            // not our raw backing array. Use the real-field-layout builder
+            // (already established for exactly this class of bug — see its
+            // doc comment) instead.
+            let keys: Vec<ObjectRef> = names.iter().map(|s| ctx.create_string(s)).collect();
+            let s = crate::build_real_layout_string_hashset(ctx, &keys);
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -6770,11 +6808,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let is_basic = view_name.ends_with("BasicFileAttributeView")
                 || view_name.ends_with("/FileAttributeView")
                 || view_name == "java/nio/file/attribute/FileAttributeView";
-            let supported = is_dos || is_basic;
+            // Posix is real on Linux/macOS (never on Windows, matching
+            // HotSpot-on-Windows null for this type). Was missing entirely,
+            // so `Files.setPosixFilePermissions`'s real bytecode (which calls
+            // `getFileAttributeView(path, PosixFileAttributeView.class)` and
+            // throws `UnsupportedOperationException` on a null result) always
+            // threw on Linux too — see
+            // docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md.
+            let is_posix = !cfg!(windows) && view_name.ends_with("PosixFileAttributeView");
+            let supported = is_dos || is_basic || is_posix;
             if std::env::var("CRATONVM_DBG_FSP").is_ok() {
                 eprintln!(
                     "[FSP-DBG] getFileAttributeView requested view={view_name} -> {}",
-                    if is_dos { "dos-view" } else if is_basic { "basic-view" } else { "null" }
+                    if is_dos { "dos-view" } else if is_posix { "posix-view" } else if is_basic { "basic-view" } else { "null" }
                 );
             }
             if !supported {
@@ -6786,6 +6832,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let vclass = if is_dos {
                 "java/nio/file/attribute/DosFileAttributeView"
+            } else if is_posix {
+                "java/nio/file/attribute/PosixFileAttributeView"
             } else {
                 "java/nio/file/attribute/BasicFileAttributeView"
             };
@@ -6862,6 +6910,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     for vclass in [
         "java/nio/file/attribute/BasicFileAttributeView",
         "java/nio/file/attribute/DosFileAttributeView",
+        "java/nio/file/attribute/PosixFileAttributeView",
     ] {
         r.register(
             vclass,
@@ -6897,6 +6946,80 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             |_ctx, _args| Ok(None),
         );
     }
+    // PosixFileAttributeView — completes the view returned by
+    // `getFileAttributeView(path, PosixFileAttributeView.class)` above.
+    // `readAttributes()` reuses `p59_files_read_attributes`, which on a
+    // real host path (Linux/macOS) already allocates a *real* JDK
+    // `sun/nio/fs/UnixFileAttributes` object (not a synthetic stub) — its
+    // own real bytecode implements `permissions()`/`isDirectory()`/etc. by
+    // reading the `st_mode` field we populate, so no separate PosixFileAttributes
+    // shim is needed here (mirrors the Dos case, which instead re-homes
+    // fields into a dedicated synthetic type because `DosFileAttributes`
+    // has no such real-class fast path).
+    r.register(
+        "java/nio/file/attribute/PosixFileAttributeView",
+        "readAttributes",
+        "()Ljava/nio/file/attribute/PosixFileAttributes;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path_obj = ctx.get_field(this, 0);
+            p59_files_read_attributes(ctx, &[path_obj])
+        },
+    );
+    r.register(
+        "java/nio/file/attribute/PosixFileAttributeView",
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("posix"))))),
+    );
+    // `setPermissions` is the operation H2's `FilePathDisk.setReadOnly()` /
+    // `TestFileSystem.testSetReadOnly` / `TestTraceSystem.testReadOnly`
+    // actually need — chmod the real backing file to the permission bits
+    // the caller computed (H2 clears the *_WRITE bits and re-submits the
+    // rest). `posix_permission_bits_from_set` walks the same 9 canonical
+    // `PosixFilePermission` singletons `PosixFilePermissions.toString`/
+    // `fromString` already use.
+    r.register(
+        "java/nio/file/attribute/PosixFileAttributeView",
+        "setPermissions",
+        "(Ljava/util/Set;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path_value = ctx.get_field(this, 0);
+            let path = extract_path_string(ctx, Some(&path_value));
+            let set = obj_arg(args, 1)?;
+            let mode = posix_permission_bits_from_set(ctx, set);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|error| p57_io_error(&error))?;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (&path, mode);
+            }
+            Ok(None)
+        },
+    );
+    // `getOwner`/`setOwner` (from the `FileOwnerAttributeView` supertype) —
+    // not exercised by the H2 tests this view was added for, but left
+    // unregistered would AbstractMethodError for any other caller now that
+    // this view is reachable. `Files.getOwner`/`setOwner` (registered
+    // elsewhere in this file) already treat owner lookup as unsupported
+    // (null/no-op); match that rather than inventing a UserPrincipal.
+    r.register(
+        "java/nio/file/attribute/PosixFileAttributeView",
+        "getOwner",
+        "()Ljava/nio/file/attribute/UserPrincipal;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        "java/nio/file/attribute/PosixFileAttributeView",
+        "setOwner",
+        "(Ljava/nio/file/attribute/UserPrincipal;)V",
+        |_ctx, _args| Ok(None),
+    );
     // DosFileAttributes — same 5-field layout as BasicFileAttributes
     // (creation=0, lastAccess=1, lastMod=2, isDir=3, size=4) plus the four
     // DOS-specific flags (all false in this VM).
@@ -9647,7 +9770,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
-            let writable = std::path::Path::new(&p).exists();
+            // Was existence-only (ignored real permission bits entirely), so
+            // `Files.isWritable` never reflected `Files.setPosixFilePermissions`/
+            // `PosixFileAttributeView.setPermissions` clearing the write bits —
+            // H2's `FilePathDisk.canWrite()` calls this directly, so
+            // `TestFileSystem.testSetReadOnly`'s `assertFalse(canWrite(...))`
+            // would still fail even once `setReadOnly()` itself stopped
+            // throwing. Mirror `File.canWrite()`'s real permission check
+            // (same `Permissions::readonly()` query) instead.
+            let writable = std::fs::metadata(&p)
+                .map(|m| !m.permissions().readonly())
+                .unwrap_or(false);
             Ok(Some(Value::Int(if writable { 1 } else { 0 })))
         },
     );
@@ -27490,6 +27623,7 @@ fn basic_file_attributes_store(
     creation_millis: i64,
     access_millis: i64,
     modified_millis: i64,
+    unix_perm_bits: i32,
 ) {
     if basic_file_attributes_is_windows(ctx, attrs) {
         ctx.set_field_by_name(
@@ -27502,10 +27636,22 @@ fn basic_file_attributes_store(
         ctx.set_field_by_name(attrs, "lastWriteTime", Value::Long(modified_millis));
         ctx.set_field_by_name(attrs, "size", Value::Long(size));
     } else {
+        // Was always the bare file-type bits with zero permission bits, so
+        // `sun/nio/fs/UnixFileAttributes.permissions()` (real JDK bytecode,
+        // reads this same `st_mode` field) always answered an empty
+        // `Set<PosixFilePermission>` regardless of the file's real mode —
+        // harmless while nothing read `permissions()`, but once
+        // `PosixFileAttributeView` became reachable (see
+        // `getFileAttributeView` above) this fed `FilePathDisk.setReadOnly`'s
+        // "keep everything except *_WRITE" recomputation from a permission
+        // set that never had bits to keep. OR in the real mode bits when the
+        // caller has them (0 for the jar/jrt-FS and directory-walk callers
+        // below, which have no real backing inode to query).
+        let type_bits = if is_dir { 0o040000 } else { 0o100000 };
         ctx.set_field_by_name(
             attrs,
             "st_mode",
-            Value::Int(if is_dir { 0o040000 } else { 0o100000 }),
+            Value::Int(type_bits | (unix_perm_bits & 0o7777)),
         );
         ctx.set_field_by_name(attrs, "st_birthtime", Value::Long(creation_millis));
         ctx.set_field_by_name(attrs, "st_atime", Value::Long(access_millis));
@@ -27584,7 +27730,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
@@ -27602,7 +27748,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0);
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
@@ -27626,6 +27772,13 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let access_millis = meta.accessed().ok().map(system_time_to_millis).unwrap_or(0);
             // Last modified time
             let mod_millis = meta.modified().ok().map(system_time_to_millis).unwrap_or(0);
+            #[cfg(unix)]
+            let perm_bits = {
+                use std::os::unix::fs::PermissionsExt;
+                (meta.permissions().mode() & 0o7777) as i32
+            };
+            #[cfg(not(unix))]
+            let perm_bits = 0i32;
             basic_file_attributes_store(
                 ctx,
                 bfa,
@@ -27634,6 +27787,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 creation_millis,
                 access_millis,
                 mod_millis,
+                perm_bits,
             );
         }
         // NIO contract: `Files.readAttributes` must raise `IOException`
@@ -37284,7 +37438,7 @@ fn p98_alloc_basic_file_attributes(
     size: i64,
 ) -> ObjectRef {
     let attrs = basic_file_attributes_alloc(ctx);
-    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0);
+    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0, 0);
     attrs
 }
 
@@ -52574,6 +52728,48 @@ pub(crate) fn register_phase70_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 // java.nio.file.attribute extensions — PosixFilePermission, FileTime, UserPrincipal
 // =============================================================================
+
+/// Convert a `Set<PosixFilePermission>` (the 9 canonical singleton constants
+/// from `posix_file_permission_stub_clinit`/the real enum) into a Unix
+/// permission-bits mode (e.g. for `std::fs::Permissions::from_mode`). Walks
+/// the same 9 constants `PosixFilePermissions.toString`/`fromString` use,
+/// via `Set.contains` (no set-internals assumption — works for any real
+/// `Set` implementation the caller passes in, not just our synthetic
+/// `HashSet`).
+fn posix_permission_bits_from_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> u32 {
+    const NAMES: [&str; 9] = [
+        "OWNER_READ",
+        "OWNER_WRITE",
+        "OWNER_EXECUTE",
+        "GROUP_READ",
+        "GROUP_WRITE",
+        "GROUP_EXECUTE",
+        "OTHERS_READ",
+        "OTHERS_WRITE",
+        "OTHERS_EXECUTE",
+    ];
+    const BITS: [u32; 9] = [
+        0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001,
+    ];
+    let pfp = "java/nio/file/attribute/PosixFilePermission";
+    let _ = ctx.ensure_class_initialized(pfp);
+    let cid = ctx.class_id_by_name(pfp);
+    let mut mode = 0u32;
+    for i in 0..9 {
+        let Some(c) = cid else { break };
+        let Some(slot) = ctx.static_field_index_by_name(c, NAMES[i]) else {
+            continue;
+        };
+        let constant = ctx.get_static_field(c, slot);
+        if matches!(
+            ctx.invoke_virtual(set, "contains", "(Ljava/lang/Object;)Z", &[constant]),
+            Ok(Some(Value::Int(1)))
+        ) {
+            mode |= BITS[i];
+        }
+    }
+    mode
+}
 
 fn posix_file_permission_stub_clinit(
     ctx: &mut dyn NativeContext,
