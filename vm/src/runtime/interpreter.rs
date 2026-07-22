@@ -17802,13 +17802,45 @@ fn resolve_class_loader_aware(
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {
-        match shared
+        let direct_loader_id = shared
             .class_manager
             .read()
-            .get_loader_id(referencing_class_id)
-        {
+            .get_loader_id(referencing_class_id);
+        match direct_loader_id {
             Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
-            _ => None,
+            // `should_use_loader_initiated_resolution` just confirmed (via the
+            // `defining_loader_for` side table) that `referencing_class_id` WAS
+            // defined by a recognized user loader (Groovy or
+            // CompileWithForkedClassLoader) -- but `class_manager`'s own
+            // `loader_id` field for that same ClassId can disagree (return
+            // `Application`/`None`), silently discarding the gate's answer and
+            // falling all the way through to the loader-BLIND global fallback
+            // below. Observed for the `AotTestContextInitializers`/
+            // `AotTestContextInitializersFactory`/
+            // `DefaultCacheAwareContextLoaderDelegate`/
+            // `AotMergedContextConfiguration` family under
+            // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
+            // double-context-refresh session, see
+            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md) -- a `new`
+            // instruction referencing one of these classes resolved via the
+            // global path instead of the fork's own already-loaded copy,
+            // busting a `Class`-identity-keyed cache
+            // (`AotMergedContextConfiguration.hashCode()`) and causing a
+            // second, uncustomized `ApplicationContext` to be created. Trust
+            // the side table `should_use_loader_initiated_resolution` already
+            // consulted directly instead of silently downgrading to "not a
+            // user loader" on a disagreement.
+            _ => cratonvm_native_builtins::classloader::defining_loader_for(
+                referencing_class_id.as_u32(),
+            )
+            .map(|loader_obj| {
+                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                cratonvm_types::ClassLoaderId::UserDefined(
+                    cratonvm_native_builtins::classloader::loader_namespace_id(
+                        &mut ctx, loader_obj,
+                    ),
+                )
+            }),
         }
     } else {
         None
