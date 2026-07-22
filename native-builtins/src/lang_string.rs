@@ -4808,6 +4808,48 @@ pub(crate) fn native_string_format(
                             }
                         }
                     }
+                    't' | 'T' => {
+                        // Date/time conversion: 't'/'T' is a *prefix*, not a
+                        // complete conversion — the next character selects the
+                        // actual field (e.g. `%tb` = abbreviated month, `%tY` =
+                        // 4-digit year). Real java.util.Formatter upper-cases
+                        // the whole result when the prefix itself is 'T'.
+                        let uppercase = spec == 'T';
+                        if let Some(&field) = chars.get(i) {
+                            i += 1;
+                            let use_idx = if flags.contains('<') {
+                                last_used_index.unwrap_or(0)
+                            } else if let Some(ei) = explicit_index {
+                                ei
+                            } else {
+                                let cur = arg_idx;
+                                arg_idx += 1;
+                                cur
+                            };
+                            last_used_index = Some(use_idx);
+                            if use_idx < arr_len {
+                                if let Some(a) = arr_ref {
+                                    let elem = ctx.get_array_element(a, use_idx);
+                                    let text =
+                                        format_temporal_field(ctx, &elem, field, &flags, width)?;
+                                    result.push_str(&if uppercase {
+                                        text.to_uppercase()
+                                    } else {
+                                        text
+                                    });
+                                }
+                            }
+                        } else {
+                            return Err(
+                                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                                    message:
+                                        "Format string ends with an incomplete date/time conversion"
+                                            .to_string(),
+                                }
+                                .into(),
+                            );
+                        }
+                    }
                     _ => {
                         result.push('%');
                         result.push_str(&flags);
@@ -4839,6 +4881,331 @@ pub(crate) fn native_string_format(
 
     let obj = ctx.create_string_uninterned(&result);
     Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Epoch-day/calendar math for `%t`/`%T` formatting, self-contained rather
+/// than reusing `util_time`'s equivalents: that module sits behind the
+/// `synthetic-jdk` feature, but `String.format`/`Formatter` (this file) is a
+/// core native available regardless of feature flags.
+const TEMPORAL_DAYS_IN_MONTH: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn temporal_is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn temporal_days_in_month(year: i32, month: i32) -> i32 {
+    if month == 2 && temporal_is_leap_year(year) {
+        29
+    } else {
+        TEMPORAL_DAYS_IN_MONTH[(month - 1) as usize]
+    }
+}
+
+fn temporal_day_of_year(year: i32, month: i32, day: i32) -> i32 {
+    let mut doy = day;
+    for m in 1..month {
+        doy += temporal_days_in_month(year, m);
+    }
+    doy
+}
+
+fn temporal_to_epoch_day(year: i32, month: i32, day: i32) -> i64 {
+    let y = year as i64;
+    let mut total: i64 = 365 * y + y / 4 - y / 100 + y / 400;
+    for m in 1..month {
+        total += temporal_days_in_month(year, m) as i64;
+    }
+    total += day as i64;
+    total - 719_528 // days from year 0 to 1970-01-01
+}
+
+fn temporal_from_epoch_day(epoch_day: i64) -> (i32, i32, i32) {
+    let abs_day = epoch_day + 719_528;
+    let mut y = ((abs_day * 400) / 146_097) as i32;
+    loop {
+        let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
+        if year_start >= abs_day {
+            y -= 1;
+        } else {
+            let next_start = 365 * (y + 1) as i64 + (y + 1) as i64 / 4 - (y + 1) as i64 / 100
+                + (y + 1) as i64 / 400;
+            if next_start < abs_day {
+                y += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let year_start = 365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400;
+    let mut remaining = (abs_day - year_start) as i32;
+    let mut month = 1;
+    loop {
+        let dim = temporal_days_in_month(y, month);
+        if remaining <= dim {
+            break;
+        }
+        remaining -= dim;
+        month += 1;
+    }
+    (y, month, remaining)
+}
+
+/// Extract the wall-clock `(year, month[1-12], day, hour[0-23], minute,
+/// second, nanosecond)` fields a `%t`/`%T` conversion needs from a
+/// `Date`/`Calendar`/`Long`/`TemporalAccessor` argument.
+///
+/// CratonVM's Calendar/Date model (see `cal_to_epoch_millis`/
+/// `cal_from_epoch_millis` in `phases_early.rs`) treats epoch millis as raw
+/// wall-clock fields with no timezone shift applied anywhere in the VM — so
+/// the same zero-offset breakdown is used here for `Date`/`Long`/`Calendar`
+/// to stay consistent with the rest of the VM (and with how those values
+/// were constructed in the first place, e.g. `Timestamp.valueOf`).
+fn extract_temporal_fields(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+) -> Result<(i64, i32, i32, i32, i32, i32, i32), MethodCallFailed> {
+    fn millis_to_fields(millis: i64) -> (i64, i32, i32, i32, i32, i32, i32) {
+        let day_millis = 86_400_000i64;
+        let epoch_day = millis.div_euclid(day_millis);
+        let mut tod = millis.rem_euclid(day_millis);
+        let hour = (tod / 3_600_000) as i32;
+        tod %= 3_600_000;
+        let minute = (tod / 60_000) as i32;
+        tod %= 60_000;
+        let second = (tod / 1000) as i32;
+        let ms = (tod % 1000) as i32;
+        let (y, m, d) = temporal_from_epoch_day(epoch_day);
+        (y as i64, m, d, hour, minute, second, ms * 1_000_000)
+    }
+
+    fn invoke_i32(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef, name: &str) -> i32 {
+        match ctx.invoke_virtual(obj, name, "()I", &[]) {
+            Ok(Some(Value::Int(v))) => v,
+            _ => 0,
+        }
+    }
+
+    match val {
+        Value::Long(ms) => Ok(millis_to_fields(*ms)),
+        Value::Object(Some(obj)) => {
+            let obj = *obj;
+            let cid = ctx.class_id_of_object(obj);
+            let is_a = |ctx: &dyn NativeContext, name: &str| {
+                ctx.class_id_by_name(name)
+                    .is_some_and(|parent| ctx.is_subclass(cid, parent))
+            };
+            // A `long` argument (e.g. `String.format("%tY", date.getTime())`)
+            // arrives here already autoboxed into the varargs Object[] array.
+            if is_a(ctx, "java/lang/Long") {
+                let millis = match ctx.get_field(obj, 0) {
+                    Value::Long(v) => v,
+                    _ => 0,
+                };
+                Ok(millis_to_fields(millis))
+            } else if is_a(ctx, "java/util/Date") {
+                let millis = match ctx.invoke_virtual(obj, "getTime", "()J", &[])? {
+                    Some(Value::Long(v)) => v,
+                    _ => 0,
+                };
+                Ok(millis_to_fields(millis))
+            } else if is_a(ctx, "java/util/Calendar") {
+                let millis = match ctx.invoke_virtual(obj, "getTimeInMillis", "()J", &[])? {
+                    Some(Value::Long(v)) => v,
+                    _ => 0,
+                };
+                Ok(millis_to_fields(millis))
+            } else if is_a(ctx, "java/time/Instant") {
+                let sec = match ctx.invoke_virtual(obj, "getEpochSecond", "()J", &[])? {
+                    Some(Value::Long(v)) => v,
+                    _ => 0,
+                };
+                let nano = match ctx.invoke_virtual(obj, "getNano", "()I", &[])? {
+                    Some(Value::Int(v)) => v,
+                    _ => 0,
+                };
+                let (y, m, d, h, mi, s, _) = millis_to_fields(sec.saturating_mul(1000));
+                Ok((y, m, d, h, mi, s, nano))
+            } else if is_a(ctx, "java/time/LocalDate") {
+                let year = invoke_i32(ctx, obj, "getYear") as i64;
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                let day = invoke_i32(ctx, obj, "getDayOfMonth");
+                Ok((year, month, day, 0, 0, 0, 0))
+            } else if is_a(ctx, "java/time/LocalTime") {
+                let hour = invoke_i32(ctx, obj, "getHour");
+                let minute = invoke_i32(ctx, obj, "getMinute");
+                let second = invoke_i32(ctx, obj, "getSecond");
+                let nano = invoke_i32(ctx, obj, "getNano");
+                Ok((1970, 1, 1, hour, minute, second, nano))
+            } else if is_a(ctx, "java/time/LocalDateTime")
+                || is_a(ctx, "java/time/ZonedDateTime")
+                || is_a(ctx, "java/time/OffsetDateTime")
+            {
+                let year = invoke_i32(ctx, obj, "getYear") as i64;
+                let month = invoke_i32(ctx, obj, "getMonthValue");
+                let day = invoke_i32(ctx, obj, "getDayOfMonth");
+                let hour = invoke_i32(ctx, obj, "getHour");
+                let minute = invoke_i32(ctx, obj, "getMinute");
+                let second = invoke_i32(ctx, obj, "getSecond");
+                let nano = invoke_i32(ctx, obj, "getNano");
+                Ok((year, month, day, hour, minute, second, nano))
+            } else {
+                Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "{} cannot be formatted as a date",
+                        ctx.class_name_of_id(cid).unwrap_or_default()
+                    ),
+                }
+                .into())
+            }
+        }
+        _ => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "Illegal date/time conversion argument".to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Zeller/Sakamoto-style day-of-week for the `%tA`/`%ta` name tables below.
+/// Returns 0=Sunday .. 6=Saturday (matching `DAYS_ABBR`/`DAYS_FULL` order) —
+/// the same algorithm as the `'E'` pattern letter in `dtf_apply_pattern`
+/// (`util_time.rs`), duplicated here in its 0=Sunday form rather than reused
+/// since that copy is private and returns the opposite (Java `DayOfWeek`,
+/// 1=Monday) convention.
+fn day_of_week_sun0(year: i32, month: i32, day: i32) -> usize {
+    let (mut y, m, d) = (year, month, day);
+    let t = [0i32, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    if m < 3 {
+        y -= 1;
+    }
+    (((y + y / 4 - y / 100 + y / 400 + t[(m - 1).max(0) as usize] + d) % 7) as usize) % 7
+}
+
+/// Format a single `%t`/`%T` date/time field conversion (the character
+/// following the `t`/`T` prefix — e.g. `b` in `%tb`). See
+/// [`extract_temporal_fields`] for how the source value is decoded and
+/// `java.util.Formatter`'s own `%t` conversion table for the field meanings.
+fn format_temporal_field(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    field: char,
+    flags: &str,
+    width: Option<usize>,
+) -> Result<String, MethodCallFailed> {
+    const MONTHS_ABBR: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MONTHS_FULL: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const DAYS_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const DAYS_FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+
+    let (year, month, day, hour, minute, second, nanos) = extract_temporal_fields(ctx, val)?;
+    let year32 = year as i32;
+    let millis = nanos / 1_000_000;
+    let dow = day_of_week_sun0(year32, month, day);
+    let month_idx = (month.clamp(1, 12) - 1) as usize;
+    let hour12 = {
+        let h = hour % 12;
+        if h == 0 {
+            12
+        } else {
+            h
+        }
+    };
+    let ampm = if hour < 12 { "am" } else { "pm" };
+    let epoch_sec = || {
+        temporal_to_epoch_day(year32, month, day) * 86_400
+            + hour as i64 * 3600
+            + minute as i64 * 60
+            + second as i64
+    };
+
+    let mut out = match field {
+        // Time
+        'H' => format!("{:02}", hour),
+        'k' => format!("{}", hour),
+        'I' => format!("{:02}", hour12),
+        'l' => format!("{}", hour12),
+        'M' => format!("{:02}", minute),
+        'S' => format!("{:02}", second),
+        'L' => format!("{:03}", millis),
+        'N' => format!("{:09}", nanos),
+        'p' => ampm.to_string(),
+        // CratonVM's Calendar/Date model has no real timezone offset (see
+        // extract_temporal_fields) — 'z'/'Z' report the fixed UTC identity
+        // consistent with that.
+        'z' => "+0000".to_string(),
+        'Z' => "UTC".to_string(),
+        's' => format!("{}", epoch_sec()),
+        'Q' => format!("{}", epoch_sec() * 1000 + millis as i64),
+        // Date
+        'B' => MONTHS_FULL[month_idx].to_string(),
+        'b' | 'h' => MONTHS_ABBR[month_idx].to_string(),
+        'A' => DAYS_FULL[dow].to_string(),
+        'a' => DAYS_ABBR[dow].to_string(),
+        'C' => format!("{:02}", year.div_euclid(100)),
+        'Y' => format!("{:04}", year),
+        'y' => format!("{:02}", year.rem_euclid(100)),
+        'j' => format!("{:03}", temporal_day_of_year(year32, month, day)),
+        'm' => format!("{:02}", month),
+        'd' => format!("{:02}", day),
+        'e' => format!("{}", day),
+        // Composites
+        'R' => format!("{:02}:{:02}", hour, minute),
+        'T' => format!("{:02}:{:02}:{:02}", hour, minute, second),
+        'r' => format!(
+            "{:02}:{:02}:{:02} {}",
+            hour12,
+            minute,
+            second,
+            ampm.to_uppercase()
+        ),
+        'D' => format!("{:02}/{:02}/{:02}", month, day, year.rem_euclid(100)),
+        'F' => format!("{:04}-{:02}-{:02}", year, month, day),
+        'c' => format!(
+            "{} {} {:2} {:02}:{:02}:{:02} UTC {:04}",
+            DAYS_ABBR[dow], MONTHS_ABBR[month_idx], day, hour, minute, second, year
+        ),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Unknown date/time conversion '%t{}'", field),
+            }
+            .into());
+        }
+    };
+
+    if let Some(w) = width {
+        if out.len() < w {
+            let pad = w - out.len();
+            if flags.contains('-') {
+                out = format!("{out}{}", " ".repeat(pad));
+            } else {
+                out = format!("{}{out}", " ".repeat(pad));
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 /// Format a single argument with flags, width, and precision support.

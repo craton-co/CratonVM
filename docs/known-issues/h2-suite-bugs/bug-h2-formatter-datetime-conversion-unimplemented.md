@@ -1,7 +1,7 @@
 # `String.format`/`java.util.Formatter` — the entire `%t`/`%T` date-time conversion category is unimplemented and silently passes the format specifier through as literal text
 
 ## Status
-**OPEN** — new finding, 2026-07-21.
+**FIXED** — 2026-07-22, `dev@<merge-commit>` (branch `fix/h2-formatter-datetime-20260722`).
 
 ## Severity
 **HIGH** — silent, no-exception data corruption for a widely-used part of
@@ -97,3 +97,69 @@ cd apps/h2database/h2
   org.h2.test.db.TestFunctions
 ```
 or the standalone `String.format("%tb", new java.util.Date())` snippet above.
+
+## Fix (2026-07-22)
+Added the `t`/`T` conversion category to `native_string_format`'s dispatch in
+`native-builtins/src/lang_string.rs`:
+
+- A new `'t' | 'T'` match arm consumes the second (field) character and
+  upper-cases the whole result when the prefix is `'T'`, matching real
+  `Formatter` semantics.
+- `extract_temporal_fields()` decodes the consumed argument's wall-clock
+  `(year, month, day, hour, minute, second, nanos)` fields. Supported
+  argument types: `Long`/boxed `java.lang.Long` (epoch millis), any
+  `java.util.Date` subclass (`getTime()`), any `java.util.Calendar`
+  subclass (`getTimeInMillis()`), `java.time.Instant`, `LocalDate`,
+  `LocalTime`, `LocalDateTime`, `ZonedDateTime`, `OffsetDateTime` (via their
+  standard `getYear`/`getMonthValue`/.../`getNano` accessors, dispatched
+  through `invoke_virtual` so real-bytecode and native-synthetic instances
+  both work). An unsupported argument type throws
+  `IllegalArgumentException` (real `Formatter` throws the more specific
+  `IllegalFormatConversionException`, a subclass — not reproduced here,
+  consistent with the rest of this format engine's simplified error
+  taxonomy).
+- `format_temporal_field()` implements the field conversions:
+  `H k I l M S L N p z Z s Q B b h A a C Y y j m d e R T r D F c`
+  (time, date, and composite conversions). `Date`/`Calendar`/`Long` epoch
+  millis are broken down with **no timezone shift** — this matches
+  CratonVM's existing Calendar/Date model (`cal_to_epoch_millis`/
+  `cal_from_epoch_millis` in `phases_early.rs`), which already treats epoch
+  millis as raw wall-clock fields VM-wide; `'z'`/`'Z'` report a fixed
+  `+0000`/`UTC` identity consistent with that. The epoch-day/calendar-math
+  helpers are self-contained duplicates of `util_time.rs`'s equivalents
+  rather than reusing them, because `util_time` sits behind the
+  `synthetic-jdk` feature while `String.format` is a core native available
+  regardless of feature flags.
+
+### Verification
+- Standalone repro (18 distinct `%t*`/`%T*` conversions against a
+  `Calendar`-derived `Date`, plus a boxed-`Long` epoch-millis argument):
+  byte-for-byte match against the HotSpot JDK25 baseline for every
+  conversion tried, including `%tb`→`Nov`, `%tB`→`November`,
+  `%TB`→`NOVEMBER`, `%tA`→`Monday`, `%tF`→`1979-11-12`, `%tr`→
+  `08:12:34 AM`, `%tj`→`316`, etc. A non-Date argument to `%tz` throws
+  (`IllegalArgumentException` under CratonVM vs. HotSpot's
+  `IllegalFormatConversionException` — see caveat above). `%%` and `%s`
+  continue to work unaffected.
+- `org.h2.test.db.TestFunctions#testToCharFromDateTime`'s own
+  `String.format("%tb", timestamp1979)` cross-check (line 1397) now
+  produces `"NOV"`, matching H2's independent `TO_CHAR` implementation —
+  confirmed with a minimal standalone JDBC repro
+  (`TO_CHAR(X)` → `12-NOV-79 08.12.34.560000000 AM`, matching HotSpot
+  exactly) run against `org.h2.Driver` directly.
+- Full `TestFunctions` class: the `%tb` `AssertionError` at line 1399 is
+  gone; `test()` now runs past `testToCharFromDateTime()` (called at line
+  135) all the way to `testAnnotationProcessorsOutput()` (line 143, a
+  later, unrelated sub-test — dynamic in-process javac/annotation-processor
+  SQL function compilation, nothing to do with date/time formatting) before
+  failing. That residual failure is tracked separately; see
+  `bug-h2-testannotationprocessorsoutput-*.md` (spawned as a follow-up
+  investigation, not yet filed as of this writing).
+- No other `%t`/`%T` usages were found anywhere under `apps/` (H2, Spring,
+  etc. test suites) via `grep -rE '"%[-+0 #(,<0-9.]*[tT][a-zA-Z]'`, so this
+  fix has no other known regression surface within the suites already
+  checked into this repo.
+- `cargo test -p cratonvm-native-builtins --lib lang_string`: all 82
+  pre-existing tests in this module still pass (no dedicated unit tests
+  were added for the new dispatch — coverage here is the black-box
+  HotSpot-parity repro above plus the real H2 integration test).
