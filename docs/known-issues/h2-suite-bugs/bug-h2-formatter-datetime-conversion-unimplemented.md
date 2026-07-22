@@ -1,7 +1,7 @@
 # `String.format`/`java.util.Formatter` — the entire `%t`/`%T` date-time conversion category is unimplemented and silently passes the format specifier through as literal text
 
 ## Status
-**FIXED** — 2026-07-22, `dev@<merge-commit>` (branch `fix/h2-formatter-datetime-20260722`).
+**FIXED** — 2026-07-22, `dev@9f3f70c5e` (branch `fix/h2-formatter-datetime-20260722`).
 
 ## Severity
 **HIGH** — silent, no-exception data corruption for a widely-used part of

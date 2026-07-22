@@ -176,9 +176,20 @@ const SS_LISTENER_ID: usize = 3;
 // port we write through SS_PORT=0). Side-tables are independent of layout.
 // ---------------------------------------------------------------------------
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct SockSide {
-    pub host_id: i32, // unused (we still keep `SOCK_HOST` in field for getInetAddress)
+    pub host_id: i32, // unused, kept for layout stability
+    // Remote host string. Side-tabled (not written to the object's real
+    // field slot 0) because real JDK 25 java.net.Socket's field slot 0
+    // is `impl` (a SocketImpl) -- writing a host String there via
+    // ctx.set_field(_, SOCK_HOST, ...) corrupts `impl`, so any later
+    // unregistered Socket method that falls through to real bytecode
+    // (e.g. getImpl(), called internally by many Socket accessors)
+    // invokes methods on a String receiver instead of a SocketImpl,
+    // producing a NoSuchMethodError that names String for a method that
+    // plainly does not exist on it (e.g. create(Z)V). See
+    // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
+    pub host: String,
     pub port: i32,
     pub local_port: i32,
     pub closed: i32,
@@ -231,6 +242,7 @@ fn ss_side_table() -> &'static Mutex<HashMap<i32, SsSide>> {
 fn sock_default() -> SockSide {
     SockSide {
         host_id: 0,
+        host: String::new(),
         port: 0,
         local_port: 0,
         closed: 0,
@@ -244,7 +256,7 @@ fn sock_default() -> SockSide {
 fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
     let t = sock_side_table().lock();
     t.get(&native_obj_key(ctx, this))
-        .copied()
+        .cloned()
         .unwrap_or_else(sock_default)
 }
 
@@ -3221,10 +3233,9 @@ fn re1_connect_socket(
     }
     let stream_id = s2_alloc_stream(stream);
     let pin_base = ctx.pin_native_root(this);
-    let host_str = ctx.create_string(host);
     let this_now = ctx.read_native_pin(pin_base, this);
-    ctx.set_field(this_now, SOCK_HOST, Value::Object(Some(host_str)));
     sock_set(ctx, this_now, |s| {
+        s.host = host.to_string();
         s.port = port;
         s.local_port = local_port;
         s.closed = 0;
@@ -3289,7 +3300,6 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
 
     r.register(sock, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, SOCK_HOST, Value::Object(None));
         sock_set(ctx, this, |s| {
             s.port = 0;
             s.local_port = 0;
@@ -3565,7 +3575,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if let Some(addr) = re1_socket_adaptor_inet(ctx, this, false)? {
                 return Ok(Some(Value::Object(Some(addr))));
             }
-            let host = read_field_string_or(ctx, this, SOCK_HOST, "");
+            let host = sock_get(ctx, this).host;
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
@@ -3894,11 +3904,9 @@ fn re2_accept_into(
     // `Socket.getInetAddress()` then read a zeroed field and returned null).
     // Pin it exactly like every other raw-ObjectRef-across-a-reentrant-call
     // site in this codebase.
-    target = ctx.read_native_pin(target_pin, target);
-    let host_str = ctx.create_string(&peer_ip);
     let target = ctx.read_native_pin(target_pin, target);
-    ctx.set_field(target, SOCK_HOST, Value::Object(Some(host_str)));
     sock_set(ctx, target, |s| {
+        s.host = peer_ip.clone();
         s.port = peer_port;
         s.local_port = local_port;
         s.closed = 0;
@@ -4107,7 +4115,6 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         let lid = s.listener_id;
         let timeout_ms = re2_accept_timeout_for(lid);
         let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
-        ctx.set_field(sock, SOCK_HOST, Value::Object(None));
         sock_set(ctx, sock, |x| {
             x.port = 0;
             x.local_port = 0;
@@ -9464,6 +9471,18 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => Some(*a),
                 _ => None,
             };
+            let tms_arr = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            // Install the long-lived manager roots before resolving identity
+            // or transferring pending context state.  Those helpers can
+            // allocate/re-enter Java; native-call argument pins survive that
+            // collection, but the copied ObjectRefs above do not get rewritten
+            // afterwards.  Retaining them later could publish a recycled
+            // receiver into the TLS manager table.
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
             // the KeyManager[] this call actually received (immune to an
             // intervening, unrelated SSLContext.init draining the
@@ -9485,12 +9504,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // these — so without this, custom/OCSP/CRL trust managers are
             // silently never invoked. Consulted post-handshake by
             // `t27_tls::engine_run_trust_check`.
-            let tms_arr = match args.get(2) {
-                Some(Value::Object(Some(a))) => Some(*a),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             Ok(None)
         },
     );
@@ -9803,10 +9816,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
-            let host_s = ctx.create_string(&host);
             let sock = ctx.read_native_pin(pin_base, sock);
-            ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_s)));
             sock_set(ctx, sock, |s| {
+                s.host = host.clone();
                 s.port = port;
                 s.local_port = 0;
                 s.closed = 0;
@@ -9892,8 +9904,8 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             if is_full_supported_set {
                 return Ok(None);
             }
-            let host = read_field_string_or(ctx, this, SOCK_HOST, "");
             let side = sock_get(ctx, this);
+            let host = side.host.clone();
             if host.is_empty() || side.port <= 0 {
                 return Ok(None);
             }

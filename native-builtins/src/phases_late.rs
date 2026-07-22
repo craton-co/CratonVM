@@ -43587,6 +43587,81 @@ fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Optio
     crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
 }
 
+/// FIX (h2-testnetutils-cipherfactory-createsocket-cast): staging table for
+/// `SSLSocketFactory.createSocket()` (the true zero-arg overload — an
+/// unconnected socket the caller connects later via `Socket.connect
+/// (SocketAddress, int)`, e.g. H2's `CipherFactory.createSocket`). The
+/// factory (and its trust scope) is only available as `args[0]` at
+/// `createSocket()` time; `connect()` runs later with just the `SSLSocket`
+/// object, so the trust roots/TrustManager key captured at creation time are
+/// stashed here, keyed by the socket's GC-stable identity hash (see
+/// `t27_tls::gc_stable_objref_key`'s doc comment for why identity hash and
+/// not a raw pointer), and consumed (removed) by `new13_ssl_socket_connect`.
+fn pending_ssl_socket_connect_ctx_table(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u64, (Vec<Vec<u8>>, Option<u64>)>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<u64, (Vec<Vec<u8>>, Option<u64>)>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn stash_pending_ssl_socket_connect_ctx(
+    ctx: &dyn NativeContext,
+    sock: ObjectRef,
+    extra_roots: Vec<Vec<u8>>,
+    java_tm_key: Option<u64>,
+) {
+    let key = ctx.identity_hash_code(sock) as u32 as u64;
+    pending_ssl_socket_connect_ctx_table()
+        .lock()
+        .insert(key, (extra_roots, java_tm_key));
+}
+
+fn take_pending_ssl_socket_connect_ctx(
+    ctx: &dyn NativeContext,
+    sock: ObjectRef,
+) -> (Vec<Vec<u8>>, Option<u64>) {
+    let key = ctx.identity_hash_code(sock) as u32 as u64;
+    pending_ssl_socket_connect_ctx_table()
+        .lock()
+        .remove(&key)
+        .unwrap_or_default()
+}
+
+/// `javax/net/ssl/SSLSocket.connect(SocketAddress[, int timeout])` for a
+/// socket obtained via the zero-arg `SSLSocketFactory.createSocket()` (see
+/// `pending_ssl_socket_connect_ctx_table`'s doc comment for the full
+/// rationale). Performs the real TCP-connect + TLS client handshake
+/// (`new13_connect_and_handshake`, shared with the immediate-connect
+/// overloads) and populates the EXISTING socket object via
+/// `new13_finish_socket` rather than allocating a new one — Java already
+/// holds a reference to this exact object.
+fn new13_ssl_socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if new13_resolve_tls_id(ctx, this) >= 0 {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/net/SocketException",
+            "already connected",
+        ));
+    }
+    let sa = match args.get(1) {
+        Some(Value::Object(Some(addr))) => *addr,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("SSLSocket.connect: null address".into()),
+            }
+            .into());
+        }
+    };
+    let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, sa)?;
+    let (extra_roots, java_tm_key) = take_pending_ssl_socket_connect_ctx(ctx, this);
+    let tls_id =
+        new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
+    let _ = new13_finish_socket(ctx, this, &host, port as u16, tls_id);
+    Ok(None)
+}
+
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
 fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
@@ -43666,14 +43741,20 @@ fn p68_create_socket_inet_address(
     new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key)
 }
 
-/// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads.
-fn new13_do_create_socket(
+/// NEW-13: real, blocking TCP-connect + TLS client handshake shared by
+/// `new13_do_create_socket` (the immediate-connect `createSocket(host, port)`
+/// overloads) and `new13_ssl_socket_connect` (the deferred
+/// `createSocket()` + later `Socket.connect(SocketAddress, timeout)` pattern
+/// — see that function's doc comment for why the two need the same logic
+/// applied to a not-yet-allocated vs. an already-allocated `SSLSocket`).
+/// Returns the `s2_registry` TLS stream id on success.
+fn new13_connect_and_handshake(
     ctx: &mut dyn NativeContext,
     host: &str,
     port: u16,
     extra_root_ders: &[Vec<u8>],
     java_tm_key: Option<u64>,
-) -> MethodCallResult {
+) -> Result<i32, MethodCallFailed> {
     #[cfg(unix)]
     let legacy_dsa_context = extra_root_ders.iter().any(|der| {
         openssl::x509::X509::from_der(der)
@@ -43746,8 +43827,49 @@ fn new13_do_create_socket(
             return Err(e);
         }
     }
+    Ok(tls_id)
+}
 
+/// NEW-13: common body for the `SSLSocketFactory.createSocket` overloads that
+/// connect immediately. Connects, then allocates a fresh `SSLSocket` and
+/// populates it — see `new13_finish_socket` (shared with the deferred
+/// `createSocket()` + `connect()` pattern, which populates an
+/// *already-allocated* socket instead).
+fn new13_do_create_socket(
+    ctx: &mut dyn NativeContext,
+    host: &str,
+    port: u16,
+    extra_root_ders: &[Vec<u8>],
+    java_tm_key: Option<u64>,
+) -> MethodCallResult {
+    let tls_id = new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key)?;
     let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+    let sock = new13_finish_socket(ctx, sock, host, port, tls_id);
+    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        eprintln!(
+            "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
+            std::thread::current().id(),
+            sock,
+            tls_id
+        );
+    }
+    Ok(Some(Value::Object(Some(sock))))
+}
+
+/// Populate a (possibly pre-existing) `javax/net/ssl/SSLSocket` object's
+/// fields/side-table state from a completed TLS connection. Shared by
+/// `new13_do_create_socket` (allocates `sock` fresh, immediately before
+/// calling this) and `new13_ssl_socket_connect` (reuses the `SSLSocket`
+/// object `SSLSocketFactory.createSocket()` already returned to Java, which
+/// is why this takes `sock` rather than allocating one itself). Returns the
+/// (possibly GC-forwarded) object reference to use afterward.
+fn new13_finish_socket(
+    ctx: &mut dyn NativeContext,
+    sock: ObjectRef,
+    host: &str,
+    port: u16,
+    tls_id: i32,
+) -> ObjectRef {
     let pin_base = ctx.pin_native_root(sock);
     let host_obj = ctx.create_string(host);
     let sock = ctx.read_native_pin(pin_base, sock);
@@ -43775,15 +43897,7 @@ fn new13_do_create_socket(
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
     let sock = ctx.read_native_pin(pin_base, sock);
     ctx.unpin_native_roots(pin_base);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
-        eprintln!(
-            "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
-            std::thread::current().id(),
-            sock,
-            tls_id
-        );
-    }
-    Ok(Some(Value::Object(Some(sock))))
+    sock
 }
 
 /// FIX (tomcat-clientauth-engine-config): identity-hash side table mapping a
@@ -43939,6 +44053,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let _ = ctx.array_length(tm_arr);
             }
 
+            // Capture the live manager objects before any helper below can
+            // allocate or re-enter Java.  The native-call funnel keeps the
+            // arguments rooted, but the copied ObjectRefs in `km_arg`/
+            // `tm_arg` are not rewritten after a moving collection.  Delaying
+            // this capture could therefore publish an old array element into
+            // the long-lived TLS side table; a later handshake would then
+            // dispatch `checkServerTrusted` on whatever object reused that
+            // address.  The tables themselves are GC-rooted/remapped once
+            // populated, so install them at this first post-validation point.
+            let kms_array = match km_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            let tms_array = match tm_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
+
             // FIX (es-restclient-https): if the supplied TrustManager[] is
             // bound to an explicit KeyStore (a custom truststore, not the
             // default), capture its trust anchors keyed by THIS SSLContext's
@@ -43975,19 +44109,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // transfers, a Java-supplied TrustManager is retained only in the
             // synthetic fields and HttpURLConnection silently falls back to
             // the platform verifier.
-            let kms_array = match km_arg {
-                Value::Object(Some(array)) => Some(array),
-                _ => None,
-            };
             let resolved_identity =
                 crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_array);
             crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
-            let tms_array = match tm_arg {
-                Value::Object(Some(array)) => Some(array),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
             Ok(None)
         },
     );
@@ -44117,6 +44241,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // FIX (h2-testnetutils-cipherfactory-createsocket-cast): the true
+    // zero-arg `createSocket()` — an unconnected socket, connected later via
+    // `Socket.connect(SocketAddress, int)`. Without its own registration
+    // here, this call fell through to the ancestor `javax/net/SocketFactory`
+    // native (`phases_early.rs::register_phase52_server_socket_factory`),
+    // which allocates a plain `java/net/Socket` — `(SSLSocket)
+    // f.createSocket()` then threw `ClassCastException` for every caller
+    // using this JSSE-standard connect-later pattern (H2's
+    // `CipherFactory.createSocket`/`NetUtils.createLoopbackSocket`; see
+    // `bug-h2-netutils-dsa-privatekey-tls-unsupported.md`'s residuals).
+    r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
+        let extra_roots = p68_factory_trust_roots(ctx, args);
+        let java_tm_key = p68_factory_java_tm_key(ctx, args);
+        let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+        ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(-1));
+        ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
+        stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key);
+        Ok(Some(Value::Object(Some(sock))))
+    });
     // NEW-13.3: SSLSocketFactory.createSocket(String host, int port) → SSLSocket.
     // Backed by `servlet::s2_tls_connect`, which performs a real native-tls
     // handshake and registers the resulting TLS stream in the unified
@@ -44393,6 +44536,25 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
+    // connect(SocketAddress[, int timeout]) — the other half of the zero-arg
+    // `createSocket()` pattern registered on `SSLSocketFactory` above. Real
+    // `javax.net.ssl.SSLSocket` does not redeclare `connect` (it stays
+    // inherited, concrete, from `java.net.Socket`), but that ancestor's own
+    // native (`net_phase_e.rs`'s `re1_connect_socket`) only performs a plain
+    // TCP connect — registering here, on the more specific `SSLSocket` class,
+    // intercepts first and additionally drives the TLS client handshake.
+    r.register(
+        ssl_sock,
+        "connect",
+        "(Ljava/net/SocketAddress;)V",
+        new13_ssl_socket_connect,
+    );
+    r.register(
+        ssl_sock,
+        "connect",
+        "(Ljava/net/SocketAddress;I)V",
+        new13_ssl_socket_connect,
+    );
     // setUseClientMode/getUseClientMode, setNeedClientAuth/getNeedClientAuth,
     // setWantClientAuth/getWantClientAuth — unlike getApplicationProtocol
     // (concrete-but-throws) these six are genuinely `abstract` in the real
@@ -44856,6 +45018,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             );
         }
         Ok(Some(Value::Int(if closed { 0 } else { 1 })))
+    });
+    // `java.net.Socket` has the same registrations, but a real-JDK
+    // `SSLSocket` receiver does not reliably inherit them through the native
+    // dispatch lookup.  Falling through to Socket's bytecode reads the real
+    // `Socket.impl` / `shutIn` fields from this synthetic overlay and can
+    // report a live TLS connection as input-shut.  HttpComponents 5.4 checks
+    // `isInputShutdown()` immediately before every request-body write and
+    // turns that false positive into `ConnectionClosedException`.
+    //
+    // There is no independent half-close state for a rustls SSLSocket: the
+    // only supported shutdown operation is `close()`, which marks the shared
+    // side-table entry closed.  Use that authoritative state for both
+    // directions rather than interpreting the host JDK's physical layout.
+    r.register(ssl_sock, "isInputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
+    });
+    r.register(ssl_sock, "isOutputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

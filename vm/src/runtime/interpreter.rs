@@ -16591,13 +16591,33 @@ fn array_is_assignable_to_impl(
     if src_comp == "java/lang/Object" {
         return lenient || tgt_comp == "java/lang/Object";
     }
-    let src_id = match shared.class_manager.write().load_class(&src_comp) {
-        Ok(id) => id,
-        Err(_) => return false,
+    // Array casts are common on reflection API results. In particular, a
+    // correctly typed `Annotation[]` is routinely widened to `Object[]` by
+    // JUnit and Spring. The old path unconditionally acquired the
+    // class-manager *write* lock and invoked `load_class` for both components,
+    // even though these bootstrap types are already loaded. That turns every
+    // such cast into a global synchronization point; an imprecise `Object[]`
+    // happens to skip it through the lenient fallback above, which masked the
+    // cost while violating the reflection return-type contract.
+    //
+    // Preserve the existing name-based, loader-agnostic semantics, but resolve
+    // from the read-side class table first. `load_class_concurrent` retains the
+    // old on-demand loading behavior for a genuine miss without forcing the
+    // warm path through an exclusive lock.
+    let resolve_component = |name: &str| {
+        shared
+            .class_manager
+            .read()
+            .find_class_by_name(name)
+            .or_else(|| shared.load_class_concurrent(name).ok())
     };
-    let tgt_id = match shared.class_manager.write().load_class(&tgt_comp) {
-        Ok(id) => id,
-        Err(_) => return false,
+    let src_id = match resolve_component(&src_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    let tgt_id = match resolve_component(&tgt_comp) {
+        Some(id) => id,
+        None => return false,
     };
     shared.class_manager.read().is_subclass_of(src_id, tgt_id)
 }
@@ -36432,6 +36452,13 @@ fn execute_invokevirtual_vtable_fast(
             Some(c) => Arc::clone(c),
             None => return Ok(CachedCallResult::CacheMiss),
         };
+        let is_native = entry.is_native;
+        // The class loader installs a vtable while it holds the class-manager
+        // writer. Do not acquire the class-manager reader below while this
+        // vtable read guard is live: concurrent class loading and virtual
+        // dispatch would otherwise form an AB-BA deadlock.
+        drop(guard);
+
         // JVMTI redefine guard — the VtableManager entry's `resolved_method`
         // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
         // staleness tracking of its own (unlike `CachedInvokeTarget`, which
@@ -36472,9 +36499,7 @@ fn execute_invokevirtual_vtable_fast(
         {
             return Ok(CachedCallResult::CacheMiss);
         }
-        let is_native = entry.is_native;
-        // Lock-order fix: drop the `vtable_manager` read guard BEFORE
-        // taking `class_manager` below. `vtable_install_adapter` (called
+        // `vtable_install_adapter` (called
         // from `ClassManager::define_class_with_options` while defining a
         // class) takes the locks in the OPPOSITE order - class_manager
         // (held for the whole definition) then vtable_manager (to install
@@ -36488,7 +36513,6 @@ fn execute_invokevirtual_vtable_fast(
         // (`vm.rs` vtable fast-path test) already establishes the
         // invariant that the vtable must be queryable WITHOUT holding
         // class_manager - this restores it.
-        drop(guard);
         // `CachedBytecodeMethod` retains the resolved declaring method, so
         // memoize this pure, 55-branch decision on that shared entry instead
         // of reopening `class_manager` and re-evaluating it for every vtable

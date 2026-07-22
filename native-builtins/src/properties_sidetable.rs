@@ -1786,29 +1786,42 @@ fn native_properties_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // `setProperty` mirror INTO it, so a `remove` that touched only the
     // side-table would let generic Map walkers (HashMap.putAll /
     // map_collect_entries, which read the CHM) resurrect the removed key.
-    // No-op when the Properties has no CHM yet.
-    remove_from_properties_backend(ctx, this, key_obj);
+    // No-op when the Properties has no CHM yet. Non-String values (arrays,
+    // etc. — see `put_non_string_into_chm`) live ONLY here, never in the
+    // String-only side-table, so this is the sole source of truth for them:
+    // capture what it actually removed instead of discarding it.
+    let chm_removed = remove_from_properties_backend(ctx, this, key_obj);
     match removed {
         Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
-        None => Ok(Some(Value::Object(None))),
+        None => Ok(Some(chm_removed)),
     }
 }
 
 /// Remove `key_obj` from a Properties object's real JDK `map` ConcurrentHashMap
-/// backing, mirroring a side-table removal. No-op if the Properties has no
-/// (CHM) `map` field yet. Symmetric with `mirror_loaded_entries_to_properties_backend`.
+/// backing, mirroring a side-table removal, and return whatever the CHM had
+/// stored under that key (or `Object(None)` if there was no CHM yet, or no
+/// entry). Symmetric with `mirror_loaded_entries_to_properties_backend`.
+/// Callers that already have a side-table hit ignore this value (the
+/// side-table and CHM are mirrored for String entries, so either source
+/// agrees); it matters only for non-String values that the side-table can't
+/// represent at all (see `native_properties_remove`).
 fn remove_from_properties_backend(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     key_obj: ObjectRef,
-) {
+) -> Value {
     if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
-        let _ = ctx.invoke_virtual(
+        ctx.invoke_virtual(
             chm,
             "remove",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[Value::Object(Some(key_obj))],
-        );
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None))
+    } else {
+        Value::Object(None)
     }
 }
 

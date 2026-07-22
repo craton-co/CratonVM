@@ -2572,6 +2572,25 @@ fn test_s18_method_annotation_present() {
 }
 
 #[test]
+fn test_s18_method_annotation_identity() {
+    if !require_extended_interpreter_tests("test_s18_method_annotation_identity") {
+        return;
+    }
+    require_class_files!();
+    let mut vm = test_vm();
+    let result = vm.invoke(
+        "cratonvm/AnnotationTest",
+        "testMethodAnnotationIdentity",
+        "()I",
+        &[],
+    );
+    match result {
+        Ok(Some(Value::Int(1))) => {}
+        other => panic!("Expected Ok(Some(Int(1))), got: {other:?}"),
+    }
+}
+
+#[test]
 fn test_s18_method_no_annotation() {
     if !require_extended_interpreter_tests("test_s18_method_no_annotation") {
         return;

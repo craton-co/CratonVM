@@ -308,6 +308,23 @@ pub(crate) fn native_system_arraycopy(
             if elem_class == dst_elem_class || ctx.is_subclass(elem_class, dst_elem_class) {
                 return true;
             }
+            // A child classloader may define an implementation while delegating
+            // its interface to the parent loader. Its exact ClassId edge can be
+            // lost in the flat class store even though the real loader-resolved
+            // hierarchy is assignable (e.g. Jackson's JDKKeyDeserializers ->
+            // KeyDeserializers during Spring's ModifiedClassPath test setup).
+            // Reuse reflection's bounded, loader-aware hierarchy walk rather
+            // than treating all same-named classes as interchangeable.
+            if let Some(dst_name) = ctx.class_name_of_id(dst_elem_class) {
+                if crate::lang_class::loader_aware_reflect_assignable(
+                    ctx,
+                    elem_class,
+                    dst_elem_class,
+                    &dst_name,
+                ) {
+                    return true;
+                }
+            }
             // Array-typed elements: a primitive array (`int[]`, `byte[]`,
             // вЂ¦) carries the synthetic `ClassId::new(0)`, so the class-id
             // comparison above can never match a real array component

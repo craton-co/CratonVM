@@ -18349,7 +18349,6 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("expected object native return, got {other:?}"),
         };
-
         assert_eq!(thread.native_pending_return, Some(returned));
         assert!(
             thread.root_snapshot.lock().is_empty(),

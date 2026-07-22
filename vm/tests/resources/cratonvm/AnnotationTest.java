@@ -108,7 +108,29 @@ public class AnnotationTest {
         }
     }
 
-    // Test 8: Method without annotation has empty array
+    // Test 8: Method annotation proxies are identity-stable, while each
+    // getDeclaredAnnotations call still returns a fresh defensive array.
+    public static int testMethodAnnotationIdentity() {
+        try {
+            Method m = AnnotationTest.class.getDeclaredMethod("annotatedMethod");
+            MethodInfo direct1 = m.getAnnotation(MethodInfo.class);
+            MethodInfo direct2 = m.getAnnotation(MethodInfo.class);
+            Annotation[] declared1 = m.getDeclaredAnnotations();
+            Annotation[] declared2 = m.getDeclaredAnnotations();
+            return direct1 != null
+                && direct1 == direct2
+                && declared1 != declared2
+                && declared1.length == 1
+                && declared2.length == 1
+                && declared1.getClass() == Annotation[].class
+                && declared1[0] == direct1
+                && declared2[0] == direct1 ? 1 : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    // Test 9: Method without annotation has empty array
     public static int testMethodNoAnnotation() {
         try {
             Method m = AnnotationTest.class.getDeclaredMethod("testCustomAnnotationValues");
@@ -119,7 +141,7 @@ public class AnnotationTest {
         }
     }
 
-    // Test 9: getParameterAnnotations returns correct count
+    // Test 10: getParameterAnnotations returns correct count
     public static int testParameterAnnotationCount() {
         try {
             Method m = AnnotationTest.class.getDeclaredMethod("paramMethod", int.class, String.class);
@@ -133,7 +155,7 @@ public class AnnotationTest {
         }
     }
 
-    // Test 10: getParameterAnnotations for unannotated method returns empty arrays
+    // Test 11: getParameterAnnotations for unannotated method returns empty arrays
     public static int testParameterAnnotationEmpty() {
         try {
             Method m = AnnotationTest.class.getDeclaredMethod("annotatedMethod");

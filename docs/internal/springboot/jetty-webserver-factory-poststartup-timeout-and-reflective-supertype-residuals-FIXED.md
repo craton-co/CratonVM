@@ -1,5 +1,9 @@
 # Jetty factory post-startup timeout and reflective-supertype residuals
 
+**Final status: FIXED (2026-07-21).** The final resolution and JIT/`--nojit`
+verification are recorded in the "Final resolution" section below. Earlier
+status labels are preserved as historical investigation notes.
+
 **Status: MOSTLY FIXED - 2026-07-20. The reflective-supertype residual, four
 real bugs, the `Deflater.end()` monitor hang (both factory classes), and the
 blocking-read-timeout bug below are all fixed. `JettyReactiveWebServerFactoryTests`
@@ -25,6 +29,41 @@ consistent with first-call/cache-population cost across the much larger set
 of distinct call sites a full DTD/schema-validating parse exercises (this
 session's repro was intentionally non-validating). Still OPEN; see the
 bottom section for the complete diagnosis, what's fixed, and what's next.**
+
+## Final resolution (2026-07-21)
+
+**FIXED.** The historical account below predates the final root-cause capture.
+The last post-startup H2C timeout was not a selector or thread-lifecycle leak.
+It was an AB-BA deadlock between the class-manager writer and the vtable-manager
+reader:
+
+1. A dynamically loading HTTP-client thread held `class_manager.write()` and
+   entered `vtable_install_adapter`, where it waited for `vtable_manager.write()`.
+2. A virtual-dispatch thread held `vtable_manager.read()` and, in the JVMTI
+   redefine guard, attempted `class_manager.read()` before releasing that
+   vtable guard.
+
+`execute_invokevirtual_vtable_fast` now copies the needed vtable values and
+releases `vtable_manager.read()` before consulting the redefine generation.
+This preserves the existing vtable fast path while enforcing a consistent
+lock order.
+
+The investigation also closed the analogous `Inflater` direct-buffer residual:
+`inflateBytesBuffer`, `inflateBufferBytes`, and `inflateBufferBuffer` now use
+`NativeContext::copy_from_native_memory` / `copy_to_native_memory` and a shared
+streaming decompression helper. Regression test:
+`direct_buffer_inflate_paths_produce_correct_output`.
+
+Verification with the task-specific release binary:
+
+| Class | JIT | `--nojit` |
+|---|---:|---:|
+| `JettyServletWebServerFactoryTests` | 113 run, 15 pre-existing TLS/IPv6 failures, 0 aborted | 113 run, 15 same failures, 0 aborted |
+| `JettyReactiveWebServerFactoryTests` | 35 run, 8 pre-existing SSL failures, 0 aborted | 35 run, 8 same failures, 0 aborted |
+
+Both servlet runs passed the exact H2C test and continued through later test
+cases. The remaining assertion failures are unchanged from the baseline and
+are separate TLS/IPv6 work; they are not attributed to this resolved timeout.
 
 ## Scope and separation
 
