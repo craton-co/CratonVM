@@ -537,7 +537,7 @@ using constants outside `sipush` range so javac emits `ldc` instead of
 
 ## Contributing
 
-**Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md).
+**Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](docs/internal/fixed-suite-bugs/app-jvm-bugs/jvm-no-synthetic-stubs.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 

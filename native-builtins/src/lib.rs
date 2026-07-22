@@ -9843,6 +9843,11 @@ const HIBERNATE_ANNOTATION_DESCRIPTOR_REGISTRY_STANDARD: &str =
 const HIBERNATE_ORM_ANNOTATION_DESCRIPTOR: &str =
     "org/hibernate/models/internal/OrmAnnotationDescriptor";
 const HIBERNATE_ASSOCIATION_KEY: &str = "org/hibernate/metamodel/mapping/AssociationKey";
+const HIBERNATE_NAVIGABLE_PATH: &str = "org/hibernate/spi/NavigablePath";
+const HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH: &str =
+    "org/hibernate/spi/EntityIdentifierNavigablePath";
+const HIBERNATE_TREATED_NAVIGABLE_PATH: &str = "org/hibernate/spi/TreatedNavigablePath";
+const HIBERNATE_NAVIGABLE_ROLE: &str = "org/hibernate/metamodel/model/domain/NavigableRole";
 const HIBERNATE_BASIC_VALUED_MODEL_PART: &str =
     "org/hibernate/metamodel/mapping/BasicValuedModelPart";
 const HIBERNATE_IMMUTABLE_ATTRIBUTE_MAPPING_LIST: &str =
@@ -17161,6 +17166,228 @@ fn native_hibernate_association_key_equals(
     result
 }
 
+/// `NavigablePath` is the key type used while Hibernate de-duplicates the
+/// circular EAGER-fetch graph.  Its value accessors are deliberately tiny
+/// field reads, but the graph can call them at every level of a very deep
+/// equality recursion.  Keep the Java `equals` implementation authoritative
+/// and only bridge these allocation-free accessors.
+fn native_hibernate_navigable_path_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(match ctx.get_field_by_name(this, "hashCode") {
+        Value::Int(hash) => Value::Int(hash),
+        _ => Value::Int(0),
+    }))
+}
+
+fn native_hibernate_navigable_path_get_alias(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "alias")))
+}
+
+fn native_hibernate_navigable_path_get_real_parent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "parent")))
+}
+
+fn native_hibernate_navigable_path_get_parent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let parent = match ctx.get_field_by_name(this, "parent") {
+        Value::Object(Some(parent)) => parent,
+        Value::Object(None) => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Mirrors `parent instanceof TreatedNavigablePath ? parent.getParent() :
+    // parent`. Treated paths cannot themselves have treated parents (the Java
+    // constructor asserts this), so reading that parent directly avoids a
+    // recursive native dispatch while retaining the exact observable result.
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(parent))
+        .as_deref()
+        == Some("org/hibernate/spi/TreatedNavigablePath")
+    {
+        return Ok(Some(ctx.get_field_by_name(parent, "parent")));
+    }
+    Ok(Some(Value::Object(Some(parent))))
+}
+
+fn hibernate_navigable_path_is_entity_identifier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref()
+        == Some(HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH)
+}
+
+fn hibernate_navigable_path_is_path(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref(),
+        Some(
+            HIBERNATE_NAVIGABLE_PATH
+                | HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH
+                | HIBERNATE_TREATED_NAVIGABLE_PATH
+        )
+    )
+}
+
+fn hibernate_pinned_objects_equal(
+    ctx: &mut dyn NativeContext,
+    left: Option<ObjectRef>,
+    right: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(a), Some(b)) if a == b => Ok(true),
+        (Some(a), Some(b)) => {
+            let base = ctx.pin_native_root(a);
+            let b_pin = ctx.pin_native_root(b);
+            let result = (|| {
+                let a = ctx.read_native_pin(base, a);
+                let b = ctx.read_native_pin(b_pin, b);
+                match ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])? {
+                    Some(Value::Int(v)) => Ok(v != 0),
+                    _ => Ok(false),
+                }
+            })();
+            ctx.unpin_native_roots(base);
+            result
+        }
+        _ => Ok(false),
+    }
+}
+
+fn hibernate_navigable_path_field_object(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    field: &str,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(value) => value,
+        _ => None,
+    }
+}
+
+/// Exact native mirror of Hibernate 7.2's immutable `NavigablePath.equals`.
+///
+/// The all-EAGER RCA mappings repeatedly compare paths tens of frames deep
+/// while constructing one loader graph. The Java body is correct but turns
+/// each immutable field comparison into several interpreter frames. This
+/// keeps the same identity, identifier-path, alias and parent rules while
+/// retaining GC roots across the only re-entrant operations (String/parent
+/// equality).
+fn native_hibernate_navigable_path_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(other) = (match args.get(1) {
+        Some(Value::Object(other)) => *other,
+        _ => None,
+    }) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+
+    let other_is_path = hibernate_navigable_path_is_path(ctx, other);
+    let other_is_role = ctx.class_name_of_id(ctx.class_id_of_object(other)).as_deref()
+        == Some(HIBERNATE_NAVIGABLE_ROLE);
+    if !other_is_path && !other_is_role {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        let this_entity = hibernate_navigable_path_is_entity_identifier(ctx, this);
+        let other_entity = other_is_path && hibernate_navigable_path_is_entity_identifier(ctx, other);
+
+        let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
+        let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
+        let local_names_match = if hibernate_pinned_objects_equal(ctx, this_local, other_local)? {
+            true
+        } else if other_entity {
+            if this_entity {
+                false
+            } else {
+                let this = ctx.read_native_pin(this_pin, this);
+                let other = ctx.read_native_pin(other_pin, other);
+                let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
+                let other_identifier =
+                    hibernate_navigable_path_field_object(ctx, other, "identifierAttributeName");
+                hibernate_pinned_objects_equal(
+                    ctx,
+                    this_local,
+                    other_identifier,
+                )?
+            }
+        } else if this_entity {
+            let this = ctx.read_native_pin(this_pin, this);
+            let other = ctx.read_native_pin(other_pin, other);
+            let this_identifier =
+                hibernate_navigable_path_field_object(ctx, this, "identifierAttributeName");
+            let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_identifier,
+                other_local,
+            )?
+        } else {
+            false
+        };
+        if !local_names_match {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        if other_is_path {
+            let this_alias = hibernate_navigable_path_field_object(ctx, this, "alias");
+            let other_alias = hibernate_navigable_path_field_object(ctx, other, "alias");
+            let aliases_equal = hibernate_pinned_objects_equal(
+                ctx,
+                this_alias,
+                other_alias,
+            )?;
+            if !aliases_equal {
+                return Ok(Some(Value::Int(0)));
+            }
+            let this = ctx.read_native_pin(this_pin, this);
+            let other = ctx.read_native_pin(other_pin, other);
+            let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
+            let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_parent,
+                other_parent,
+            )
+        } else {
+            let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
+            let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_parent,
+                other_parent,
+            )
+        }
+        .map(|equal| Some(Value::Int(equal as i32)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn native_hibernate_immutable_attribute_mapping_list_indexed_for_each(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17404,6 +17631,36 @@ fn register_hibernate_models_intrinsics(registry: &mut NativeMethodRegistry) {
         "equals",
         "(Ljava/lang/Object;)Z",
         native_hibernate_association_key_equals,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "hashCode",
+        "()I",
+        native_hibernate_navigable_path_hash_code,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getAlias",
+        "()Ljava/lang/String;",
+        native_hibernate_navigable_path_get_alias,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getRealParent",
+        "()Lorg/hibernate/spi/NavigablePath;",
+        native_hibernate_navigable_path_get_real_parent,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getParent",
+        "()Lorg/hibernate/spi/NavigablePath;",
+        native_hibernate_navigable_path_get_parent,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_hibernate_navigable_path_equals,
     );
     registry.register(
         HIBERNATE_IMMUTABLE_ATTRIBUTE_MAPPING_LIST,
@@ -19744,6 +20001,15 @@ mod antlr_prediction_context_tests {
             .is_some());
         assert!(registry
             .find(HIBERNATE_ASSOCIATION_KEY, "equals", "(Ljava/lang/Object;)Z",)
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "equals", "(Ljava/lang/Object;)Z")
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "getParent", "()Lorg/hibernate/spi/NavigablePath;")
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "getRealParent", "()Lorg/hibernate/spi/NavigablePath;")
             .is_some());
         assert!(registry
             .find(
@@ -44250,6 +44516,25 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 ctx.array_length(this)
             );
         }
+        // Array ClassIds are deliberately interned globally, but an array
+        // object's header preserves its *actual* reference-component ClassId.
+        // Do not collapse that identity when exposing `getClass()` for an array
+        // whose component was defined by an isolated loader: the subsequent
+        // `getComponentType()` / `Array.newInstance()` path must retain the
+        // same component, or Java's perfectly valid arraycopy covariance check
+        // observes two same-named classes as incompatible.
+        if element_type == cratonvm_types::ArrayElementType::Reference
+            && ctx.loader_id_of_class(class_id) >= 3
+        {
+            if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+                let loader_pin = ctx.pin_native_root(loader);
+                let mirror = crate::lang_class::synthetic_class_mirror(ctx, &array_class_name);
+                let loader = ctx.read_native_pin(loader_pin, loader);
+                ctx.unpin_native_roots(loader_pin);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader)));
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+        }
         if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
             let mirror = ctx.get_class_mirror(arr_cid);
             return Ok(Some(Value::Object(Some(mirror))));
@@ -45178,7 +45463,21 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
             ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n != "java/lang/Object"
         );
-        if !is_canonical && receiver_classed && depth < 2 {
+        // WildFly's `org.jboss.stdio` override streams REDIRECT stdout back
+        // INTO the logging framework (delegating stream → JUL "stdout" logger
+        // → jboss-logmanager). Dispatching a framework log RECORD into them is
+        // circular by construction: on real HotSpot these records flow
+        // logger → ConsoleHandler → the fd saved BEFORE the stdio swap, never
+        // through the live `System.out`. The dispatch below therefore
+        // black-holed every WildFly boot log line (WFLYSRV0049/0025 included —
+        // boot "completed" invisibly, startup-marker written but no console
+        // output). Route framework records straight to the canonical fd-backed
+        // stream for these redirect streams.
+        let is_stdio_redirect = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            Some(n) if n.starts_with("org/jboss/stdio/")
+        );
+        if !is_canonical && receiver_classed && !is_stdio_redirect && depth < 2 {
             EMIT_FRAMEWORK_LOG_DEPTH.with(|d| d.set(depth + 1));
             // GC-safety: `create_string` can trigger a moving collection;
             // pin `out` across it and re-read the (possibly relocated) ref
@@ -45205,7 +45504,12 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
             stream_writeln(ctx, &[Value::Object(Some(out_after))], text);
             return;
         }
-        stream_writeln(ctx, &[Value::Object(Some(out))], text);
+        let sink = if is_stdio_redirect {
+            canonical.unwrap_or(out)
+        } else {
+            out
+        };
+        stream_writeln(ctx, &[Value::Object(Some(sink))], text);
     }
 }
 
@@ -79753,35 +80057,33 @@ fn native_array_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
-fn array_new_instance_component_name(
+fn array_new_instance_component(
     ctx: &mut dyn NativeContext,
     mirror_arg: Option<&Value>,
-) -> String {
+) -> (String, Option<cratonvm_types::ClassId>) {
     match mirror_arg {
         Some(Value::Object(Some(mirror))) => {
-            // Use the canonical mirror-name reader. It consults the VM
-            // reverse-map (`class_id_from_mirror` -> `class_name_of_id`), which
-            // is the ONLY thing that resolves the name of a *synthesized
-            // array-class mirror* such as the `[Ljava/lang/String;` returned by
-            // `Class.getComponentType()` on a `String[][]`. The previous ad-hoc
-            // `read_string`/slot-1 read returned nothing for those mirrors and
-            // fell back to `java/lang/Object`, so `Arrays.copyOf(.., String[][]
-            // .class)` (and H2's `SortOrder.sort` `rows.toArray(new Value[0][])`)
-            // allocated a bare `Object[]` and CCE'd on the caller's
-            // `(Value[][])` / `(String[][])` checkcast.
-            crate::lang_class::mirror_class_name(&*ctx, *mirror)
+            // Preserve the exact ClassId when the mirror represents a class
+            // from an isolated defining loader. The name is still needed for
+            // primitive handling and for the legacy fallback, but name-only
+            // resolution is invalid for same-named classes from distinct
+            // loaders (the AOT forked-loader case).
+            let component_id = crate::lang_class::mirror_class_id(&*ctx, *mirror);
+            let component_name = crate::lang_class::mirror_class_name(&*ctx, *mirror)
                 .filter(|s| !s.is_empty())
                 .or_else(|| ctx.read_string(*mirror))
                 .map(|s| s.replace('.', "/"))
-                .unwrap_or_else(|| "java/lang/Object".to_string())
+                .unwrap_or_else(|| "java/lang/Object".to_string());
+            (component_name, component_id)
         }
-        _ => "java/lang/Object".to_string(),
+        _ => ("java/lang/Object".to_string(), None),
     }
 }
 
 fn array_new_instance_for_component(
     ctx: &mut dyn NativeContext,
     comp_name: &str,
+    component_id: Option<cratonvm_types::ClassId>,
     length: usize,
 ) -> cratonvm_types::ObjectRef {
     use cratonvm_types::ArrayElementType;
@@ -79795,9 +80097,10 @@ fn array_new_instance_for_component(
         "char" | "C" => ctx.new_array(ArrayElementType::Char, length),
         "short" | "S" => ctx.new_array(ArrayElementType::Short, length),
         _ => {
-            let comp_id = ctx
-                .ensure_class_initialized(comp_name)
-                .unwrap_or(cratonvm_types::ClassId::new(0));
+            let comp_id = component_id.unwrap_or_else(|| {
+                ctx.ensure_class_initialized(comp_name)
+                    .unwrap_or(cratonvm_types::ClassId::new(0))
+            });
             if dbg_toarray_enabled() {
                 eprintln!(
                     "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
@@ -79814,8 +80117,8 @@ fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
-    let comp_name = array_new_instance_component_name(ctx, args.first());
-    let arr = array_new_instance_for_component(ctx, &comp_name, len);
+    let (comp_name, component_id) = array_new_instance_component(ctx, args.first());
+    let arr = array_new_instance_for_component(ctx, &comp_name, component_id, len);
     Ok(Some(Value::Object(Some(arr))))
 }
 

@@ -15109,6 +15109,45 @@ fn invoke_on_class_shared_inner(
                                 // our stream pipeline already consumes.
                                 | "spliterator"
                             ))
+                        // `Map.values()` (native_map_values) returns a plain
+                        // `java/util/ArrayList` that stashes its source map
+                        // in a spare trailing capacity slot so a later
+                        // `Map.put`/`remove` on the source is reflected on
+                        // read (`resync_values_view`, called from
+                        // `native_al_size`/`native_al_is_empty`/
+                        // `native_al_get`/`native_al_contains`/
+                        // `native_al_iterator`/`native_al_to_array*` etc. in
+                        // native-collections/src/lib.rs). Real `ArrayList`
+                        // bytecode declares its own `size()`/`isEmpty()`/
+                        // `get()`/etc., so without this force-entry the
+                        // receiver-has-own-bytecode rule picks real bytecode
+                        // over the registered native, skipping the resync
+                        // entirely and freezing the returned Collection at
+                        // whatever the source map held at `values()` call
+                        // time (H2 `TestAlter.testAlterTableDropIdentityColumn`:
+                        // `Schema.getAllSequences()` captures
+                        // `ConcurrentHashMap.values()` once, before any
+                        // sequence exists). `resync_values_view` is a cheap
+                        // no-op for an ordinary ArrayList (no stashed source
+                        // map in the trailing slot), so forcing these
+                        // methods through the native is safe for plain
+                        // ArrayLists too. Companion entry in
+                        // interpreter.rs::force_native_over_real_jdk_bytecode.
+                        || (matches!(class_name, "java/util/ArrayList")
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "get"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "indexOf"
+                                    | "lastIndexOf"
+                                    | "toString"
+                                    | "hashCode"
+                                    | "equals"
+                            ))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent
@@ -15380,6 +15419,14 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
+                        // Compact strings are stored in byte[] and OpenJDK's
+                        // UTF-16 copy loop is prohibitively expensive before
+                        // this cold call-site can warm. Keep this concrete
+                        // bytecode override in sync with interpreter.rs's
+                        // force_native_over_real_jdk_bytecode gate.
+                        || (class_name == "java/lang/StringUTF16"
+                            && method_name == "getChars"
+                            && descriptor == "([BII[CI)V")
                         // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout
                         // `Matcher.find()`/`find(int)`/`start`/`end`/`group`
                         // fast path — companion entry to the one in
@@ -16634,35 +16681,13 @@ fn invoke_on_class_shared_inner(
                                     | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                                     | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                             ))
-                        // `StringBuilder/StringBuffer/AbstractStringBuilder
-                        // .insert(int, char[], int, int)` (and its no-off/len
-                        // sibling `insert(int, char[])`) has real, concrete
-                        // (non-abstract) JDK bytecode, so without this entry
-                        // `check_override` stays false and that bytecode runs
-                        // directly against fields it expects at the real
-                        // `AbstractStringBuilder` layout (`byte[] value`,
-                        // `byte coder`, `int count`) — but CratonVM backs
-                        // these objects with a synthetic 2-field layout
-                        // (`char[] buffer`, `int count`; see
-                        // `native_sb_get_coder`'s doc comment). Real bytecode's
-                        // `checkOffset(dstOffset, count)` reads back a bogus
-                        // `count` (the synthetic layout has no field at that
-                        // slot) and throws `ArrayIndexOutOfBoundsException`
-                        // for any nonzero `dstOffset` — hit by Log4j2's
-                        // `FormattingInfo.format`/`ColorConverter` padding a
-                        // partially-built line (`sbuf.insert(fieldStart,
-                        // spaces, 0, n)`), which silently drops the log
-                        // record ("An exception occurred processing Appender
-                        // STDOUT") instead of reaching `System.out` —
-                        // see docs/known-issues/springboot/capturedoutput-empty-console-cluster.md.
-                        || (matches!(
+                        // Synthetic StringBuilder/StringBuffer objects are char[]-backed,
+                        // whereas every real JDK compact-string operation reads byte[]/coder/count.
+                        // Route all registered layout-sensitive methods through their natives.
+                        || crate::runtime::interpreter::is_string_builder_layout_native_override(
                             class_name,
-                            "java/lang/StringBuilder"
-                                | "java/lang/StringBuffer"
-                                | "java/lang/AbstractStringBuilder"
-                        ) && method_name == "insert"
-                            && (descriptor.starts_with("(I[CII)")
-                                || descriptor.starts_with("(I[C)")))
+                            method_name,
+                        )
                         // Keep in sync with interpreter.rs's
                         // `force_native_over_real_jdk_bytecode` entry for the
                         // same triple — see that entry's comment for the full

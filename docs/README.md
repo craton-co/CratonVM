@@ -46,7 +46,7 @@ and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
 ## Design notes and policy
 
 - [`../vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs) — canonical, in-source definition of the global lock acquisition order (the `LockLevel` hierarchy) and its runtime-enforcement wrappers.
-- [internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](internal/app-jvm-bugs/jvm-no-synthetic-stubs.md) — project rule: run real Java classes, no synthetic stubs.
+- [internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](internal/fixed-suite-bugs/app-jvm-bugs/jvm-no-synthetic-stubs.md) — project rule: run real Java classes, no synthetic stubs.
 - [internal/feature_roadmap_interpreter_intrinsic_table.md](internal/feature_roadmap_interpreter_intrinsic_table.md) — interpreter intrinsic table roadmap.
 - [internal/feature_roadmap_jit_intrinsics.md](internal/feature_roadmap_jit_intrinsics.md) — roadmap for JIT-inlined intrinsics beyond `java.lang.Math`.
 
@@ -63,8 +63,8 @@ Grounded engineering designs for larger, not-yet-landed features. See [`feature-
 ## Open investigations
 
 - [internal/bc-ec-mod-mododdinverse-investigation.md](internal/bc-ec-mod-mododdinverse-investigation.md) — BouncyCastle EC `Mod.modOddInverse` residual failures.
-- [internal/app-jvm-bugs/tomcat-selector-investigation.md](internal/app-jvm-bugs/tomcat-selector-investigation.md) — Tomcat NIO selector investigation.
-- [internal/app-jvm-bugs/jit-safepoint-revert.md](internal/app-jvm-bugs/jit-safepoint-revert.md) — JIT precise-oop-map fixes, reverted.
+- [internal/app-jvm-bugs/tomcat-selector-investigation.md](internal/fixed-suite-bugs/app-jvm-bugs/tomcat-selector-investigation.md) — Tomcat NIO selector investigation.
+- [internal/app-jvm-bugs/jit-safepoint-revert.md](internal/fixed-suite-bugs/app-jvm-bugs/jit-safepoint-revert.md) — JIT precise-oop-map fixes, reverted.
 
 ## Internal notes
 

@@ -108,7 +108,7 @@ the flag on gets standalone mode further, but into an unrelated
 `ServiceNotFoundException` (`BootstrapImpl.internalBootstrap` failing to resolve
 `Services.JBOSS_AS`) within ~3 seconds, and makes domain mode hang even earlier with no
 error at all. Filed as
-[bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md)
+[bug-15](fixed-suite-bugs/wildfly/bug-15-msc-real-start-servicenotfound-and-domain-hang.md)
 — a boot-infrastructure gap orthogonal to both hypotheses above, but one that must be
 resolved (or Maven + the real testsuite restored) before *either* hypothesis can be
 confirmed or refuted against a live, sustained-load domain-mode process again.

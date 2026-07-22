@@ -387,9 +387,41 @@ fn new_native_thread_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Metho
 /// boot image does not expose that exact method. Materialize the real
 /// `FileChannelImpl` field layout directly, so callers do not fall back to the
 /// synthetic abstract `java.nio.channels.FileChannel`.
+/// `sun/nio/ch/FileChannelImpl$Closer.run()V` — the `Runnable` action a
+/// real `Cleaner.Cleanable` invokes on `clean()`. Real bytecode reads
+/// `this.fd` and calls `FileChannelImpl.fdAccess.close(fd)`, an
+/// internal `SharedSecrets`-style static field populated by
+/// `java.io.FileDescriptor`'s own class initializer. In this bridge's
+/// construction path (`native_fcimpl_open` builds the `FileChannelImpl`
+/// object directly rather than running its real `<init>`), that static
+/// field's population is not reliably ordered before this runs, and an
+/// interface call through a null `fdAccess` silently no-ops here rather
+/// than throwing -- the fd is never actually released (see
+/// `native_fcimpl_open`'s `closer` registration below for the full
+/// history: this is what finally makes `closer.clean()` -> `run()`
+/// actually close the fd instead of being a well-registered no-op).
+/// Override `run()` directly against our own fd table instead of relying
+/// on that indirection.
+fn native_fcimpl_closer_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let fd_obj = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(None),
+    };
+    if let Some(fd) = fd_from_descriptor(ctx, fd_obj) {
+        let _ = ctx.fd_table().close(fd);
+    }
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+    Ok(None)
+}
+
 fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let fd = match args.first() {
-        Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+    let fd_obj = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
         _ => return Err(io_error("FileChannelImpl.open: null FileDescriptor")),
     };
     let path = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -403,6 +435,7 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         jdk21_direct
     };
     let parent = args.last().copied().unwrap_or(Value::Object(None));
+    let parent_is_null = matches!(parent, Value::Object(None));
 
     let channel = new_object_ref(ctx, "sun/nio/ch/FileChannelImpl")?;
     let close_lock = new_object_ref(ctx, "java/lang/Object")?;
@@ -417,7 +450,7 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     ctx.set_field_by_name(channel, "threads", Value::Object(Some(threads)));
     ctx.set_field_by_name(channel, "positionLock", Value::Object(Some(position_lock)));
-    ctx.set_field_by_name(channel, "fd", fd);
+    ctx.set_field_by_name(channel, "fd", Value::Object(Some(fd_obj)));
     ctx.set_field_by_name(channel, "readable", readable);
     ctx.set_field_by_name(channel, "writable", writable);
     ctx.set_field_by_name(channel, "parent", parent);
@@ -425,8 +458,69 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.set_field_by_name(channel, "direct", direct);
     ctx.set_field_by_name(channel, "alignment", Value::Int(-1));
     ctx.set_field_by_name(channel, "nd", Value::Object(Some(dispatcher)));
-    ctx.set_field_by_name(channel, "closer", Value::Object(None));
     ctx.set_field_by_name(channel, "fileLockTable", Value::Object(None));
+
+    // Real JDK's FileChannelImpl private constructor ALWAYS registers a
+    // Cleaner action here when `parent` is null: `closer = parent == null
+    // ? cleaner.register(this, new Closer(fd)) : null` (confirmed via
+    // javap against this host's real JDK 25). This bridge previously set
+    // `closer` unconditionally to null, producing a combination real
+    // bytecode never creates when parent is null: `implCloseChannel()`
+    // always calls `closer.clean()` on the parent-null branch, so a null
+    // closer meant the fd was silently never released whenever
+    // invokeinterface on a null receiver didn't throw here -- a resource
+    // leak. Combined with a caller that reopens the same path shortly
+    // after closing (e.g. MVStore's compact()/checkpoint sequence), the
+    // still-open fd can outlive what Java believes is a closed channel,
+    // racing the JVM-level FileLockTable bookkeeping and MVStore's own
+    // chunk metadata -- see H2 TestLob's OverlappingFileLockException /
+    // "Chunk N not found"
+    // (docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md).
+    // Register the real Cleaner action so the fd genuinely closes,
+    // mirroring the real constructor exactly. `CleanerFactory.cleaner()`
+    // is already relied on elsewhere for FileInputStream/FileOutputStream
+    // cleanup (see the "P69-Cleaner-realfix" note in lib.rs), so the
+    // underlying Cleaner machinery is known-working here.
+    let mut channel = channel;
+    let mut closer = Value::Object(None);
+    if parent_is_null {
+        let channel_pin = ctx.pin_native_root(channel);
+        let cleaner = ctx
+            .invoke(
+                "jdk/internal/ref/CleanerFactory",
+                "cleaner",
+                "()Ljava/lang/ref/Cleaner;",
+                &[],
+            )
+            .ok()
+            .flatten();
+        let closer_runnable = ctx
+            .new_object_initialized(
+                "sun/nio/ch/FileChannelImpl$Closer",
+                "(Ljava/io/FileDescriptor;)V",
+                &[Value::Object(Some(fd_obj))],
+            )
+            .ok()
+            .flatten();
+        channel = ctx.read_native_pin(channel_pin, channel);
+        if let (Some(Value::Object(Some(cleaner_obj))), Some(runnable)) =
+            (cleaner, closer_runnable)
+        {
+            closer = ctx
+                .invoke_virtual(
+                    cleaner_obj,
+                    "register",
+                    "(Ljava/lang/Object;Ljava/lang/Runnable;)Ljava/lang/ref/Cleaner$Cleanable;",
+                    &[Value::Object(Some(channel)), runnable],
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            channel = ctx.read_native_pin(channel_pin, channel);
+        }
+        ctx.unpin_native_roots(channel_pin);
+    }
+    ctx.set_field_by_name(channel, "closer", closer);
 
     Ok(Some(Value::Object(Some(channel))))
 }
@@ -887,6 +981,12 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "open",
         "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;",
         native_fcimpl_open,
+    );
+    r.register(
+        "sun/nio/ch/FileChannelImpl$Closer",
+        "run",
+        "()V",
+        native_fcimpl_closer_run,
     );
     let nts = "sun/nio/ch/NativeThreadSet";
     r.register(nts, "add", "()I", native_native_thread_set_add);

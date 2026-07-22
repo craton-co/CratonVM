@@ -36526,22 +36526,39 @@ fn native_chm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // wrote the backing array into the wrong slots and `values()` iterated
     // empty even though `size()` was correct.
     //
-    // cceres5: the list/array allocations can move the just-collected values;
-    // pin + re-read before the stores (see make_static_entry_set).
+    // Live view (2026-07-22): reserve one extra trailing slot and stash the
+    // source map there, exactly like the generic `native_map_values`
+    // (HashMap) does — `values_view_source`/`resync_values_view` (see
+    // `native_al_size`/`native_al_get`/`native_al_contains`/
+    // `native_al_iterator`/etc.) detect that marker and re-collect the
+    // current values from the live map before every read. Without it, this
+    // ArrayList was a dead one-time snapshot: `map.values()` captured before
+    // any entries existed (or before later puts) never grew, e.g. H2's
+    // `Schema.getAllSequences()` (a raw `ConcurrentHashMap.values()` captured
+    // once) permanently reported 0 regardless of how many sequences were
+    // created afterward (`TestAlter.testAlterTableDropIdentityColumn`).
+    //
+    // cceres5: the list/array allocations can move the just-collected values
+    // (and `this`, the source map stashed below) — pin + re-read before the
+    // stores (see make_static_entry_set / native_chm_entry_set).
     let (elem_base, val_handles) = pin_value_slice(ctx, &vals);
-    let n_fields = al_slots(ctx).2;
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", n_fields);
-    let list_pin = ctx.pin_native_root(list);
+    let this_pin = ctx.pin_native_root(this);
     let first_pin = if elem_base == usize::MAX {
-        list_pin
+        this_pin
     } else {
         elem_base
     };
-    let arr = alloc_ref_array(ctx, vals.len().max(AL_DEFAULT_CAPACITY));
+    let n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", n_fields);
+    let list_pin = ctx.pin_native_root(list);
+    let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
+    let arr = alloc_ref_array(ctx, cap);
     for (i, v) in vals.iter().enumerate() {
         let v = read_pinned_elem(ctx, val_handles[i], *v);
         let _ = ctx.set_array_element(arr, i, v);
     }
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_array_element(arr, cap - 1, Value::Object(Some(this)));
     let list = ctx.read_native_pin(list_pin, list);
     al_set_data(ctx, list, arr);
     al_set_size(ctx, list, vals.len() as i32);

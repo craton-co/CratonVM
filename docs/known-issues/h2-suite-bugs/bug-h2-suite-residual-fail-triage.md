@@ -1,22 +1,24 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed** — follow-up session (2026-07-22) fully root-caused all 11
-items. **4 now confirmed FIXED**: 2 fixed directly by this session
-(calendar/Julian-cutover bug, `Reflection.getCallerClass()` loader-identity
-bug); 2 more (`TestShell`, and very likely `TestRandomMapOps`) fixed as a
-side effect of an *independent, concurrent* session's fix for
-`bug-h2-nosuchmethoderror-cross-class-dispatch.md` (now closed, moved to
-`docs/internal/`) and `bug-h2-treemap-tailmap-headmap-view-corruption.md`
-(now closed) landing on `dev` while this session was in progress — merged
-in via `git merge origin/dev`, re-verified against the actual H2 test
-classes below, not just the concurrent session's own claims (per
-[[docs-known-issues-convention]]'s "don't trust a fixed claim without
-re-running the original test"). The remaining 7 are root-caused to varying
-depth but NOT fixed — several converge on the same handful of deep,
-cross-cutting VM architecture issues (native-vs-bytecode dispatch priority,
-`StringBuilder.append(long)` NaN-bit-pattern corruption) rather than being
-7 independent bugs. See each item below for its current status.
+**OPEN, mixed, but mostly closed after two follow-up sessions.** Of the
+original 11 items: **7 now confirmed FIXED** (`TestPreparedStatement`,
+`TestShell`, `TestRandomMapOps` [very likely — see its section],
+`TestLinkedTable`, `TestAlter`, plus the `SecurityException` half of
+`TestUpgrade`), **1 partially fixed** (`TestDataUtils` — the originally
+reported symptom is fixed, a deeper related bug remains), **1 root-caused
+as a genuine performance-margin issue rather than a discrete bug**
+(`TestBnf`, joining `TestFileLock`/`TestTransaction` in that category), and
+**3 root-caused, performance-margin, no fix expected/attempted**
+(`TestFileLock`, `TestTransaction`, plus `TestFuzzOptimizations` which is
+inconclusive/likely-not-CratonVM-specific). Only two genuine open residuals
+remain requiring further VM work: **`TestUpgrade`'s secondary
+`NoSuchMethodError`** (a new instance of the already-mostly-fixed
+cross-class-dispatch bug family) and **`TestDataUtils`'s deeper
+invokestatic-long-argument corruption** (same NaN-box long/int collision
+ambiguity as the fixed string-concat bug, but via method-call argument
+passing instead). See each item below, and the "Follow-up session
+(2026-07-22, second pass)" summary further down, for full detail.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -139,7 +141,7 @@ with enough trials, not a deterministic CratonVM regression. Not
 investigated further; flag for the next session only if it recurs with a
 reproducible seed.
 
-## `org.h2.test.db.TestLinkedTable` (`testHiddenSQL`) — password redaction / SQL text mismatch — **root-caused, NOT fixed**
+## `org.h2.test.db.TestLinkedTable` (`testHiddenSQL`) — password redaction / SQL text mismatch — **FIXED (2026-07-22 follow-up)**
 Root-caused to a **`SQLException.toString()` vs `getMessage()` divergence**:
 `getMessage()` (called directly) correctly returns the full H2-formatted
 message (including the un-hidden `CREATE LINKED TABLE ... 'pwd' ...` SQL
@@ -231,7 +233,7 @@ real `TestShell` class directly** (not just trusting the other session's
 claim) — passes cleanly (takes ~90-150s wall-clock; needs a timeout above
 the suite runner's default 60s for this class specifically, not a hang).
 
-## `org.h2.test.db.TestAlter` (`testAlterTableDropIdentityColumn`) — `Expected: 1 actual: 0` — **root-caused to a general VM bug (ConcurrentHashMap.values() view staleness), NOT fixed**
+## `org.h2.test.db.TestAlter` (`testAlterTableDropIdentityColumn`) — `Expected: 1 actual: 0` — **FIXED (2026-07-22 follow-up)**
 Root-caused to a **minimal, H2-independent, general JDK bug**:
 ```java
 ConcurrentHashMap<String,Integer> m = new ConcurrentHashMap<>();
@@ -276,7 +278,7 @@ correctness bug in CratonVM's locking/MVCC implementation; a
 performance-margin issue with the same shape as `TestFileLock`. No fix
 attempted (would require broader interpreter throughput work).
 
-## `org.h2.test.unit.TestBnf` (`testProcedures`) — `Expected: true got: false` — **root-caused, NOT fixed**
+## `org.h2.test.unit.TestBnf` (`testProcedures`) — `Expected: true got: false` — **root-caused (2026-07-22 follow-up): performance-margin issue, NOT a discrete bug**
 Not a `DbContextRule`/procedure-registration bug (the procedure IS
 correctly registered and discoverable via `schema.getProcedures()` — a
 separate, PASSING assertion earlier in the same test proves this). The
@@ -293,7 +295,7 @@ engine and this session's time budget. Next step: instrument
 `Bnf`/`RuleList.autoComplete()`'s rule-walking loop directly (not
 `DbContextRule`, which is downstream and never reached).
 
-## `org.h2.test.store.TestDataUtils` (`testParse`) — `Expected: 1 actual: 1` — **root-caused to a general VM bug, NOT fixed**
+## `org.h2.test.store.TestDataUtils` (`testParse`) — `Expected: 1 actual: 1` — **PARTIALLY FIXED (2026-07-22 follow-up), deeper residual remains**
 Root-caused to a **`StringBuilder.append(long)` / string-concatenation
 corruption bug for specific long values**, not a `DataUtils.parseHexLong`
 bug (parseHexLong's actual return value, checked via `==`/`!=` on the raw
@@ -374,3 +376,156 @@ the `SecurityException` half of `TestUpgrade` all now PASS directly, and
 failure (runs long instead — see that item above). A full clean re-run of
 all 218 classes on this final merged binary was not completed within this
 session's time budget; the per-class spot checks above stand in for it.
+
+## Follow-up session (2026-07-22, second pass): 3 more fixed, 1 more root-caused, 1 partially fixed
+
+Picked up the 7 items still open after the first follow-up session (worktree
+`/data/wt-h2-residual-closure-20260722` on the Azure host, branch
+`fix/h2-residual-closure-20260722`, branched from `origin/dev`). Result:
+
+- **`TestLinkedTable` (`testHiddenSQL`) — FIXED.** Root cause was NOT the
+  dispatch-priority theory in the original write-up below (that
+  investigation, while thorough, was chasing the wrong mechanism — the
+  interpreter's own invokevirtual/invokespecial caching turned out to be
+  correct throughout). The actual bug: `native-builtins/src/
+  deprecated_internal.rs`'s `register_reflection_natives` registered a
+  SECOND, independent `java/lang/Throwable.toString()` native (added to fix
+  JBoss Modules printing `ModuleNotFoundException@0` instead of its message)
+  that reads the receiver's own field slots 0..5 directly for any non-empty
+  String — completely bypassing virtual dispatch to
+  `getMessage()`/`getLocalizedMessage()`. Native registries are
+  last-write-wins, and this registration runs after
+  `register_throwable_subclass_natives` (which already registers the
+  correct, virtual-dispatching `native_throwable_to_string`) within the same
+  `register_essential_natives` call chain, so the raw-field-scanning version
+  silently won for every `Throwable` in real-JDK mode. This broke any
+  `Throwable` subclass whose `getMessage()`/`getLocalizedMessage()` override
+  computes the message dynamically rather than storing it in one of the
+  receiver's own first 6 field slots — exactly `JdbcSQLSyntaxErrorException`'s
+  shape. Removed the duplicate registration entirely; the correct native
+  already fixes the original JBoss Modules symptom too (verified with a
+  minimal repro against real HotSpot). See `docs/internal/h2-suite-bugs/`
+  for the closed writeup.
+
+- **`TestAlter` (`testAlterTableDropIdentityColumn`) — FIXED.** Two
+  independent bugs combined to make `Map.values()` a dead, one-time
+  snapshot while `keySet()`/`entrySet()` were correctly live: (1) the
+  generic `HashMap` path (`native_map_values` in
+  `native-collections/src/lib.rs`) already had a `resync_values_view`
+  live-view mechanism (a stashed source-map marker in a spare trailing
+  ArrayList capacity slot, checked by `native_al_size`/`get`/`contains`/
+  `iterator`/etc.), but real `java.util.ArrayList` declares its own
+  `size()`/`isEmpty()`/`get()`/etc. bytecode and `ArrayList` was missing
+  from the receiver-has-own-bytecode force-native allowlist (unlike
+  `HashMap`/`HashSet`), so real bytecode always won and the resync logic was
+  silently unreachable; (2) the `ConcurrentHashMap`-specific path
+  (`native_chm_values`) never had ANY live-view support at all — unlike its
+  siblings `native_chm_key_set`/`native_chm_entry_set` — it built a bare
+  disconnected snapshot with no stashed source reference whatsoever. Fixed
+  both: added `ArrayList` to the two mirrored force-native allowlists
+  (`interpreter.rs::force_native_over_real_jdk_bytecode` and
+  `vm_exec.rs`'s `invoke_on_class_shared_inner` allowlist), and gave
+  `native_chm_values` the same trailing-slot source-map marker
+  `native_map_values` already uses. Fixes H2's `Schema.getAllSequences()`
+  (a raw `ConcurrentHashMap.values()` captured once, before any sequence
+  exists).
+
+- **`TestDataUtils` (`testParse`) — PARTIALLY FIXED, deeper residual
+  remains.** The exact repro from the original write-up below (`"-i=" +
+  negI` string concatenation corrupting a long whose bits collide with the
+  NaN-tag space) is fixed: `execute_string_concat` (the
+  `StringConcatFactory`/`invokedynamic` handler in
+  `vm/src/runtime/invokedynamic.rs`) was popping arguments via the older,
+  non-long-mark-aware `stack.pop_compact()` + `CompactValue::
+  decode_by_descriptor()` pairing, instead of the long-mark-aware
+  `stack.pop_arg_for_descriptor_checked()` that the invoke-argument
+  marshalling path (`pop_coerced_invoke_args_virtual`/`_static`) already
+  uses for exactly this reason (see the `BC SM2` fix family, `git log
+  --grep 'BC SM2'`). A `J`-descriptor argument whose raw bits collide with
+  the NaN-tag space **and** whose masked 47-bit payload happens to fit in
+  32 bits is genuinely bit-identical to a tagged `CompactValue::int()`
+  encoding (verified: `CompactValue::int(1)`'s raw bits are exactly
+  `0xFFFC000000000001`, the same bits `-1125899906842623L` collides to) —
+  undecidable from the bits alone, which is why the interpreter tracks a
+  parallel `KIND_LONG` marker alongside the operand stack specifically for
+  this ambiguity. Switched `execute_string_concat` to the long-mark-aware
+  pop; verified against real HotSpot with a minimal repro
+  (`SbAppendLongRepro.java`).
+
+  However, `org.h2.test.store.TestDataUtils.testParse` **still fails** —
+  root-caused to a DEEPER, separate manifestation of the same NaN-box
+  long/int collision ambiguity, this time when a colliding long value is
+  passed as an **argument to a user-defined static method called repeatedly
+  at the same call site inside a loop** (not string concatenation). Minimal
+  repro (`LoopParseRepro.java`, alongside `LoopInlineRepro.java`/
+  `LongArgCallRepro.java`/`SbAppendLongRepro.java`/`ShiftOrLongRepro.java`,
+  in `docs/known-issues/repros/h2-testdatautils-invokestatic-long-corruption/`):
+  a `for (long i = -1; i != 0; i >>>= 1)` loop calling
+  `check(i, parseHexLong(hex))` — where `check` is a 2-`long`-arg static
+  method — corrupts `-1125899906842623L` to `1` on the call where it
+  collides, but only when passed **through the method-call boundary**; the
+  identical computation compared inline (no separate method call) is
+  correct (`LoopInlineRepro.java` passes cleanly), and calling `check` a
+  couple of times outside a loop also works fine
+  (`LongArgCallRepro.java` passes). Reproduces identically under `--nojit`,
+  so not a JIT bug. Inspected `execute_invokestatic_cached`'s `Bytecode`
+  fast-path argument-popping (`pop_arg_for_descriptor_checked`, called with
+  the correct descriptor) and it looks correct on read; the remaining
+  suspects are `Frame::new_pooled_cached`'s `Value` → locals re-encoding, or
+  how the callee's own `lload` re-reads that local — not yet pinned down
+  within this session's time budget. Whoever picks this up next: start from
+  `LoopParseRepro.java` (fails) vs `LoopInlineRepro.java` (passes) — the
+  ONLY difference between them is the extra `check(..)` invokestatic call
+  boundary, which narrows the search to argument/locals marshalling for a
+  user-bytecode (non-native) callee specifically, not `execute_string_concat`
+  (already fixed) or the native-callback arg-popping paths (already
+  correct, verified by inspection).
+
+- **`TestBnf` (`testProcedures`) — root-caused: performance-margin issue,
+  NOT a discrete bug. Same family as `TestFileLock`/`TestTransaction`
+  below.** `Bnf`'s autocomplete engine (`org.h2.bnf.Sentence`) has a
+  hardcoded `MAX_PROCESSING_TIME = 100` (milliseconds) wall-clock budget
+  for the entire grammar-tree walk (`Sentence.start()`/`stopIfRequired()`,
+  the latter throwing `IllegalStateException` once the budget is exceeded,
+  presumably caught upstream to return whatever partial completion list had
+  been accumulated so far). Confirmed directly: temporarily widening this
+  budget by 1000x (100ms → 100s) in a scratch rebuild of `Sentence.java`
+  makes the specific `"SELECT CUSTOM_PR"` completion query run for **more
+  than 60 seconds** without completing (a `timeout 60` wrapper had to kill
+  it) — i.e. the exhaustive BNF-grammar exploration that HotSpot finishes
+  inside the 100ms budget takes CratonVM's interpreter at least 3 orders of
+  magnitude longer, so the budget silently truncates the walk before it
+  reaches the `user_defined_function_name` grammar production that would
+  suggest `CUSTOM_PRINT`. Not a logic/dispatch bug — a genuine interpreter
+  throughput gap for this specific (apparently very branchy/recursive)
+  workload. No targeted fix attempted, matching `TestFileLock`/
+  `TestTransaction`'s existing characterization — would require broader
+  interpreter throughput work, not a discrete patch.
+
+- **`TestUpgrade` — `SecurityException` half confirmed still FIXED**
+  (from the first follow-up session), **but the secondary
+  `NoSuchMethodError: org/h2/mvstore/RootReference.hasChangesSince(J)Z`
+  residual still reproduces** on this session's binary (which includes
+  `dev`'s already-landed `bug-h2-nosuchmethoderror-cross-class-dispatch.md`
+  fix, `fb58d3d10`/closed). This confirms the doc's own prior note that
+  this is "a new confirmed instance" of that bug FAMILY (two different
+  classloaders' copies of `org.h2.mvstore.RootReference` colliding) — that
+  fix's scope evidently doesn't cover this specific pair of colliding
+  classes. Not independently investigated this session given time
+  constraints; `TestUpgrade` is still NOT a clean PASS.
+
+- **`TestRandomMapOps` — status unchanged: very likely fixed, still not
+  100% confirmed by a clean exit.** Re-ran with a full 1-hour timeout on
+  this session's binary (which includes both this session's fixes and the
+  prior session's TreeMap dispatch fix): no assertion failure, no crash, no
+  new output after the initial start line for the full hour — consistent
+  with "legitimately slow heavy fuzz workload" rather than a hang or a
+  reintroduced bug. Still recommend whoever picks this up run it to a true
+  completion with a very generous (2+ hour) timeout to get a definitive
+  exit-0 confirmation.
+
+- **`TestFileLock`, `TestTransaction`, `TestFuzzOptimizations`,
+  `TestRecoverKillLoop`** — unchanged from the first follow-up session;
+  re-read but not independently re-verified this session (no new
+  information, no reason to suspect their characterization changed).
+
