@@ -4,6 +4,28 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-22 H2 `cp500`/IBM500 charset FIXED
+
+FIXED (moved to `docs/internal/fixed-suite-bugs/`):
+[`bug-h2-charset-cp500-unsupported-FIXED.md`](../internal/fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md)
+— `Charset.forName("cp500")`/`("IBM500")` threw `UnsupportedCharsetException`
+because CratonVM's charset engine only curates a subset of the real JDK's
+`jdk.charsets`-module extended charsets, and IBM500 (EBCDIC 500
+International) wasn't one of them, breaking `org.h2.test.db.TestSetCollation`
+(`testCp500Collator`) and `org.h2.test.unit.TestCharsetCollator`. Fixed by
+adding IBM500 as a new single-byte codec in `native-api/src/charset.rs`
+(canonical-name aliases, decode/encode, 256-byte table + reverse-lookup),
+following the same pattern the existing IBM1047 codec uses. The 256-byte
+table was captured directly from real JDK25's `sun.nio.cs.ext.IBM500` (not a
+generic reference table) to match a genuine byte-0x15 NEL/LF ambiguity in
+this codepage exactly. Verified: standalone `Charset.forName`/round-trip
+probe, both affected H2 test classes pass (and reproduce on an unmodified
+pre-fix baseline binary, confirming the A/B), zero regressions in
+`cratonvm-native-api`/`cratonvm-native-builtins`'s combined 3236-test unit
+suite. This is the second time this exact bug was documented — the first
+doc was deleted by `b71e7402f` (2026-06-22 doc cleanup) without being fixed;
+this closure is a real fix, not another cleanup deletion.
+
 ## 2026-07-20 CRITICAL core JIT/OSR bug FIXED: back-edge OSR silently re-executed loop iterations after an `invokedynamic` trap
 
 FIXED (moved to `docs/internal/`):
@@ -218,7 +240,7 @@ The sweep A/B also confirmed the STW-takeover bracketing fix (`945e44920`)
 as the root cause of the long-standing cross-suite ~300s
 `SocketTimeoutException` flake family (33 hits in the 07-12 baseline в†’ 0).
 One NEW low-rate residual found and filed:
-[`tomcat-08-07/threadpoolexecutor-prestart-illegalthreadstate-sporadic.md`](tomcat-08-07/threadpoolexecutor-prestart-illegalthreadstate-sporadic.md)
+[`tomcat/threadpoolexecutor-prestart-illegalthreadstate-sporadic.md`](tomcat/threadpoolexecutor-prestart-illegalthreadstate-sporadic.md)
 (`Thread.start()` on a freshly constructed endpoint worker sporadically
 throws `IllegalThreadStateException`, ~1/5000 Tomcat boots).
 
@@ -572,12 +594,12 @@ Investigated the confirmed-but-unexplained pattern already flagged in
 
 ## 2026-07-10 AccessLogValve/RewriteValve doc RETIRED (5/6 causes fixed; 6th is the already-tracked register-invisible-JIT-root family, not a new bug)
 
-- RETIRED: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) вЂ” five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth вЂ” a SIGSEGV around `TestAccessLogValve` test #8 вЂ” is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (also since retired вЂ” see below), the tracking doc for this family вЂ” don't reopen either retired doc for a repeat of this signature, catalogue it as a new occurrence somewhere fresh instead.
+- RETIRED: [`tomcat/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`](../internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) вЂ” five of six root causes found across this investigation (`URL.openConnection()` CCE, `ByteBuffer.address`, `StringReader.read()`, the cross-cutting `SocketWrapperBase.lock` NPE, and a JIT `ConcurrentLinkedQueue` allocate-then-CAS miscompile) are FIXED and landed on `dev`. The sixth вЂ” a SIGSEGV around `TestAccessLogValve` test #8 вЂ” is a confirmed, byte-for-byte register-signature match with the already-tracked, currently-OPEN "register-invisible JIT root" bug family (real fix needs precise JIT oop maps / shadow stack, deep infrastructure work, deliberately not attempted). Catalogued as another occurrence in [`tomcat/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (also since retired вЂ” see below), the tracking doc for this family вЂ” don't reopen either retired doc for a repeat of this signature, catalogue it as a new occurrence somewhere fresh instead.
 - **Correction while retiring:** the retired doc's sixth-cause section had cited `hib-global-temptable-nondeterministic-sigsegv-20260710.md` as a corroborating occurrence of this family. That's stale вЂ” see the entry above (2026-07-10 Hibernate remote rerun SIGSEGV cluster RESOLVED): that cluster was a different, unrelated, already-fixed bug. Corrected in both the retired doc and the swallow-uploads tracking doc.
 
 ## 2026-07-11 `TestSwallowAbortedUploads` doc RETIRED вЂ” full class passes clean
 
-- RETIRED: [`tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) вЂ” `org.apache.catalina.core.TestSwallowAbortedUploads` now passes all 10 tests clean (`OK (10 tests)`, verified 4Г—). This doc's history spans 8 distinct, genuine defects across ~10 sessions (the original socket-close overcorrection, a `ScheduledThreadPoolExecutor` boot blocker, a `ByteBuffer` connector `AbstractMethodError`, the cross-cutting `SocketWrapperBase.lock`/`LinkedBlockingDeque` synthetic-layout NPE, a `String(char[])` interpreter-throughput gap that tripped a 3s connector timeout, the register-invisible-JIT-root `SB-CRASH-04` SIGSEGV, and finally the `sc_close` swallow-vs-abort gap itself plus a `java.net.Socket` write-path exception-classification bug) вЂ” read the retired doc's own chronology for the full arc before assuming a superficially-similar future symptom is one of these already-closed causes.
+- RETIRED: [`tomcat/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`](../internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md) (moved from `known-issues/tomcat-08-07/`) вЂ” `org.apache.catalina.core.TestSwallowAbortedUploads` now passes all 10 tests clean (`OK (10 tests)`, verified 4Г—). This doc's history spans 8 distinct, genuine defects across ~10 sessions (the original socket-close overcorrection, a `ScheduledThreadPoolExecutor` boot blocker, a `ByteBuffer` connector `AbstractMethodError`, the cross-cutting `SocketWrapperBase.lock`/`LinkedBlockingDeque` synthetic-layout NPE, a `String(char[])` interpreter-throughput gap that tripped a 3s connector timeout, the register-invisible-JIT-root `SB-CRASH-04` SIGSEGV, and finally the `sc_close` swallow-vs-abort gap itself plus a `java.net.Socket` write-path exception-classification bug) вЂ” read the retired doc's own chronology for the full arc before assuming a superficially-similar future symptom is one of these already-closed causes.
 
 ## 2026-07-11 `testNonBlockingReadIgnoreIsReady`: fixed-length HTTP streaming FIXED
 
@@ -593,7 +615,7 @@ body writes immediately; both `testNonBlockingReadIgnoreIsReady` and
 historical root-cause evidence.
 
 Re-investigated
-[`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md).
+[`tomcat/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat/nonblockingreadignoreisready-async-error-response-completion-gap.md).
 Its "container commits an implicit 200 response that never flushes" theory
 does not hold up: verified directly against real HotSpot that the test
 actually passes via a genuine client-side `IOException` thrown mid-upload,
@@ -652,7 +674,7 @@ effect вЂ” the peer had already sent EOF long before close() ran).
 ## 2026-07-10 FormAuthenticator `StreamDecoder` field-index residual FIXED; new zero-byte HTTP request blocker filed (unrelated, pre-existing)
 
 - FIXED/RETIRED: [`form-authenticator-cookie-session-bare-assertion-FIXED.md`](../internal/tomcat-08-07/form-authenticator-cookie-session-bare-assertion-FIXED.md) вЂ” the doc's last open residual (`NoSuchMethodError: java/lang/Object.read([CII)I` / `BufferedReader.in` reading null right after construction) was `alloc_stream_decoder` addressing the real `sun.nio.cs.StreamDecoder`'s `in` field and its side-table key via hardcoded absolute slot indices (`SD_INPUT = 0`, `SD_ID = 4`) that didn't match the real class's actual declared field order (`javap`: `closed, haveLeftoverChar, leftoverChar, cs, decoder, bb, in, ch` вЂ” `in` is the 7th field, slot 0 is really `closed`, a primitive) вЂ” the same "synthetic native writes the wrong slots for a real-`ClassId`-stamped object" corruption family as `LinkedBlockingDeque`/`ThreadPoolExecutor`/`StringJoiner`. Fixed the same way `stream_encoder.rs` already fixed the analogous `StreamEncoder` corruption: resolve `in` by name (`get_field_by_name`/`set_field_by_name`) instead of a hand-counted index, and key the side-table by `ctx.identity_hash_code` instead of a scratch field slot. Verified via `cargo test -p cratonvm-native-io stream_decoder::` (16/16) and two live `TestFormAuthenticatorA/B/C` reruns showing zero `NoSuchMethodError`/`lock is null` occurrences (commit `e5f20c9bf`).
-- OPEN (new, pre-existing, unrelated вЂ” found while re-verifying the above): [`formauth-zero-byte-garbage-http-request.md`](tomcat-08-07/formauth-zero-byte-garbage-http-request.md) вЂ” every `TestFormAuthenticatorA/B/C` method's first request now fails with the server reading a few hundred NUL bytes instead of an HTTP method line, on a freshly-accepted socket. Confirmed NOT caused by the fix above via a same-dev-tip baseline comparison (an unmodified binary hit the identical symptom, and fared worse вЂ” hung instead of completing). Root cause not narrowed; may be host-load/contention on this specific run rather than an always-reproducible VM bug вЂ” needs a rerun on an idle host first.
+- OPEN (new, pre-existing, unrelated вЂ” found while re-verifying the above): [`formauth-zero-byte-garbage-http-request.md`](tomcat/formauth-zero-byte-garbage-http-request.md) вЂ” every `TestFormAuthenticatorA/B/C` method's first request now fails with the server reading a few hundred NUL bytes instead of an HTTP method line, on a freshly-accepted socket. Confirmed NOT caused by the fix above via a same-dev-tip baseline comparison (an unmodified binary hit the identical symptom, and fared worse вЂ” hung instead of completing). Root cause not narrowed; may be host-load/contention on this specific run rather than an always-reproducible VM bug вЂ” needs a rerun on an idle host first.
 
 ## 2026-07-10 zero-byte HTTP request blocker RULED OUT (host-load artifact, confirmed on idle host); TestFormAuthenticatorA/B/C now pass end-to-end after merging 3 unrelated concurrent fixes
 
@@ -701,7 +723,7 @@ regression and the previously-unexplained Jasper JSP failure in
 `TestHttp11Processor`.
 
 - FIXED/RETIRED: [`nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md`](../internal/fixed-suite-bugs/nonblockingapi-http11processor-http2limits-bare-assertions-FIXED.md) вЂ” 5/6 of the doc's originally-failing methods now pass (`testDelayedNBWrite`, `testPipelining`, `testWithTEChunkedWithCL`, `testHeaderLimits100x32`, `testPostWithTrailerHeadersSize0`); root cause and fix for both the regex gap and the `ByteBuffer` bug are in the doc's final section.
-- OPEN (new, split off): [`tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat-08-07/nonblockingreadignoreisready-async-error-response-completion-gap.md) вЂ” `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`'s Java-level `onError`/`onComplete` callback sequence is confirmed byte-for-byte identical to HotSpot (via socket-capture + log diff), but CratonVM then writes zero bytes to the socket where HotSpot's container commits an implicit `200` response. Narrowed but not root-caused; low priority (narrow, deliberately-adversarial test scenario).
+- OPEN (new, split off): [`tomcat/nonblockingreadignoreisready-async-error-response-completion-gap.md`](tomcat/nonblockingreadignoreisready-async-error-response-completion-gap.md) вЂ” `TestNonBlockingAPI.testNonBlockingReadIgnoreIsReady`'s Java-level `onError`/`onComplete` callback sequence is confirmed byte-for-byte identical to HotSpot (via socket-capture + log diff), but CratonVM then writes zero bytes to the socket where HotSpot's container commits an implicit `200` response. Narrowed but not root-caused; low priority (narrow, deliberately-adversarial test scenario).
 
 ## 2026-07-10 ES storedscripts crash trio FIXED; Object.contains signal gone (masked); new Executors factory mainLock NPE found (OPEN, partially fixed)
 
@@ -716,7 +738,7 @@ on current `dev` per their own note ("re-run on current dev before assigning own
 ## 2026-07-10 TestEncodingDetector retired; UTF-16/prolog-conflict residual split off
 
 - FIXED/RETIRED: [`encodingdetector-jsp-encoding-500-failures-FIXED.md`](../internal/fixed-suite-bugs/encodingdetector-jsp-encoding-500-failures-FIXED.md) - the StAX prolog-encoding fix (`1b60c103`) was already merged; verifying it end-to-end against the real `TestEncodingDetector` class required also picking up a concurrent session's fix for two independent blockers (`FileInputStream.<init>(String)` native-fallback backfill gap; `defineClass1` duplicate-define during repeated Tomcat webapp stop/start in one process, commit `45cc4f4f`). With both merged, the class went from 22/22 failing to 5/22 failing.
-- OPEN (new, split off): [`tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md`](tomcat-08-07/encodingdetector-utf16-and-conflicting-prolog-residuals.md) вЂ” the remaining 5/22: 3 deliberately-invalid BOM/prolog-conflict fixtures now return 200 instead of HotSpot's 500, and 2 plain-`.jsp` UTF-16 (no-prolog) cases either decode garbled or hang.
+- OPEN (new, split off): [`tomcat/encodingdetector-utf16-and-conflicting-prolog-residuals.md`](tomcat/encodingdetector-utf16-and-conflicting-prolog-residuals.md) вЂ” the remaining 5/22: 3 deliberately-invalid BOM/prolog-conflict fixtures now return 200 instead of HotSpot's 500, and 2 plain-`.jsp` UTF-16 (no-prolog) cases either decode garbled or hang.
 
 ## 2026-07-10 ES tdigest SortingDigestTests crash FIXED, 2 new correctness residuals found (OPEN)
 
@@ -750,7 +772,7 @@ above is cleared.
 
 ## 2026-07-09 AccessLogValve/RewriteValve re-verify: 2 severe regressions FIXED, 1 new foundational bug found (OPEN)
 
-Re-verified `tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+Re-verified `tomcat/accesslogvalve-rewritevalve-connection-failures.md`
 in isolation (`-Parallel 1`, idle Azure host) per its own recommendation.
 Both classes are CONFIRMED genuine bugs, not contention. Investigating them
 surfaced three distinct, layered issues:
@@ -779,7 +801,7 @@ surfaced three distinct, layered issues:
   GC-stable side table (`SR_STATE`, keyed by `identity_hash_code`), same
   pattern as this file's `InputStreamReader` `ISR_PENDING` table.
   `TestRewriteValve` now completes all 121 tests instead of hanging.
-- Updated: [`tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`](tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md)
+- Updated: [`tomcat/accesslogvalve-rewritevalve-connection-failures.md`](tomcat/accesslogvalve-rewritevalve-connection-failures.md)
   now reflects all three findings.
 
 ## 2026-07-09 Spring suite genuine-bug list, updated (125, down from 159)

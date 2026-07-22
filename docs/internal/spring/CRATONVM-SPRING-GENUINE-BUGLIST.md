@@ -2844,7 +2844,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     — while the caller executed a tight Java-level spin/poll loop typical of Reactor/Netty/Jetty's
     lock-free scheduling. This is the SAME function already flagged as consuming ~51% of all
     executed instructions on method-call-heavy workloads in
-    `docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md` (2026-07-13) — that
+    `../../known-issues/tomcat/silent-hang-no-signature-cluster.md` (2026-07-13) — that
     session measured call *frequency* but not per-call cost, and judged a fast-reject allowlist too
     risky to hand-write (a first attempt missed a case hiding in a nested helper). This fix instead
     memoizes the check exactly (no approximation, so no risk of silently changing behaviour):

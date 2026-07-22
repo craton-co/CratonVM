@@ -1,7 +1,7 @@
 # TestOutputBuffer.testWriteSpeed — deterministic content-length mismatch (FIXED)
 
 **Status: FIXED 2026-07-20**, branch `fix/tomcat-writespeed-clenmismatch-20260720`.
-Originally opened same-day in `docs/known-issues/tomcat-08-07/` while sweeping
+Originally opened same-day in `../../known-issues/tomcat/` while sweeping
 the Tomcat connector package for RBC.6-related throughput residuals; this was
 a separate, unrelated bug. Root-caused and fixed to completion in a follow-up
 session — three independent, compounding JIT defects, all in the x86-64 OSR

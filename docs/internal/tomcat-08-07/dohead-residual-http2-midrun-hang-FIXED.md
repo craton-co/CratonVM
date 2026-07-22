@@ -142,7 +142,7 @@ dying-thread loss shape (`Weak` registry slots) — spun off separately
   1× `URLClassLoader.ucp` null) — the same order as the best historical
   sweep floor (58/64 + 6×287/288 on 2026-07-13, measured on a quieter
   box) — plus 1× a distinct native stack-overflow singleton. All residuals
-  filed in `docs/known-issues/tomcat-08-07/dohead-post-fix-sporadic-residuals.md`.
+  filed in `../../known-issues/tomcat/dohead-post-fix-sporadic-residuals.md`.
 - **The doc's two original hang classes**: full 288/288 PASS at 500 m
   (both), 2 g (both), and in the family sweep. The mid-run hang shape and
   the `LifecycleException`/ITSE flake shape occurred **zero** times across

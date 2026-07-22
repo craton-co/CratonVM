@@ -1792,7 +1792,7 @@ blocking-recv-faked-as-async read/write natives
 a JIT-takeover safepoint on its own, so a concurrent STW pause that expects
 every mutator to cooperate waits forever (`pending=1 taken=0`) — this is the
 same "STW cross-thread JIT takeover" bug class documented in
-[`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md`](tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md),
+[`../../known-issues/tomcat/stw-crossthread-jit-takeover-hang-cluster.md`](tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md),
 applied here to a different subsystem (raw socket I/O rather than locks/
 `IoFuture`). `origin/dev` already had an independent, concurrently-landed
 fix for the *async*-channel half of this (same root cause, found via a
