@@ -1,24 +1,27 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed, but mostly closed after two follow-up sessions.** Of the
-original 11 items: **7 now confirmed FIXED** (`TestPreparedStatement`,
+**OPEN, mixed, mostly closed after three follow-up sessions.** Of the
+original 11 items: **8 now confirmed FIXED** (`TestPreparedStatement`,
 `TestShell`, `TestRandomMapOps` [very likely — see its section],
-`TestLinkedTable`, `TestAlter`, plus the `SecurityException` half of
-`TestUpgrade`), **1 partially fixed** (`TestDataUtils` — the originally
-reported symptom is fixed, a deeper related bug remains), **1 root-caused
-as a genuine performance-margin issue rather than a discrete bug**
-(`TestBnf`, joining `TestFileLock`/`TestTransaction` in that category), and
-**3 root-caused, performance-margin, no fix expected/attempted**
-(`TestFileLock`, `TestTransaction`, plus `TestFuzzOptimizations` which is
-inconclusive/likely-not-CratonVM-specific). Only two genuine open residuals
-remain requiring further VM work: **`TestUpgrade`'s secondary
-`NoSuchMethodError`** (a new instance of the already-mostly-fixed
-cross-class-dispatch bug family) and **`TestDataUtils`'s deeper
-invokestatic-long-argument corruption** (same NaN-box long/int collision
-ambiguity as the fixed string-concat bug, but via method-call argument
-passing instead). See each item below, and the "Follow-up session
-(2026-07-22, second pass)" summary further down, for full detail.
+`TestLinkedTable`, `TestAlter`, `TestDataUtils` [now fully fixed — see the
+"Follow-up session (2026-07-22, third pass)" section], plus the
+`SecurityException` half of `TestUpgrade`), **1 root-caused as a genuine
+performance-margin issue rather than a discrete bug** (`TestBnf`, joining
+`TestFileLock`/`TestTransaction` in that category), and **3 root-caused,
+performance-margin, no fix expected/attempted** (`TestFileLock`,
+`TestTransaction`, plus `TestFuzzOptimizations` which is
+inconclusive/likely-not-CratonVM-specific). **One genuine open residual
+remains requiring further VM work: `TestUpgrade`'s secondary
+`NoSuchMethodError`** — now narrowed much further (see the third-pass
+section) but still not closed. A **separate, previously-undiscovered
+systemic bug was found and fixed** in the process (the JIT compiled-code
+cache was keyed by class NAME only, with no loader/`ClassId` component —
+see the third-pass section for the full writeup) — real and worth keeping,
+but confirmed **not sufficient by itself** to close `TestUpgrade` (the
+NoSuchMethodError reproduces identically with `--nojit`). See each item
+below, and the "Follow-up session (2026-07-22, second pass)" and "third
+pass" summaries further down, for full detail.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -295,7 +298,7 @@ engine and this session's time budget. Next step: instrument
 `Bnf`/`RuleList.autoComplete()`'s rule-walking loop directly (not
 `DbContextRule`, which is downstream and never reached).
 
-## `org.h2.test.store.TestDataUtils` (`testParse`) — `Expected: 1 actual: 1` — **PARTIALLY FIXED (2026-07-22 follow-up), deeper residual remains**
+## `org.h2.test.store.TestDataUtils` (`testParse`) — `Expected: 1 actual: 1` — **FULLY FIXED (2026-07-22, third pass — see that section for the closing fix)**
 Root-caused to a **`StringBuilder.append(long)` / string-concatenation
 corruption bug for specific long values**, not a `DataUtils.parseHexLong`
 bug (parseHexLong's actual return value, checked via `==`/`!=` on the raw
@@ -528,4 +531,210 @@ Picked up the 7 items still open after the first follow-up session (worktree
   `TestRecoverKillLoop`** — unchanged from the first follow-up session;
   re-read but not independently re-verified this session (no new
   information, no reason to suspect their characterization changed).
+
+## Follow-up session (2026-07-22, third pass): `TestDataUtils` fully closed, a separate systemic JIT-cache bug found and fixed, `TestUpgrade` narrowed further but still open
+
+Worktree `/data/wt-h2-residual-finalclose-20260722` on the Azure host, branch
+`fix/h2-residual-finalclose-20260722`, branched from `origin/dev` (`ad909ee8f`).
+
+### `TestDataUtils` — the deeper invokestatic-long-argument residual — **FIXED**
+
+Root cause was **not** in `execute_invokestatic_cached`'s argument popping (as
+the second-pass write-up suspected) — that path was already correct. It was in
+the **raw-byte-peek fast interpreter loop's stackless-return handling**
+(`vm/src/runtime/interpreter.rs`, the `0xac..=0xb0` opcode arm for
+`ireturn`/`lreturn`/`freturn`/`dreturn`/`areturn`). On a stackless return (the
+common case: returning into an interpreted caller frame further down
+`thread.frames`), this arm correctly determined `is_long` via
+`pop_compact_with_long_mark_unchecked()` (honoring the `KIND_LONG` stack tag)
+and built a properly-decoded `value` for diagnostics — but then pushed the
+*raw* `CompactValue` onto the caller's operand stack via `stack.push_compact(cv)`
+for every non-`areturn` return, **discarding the `is_long`/`is_double`
+distinction entirely**. `push_compact` (as opposed to `push_compact_long` /
+`push_compact_double`) always marks the destination slot `KIND_UNKNOWN` — the
+"bits alone can't tell" fallback. For an ordinary long/double this is harmless
+(the fallback bit-pattern heuristic in `CompactValue::to_value()` /
+`decode_by_descriptor` correctly recovers it), but for a long whose bits
+collide with the NaN-tag space **and** whose masked 47-bit payload happens to
+additionally fit in 32 bits (e.g. `-1125899906842623L` /
+`0xFFFC000000000001`, bit-identical to `CompactValue::int(1)`), the heuristic
+is provably undecidable — exactly why the `KIND_LONG` tag exists in the first
+place. Every later consumer of that return value (an `invokestatic` argument
+pop, another `lreturn`, etc.) would then silently truncate it to `1`.
+
+This is the same collision-long family as the already-fixed
+`execute_string_concat` bug (`BC SM2`), just at a different propagation point:
+a value returned from a callee, rather than an invoke-argument, losing its
+tag on the specific fast-dispatch path that handles the overwhelming majority
+of ordinary method returns.
+
+**Fix:** `vm/src/runtime/interpreter.rs`'s `0xac..=0xb0` return arm now
+dispatches on the opcode: `0xad` (`lreturn`) pushes via `push_compact_long`,
+`0xaf` (`dreturn`) via `push_compact_double`, and `0xac`/`0xae`
+(`ireturn`/`freturn`, no NaN-tag collision risk for 32-bit values) keep the
+original `push_compact`. `0xb0` (`areturn`) is unchanged (already
+kind-normalized via `coerce_value_for_return`).
+
+**Verification (Azure Linux host, real-JDK mode, both JIT-on and
+`--nojit`):** all 5 minimal repros in
+`docs/known-issues/repros/h2-testdatautils-invokestatic-long-corruption/`
+(`SbAppendLongRepro`, `ShiftOrLongRepro`, `LongArgCallRepro`,
+`LoopInlineRepro`, `LoopParseRepro`) now print `ALL OK` / correct values.
+`org.h2.test.store.TestDataUtils` itself now passes cleanly (exit 0; the
+class runs ~5-6 minutes wall-clock, needs a timeout above 200s).
+
+### A separate, previously-undiscovered systemic bug: the JIT compiled-code cache had no loader/`ClassId` component
+
+While investigating `TestUpgrade`'s residual `NoSuchMethodError`
+(`org/h2/mvstore/RootReference.hasChangesSince(J)Z`), traced the interpreter's
+own loader-aware dispatch machinery (`resolve_class_loader_aware`,
+`lookup_loader_initiated`, `execute_invoke_kind`'s `dispatch_override`,
+`execute_invokevirtual_cached`'s `actual_class_id != receiver_class_id`
+guard) and confirmed **all of it is sound** — every one of these paths
+correctly distinguishes `org.h2.mvstore.RootReference` loaded by
+`Upgrade.loadH2`'s anonymous `ClassLoader(null)` (the OLD H2 jar, downloaded
+for the upgrade test) from the identically-named class already on the
+application classpath (the CURRENT H2 build).
+
+The one place that was **not** loader-aware: `jit::JitCache` (`jit/src/lib.rs`).
+`JitKey` was `{class_name: Arc<str>, method_name, descriptor}` — no `ClassId`,
+no loader component. `JitCache::get`/`put` are consulted directly (bypassing
+the interpreter's own loader-aware resolution) from ~15 call sites across
+`execute_invokestatic_cached`, `try_jit_upgrade_with_gate`,
+`try_jit_compile_callee`/`_slow`, the OSR paths, and a few JIT-ABI dispatch
+helpers in `vm/src/jit/helpers.rs`. Once **either** same-named
+`RootReference` class got a given method JIT-compiled first (in practice, the
+`Application`-loaded one — H2's own MVStore background/commit activity
+elsewhere in the same process warms up first), every subsequent call to the
+identically-named-and-shaped method on the **other** class's instances would
+hit this cache by name alone and silently execute the wrong class's compiled
+machine code. `put()` additionally **evicted** the loser's entry on every
+write, so the two classes' compiled bodies would fight over the one cache
+slot rather than simply serving stale code.
+
+**Fix:** added `declaring_class_id: ClassId` to `JitKey`, folded it into
+`compute_jit_key_hash`, and threaded a `ClassId` argument through
+`JitCache::get`/`get_osr`/`put`/`put_osr`/`remove` and all ~20 production call
+sites across `jit/src/lib.rs`, `vm/src/runtime/interpreter.rs`,
+`vm/src/jit/helpers.rs`, and `vm/src/vm/vm_init.rs` (JIT-cache invalidation on
+class-hierarchy change). Every call site that already had a `ClassId` in
+scope (`cached.declaring_class_id`, a frame's `class_id`, a freshly-resolved
+receiver class) now passes it through precisely. A handful of call sites are
+themselves constrained to a bare `&str` by the raw JIT-ABI boundary
+(`JitInvokeInfo`, baked into compiled machine code at codegen time — extending
+that would mean touching the x64 codegen call-site emission itself, out of
+scope for this session) or by a `deoptimize`/similar public API with ~20 of
+its own callers; these resolve the class via a global name lookup at the
+point of use, which preserves their *existing* (already not loader-aware)
+behavior unchanged rather than newly introducing the collision — they do not
+regress anything, they just don't yet share in the fix's precision. The
+crate's own `#[cfg(test)]` `JitCache` unit tests were updated to pass a
+`ClassId` too (`cargo check --tests` verified clean).
+
+**This is a real, generally-applicable correctness fix** (any two identically
+named-and-shaped classes loaded by different loaders — Groovy dynamic
+classes, Hibernate bytecode-enhanced copies, forked test classloaders, OSGi
+plugins, etc. — sharing a hot method name were vulnerable to this), verified
+via `cargo build --release` + a broad regression spot-check (see below) with
+no observed regressions. **However, it was NOT sufficient by itself to fix
+`TestUpgrade`**: rebuilt and reran `TestUpgrade` after landing this fix, and
+the identical `NoSuchMethodError` still reproduces — including under
+`--nojit`, which rules out the JIT cache (and JIT compilation generally) as
+the (sole) mechanism for this specific bug. Keeping the fix regardless, since
+it is independently correct and confirmed harmless.
+
+### `TestUpgrade`'s secondary `NoSuchMethodError` — narrowed further, still OPEN
+
+Added targeted tracing (`CRATONVM_DBG_LOADER_TRACE`, gated, left in place —
+zero cost when unset) to `Instruction::New`'s class resolution,
+`lookup_loader_initiated`, `execute_invoke_kind`'s dispatch-override
+computation, `execute_invokevirtual_cached`'s cache-hit guard, and the
+`AtomicReference` native `get`/`set`/`compareAndSet` implementations (plus
+the shared `compare_and_swap_field`/`set_field_volatile` helpers in
+`vm/src/vm/vm_exec.rs`) to follow exactly which `RootReference` instance
+`MVMap`'s `root` field holds at each step.
+
+Confirmed, with high confidence:
+- Every `new RootReference(...)` / chained-construction call from within the
+  OLD (`UserDefined`-loader) `MVMap`/`RootReference`'s own bytecode correctly
+  resolves and constructs an OLD-loader instance — `resolve_class_loader_aware`
+  and the interpreter's `dispatch_override` mechanism both work exactly as
+  designed here.
+- `MVMap.getRoot()`, at the exact call site that eventually reaches the failing
+  `hasChangesSince(J)Z`, **also dispatches correctly** (its receiver's
+  `ClassId` matches the cached target — `execute_invokevirtual_cached`'s
+  monomorphic guard holds).
+- Yet the **value `getRoot()` returns** — read via `AtomicReference.get()`,
+  i.e. a plain per-object field-slot-0 read, confirmed NOT globally shared or
+  pooled — is, at the moment of failure, genuinely a live, currently-valid
+  instance of the *Application*-loaded `RootReference` class, not the
+  OLD-loader one the rest of the call chain expects. This is a real field
+  value, not a stale/reclaimed-memory artifact (ruled out via the same
+  tracing: the failing receiver's `class_id_of()` was checked against a live,
+  currently-referenced object at the exact failing call, not inferred from a
+  reused heap address).
+- Reproduces **identically under `--nojit`**, ruling out JIT compilation (and
+  the cache bug above) entirely as the mechanism.
+- An earlier hypothesis in this session — that `holder_obj` addresses seen
+  transitioning between `UserDefined`- and `Application`-loaded values in a
+  `compare_and_swap_field` trace indicated live cross-contamination — was
+  re-examined and **retracted**: `Upgrade.upgrade()` legitimately creates its
+  own `Application`-loaded MVStore (for the migrated, current-format
+  database) as part of its normal operation, and `testUpgrade()` runs twice
+  (`build=120`, then `build=200`) in the same process, so `Application`- and
+  `UserDefined`-loaded `RootReference` construction traces coexist in one log
+  for entirely legitimate, unrelated reasons; some earlier apparent "same
+  object, different class over time" observations were very likely ordinary
+  GC address reuse between the two temporally-separate, unrelated MVStore
+  lifecycles, not evidence of a shared/corrupted object.
+
+**Not yet root-caused**: how a live `Application`-loaded `RootReference`
+instance ends up referenced by the `UserDefined`-loader `MVMap`'s own
+`AtomicReference` field. Candidate next steps for whoever picks this up:
+- Trace `MVMap.compareAndSetRoot`'s two arguments (not just its dispatch
+  target) directly at the call site, to see whether the `updated` value
+  passed in is *already* wrong before the CAS, which would point further
+  upstream (into `RootReference.updateRootPage`/`tryLock`/
+  `tryUnlockAndUpdateVersion`'s own internal chained construction) rather than
+  at the CAS itself.
+- Check whether `testUpgrade`'s two sequential `Upgrade.loadH2()` calls within
+  one `testUpgrade(major,minor,build)` invocation (one direct, one inside
+  `Upgrade.upgrade()`) get assigned the **same** `ClassLoaderId::UserDefined(N)`
+  (loader-ID reuse after the first is GC'd) — and if so, whether any
+  loader-keyed cache in this codebase (`initiating_resolution_cache`, the
+  promoted-invoke `SharedResolutionState`, etc.) fails to invalidate/rescope
+  correctly across that reuse.
+- Consider whether `MVStore`'s own background auto-commit thread (a
+  `Runnable` started per-instance) could, for the `Application`-loaded
+  migrated-DB's `MVStore`, somehow retain or leak a reference reachable from
+  the `UserDefined`-loader `MVMap`'s object graph (e.g. via a shared
+  `ThreadLocal`, a static registry, or a JMX/shutdown-hook list) — this was
+  not investigated this session.
+- `CRATONVM_DBG_LOADER_TRACE=1` (left in the tree, zero cost when unset) plus
+  a `--nojit` run reproduces the full trace in well under 5 minutes and is
+  the fastest way to pick this back up.
+
+### Regression check
+
+Ran the 5 `TestDataUtils`-family repros, then a broad manual spot-check
+across previously-passing classes (`TestAlter`, `TestShell`,
+`TestLinkedTable`, `TestPreparedStatement`, `TestUpdatableResultSet`,
+`TestView`, `TestResultSet`, `TestAnalyzeTableTx`, plus `TestBnf`,
+`TestFileSystem`, `TestFuzzOptimizations` re-confirming their already-documented
+pre-existing characterizations) against the fixed binary — **no regressions
+observed**. One *new*, unrelated finding surfaced:
+`org.h2.test.jdbc.TestPreparedStatement.testDate8` fails with a 1-hour offset
+(`Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000`) —
+confirmed via a from-scratch build of unmodified `dev@ad909ee8f` that this is
+**pre-existing, not a regression from this session**; it's a distinct residual
+from the already-fixed Julian/Gregorian cutover bug in the same test class.
+Filed separately, not fixed here (out of scope for this pass) — see the
+spawned follow-up task / a new doc for it.
+
+`org.h2.test.store.TestRandomMapOps` was kicked off again with a full 2-hour
+timeout at the end of this session to try for the definitive exit-0
+confirmation the second-pass session couldn't get; check
+`/tmp/testrandommapops.log` on the Azure host (or a future session's own
+rerun) for the outcome if this doc wasn't updated with a result before the
+session ended.
 
