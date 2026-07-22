@@ -25036,11 +25036,18 @@ fn force_native_over_real_jdk_bytecode(
             "org/apache/maven/surefire/booter/ForkedBooter"
                 | "org/apache/tomcat/util/buf/CharChunk"
                 | "org/apache/tomcat/util/buf/AbstractChunk"
+                | "org/apache/catalina/connector/Response"
                 | "org/apache/tomcat/util/bcel/classfile/Constant"
         ))
         || class_name == "java/net/URI"
     {
         return false;
+    }
+    if class_name == "org/apache/catalina/connector/Response"
+        && method_name == "toAbsolute"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/lang/String;"
+    {
+        return true;
     }
     if class_name == "org/apache/tomcat/util/buf/CharChunk"
         && matches!(

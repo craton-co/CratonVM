@@ -1,5 +1,30 @@
 # Silent 1200s hangs with no diagnostic signature (3 classes)
 
+**Status (2026-07-22): FIXED.** The last live residual,
+`TestResponsePerformance`, was not an unavoidable interpreter-throughput
+limit: `CharChunk.toString()` was classified force-native but had no native
+registration, and the common `Response.toAbsolute("bar.html")` path still
+crossed a large stack of bytecode/native dispatches per call. A deliberately
+narrow native fast path now constructs only the proven-simple relative redirect
+shape (`scheme://host[:port]/parent/leaf`) and sends every other URL form back
+to Tomcat's original bytecode via `invoke_virtual_bytecode_only`, preserving
+escaping and normalization semantics. `CharChunk.toString()` now has its
+matching native registration too. Fresh Azure verification with the unique
+release binary passed all three historical classes at the canonical `-Xmx2g`:
+
+- `TestContextConfig`: `OK (8 tests)`.
+- `TestValidator`: `OK (11 tests)`.
+- `TestResponsePerformance`: `OK (1 test)` in 128s, with homebrew
+  8.6-11.1s versus URI 22.0-23.0s per counted round.
+
+The performance test also passed at `-Xmx4g` in both normal JIT mode (134s,
+homebrew 8.3-11.2s versus URI 20.9-31.5s) and `--nojit` mode (141s,
+homebrew 10.0s versus URI 22.5-24.6s). There were no timeout, SIGABRT,
+stale-pointer, or out-of-bounds-field diagnostics in these runs. The previous
+`-Xmx2g` allocator-abort and relative-performance residuals are therefore
+closed; this document is archived under `docs/internal`.
+
+
 **Status (2026-07-20 update):** the recompile-storm bug that blocked
 `TestResponsePerformance`'s relative-perf assertion is **FIXED and verified**
 (`Response.toAbsolute()` now compiles at most once per process and never
