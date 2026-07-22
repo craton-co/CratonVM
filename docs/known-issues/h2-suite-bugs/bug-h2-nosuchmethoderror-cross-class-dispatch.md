@@ -1,98 +1,101 @@
-# NoSuchMethodError citing an unrelated class — `PipedInputStream.flush()V` and `String.create(Z)V` (new instances of the general wrong-receiver-class dispatch bug)
+# NoSuchMethodError citing an unrelated class — `PipedInputStream.flush()V` (FIXED) and `String.create(Z)V` (still OPEN)
 
 ## Status
-**OPEN** — new repros of an already-tracked general bug family, 2026-07-21.
-`docs/known-issues/README.md` already tracks a "wrong-receiver-type/virtual-dispatch"
-class of bug (see e.g. `jit-osr-linux-regression-triad.md` and
-`http-client-simpleclienthttpresponsetests-mockito-dispatch-bugs.md`'s
-"intermittent `(class, method, descriptor)`-substituting `NoSuchMethodError`;
-several hypotheses refuted, root cause still open"). This doc adds two new,
-cleanly-isolated H2-suite triggers for that same symptom shape rather than
-opening an unrelated bug.
+**Cluster A FIXED** (dev@`fix/h2-nsme-crossclass-dispatch-20260722`,
+2026-07-22) — root-caused to a synthetic-vs-real-JDK field-layout drift, NOT
+a class-dispatch/method-resolution bug. **Cluster B still OPEN** — not
+root-caused this session.
 
-## Severity
-**HIGH** — `NoSuchMethodError` for a method that plainly doesn't exist on
-the named class (`PipedInputStream` has no `flush()`; `String` has no
-`create(boolean)`) is a diagnostic-integrity signal that method resolution
-picked the wrong target class somewhere upstream of the error report.
+**Correction to this doc's original framing:** the two clusters below do
+**not** share a root cause, and neither is the same defect as
+`bug-h2-treemap-tailmap-headmap-view-corruption.md`'s submap-view corruption
+(that doc originally speculated the TreeMap bug "may be a silent instance of
+this exact same underlying dispatch defect" — confirmed false: the TreeMap
+bug is a fast-mode/array-mode data-source bug entirely internal to the
+synthetic `TreeMap`, with no involvement of method dispatch, class
+resolution, or `NativeMethodRegistry` at all). Kept as one doc for the two
+NoSuchMethodError clusters since they were reported together, but they are
+two independent findings.
 
-## Affected test classes
+## Cluster A — `PipedInputStream.flush()V` — FIXED
 
-**Cluster A — `PipedInputStream.flush()V`** (5 classes, all real
-`java.io.PipedOutputStream`/`PipedInputStream` pairs, all PASS on HotSpot):
-`org.h2.test.db.TestLob`, `org.h2.test.jdbc.TestLobApi`,
-`org.h2.test.jdbc.TestSQLXML`, `org.h2.test.jdbc.TestUpdatableResultSet`,
-`org.h2.test.jdbc.TestResultSet`.
+### Root cause (confirmed)
+`java/io/PipedInputStream`/`java/io/PipedOutputStream` are registered in
+`native-io/src/lib.rs` as a "simplified as ByteArrayI/O pair" synthetic
+implementation, reusing the same 4-slot `BufferedInputStream`/
+`BufferedOutputStream`-shaped natives (`native_bis_read`, `native_bos_write`,
+`native_bos_flush`, ...) — i.e. slot 0 is hardcoded to mean "the delegate
+stream this buffers for". On a **real** JDK 25 `PipedOutputStream` (whose
+only field is `sink`, a reference to the connected `PipedInputStream`) and
+`PipedInputStream`, that slot-0 assumption is wrong: `native_bos_flush`/
+`native_bos_write` read slot 0 expecting an `OutputStream`-like delegate to
+forward to, but on the real layout slot 0 (`sink`) is the connected
+`PipedInputStream` — so `flush()`/`write()`/`close()` end up doing
+`invoke_virtual(sink, "flush", "()V", ...)` on a `PipedInputStream` instance,
+which declares no such method, producing the observed
+`NoSuchMethodError method="java/io/PipedInputStream.flush()V"` regardless of
+which real call site (`OutputStreamWriter.close()`, H2's own
+`JdbcLob$LobPipedOutputStream.close()`) triggered it — explaining why the
+error is byte-identical across unrelated callers (same broken synthetic
+native, not a shared dispatch defect).
 
-```
-WARN NoSuchMethodError method="java/io/PipedInputStream.flush()V" caller="java/io/OutputStreamWriter.close()V @pc=7"
-WARN NoSuchMethodError method="java/io/PipedInputStream.flush()V" caller="org/h2/jdbc/JdbcLob$LobPipedOutputStream.close()V @pc=4"
-```
-Two **unrelated** call sites (`OutputStreamWriter.close()`, real JDK
-bytecode; and H2's own `JdbcLob$LobPipedOutputStream.close()`, which calls
-`super.close()` — i.e. `PipedOutputStream.close()`) both get the identical
-bogus target `PipedInputStream.flush()V` — a method that doesn't exist on
-`PipedInputStream` in the real JDK at all (`flush()` belongs to
-`OutputStream`/`Writer`/`Flushable`, never `InputStream`). `TestLob` fails
-outright (`IOException: Pipe not connected`, from the corrupted stream state
-after this); the other four surface it as a downstream
-`JdbcSQLFeatureNotSupportedException: "Stream setter is not yet closed."`
+Same bug family as the already-fixed `StringReader`/`EnumSet`/`Pattern`/
+`Matcher`/`StringJoiner`/`Cleaner` synthetic-layout drops in
+`native-api/src/registry.rs`'s `drop_real_layout_synthetic` real-JDK-mode
+gate (see `docs/synthetic-vs-real-explained.md`) — real
+`PipedInputStream`/`PipedOutputStream` bytecode is self-contained (a
+synchronized circular buffer with `wait`/`notifyAll` and thread-identity
+checks; no missing native dependency), so the fix drops the synthetic
+surface in real-JDK mode and lets real bytecode run, exactly like those
+siblings.
 
-**Cluster B — `String.create(Z)V`** (3 classes, all PASS on HotSpot):
-`org.h2.test.server.TestWeb`, `org.h2.test.unit.TestServlet`,
-`org.h2.test.unit.TestJakartaServlet`.
-```
-WARN NoSuchMethodError method="java/lang/String.create(Z)V" caller="java/net/Socket.getImpl()Ljava/net/SocketImpl; @pc=67"
-```
-Byte-for-byte identical across all three (same caller, same pc, same bogus
-target). `java.lang.String` has no `create(boolean)` method in the real
-JDK. Each class's embedded HTTP client subsequently sees
-`java.io.EOFException: Unexpected EOF` / `HttpURLConnection response failed:
-connection closed before response head` — consistent with the socket setup
-being disrupted by whatever this `NoSuchMethodError` actually corrupted or
-skipped.
+### Fix
+`native-api/src/registry.rs`: added `java/io/PipedInputStream` and
+`java/io/PipedOutputStream` to the `drop_real_layout_synthetic` gate in
+`register()`, alongside the existing `StringReader`/`EnumSet`/`Pattern`/
+`Matcher` entries.
 
-## Analysis
-Neither cluster was root-caused down to the exact interpreter/dispatch code
-path in this session (time-boxed — see "Status" above for why this is
-treated as a rediscovery rather than a fresh investigation). What is
-established:
-- Both clusters produce **byte-identical** bogus `(class, method,
-  descriptor)` triples across multiple, code-wise-unrelated call sites —
-  this is a strong signal of a *shared*, deterministic mis-resolution
-  (e.g. a stale/overly-coarse method-resolution cache, or a class-agnostic
-  fallback path being taken when it shouldn't be — see
-  `native-api/src/registry.rs`'s `find_by_method_descriptor`, documented as
-  a last-resort, class-blind `(method_name, descriptor)` lookup meant only
-  for the "receiver's `class_id_of` reports as 0/`Object`" recovery case),
-  not two independent one-off gaps.
-- Neither is JIT-specific in the sense of a codegen bug local to one
-  method — the caller classes involved (`OutputStreamWriter`,
-  `JdbcLob$LobPipedOutputStream`, `Socket`) are all real, unrelated JDK/H2
-  classes, and the SAME bogus target recurs regardless of which one calls
-  in.
-- See also `bug-h2-treemap-tailmap-headmap-view-corruption.md`, whose
-  `TreeMap.tailMap()` corruption may be a **silent** (no exception) instance
-  of this exact same underlying dispatch defect, just not surfacing as an
-  explicit `NoSuchMethodError` because the wrongly-resolved handler in that
-  case still returns *some* object rather than failing outright. Kept
-  separate pending confirmation.
+### Verification
+Ran the 5 originally-affected classes against a real-JDK-mode build with the
+fix:
+- `org.h2.test.jdbc.TestLobApi` — PASS (was failing on this NoSuchMethodError)
+- `org.h2.test.jdbc.TestSQLXML` — PASS
+- `org.h2.test.jdbc.TestUpdatableResultSet` — PASS
+- `org.h2.test.db.TestLob` — no longer hits `PipedInputStream.flush()V` (grepped
+  clean), but times out on an unrelated, pre-existing "STW cross-thread JIT
+  takeover ... waiting for cooperative mutators" stall — a different
+  subsystem, not chased further here.
+- `org.h2.test.jdbc.TestResultSet` — no longer hits `PipedInputStream.flush()V`
+  (grepped clean), but fails on an unrelated, pre-existing
+  `testDatetimeWithCalendar` DST/`Calendar`-offset assertion
+  (`Expected: ...10:11:12... actual: ...09:11:12...`) — a different bug,
+  not chased further here.
 
-## Fix direction
-Needs a live interpreter trace of one of these call sites (e.g.
-`JdbcLob$LobPipedOutputStream.close()`'s `invokespecial` at pc=4, or
-`Socket.getImpl()`'s call at pc=67) to see which native-lookup path is
-actually taken and why it resolves to the wrong class — genuinely deferred
-to a dedicated dispatch-focused investigation, consistent with the existing
-open items in `docs/known-issues/README.md` for this bug family.
+## Cluster B — `String.create(Z)V` — still OPEN
+
+Not root-caused this session. Ruled out: no native is registered anywhere in
+the tree under class `java/lang/String` method `create` descriptor `(Z)V` —
+so this is not a simple wrong registration shadowing `String`, and (per the
+TreeMap doc's correction above) `find_by_method_descriptor` is dead code with
+zero call sites, so it cannot be the mechanism either. The bogus
+`(class, method, descriptor)` triple is byte-identical across all three
+call sites (`TestWeb`, `TestServlet`, `TestJakartaServlet`), all originating
+from `Socket.getImpl()`'s internal `SocketImpl.create(boolean)` call — real
+`SocketImpl` subclasses (`PlainSocketImpl`/`NioSocketImpl`) do declare a
+package-private `create(boolean)`, so this looks like a genuine
+method-resolution/vtable bug picking the wrong target class during that
+`invokevirtual`, rather than a registry issue — needs a live interpreter
+trace of `Socket.getImpl()`'s dispatch to confirm, same as this doc
+previously recommended. Still deferred to a dedicated dispatch-focused
+investigation.
 
 ## Repro
 ```bash
 cd apps/h2database/h2
 <cratonvm-bin> --java-home /home/victor/jdk25 \
   -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
-  org.h2.test.jdbc.TestResultSet     # Cluster A
+  org.h2.test.jdbc.TestLobApi       # Cluster A (now passes)
 <cratonvm-bin> --java-home /home/victor/jdk25 \
   -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
-  org.h2.test.unit.TestServlet       # Cluster B
+  org.h2.test.unit.TestServlet      # Cluster B (still open)
 ```
