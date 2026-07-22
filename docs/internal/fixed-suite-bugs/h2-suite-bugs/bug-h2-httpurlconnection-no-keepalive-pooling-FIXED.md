@@ -166,6 +166,37 @@ template interpolates — hence the empty body. Filed as its own known issue:
   and `org.apache.catalina.filters.TestRemoteIpFilter` (27/27 tests) against
   the shared Tomcat fixture at `/data/data/apps/tomcat` — both clean.
 
+## Note: a third, independent concurrent implementation attempt was found merged into dev during this fix's own merge
+While merging this fix into `dev`, discovered that a *third*, independent
+attempt at this same feature had *also* been merged into `dev` in the
+interim (commit `9d1cf3fed`, bundled into an unrelated "fix: wildfly CCE"
+commit) — a `perform_pooled`/`pool_take_live`/`conn_pool` implementation
+using a 30s idle timeout + 2s reuse-probe-timeout design. **That merged
+implementation was silently broken in two ways**, confirmed by checking out
+`origin/dev` HEAD in isolation and running `cargo check`:
+1. **`dev` HEAD did not compile at all**: a duplicate `fn perform_with_retry`
+   definition (two copies of the same function, `E0428`) — i.e. `dev` was
+   red for anyone who pulled it before this merge landed.
+2. **Even past that, its wiring in `huc_real_perform` was dead/duplicated**:
+   the pooled-or-plain result was computed into `resp`, then immediately
+   *shadowed* by a second, unconditional `perform_with_retry(...)` call
+   whose result was what actually got used — meaning every plain-HTTP
+   request would have been sent to the server **twice** (a real correctness
+   bug for non-idempotent requests, and the pool's own result was always
+   discarded, making the feature dead code even if the compile error were
+   fixed).
+
+Resolved by removing that entire implementation (the `PoolKey`,
+`conn_pool`/`pool_take_live`/`pool_put`/`is_poolable`/`connect_plain`/
+`configure_stream`/`attempt_plain`/`perform_pooled` block, and the duplicate
+`perform_with_retry`) and the dead double-call site in `huc_real_perform`,
+replacing it with this fix's implementation (integrated inside `perform()`
+itself, so it's shared transparently by both `huc_real_perform` and
+`ensure_connected` rather than needing its own call site). Verified the
+merged result with `cargo check --workspace` (clean) and a full
+`cargo test -p cratonvm-native-builtins http_url_connection` run (39/39
+pass) before pushing.
+
 ## Related
 - `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testweb-logout-connectexception-mismatch-FIXED.md` — the fix that originally exposed this.
 - `docs/known-issues/h2-suite-bugs/bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` — the separate, pre-existing bug this fix newly exposed reachability to.

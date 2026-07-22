@@ -1268,3 +1268,75 @@ above. Removed from this table.
 - Per-class FAILCAUSE and crash-log detail available in
   `/data/tmp/nonpassed263-s{0..3}/{failcauses,crashes}.log` on the Azure
   host at capture time.
+
+## 2026-07-22 AOT follow-up  loader identity and synthetic StringBuilder fixes
+
+Worktree: `/data/wt-aot-cluster-complete-20260721-019f873e` (branch
+`codex/aot-cluster-complete-20260721-019f873e`), built against the real
+JDK 25 Spring fixture. This follow-up intentionally remains **OPEN**: it
+eliminated the previously dominant failures below, then exposed a later,
+separate generated-AOT execution residual.
+
+### Fixed in this follow-up
+
+1. **Reference-array class identity now preserves the component's defining
+   loader.** `Object.getClass()` on a reference array returns a synthetic
+   descriptor mirror with the exact component loader, and
+   `Array.newInstance(Class,...)` retains the supplied component
+   `ClassId` instead of re-resolving it by binary name. This removes the
+   stale app-loader array type from forked AOT loaders.
+
+2. **Forked-loader symbolic static and interface resolution now stays in the
+   initiating-loader namespace.** Static-owner caches, static invokes, and
+   the pre-resolution part of `invokeinterface` use the same narrow
+   `CompileWithForkedClassLoader` rule as ordinary symbolic resolution.
+   This removed the old
+   `MergedAnnotations$Search.withEnclosingClasses` /
+   `SearchStrategy.TYPE_HIERARCHY` identity failure.
+
+3. **Synthetic StringBuilder layout is now consistently routed to registered
+   native methods for the direct JDK operations reached by JavaPoet.**
+   CratonVM builders are `char[]/count`, whereas JDK 25 direct
+   `StringBuilder` bodies use compact `byte[]/coder/count`. The routing
+   covers constructor, append, charAt, delete, getChars, insert, length, and
+   toString. The ArrayCopy bridge also recognizes the String.getBytes path
+   through `AbstractStringBuilder.insert`.
+
+   The final targeted addition was `StringBuilder.delete(int,int)`: Spring
+   JavaPoet `LineWrapper` calls it directly, and omitting it left generated
+   source corrupt (for example
+   `registerAliases(DefaultListableBeanFactory beanFactory) {DefaultListableBeanFactory beanFactory) {`).
+
+### Validation
+
+* Unique binary: `/data/cratonvm-aotcomplete-019f873e-r10.bin`.
+* `web.service.registry.HttpServiceProxyRegistrationAotProcessorTests`:
+  **5/5 OK** (was 3/5).
+* `web.service.registry.ImportHttpServiceRegistrarTests`: **5/5 OK**
+  (was 3/5).
+* The previously failing `AotIntegrationTests` generation passed the
+  malformed-source/parser point and compiled its generated test suite.
+* As a control, the ordinary
+  `TestBeanByNameLookupTestClassScopedExtensionContextIntegrationTests`
+  run is **13/13 OK** on r10.
+
+### Newly exposed residual  not fixed
+
+After generated compilation,
+`AotIntegrationTests.endToEndTestsForBeanOverrides` runs its 175-test
+AOT-mode suite with **73 successful / 102 failed**. The ordinary direct run
+of the same bean-override test class passes, so this is specific to
+generated-AOT/forked-loader execution. The first shared symptom is Log4j
+plugin configuration failing during reflective field/factory wiring with
+`IllegalArgumentException: argument type mismatch` in
+`PluginBuilder.injectFields`, followed by missing Logger/Root plugin
+objects. This is consistent with another loader-identity/reflective
+assignability boundary, but has not yet been localized enough for a safe
+fix.
+
+A 360-second full `AotIntegrationTests` r10 run advanced beyond this first
+generated suite into later AOT processing, then hit the external timeout;
+therefore neither it nor the broader AOT/TIMEOUT list should be marked
+complete. Continue from the single-method probe
+`/data/aotcomplete-probes-019f873e/KRunMethod` and log
+`/data/aotcomplete-r10-singlemethod.log`.

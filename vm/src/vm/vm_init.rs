@@ -2741,6 +2741,17 @@ impl SharedVm {
             format!("{}/lib", java_home_val),
         );
 
+        // Hibernate ORM 8 defaults to its graph-based ActionQueue. Its
+        // cycle-breaking planner can spend several minutes in dispatch-heavy
+        // DFS work on CratonVM's real-JDK runtime. The mature legacy queue
+        // completes the same workloads predictably. An explicit user property
+        // is applied immediately below and therefore still selects `graph`.
+        if !config.use_synthetic_jdk {
+            sys_props
+                .entry("hibernate.flush.queue.type".to_string())
+                .or_insert_with(|| "legacy".to_string());
+        }
+
         // Apply user overrides from config — always wins over platform defaults.
         for (k, v) in &config.system_properties {
             sys_props.insert(k.clone(), v.clone());

@@ -15380,6 +15380,14 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
+                        // Compact strings are stored in byte[] and OpenJDK's
+                        // UTF-16 copy loop is prohibitively expensive before
+                        // this cold call-site can warm. Keep this concrete
+                        // bytecode override in sync with interpreter.rs's
+                        // force_native_over_real_jdk_bytecode gate.
+                        || (class_name == "java/lang/StringUTF16"
+                            && method_name == "getChars"
+                            && descriptor == "([BII[CI)V")
                         // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout
                         // `Matcher.find()`/`find(int)`/`start`/`end`/`group`
                         // fast path — companion entry to the one in
@@ -16634,35 +16642,13 @@ fn invoke_on_class_shared_inner(
                                     | ("getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                                     | ("getSystemResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;")
                             ))
-                        // `StringBuilder/StringBuffer/AbstractStringBuilder
-                        // .insert(int, char[], int, int)` (and its no-off/len
-                        // sibling `insert(int, char[])`) has real, concrete
-                        // (non-abstract) JDK bytecode, so without this entry
-                        // `check_override` stays false and that bytecode runs
-                        // directly against fields it expects at the real
-                        // `AbstractStringBuilder` layout (`byte[] value`,
-                        // `byte coder`, `int count`) — but CratonVM backs
-                        // these objects with a synthetic 2-field layout
-                        // (`char[] buffer`, `int count`; see
-                        // `native_sb_get_coder`'s doc comment). Real bytecode's
-                        // `checkOffset(dstOffset, count)` reads back a bogus
-                        // `count` (the synthetic layout has no field at that
-                        // slot) and throws `ArrayIndexOutOfBoundsException`
-                        // for any nonzero `dstOffset` — hit by Log4j2's
-                        // `FormattingInfo.format`/`ColorConverter` padding a
-                        // partially-built line (`sbuf.insert(fieldStart,
-                        // spaces, 0, n)`), which silently drops the log
-                        // record ("An exception occurred processing Appender
-                        // STDOUT") instead of reaching `System.out` —
-                        // see docs/known-issues/springboot/capturedoutput-empty-console-cluster.md.
-                        || (matches!(
+                        // Synthetic StringBuilder/StringBuffer objects are char[]-backed,
+                        // whereas every real JDK compact-string operation reads byte[]/coder/count.
+                        // Route all registered layout-sensitive methods through their natives.
+                        || crate::runtime::interpreter::is_string_builder_layout_native_override(
                             class_name,
-                            "java/lang/StringBuilder"
-                                | "java/lang/StringBuffer"
-                                | "java/lang/AbstractStringBuilder"
-                        ) && method_name == "insert"
-                            && (descriptor.starts_with("(I[CII)")
-                                || descriptor.starts_with("(I[C)")))
+                            method_name,
+                        )
                         // Keep in sync with interpreter.rs's
                         // `force_native_over_real_jdk_bytecode` entry for the
                         // same triple — see that entry's comment for the full
@@ -17546,6 +17532,28 @@ fn invoke_on_class_shared_inner(
                         .unwrap_or_default(),
                     "NoSuchMethodError"
                 );
+                // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
+                // to bare `java/lang/Object` is the stale-ObjectRef family's
+                // cid=0 signature surfacing at INVOKE (the checkcast tracer's
+                // sibling — e.g. `Object.read([CII)I` in Elytron's
+                // MechanismDatabase when a Reader ref went stale). Dump the
+                // frame stack so the producing frame is named, exactly like
+                // CCE-BT-STK.
+                if class_name == "java/lang/Object"
+                    && crate::runtime::interpreter::dbg_cce_bt_enabled()
+                {
+                    eprintln!(
+                        "CRATONVM_DBG_CCE_BT: site=nsme_dispatch method={class_name}.{method_name}{descriptor}"
+                    );
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                        eprintln!(
+                            "  CCE-BT-STK[{i}] {}.{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.pc
+                        );
+                    }
+                }
                 // Optional operator diagnostic: at the terminal not-found point
                 // (no native and no loadable bytecode), emit one clear line so
                 // operators can see exactly what is missing. Gated on

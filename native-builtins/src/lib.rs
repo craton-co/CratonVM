@@ -44250,6 +44250,25 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                 ctx.array_length(this)
             );
         }
+        // Array ClassIds are deliberately interned globally, but an array
+        // object's header preserves its *actual* reference-component ClassId.
+        // Do not collapse that identity when exposing `getClass()` for an array
+        // whose component was defined by an isolated loader: the subsequent
+        // `getComponentType()` / `Array.newInstance()` path must retain the
+        // same component, or Java's perfectly valid arraycopy covariance check
+        // observes two same-named classes as incompatible.
+        if element_type == cratonvm_types::ArrayElementType::Reference
+            && ctx.loader_id_of_class(class_id) >= 3
+        {
+            if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+                let loader_pin = ctx.pin_native_root(loader);
+                let mirror = crate::lang_class::synthetic_class_mirror(ctx, &array_class_name);
+                let loader = ctx.read_native_pin(loader_pin, loader);
+                ctx.unpin_native_roots(loader_pin);
+                ctx.set_field_by_name(mirror, "classLoader", Value::Object(Some(loader)));
+                return Ok(Some(Value::Object(Some(mirror))));
+            }
+        }
         if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
             let mirror = ctx.get_class_mirror(arr_cid);
             return Ok(Some(Value::Object(Some(mirror))));
@@ -79772,35 +79791,33 @@ fn native_array_set_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
-fn array_new_instance_component_name(
+fn array_new_instance_component(
     ctx: &mut dyn NativeContext,
     mirror_arg: Option<&Value>,
-) -> String {
+) -> (String, Option<cratonvm_types::ClassId>) {
     match mirror_arg {
         Some(Value::Object(Some(mirror))) => {
-            // Use the canonical mirror-name reader. It consults the VM
-            // reverse-map (`class_id_from_mirror` -> `class_name_of_id`), which
-            // is the ONLY thing that resolves the name of a *synthesized
-            // array-class mirror* such as the `[Ljava/lang/String;` returned by
-            // `Class.getComponentType()` on a `String[][]`. The previous ad-hoc
-            // `read_string`/slot-1 read returned nothing for those mirrors and
-            // fell back to `java/lang/Object`, so `Arrays.copyOf(.., String[][]
-            // .class)` (and H2's `SortOrder.sort` `rows.toArray(new Value[0][])`)
-            // allocated a bare `Object[]` and CCE'd on the caller's
-            // `(Value[][])` / `(String[][])` checkcast.
-            crate::lang_class::mirror_class_name(&*ctx, *mirror)
+            // Preserve the exact ClassId when the mirror represents a class
+            // from an isolated defining loader. The name is still needed for
+            // primitive handling and for the legacy fallback, but name-only
+            // resolution is invalid for same-named classes from distinct
+            // loaders (the AOT forked-loader case).
+            let component_id = crate::lang_class::mirror_class_id(&*ctx, *mirror);
+            let component_name = crate::lang_class::mirror_class_name(&*ctx, *mirror)
                 .filter(|s| !s.is_empty())
                 .or_else(|| ctx.read_string(*mirror))
                 .map(|s| s.replace('.', "/"))
-                .unwrap_or_else(|| "java/lang/Object".to_string())
+                .unwrap_or_else(|| "java/lang/Object".to_string());
+            (component_name, component_id)
         }
-        _ => "java/lang/Object".to_string(),
+        _ => ("java/lang/Object".to_string(), None),
     }
 }
 
 fn array_new_instance_for_component(
     ctx: &mut dyn NativeContext,
     comp_name: &str,
+    component_id: Option<cratonvm_types::ClassId>,
     length: usize,
 ) -> cratonvm_types::ObjectRef {
     use cratonvm_types::ArrayElementType;
@@ -79814,9 +79831,10 @@ fn array_new_instance_for_component(
         "char" | "C" => ctx.new_array(ArrayElementType::Char, length),
         "short" | "S" => ctx.new_array(ArrayElementType::Short, length),
         _ => {
-            let comp_id = ctx
-                .ensure_class_initialized(comp_name)
-                .unwrap_or(cratonvm_types::ClassId::new(0));
+            let comp_id = component_id.unwrap_or_else(|| {
+                ctx.ensure_class_initialized(comp_name)
+                    .unwrap_or(cratonvm_types::ClassId::new(0))
+            });
             if dbg_toarray_enabled() {
                 eprintln!(
                     "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
@@ -79833,8 +79851,8 @@ fn native_array_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(v)) => (*v).max(0) as usize,
         _ => 0,
     };
-    let comp_name = array_new_instance_component_name(ctx, args.first());
-    let arr = array_new_instance_for_component(ctx, &comp_name, len);
+    let (comp_name, component_id) = array_new_instance_component(ctx, args.first());
+    let arr = array_new_instance_for_component(ctx, &comp_name, component_id, len);
     Ok(Some(Value::Object(Some(arr))))
 }
 
