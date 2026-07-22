@@ -1340,3 +1340,218 @@ therefore neither it nor the broader AOT/TIMEOUT list should be marked
 complete. Continue from the single-method probe
 `/data/aotcomplete-probes-019f873e/KRunMethod` and log
 `/data/aotcomplete-r10-singlemethod.log`.
+
+
+## 2026-07-22 AOT follow-up 2 -- bean-override double-context-refresh root-caused, one contributing gap fixed
+
+Worktree `/data/wt-aot-cluster-final-20260722` (branch
+`fix/aot-cluster-final-20260722`). Follows directly from the "2026-07-22 AOT
+follow-up" session above, which got `AotIntegrationTests` past generated
+compilation but exposed `endToEndTestsForBeanOverrides` running its 175-test
+generated-AOT suite at only 73/175. **This session confirms the Log4j
+`PluginBuilder.injectFields` error documented there is a red herring** --
+transient/host-load-dependent, reproduces on 1 of 10+ repeat runs of the
+identical binary/command, and does NOT correlate with the actual 102 test
+failures (a full run with the Log4j error absent still showed 102 failures).
+Do not chase it further; if it recurs, just retry.
+
+**Root cause of the real 102 failures (`@TestBean`/`@MockitoBean`/
+`@MockitoSpyBean` overrides silently not applying) traced to a genuine
+double-`ApplicationContext`-refresh bug**, isolated with a fast (~30-40s,
+not 300s+) standalone repro
+(`org.springframework.test.context.aot.AotIntegrationTests.runEndToEndTests`'s
+API called directly against ONE minimal `@TestBean`-using fixture class, own
+copy so diagnostics can be added without touching the shared checkout --
+saved at `/data/tmp/aotcluster-final-repro/BeanOverrideProbe2.java` on the
+Azure host). Confirmed via a `BeanFactoryAware`+`SmartInitializingSingleton`
+probe bean that the SAME logical test gets its `DefaultListableBeanFactory`
+refreshed TWICE -- once correctly (through
+`BeanOverrideContextCustomizer.customizeContext()`, which calls the override
+factory and `registerSingleton`), and a SECOND time on a completely
+different `BeanFactory` instance that skips customization entirely (so
+`preInstantiateSingletons()` creates the plain `@Bean`-defined production
+value instead) -- and the SECOND, wrong context is what ends up bound to the
+actual `@Test` method. Ruled out a `ConcurrentHashMap` correctness bug via
+direct native tracing (`native_chm_get`/`native_chm_put_if_absent` in
+`native-collections/src/lib.rs`) -- put/get round-trips perfectly for the
+FIRST (correct) BeanFactory's `singletonObjects` map every time it was
+queried; the bug is entirely about which `BeanFactory` instance ends up
+wired to the test.
+
+Traced (with the EXISTING `CRATONVM_DBG_DUPCLASS=1`/`CRATONVM_DBG_DUPCLASS_BT=1`
+and `CRATONVM_FORNAME_TRACE=1` diagnostics, no new code needed to find this
+part) to `AotTestContextInitializersFactory`/`AotTestContextInitializers`/
+`AotMergedContextConfiguration`/`DefaultCacheAwareContextLoaderDelegate`
+(all in `org.springframework.test.context.{aot,cache}`) repeatedly
+re-resolving to FRESH Application-loader `ClassId`s instead of reusing the
+`@CompileWithForkedClassLoader` fork's own already-loaded copy
+(`classloading::class_manager::resolve_fast_path_class_id`'s documented
+"always prefer Application over a lone UserDefined candidate" behavior).
+Since `AotTestContextInitializersFactory`'s static double-checked-locking
+cache (`private static volatile Map<...> contextInitializerClasses`) lives
+on the CLASS object, a fresh `ClassId` means fresh (null) static state, so
+`Class.forName`-based lookups re-run and can yield a different `Class`
+object for the generated `TestContextNNN_ApplicationContextInitializer`.
+`AotMergedContextConfiguration.hashCode()`/`.equals()` are defined purely in
+terms of THAT `Class` object's identity (by design, matching real JDK
+`Class` semantics) -- so a second, non-identical `Class` object busts
+`DefaultContextCache.contextMap`'s cache-hit check on a later
+`DefaultCacheAwareContextLoaderDelegate.loadContext()` call, causing a
+second, uncustomized context load from scratch.
+
+**One contributing gap found and fixed**: `spring_class_utils_for_name_impl`
+(`native-builtins/src/phases_late.rs`, the native shortcut backing Spring's
+`org.springframework.util.ClassUtils.forName`) only consulted an explicit
+loader argument or the thread context classloader before falling through to
+the global, loader-blind `ensure_class_initialized` path -- when NEITHER was
+available (as in `GeneratedMapUtils.loadMap`'s `ClassUtils.forName(className,
+null)` call with no TCCL set at that point), it never considered the
+CALLING code's own defining loader, unlike the real `Class.forName(String)`
+1-arg overload (`class_for_name_one_arg_caller_loader`, already correct).
+Fixed by reusing that same caller-sensitive helper (promoted to
+`pub(crate)`) as an additional fallback. Verified safe (`cargo test -p
+cratonvm-vm --lib --release`: 2229 passed / 11 failed, byte-identical to the
+pre-existing release-mode `lock_order`/`skip_list`/`tomcat_scanner`/
+`elasticsearch_vector` baseline both before and after, confirmed via
+`git stash` A/B; spot-checked `beans.factory.aot.
+BeanDefinitionMethodGeneratorTests` 29/34 unchanged both sides -- NOTE this
+count is lower than the 34/34 this class was verified at on 2026-07-21;
+under this session's much heavier host load, ~20+ concurrent sessions,
+`uptime` load average 20-24, this is far more likely re-triggered
+cross-test-timing host contention (already documented for this exact class
+in `[[spring-aot-cluster-loader-identity-fixes-20260715]]`'s "Round 7b")
+than a regression -- re-verify on a quieter host before concluding either
+way). Landed on `fix/aot-cluster-final-20260722` at `b0100920a`.
+
+**This fix alone did NOT close the bean-override bug.** Re-running the
+repro against the patched binary, `CRATONVM_DBG_DUPCLASS_BT=1` shows the
+dominant remaining rejection now comes through a DIFFERENT, deeper path:
+```
+resolve_fast_path_class_id (classloading/src/class_manager.rs:2783)
+  <- load_class_concurrent (vm/src/vm/vm_init.rs:3824)
+  <- resolve_class_loader_aware (vm/src/runtime/interpreter.rs:17795)
+  <- execute_instruction [New bytecode] (vm/src/runtime/interpreter.rs:15022)
+```
+i.e. a plain `new AotTestContextInitializers()` instruction (almost
+certainly inside `DefaultCacheAwareContextLoaderDelegate`'s own
+constructor) resolves its target class via `resolve_class_loader_aware` --
+which the existing `is_compile_with_forked_class_loader` carve-out in
+`should_use_loader_initiated_resolution` is SUPPOSED to make loader-aware
+for exactly this scenario -- but still falls through to the global answer.
+Since `should_use_loader_initiated_resolution` gates on
+`defining_loader_for(referencing_class_id)` matching the fork's own loader,
+and `DefaultCacheAwareContextLoaderDelegate` ITSELF is also among the
+classes being repeatedly rejected/re-resolved per the same `DBG_DUPCLASS`
+evidence, the most likely explanation is that the REFERENCING class (not
+just its downstream reference) is itself sometimes resolved to the wrong
+(Application-loader) copy at the moment this instruction executes -- a
+strictly harder, more foundational problem than the single missing
+fallback fixed above. **Recommended next step**: use
+`CRATONVM_DBG_DUPCLASS_BT=1` against the fast repro
+(`/data/tmp/aotcluster-final-repro/BeanOverrideProbe2.java` on the Azure
+host, ~30-40s iteration, see the companion memory doc
+`aot-beanoverride-double-context-refresh-rootcaused-20260722` for the full
+probe-construction gotchas) to find WHERE
+`DefaultCacheAwareContextLoaderDelegate`/`TestContextManager`'s own class
+identity first goes wrong, then apply the same narrow, exact-`ClassId`-match
+pattern used elsewhere in this file's history to that specific resolution
+site.
+
+**Still fully OPEN**: `AotIntegrationTests#endToEndTestsForBeanOverrides`
+(73/175, dominated by this bug -- unchanged by this session's fix),
+`ApplicationContextAotGeneratorTests`'s remaining 8 residuals (the `@Value`
+field-injection gap, `"Hi null"` instead of `"Hi AOT World"`, is plausibly
+the SAME double-refresh mechanism -- not yet cross-checked),
+`test.context.aot.TestContextAotGeneratorIntegrationTests` (needs
+re-baseline after this AND the prior session's fixes -- not done),
+`beans.factory.aot.BeanRegistrationsAotContributionTests` (the separately-
+tracked ~227x-vs-HotSpot interpreter throughput defect -- untouched this
+session, needs dedicated profiling work, not a correctness bug).
+
+
+## 2026-07-22 AOT follow-up 3 -- second contributing fix landed, real mechanism for the residual now identified
+
+Same worktree/branch as follow-up 2. Landed a second, real, verified-safe
+fix, then traced the remaining bug to its actual mechanism.
+
+**Second fix**: `resolve_class_loader_aware`'s `user_loader` computation
+(`vm/src/runtime/interpreter.rs`) re-queried `class_manager::get_loader_id`
+for `referencing_class_id` even after `should_use_loader_initiated_resolution`
+had already confirmed (via the separate `defining_loader_for` side table)
+that the referencing class WAS defined by the fork loader -- when the two
+sources disagreed, the gate's positive answer was silently discarded and
+resolution fell through to the loader-blind global fast path. Fixed by
+falling back to `defining_loader_for` (converted to a `ClassLoaderId` via
+`loader_namespace_id`, promoted `pub`) on a disagreement instead of treating
+it as "not a user loader". Landed at `f5831451a`, verified safe (`cargo test
+-p cratonvm-vm --lib --release`: 2229/11, byte-identical baseline).
+
+**Confirmed via `CRATONVM_DBG_LOADER_TRACE=1`** (widened its existing name
+filter to include `AotTestContextInitializers`/`AotMergedContextConfiguration`/
+`DefaultCacheAwareContextLoaderDelegate` -- zero new code needed beyond the
+filter list, already-existing diagnostic) that BOTH fixes together now make
+`AotTestContextInitializers`, `AotTestContextInitializersCodeGenerator`, and
+`AotMergedContextConfiguration` resolve consistently and correctly through
+`drive_defining_loader_load` (the fork's own `loadClass`) every time they
+were referenced from the fork-loaded `DefaultCacheAwareContextLoaderDelegate`
+(`ClassId(2486)`, `referencing_loader=Some(UserDefined(3))`) -- this specific
+identity-instability layer is CLOSED.
+
+**The double-context-refresh bug still reproduces** (confirmed against the
+post-both-fixes binary). The loader trace shows why: partway through the
+SAME test's lifecycle, a **second, genuinely different**
+`DefaultCacheAwareContextLoaderDelegate` **object** comes into play --
+`ClassId(6948)`, with `referencing_loader=Some(Application)` (not a
+disagreement this time; `class_manager` and the side table AGREE this copy
+is Application-loaded) -- and it resolves ITS OWN self-reference and
+everything downstream (presumably `AotTestContextInitializers`/
+`AotMergedContextConfiguration` too) via the ordinary global path, correctly
+per ITS OWN loader identity, landing on the Application-loader's answer.
+Since this is a **different delegate instance** (not just a different
+`ClassId` for symbolically resolving the SAME logical singleton), it has its
+own, independent `DefaultContextCache`, which naturally has never seen the
+first delegate's customized context -- so it loads a fresh, uncustomized one
+from scratch. Correlated by timing against the `BeanOverrideProbe2` probe's
+own timestamped prints: the first (fork-scoped, `ClassId 2486`) delegate is
+used for the correctly-customized context (matches
+`BeanOverrideTestExecutionListener.prepareTestInstance` -> `injectFields` ->
+`testContext.getApplicationContext()`, the FIRST of the two `loadContext()`
+call sites `DefaultCacheAwareContextLoaderDelegate.loadContext()`'s own
+Javadoc documents); the second (Application-scoped, `ClassId 6948`) delegate
+appears shortly before the wrongful `bean1()` call, consistent with the
+SECOND call site (the `@Test` method's own `ApplicationContext ctx`
+parameter resolution).
+
+**This reframes the remaining problem**: it is very likely NOT a
+symbolic-class-resolution bug at all (the mechanism this doc's several AOT
+sessions have been fixing all day) but a **`TestContextManager`/
+`DefaultCacheAwareContextLoaderDelegate` object-instantiation duplication**
+-- i.e. two DIFFERENT calls to `new DefaultCacheAwareContextLoaderDelegate()`
+(or whatever constructs/caches the ONE that should be shared for a given
+test) happening under two different loader contexts and NOT being
+recognized as "the same test's infrastructure" by whatever caches/scopes
+`TestContextManager` instances across a test's lifecycle -- plausibly
+JUnit Jupiter's own `ExtensionContext.Store` (keyed by `Namespace` +
+key objects, which can be subject to the exact same `Class`-identity-based
+cache-key instability if `SpringExtension`'s own class resolves
+inconsistently under the fork) rather than anything AOT-specific. **This is
+a THIRD, distinct investigation layer** (JUnit's own extension-store
+caching, not Spring's `DefaultContextCache` or CratonVM's `ClassId`
+resolution) and was not pursued further this session -- flagged as the
+concrete next step for whoever continues.
+
+**Recommended next step**: widen `CRATONVM_DBG_LOADER_TRACE`'s filter
+(already trivial to do, see this session's pattern) to also cover
+`SpringExtension`/`TestContextManager`/`ExtensionContext` class names, and
+add print instrumentation (via a custom probe fixture, NOT the shared
+checkout) around `SpringExtension`'s `getTestContextManager(ExtensionContext)`
+-- the actual JUnit-side store lookup -- to determine whether it's finding
+two different `Store` instances, two different cached `TestContextManager`
+values under the same key, or constructing a fresh one each time due to a
+key-equality failure. The fast repro
+(`/data/tmp/aotcluster-final-repro/BeanOverrideProbe2.java`, or its
+non-forked sibling `BeanOverrideProbe3.java` used to confirm forking is
+REQUIRED to trigger this at all -- both on the Azure host) remains the
+fastest iteration path (~30-60s depending on host load and whether
+`CRATONVM_DBG_LOADER_TRACE` is enabled, which adds significant overhead --
+prefer `CRATONVM_DBG_DUPCLASS`/targeted name filters over blanket tracing).

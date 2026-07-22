@@ -1,27 +1,39 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed, mostly closed after three follow-up sessions.** Of the
+**OPEN, mixed, mostly closed after five follow-up sessions.** Of the
 original 11 items: **8 now confirmed FIXED** (`TestPreparedStatement`,
-`TestShell`, `TestRandomMapOps` [very likely — see its section],
-`TestLinkedTable`, `TestAlter`, `TestDataUtils` [now fully fixed — see the
-"Follow-up session (2026-07-22, third pass)" section], plus the
-`SecurityException` half of `TestUpgrade`), **1 root-caused as a genuine
-performance-margin issue rather than a discrete bug** (`TestBnf`, joining
+`TestShell`, `TestRandomMapOps` [very likely — ~99 CPU-minutes clean before
+an unrelated host-wide OOM kill cut the confirmation run short; see its
+section for the corrected account — a prior version of this doc incorrectly
+claimed a clean 2-hour completion], `TestLinkedTable`, `TestAlter`,
+`TestDataUtils` [now fully fixed — see the "Follow-up session (2026-07-22,
+third pass)" section], plus the `SecurityException` half of `TestUpgrade`),
+**1 root-caused as a genuine performance-margin issue rather than a
+discrete bug, now with two confirmed instances** (`TestBnf` and, as of the
+fifth pass, the separate `Bnf`/`RuleElement`-NPE doc — both the exact same
+`Sentence.MAX_PROCESSING_TIME` budget-exhaustion mechanism; joining
 `TestFileLock`/`TestTransaction` in that category), and **3 root-caused,
 performance-margin, no fix expected/attempted** (`TestFileLock`,
 `TestTransaction`, plus `TestFuzzOptimizations` which is
 inconclusive/likely-not-CratonVM-specific). **One genuine open residual
 remains requiring further VM work: `TestUpgrade`'s secondary
-`NoSuchMethodError`** — now narrowed much further (see the third-pass
-section) but still not closed. A **separate, previously-undiscovered
-systemic bug was found and fixed** in the process (the JIT compiled-code
-cache was keyed by class NAME only, with no loader/`ClassId` component —
-see the third-pass section for the full writeup) — real and worth keeping,
-but confirmed **not sufficient by itself** to close `TestUpgrade` (the
-NoSuchMethodError reproduces identically with `--nojit`). See each item
-below, and the "Follow-up session (2026-07-22, second pass)" and "third
-pass" summaries further down, for full detail.
+`NoSuchMethodError`** — narrowed much further across the third and fifth
+passes (see those sections) but still not closed; the fifth pass pinned it
+to a specific polymorphic inline-cache-miss correlation with a concrete
+next instrumentation step. A **separate, previously-undiscovered systemic
+bug was found and fixed** in the process (the JIT compiled-code cache was
+keyed by class NAME only, with no loader/`ClassId` component — see the
+third-pass section for the full writeup) — real and worth keeping, but
+confirmed **not sufficient by itself** to close `TestUpgrade` (the
+NoSuchMethodError reproduces identically with `--nojit`). A **ninth item is
+now also FIXED**: the `TestPreparedStatement.testDate8` 1-hour-offset
+residual discovered during the third pass (distinct from the
+already-fixed Julian/Gregorian cutover bug in the same test class) — see
+the "Follow-up session (2026-07-22, fourth pass)" section. See each item
+below, and the "Follow-up session (2026-07-22, second pass)", "third
+pass", "fourth pass", and "fifth pass" summaries further down, for full
+detail.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -501,17 +513,17 @@ Picked up the 7 items still open after the first follow-up session (worktree
   reaches the `user_defined_function_name` grammar production that would
   suggest `CUSTOM_PRINT`. Not a logic/dispatch bug — a genuine interpreter
   throughput gap for this specific (apparently very branchy/recursive)
-  workload. No targeted fix attempted, matching `TestFileLock`/
+  workload. **Second confirmed instance (2026-07-22, fifth pass)**:
+  `TestWeb.testWebApp()`'s `autoCompleteList.do?query=select 'abc`
+  empty-body failure — originally tracked as a separate doc
+  (`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, a `RuleElement
+  .link` NPE hypothesis from an incomplete isolated repro that skipped
+  `linkStatements()`) — turned out to be this exact same budget-exhaustion
+  mechanism for a query with an unclosed string literal; see that doc (now
+  closed/reclassified) and the "fifth pass" section below for the full
+  faithful-repro writeup. No targeted fix attempted, matching `TestFileLock`/
   `TestTransaction`'s existing characterization — would require broader
   interpreter throughput work, not a discrete patch.
-  **Second confirmed instance (2026-07-22, follow-up session)**:
-  `TestWeb.testWebApp()`'s `autoCompleteList.do?query=select 'abc` empty-body
-  failure — originally tracked as a separate, seemingly-unrelated doc
-  (`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, an `RuleElement
-  .link` NPE hypothesis from an incomplete isolated repro) — turned out to
-  be the exact same `Sentence.MAX_PROCESSING_TIME` budget-exhaustion
-  mechanism, this time for a query with an unclosed string literal. See
-  that doc (now closed/reclassified) for the full faithful-repro writeup.
 
 - **`TestUpgrade` — `SecurityException` half confirmed still FIXED**
   (from the first follow-up session), **but the secondary
@@ -722,18 +734,190 @@ instance ends up referenced by the `UserDefined`-loader `MVMap`'s own
   a `--nojit` run reproduces the full trace in well under 5 minutes and is
   the fastest way to pick this back up.
 
-### Follow-up session (2026-07-22, fourth pass): narrowed to a specific
-### polymorphic-inline-cache-miss correlation; still not closed
+### Regression check
+
+Ran the 5 `TestDataUtils`-family repros, then a broad manual spot-check
+across previously-passing classes (`TestAlter`, `TestShell`,
+`TestLinkedTable`, `TestPreparedStatement`, `TestUpdatableResultSet`,
+`TestView`, `TestResultSet`, `TestAnalyzeTableTx`, plus `TestBnf`,
+`TestFileSystem`, `TestFuzzOptimizations` re-confirming their already-documented
+pre-existing characterizations) against the fixed binary — **no regressions
+observed**. One *new*, unrelated finding surfaced:
+`org.h2.test.jdbc.TestPreparedStatement.testDate8` fails with a 1-hour offset
+(`Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000`) —
+confirmed via a from-scratch build of unmodified `dev@ad909ee8f` that this is
+**pre-existing, not a regression from this session**; it's a distinct residual
+from the already-fixed Julian/Gregorian cutover bug in the same test class.
+Filed separately, not fixed here (out of scope for this pass) at the time —
+**now FIXED, see the "Follow-up session (2026-07-22, fourth pass)" section
+below.**
+
+`org.h2.test.store.TestRandomMapOps` was kicked off again with a full 2-hour
+timeout at the end of this session to try for the definitive exit-0
+confirmation the second-pass session couldn't get; check
+`/tmp/testrandommapops.log` on the Azure host (or a future session's own
+rerun) for the outcome if this doc wasn't updated with a result before the
+session ended.
+
+**Outcome (2026-07-22, same session) — CORRECTED (2026-07-22, fifth pass):**
+the original writeup here claimed the run "completed its `timeout` wrapper
+without ever exiting on its own — killed at the 7200s mark." **That is
+factually wrong** — checked directly against the Azure host's kernel log
+(`dmesg`) during the fifth-pass session: PID `1793972` was **OOM-killed by
+the Linux kernel at 23:27:12 UTC**, i.e. **~99 minutes** into the run
+(started 21:48), not reaped by the `timeout 7200` wrapper at the 2-hour
+mark:
+```
+kernel: Out of memory: Killed process 1793972 (cratonvm-h2fina) total-vm:5700264kB, anon-rss:1962172kB, ...
+```
+This happened because the Azure host was concurrently running several other
+sessions' heavy workloads (multiple WildFly node clusters, other H2/Tomcat
+fixture runs, several `cargo build`/`cargo test` invocations) at the same
+time, not because of anything specific to `TestRandomMapOps` itself — the
+host's `free -g` showed 25GB reclaimed immediately after the kill, i.e. a
+genuine system-wide memory-pressure event, not a leak in the test or the VM.
+The **qualitative conclusion is still likely correct** (~99 minutes of
+continuous CPU-bound execution with no assertion failure or crash before the
+OOM kill is still meaningful evidence the original fast, deterministic
+`rev (1654, null)` bug is gone) but it is **weaker evidence than the
+original writeup claimed**, and a truly definitive exit-0 confirmation is
+still outstanding. Whoever picks this up next should re-run with a
+generous timeout **on a host that is not concurrently oversubscribed**
+(check `free -g` and `ps aux --sort=-%mem` first — this Azure host runs many
+concurrent orchestrated sessions and can OOM-kill an otherwise-healthy long
+run), or run it with a lower per-process memory footprint / under `systemd-run
+--scope -p MemoryMax=...` isolation so an unrelated session's memory spike
+can't take it down.
+
+
+
+## Follow-up session (2026-07-22, fourth pass): `TestPreparedStatement.testDate8` 1-hour-offset residual — FIXED
+
+Picked up the residual filed at the end of the third pass (see immediately
+above). Re-confirmed it still reproduces on current `dev` HEAD
+(`becf0f642f9`, 2026-07-22) with an unmodified, from-scratch build before
+touching anything, per this repo's "check already fixed first" convention —
+still reproduced identically:
+```
+AssertionError: Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000
+	at org/h2/test/jdbc/TestPreparedStatement.testDate8(TestPreparedStatement.java:728)
+```
+
+### Root cause
+
+**Not** a date-arithmetic or calendar-cutover bug (the working hypothesis
+going in — a historical-date DST/zone-offset edge case — turned out to be
+wrong; the actual bug isn't date-dependent at all). `testDate8` wraps its
+Julian/Gregorian-transition assertions in:
+```java
+TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"));
+```
+and the failing assertion (`assertEquals(Date.valueOf("1582-09-25"),
+rs.getDate(1))`) compares a value built via `java.sql.Date.valueOf` (which
+routes through `java.util.Date`'s deprecated field constructors and the
+already-fixed JDN-based `date_fields_to_millis`/`date_fields_to_default_millis`
+in `deprecated_util.rs`) against a value the H2 JDBC driver computes
+independently. The JDN/cutover math on both sides is correct — verified by
+isolating `Date.valueOf("1582-09-25")` alone (no H2 involved) under
+`TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"))`: CratonVM produced
+`-12220156800000` where real HotSpot JDK 25 produces `-12220160400000` —
+an exact 3,600,000 ms (1h) discrepancy, reproducing with **any** date, not
+just 1582 ones.
+
+Traced further with a direct probe of `TimeZone.getTimeZone("GMT+01")`
+itself (no `Date`/H2 involved at all):
+```
+tz id=GMT+01:00 rawOffset=0 getOffset(0)=0 getOffset(now)=0   <- CratonVM (WRONG)
+tz id=GMT+01:00 rawOffset=3600000 getOffset(...)=3600000      <- real HotSpot JDK 25
+```
+Every synthetic **custom fixed-offset** `TimeZone` — any id of the form
+`"GMT±HH:MM"` / `"GMT±HHMM"` / `"GMT±H"` / `"UTC±HH:MM"`, canonicalised by
+`normalize_gmt_custom_id` in `native-builtins/src/lib.rs` — resolved every
+offset query (`getRawOffset()`, `getOffset(long)`, `getOffsets(long,int[])`,
+`getOffsetsByWall(long,int[])`) to **0**, regardless of the requested
+offset. `TimeZone.getTimeZone("GMT+01")`'s canonical `ID` field
+(`"GMT+01:00"`) was set correctly, so `getID()`/`toString()` looked right —
+only the numeric offset was silently wrong, which is exactly why `testDate8`
+(fixed-offset-zone-dependent) was the symptom while dates alone were red
+herrings.
+
+Root cause, once traced into `native-builtins/src/lib.rs`'s `getRawOffset`/
+`getOffset`/`getOffsets`/`getOffsetsByWall` native registrations for
+`sun/util/calendar/ZoneInfo`/`java/util/SimpleTimeZone`: none of them read
+the object's own `rawOffset` field (which `alloc_synth_timezone` *does* set
+correctly via the `tz_standard_offset_seconds` lookup table — a dead code
+path for this purpose, it turns out). They instead all go through
+`crate::tzdb::raw_offset_seconds`/`offset_seconds_at_instant`/
+`offset_seconds_at_local`/`standard_offset_seconds_at_instant`, which in
+turn call `tzdb::get_zone_rules(ctx, zone_id)` — a lookup **purely against
+the real `tzdb.dat` catalog** (604 IANA zones + aliases). A synthetic
+`"GMT+01:00"` id has no `tzdb.dat` entry (real Java doesn't need one either
+— it builds these zones' `ZoneInfo` directly from the parsed offset, never
+touching tzdb), so `get_zone_rules` returned `None` for every custom-offset
+id, and every caller's `.unwrap_or(0)` silently substituted 0.
+
+### Fix
+
+`native-builtins/src/tzdb.rs`: added `parse_fixed_gmt_offset_seconds(id)` —
+a self-contained parser for `"GMT±HH:MM"`/`"GMT±HHMM"`/`"GMT±H"`/
+`"UTC±HH:MM"` ids (handles both the canonicalised form
+`normalize_gmt_custom_id` produces and the short forms it accepts on input)
+— and `fixed_offset_rules(offset_seconds)`, which builds a degenerate
+`ZoneRulesData` with empty transition tables and a single constant offset
+(the existing `offset_at_instant`/`offset_at_local`/
+`standard_offset_at_instant`/`raw_offset` functions already treat empty
+transition vectors as "constant offset, no DST" — no changes needed there).
+`get_zone_rules` now falls back to this synthetic rule set when the tzdb
+catalog lookup misses and the id parses as a fixed GMT/UTC offset — fixing
+`getRawOffset`/`getOffset`/`getOffsets`/`getOffsetsByWall` for **every**
+custom-offset zone uniformly (not just `"GMT+01"`), since all four go
+through this same shared lookup. `get_zone_rules`'s one other caller
+(`TimeZone.getTimeZone`'s "is this id resolvable, or should it fall back to
+bogus-id `GMT`" check) already short-circuits `custom_gmt.is_some()` before
+reaching `get_zone_rules`, so this fallback doesn't change that path's
+behavior.
+
+**Verified bit-for-bit against real HotSpot JDK 25**:
+- `TimeZone.getTimeZone("GMT+01"/"GMT+01:00"/"GMT+1"/"GMT+0100").getRawOffset()`
+  / `.getOffset(0)` / `.getOffset(now)`: all now `3600000`, matching HotSpot
+  exactly (was `0`).
+- `TimeZone.getTimeZone("GMT-05"/"GMT-05:00").getOffset(...)`: `-18000000`,
+  matching HotSpot (was `0`).
+- `TimeZone.getTimeZone("UTC"/"GMT"/"GMT+00").getOffset(...)`: unchanged at
+  `0` (still correct — not custom-offset ids, or a genuinely zero offset).
+- `Date.valueOf("1582-09-25")` under `TimeZone.setDefault(GMT+01)`:
+  `-12220160400000`, now matching HotSpot exactly (was `-12220156800000`,
+  off by +3,600,000 ms).
+- `org.h2.test.jdbc.TestPreparedStatement` (the full class, including
+  `testDate8`): clean pass, no assertion failures.
+
+3 new regression unit tests added to `native-builtins/src/tzdb.rs`'s
+existing `#[cfg(test)] mod tests`, alongside 2 more covering the
+`fixed_offset_rules`/`get_zone_rules` fallback plumbing directly (5 new,
+7/7 total in the module including the 2 pre-existing tests, all pass).
+
+**Regression check**: spot-ran `TestAlter`, `TestShell`, `TestLinkedTable`
+(the classes this doc's own history most recently touched) against the
+fixed binary — all clean, no regressions.
+
+## Follow-up session (2026-07-22, fifth pass): `TestUpgrade` narrowed to a
+## specific inline-cache-miss correlation (still open); `Bnf`/`RuleElement`
+## NPE doc reclassified as the same `TestBnf` family (closed)
 
 Worktree `/data/wt-h2-testupgrade-20260722` on the Azure host, branch
 `fix/h2-testupgrade-rootreference-20260722`, branched from `origin/dev`
-(`ffe407a5f`). Re-ran the existing `CRATONVM_DBG_LOADER_TRACE=1 --nojit`
-repro (confirms the bug is unchanged/still open) and, this time, grepped the
-full `[LOADER-TRACE]` output (100k+ lines) systematically instead of
-sampling, cross-referencing `execute_invokevirtual_cached`'s HIT-CHECK lines
-against the `compare_and_swap_field`/`set_field_volatile` lines by
-timestamp/line-number adjacency. Found a precise, reproducible correlation
-that narrows the search significantly:
+(`ffe407a5f`).
+
+### `TestUpgrade`'s secondary `NoSuchMethodError` — narrowed further via a
+### precise inline-cache-miss correlation, still OPEN
+
+Re-ran the existing `CRATONVM_DBG_LOADER_TRACE=1 --nojit` repro (confirms
+the bug is unchanged/still open) and, this time, grepped the full
+`[LOADER-TRACE]` output (100k+ lines) systematically instead of sampling,
+cross-referencing `execute_invokevirtual_cached`'s HIT-CHECK lines against
+the `compare_and_swap_field`/`set_field_volatile` lines by line-number
+adjacency. Found a precise, reproducible correlation that narrows the
+search significantly:
 
 - **Confirmed (again, via a fresh trace) that every single `new
   RootReference(...)` allocation in the failure window resolves its target
@@ -749,9 +933,9 @@ that narrows the search significantly:
   `compare_and_swap_field` writes (a `cid=1168` `RootReference` landing in an
   `AtomicReference` holder whose entire history otherwise shows `cid=1619`
   objects — e.g. holder `0x200c647f4b0` gets 10 consecutive `cid=1619`
-  writes, then one `cid=1168` write at trace line 113022), the
-  `execute_invokevirtual_cached` HIT-CHECK immediately preceding it shows a
-  **polymorphic inline-cache miss** at the *same* call site:
+  writes, then one `cid=1168` write), the `execute_invokevirtual_cached`
+  HIT-CHECK immediately preceding it shows a **polymorphic inline-cache
+  miss** at the *same* call site:
   ```
   execute_invokevirtual_cached HIT-CHECK method=org/h2/mvstore/MVMap.compareAndSetRoot(...)Z
     cached.declaring=org/h2/mvstore/MVMap cached_receiver_class_id=ClassId(1162)
@@ -803,48 +987,48 @@ that narrows the search significantly:
   `thread.invoke_cache` key-aliasing hypothesis in (a) above without another
   full investigative pass.
 
+Doc updated in place, no code changes landed this session for `TestUpgrade`
+itself (investigation-only pass). `CRATONVM_DBG_LOADER_TRACE=1` remains in
+the tree, zero cost when unset, and is confirmed to reproduce the full trace
+in well under 5 minutes.
+
+### `Bnf`/`RuleElement.link` NPE doc — reclassified and closed
+
+Investigated `bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` (the
+`TestWeb.testWebApp()` autocomplete empty-body finding). The doc's own
+`RuleElement.link` NPE hypothesis turned out to be a red herring from an
+incomplete isolated repro that skipped the required `linkStatements()` call
+(`docs-known-issue-doc-hypothesis-can-be-wrong-not-just-stale` applies). A
+faithful repro replicating `WebSession.loadBnf()` exactly — all 7
+`updateTopic()` calls, a real `readContents()`-populated `DbContents`
+against a live H2 connection, then `linkStatements()` — shows the NPE does
+**not** reproduce at all (`BnfProbe4.java`, worktree
+`/data/wt-h2-testupgrade-20260722/apps/h2database/h2/BnfProbe4.java`).
+
+The real mechanism: `getNextTokenList("select 'abc")` (unclosed string
+literal) returns an empty result instead of suggesting the closing `'` —
+root-caused (via the same "widen `Sentence.MAX_PROCESSING_TIME` in a scratch
+rebuild" technique already used for `TestBnf` above) to the **exact same
+100ms budget-exhaustion mechanism**: widening the budget to 30000ms makes
+this query correctly return `{1#anything=Hello World, 1#'='}`. Not a
+dispatch/NPE/loader bug — the same interpreter-throughput performance-margin
+family as `TestBnf`/`TestFileLock`/`TestTransaction`. See the updated
+`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` for the full
+corrected writeup; no code fix attempted or needed (matches this family's
+existing "no targeted fix, broader interpreter throughput work" stance).
+
 ### Regression check
 
-Ran the 5 `TestDataUtils`-family repros, then a broad manual spot-check
-across previously-passing classes (`TestAlter`, `TestShell`,
-`TestLinkedTable`, `TestPreparedStatement`, `TestUpdatableResultSet`,
-`TestView`, `TestResultSet`, `TestAnalyzeTableTx`, plus `TestBnf`,
-`TestFileSystem`, `TestFuzzOptimizations` re-confirming their already-documented
-pre-existing characterizations) against the fixed binary — **no regressions
-observed**. One *new*, unrelated finding surfaced:
-`org.h2.test.jdbc.TestPreparedStatement.testDate8` fails with a 1-hour offset
-(`Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000`) —
-confirmed via a from-scratch build of unmodified `dev@ad909ee8f` that this is
-**pre-existing, not a regression from this session**; it's a distinct residual
-from the already-fixed Julian/Gregorian cutover bug in the same test class.
-Filed separately, not fixed here (out of scope for this pass) — see the
-spawned follow-up task / a new doc for it.
+Ran `TestWeb` (the `select 'abc` case only, via `BnfProbe4`) and confirmed
+the reverted/clean binary (all diagnostic edits to `Sentence.java`,
+`WebSession.java`, `WebApp.java` backed out — those files aren't
+git-tracked in this repo, see below) still fails `TestWeb.testWebApp()`
+identically to `origin/dev`, i.e. this session made no code changes, purely
+investigation + doc updates. Note: `apps/h2database/` is not tracked by
+git in this repo (each worktree gets its own untracked local copy of the H2
+source/build); any source-level scratch edits made while investigating
+(temporary debug prints, the `Sentence.MAX_PROCESSING_TIME` widening) were
+reverted in-place in this worktree's copy and are not part of any commit.
 
-`org.h2.test.store.TestRandomMapOps` was kicked off again with a full 2-hour
-timeout at the end of this session to try for the definitive exit-0
-confirmation the second-pass session couldn't get; check
-`/tmp/testrandommapops.log` on the Azure host (or a future session's own
-rerun) for the outcome if this doc wasn't updated with a result before the
-session ended.
-
-**Outcome (2026-07-22, same session):** the full 2-hour run completed its
-`timeout` wrapper without ever exiting on its own — killed at the 7200s mark,
-no assertion, no crash, no output past the initial start line the entire run
-(`/tmp/testrandommapops.log` on the Azure host, PID `1793972`, confirmed via
-`ps` to still be at 99.9% CPU with zero new log output moments before the
-`timeout` wrapper reaped it). This is consistent with, and strengthens, the
-existing "very likely fixed, not 100% verified" characterization — two hours
-of continuous CPU-bound execution with no assertion failure or crash is
-strong evidence the original fast, deterministic `rev (1654, null)` bug is
-genuinely gone, not just delayed. But it also means a true exit-0 completion
-is not achievable within a normal session's time budget at the current
-interpreter throughput: `TestAll.big`'s fuzz workload (up to 3000 ops × 100
-rounds) does not complete in 2+ hours under CratonVM real-JDK mode. Whoever
-next needs a definitive confirmation should either (a) run it detached with a
-much longer timeout (a half-day+) and check back later, or (b) treat "no
-crash after 2 CPU-hours" as sufficient confidence and close this item as
-fixed — the latter is this session's recommendation, since the odds of an
-assertion or crash appearing only after hour 3+ but not in the first 2 are
-low for a genuinely-fixed, purely-CPU-bound fuzz loop (as opposed to e.g. a
-rare race that needs a specific interleaving to trigger).
-
+Fix commit landed on `dev` via branch
+`fix/h2-testdate8-1hour-offset-20260722`.
