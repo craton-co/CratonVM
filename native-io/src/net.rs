@@ -1396,12 +1396,20 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
 /// `Net.poll(FileDescriptor fd, int events, long timeoutMillis) -> int`.
 ///
-/// JDK 25's `NioSocketImpl` uses this after a non-blocking read reports
-/// `IOStatus.UNAVAILABLE`. A readiness loop based on `peek` works for the
-/// TCP streams behind the CratonVM Net registry and, unlike a blind sleep,
-/// wakes promptly for either bytes or peer EOF.
+/// JDK 25's `NioSocketImpl` uses this after a non-blocking I/O operation
+/// reports `IOStatus.UNAVAILABLE`. The event mask is significant: timed reads
+/// park on `POLLIN`, while a non-blocking write parks on `POLLOUT`. The old
+/// `TcpStream::peek` loop only detected incoming bytes, so a client whose
+/// output buffer filled waited for a *response* instead of writable capacity;
+/// Tomcat then hit its 20-second request timeout and aborted the connection.
+///
+/// Use the OS poll primitive directly. Besides handling read and write
+/// readiness faithfully, this leaves the stream's persistent blocking mode
+/// untouched, which matters because the JDK toggles it around timed connects
+/// and reads.
 fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = obj_arg(args, 0)?;
+    let events = int_arg(args, 1);
     let timeout_millis = match args.get(2) {
         Some(Value::Long(value)) => *value,
         Some(Value::Int(value)) => *value as i64,
@@ -1416,28 +1424,131 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => return Ok(Some(Value::Int(0))),
         }
     };
-    let deadline = if timeout_millis < 0 {
-        None
+    let timeout = if timeout_millis < 0 {
+        -1
     } else {
-        Some(std::time::Instant::now() + Duration::from_millis(timeout_millis as u64))
+        timeout_millis.min(i64::from(i32::MAX)) as i32
     };
     ctx.begin_blocking_region();
-    let result = loop {
-        let mut probe = [0u8; 1];
-        match stream.peek(&mut probe) {
-            Ok(_) => break Ok(Some(Value::Int(1))),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
-                    break Ok(Some(Value::Int(0)));
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => break Err(net_err("poll", error)),
-        }
-    };
+    let result = net_poll_stream(&stream, events, timeout)
+        .map(|ready| Some(Value::Int(if ready { 1 } else { 0 })))
+        .map_err(|error| net_err("poll", error));
     ctx.end_blocking_region();
     result
 }
+
+/// Wait for the requested `sun.nio.ch.Net` event mask on one TCP stream.
+/// JDK's Windows `Net` constants intentionally match WSAPoll (`POLLIN=0x300`,
+/// `POLLOUT=0x10`); Unix constants match `poll(2)`. A readiness error/hangup
+/// is still reported as ready so the subsequent Java read/write surfaces the
+/// concrete socket error instead of parking indefinitely.
+#[cfg(windows)]
+fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+
+    #[repr(C)]
+    struct WsaPollFd {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+    #[link(name = "Ws2_32")]
+    extern "system" {
+        fn WSAPoll(fds: *mut WsaPollFd, nfds: u32, timeout: i32) -> i32;
+    }
+
+    let mut pfd = WsaPollFd {
+        fd: stream.as_raw_socket() as usize,
+        events: events as i16,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a valid one-element WSAPOLLFD array. The socket stays
+    // alive through the borrowed `TcpStream` for the duration of the call.
+    let count = unsafe { WSAPoll(&mut pfd, 1, timeout) };
+    if count < 0 {
+        let error = std::io::Error::last_os_error();
+        Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "WSAPoll fd={:#x} events={events:#x} timeout={timeout}: {error}",
+                pfd.fd
+            ),
+        ))
+    } else {
+        Ok(count > 0)
+    }
+}
+
+#[cfg(unix)]
+fn net_poll_stream(stream: &TcpStream, events: i32, timeout: i32) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    type NfdsT = u32;
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    type NfdsT = u64;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
+    }
+
+    let mut pfd = PollFd {
+        fd: stream.as_raw_fd(),
+        events: events as i16,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a valid one-element pollfd array and the borrowed
+    // stream keeps its file descriptor alive for the call.
+    let count = unsafe { poll(&mut pfd, 1, timeout) };
+    if count < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(count > 0)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn net_poll_stream(_stream: &TcpStream, _events: i32, timeout: i32) -> std::io::Result<bool> {
+    if timeout > 0 {
+        std::thread::sleep(Duration::from_millis(timeout as u64));
+    }
+    Ok(false)
+}
+
+// `sun.nio.ch.Net` exposes the host poll ABI through these native methods.
+// Keep the Java constants aligned with the primitive used by `net_poll_stream`:
+// on Windows that is WSAPoll (where POLLIN is RDNORM|RDBAND and POLLOUT is
+// WRNORM), while Unix uses the usual poll(2) bit layout.
+#[cfg(windows)]
+const NET_POLLIN: i32 = 0x0300;
+#[cfg(windows)]
+const NET_POLLOUT: i32 = 0x0010;
+#[cfg(windows)]
+const NET_POLLERR: i32 = 0x0001;
+#[cfg(windows)]
+const NET_POLLHUP: i32 = 0x0002;
+#[cfg(windows)]
+const NET_POLLNVAL: i32 = 0x0004;
+#[cfg(windows)]
+const NET_POLLCONN: i32 = NET_POLLOUT;
+
+#[cfg(not(windows))]
+const NET_POLLIN: i32 = 0x0001;
+#[cfg(not(windows))]
+const NET_POLLOUT: i32 = 0x0004;
+#[cfg(not(windows))]
+const NET_POLLERR: i32 = 0x0008;
+#[cfg(not(windows))]
+const NET_POLLHUP: i32 = 0x0010;
+#[cfg(not(windows))]
+const NET_POLLNVAL: i32 = 0x0020;
+#[cfg(not(windows))]
+const NET_POLLCONN: i32 = NET_POLLOUT;
 
 /// `write0(FileDescriptor fd, long address, int len) -> int`
 fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1486,7 +1597,20 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             ctx.begin_blocking_region();
             let res = w.write(buf);
             ctx.end_blocking_region();
-            res.map_err(|e| net_err("write0", e))?
+            // `SocketChannelImpl` deliberately switches an fd to non-blocking
+            // mode around its write path. On Windows the resulting
+            // WSAEWOULDBLOCK is `ErrorKind::WouldBlock`, not a Java socket
+            // timeout: the native dispatcher must return IOStatus.UNAVAILABLE
+            // (-2) so the Java caller registers/polls for OP_WRITE and retries.
+            // Mapping it through `net_err` turns routine backpressure into
+            // SocketTimeoutException and breaks Tomcat's aborted-upload
+            // swallow protocol.
+            match res {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(Some(Value::Int(-2)));
+                }
+                result => result.map_err(|e| net_err("write0", e))?,
+            }
         };
         socket_capture('w', fd, &buf[..n]);
         Ok(Some(Value::Int(n as i32)))
@@ -2147,18 +2271,12 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(net, "pollinValue", "()S", |_c, _a| Ok(Some(Value::Int(1))));
-    r.register(net, "polloutValue", "()S", |_c, _a| Ok(Some(Value::Int(4))));
-    r.register(net, "pollerrValue", "()S", |_c, _a| Ok(Some(Value::Int(8))));
-    r.register(net, "pollhupValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(16)))
-    });
-    r.register(net, "pollnvalValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(32)))
-    });
-    r.register(net, "pollconnValue", "()S", |_c, _a| {
-        Ok(Some(Value::Int(4)))
-    });
+    r.register(net, "pollinValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLIN))));
+    r.register(net, "polloutValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLOUT))));
+    r.register(net, "pollerrValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLERR))));
+    r.register(net, "pollhupValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLHUP))));
+    r.register(net, "pollnvalValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLNVAL))));
+    r.register(net, "pollconnValue", "()S", |_c, _a| Ok(Some(Value::Int(NET_POLLCONN))));
     r.set_category(__prev_cat);
 }
 
