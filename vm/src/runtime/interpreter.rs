@@ -19090,11 +19090,17 @@ fn execute_invoke_kind(
     // hierarchy. The slot is also left unset when the resolved class isn't
     // an interface so a malformed CP entry can't poison nested dispatch.
     let cp_resolved_class_id: Option<ClassId> = if is_interface {
-        let loaded = shared
-            .class_manager
-            .write()
-            .load_class(&method_class_name)
-            .ok();
+        // An interface Methodref is resolved by the current frame's initiating
+        // loader too. The cache-preparation probe must not create a global
+        // duplicate before the actual invokeinterface dispatch has a chance to
+        // use its loader-local constant-pool identity.
+        let loaded = resolve_class_loader_aware(
+            shared,
+            thread,
+            current_class_id,
+            &method_class_name,
+        )
+        .ok();
         loaded.and_then(|cid| {
             let cm = shared.class_manager.read();
             cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
@@ -24982,16 +24988,11 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // Keep in sync with vm_exec.rs's `check_override` allow-list entry for
-    // the same triple — see that entry's comment for the full rationale
-    // (synthetic StringBuilder/StringBuffer/AbstractStringBuilder layout vs.
-    // real bytecode's `checkOffset(dstOffset, count)` AIOOBE).
-    if matches!(
-        class_name,
-        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
-    ) && method_name == "insert"
-        && (method_descriptor.starts_with("(I[CII)") || method_descriptor.starts_with("(I[C)"))
-    {
+    // Keep in sync with vm_exec.rs's cold-path gate. The real JDK builder
+    // methods read compact-string fields that do not exist on our synthetic
+    // char[]-backed builders, so all registered layout operations must resolve
+    // through their native implementations.
+    if is_string_builder_layout_native_override(class_name, method_name) {
         return true;
     }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
@@ -27040,15 +27041,34 @@ fn redefine_immune_reflection_native(class_name: &str, method_name: &str) -> boo
     )
 }
 
+/// Methods whose real JDK bodies access compact `byte[]`/`coder`/`count`
+/// fields while CratonVM StringBuilder objects intentionally use a synthetic
+/// `char[]`/`count` layout. A registered native must win for every one of these
+/// operations, including direct methods on StringBuilder rather than only their
+/// AbstractStringBuilder implementation.
+pub(crate) fn is_string_builder_layout_native_override(
+    class_name: &str,
+    method_name: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+    ) && matches!(
+        method_name,
+        // Keep this deliberately narrow: these direct JDK bodies read the
+        // incompatible compact-string layout on synthetic builders. Other
+        // operations keep their established dispatch to avoid turning the
+        // high-volume AOT code-generation path into an all-native slow path.
+        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "length" | "toString"
+    )
+}
+
 fn redefine_immune_string_builder_native(
     class_name: &str,
     method_name: &str,
     _method_descriptor: &str,
 ) -> bool {
-    matches!(
-        class_name,
-        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
-    ) && matches!(method_name, "<init>" | "append" | "toString")
+    is_string_builder_layout_native_override(class_name, method_name)
 }
 
 fn redefine_immune_path_native(
@@ -29056,7 +29076,13 @@ fn execute_invokestatic(
     // Sibling static owners in a user-defined loader need the same identity
     // preservation as self-calls; resolving by flat name can pick the app copy.
     let static_dispatch_class_id = self_class_id.or_else(|| {
-        if crate::runtime::env_cache::loader_aware_resolution() {
+        // Keep static method owners in the same initiating-loader namespace
+        // as every other symbolic reference. This includes the narrow
+        // CompileWithForkedClassLoader carve-out, not only the global opt-in:
+        // Spring's forked BootstrapUtils calls MergedAnnotations.search(), and
+        // mixing a forked SearchStrategy singleton with an application Search
+        // instance makes the latter's identity check fail spuriously.
+        if should_use_loader_initiated_resolution(shared, current_class_id) {
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
@@ -29487,7 +29513,10 @@ fn populate_invoke_cache(
         return;
     }
 
-    let loader_owner_override = if crate::runtime::env_cache::loader_aware_resolution() {
+    // The forked Spring test loader has the same identity requirement as the
+    // global loader-aware mode. Its private classes may share binary names with
+    // application classes, so never build a cache entry from the flat owner.
+    let loader_owner_override = if should_use_loader_initiated_resolution(shared, caller_class_id) {
         lookup_loader_initiated(shared, caller_class_id, &class_name)
     } else {
         None
@@ -29756,7 +29785,7 @@ fn cached_static_owner_stale(
     caller_class_id: ClassId,
     cached: &CachedBytecodeMethod,
 ) -> bool {
-    if !crate::runtime::env_cache::loader_aware_resolution() {
+    if !should_use_loader_initiated_resolution(shared, caller_class_id) {
         return false;
     }
     lookup_loader_initiated(shared, caller_class_id, cached.class_name.as_ref())
