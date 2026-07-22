@@ -101,10 +101,36 @@ already correct.
 - `org.h2.test.synth.TestDiskFull`, `org.h2.test.synth.TestPowerOffFs` — the
   reported NPE is gone (no exception in the log at all; both now run well
   past the point that used to fail, doing hundreds of real write/crash-sim
-  iterations) but both exceed a 300s harness timeout in this environment.
-  That looks like the tests' own long fuzz-loop design (large iteration
-  counts under an interpreter) rather than a residual of this bug — not
-  chased further here, out of scope for this doc.
+  iterations).
+
+  **Residual timeout, chased and closed (2026-07-22, NOT A BUG):**
+  `TestDiskFull` completes cleanly under CratonVM in ~100s (380 write-op
+  iterations; `--java-home` JIT mode, 300s budget) vs. ~17s under real
+  HotSpot (JDK25, 230 iterations) — well inside any reasonable per-class
+  timeout, ~6x overhead in line with CratonVM's normal interpreter/JIT gap
+  for this kind of workload.
+
+  `TestPowerOffFs` is a different story, but not a CratonVM bug: its
+  `test()` method has an *unbounded* `for (int i = 0;; i++)` loop (no
+  upper limit — see `apps/h2database/h2/src/test/org/h2/test/synth/
+  TestPowerOffFs.java`) that only terminates once `i` exceeds the total
+  number of internal write operations performed by one full
+  create/insert/update/delete/drop DB lifecycle, with each iteration
+  re-running that entire lifecycle from scratch. Confirmed via direct
+  standalone runs on the Azure host: **real HotSpot itself does not finish
+  this test within 10 minutes** (`timeout 600` → killed, rc=124, `real
+  10m22s` / `user 1m52s` / `sys 4m30s` — heavy syscall time, consistent
+  with H2's `FilePathDebug` wrapper doing large numbers of small real I/O
+  ops per simulated write). CratonVM shows the same shape of behavior
+  (completes the bounded first phase, then times out mid-way through the
+  identical unbounded second loop; `timeout 180` → rc=124, no crash, no
+  exception, no CratonVM-specific divergence from HotSpot's behavior).
+  This is upstream H2 test-design cost (an intentionally exhaustive fuzz
+  loop with no cap), not a VM correctness or performance bug — same
+  disposition as this suite's separate raw-Thread hang-cluster
+  investigation (`apps/h2database-suite-runner/RESULTS-20260722-rawthread-
+  hang-investigation.md`): slow-by-design test, not a VM defect. No source
+  change made; closing this residual as confirmed not-a-bug.
 
 ## Repro (kept for reference — now fixed)
 ```java

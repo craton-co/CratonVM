@@ -1,6 +1,6 @@
 # Repro set — object-binarytrees GC-frame stale-root under extreme `GC_STRESS`
 
-Writeup (FIXED): [`docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../../../internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md).
+Writeup (FIXED): [`docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../../fixed-suite-bugs/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md).
 
 > **✅ FIXED (2026-06-22, dev `77c98761`).** Root cause: the compiled entry-point
 > `main`'s JIT frame is invisible to `gc_quiescence` (invoked via `Vm::invoke`

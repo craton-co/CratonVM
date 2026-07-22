@@ -508,7 +508,7 @@ MTChurn/BinaryTrees(16).
 
 While investigating a `ClassCastException` spotted once during verification of
 the (separate, since-fixed) `InetAddress` GC-root bug in
-[`ES-HANG-20260709-...-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md),
+[`ES-HANG-20260709-...-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md`](fixed-suite-bugs/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-lucene-queries-inetaddressrandombinarydocvaluesrangequerytests-51a9c7ea93-FIXED.md),
 reproduced this same finding a THIRD independent way, via yet another real
 Lucene/ES workload — `org.elasticsearch.lucene.queries.InetAddressRandomBinaryDocValuesRangeQueryTests`
 (`testRandomMedium`, seed `B17AC9D3E1F2A0C4`, `--Xmx 2g`, clean dev tip

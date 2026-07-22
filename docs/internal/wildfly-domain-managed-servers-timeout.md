@@ -169,7 +169,7 @@ Worktree `fix/wildfly-msc-getservice-registry-gap-20260706` off `dev` (Azure pro
 re-driving the same hand-built WildFly 32.0.1.Final binary distribution + `bin/standalone.sh`
 repro from the update above (`CRATONVM_MSC_REAL_START=1 CRATONVM_DISABLE_JIT=1`, real JDK 25
 boot). Full detail in
-[bug-15](../internal/wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md).
+[bug-15](fixed-suite-bugs/wildfly/bug-15-msc-real-start-servicenotfound-and-domain-hang.md).
 Two root causes confirmed and fixed in `native-builtins/src/jboss_msc.rs`:
 
 1. **`ServiceNotFoundException` (bug-15's own headline symptom) — FIXED.** The P2

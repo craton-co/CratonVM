@@ -13,7 +13,7 @@ the README's `String/Regex (10K)` QuickBench kernel still showed a **37.6x**
 constant-factor gap vs HotSpot (11 ms JDK / 414 ms CratonVM). That gap is the
 interpreted `java.util.regex` engine itself: `CRATONVM_NATIVE_STRING_REGEX`
 (default-ON, see
-[`../../internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`](../wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md))
+[`../../internal/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md`](wildfly/bug-03-regex-perf-deployment-build.md))
 already routes `String.replaceAll`/`replaceFirst`/`matches` to a fast cached
 Rust `regex`/`fancy-regex` native, but does nothing for the extremely common
 explicit

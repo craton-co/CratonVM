@@ -5,7 +5,7 @@ the rate climbs materially above the ~1-2%-per-class-run baseline measured
 below, or a VM-side corruption/panic signature is ever observed alongside it.
 
 Split out of
-[`docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md`](../../internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md)
+[`docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md`](../../internal/fixed-suite-bugs/tomcat/dohead-post-fix-sporadic-residuals-FIXED.md)
 on 2026-07-21: that document tracked a long series of real, now-fixed
 CratonVM correctness bugs (selector wakeup races, HashMap node-layout
 corruption, an OSR exception-table gap, and two unpinned-receiver GC hazards
