@@ -12,6 +12,38 @@ bean creation nor JUnit5's own execution machinery is individually
 catastrophic in isolation — the two appear to **compound multiplicatively**
 when nested together, which is what actually produces the 600s+ wall time.
 
+## Final closure (2026-07-22)
+
+**Status: FIXED.** The preceding OPEN status paragraph is retained as
+historical investigation context only.
+
+The root-snapshot publication fix delivered with the OAuth2 closure removed
+the dominant stack-depth cost but left Jackson just beyond its 300-second
+budget. Two reflection/map residuals completed the closure:
+
+1. CratonVM-created `java.lang.reflect.Method` mirrors now carry a trusted
+   post-layout descriptor marker. `Method.invoke` can use that immutable
+   descriptor directly instead of rebuilding and validating it from Java
+   fields on every call. The public access path also no longer formats an
+   exception-only string for a successful invocation.
+2. `LinkedHashMap.computeIfAbsent` now keeps a mapper-produced object alive
+   while its direct native insertion can allocate. The mapper result is not an
+   original safe-native argument, so it could otherwise become a stale
+   `ObjectRef`; Spring's annotation collector then received its enclosing
+   `LinkedMultiValueMap` where it required an `ArrayList`, producing
+   `NoSuchMethodError LinkedMultiValueMap.add(Object): boolean`. A temporary
+   global root protects only that result across `native_lhm_put`, preserving
+   the fast direct insertion path without the throughput regression caused by
+   repeatedly publishing transient roots.
+
+Validated with a unique release binary and the normal suite-runner 300-second
+class limit for all 162 expanded JUnit invocations:
+
+| Mode | Result | Time |
+| --- | --- | --- |
+| JIT | PASS, 162/162 | 237.762s |
+| `--nojit` | PASS, 162/162 | 237.561s |
+
 ## Symptom
 
 `module/spring-boot-jackson`'s `org.springframework.boot.jackson.autoconfigure.JacksonAutoConfigurationTests`

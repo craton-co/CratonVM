@@ -5615,10 +5615,17 @@ pub(crate) fn native_class_get_declared_field(
 ///   +0 в†’ String (raw descriptor, e.g. "(II)I")
 ///   +1 в†’ Int    (parameter count вЂ” cached)
 ///   +2 в†’ Int    (accessible flag, 0 or 1)
-const METHOD_EXTRA_SLOTS: usize = 3;
+// The fourth tail slot marks metadata written by `create_method_object` as
+// immutable and safe to use without rebuilding the JDK field descriptor.
+const METHOD_EXTRA_SLOTS: usize = 4;
 const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
 const METHOD_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
+const METHOD_EXTRA_OFFSET_TRUSTED: usize = 3;
+// Marker for Method mirrors constructed by `create_method_object`. Real JDK
+// Method objects do not reserve this CratonVM tail slot, so their descriptor
+// still takes the defensive field-reconstruction path below.
+const METHOD_EXTRA_TRUSTED_MARKER: i32 = 0x4d45_5448; // "METH"
 
 // Legacy synthetic Method mirror slots used when `java/lang/reflect/Method`
 // has no real JDK field metadata (synthetic-JDK mode). These mirror the
@@ -5908,6 +5915,11 @@ pub(crate) fn create_method_object(
         Value::Int(param_descs.len() as i32),
     );
     ctx.set_field(obj, base + METHOD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
+    ctx.set_field(
+        obj,
+        base + METHOD_EXTRA_OFFSET_TRUSTED,
+        Value::Int(METHOD_EXTRA_TRUSTED_MARKER),
+    );
 
     ctx.unpin_native_roots(obj_pin);
     obj
@@ -5928,6 +5940,21 @@ pub(crate) fn read_method_descriptor(
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
+}
+
+/// Whether this Method mirror was constructed by CratonVM with a dedicated,
+/// post-layout metadata tail. Unmarked real-JDK mirrors can have an unrelated
+/// field at the calculated tail offset and must not skip descriptor validation.
+#[inline]
+fn method_has_trusted_metadata(ctx: &dyn NativeContext, method_obj: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(method_obj);
+    let base = method_extra_base(ctx, class_id);
+    let marker = base + METHOD_EXTRA_OFFSET_TRUSTED;
+    ctx.object_num_fields(method_obj) > marker
+        && matches!(
+            ctx.get_field(method_obj, marker),
+            Value::Int(METHOD_EXTRA_TRUSTED_MARKER)
+        )
 }
 
 /// Single type token for a `java.lang.Class` mirror (`java/lang/String` в†’
@@ -6016,10 +6043,21 @@ pub(crate) fn method_descriptor_for_invoke(
         close + 1 < d.len()
     }
 
-    let composed = compose_method_descriptor_from_type_fields(ctx, method_obj);
+    // Mirrors built by `create_method_object` own a post-layout descriptor
+    // slot that Java code cannot mutate. Take that fast path before doing the
+    // defensive descriptor scan/reconstruction required for a real JDK
+    // `Method` mirror. Besides avoiding field walks, returning the stored
+    // string directly avoids a second allocation from `trim().to_string()` on
+    // every reflective invocation.
+    if method_has_trusted_metadata(ctx, method_obj) {
+        if let Some(d) = read_method_descriptor(ctx, method_obj) {
+            return d;
+        }
+    }
 
     if let Some(d) = read_method_descriptor(ctx, method_obj) {
         if looks_like_jvm_method_descriptor(&d) {
+            let composed = compose_method_descriptor_from_type_fields(ctx, method_obj);
             let (slot_params, slot_ret) = parse_descriptor_param_and_return(d.trim());
             let (comp_params, comp_ret) = parse_descriptor_param_and_return(&composed);
             // Only trust the CratonVM extra-slot descriptor when it agrees with
@@ -6033,7 +6071,7 @@ pub(crate) fn method_descriptor_for_invoke(
             return d.trim().to_string();
         }
     }
-    composed
+    compose_method_descriptor_from_type_fields(ctx, method_obj)
 }
 
 /// Read the CratonVM-specific cached parameter count extra slot.
@@ -6511,11 +6549,16 @@ pub(crate) fn native_method_invoke(
 
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
-    check_access(
-        modifiers,
-        accessible,
-        &format!("Method.invoke: {}.{}", class_name, method_name),
-    )?;
+    let is_public = (modifiers & ACC_PUBLIC) != 0;
+    // Most framework reflection invokes public methods. Do not format an
+    // exception-only diagnostic string on that successful hot path.
+    if !accessible && !is_public {
+        check_access(
+            modifiers,
+            false,
+            &format!("Method.invoke: {}.{}", class_name, method_name),
+        )?;
+    }
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
     // the override flag short-circuits the deep check (JEP 403).
     //
@@ -6523,7 +6566,6 @@ pub(crate) fn native_method_invoke(
     // only `exports`, not `opens`. Only enforce the deep check when the
     // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
     // setAccessible / opens is required.
-    let is_public = (modifiers & 0x0001) != 0;
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
             return Err(
@@ -18760,6 +18802,15 @@ mod tests {
         assert_eq!(
             desc, "()I",
             "C6: Method raw descriptor must survive in the extra slot"
+        );
+        assert!(
+            method_has_trusted_metadata(&ctx, method_obj),
+            "CratonVM-created Method mirrors must identify their dedicated metadata tail"
+        );
+        assert_eq!(
+            method_descriptor_for_invoke(&ctx, method_obj),
+            "()I",
+            "Method.invoke must use the trusted immutable descriptor directly"
         );
 
         // Parameter count is 0.
