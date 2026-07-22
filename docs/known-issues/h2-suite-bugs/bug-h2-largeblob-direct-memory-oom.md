@@ -1,7 +1,7 @@
 # H2 — `TestLargeBlob` hits `OutOfMemoryError: Direct buffer memory` under CratonVM where HotSpot doesn't
 
 ## Status
-**FIXED** — dev@`<merge-commit>` (branch `fix/h2-largeblob-directmem-20260722`).
+**FIXED** — dev@b8a67c296 (branch `fix/h2-largeblob-directmem-20260722`).
 Root cause #1 below was confirmed as the actual defect; root cause #2 was
 investigated and not observed (see Verification).
 
