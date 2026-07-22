@@ -5924,9 +5924,17 @@ pub(crate) fn native_string_utf16_get_chars(
             .into(),
         );
     }
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
-        let unit = u16::from(pair[0]) | (u16::from(pair[1]) << 8);
-        ctx.set_array_element(dst, dst_begin as usize + index, Value::Int(unit as i32));
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from(pair[0]) | (u16::from(pair[1]) << 8))
+        .collect();
+    // The VM implementation performs one checked memcpy into the compact
+    // char-array payload. Keep the element fallback for test/mock contexts
+    // and unusual heaps that do not expose the bulk hook.
+    if !ctx.write_char_array_from(dst, dst_begin as usize, &units) {
+        for (index, unit) in units.into_iter().enumerate() {
+            ctx.set_array_element(dst, dst_begin as usize + index, Value::Int(unit as i32));
+        }
     }
     Ok(None)
 }
