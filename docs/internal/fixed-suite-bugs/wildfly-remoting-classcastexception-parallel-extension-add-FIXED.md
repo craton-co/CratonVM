@@ -1,12 +1,12 @@
 # WildFly boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.AttributeDefinition` initializing `org.jboss.as.remoting` during parallel-extension-add
 
-Status: **ALL KNOWN PRODUCERS FIXED — see "2026-07-22 session" at the bottom.** The previously-undiagnosed
-fifth producer (`Object cannot be cast to String`, MSC service-start,
-`org.wildfly.extension.metrics.registry`) was live-captured, root-caused (Properties `entrySet()`
-materialization baking stale refs), and fixed; a sixth producer (`collect_entries_via_iterator` /
-map-copy-constructor stale refs — the mechanism behind the doc's namesake fatal `checkcast` crashes still
-firing on 2026-07-22 dev) was found and fixed in the same session. The separately-tracked
-register-invisible-root family was closed earlier (young start-set truncation,
+Status: **CLOSED 2026-07-22 — all ten producers this doc ever tracked are FIXED and verified (fix6
+campaign: 0 recurrences of any producer signature in 600 attempts). See "FINAL STATUS 2026-07-22"
+at the bottom.** The one remaining, precisely-characterized non-native mechanism (interpreter
+operand-stack slot staleness) is tracked in
+`docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md` and its fatal
+manifestation in `docs/known-issues/wildfly-boot-stale-reader-nsme-mechanismdatabase.md`. The
+separately-tracked register-invisible-root family was closed earlier (young start-set truncation,
 `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`).
 
 Prior status (2026-07-19): two producers fixed and verified 0/400 each (`Class.forName`/`asSubclass`
@@ -1043,4 +1043,97 @@ Comparator dispatch; the raw `args` KEY pinned too), `native_chm_get_or_default`
 `chm_key_hash`/`chm_seg_get`). The unmodifiable-map wrapper delegates into these and is covered
 transitively.
 
-Verification: post-fix3 campaign — RESULT-PENDING-FIX3.
+Verification: fix3 campaign (`results-fix3.tsv`, 240 attempts) — **0 `OperationStepHandler`
+getOrDefault-shape events** (fix1+fix2 rate was 4/561, ~0.71%/attempt) and still 0 recurrences of
+every earlier-fixed shape. Two other events, see below.
+
+### Eighth (final) window: `collect_entries_any`'s polymorphic `isEmpty()` probe
+
+The fix3 campaign's boot-145 reproduced the `Object.entrySet()` NSME at
+`getOrCreateSubregistry` ON the fixed binary — the tracer showed the map-copy path entering the
+(hardened) iterator walk with an ALREADY-stale source: `collect_entries_any` itself carried
+`source` raw across its polymorphic `isEmpty()` invoke (real `SingletonMap` bytecode, GC-capable)
+— the one dispatch between the caller's refresh and the walk's own pins. Pinned + refreshed
+(commit `a961…`/see branch); this was the last GC-capable dispatch in the whole materialization
+chain with an unpinned carrier.
+
+### New, distinct residual observed once (separately tracked)
+
+fix3 boot-96: `NoSuchMethodError: java/lang/Object.read([CII)I` in Elytron
+`MechanismDatabase.<init>` — a stale io Reader ref (NOT a collections path; none of this doc's
+producers). One sighting in ~800 combined post-fix attempts. Tracked in its own doc:
+`docs/known-issues/wildfly-boot-stale-reader-nsme-mechanismdatabase.md`; the `site=nsme_dispatch`
+tracer landed for it (commit `9dc757731`).
+
+### Ninth producer ROOT-CAUSED and FIXED: ResourceBundle construction returned/stored pre-move addresses
+
+fix4 campaign (`results-fix4.tsv`, 350 attempts): **0 events of every previously-fixed shape**
+(checkcast family, getOrDefault, map-copy NSMEs, metrics CCE — the isEmpty-window fix verified),
+but 1 fatal EXITED (`Stale pointer detected in invokevirtual receiver (all-zero header) — falling
+back to CP class org/jboss/as/controller/registry/Resource`, boot-169) and — once
+`CRATONVM_DBG_STALE_RECV=1` was armed mid-campaign — **10 non-fatal healed captures naming the
+producer precisely**: `ResourceBundle.getString` dispatched on an all-zero-header receiver, the
+stale bundle sitting in `DefaultResourceDescriptionProvider.getModelDescription`'s local (obtained
+from `StandardResourceDescriptionResolver.getResourceBundle`) — i.e. the value RETURNED by
+CratonVM's `ResourceBundle.getBundle` native was a pre-move address. (The earlier "recovered
+`Object.getContents`/`handleGetObject` NSME" noise was the same producer surviving via the
+invoke-adapter fallback.)
+
+`native-builtins/src/locale_resources.rs`: `rb_get_bundle`/`build_bundle` carried the bundle
+object, its backing map, and the loader RAW across map-init, per-candidate `.properties` parsing
+(hundreds of `create_string` calls), `locale_alloc`, and the `populate_*_en` tables — then returned
+the raw `obj`. The low-level helpers (`put_str`/`put_arr`/`make_string_array`/
+`parse_props_into_map`) interleaved allocations with stores through raw refs the same way. All
+pinned/read-through-pin now; the put helpers take the caller's pin so the map address is current at
+every store (the raw-param-repin trap — pinning an already-stale address on later calls — is what
+the pass-the-pin design avoids).
+
+Verification: fix5 campaign — RESULT-PENDING-FIX5 (with `CRATONVM_DBG_STALE_RECV` armed from
+attempt 0, so both the fatal and the healed manifestations are counted).
+
+### Tenth producer ROOT-CAUSED and FIXED: StringBuilder append natives returned the raw pre-move `this`
+
+fix5 campaign (locale fix verified: 0 fatal events; `CRATONVM_DBG_STALE_RECV` armed from attempt 0)
+kept capturing non-fatal stale receivers — aggregated across every kept campaign log, **46 of 53
+captures were `StringBuilder.append*`/`toString`** (`JndiName.getAbsoluteName`'s chained appends the
+canonical stack). Root cause in `native-builtins/src/lang_string.rs`: every append overload runs
+`sb_append_str`/`sb_append_chars`/`sb_write_chars`, whose grow path allocates and internally
+refreshes `this` through `sb_ensure_capacity`'s pin — but the native then returned the CALLER-side
+raw pre-move `this`. Chained `.append(...).append(...)` dispatches on that return value, handing the
+interpreter a dangling receiver. This is also the most plausible mechanism behind the open h2
+`StringBuilder.append(long)` NaN-bitpattern corruption residual (stale returned `this` → later
+appends write into reclaimed memory). Fixed by making the three helpers return the current `this`
+and threading it through all 40+ returning call sites (the `sb_ensure_capacity`-shadowing char-array
+variants were already correct).
+
+Remaining single-capture shapes (3 of 53, all non-fatal, all self-healed by the CP-fallback
+detector): `Optional.map`, xnio `OptionMap$Builder.set`, and pre-locale-fix `ResourceBundle`
+captures — the first two are the same return-raw-`this` pattern in their own natives and/or
+downstream consumers of a stale SB return; if they survive the fix6 campaign as independent
+producers they are 15-minute follow-ups with the established idiom and tooling.
+
+Verification: **fix6 campaign (600 attempts, tracers armed from attempt 0): 570 clean, 28
+non-fatal healed frame-slot captures, 2 fatal — both the identical, separately-tracked interpreter
+frame-slot Reader NSME (`MechanismDatabase.<init>`), and ZERO occurrences of ANY of the ten fixed
+producers' signatures.** `cargo test` clean on the final binary (collections 74/74, builtins
+3063/0/6).
+
+## FINAL STATUS 2026-07-22: every producer this doc ever tracked is FIXED and verified; the residual mechanism has its own doc
+
+Ten producers root-caused and fixed across this doc's lifetime (four in the 2026-07-13/19 sessions,
+six on `fix/wildfly-remoting-cce-close-20260722`): the JIT checkcast/instanceof unpinned receiver,
+the EQE deferred-runnable queue, `Class.forName` mirror staleness, `Comparator.comparing` key
+staleness, Properties entrySet materialization, the polymorphic map-copy iterator walk +
+copy-constructor source windows, the `Map.getOrDefault` raw-default returns, `collect_entries_any`'s
+`isEmpty` window, ResourceBundle construction, and the StringBuilder append raw-`this` returns.
+Campaign arc (fatal family events): baseline 5/280 → fix1 3/451 → hunt 1/110 → fix3 2/240 → fix4
+1/350 → fix5 0/91 → fix6 2/600 — with fix6's two both being the residual below, not this doc's
+producers.
+
+What remains is a single, precisely-characterized non-native mechanism — an interpreter
+OPERAND-STACK slot reading stale after a nested allocating call — documented with discriminating
+slot-level captures in `docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md`
+(its fatal manifestation:
+`docs/known-issues/wildfly-boot-stale-reader-nsme-mechanismdatabase.md`, ~2/1,500 attempts). That
+work belongs to the GC/frame-scan (precise-maps) roadmap; the native-side surface of this family is
+done.

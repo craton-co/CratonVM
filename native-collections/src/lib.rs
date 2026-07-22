@@ -7414,7 +7414,7 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     // cceres5 (live-captured on the FIXED fix3 binary, boot-145: the
     // `Object.entrySet()` NSME at getOrCreateSubregistry recurred): the
     // `isEmpty()` invoke below dispatches real bytecode (GC-capable) and
-    // `source` was carried RAW across it into the iterator walk — the walk's
+    // `source` was carried RAW across it into the iterator walk -- the walk's
     // own entry pin then faithfully pinned an ALREADY-STALE address. Pin +
     // refresh across the probe.
     let source_pin = ctx.pin_native_root(source);

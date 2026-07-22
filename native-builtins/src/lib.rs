@@ -9843,6 +9843,11 @@ const HIBERNATE_ANNOTATION_DESCRIPTOR_REGISTRY_STANDARD: &str =
 const HIBERNATE_ORM_ANNOTATION_DESCRIPTOR: &str =
     "org/hibernate/models/internal/OrmAnnotationDescriptor";
 const HIBERNATE_ASSOCIATION_KEY: &str = "org/hibernate/metamodel/mapping/AssociationKey";
+const HIBERNATE_NAVIGABLE_PATH: &str = "org/hibernate/spi/NavigablePath";
+const HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH: &str =
+    "org/hibernate/spi/EntityIdentifierNavigablePath";
+const HIBERNATE_TREATED_NAVIGABLE_PATH: &str = "org/hibernate/spi/TreatedNavigablePath";
+const HIBERNATE_NAVIGABLE_ROLE: &str = "org/hibernate/metamodel/model/domain/NavigableRole";
 const HIBERNATE_BASIC_VALUED_MODEL_PART: &str =
     "org/hibernate/metamodel/mapping/BasicValuedModelPart";
 const HIBERNATE_IMMUTABLE_ATTRIBUTE_MAPPING_LIST: &str =
@@ -17161,6 +17166,228 @@ fn native_hibernate_association_key_equals(
     result
 }
 
+/// `NavigablePath` is the key type used while Hibernate de-duplicates the
+/// circular EAGER-fetch graph.  Its value accessors are deliberately tiny
+/// field reads, but the graph can call them at every level of a very deep
+/// equality recursion.  Keep the Java `equals` implementation authoritative
+/// and only bridge these allocation-free accessors.
+fn native_hibernate_navigable_path_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(match ctx.get_field_by_name(this, "hashCode") {
+        Value::Int(hash) => Value::Int(hash),
+        _ => Value::Int(0),
+    }))
+}
+
+fn native_hibernate_navigable_path_get_alias(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "alias")))
+}
+
+fn native_hibernate_navigable_path_get_real_parent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(ctx.get_field_by_name(this, "parent")))
+}
+
+fn native_hibernate_navigable_path_get_parent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let parent = match ctx.get_field_by_name(this, "parent") {
+        Value::Object(Some(parent)) => parent,
+        Value::Object(None) => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // Mirrors `parent instanceof TreatedNavigablePath ? parent.getParent() :
+    // parent`. Treated paths cannot themselves have treated parents (the Java
+    // constructor asserts this), so reading that parent directly avoids a
+    // recursive native dispatch while retaining the exact observable result.
+    if ctx
+        .class_name_of_id(ctx.class_id_of_object(parent))
+        .as_deref()
+        == Some("org/hibernate/spi/TreatedNavigablePath")
+    {
+        return Ok(Some(ctx.get_field_by_name(parent, "parent")));
+    }
+    Ok(Some(Value::Object(Some(parent))))
+}
+
+fn hibernate_navigable_path_is_entity_identifier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref()
+        == Some(HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH)
+}
+
+fn hibernate_navigable_path_is_path(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref(),
+        Some(
+            HIBERNATE_NAVIGABLE_PATH
+                | HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH
+                | HIBERNATE_TREATED_NAVIGABLE_PATH
+        )
+    )
+}
+
+fn hibernate_pinned_objects_equal(
+    ctx: &mut dyn NativeContext,
+    left: Option<ObjectRef>,
+    right: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(a), Some(b)) if a == b => Ok(true),
+        (Some(a), Some(b)) => {
+            let base = ctx.pin_native_root(a);
+            let b_pin = ctx.pin_native_root(b);
+            let result = (|| {
+                let a = ctx.read_native_pin(base, a);
+                let b = ctx.read_native_pin(b_pin, b);
+                match ctx.invoke_virtual(a, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(b))])? {
+                    Some(Value::Int(v)) => Ok(v != 0),
+                    _ => Ok(false),
+                }
+            })();
+            ctx.unpin_native_roots(base);
+            result
+        }
+        _ => Ok(false),
+    }
+}
+
+fn hibernate_navigable_path_field_object(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    field: &str,
+) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(value) => value,
+        _ => None,
+    }
+}
+
+/// Exact native mirror of Hibernate 7.2's immutable `NavigablePath.equals`.
+///
+/// The all-EAGER RCA mappings repeatedly compare paths tens of frames deep
+/// while constructing one loader graph. The Java body is correct but turns
+/// each immutable field comparison into several interpreter frames. This
+/// keeps the same identity, identifier-path, alias and parent rules while
+/// retaining GC roots across the only re-entrant operations (String/parent
+/// equality).
+fn native_hibernate_navigable_path_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(other) = (match args.get(1) {
+        Some(Value::Object(other)) => *other,
+        _ => None,
+    }) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    if this == other {
+        return Ok(Some(Value::Int(1)));
+    }
+
+    let other_is_path = hibernate_navigable_path_is_path(ctx, other);
+    let other_is_role = ctx.class_name_of_id(ctx.class_id_of_object(other)).as_deref()
+        == Some(HIBERNATE_NAVIGABLE_ROLE);
+    if !other_is_path && !other_is_role {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let this_pin = ctx.pin_native_root(this);
+    let other_pin = ctx.pin_native_root(other);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        let this_entity = hibernate_navigable_path_is_entity_identifier(ctx, this);
+        let other_entity = other_is_path && hibernate_navigable_path_is_entity_identifier(ctx, other);
+
+        let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
+        let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
+        let local_names_match = if hibernate_pinned_objects_equal(ctx, this_local, other_local)? {
+            true
+        } else if other_entity {
+            if this_entity {
+                false
+            } else {
+                let this = ctx.read_native_pin(this_pin, this);
+                let other = ctx.read_native_pin(other_pin, other);
+                let this_local = hibernate_navigable_path_field_object(ctx, this, "localName");
+                let other_identifier =
+                    hibernate_navigable_path_field_object(ctx, other, "identifierAttributeName");
+                hibernate_pinned_objects_equal(
+                    ctx,
+                    this_local,
+                    other_identifier,
+                )?
+            }
+        } else if this_entity {
+            let this = ctx.read_native_pin(this_pin, this);
+            let other = ctx.read_native_pin(other_pin, other);
+            let this_identifier =
+                hibernate_navigable_path_field_object(ctx, this, "identifierAttributeName");
+            let other_local = hibernate_navigable_path_field_object(ctx, other, "localName");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_identifier,
+                other_local,
+            )?
+        } else {
+            false
+        };
+        if !local_names_match {
+            return Ok(Some(Value::Int(0)));
+        }
+
+        let this = ctx.read_native_pin(this_pin, this);
+        let other = ctx.read_native_pin(other_pin, other);
+        if other_is_path {
+            let this_alias = hibernate_navigable_path_field_object(ctx, this, "alias");
+            let other_alias = hibernate_navigable_path_field_object(ctx, other, "alias");
+            let aliases_equal = hibernate_pinned_objects_equal(
+                ctx,
+                this_alias,
+                other_alias,
+            )?;
+            if !aliases_equal {
+                return Ok(Some(Value::Int(0)));
+            }
+            let this = ctx.read_native_pin(this_pin, this);
+            let other = ctx.read_native_pin(other_pin, other);
+            let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
+            let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_parent,
+                other_parent,
+            )
+        } else {
+            let this_parent = hibernate_navigable_path_field_object(ctx, this, "parent");
+            let other_parent = hibernate_navigable_path_field_object(ctx, other, "parent");
+            hibernate_pinned_objects_equal(
+                ctx,
+                this_parent,
+                other_parent,
+            )
+        }
+        .map(|equal| Some(Value::Int(equal as i32)))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn native_hibernate_immutable_attribute_mapping_list_indexed_for_each(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -17404,6 +17631,36 @@ fn register_hibernate_models_intrinsics(registry: &mut NativeMethodRegistry) {
         "equals",
         "(Ljava/lang/Object;)Z",
         native_hibernate_association_key_equals,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "hashCode",
+        "()I",
+        native_hibernate_navigable_path_hash_code,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getAlias",
+        "()Ljava/lang/String;",
+        native_hibernate_navigable_path_get_alias,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getRealParent",
+        "()Lorg/hibernate/spi/NavigablePath;",
+        native_hibernate_navigable_path_get_real_parent,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "getParent",
+        "()Lorg/hibernate/spi/NavigablePath;",
+        native_hibernate_navigable_path_get_parent,
+    );
+    registry.register(
+        HIBERNATE_NAVIGABLE_PATH,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_hibernate_navigable_path_equals,
     );
     registry.register(
         HIBERNATE_IMMUTABLE_ATTRIBUTE_MAPPING_LIST,
@@ -19744,6 +20001,15 @@ mod antlr_prediction_context_tests {
             .is_some());
         assert!(registry
             .find(HIBERNATE_ASSOCIATION_KEY, "equals", "(Ljava/lang/Object;)Z",)
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "equals", "(Ljava/lang/Object;)Z")
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "getParent", "()Lorg/hibernate/spi/NavigablePath;")
+            .is_some());
+        assert!(registry
+            .find(HIBERNATE_NAVIGABLE_PATH, "getRealParent", "()Lorg/hibernate/spi/NavigablePath;")
             .is_some());
         assert!(registry
             .find(

@@ -4222,7 +4222,12 @@ impl SharedVm {
                 None => continue,
             };
             let before = jit.len();
-            jit.remove(class_part, method_part, descriptor);
+            let part_class_id = self
+                .class_manager
+                .read()
+                .get_loaded_class_id(class_part)
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            jit.remove(class_part, method_part, descriptor, part_class_id);
             if jit.len() < before {
                 evicted += 1;
             }

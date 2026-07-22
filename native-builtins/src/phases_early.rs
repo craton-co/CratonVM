@@ -16779,10 +16779,35 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     // compares ObjectRef pointers which is reference identity (not .equals()).
     r.register(ar, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field_volatile(this, 0)))
+        let v = ctx.get_field_volatile(this, 0);
+        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if let Value::Object(Some(o)) = v {
+                let cid = ctx.class_id_of_object(o);
+                let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+                if cn.contains("RootReference") {
+                    eprintln!(
+                        "[LOADER-TRACE] AtomicReference.get() this={:p} value_ptr={:p} value_class={} value_cid={}",
+                        this.as_ptr(), o.as_ptr(), cn, cid.as_u32()
+                    );
+                }
+            }
+        }
+        Ok(Some(v))
     });
     r.register(ar, "set", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if let Value::Object(Some(o)) = args[1] {
+                let cid = ctx.class_id_of_object(o);
+                let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+                if cn.contains("RootReference") {
+                    eprintln!(
+                        "[LOADER-TRACE] AtomicReference.set() this={:p} value_ptr={:p} value_class={} value_cid={}",
+                        this.as_ptr(), o.as_ptr(), cn, cid.as_u32()
+                    );
+                }
+            }
+        }
         ctx.set_field_volatile(this, 0, args[1]);
         Ok(Some(Value::Object(None)))
     });
@@ -16813,6 +16838,25 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ok = ctx.compare_and_swap_field(this, 0, args[1], args[2]);
+            if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+                if let Value::Object(Some(o)) = args[2] {
+                    let cid = ctx.class_id_of_object(o);
+                    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+                    if cn.contains("RootReference") {
+                        let expected_desc = match args[1] {
+                            Value::Object(Some(e)) => {
+                                let ecid = ctx.class_id_of_object(e);
+                                format!("{:p}/cid={}", e.as_ptr(), ecid.as_u32())
+                            }
+                            _ => "null".to_string(),
+                        };
+                        eprintln!(
+                            "[LOADER-TRACE] AtomicReference.compareAndSet() this={:p} expected={} new_ptr={:p} new_class={} new_cid={} ok={}",
+                            this.as_ptr(), expected_desc, o.as_ptr(), cn, cid.as_u32(), ok
+                        );
+                    }
+                }
+            }
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         },
     );

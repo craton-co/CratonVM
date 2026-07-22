@@ -6,6 +6,15 @@
 | **Area** | Suspected: JIT/interpreter throughput, GC pause behavior, or native-call dispatch overhead under real-JDK+JIT-on mode. |
 | **Severity** | Medium — no crashes or wrong results, but a real perf/timing gap wide enough to blow through Hibernate's own generous internal timeouts. |
 
+## 2026-07-22 closure note: `InsertOrderingRCATest`
+
+The later eager-fetch recursion residual is now fixed by the native,
+GC-safe `NavigablePath.equals` bridge documented in
+[`hibernate/insertorderingrcatest-eager-circular-fetch-recursion-20260721.md`](hibernate/insertorderingrcatest-eager-circular-fetch-recursion-20260721.md).
+The exact real-JDK suite class now passes in both modes: 65926 ms with
+`--nojit`, and 65615 ms with JIT. Earlier generic-throughput characterization
+below is retained as historical investigation context, not an open residual.
+
 ## Symptom
 
 Seven unrelated Hibernate test classes, spanning batching, JSON functions,

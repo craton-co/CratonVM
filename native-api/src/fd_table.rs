@@ -682,9 +682,31 @@ impl FileDescriptorTable {
         // theoretically — though in practice they shouldn't), so we
         // flush through the inner Mutex on the existing Arc and let
         // `Drop` close the OS handle when the Arc count reaches zero.
+        //
+        // `FileReadWrite`/`FileRead` also need the lock acquired (and
+        // dropped) here, even though there's nothing to flush: a reader
+        // or writer that already cloned this Arc via `get_entry` before
+        // the `remove()` above (e.g. a `pwrite_at`/`rw_read` call in
+        // flight on another thread) is invisible to the table lock and
+        // would otherwise keep running concurrently with — or after —
+        // this close(). Acquiring the entry's own lock blocks until that
+        // in-flight operation finishes, so no read/write started before
+        // this close() call can still be touching the file once it
+        // returns (callers that skip joining a writer thread before
+        // closing, e.g. H2 MVStore's `FileStore.stopBackgroundThread
+        // (waitForIt=false)`, otherwise race a stray write against the
+        // file being closed/truncated/reopened).
         match &*entry {
             FileEntry::FileWrite(writer) => writer.lock().flush(),
             FileEntry::ChildStdinPipe(p) => p.lock().flush(),
+            FileEntry::FileReadWrite(file) => {
+                let _ = file.lock();
+                Ok(())
+            }
+            FileEntry::FileRead(reader) => {
+                let _ = reader.lock();
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
