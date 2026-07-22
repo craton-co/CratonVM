@@ -52880,31 +52880,40 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let len = ctx.array_length(arr);
-    let mut result: i32 = 1;
-    for i in 0..len {
-        let elem = ctx.get_array_element(arr, i);
-        let elem_hash = match elem {
-            Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
-            Value::Int(v) => v,
-            Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => {
-                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-                bits as i32
-            }
-            Value::Double(v) => {
-                let bits = if v.is_nan() {
-                    0x7ff8_0000_0000_0000u64
-                } else {
-                    v.to_bits()
-                };
-                (bits ^ (bits >> 32)) as i32
-            }
-            _ => 0,
-        };
-        result = result.wrapping_mul(31).wrapping_add(elem_hash);
-    }
-    Ok(Some(Value::Int(result)))
+    // Element hashCode() is virtual and can allocate/collect. Keep the input
+    // array rooted and reload it before every element access rather than
+    // dereferencing its pre-GC address on the next iteration.
+    let arr_pin = ctx.pin_native_root(arr);
+    let result = (|| -> Result<i32, MethodCallFailed> {
+        let len = ctx.array_length(ctx.read_native_pin(arr_pin, arr));
+        let mut result: i32 = 1;
+        for i in 0..len {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let elem = ctx.get_array_element(arr, i);
+            let elem_hash = match elem {
+                Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
+                Value::Int(v) => v,
+                Value::Long(v) => (v ^ (v >> 32)) as i32,
+                Value::Float(v) => {
+                    let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                    bits as i32
+                }
+                Value::Double(v) => {
+                    let bits = if v.is_nan() {
+                        0x7ff8_0000_0000_0000u64
+                    } else {
+                        v.to_bits()
+                    };
+                    (bits ^ (bits >> 32)) as i32
+                }
+                _ => 0,
+            };
+            result = result.wrapping_mul(31).wrapping_add(elem_hash);
+        }
+        Ok(result)
+    })();
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Int(result?)))
 }
 
 fn native_objects_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

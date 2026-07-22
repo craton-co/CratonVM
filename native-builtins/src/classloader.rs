@@ -1211,6 +1211,18 @@ pub(crate) fn invoke_single_load_class_override(
 /// lookup that is correct for the built-in loaders.
 pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
+    // This predicate is reached from real ClassLoader bytecode before the
+    // receiver's dynamic type has otherwise been constrained. Treating every
+    // non-builtin class as a user loader made ordinary objects (notably String)
+    // reach the synthetic CL_LOADER_ID slot probe, producing an OOB field read
+    // during DoHead's reflective class loading. Require actual ClassLoader
+    // inheritance before considering the built-in-name exclusion.
+    let Some(class_loader) = ctx.class_id_by_name("java/lang/ClassLoader") else {
+        return false;
+    };
+    if cid != class_loader && !ctx.is_subclass(cid, class_loader) {
+        return false;
+    }
     match ctx.class_name_of_id(cid) {
         Some(name) => !is_builtin_loader_class(&name),
         None => false,
@@ -8537,6 +8549,13 @@ mod classloader_tests {
     #[test]
     fn test_reset_clears_real_jdk_loader_namespace_ids() {
         let mut ctx = MockNativeContext::new();
+        let class_loader = ctx
+            .ensure_class_initialized("java/lang/ClassLoader")
+            .expect("ClassLoader class");
+        let isolated_loader = ctx
+            .ensure_class_initialized("example/IsolatedLoader")
+            .expect("isolated loader class");
+        ctx.set_superclass(isolated_loader, class_loader);
         let loader = new_object_ref(&mut ctx, "example/IsolatedLoader");
         loader_namespace_id_store()
             .lock()

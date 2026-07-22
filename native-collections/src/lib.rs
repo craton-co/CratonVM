@@ -6305,11 +6305,10 @@ fn native_map_remove_pinned(
     };
     let this = ctx.read_native_pin(remove_pin_base, this);
     let key_val = read_pinned_elem(ctx, key_pin, key_val);
-    let key_ref = match key_val {
-        Value::Object(Some(k)) => Some(k),
-        Value::Object(None) if is_null_key => None,
+    match (key_val, is_null_key) {
+        (Value::Object(Some(_)), false) | (Value::Object(None), true) => {}
         _ => return Ok(Some(Value::Object(None))),
-    };
+    }
 
     let (buckets, size, cap) = map_state(ctx, this);
     let buckets = match buckets {
@@ -6332,21 +6331,36 @@ fn native_map_remove_pinned(
     // propagates instead of being silently treated as "not equal".
     fn node_matches_inner(
         ctx: &mut dyn NativeContext,
-        node: ObjectRef,
+        node_pin: usize,
+        node_fallback: ObjectRef,
         is_null_key: bool,
-        key_ref: Option<ObjectRef>,
+        key_pin: usize,
+        key_fallback: Value,
     ) -> Result<bool, MethodCallFailed> {
+        // The node and requested key can both be relocated while this native
+        // call is running on a Tomcat worker. Reload the node *before* reading
+        // its key field; pinning only the field value below was too late when
+        // the node's raw local had already crossed a collection.
+        let node = ctx.read_native_pin(node_pin, node_fallback);
         let node_key_field = get_node_key(ctx, node);
         if is_null_key {
-            Ok(matches!(node_key_field, Value::Object(None)))
-        } else if let Value::Object(Some(nk)) = node_key_field {
-            match key_ref {
-                Some(k) => map_keys_equal(ctx, nk, k),
-                None => Ok(false),
-            }
-        } else {
-            Ok(false)
+            return Ok(matches!(node_key_field, Value::Object(None)));
         }
+        let Value::Object(Some(nk)) = node_key_field else {
+            return Ok(false);
+        };
+        let Value::Object(Some(k)) = read_pinned_elem(ctx, key_pin, key_fallback) else {
+            return Ok(false);
+        };
+        // The freshly loaded node key has no caller-owned pin. Retain it
+        // together with the already-rooted requested key for every
+        // fast-wrapper probe and the eventual Java equals dispatch.
+        let nk_pin = ctx.pin_native_root(nk);
+        let nk = ctx.read_native_pin(nk_pin, nk);
+        let k = ctx.read_native_pin(key_pin, k);
+        let result = map_keys_equal(ctx, nk, k);
+        ctx.unpin_native_roots(nk_pin);
+        result
     }
 
     // Check if the head node is the target
@@ -6360,7 +6374,7 @@ fn native_map_remove_pinned(
         // address (docs/known-issues/tomcat-08-07/
         // dohead-post-fix-sporadic-residuals.md's header-count residual).
         let head_pin = ctx.pin_native_root(head);
-        let head_matches = node_matches_inner(ctx, head, is_null_key, key_ref)?;
+        let head_matches = node_matches_inner(ctx, head_pin, head, is_null_key, key_pin, key_val)?;
         let head = ctx.read_native_pin(head_pin, head);
         let buckets = ctx.read_native_pin(buckets_pin, buckets);
         // GC SAFETY (2026-07-20, DoHead sporadic transport-flake
@@ -6415,7 +6429,8 @@ fn native_map_remove_pinned(
             // dereferencing either again.
             let prev_pin = ctx.pin_native_root(prev);
             let curr_pin = ctx.pin_native_root(curr);
-            let curr_matches = node_matches_inner(ctx, curr, is_null_key, key_ref)?;
+            let curr_matches =
+                node_matches_inner(ctx, curr_pin, curr, is_null_key, key_pin, key_val)?;
             prev = ctx.read_native_pin(prev_pin, prev);
             let curr = ctx.read_native_pin(curr_pin, curr);
             // GC SAFETY: same `this`-goes-stale hazard as the head check
