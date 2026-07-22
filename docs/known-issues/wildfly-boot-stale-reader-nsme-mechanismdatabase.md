@@ -37,6 +37,21 @@ Commit `9dc757731` (same branch) extends `CRATONVM_DBG_CCE_BT` to dump the Java 
 (`site=nsme_dispatch`) — the exact instrumentation that named the `getOrDefault` producer within one
 campaign wave. The one sighting predates the tracer build, so no stack exists yet.
 
+## Second sighting WITH stack (2026-07-22, fix6 campaign boot-139)
+
+The `site=nsme_dispatch` tracer captured the full frame chain:
+`MechanismDatabase.<init> pc=47` ← `<clinit>` ← `CipherSuiteSelector.fromNamesString` ←
+`SSLDefinitions$CipherSuiteFilterValidator.validateParameter` ← `AttributeDefinition.validateAndSet`
+← `AbstractAddStepHandler` ← `ParallelBootOperationStepHandler$ParallelBootTask.run` — i.e. the
+elytron cipher-suite validation running MechanismDatabase's properties-read loop during
+parallel-extension-add. The reader ref dies inside the constructor's own read loop. Reader
+CONSTRUCTION natives (`alloc_stream_decoder` family) were pin-hardened in the 2026-07-11 sweep, and
+on this binary every collection/getOrDefault/ResourceBundle/StringBuilder producer is fixed — this
+sighting therefore belongs to the interpreter frame-slot staleness characterized in
+`docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md` (same pickup: the
+moving collector's interpreter frame scan), not to a native producer. Rate: 2 sightings in ~1,500
+combined post-fix attempts.
+
 ## Next steps
 
 - Re-run the `xargs -P 10` isolated `standalone.sh` harness

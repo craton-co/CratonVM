@@ -32,48 +32,80 @@ use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
 
+// cceres5 (WildFly metrics `getResourceDescription` stale-ResourceBundle,
+// live-captured 2026-07-22 via CRATONVM_DBG_STALE_RECV): every helper below
+// interleaves `create_string`/array allocations with stores into `map`/`arr`
+// while holding the raw refs — a moving GC mid-sequence baked pre-move
+// addresses into the freshly built bundle (and `rb_get_bundle` then RETURNED
+// the pre-move bundle itself). Pin + re-read throughout, per the Family-1
+// idiom.
 fn make_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
+    let arr_pin = ctx.pin_native_root(arr);
     for (i, s) in items.iter().enumerate() {
         let js = ctx.create_string(s);
-        ctx.set_array_element(arr, i, Value::Object(Some(js)));
+        let arr_now = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr_now, i, Value::Object(Some(js)));
     }
+    let arr = ctx.read_native_pin(arr_pin, arr);
+    ctx.unpin_native_roots(arr_pin);
     arr
 }
 
-fn put_arr(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, items: &[&str]) {
+// `map_pin` is the CALLER's pin for `map` (taken before its first
+// allocation); reading through it here yields the current address even after
+// the internal string/array allocations of earlier calls in the caller's
+// sequence.
+fn put_arr(
+    ctx: &mut dyn NativeContext,
+    map_pin: usize,
+    map: ObjectRef,
+    key: &str,
+    items: &[&str],
+) {
     let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
     let arr = make_string_array(ctx, items);
+    let map_now = ctx.read_native_pin(map_pin, map);
+    let k_now = ctx.read_native_pin(k_pin, k);
     cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
-            Value::Object(Some(map)),
-            Value::Object(Some(k)),
+            Value::Object(Some(map_now)),
+            Value::Object(Some(k_now)),
             Value::Object(Some(arr)),
         ],
     )
     .ok();
+    ctx.unpin_native_roots(k_pin);
 }
 
-fn put_str(ctx: &mut dyn NativeContext, map: ObjectRef, key: &str, value: &str) {
+fn put_str(ctx: &mut dyn NativeContext, map_pin: usize, map: ObjectRef, key: &str, value: &str) {
     let k = ctx.create_string(key);
+    let k_pin = ctx.pin_native_root(k);
     let v = ctx.create_string(value);
+    let map_now = ctx.read_native_pin(map_pin, map);
+    let k_now = ctx.read_native_pin(k_pin, k);
     cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
-            Value::Object(Some(map)),
-            Value::Object(Some(k)),
+            Value::Object(Some(map_now)),
+            Value::Object(Some(k_now)),
             Value::Object(Some(v)),
         ],
     )
     .ok();
+    ctx.unpin_native_roots(k_pin);
 }
 
 fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    // cceres5: every put below allocates; one entry pin, read per call.
+    let map_pin = ctx.pin_native_root(map);
     // 13-slot month arrays (12 months + empty trailing slot for lunar
     // calendar compatibility, per the JDK convention).
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthNames",
         &[
@@ -94,6 +126,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthAbbreviations",
         &[
@@ -102,6 +135,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "MonthNarrows",
         &[
@@ -110,6 +144,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthNames",
         &[
@@ -130,6 +165,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthAbbreviations",
         &[
@@ -138,6 +174,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.MonthNarrows",
         &[
@@ -151,6 +188,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     // would yield a 9-slot result and trip downstream array reads.
     put_arr(
         ctx,
+        map_pin,
         map,
         "DayNames",
         &[
@@ -165,13 +203,15 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "DayAbbreviations",
         &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
-    put_arr(ctx, map, "DayNarrows", &["S", "M", "T", "W", "T", "F", "S"]);
+    put_arr(ctx, map_pin, map, "DayNarrows", &["S", "M", "T", "W", "T", "F", "S"]);
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayNames",
         &[
@@ -186,47 +226,53 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayAbbreviations",
         &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.DayNarrows",
         &["S", "M", "T", "W", "T", "F", "S"],
     );
-    put_arr(ctx, map, "AmPmMarkers", &["AM", "PM"]);
-    put_arr(ctx, map, "narrow.AmPmMarkers", &["a", "p"]);
-    put_arr(ctx, map, "Eras", &["BC", "AD"]);
-    put_arr(ctx, map, "short.Eras", &["BC", "AD"]);
-    put_arr(ctx, map, "narrow.Eras", &["B", "A"]);
+    put_arr(ctx, map_pin, map, "AmPmMarkers", &["AM", "PM"]);
+    put_arr(ctx, map_pin, map, "narrow.AmPmMarkers", &["a", "p"]);
+    put_arr(ctx, map_pin, map, "Eras", &["BC", "AD"]);
+    put_arr(ctx, map_pin, map, "short.Eras", &["BC", "AD"]);
+    put_arr(ctx, map_pin, map, "narrow.Eras", &["B", "A"]);
     put_arr(
         ctx,
+        map_pin,
         map,
         "QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
-    put_arr(ctx, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
-    put_arr(ctx, map, "QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(ctx, map_pin, map, "QuarterAbbreviations", &["Q1", "Q2", "Q3", "Q4"]);
+    put_arr(ctx, map_pin, map, "QuarterNarrows", &["1", "2", "3", "4"]);
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.QuarterNames",
         &["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "standalone.QuarterAbbreviations",
         &["Q1", "Q2", "Q3", "Q4"],
     );
-    put_arr(ctx, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
+    put_arr(ctx, map_pin, map, "standalone.QuarterNarrows", &["1", "2", "3", "4"]);
     // 9-slot DateTimePatterns: 4 time patterns (FULL/LONG/MEDIUM/SHORT),
     // 4 date patterns, 1 date-time combiner — the standard JDK layout
     // SimpleDateFormat consumes via DateFormatSymbols.
     put_arr(
         ctx,
+        map_pin,
         map,
         "DateTimePatterns",
         &[
@@ -243,6 +289,7 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "gregorian.DateTimePatterns",
         &[
@@ -257,9 +304,10 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
             "{1} {0}",
         ],
     );
-    put_str(ctx, map, "DateTimePatternChars", "GyMdkHmsSEDFwWahKzZYuXL");
+    put_str(ctx, map_pin, map, "DateTimePatternChars", "GyMdkHmsSEDFwWahKzZYuXL");
     put_arr(
         ctx,
+        map_pin,
         map,
         "NumberPatterns",
         &[
@@ -271,16 +319,20 @@ fn populate_format_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
     );
     put_arr(
         ctx,
+        map_pin,
         map,
         "NumberElements",
         &[
             ".", ",", ";", "%", "0", "#", "-", "E", "\u{2030}", "\u{221E}", "NaN",
         ],
     );
-    put_str(ctx, map, "TimePatternChars", "hHmsSaEcLkKzZ");
+    put_str(ctx, map_pin, map, "TimePatternChars", "hHmsSaEcLkKzZ");
+    ctx.unpin_native_roots(map_pin);
 }
 
 fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
+    // cceres5: every put below allocates; one entry pin, read per call.
+    let map_pin = ctx.pin_native_root(map);
     let langs: &[(&str, &str)] = &[
         ("en", "English"),
         ("fr", "French"),
@@ -319,28 +371,35 @@ fn populate_locale_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
         ("ZA", "South Africa"),
     ];
     for (k, v) in langs {
-        put_str(ctx, map, k, v);
+        put_str(ctx, map_pin, map, k, v);
     }
     for (k, v) in countries {
-        put_str(ctx, map, k, v);
+        put_str(ctx, map_pin, map, k, v);
     }
+    ctx.unpin_native_roots(map_pin);
 }
 
 fn populate_calendar_data_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
-    put_str(ctx, map, "firstDayOfWeek", "1"); // Sunday
-    put_str(ctx, map, "minimalDaysInFirstWeek", "1");
+    // cceres5: every put below allocates; one entry pin, read per call.
+    let map_pin = ctx.pin_native_root(map);
+    put_str(ctx, map_pin, map, "firstDayOfWeek", "1"); // Sunday
+    put_str(ctx, map_pin, map, "minimalDaysInFirstWeek", "1");
+    ctx.unpin_native_roots(map_pin);
 }
 
 fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
-    put_str(ctx, map, "USD", "US Dollar");
-    put_str(ctx, map, "EUR", "Euro");
-    put_str(ctx, map, "GBP", "British Pound");
-    put_str(ctx, map, "JPY", "Japanese Yen");
-    put_str(ctx, map, "CNY", "Chinese Yuan");
-    put_str(ctx, map, "usd", "$");
-    put_str(ctx, map, "eur", "\u{20AC}");
-    put_str(ctx, map, "gbp", "\u{00A3}");
-    put_str(ctx, map, "jpy", "\u{00A5}");
+    // cceres5: every put below allocates; one entry pin, read per call.
+    let map_pin = ctx.pin_native_root(map);
+    put_str(ctx, map_pin, map, "USD", "US Dollar");
+    put_str(ctx, map_pin, map, "EUR", "Euro");
+    put_str(ctx, map_pin, map, "GBP", "British Pound");
+    put_str(ctx, map_pin, map, "JPY", "Japanese Yen");
+    put_str(ctx, map_pin, map, "CNY", "Chinese Yuan");
+    put_str(ctx, map_pin, map, "usd", "$");
+    put_str(ctx, map_pin, map, "eur", "\u{20AC}");
+    put_str(ctx, map_pin, map, "gbp", "\u{00A3}");
+    put_str(ctx, map_pin, map, "jpy", "\u{00A5}");
+    ctx.unpin_native_roots(map_pin);
 }
 
 /// Build a synthetic `ResourceBundle` for `bundle_name`. Always returns
@@ -348,11 +407,20 @@ fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
 /// populate from the file. For known JDK locale-data base names we
 /// pre-populate English/US defaults. Unknown names get an empty bundle.
 fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
+    // cceres5: pin the bundle + backing map across every allocation below
+    // (map init, root-locale alloc, per-property string allocations, the
+    // populate tables) and return the pin-refreshed address — the raw `obj`
+    // return was one producer of the stale-ResourceBundle family (see
+    // rb_get_bundle).
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj_pin = ctx.pin_native_root(obj);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
-    ctx.set_field(obj, 0, Value::Object(Some(map)));
-    ctx.set_field(obj, 1, Value::Object(None));
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
+    let map_now = ctx.read_native_pin(map_pin, map);
+    ctx.set_field(obj_now, 0, Value::Object(Some(map_now)));
+    ctx.set_field(obj_now, 1, Value::Object(None));
 
     // CRITICAL (Tomcat boot): `java.util.ResourceBundle.getLocale()` is a
     // `final` JDK method whose body is `return this.locale;`. Our synthetic
@@ -371,12 +439,13 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     // there. The `getLocale` native override still returns the same value;
     // this just guarantees correctness when the override is bypassed.
     let root_locale = crate::locale_alloc(ctx, "", "");
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
     if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-        ctx.set_field(obj, loc_idx, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, loc_idx, Value::Object(Some(root_locale)));
     } else {
         // Synthetic-JDK mode (class not loaded with real layout): slot 1 is
         // the conventional `locale` placement used by the synthetic layout.
-        ctx.set_field(obj, 1, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, 1, Value::Object(Some(root_locale)));
     }
 
     // .properties fallback for user resources.
@@ -394,16 +463,20 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
                     let key = line[..pos].trim();
                     let value = line[pos + 1..].trim();
                     let k = ctx.create_string(key);
+                    let k_pin = ctx.pin_native_root(k);
                     let v = ctx.create_string(value);
+                    let map_now = ctx.read_native_pin(map_pin, map);
+                    let k_now = ctx.read_native_pin(k_pin, k);
                     cratonvm_native_collections::native_map_put_pub(
                         ctx,
                         &[
-                            Value::Object(Some(map)),
-                            Value::Object(Some(k)),
+                            Value::Object(Some(map_now)),
+                            Value::Object(Some(k_now)),
                             Value::Object(Some(v)),
                         ],
                     )
                     .ok();
+                    ctx.unpin_native_roots(k_pin);
                     populated_from_props = true;
                 }
             }
@@ -415,24 +488,30 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
             || bundle_name.starts_with("sun.text.resources.cldr.FormatData")
             || bundle_name.starts_with("sun.text.resources.ext.FormatData")
         {
-            populate_format_data_en(ctx, map);
+            let map_now = ctx.read_native_pin(map_pin, map);
+            populate_format_data_en(ctx, map_now);
         } else if bundle_name.starts_with("sun.util.resources.LocaleNames")
             || bundle_name.starts_with("sun.util.resources.cldr.LocaleNames")
             || bundle_name.starts_with("sun.util.resources.ext.LocaleNames")
         {
-            populate_locale_names_en(ctx, map);
+            let map_now = ctx.read_native_pin(map_pin, map);
+            populate_locale_names_en(ctx, map_now);
         } else if bundle_name.starts_with("sun.util.resources.CalendarData")
             || bundle_name.starts_with("sun.util.resources.cldr.CalendarData")
         {
-            populate_calendar_data_en(ctx, map);
+            let map_now = ctx.read_native_pin(map_pin, map);
+            populate_calendar_data_en(ctx, map_now);
         } else if bundle_name.starts_with("sun.util.resources.CurrencyNames")
             || bundle_name.starts_with("sun.util.resources.cldr.CurrencyNames")
         {
-            populate_currency_names_en(ctx, map);
+            let map_now = ctx.read_native_pin(map_pin, map);
+            populate_currency_names_en(ctx, map_now);
         }
     }
 
-    obj
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
+    obj_now
 }
 
 /// Decode `java.util.Properties` escapes in a key or value: `\uXXXX`,
@@ -475,6 +554,10 @@ fn parse_props_into_map(ctx: &mut dyn NativeContext, map: ObjectRef, bytes: &[u8
         Ok(c) => c,
         Err(_) => return,
     };
+    // cceres5: one entry pin for the whole parse — each line's two
+    // `create_string` calls can move `map`, and pinning the raw param
+    // per-line would just pin an already-stale address on later lines.
+    let entry_pin = ctx.pin_native_root(map);
     let mut pending = String::new();
     let mut continuing = false;
     for raw in content.lines() {
@@ -516,19 +599,24 @@ fn parse_props_into_map(ctx: &mut dyn NativeContext, map: ObjectRef, bytes: &[u8
             let key = unescape_props(pending[..pos].trim_end());
             let val = unescape_props(pending[pos + 1..].trim_start());
             let k = ctx.create_string(&key);
+            let k_pin = ctx.pin_native_root(k);
             let v = ctx.create_string(&val);
+            let map_now = ctx.read_native_pin(entry_pin, map);
+            let k_now = ctx.read_native_pin(k_pin, k);
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
                 &[
-                    Value::Object(Some(map)),
-                    Value::Object(Some(k)),
+                    Value::Object(Some(map_now)),
+                    Value::Object(Some(k_now)),
                     Value::Object(Some(v)),
                 ],
             )
             .ok();
+            ctx.unpin_native_roots(k_pin);
         }
         pending.clear();
     }
+    ctx.unpin_native_roots(entry_pin);
 }
 
 /// `true` for JDK-internal bundle base names that CratonVM synthesizes (locale
@@ -901,17 +989,29 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
     let loader = bundle_class_loader(ctx, args);
 
+    // cceres5 (WildFly metrics stale-ResourceBundle, live-captured via
+    // CRATONVM_DBG_STALE_RECV): `obj`/`map`/`loader` were carried raw across
+    // map-init, every per-candidate parse (hundreds of string allocations),
+    // and `locale_alloc` — and the PRE-MOVE `obj` was then returned to Java.
+    // Pin all three; read through the pins at every later use.
+    let loader_pin = loader.map(|l| ctx.pin_native_root(l));
     let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj_pin = ctx.pin_native_root(obj);
     let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
-    ctx.set_field(obj, 0, Value::Object(Some(map)));
-    ctx.set_field(obj, 1, Value::Object(None));
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
+    let map_now = ctx.read_native_pin(map_pin, map);
+    ctx.set_field(obj_now, 0, Value::Object(Some(map_now)));
+    ctx.set_field(obj_now, 1, Value::Object(None));
 
     let mut matched: Option<(String, String)> = None;
     for (cand, m_lang, m_country) in &chain {
         let path = format!("{}.properties", cand.replace('.', "/"));
-        if let Some(bytes) = find_bundle_resource(ctx, loader, &path) {
-            parse_props_into_map(ctx, map, &bytes);
+        let loader_now = loader_pin.map(|p| ctx.read_native_pin(p, loader.unwrap()));
+        if let Some(bytes) = find_bundle_resource(ctx, loader_now, &path) {
+            let map_now = ctx.read_native_pin(map_pin, map);
+            parse_props_into_map(ctx, map_now, &bytes);
             matched = Some((m_lang.clone(), m_country.clone()));
         }
     }
@@ -942,8 +1042,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             let fallback_chain = build_locale_chain(&bundle_name, &f_lang, &f_country, &f_variant);
             for (cand, m_lang, m_country) in &fallback_chain {
                 let path = format!("{}.properties", cand.replace('.', "/"));
-                if let Some(bytes) = find_bundle_resource(ctx, loader, &path) {
-                    parse_props_into_map(ctx, map, &bytes);
+                let loader_now = loader_pin.map(|p| ctx.read_native_pin(p, loader.unwrap()));
+                if let Some(bytes) = find_bundle_resource(ctx, loader_now, &path) {
+                    let map_now = ctx.read_native_pin(map_pin, map);
+                    parse_props_into_map(ctx, map_now, &bytes);
                     matched = Some((m_lang.clone(), m_country.clone()));
                 }
             }
@@ -953,12 +1055,15 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
     if let Some((m_lang, m_country)) = matched {
         let locale = crate::locale_alloc(ctx, &m_lang, &m_country);
+        let obj_now = ctx.read_native_pin(obj_pin, obj);
         if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-            ctx.set_field(obj, loc_idx, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, loc_idx, Value::Object(Some(locale)));
         } else {
-            ctx.set_field(obj, 1, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, 1, Value::Object(Some(locale)));
         }
-        return Ok(Some(Value::Object(Some(obj))));
+        let first_pin = loader_pin.unwrap_or(obj_pin);
+        ctx.unpin_native_roots(first_pin);
+        return Ok(Some(Value::Object(Some(obj_now))));
     }
 
     // No .properties on the classpath. Before the synthetic / empty-bundle
@@ -968,6 +1073,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // hand-synthesized locale-data families, which stay on their curated path.
     if !is_synthesized_locale_base(&bundle_name) || needs_concrete_bundle_class(&bundle_name) {
         if let Some(real) = try_class_bundle(ctx, &chain) {
+            ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
             return Ok(Some(Value::Object(Some(real))));
         }
     }
@@ -977,9 +1083,11 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // (java.util.ResourceBundle.getBundle's contract, which callers such as
     // Tomcat's StringManager rely on).
     if is_jdk_internal_bundle(&bundle_name) {
+        ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
         let obj = build_bundle(ctx, &bundle_name);
         return Ok(Some(Value::Object(Some(obj))));
     }
+    ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
     let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
     let msg = ctx.create_string(&format!(
         "Can't find bundle for base name {bundle_name}, locale {lang}"
