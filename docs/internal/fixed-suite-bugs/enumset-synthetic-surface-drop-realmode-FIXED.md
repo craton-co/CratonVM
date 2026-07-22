@@ -22,7 +22,7 @@ non-passed selection failed through `org.apache.logging.log4j.Level.<clinit>`
 → `StandardLevel.getStandardLevel`) and blocked Tomcat's
 `WsServerContainer` constructor (`EnumSet.of(DispatcherType.REQUEST,
 DispatcherType.FORWARD)`), which in turn blocked the
-`docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md`
+`../../known-issues/tomcat/wsremoteendpoint-close-delay-near-deadlock.md`
 investigation from ever reaching Tomcat startup.
 
 ## Root cause (confirmed empirically via targeted debug instrumentation)
@@ -162,7 +162,7 @@ real-JDK mode so the real constructors/factories run.
   `TestWsRemoteEndpointImplServerDeadlock` now starts Tomcat successfully
   and reaches/runs the actual close-handshake test logic (previously never
   got past `WsServerContainer`'s constructor). See
-  `docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md`
+  `../../known-issues/tomcat/wsremoteendpoint-close-delay-near-deadlock.md`
   for the continuation of that investigation — the close-delay/hang itself
   is a separate, still-open issue.
 - ES suite spot check (2 sampled classes,

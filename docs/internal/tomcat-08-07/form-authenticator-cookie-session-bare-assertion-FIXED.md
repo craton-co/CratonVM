@@ -8,7 +8,7 @@ cookie/session-ID handling test matrix). **HotSpot:** PASS (A 9/9, B 6/6,
 C 7/7 — `overnight0629c/hotspot-jit`). A **new, unrelated** blocker was
 found while re-verifying this fix — see the "2026-07-10 verification" section
 near the bottom and
-[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat-08-07/formauth-zero-byte-garbage-http-request.md)
+[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat/formauth-zero-byte-garbage-http-request.md)
 (filed separately; reproduces identically on unmodified `dev`, so it is not
 a regression from this doc's fix).
 
@@ -254,7 +254,7 @@ found in method name [0x00 0x00 ...]` (a few hundred NUL bytes instead of an
 HTTP method) on a freshly-accepted socket — 100% of test methods, identically
 on both binaries (the unmodified baseline actually fared *worse*, hanging all
 3 classes at a 120s timeout instead of failing cleanly). Filed separately as
-[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat-08-07/formauth-zero-byte-garbage-http-request.md)
+[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat/formauth-zero-byte-garbage-http-request.md)
 since it blocks a clean HotSpot-matching pass-rate re-confirmation for this
 doc but is demonstrably not caused by the fix above.
 
@@ -293,6 +293,6 @@ cd C:\craton\CratonVM\apps\tomcat-suite-runner
 
 This doc's own bug is fixed; retired to `docs/internal/tomcat-08-07/`.
 Whoever picks up Tomcat suite work next should instead chase
-[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat-08-07/formauth-zero-byte-garbage-http-request.md)
+[`formauth-zero-byte-garbage-http-request.md`](../../known-issues/tomcat/formauth-zero-byte-garbage-http-request.md)
 — the new blocker found while re-verifying this fix — to get a clean
 9/9, 6/6, 7/7 HotSpot-matching confirmation run.

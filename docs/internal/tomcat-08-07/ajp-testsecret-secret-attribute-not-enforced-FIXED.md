@@ -33,5 +33,5 @@ AJP_TESTSECRET runs=1 failures=0
 
 The probe preserves all three original requests: missing secret -> 403, wrong
 secret -> 403, and `RIGHTSECRET` -> 200. The unrelated
-[`testNoHeaders` residual](../../known-issues/tomcat-08-07/ajp-testnoheaders-response-body-not-empty.md)
+[`testNoHeaders` residual](../../known-issues/tomcat/ajp-testnoheaders-response-body-not-empty.md)
 remains separately tracked.

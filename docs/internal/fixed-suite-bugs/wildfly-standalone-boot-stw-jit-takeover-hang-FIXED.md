@@ -365,7 +365,7 @@ STW barrier's `expected` set forever:
    investigation (live-gdb caught two threads permanently parked here during WildFly's
    `parallel-extension-add`, the lock held by `ConcreteResourceRegistration`'s shared registry lock)
    and, separately, a Tomcat/`TestOrderInterceptor` investigation
-   (`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md`) that found the exact
+   (`../../known-issues/tomcat/stw-crossthread-jit-takeover-hang-cluster.md`) that found the exact
    same missing bracket via a Windows `cdb` stack (Tribes' internal executor). The Tomcat-side fix
    landed first (`fix(gc): bracket 5 missing GC-blocking-region locks — the real STW takeover root
    cause`, `945e4492`, merged `dev`) — call-site-level `ctx.begin_blocking_region()`/
@@ -422,7 +422,7 @@ outside any lock acquisition).
 [[wildfly-remoting-classcastexception-parallel-extension-add]] — FIXED (`70154861`), moved to
 `docs/internal/fixed-suite-bugs/`; the `CCE_CRASH` bucket above is a recurrence of the same bug class at
 a new site, not this exact bug reopened.
-`docs/known-issues/tomcat-08-07/stw-crossthread-jit-takeover-hang-cluster.md` — the sibling
+`../../known-issues/tomcat/stw-crossthread-jit-takeover-hang-cluster.md` — the sibling
 investigation that found and fixed the `ReentrantReadWriteLock`/`StampedLock`/XNIO/`SynchronousQueue`
 cluster (`945e4492`) via a completely different repro (Tomcat `TestOrderInterceptor`), independently
 confirming the same root-cause class this doc found for `ReentrantReadWriteLock`/`StampedLock`.

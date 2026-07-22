@@ -702,4 +702,4 @@ tracked by a distinct, separately-scoped open doc — this document is moved
 to `docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md`,
 and the remaining low single-digit-percent, corruption-free, host-load-
 correlated transport flake is now tracked on its own as
-`docs/known-issues/tomcat-08-07/dohead-environmental-transport-flake.md`.
+`../../known-issues/tomcat/dohead-environmental-transport-flake.md`.

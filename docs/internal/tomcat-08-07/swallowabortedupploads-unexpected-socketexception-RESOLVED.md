@@ -343,7 +343,7 @@ assertion failures once the HTTP socket processor path is stable.
 Cross-checking the "lock is null" symptom mentioned above against a
 completely different suite class:
 `org.apache.catalina.valves.rewrite.TestRewriteValve` (see
-`docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`)
+`../../known-issues/tomcat/accesslogvalve-rewritevalve-connection-failures.md`)
 hit the exact same
 ```
 ERROR [org.apache.tomcat.util.net.NioEndpoint] Error running socket processor
@@ -1355,7 +1355,7 @@ whether it happens to be the exact mechanism behind this one crash.
 
 ## 2026-07-10: `accesslogvalve-rewritevalve-connection-failures.md` retired — its sixth-cause SIGSEGV catalogued here; stale Hibernate cross-reference in that doc corrected
 
-`docs/known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md`
+`../../known-issues/tomcat/accesslogvalve-rewritevalve-connection-failures.md`
 has been retired and moved to
 `docs/internal/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures-RESOLVED.md`.
 All five of its own locally-owned root causes (Layer 1 `URL.openConnection()`

@@ -309,7 +309,7 @@ and lack of any STW signature.
 
 This is very likely the same underlying issue (or a more severe,
 non-timing-out variant of it) as the already-open
-`docs/known-issues/tomcat-08-07/elinjsp-socket-read-timeout.md`
+`../known-issues/tomcat/elinjsp-socket-read-timeout.md`
 (`TestELInJsp` — 4/25 failures with client-side `SocketTimeoutException`,
 also EL/JSP, also via `getUrl()`) — that doc's failures eventually time out
 client-side (meaning a read timeout WAS configured for those specific

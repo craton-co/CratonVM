@@ -2,7 +2,7 @@
 
 **Status:** FIXED. **Found/fixed:** 2026-07-09, while investigating the
 Tomcat WebSocket close-delay bug (see
-`docs/known-issues/tomcat-08-07/wsremoteendpoint-close-delay-near-deadlock.md`).
+`../../known-issues/tomcat/wsremoteendpoint-close-delay-near-deadlock.md`).
 Commit: see `git log --oneline -- native-builtins/src/lib.rs` for
 `native_file_clinit` on `dev`.
 

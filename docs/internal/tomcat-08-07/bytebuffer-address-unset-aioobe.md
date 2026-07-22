@@ -8,7 +8,7 @@ NIO servers that read incoming bytes into a `byte[]` via bulk
 **HotSpot:** unaffected (n/a - this was a CratonVM-only synthetic-object gap).
 
 Found 2026-07-09 while re-verifying
-[`accesslogvalve-rewritevalve-connection-failures.md`](../../known-issues/tomcat-08-07/accesslogvalve-rewritevalve-connection-failures.md).
+[`accesslogvalve-rewritevalve-connection-failures.md`](../../known-issues/tomcat/accesslogvalve-rewritevalve-connection-failures.md).
 
 ## Symptom
 

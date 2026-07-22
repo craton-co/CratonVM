@@ -69,7 +69,7 @@ this gate to notice it now covered the `athrow` case too:
 Confirmed root cause of `Response.toAbsolute()` (Tomcat's hot
 URL-normalization path, `try { ... } catch (IOException) { throw new
 IllegalArgumentException(...) }`) permanently staying interpreted — see
-`docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md`'s
+`../known-issues/tomcat/silent-hang-no-signature-cluster.md`'s
 2026-07-19 deep-dive section for the original trace that led here.
 
 ## The fix — two parts
@@ -465,7 +465,7 @@ steps:
 ## 2026-07-20 session: recompile-storm root-caused and fixed; deeper residual found
 
 Full account, evidence, and the reverted-merge tangent in
-`docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md`'s
+`../known-issues/tomcat/silent-hang-no-signature-cluster.md`'s
 "2026-07-20 session" section — summarized here for this doc's own history.
 
 **Root cause of the recompile storm**: `toAbsolute()`'s internal loop always
