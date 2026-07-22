@@ -2237,16 +2237,52 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // consumers that enumerate `entrySet()` — Kafka's `AbstractConfig`, Spring's
     // `SpringFactoriesLoader`, `HashMap.putAll(props)` via the generic Map
     // iterator — observe the full map. Real stored value objects are reused.
+    //
+    // cceres5 (metrics-registry `(String) entry.getKey()` CCE, live-captured
+    // 2026-07-22): every `create_string` below can trigger a moving GC that
+    // relocates the strings already accumulated in `pairs` (and
+    // `chm_extra_entries` re-enters Java, which can move them all again).
+    // Accumulating the raw refs handed `make_static_entry_set` pre-move
+    // addresses. Pin every produced ref and refresh the whole vec through the
+    // pins immediately before building the set.
+    let this_pin = ctx.pin_native_root(this);
     let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(snapshot.len());
+    let mut pair_pins: Vec<(usize, usize)> = Vec::with_capacity(snapshot.len());
     for (k, v) in &snapshot {
         let ks = ctx.create_string(k);
+        let ks_pin = ctx.pin_native_root(ks);
         let vs = ctx.create_string(v);
+        let vs_pin = ctx.pin_native_root(vs);
         pairs.push((Value::Object(Some(ks)), Value::Object(Some(vs))));
+        pair_pins.push((ks_pin, vs_pin));
     }
     let side_keys: std::collections::HashSet<String> =
         snapshot.iter().map(|(k, _v)| k.clone()).collect();
-    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side_keys) {
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this_cur, &side_keys) {
+        let k_pin = ctx.pin_native_root(key_obj);
+        let v_pin = match value {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
         pairs.push((Value::Object(Some(key_obj)), value));
+        pair_pins.push((k_pin, v_pin));
+    }
+    // Refresh every accumulated pair to its current address. No allocation may
+    // happen between this loop and `make_static_entry_set`'s own entry pins.
+    for (i, (k_pin, v_pin)) in pair_pins.iter().enumerate() {
+        let (k0, v0) = pairs[i];
+        let k = match k0 {
+            Value::Object(Some(o)) => Value::Object(Some(ctx.read_native_pin(*k_pin, o))),
+            other => other,
+        };
+        let v = match (v0, *v_pin) {
+            (Value::Object(Some(o)), pin) if pin != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(pin, o)))
+            }
+            (other, _) => other,
+        };
+        pairs[i] = (k, v);
     }
     // Build a STATIC entrySet view backed by this Properties object. Each
     // element is a 3-field live `java/util/Map$Entry` (key@0, value@1,
@@ -2264,7 +2300,9 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // into this method and collapse to an empty iterator. Tagging the backing —
     // rather than the entries — as the write-through carrier also keeps a later
     // `new HashSet<>(props.entrySet())` copy correctly detached on `remove`.
-    let set = cratonvm_native_collections::make_static_entry_set(ctx, this, &pairs);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let set = cratonvm_native_collections::make_static_entry_set(ctx, this_cur, &pairs);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }
 

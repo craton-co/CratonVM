@@ -3416,7 +3416,7 @@ pub(crate) fn descriptor_to_class_mirror(
 /// `ClassId(0)` / java.lang.Object).  Otherwise `invokevirtual Class.isArray`
 /// on the returned mirror walks up Object's superclass chain and raises
 /// `NoSuchMethodError: java/lang/Object.isArray()Z`.
-fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
+pub(crate) fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
     // Resolve java/lang/Class вЂ” ensure it's loaded so we get its real ClassId.
     let class_class_id = ctx
         .ensure_class_initialized("java/lang/Class")

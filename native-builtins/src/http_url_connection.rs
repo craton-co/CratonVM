@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -1175,23 +1175,36 @@ fn read_response<S: Read>(
     stream: &mut S,
     head: bool,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(8192);
+    read_response_with_prefix(stream, head, Vec::new())
+}
+
+/// Same as [`read_response`], but starts from `prefix` bytes already read off
+/// the wire (e.g. the pooled connection liveness-probe's first read) instead
+/// of assuming nothing has been consumed yet.
+fn read_response_with_prefix<S: Read>(
+    stream: &mut S,
+    head: bool,
+    prefix: Vec<u8>,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let mut buf = prefix;
     let mut tmp = [0u8; 8192];
-    let head_end;
-    loop {
-        let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("response read", e))?;
-        if n == 0 {
-            return Err("connection closed before response head".into());
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            head_end = pos + 4;
-            break;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err("response head exceeded 64 KiB".into());
-        }
-    }
+    let head_end = match find_subslice(&buf, b"\r\n\r\n") {
+        Some(pos) => pos + 4,
+        None => loop {
+            let n =
+                read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("response read", e))?;
+            if n == 0 {
+                return Err("connection closed before response head".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > 64 * 1024 {
+                return Err("response head exceeded 64 KiB".into());
+            }
+        },
+    };
 
     let mut headers_storage = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers_storage);
@@ -1461,6 +1474,182 @@ fn huc_upcall_create_socket_if_custom_factory(
     Ok(Some(stream_id))
 }
 
+// ---------------------------------------------------------------------------
+// Plain-HTTP keep-alive connection pool
+// ---------------------------------------------------------------------------
+//
+// docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md
+// — real JDK's `sun.net.www.http.HttpClient` pools/reuses a TCP connection to
+// the same `(host, port)` across separate `HttpURLConnection` instances once
+// a response is fully drained; `perform` previously always opened a brand
+// new `TcpStream` per call. Plain-HTTP only (mirrors the request builder's
+// own `Connection: keep-alive` default above) — HTTPS is out of scope, same
+// as the reverted first attempt at this feature.
+//
+// A first implementation attempt (2026-07-22, see the doc above) was
+// reverted after a confirmed ~28-30s regression on `org.h2.test.server.
+// TestWeb`. Root-caused (this session, via `WebThread`/`WebServer`/`TestWeb`
+// source inspection) to: `TestWeb.test()` runs ~8 independent `Server`
+// instances *sequentially in one process*, ALL bound to the same fixed port
+// (8182) — each one's `finally { server.shutdown(); }` synchronously force-
+// closes any still-open kept-alive sockets (`WebServer.stop()` iterates
+// `running` `WebThread`s and calls `stopNow()`, i.e. `socket.close()`, on
+// each). A `(host,port)`-keyed pool inevitably hands the next test method's
+// first request a connection left over from the *previous, now-dead* server
+// instance — that is the dominant source of "staleness", not some inherent
+// property of the H2 wire protocol. The prior attempt's fix compounded this:
+// it used a full non-blocking peek plus a 2s probe-read timeout per stale
+// hit, AND (implicitly) could pay that cost once per pooled candidate if the
+// freshest one happened to look alive at peek time but still failed later.
+//
+// This attempt bounds cost differently:
+//   * A non-blocking `peek()` before handing out a pooled connection catches
+//     the common case — the peer's `socket.close()` sent a FIN well before
+//     the next request arrives (test methods do real work in between) — for
+//     effectively zero added latency, no timeout wait at all.
+//   * The residual race (peek looks alive, but the peer tears down before or
+//     during our write/first-read) is bounded by a SHORT, fixed probe
+//     timeout (`POOL_PROBE_TIMEOUT`, not the caller's full read timeout,
+//     which can be 60s) applied ONLY to the wait for the first response
+//     byte. Once real bytes arrive the connection is proven alive and the
+//     caller's normal `read_timeout` takes back over for the rest of the
+//     body — so a slow-but-alive server response is never misclassified as
+//     dead.
+//   * On ANY failure using a pooled connection (peek, write, or the bounded
+//     first-read), `perform` treats it exactly like a pool miss — silently
+//     discards it (and drains the rest of that key's bucket, since one dead
+//     connection strongly implies the others from the same server
+//     generation are equally dead — see `WebServer.stop()` above) and falls
+//     straight through to the ordinary fresh-connect path below. No new
+//     error sentinel, no interaction with `perform_with_retry`'s existing
+//     retry-on-immediately-closed-fresh-connection logic.
+//   * `POOL_IDLE_WINDOW` is a secondary/backstop cleanup (bounds memory and
+//     stale-fd lifetime for a key that's never queried again), not the
+//     primary staleness defense — the peek+probe above are.
+struct PooledConn {
+    stream: TcpStream,
+    returned_at: Instant,
+}
+
+const POOL_MAX_PER_KEY: usize = 4;
+const POOL_IDLE_WINDOW: Duration = Duration::from_secs(2);
+const POOL_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+fn conn_pool() -> &'static Mutex<HashMap<(String, u16), Vec<PooledConn>>> {
+    static P: OnceLock<Mutex<HashMap<(String, u16), Vec<PooledConn>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pop the freshest still-plausibly-alive pooled connection for `(host,
+/// port)`, or `None` on a miss. Entries are stored oldest-first, so the
+/// freshest is the last one; if IT is already past `POOL_IDLE_WINDOW`, every
+/// other entry (returned earlier) is too, so the whole bucket is dropped in
+/// one step rather than age-checking each entry individually.
+fn pool_take(host: &str, port: u16) -> Option<TcpStream> {
+    let mut guard = conn_pool().lock().ok()?;
+    let key = (host.to_string(), port);
+    let bucket = guard.get_mut(&key)?;
+    let mut entry = bucket.pop()?;
+    if entry.returned_at.elapsed() > POOL_IDLE_WINDOW {
+        bucket.clear();
+        return None;
+    }
+    // Non-blocking peek: a peer that already sent FIN/RST shows up as Ok(0)
+    // or a hard error here; WouldBlock (nothing pending) is the only signal
+    // that means "still looks alive" for an idle keep-alive connection —
+    // HTTP request/response is strictly synchronous, so any other outcome
+    // (including unexpected already-buffered bytes) is treated as untrusted.
+    let _ = entry.stream.set_nonblocking(true);
+    let mut probe = [0u8; 1];
+    let peek_result = entry.stream.peek(&mut probe);
+    let _ = entry.stream.set_nonblocking(false);
+    match peek_result {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Some(entry.stream),
+        _ => {
+            bucket.clear();
+            None
+        }
+    }
+}
+
+/// Drop every pooled connection for `(host, port)` — called after a pooled
+/// candidate fails post-peek (write or bounded first-read), since that
+/// almost always means the whole server generation behind this key is gone.
+fn pool_clear(host: &str, port: u16) {
+    if let Ok(mut guard) = conn_pool().lock() {
+        guard.remove(&(host.to_string(), port));
+    }
+}
+
+fn pool_put(host: &str, port: u16, stream: TcpStream) {
+    if let Ok(mut guard) = conn_pool().lock() {
+        let bucket = guard.entry((host.to_string(), port)).or_default();
+        if bucket.len() >= POOL_MAX_PER_KEY {
+            bucket.remove(0);
+        }
+        bucket.push(PooledConn {
+            stream,
+            returned_at: Instant::now(),
+        });
+    }
+}
+
+/// Whether a just-parsed response leaves the connection in a cleanly
+/// reusable state: unambiguous framing (explicit `Content-Length`, or a
+/// status/method that RFC 9110 §6.4.1 guarantees carries no body) and no
+/// `Connection: close` from the peer. Chunked responses are excluded —
+/// narrower, already-validated scope matching the reverted first attempt,
+/// not a framing-safety requirement (a fully-consumed chunked body does
+/// leave the stream at a clean boundary).
+fn is_poolable_response(status: i32, head: bool, headers: &[(String, String)]) -> bool {
+    let bodiless = head || status == 204 || status == 304 || (100..200).contains(&status);
+    let mut chunked = false;
+    let mut has_content_length = false;
+    let mut close = false;
+    for (k, v) in headers {
+        let lk = k.to_ascii_lowercase();
+        if lk == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+            chunked = true;
+        }
+        if lk == "content-length" {
+            has_content_length = true;
+        }
+        if lk == "connection" && v.to_ascii_lowercase().contains("close") {
+            close = true;
+        }
+    }
+    !chunked && !close && (has_content_length || bodiless)
+}
+
+/// Send `req` over an already-connected pooled `stream` and read the
+/// response, bounding the wait for the first response byte to
+/// `POOL_PROBE_TIMEOUT` rather than the caller's full `read_timeout` (see the
+/// pool's module doc for why). Once at least one byte has arrived the
+/// connection is proven alive and `read_timeout` applies normally for the
+/// rest of the response.
+fn try_pooled_request(
+    stream: &mut TcpStream,
+    req: &[u8],
+    head: bool,
+    read_timeout: Duration,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let _ = stream.set_write_timeout(Some(POOL_PROBE_TIMEOUT));
+    stream
+        .write_all(req)
+        .map_err(|e| format!("pooled write: {e}"))?;
+    stream.flush().map_err(|e| format!("pooled flush: {e}"))?;
+    let _ = stream.set_read_timeout(Some(POOL_PROBE_TIMEOUT));
+    let mut probe = [0u8; 4096];
+    let n = stream
+        .read(&mut probe)
+        .map_err(|e| format!("pooled probe read: {e}"))?;
+    if n == 0 {
+        return Err("pooled connection closed before response head".into());
+    }
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    read_response_with_prefix(stream, head, probe[..n].to_vec())
+}
+
 fn perform(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -1474,6 +1663,31 @@ fn perform(
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let head = method.eq_ignore_ascii_case("HEAD");
     let req = build_request(method, parsed, headers, body);
+
+    // Plain-HTTP keep-alive pool (see the module doc above `perform`): try a
+    // pooled connection before ever touching the network. Any failure here —
+    // peek, write, or the bounded first-read — is treated exactly like a
+    // pool miss, falling straight through to the ordinary fresh-connect path
+    // below with no error surfaced to the caller.
+    let poolable_key = (established_https_stream_id.is_none() && parsed.scheme == "http")
+        .then(|| (parsed.host.clone(), parsed.port));
+    if let Some((host, port)) = &poolable_key {
+        if let Some(mut pooled) = pool_take(host, *port) {
+            ctx.begin_blocking_region();
+            let attempt = try_pooled_request(&mut pooled, &req, head, read_timeout);
+            ctx.end_blocking_region();
+            match attempt {
+                Ok((status, resp_headers, resp_body)) => {
+                    if is_poolable_response(status, head, &resp_headers) {
+                        pool_put(host, *port, pooled);
+                    }
+                    return Ok((status, resp_headers, resp_body));
+                }
+                Err(_) => pool_clear(host, *port),
+            }
+        }
+    }
+
     // FIX (client-cipher-restriction): when the caller up-called a real,
     // caller-installed SSLSocketFactory's createSocket (see
     // `huc_upcall_create_socket_if_custom_factory`), that socket's handshake
@@ -1754,6 +1968,11 @@ fn perform(
             read_response(&mut s, head)
         })();
         ctx.end_blocking_region();
+        if let (Ok((status, resp_headers, _)), Some((host, port))) = (&result, &poolable_key) {
+            if is_poolable_response(*status, head, resp_headers) {
+                pool_put(host, *port, s);
+            }
+        }
         result
     }
 }
@@ -3424,5 +3643,115 @@ mod http_url_connection_tests {
         let mut r = NativeMethodRegistry::new();
         register_http_url_connection_real(&mut r);
         assert!(!r.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Plain-HTTP keep-alive pool
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_is_poolable_response_content_length() {
+        let headers = vec![("Content-Length".to_string(), "5".to_string())];
+        assert!(is_poolable_response(200, false, &headers));
+    }
+
+    #[test]
+    fn test_is_poolable_response_chunked_excluded() {
+        let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
+        assert!(!is_poolable_response(200, false, &headers));
+    }
+
+    #[test]
+    fn test_is_poolable_response_connection_close_excluded() {
+        let headers = vec![
+            ("Content-Length".to_string(), "5".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+        ];
+        assert!(!is_poolable_response(200, false, &headers));
+    }
+
+    #[test]
+    fn test_is_poolable_response_bodiless_without_content_length() {
+        // HEAD / 204 / 304 / 1xx carry no body and no Content-Length, but the
+        // framing is still unambiguous — poolable.
+        assert!(is_poolable_response(200, true, &[]));
+        assert!(is_poolable_response(204, false, &[]));
+        assert!(is_poolable_response(304, false, &[]));
+        assert!(is_poolable_response(100, false, &[]));
+    }
+
+    #[test]
+    fn test_is_poolable_response_ambiguous_framing_excluded() {
+        // A normal 200 with neither Content-Length nor chunked has no
+        // reliable end-of-body marker other than connection close — not safe
+        // to hand back to the pool.
+        assert!(!is_poolable_response(200, false, &[]));
+    }
+
+    /// A loopback `TcpStream` pair for exercising `pool_take`/`pool_put`
+    /// against real sockets (the pool stores `TcpStream` directly, not a
+    /// generic `Read`, so a slice-backed fake won't do here).
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn test_pool_put_then_take_roundtrip() {
+        let (client, _server) = loopback_pair();
+        let host = format!("test-roundtrip-{}", client.local_addr().unwrap().port());
+        let port = 1;
+        pool_put(&host, port, client);
+        assert!(pool_take(&host, port).is_some());
+        // The bucket is empty now — a second take is a plain miss.
+        assert!(pool_take(&host, port).is_none());
+    }
+
+    #[test]
+    fn test_pool_take_evicts_closed_peer() {
+        let (client, server) = loopback_pair();
+        let host = format!("test-closed-peer-{}", client.local_addr().unwrap().port());
+        let port = 1;
+        pool_put(&host, port, client);
+        drop(server); // peer close -> FIN visible to a peek on `client`
+        // Give the FIN a moment to actually land in the kernel buffer.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(pool_take(&host, port).is_none());
+    }
+
+    #[test]
+    fn test_pool_take_respects_idle_window() {
+        let (client, _server) = loopback_pair();
+        let host = format!("test-idle-window-{}", client.local_addr().unwrap().port());
+        let port = 1;
+        if let Ok(mut guard) = conn_pool().lock() {
+            guard.entry((host.clone(), port)).or_default().push(PooledConn {
+                stream: client,
+                returned_at: Instant::now() - POOL_IDLE_WINDOW - Duration::from_millis(1),
+            });
+        }
+        assert!(pool_take(&host, port).is_none());
+    }
+
+    #[test]
+    fn test_pool_put_caps_bucket_at_max_per_key() {
+        let (first, _first_server) = loopback_pair();
+        let host = format!("test-cap-{}", first.local_addr().unwrap().port());
+        let port = 2;
+        pool_put(&host, port, first);
+        for _ in 0..(POOL_MAX_PER_KEY + 1) {
+            let (client, _server) = loopback_pair();
+            pool_put(&host, port, client);
+        }
+        let len = conn_pool()
+            .lock()
+            .unwrap()
+            .get(&(host, port))
+            .map(|b| b.len())
+            .unwrap_or(0);
+        assert_eq!(len, POOL_MAX_PER_KEY);
     }
 }
