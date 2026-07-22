@@ -18075,61 +18075,49 @@ fn register_antlr_prediction_context_intrinsics(registry: &mut NativeMethodRegis
             "(I)Z",
             native_antlr_interval_set_contains,
         );
-        // Hibernate uses the unshaded ANTLR runtime.  Its recursive prediction
-        // machinery allocates while walking mutable ATN/DFA graphs, and the
-        // native implementation historically carried graph ObjectRefs across
-        // those allocation points.  That is not safe with a moving collector:
-        // an intermittently stale ATNState reaches the Java `computeTargetState`
-        // caller and manifests as `ATNState.transitions` NPE.  Run the real
-        // unshaded methods as bytecode (already JIT-excluded) so the interpreter
-        // maintains normal Java-frame roots.  Keep the shaded Groovy runtime's
-        // established intrinsic set unchanged.
-        if prefix == "groovyjarjarantlr4/v4/runtime" {
-            let parser_atn_simulator = format!("{prefix}/atn/ParserATNSimulator");
-            let atn_config_desc = format!("L{prefix}/atn/ATNConfig;");
-            registry.register(
-                &parser_atn_simulator,
-                "canDropLoopEntryEdgeInLeftRecursiveRule",
-                &format!("({atn_config_desc})Z"),
-                native_antlr_parser_can_drop_loop_entry_edge,
-            );
-            let transition_desc = format!("L{prefix}/atn/Transition;");
-            registry.register(
-                &parser_atn_simulator,
-                "getEpsilonTarget",
-                &format!("({atn_config_desc}{transition_desc}ZZZZ){atn_config_desc}"),
-                native_antlr_parser_get_epsilon_target,
-            );
-            let atn_config_set_desc = format!("L{prefix}/atn/ATNConfigSet;");
-            registry.register(
-                &parser_atn_simulator,
-                "computeReachSet",
-                &format!("({atn_config_set_desc}IZ){atn_config_set_desc}"),
-                native_antlr_parser_compute_reach_set,
-            );
-            let closure_desc =
-                format!("({atn_config_desc}{atn_config_set_desc}Ljava/util/Set;ZZIZ)V");
-            let public_closure_desc =
-                format!("({atn_config_desc}{atn_config_set_desc}Ljava/util/Set;ZZZ)V");
-            registry.register(
-                &parser_atn_simulator,
-                "closure",
-                &public_closure_desc,
-                native_antlr_parser_public_closure,
-            );
-            registry.register(
-                &parser_atn_simulator,
-                "closureCheckingStopState",
-                &closure_desc,
-                native_antlr_parser_closure_checking_stop_state,
-            );
-            registry.register(
-                &parser_atn_simulator,
-                "closure_",
-                &closure_desc,
-                native_antlr_parser_closure,
-            );
-        }
+        let parser_atn_simulator = format!("{prefix}/atn/ParserATNSimulator");
+        let atn_config_desc = format!("L{prefix}/atn/ATNConfig;");
+        registry.register(
+            &parser_atn_simulator,
+            "canDropLoopEntryEdgeInLeftRecursiveRule",
+            &format!("({atn_config_desc})Z"),
+            native_antlr_parser_can_drop_loop_entry_edge,
+        );
+        let transition_desc = format!("L{prefix}/atn/Transition;");
+        registry.register(
+            &parser_atn_simulator,
+            "getEpsilonTarget",
+            &format!("({atn_config_desc}{transition_desc}ZZZZ){atn_config_desc}"),
+            native_antlr_parser_get_epsilon_target,
+        );
+        let atn_config_set_desc = format!("L{prefix}/atn/ATNConfigSet;");
+        registry.register(
+            &parser_atn_simulator,
+            "computeReachSet",
+            &format!("({atn_config_set_desc}IZ){atn_config_set_desc}"),
+            native_antlr_parser_compute_reach_set,
+        );
+        let closure_desc = format!("({atn_config_desc}{atn_config_set_desc}Ljava/util/Set;ZZIZ)V");
+        let public_closure_desc =
+            format!("({atn_config_desc}{atn_config_set_desc}Ljava/util/Set;ZZZ)V");
+        registry.register(
+            &parser_atn_simulator,
+            "closure",
+            &public_closure_desc,
+            native_antlr_parser_public_closure,
+        );
+        registry.register(
+            &parser_atn_simulator,
+            "closureCheckingStopState",
+            &closure_desc,
+            native_antlr_parser_closure_checking_stop_state,
+        );
+        registry.register(
+            &parser_atn_simulator,
+            "closure_",
+            &closure_desc,
+            native_antlr_parser_closure,
+        );
         let default_error_strategy = format!("{prefix}/DefaultErrorStrategy");
         let parser_desc = format!("L{prefix}/Parser;");
         registry.register(
@@ -19405,7 +19393,7 @@ mod antlr_prediction_context_tests {
                 "canDropLoopEntryEdgeInLeftRecursiveRule",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;)Z",
             )
-            .is_none());
+            .is_some());
         assert!(registry
             .find(
                 "org/antlr/v4/runtime/DefaultErrorStrategy",
@@ -19419,40 +19407,33 @@ mod antlr_prediction_context_tests {
                 "getEpsilonTarget",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/Transition;ZZZZ)Lorg/antlr/v4/runtime/atn/ATNConfig;",
             )
-            .is_none());
+            .is_some());
         assert!(registry
             .find(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "computeReachSet",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfigSet;IZ)Lorg/antlr/v4/runtime/atn/ATNConfigSet;",
             )
-            .is_none());
+            .is_some());
         assert!(registry
             .find(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "closureCheckingStopState",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V",
             )
-            .is_none());
+            .is_some());
         assert!(registry
             .find(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "closure",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZZ)V",
             )
-            .is_none());
+            .is_some());
         assert!(registry
             .find(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
                 "closure_",
                 "(Lorg/antlr/v4/runtime/atn/ATNConfig;Lorg/antlr/v4/runtime/atn/ATNConfigSet;Ljava/util/Set;ZZIZ)V",
-            )
-            .is_none());
-        assert!(registry
-            .find(
-                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
-                "computeReachSet",
-                "(Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;IZ)Lgroovyjarjarantlr4/v4/runtime/atn/ATNConfigSet;",
             )
             .is_some());
         assert!(registry
