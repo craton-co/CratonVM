@@ -340,46 +340,123 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // The previous implementation returned a packed `Long(0)` ("no progress")
 // and claimed the JDK would "loop around to an array-backed path". That is
 // NOT correct: the JDK's `Inflater` dispatches to the native that matches
-// the buffer types the *caller* actually supplied (see
-// `java.util.zip.Inflater.inflate(ByteBuffer)` / `inflate(byte[],...)`),
-// and it does NOT retry with a different native when one reports no
-// progress. For a direct OUTPUT buffer there is no array-backed
-// alternative at all. A direct-only caller therefore sees
-// inputConsumed == 0 && outputConsumed == 0 && !finished forever and spins
-// in an infinite read loop.
-//
-// Since fully implementing direct-buffer inflate is out of scope, the safe
-// behavior is to fail LOUDLY rather than hang: surface
-// `RuntimeError::NotImplemented` so a future regression that routes a
-// direct-only caller here aborts with a clear message instead of wedging.
-// The common JAR/ZIP bootstrap path is array-backed and goes through
-// `infl_inflate_bytes_bytes`, so this path is not exercised today.
-fn infl_direct_buffer_unsupported(which: &str) -> MethodCallResult {
-    Err(RuntimeError::NotImplemented {
-        feature: format!(
-            "Inflater.{which}: direct-ByteBuffer inflate is not supported \
-             (this VM has no raw-memory view of direct buffers); use an \
-             array-backed Inflater path"
-        ),
-    }
-    .into())
+/// Shared decompression core for all four `Inflater.inflate*` overloads.
+fn infl_do_decompress(
+    addr: i64,
+    input_data: &[u8],
+    output_buf: &mut [u8],
+) -> (u32, u32, bool, bool) {
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = tbl.get_mut(&addr) else {
+        return (0, 0, false, false);
+    };
+    let total_in_before = st.decomp.total_in();
+    let total_out_before = st.decomp.total_out();
+    let status = st.decomp.decompress(input_data, output_buf, FlushDecompress::None);
+    let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
+    let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
+    let (finished, need_dict) = match status {
+        Ok(flate2::Status::StreamEnd) => (true, false),
+        Ok(flate2::Status::Ok | flate2::Status::BufError) => (false, false),
+        Err(e) => (false, e.needs_dictionary().is_some()),
+    };
+    (input_consumed, output_consumed, finished, need_dict)
 }
 
-fn infl_inflate_bytes_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn infl_inflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // input: byte[], output: direct ByteBuffer (long addr). Cannot write the
     // direct output buffer — no array fallback exists for a direct output.
-    infl_direct_buffer_unsupported("inflateBytesBuffer")
+    let addr = arg_long(args, 1);
+    let input_arr = arg_obj(args, 2);
+    let in_off = arg_int(args, 3).max(0) as usize;
+    let in_len = arg_int(args, 4).max(0) as usize;
+    let output_addr = arg_long(args, 5);
+    let out_len = arg_int(args, 6).max(0) as usize;
+    let input_data = input_arr
+        .map(|a| read_byte_array(ctx, a, in_off, in_len))
+        .unwrap_or_default();
+    let mut output_buf = vec![0u8; out_len];
+    let (input_consumed, output_consumed, finished, need_dict) =
+        infl_do_decompress(addr, &input_data, &mut output_buf);
+    if output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    {
+        return Err(RuntimeError::IOException {
+            message: format!("inflateBytesBuffer: invalid output buffer address {output_addr:#x}"),
+        }
+        .into());
+    }
+    Ok(Some(Value::Long(pack_inflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+        need_dict,
+    ))))
 }
 
-fn infl_inflate_buffer_bytes(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // input: direct ByteBuffer (long addr), output: byte[]. Cannot read the
     // direct input bytes, so no progress is possible.
-    infl_direct_buffer_unsupported("inflateBufferBytes")
+    let addr = arg_long(args, 1);
+    let input_addr = arg_long(args, 2);
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let output_arr = arg_obj(args, 4);
+    let out_off = arg_int(args, 5).max(0) as usize;
+    let out_len = arg_int(args, 6).max(0) as usize;
+    let mut input_data = vec![0u8; in_len];
+    if in_len > 0 && !ctx.copy_from_native_memory(input_addr, &mut input_data) {
+        return Err(RuntimeError::IOException {
+            message: format!("inflateBufferBytes: invalid input buffer address {input_addr:#x}"),
+        }
+        .into());
+    }
+    let mut output_buf = vec![0u8; out_len];
+    let (input_consumed, output_consumed, finished, need_dict) =
+        infl_do_decompress(addr, &input_data, &mut output_buf);
+    if let Some(a) = output_arr {
+        if output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        }
+    }
+    Ok(Some(Value::Long(pack_inflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+        need_dict,
+    ))))
 }
 
-fn infl_inflate_buffer_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Both sides are direct ByteBuffers — neither readable nor writable here.
-    infl_direct_buffer_unsupported("inflateBufferBuffer")
+    let addr = arg_long(args, 1);
+    let input_addr = arg_long(args, 2);
+    let in_len = arg_int(args, 3).max(0) as usize;
+    let output_addr = arg_long(args, 4);
+    let out_len = arg_int(args, 5).max(0) as usize;
+    let mut input_data = vec![0u8; in_len];
+    if in_len > 0 && !ctx.copy_from_native_memory(input_addr, &mut input_data) {
+        return Err(RuntimeError::IOException {
+            message: format!("inflateBufferBuffer: invalid input buffer address {input_addr:#x}"),
+        }
+        .into());
+    }
+    let mut output_buf = vec![0u8; out_len];
+    let (input_consumed, output_consumed, finished, need_dict) =
+        infl_do_decompress(addr, &input_data, &mut output_buf);
+    if output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    {
+        return Err(RuntimeError::IOException {
+            message: format!("inflateBufferBuffer: invalid output buffer address {output_addr:#x}"),
+        }
+        .into());
+    }
+    Ok(Some(Value::Long(pack_inflate_result(
+        input_consumed,
+        output_consumed,
+        finished,
+        need_dict,
+    ))))
 }
 
 fn infl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1113,6 +1190,97 @@ mod tests {
         assert!(output_consumed > 0, "deflateBufferBuffer produced no output");
         assert!(finished, "deflateBufferBuffer must report finished on FINISH");
         assert_decompresses_to(&output_buf[..output_consumed], original);
+    }
+
+    /// Regression guard for the three direct-ByteBuffer `Inflater` overloads.
+    #[test]
+    fn direct_buffer_inflate_paths_produce_correct_output() {
+        let original = b"hello hello hello hello hello world world world";
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(original).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        fn unpack(packed: i64) -> (usize, usize, bool, bool) {
+            let p = packed as u64;
+            (
+                (p & 0x7FFF_FFFF) as usize,
+                ((p >> 31) & 0x7FFF_FFFF) as usize,
+                (p >> 62) & 1 == 1,
+                (p >> 63) & 1 == 1,
+            )
+        }
+        fn new_inflater(ctx: &mut dyn NativeContext) -> i64 {
+            match infl_init(ctx, &[Value::Int(1)]).unwrap().unwrap() {
+                Value::Long(addr) => addr,
+                other => panic!("expected Long handle, got {other:?}"),
+            }
+        }
+        fn packed(result: MethodCallResult) -> i64 {
+            match result.unwrap().unwrap() {
+                Value::Long(value) => value,
+                other => panic!("expected Long result, got {other:?}"),
+            }
+        }
+
+        let mut ctx = mock_ctx();
+        let addr = new_inflater(&mut ctx);
+        let input_arr = ctx.new_array(ArrayElementType::Byte, compressed.len());
+        for (i, b) in compressed.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i8 as i32));
+        }
+        let mut output = vec![0u8; 1024];
+        let (used_in, used_out, finished, need_dict) = unpack(packed(infl_inflate_bytes_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(compressed.len() as i32),
+                Value::Long(output.as_mut_ptr() as i64),
+                Value::Int(output.len() as i32),
+            ],
+        )));
+        assert_eq!(used_in, compressed.len());
+        assert_eq!(&output[..used_out], original);
+        assert!(finished && !need_dict);
+
+        let addr = new_inflater(&mut ctx);
+        let mut input = compressed.clone();
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 1024);
+        let (used_in, used_out, finished, need_dict) = unpack(packed(infl_inflate_buffer_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input.as_mut_ptr() as i64),
+                Value::Int(input.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(1024),
+            ],
+        )));
+        assert_eq!(used_in, compressed.len());
+        assert_eq!(read_byte_array(&ctx, output_arr, 0, used_out), original);
+        assert!(finished && !need_dict);
+
+        let addr = new_inflater(&mut ctx);
+        let mut input = compressed.clone();
+        let mut output = vec![0u8; 1024];
+        let (used_in, used_out, finished, need_dict) = unpack(packed(infl_inflate_buffer_buffer(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(input.as_mut_ptr() as i64),
+                Value::Int(input.len() as i32),
+                Value::Long(output.as_mut_ptr() as i64),
+                Value::Int(output.len() as i32),
+            ],
+        )));
+        assert_eq!(used_in, compressed.len());
+        assert_eq!(&output[..used_out], original);
+        assert!(finished && !need_dict);
     }
 
     #[test]

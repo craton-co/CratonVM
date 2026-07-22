@@ -2545,7 +2545,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
         || name.starts_with("com/sun/")
 }
 
-fn loader_aware_reflect_assignable(
+pub(crate) fn loader_aware_reflect_assignable(
     ctx: &dyn NativeContext,
     source_class_id: ClassId,
     target_class_id: ClassId,
@@ -16023,7 +16023,7 @@ pub(crate) fn native_class_get_annotated_superclass(
     };
 
     let tree = ctx.class_extends_type_annotations(class_id, CLASS_EXTENDS_SUPERCLASS_INDEX);
-    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns);
+    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns, Some(class_id));
     if !tree.children.is_empty() {
         stash_annotated_type_argument_anns(at, tree.children);
     }
@@ -16095,7 +16095,7 @@ pub(crate) fn native_class_get_annotated_interfaces(
             let tree = class_id
                 .map(|cid| ctx.class_extends_type_annotations(cid, i as u16))
                 .unwrap_or_default();
-            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns);
+            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns, class_id);
             if !tree.children.is_empty() {
                 stash_annotated_type_argument_anns(at, tree.children);
             }
@@ -16299,6 +16299,7 @@ fn make_annotated_type_with_anns(
     ctx: &mut dyn NativeContext,
     backing_type: ObjectRef,
     anns: &[cratonvm_native_api::AnnotationData],
+    declaring_class_id: Option<ClassId>,
 ) -> ObjectRef {
     // GC-SAFETY: `build_annotation_array`, `ensure_class_initialized`,
     // `alloc_object`, and (in the `else` branch) `annotated_type_fill_
@@ -16310,7 +16311,7 @@ fn make_annotated_type_with_anns(
     let backing_pin = ctx.pin_native_root(backing_type);
     // Build the proxy array first (it allocates) before we allocate the
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
-    let ann_arr = build_annotation_array(ctx, anns);
+    let ann_arr = build_annotation_array_for(ctx, declaring_class_id, anns);
     let ann_pin = ctx.pin_native_root(ann_arr);
     let backing_type = ctx.read_native_pin(backing_pin, backing_type);
 
@@ -16438,12 +16439,13 @@ pub(crate) fn native_method_get_annotated_return_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (anns, type_arg_anns) = match method_class_name_desc(ctx, this) {
+    let (declaring_class_id, anns, type_arg_anns) = match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => (
+            Some(cid),
             ctx.method_return_type_annotations(cid, &name, &desc),
             ctx.method_return_type_argument_annotations(cid, &name, &desc),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         this,
@@ -16457,7 +16459,7 @@ pub(crate) fn native_method_get_annotated_return_type(
             _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
         },
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16495,7 +16497,7 @@ pub(crate) fn native_parameter_get_annotated_type(
         Value::Int(i) => i as usize,
         _ => 0,
     };
-    let (anns, type_arg_anns) = match method_class_name_desc(ctx, exec) {
+    let (declaring_class_id, anns, type_arg_anns) = match method_class_name_desc(ctx, exec) {
         Some((cid, name, desc)) => {
             let anns = ctx
                 .method_parameter_type_annotations(cid, &name, &desc)
@@ -16507,9 +16509,9 @@ pub(crate) fn native_parameter_get_annotated_type(
                 .get(idx)
                 .cloned()
                 .unwrap_or_default();
-            (anns, type_arg_anns)
+            (Some(cid), anns, type_arg_anns)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         exec,
@@ -16525,7 +16527,7 @@ pub(crate) fn native_parameter_get_annotated_type(
         }
         _ => parameter_erased_type_mirror(ctx, this),
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16543,13 +16545,14 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (per_param, per_param_type_args, count) = match method_class_name_desc(ctx, this) {
+    let (declaring_class_id, per_param, per_param_type_args, count) =
+        match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => {
             let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
             let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
-            (pta, pta_args, count_method_params(&desc))
+            (Some(cid), pta, pta_args, count_method_params(&desc))
         }
-        None => (Vec::new(), Vec::new(), 0),
+        None => (None, Vec::new(), Vec::new(), 0),
     };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
@@ -16597,7 +16600,7 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
             .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        let at = make_annotated_type_with_anns(ctx, tm, anns, declaring_class_id);
         // Stash this parameter's TYPE_ARGUMENT-level annotations (e.g. the
         // `@Valid` in `List<@Valid Person>`) alongside the AnnotatedType we
         // just built, so a later `getAnnotatedActualTypeArguments()` call on
@@ -16623,12 +16626,13 @@ pub(crate) fn native_field_get_annotated_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (anns, type_arg_anns) = match field_class_and_name(ctx, this) {
+    let (declaring_class_id, anns, type_arg_anns) = match field_class_and_name(ctx, this) {
         Some((cid, name)) => (
+            Some(cid),
             ctx.field_type_annotations(cid, &name),
             ctx.field_type_argument_annotations(cid, &name),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror =
         match ctx.invoke_virtual(this, "getGenericType", "()Ljava/lang/reflect/Type;", &[]) {
@@ -16638,7 +16642,7 @@ pub(crate) fn native_field_get_annotated_type(
                 _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
             },
         };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16831,7 +16835,7 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
             .as_ref()
             .and_then(|v| v.get(i))
             .unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, &node.anns);
+        let at = make_annotated_type_with_anns(ctx, tm, &node.anns, None);
         if !node.children.is_empty() {
             stash_annotated_type_argument_anns(at, node.children.clone());
         }

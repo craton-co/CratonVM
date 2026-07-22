@@ -64,8 +64,10 @@ correctness (see the perf-hang report).
    stack garbage as the VM pointer. Fixed in `jit/src/x64.rs`.
 
 ## Open bugs (reports in this directory)
-- **`bug-h2-charset-cp500-unsupported.md`** — `Charset.forName("cp500")` missing
-  (jdk.charsets extended charsets) — `TestCharsetCollator`.
+- **`bug-h2-charset-cp500-unsupported.md`** — FIXED 2026-07-22, see
+  [`../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md`](../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md)
+  — `Charset.forName("cp500")` now resolves (curated IBM500 codec added);
+  `TestCharsetCollator`/`TestSetCollation.testCp500Collator` both pass.
 - **`bug-h2-netutils-missing-pbe-algparams.md`** — missing
   `PBEWithHmacSHA256AndAES_256` AlgorithmParameters — `TestNetUtils`.
 - **`bug-h2-mvstore-insert-loop-perf-hang.md`** — MVStore insert/commit

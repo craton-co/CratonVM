@@ -3845,6 +3845,35 @@ impl NativeMethodRegistry {
         if self.drop_real_layout_synthetic && class_name == "java/io/StringReader" {
             return;
         }
+        // Real-JDK mode: drop synthetic `java/io/PipedInputStream`/
+        // `java/io/PipedOutputStream` natives. These were written for a
+        // legacy hardcoded 4-slot BufferedInputStream/BufferedOutputStream-
+        // style layout (in/buf/pos/count) and reused verbatim for the piped
+        // streams, including writing/reading those slot indices directly on
+        // whatever object is passed in. On a real JDK 25 PipedOutputStream
+        // (single field: `sink`, a connected PipedInputStream), the "out"
+        // slot these natives resolve/hardcode to index 0 lands on `sink`
+        // instead of a delegate OutputStream, so flush()/write()/close()
+        // then invoke_virtual "write"/"flush" on the connected
+        // PipedInputStream itself -- which declares neither -- producing a
+        // NoSuchMethodError naming PipedInputStream for a completely
+        // unrelated method. See
+        // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
+        // TestResultSet, which all use real connected Piped stream pairs).
+        // Real JDK PipedInputStream/PipedOutputStream bytecode is
+        // self-contained (synchronized circular buffer, wait/notifyAll,
+        // Thread identity checks -- no missing native dependency), so drop
+        // the synthetic surface and let it run, same as StringReader/
+        // EnumSet/Pattern/Matcher above.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/io/PipedInputStream" | "java/io/PipedOutputStream"
+            )
+        {
+            return;
+        }
         // Real-JDK mode: drop every `java/util/EnumSet` native, including the
         // SyntheticStub-tagged fallback surface. The real JDK factories are
         // self-contained once `Class.getEnumConstantsShared` works, and they

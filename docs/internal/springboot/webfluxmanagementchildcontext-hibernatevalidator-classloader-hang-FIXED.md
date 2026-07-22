@@ -1,4 +1,26 @@
-# `WebFluxManagementChildContextConfigurationIntegrationTests`: HANG fixed; ObjectProvider `NoSuchBeanDefinitionException` fixed (x2); ServerProperties loader-identity divergence FIXED; a THIRD, different ObjectProvider residual remains OPEN
+# `WebFluxManagementChildContextConfigurationIntegrationTests`: fixed
+
+## Final closure 2026-07-22
+
+The final residual was a loader-blind cached `Method` in
+`RootBeanDefinition.setResolvedFactoryMethod`: after parent contexts had run,
+it retained the application-loader factory method while the filtered child
+context used its own `DefaultListableBeanFactory`. Its `ObjectProvider`
+identity check therefore missed the parent method parameter and required an
+optional `ObjectProvider<WebSessionIdResolver>` bean.
+
+The native setter now rebuilds only a global/application `Method` from the
+active user-defined TCCL's declaring class, preserving its exact name and
+descriptor. Methods already owned by a defining loader remain unchanged.
+TYPE_USE annotation proxy materialization and reference-array assignability
+were also made declaring-loader aware.
+
+The full WebFlux class passes 5/5 on the clean final binary in both `--nojit`
+and JIT modes. Historical residual classes complete locally; current Mockito
+`MockMethodDispatcher` bootstrap-injection failures are fixture/environment
+failures, not this issue's loader/hang path.
+
+---
 
 **Status: OPEN — hang fixed (confirmed gone as of `dev` a026c2c4c); the
 `ObjectProvider<TomcatConnectorCustomizer>` `NoSuchBeanDefinitionException`

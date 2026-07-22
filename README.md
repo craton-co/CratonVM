@@ -6,7 +6,7 @@
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
-**Boots against a real JDK when one is present, and runs standalone when it isn't.**
+**Boots against a real`` JDK when one is present, and runs standalone when it isn't.**
 By default CratonVM loads the real `java.base` module from a detected JDK (via `JAVA_HOME`,
 `CRATONVM_JAVA_HOME`, or `java` on your `PATH`). When no JDK is found — or when you pass
 `--synthetic-jdk` — it falls back to its own synthetic Rust implementations of the Java

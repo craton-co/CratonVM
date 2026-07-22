@@ -1672,7 +1672,21 @@ impl SharedVm {
                 );
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
                 // bytecode depends on internal sun.net classes we don't support.
-                cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(
+                //
+                // Call `register_url_codec` directly rather than the whole-module
+                // `register_deprecated_io_util_natives` — that function ALSO
+                // re-registers this module's Date constructors/getters/setters
+                // (and everything else in the module), which is a genuine
+                // duplicate registration of `java/util/Date`'s deprecated
+                // multi-arg constructors: `deprecated_util.rs` registers its own
+                // (Julian/Gregorian-cutover-aware, default-timezone-aware) version
+                // of the same natives earlier in boot, and `NativeMethodRegistry`'s
+                // registration table is last-write-wins, so this second call was
+                // silently clobbering the correct implementation back to the
+                // naive proleptic-Gregorian one with no timezone offset at all.
+                // See `bug-h2-suite-residual-fail-triage.md`'s
+                // `TestPreparedStatement.testDate8` writeup.
+                cratonvm_native_builtins::deprecated_io_util::register_url_codec(
                     &mut native_methods,
                 );
                 // KC26: Register Charset/StandardCharsets natives
@@ -2302,7 +2316,11 @@ impl SharedVm {
                 real_jdk_to_array_typed,
             );
             native_methods.set_category(__prev_toarray);
-            cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(
+            // See the KC26 URL-codec registration comment above: only
+            // `register_url_codec` is wanted here, not the whole
+            // `deprecated_io_util` module (which would re-clobber
+            // `deprecated_util.rs`'s correct `java/util/Date` natives).
+            cratonvm_native_builtins::deprecated_io_util::register_url_codec(
                 &mut native_methods,
             );
             cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);

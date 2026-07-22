@@ -159,33 +159,15 @@ pub struct CompilationPolicy {
 impl Default for CompilationPolicy {
     fn default() -> Self {
         Self {
-            // Raised from the historical 200/5_000 defaults on 2026-07-16
-            // (fix/jit-compile-time-tax-20260716): investigation of
-            // `LockTest`/`CriteriaBuilderNonStandardFunctionsTest` (see
-            // docs/known-issues/hibernate/hib-misc-residuals-20260716.md)
-            // found that CratonVM's *compilation itself* (real CPU-bound
-            // codegen work on the single background compiler thread, not
-            // the compiled code's steady-state execution) is expensive
-            // enough that eagerly triggering it for methods only called a
-            // few hundred times during a short-lived, one-shot JVM process
-            // (one Hibernate test class = one process, heavy on
-            // reflection/JPA-metamodel bootstrap) is a net wall-clock loss:
-            // the compiled body rarely gets to run enough additional times
-            // before process exit to repay the one-time compile cost.
-            // Raising the invocation-count bar (method-entry C1/C2 only --
-            // OSR's back-edge-counted `osr_threshold` is untouched, since a
-            // hot loop that has already run osr_threshold back-edges is
-            // self-evidently still running, unlike a one-shot bootstrap
-            // method) keeps genuinely hot/long-running workloads compiling
-            // (their invocation counts blow past this bar quickly relative
-            // to their total lifetime) while sparing short processes whose
-            // methods only cross the old low bar once, incidentally, during
-            // startup. Verified against `vm/benches/vm_benchmarks.rs`
-            // (jit_hot_loop_dispatch, specjvm_compiler_throughput,
-            // interpreter_fibonacci, shootout_binary_trees) to confirm no
-            // steady-state throughput regression -- see the fix commit
-            // message / doc updates for the before/after numbers.
-            c1_threshold: 1500,
+            // The invocation dispatch gate starts consulting this policy at
+            // `CRATONVM_JIT_THRESHOLD` (500 by default).  Keep the first
+            // background-tier admission aligned with that gate: delaying C1
+            // until 1500 left reflection-heavy, short-lived bootstraps fully
+            // interpreted for an additional thousand hot calls.  Those calls
+            // dominate Hibernate/JAXB model construction, while the worker is
+            // otherwise idle.  C2 remains deliberately conservative so a
+            // one-shot process still avoids expensive optimizing recompiles.
+            c1_threshold: 500,
             c2_threshold: 20_000,
             osr_threshold: 10_000,
             tiered_enabled: true,
@@ -204,7 +186,7 @@ impl CompilationPolicy {
     ///
     /// | env var                            | field                | default |
     /// |------------------------------------|----------------------|---------|
-    /// | `CRATONVM_TIER_C1_THRESHOLD`       | `c1_threshold`       | 1500    |
+    /// | `CRATONVM_TIER_C1_THRESHOLD`       | `c1_threshold`       | 500     |
     /// | `CRATONVM_TIER_C2_THRESHOLD`       | `c2_threshold`       | 20000   |
     /// | `CRATONVM_TIER_OSR_THRESHOLD`      | `osr_threshold`      | 10000   |
     /// | `CRATONVM_TIER_C2_MIN_INVOCATIONS` | `c2_min_invocations` | 1000    |
@@ -1719,7 +1701,7 @@ mod tests {
     #[test]
     fn default_policy_values() {
         let p = CompilationPolicy::default();
-        assert_eq!(p.c1_threshold, 1500);
+        assert_eq!(p.c1_threshold, 500);
         assert_eq!(p.c2_threshold, 20_000);
         assert_eq!(p.osr_threshold, 10_000);
         assert!(p.tiered_enabled);
@@ -1757,7 +1739,7 @@ mod tests {
         let key = test_key();
         // Drive exactly `c1_threshold` invocations rather than a hardcoded
         // literal, so this test stays correct regardless of the default
-        // policy's threshold value (raised 200 -> 1500 on 2026-07-16, see
+        // policy's threshold value (currently 500; see
         // the rationale comment on `CompilationPolicy::default`).
         let c1_threshold = mgr.policy().c1_threshold;
         let mut triggered = None;
@@ -2247,7 +2229,7 @@ mod tests {
     fn policy_update() {
         let mgr = TieredCompilationManager::with_default_policy();
         let mut p = mgr.policy();
-        assert_eq!(p.c1_threshold, 1500);
+        assert_eq!(p.c1_threshold, 500);
         p.c1_threshold = 500;
         mgr.set_policy(p);
         assert_eq!(mgr.policy().c1_threshold, 500);
