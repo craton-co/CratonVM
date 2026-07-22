@@ -17602,9 +17602,6 @@ fn lookup_loader_initiated(
     name: &str,
 ) -> Option<ClassId> {
     hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
-    if !should_use_loader_initiated_resolution(shared, referencing_class_id) {
-        return None;
-    }
     let loader = match shared
         .class_manager
         .read()
@@ -25142,6 +25139,12 @@ fn force_native_over_real_jdk_bytecode(
                 | ("getName", "()Ljava/lang/String;")
                 | ("canRead", "()Z")
         )
+    {
+        return true;
+    }
+    if class_name == "java/lang/StringUTF16"
+        && method_name == "getChars"
+        && method_descriptor == "([BII[CI)V"
     {
         return true;
     }
@@ -40521,6 +40524,15 @@ mod tests {
             ),
             "Object.clone must route to the registered shallow-clone native"
         );
+    }
+
+    #[test]
+    fn string_utf16_get_chars_force_native_covers_cached_dispatch() {
+        assert!(force_native_over_real_jdk_bytecode(
+            "java/lang/StringUTF16",
+            "getChars",
+            "([BII[CI)V"
+        ));
     }
 
     #[test]
