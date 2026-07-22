@@ -199,3 +199,25 @@ landed in that window).
   from `orm.xml`. For Bug A, trace `hibernate-scan-jandex`'s indexer /
   `MetadataSources` entity-binding merge to see where the XML-only `Mouse`/
   `Seat` declarations are dropped relative to their annotated siblings.
+
+## Resolution (2026-07-22)
+
+This was one loader-local classpath defect, not separate JPA XML, listener, or
+ServiceLoader bugs. `URLClassLoader` retained its constructor URLs correctly,
+but its local resolver used `ClassPath::new()`, which admitted only `.jar`
+files. Hibernate creates valid ZIP packages with `.par` suffixes, so the child
+loader silently omitted every resource and class inside them.
+
+`ClassPath::new()` now treats every existing non-directory file (except its
+dedicated JMOD/JImage cases) as an archive candidate, consistent with
+`add_path()` and the JDK `URLClassLoader` contract. Invalid files remain safely
+ignored because ZIP parsing fails closed. The focused Rust regression
+`explicit_non_jar_archive_is_searchable` covers a `.par` ZIP service resource.
+
+Validation used current `dev`, a unique release executable, Temurin
+25.0.3.9, and the existing Hibernate fixture:
+
+| Mode | Result |
+|---|---|
+| JIT | 15/15 passed in 209847 ms |
+| `--nojit` | 15/15 passed in 238295 ms |
