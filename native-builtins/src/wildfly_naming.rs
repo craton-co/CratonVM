@@ -727,8 +727,32 @@ fn environment_with_property(
     property: &str,
     value: &str,
 ) -> Value {
-    let ht = match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
-        Ok(Some(Value::Object(Some(o)))) => o,
+    // Preserve a caller supplied real-JDK environment.  In particular, an
+    // InitialDirContext carries both the initial factory *and* the provider
+    // URL in `myProps`; replacing it with a one-entry table lets
+    // NamingManager select LdapCtxFactory but leaves that factory without its
+    // LDAP endpoint.  Hashtable's Map constructor makes the same shallow copy
+    // that InitialContext uses for its private properties table.
+    let copied = match incoming {
+        Value::Object(Some(_)) => ctx
+            .new_object_initialized("java/util/Hashtable", "(Ljava/util/Map;)V", &[incoming])
+            .ok()
+            .flatten()
+            .and_then(|value| match value {
+                Value::Object(Some(object)) => Some(object),
+                _ => None,
+            })
+            .or_else(|| match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
+                Ok(Some(Value::Object(Some(object)))) => Some(object),
+                _ => None,
+            }),
+        _ => match ctx.new_object_initialized("java/util/Hashtable", "()V", &[]) {
+            Ok(Some(Value::Object(Some(object)))) => Some(object),
+            _ => None,
+        },
+    };
+    let ht = match copied {
+        Some(object) => object,
         _ => return incoming,
     };
     // GC-SAFETY: `ht` is used again after its own `put` dispatch (the final
@@ -770,6 +794,10 @@ fn native_initial_context_get_environment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    let incoming = initial_context_env(ctx, this);
+    if matches!(incoming, Value::Object(Some(_))) {
+        return Ok(Some(incoming));
+    }
     let factory = match ctx.get_system_property("java.naming.factory.initial") {
         Some(value) if !value.trim().is_empty() => value,
         _ => {
@@ -779,7 +807,6 @@ fn native_initial_context_get_environment(
             ))
         }
     };
-    let incoming = initial_context_env(ctx, this);
     let env = environment_with_property(ctx, incoming, "java.naming.factory.initial", &factory);
     Ok(Some(env))
 }
@@ -812,7 +839,10 @@ fn initial_context_env(ctx: &dyn NativeContext, this: ObjectRef) -> Value {
     if is_synthetic {
         ctx.get_field(this, INIT_CTX_FIELD_ENV)
     } else {
-        Value::Object(None)
+        // Real JDK InitialContext stores its caller-supplied Hashtable in
+        // myProps.  Returning null here loses InitialDirContext's LDAP
+        // factory setting before NamingManager can select LdapCtxFactory.
+        ctx.get_field_by_name(this, "myProps")
     }
 }
 
@@ -877,15 +907,25 @@ fn configured_initial_context(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let incoming = initial_context_env(ctx, this);
     let factory = match ctx.get_system_property("java.naming.factory.initial") {
-        Some(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
+        Some(value) if !value.trim().is_empty() => Some(value),
+        _ => match incoming {
+            Value::Object(Some(env)) => {
+                let key = ctx.create_string("java.naming.factory.initial");
+                match ctx.invoke_virtual(env, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[Value::Object(Some(key))])? {
+                    Some(Value::Object(Some(value))) => ctx.read_string(value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
     };
+    let Some(factory) = factory.filter(|value| !value.trim().is_empty()) else { return Ok(None); };
     // The native InitialContext constructor does not execute the JDK body that
     // copies system JNDI properties into `myProps`. Give NamingManager the
     // equivalent explicit environment so it can instantiate the configured
     // factory instead of throwing NoInitialContextException.
-    let incoming = initial_context_env(ctx, this);
     let env = environment_with_property(ctx, incoming, "java.naming.factory.initial", &factory);
     match ctx.invoke(
         "javax/naming/spi/NamingManager",
