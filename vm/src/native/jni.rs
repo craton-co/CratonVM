@@ -465,6 +465,13 @@ pub fn attach_foreign_thread(
     shared
         .thread_registry
         .set_tlab_addr(tid, &jt.tlab as *const cratonvm_gc::Tlab as usize);
+    // XT-FRAME-SCAN: publish this foreign thread's `JvmThread` address too
+    // (the same Box keeps it stable) so a takeover that freezes it mid-JIT
+    // can walk its interpreter frames. Cleared with the TLAB address in
+    // `detach_foreign_thread`.
+    shared
+        .thread_registry
+        .set_jvm_thread_addr(tid, &*jt as *const JvmThread as usize);
 
     // Park the box in TLS so it outlives this call and stays address-stable; the
     // raw pointer is the heap allocation address, unchanged by moving the Box.

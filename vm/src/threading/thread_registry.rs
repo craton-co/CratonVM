@@ -197,6 +197,12 @@ struct ThreadEntry {
     /// before dropping). `AtomicUsize` so the owning thread sets/clears it
     /// lock-free.
     tlab_addr: std::sync::atomic::AtomicUsize,
+    /// XT-FRAME-SCAN: the owning thread's whole `JvmThread` address (0 =
+    /// unpublished). Published with the same discipline as `tlab_addr`
+    /// (address-stable for the thread's life, published by the owner) and
+    /// cleared together with it in [`ThreadRegistry::clear_tlab_addr`]; read
+    /// only for OS-frozen takeover peers (see `frozen_peer_thread_addrs`).
+    jvm_thread_addr: std::sync::atomic::AtomicUsize,
     /// xt-hardening (2026-07-03): the OS thread id of the thread executing
     /// this entry, published by the thread itself at startup (next to its
     /// TLAB address). `0` = not yet published. The GC initiator snapshots
@@ -343,6 +349,7 @@ impl ThreadRegistry {
             jmx_locked_synchronizers: Mutex::new(Vec::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
+            jvm_thread_addr: std::sync::atomic::AtomicUsize::new(0),
             os_tid: std::sync::atomic::AtomicU32::new(0),
         };
         self.threads.lock().insert(thread_id, entry);
@@ -371,7 +378,58 @@ impl ThreadRegistry {
         let threads = self.threads.lock();
         if let Some(entry) = threads.get(&thread_id) {
             entry.tlab_addr.store(0, Ordering::Release);
+            // XT-FRAME-SCAN: the JvmThread address shares the TLAB address's
+            // exact lifecycle (published once the JvmThread's address is
+            // final, must stop being visible before it drops) — clear both
+            // under the same lock hold so no reader can observe a cleared
+            // TLAB with a still-published thread address or vice versa.
+            entry.jvm_thread_addr.store(0, Ordering::Release);
         }
+    }
+
+    /// XT-FRAME-SCAN: publish the owning thread's `JvmThread` address so the
+    /// cross-thread STW takeover can walk a frozen peer's interpreter frames
+    /// (locals + operand stacks) directly. Same publication discipline as
+    /// [`Self::set_tlab_addr`]: called once after the `JvmThread`'s address
+    /// is final (worker spawn body / primordial boot / JNI attach); cleared
+    /// by [`Self::clear_tlab_addr`] before the `JvmThread` drops. No-op for
+    /// an unknown id.
+    pub fn set_jvm_thread_addr(&self, thread_id: ThreadId, addr: usize) {
+        let threads = self.threads.lock();
+        if let Some(entry) = threads.get(&thread_id) {
+            entry.jvm_thread_addr.store(addr, Ordering::Release);
+        }
+    }
+
+    /// XT-FRAME-SCAN: the published `JvmThread` addresses of every alive
+    /// thread whose OS tid is in `os_tids` (the takeover's frozen-peer set).
+    ///
+    /// SAFETY contract for the caller's deref: entries must only be
+    /// dereferenced for peers that are OS-frozen by the takeover (suspended
+    /// with `Rip` inside registered compiled code) and stay frozen until
+    /// after the deref ends — compiled code never mutates the `JvmThread`'s
+    /// interpreter state, and a frozen thread cannot exit (so `alive` cannot
+    /// flip nor the `JvmThread` drop while frozen).
+    pub fn frozen_peer_thread_addrs(&self, os_tids: &[u32]) -> Vec<usize> {
+        if os_tids.is_empty() {
+            return Vec::new();
+        }
+        let threads = self.threads.lock();
+        let mut out = Vec::new();
+        for entry in threads.values() {
+            if !entry.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            let tid = entry.os_tid.load(Ordering::Acquire);
+            if tid == 0 || !os_tids.contains(&tid) {
+                continue;
+            }
+            let addr = entry.jvm_thread_addr.load(Ordering::Acquire);
+            if addr != 0 {
+                out.push(addr);
+            }
+        }
+        out
     }
 
     /// BUG-03 — collect the reserved (un-retired) TLAB tails of every alive

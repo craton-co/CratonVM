@@ -690,6 +690,75 @@ fn stw_take_over_and_wait(
             warned = true;
         }
     }
+    // XT-FRAME-SCAN fix (2026-07-22, stw-residual-close): a frozen in-JIT
+    // peer's interpreter frames live in Rust Vecs (`JvmThread::frames`) —
+    // invisible to the conservative register/native-stack scan — and its
+    // deposited `root_snapshot` is only as fresh as its last publish
+    // (safepoint arrival, block-enter). Any ref pushed onto an interpreter
+    // operand stack (or stored into a local) after that publish and before
+    // entering compiled code was therefore missing from the mark roots for
+    // the whole frozen window, and the non-moving sweep zeroed the still-live
+    // object in place (WildFly parallel-extension-add: fresh
+    // StringBuilder/Reader receivers reading back all-zero — see
+    // docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md).
+    // Walk each frozen peer's interpreter frames directly into `xt_roots`.
+    //
+    // SAFETY: each address was published by its owning thread with the
+    // `tlab_addr` discipline (stable for the thread's life, cleared before
+    // the `JvmThread` drops), and the peer is OS-frozen with `Rip` inside
+    // registered compiled code (`take_over_pass` freezes nothing else).
+    // Compiled code never mutates the `JvmThread`'s interpreter state — the
+    // code paths that do (interpreter, JIT helpers) put `Rip` outside every
+    // registered range — and frozen peers are resumed only after the
+    // collection completes (`xt_root_scan::resume`), so the reference is
+    // dropped before any mutation can resume. A frozen thread also cannot
+    // exit, so the entry stays alive and the `JvmThread` cannot drop.
+    // Contributed roots go into `xt_roots`, which already forces the
+    // non-moving sweep (Generational) / region pinning (G1) for this cycle,
+    // so a stale or dead value can only over-retain — never relocate or
+    // corrupt.
+    if taken.count() > 0 {
+        let peer_addrs = shared.thread_registry.frozen_peer_thread_addrs(&taken.tids);
+        let contributed_from = xt_roots.len();
+        for addr in peer_addrs {
+            // SAFETY: see the block comment above.
+            let peer: &crate::threading::jvm_thread::JvmThread =
+                unsafe { &*(addr as *const crate::threading::jvm_thread::JvmThread) };
+            for frame in peer.frames.iter() {
+                frame.scan_local_objects(xt_roots, &shared.heap);
+                let sb = xt_roots.len();
+                frame.stack.scan_object_refs(xt_roots, &shared.heap);
+                if xt_roots.len() > sb {
+                    // Operand-stack candidates are validated strictly, exactly
+                    // like the deposit path (`scan_frame_roots`): a pointer-
+                    // shaped primitive long must not become a root.
+                    let added = xt_roots.split_off(sb);
+                    for o in added {
+                        if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                            xt_roots.push(o);
+                        }
+                    }
+                }
+                if let Some(m) = frame.monitor_on_exit {
+                    xt_roots.push(m);
+                }
+            }
+            for r in peer.native_pin_roots.iter() {
+                xt_roots.push(*r);
+            }
+            if let Some(r) = peer.native_pending_return {
+                xt_roots.push(r);
+            }
+        }
+        if std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
+            eprintln!(
+                "[xt-frame-scan] frozen_peers={} contributed_roots={}",
+                taken.count(),
+                xt_roots.len() - contributed_from
+            );
+        }
+    }
+
     // A4 (fork6-fjp) — helper-window coverage. The barrier is satisfied, so
     // every remaining un-scanned root holder is a BLOCKED thread (excluded via
     // `threads_blocked`, covered only by its `deposit_root_snapshot`, which
@@ -19740,6 +19809,26 @@ fn execute_invoke_kind(
                                     &*method_name,
                                     &*method_descriptor,
                                 );
+                                {
+                                    let blocked_flag = thread
+                                        .gc_block_state
+                                        .in_blocked_region
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                    eprintln!(
+                                        "[stale-recv] holder tid={} blocked={} epoch={} kind={:?}",
+                                        thread.thread_id.0,
+                                        blocked_flag,
+                                        shared.heap.collection_count(),
+                                        thread.kind,
+                                    );
+                                    for (e, moved_to, mlen, as_dest) in
+                                        crate::memory::gc::gcpart_probe(stale_addr)
+                                    {
+                                        eprintln!(
+                                            "[stale-recv] [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                                        );
+                                    }
+                                }
                                 for (fi, f) in thread.frames.iter().enumerate().rev().take(30) {
                                     eprintln!(
                                         "  [{}] {}.{}{} pc={}",
@@ -19749,6 +19838,12 @@ fn execute_invoke_kind(
                                         f.method_descriptor(),
                                         f.pc,
                                     );
+                                    if let Some(loc) = f.dbg_locate_addr(stale_addr) {
+                                        eprintln!("      LOCATE {loc}");
+                                    }
+                                    if fi + 3 >= thread.frames.len() {
+                                        eprintln!("      RAWSTACK{}", f.dbg_stack_dump());
+                                    }
                                     for li in 0..f.locals_len() {
                                         // Cast: numeric/representation conversion
                                         let v = f.get_local(li as u16);

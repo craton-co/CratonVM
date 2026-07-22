@@ -106,6 +106,59 @@ pub(crate) fn watch_addr() -> Option<usize> {
     })
 }
 
+// GCPART (stw-residual-close 20260722): env-gated ring of the last few
+// relocation pointer maps. A stale-ref capture probes it to distinguish
+// "this address WAS relocated at epoch E to X but the holding slot missed
+// the remap" from "never relocated in any recent cycle (root-scan miss /
+// young-space reuse)". Gate: CRATONVM_DBG_GCPART; debug-only.
+pub(crate) fn gcpart_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCPART").is_some())
+}
+
+#[allow(clippy::type_complexity)]
+fn gcpart_ring() -> &'static std::sync::Mutex<Vec<(u64, HashMap<usize, usize>)>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, HashMap<usize, usize>)>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn gcpart_record(epoch: u64, map: &HashMap<usize, usize>) {
+    if !gcpart_enabled() || map.is_empty() {
+        return;
+    }
+    if let Ok(mut ring) = gcpart_ring().lock() {
+        if ring.len() >= 8 {
+            ring.remove(0);
+        }
+        ring.push((epoch, map.clone()));
+    }
+}
+
+/// For each recorded recent map, oldest first: (epoch, moved_to-if-key,
+/// map_len, appears-as-destination).
+#[allow(clippy::type_complexity)]
+pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)> {
+    if !gcpart_enabled() {
+        return Vec::new();
+    }
+    match gcpart_ring().lock() {
+        Ok(ring) => ring
+            .iter()
+            .map(|(e, m)| {
+                (
+                    *e,
+                    m.get(&addr).copied(),
+                    m.len(),
+                    m.values().any(|&v| v == addr),
+                )
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
@@ -148,6 +201,7 @@ pub fn update_all_roots(
     if pointer_map.is_empty() {
         return;
     }
+    gcpart_record(shared.heap.collection_count(), pointer_map);
 
     // JNI local references (INT-2): rewrite THIS thread's `JNI_LOCAL_FRAMES`
     // handles through the pointer map. The scan half

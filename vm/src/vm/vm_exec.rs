@@ -6179,6 +6179,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_tlab_addr(tid, &jvm_thread.tlab as *const cratonvm_gc::Tlab as usize);
+            // XT-FRAME-SCAN: publish the whole `JvmThread` address too (same
+            // address-stability argument as the TLAB line above) so a
+            // takeover that freezes this worker mid-JIT can walk its
+            // interpreter frames for roots newer than its last snapshot
+            // deposit. Cleared together with the TLAB address at teardown.
+            shared_arc
+                .thread_registry
+                .set_jvm_thread_addr(tid, &jvm_thread as *const JvmThread as usize);
             // xt-hardening (2026-07-03): publish this worker's OS thread id
             // so the takeover's counted-set excusal can identify it (see
             // ThreadRegistry::set_os_tid_current). Must precede any Java/JIT
@@ -17635,6 +17643,30 @@ fn invoke_on_class_shared_inner(
                             f.method_name(),
                             f.pc
                         );
+                    }
+                    if let Some(Value::Object(Some(r))) = args.first() {
+                        let addr = r.as_ptr() as usize;
+                        let blocked_flag = thread
+                            .gc_block_state
+                            .in_blocked_region
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        eprintln!(
+                            "  NSME-RECV addr=0x{addr:x} tid={} blocked={} epoch={}",
+                            thread.thread_id.0,
+                            blocked_flag,
+                            shared.heap.collection_count(),
+                        );
+                        for (e, moved_to, mlen, as_dest) in crate::memory::gc::gcpart_probe(addr) {
+                            eprintln!(
+                                "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                            );
+                        }
+                        for (fi, f) in thread.frames.iter().enumerate().rev().take(6) {
+                            if let Some(loc) = f.dbg_locate_addr(addr) {
+                                eprintln!("  NSME-RECV LOCATE frame#{fi} {loc}");
+                            }
+                            eprintln!("  NSME-RECV RAWSTACK frame#{fi}{}", f.dbg_stack_dump());
+                        }
                     }
                 }
                 // Optional operator diagnostic: at the terminal not-found point
