@@ -47,6 +47,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 #[cfg(unix)]
@@ -1270,6 +1271,12 @@ pub(crate) struct TlsServerListenerEntry {
     pub(crate) listener: TcpListener,
     pub(crate) config: TlsServerConfig,
     pub(crate) local_port: u16,
+    /// Set by `rustls_listener_close` and polled by `rustls_server_accept`'s
+    /// non-blocking accept loop (see that function's doc comment) — lets a
+    /// concurrent `close()` unblock a thread parked in `accept()` without
+    /// needing the `sreg()` mutex, which that thread cannot hold while
+    /// blocked.
+    pub(crate) closed: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -2613,29 +2620,58 @@ pub(crate) fn rustls_client_connect(
 
 /// Accept a TLS connection on the listener with the given id. Drives the
 /// handshake to completion and stores the stream in the server-streams table.
+///
+/// FIX (h2-testnetutils-accept-close-deadlock): the previous version called
+/// the blocking `TcpListener::accept()` *through* the `sreg()`-guarded
+/// listener entry, i.e. with `sreg()`'s mutex held for the full duration of
+/// the wait for a peer connection — which can be indefinite (H2's
+/// `TestNetUtils.testFrequentConnections` starts a background `Task` thread
+/// looping `serverSocket.accept()`, and its client-side workers can all
+/// finish/bail without ever connecting, e.g. after a *different*, since-fixed
+/// bug — see `bug-h2-netutils-dsa-privatekey-tls-unsupported.md` — left them
+/// throwing before they ever reached the network). The test's own `finally`
+/// block then calls `serverSocket.close()` from the main thread, which needs
+/// that SAME mutex (`rustls_listener_close`) to remove the listener entry —
+/// permanently deadlocked against the accept thread that can never release it
+/// while blocked in the kernel. Fixed by only holding `sreg()` briefly (to
+/// clone the `TcpListener` handle and the `closed` flag), then polling
+/// `accept()` non-blockingly outside the lock so a `close()` call can always
+/// acquire the mutex immediately and is noticed within one poll interval.
 pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     let debug_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
-    // Step 1: pop the config + tcp listener ref, then accept *without* the
-    // mutex held so long handshakes don't stall every other TLS operation.
-    let config = {
-        let reg = sreg().lock();
-        reg.listeners
-            .get(&listener_id)
-            .map(|e| e.config.clone())
-            .ok_or_else(|| format!("no such SSLServerSocket id: {}", listener_id))?
-    };
-
-    let (tcp, _peer) = {
+    // Step 1: pop the config + a cloned tcp listener handle + the closed
+    // flag, then accept *without* the mutex held so long handshakes (or a
+    // long wait for a peer that never connects) don't stall every other TLS
+    // operation, and so `close()` is never blocked behind this wait.
+    let (config, tcp_listener, closed) = {
         let reg = sreg().lock();
         let entry = reg
             .listeners
             .get(&listener_id)
-            .ok_or_else(|| format!("SSLServerSocket {} gone", listener_id))?;
-        entry
+            .ok_or_else(|| format!("no such SSLServerSocket id: {}", listener_id))?;
+        let cloned = entry
             .listener
-            .accept()
-            .map_err(|e| format!("accept failed: {}", e))?
+            .try_clone()
+            .map_err(|e| format!("listener try_clone failed: {e}"))?;
+        (entry.config.clone(), cloned, entry.closed.clone())
     };
+
+    tcp_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
+    let (tcp, _peer) = loop {
+        match tcp_listener.accept() {
+            Ok(pair) => break pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if closed.load(Ordering::SeqCst) {
+                    return Err("listener closed".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("accept failed: {}", e)),
+        }
+    };
+    let _ = tcp.set_nonblocking(false);
     if debug_hs {
         eprintln!("[dbg-tls-hs] server_accept listener_id={} accepted TCP", listener_id);
     }
@@ -3296,7 +3332,11 @@ pub(crate) fn rustls_stream_close(id: i32) {
 /// Close a listener by id (idempotent).
 pub(crate) fn rustls_listener_close(id: i32) {
     let mut reg = sreg().lock();
-    reg.listeners.remove(&id);
+    if let Some(entry) = reg.listeners.remove(&id) {
+        // Wake a thread parked in `rustls_server_accept`'s non-blocking poll
+        // loop for this listener — see that function's doc comment.
+        entry.closed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Retrieve negotiated session info for either stream flavor.
@@ -3451,6 +3491,20 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// OpenSSL-backed fallback acceptor for identities rustls's `ring` crypto
+/// backend refuses to sign with. Originally written for DSA (rustls has no
+/// DSA `SigningKey` at all), but `ring::rsa::KeyPair::from_pkcs8` *also*
+/// rejects any RSA key below 2047 bits (a hard-coded policy floor, not a
+/// parsing failure) — `rustls::sign::any_supported_type` surfaces that as the
+/// same generic "failed to parse private key as RSA, ECDSA, or EdDSA" rustls
+/// gives for a genuinely-unparseable key, with no way to distinguish the two
+/// from the caller side. H2's bundled `TestNetUtils` self-signed test
+/// keystore carries exactly this: a legacy 1024-bit RSA key (generated 2005)
+/// that's syntactically well-formed PKCS#8 RSA but below ring's floor. Since
+/// OpenSSL enforces no such minimum (once `set_security_level(0)` is applied
+/// below), it accepts whatever key/cert pair rustls's stricter backend
+/// wouldn't — DSA, sub-2047-bit RSA, or any other legacy identity — so this
+/// accepts any key OpenSSL itself can use rather than gating on key type.
 /// Build a real TLS listener and its Java `SSLServerSocket` wrapper.  Keep
 /// every `SSLServerSocketFactory.createServerSocket` overload on this one
 /// path so callers cannot accidentally fall through to `ServerSocketFactory`'s
@@ -3458,9 +3512,6 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
 #[cfg(unix)]
 fn legacy_dsa_acceptor(cert_pem: &str, key_pem: &str) -> Result<SslAcceptor, String> {
     let key = PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| e.to_string())?;
-    if !key.dsa().is_ok() {
-        return Err("key is not DSA".to_string());
-    }
     let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| e.to_string())?;
     let mut builder =
         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).map_err(|e| e.to_string())?;
@@ -3555,6 +3606,7 @@ fn create_ssl_server_socket(
         listener,
         config,
         local_port,
+        closed: Arc::new(AtomicBool::new(false)),
     };
     let id = {
         let mut reg = sreg().lock();
@@ -3750,6 +3802,12 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         ctx.set_field(sock, SSS_SOCK_PORT, Value::Int(0));
         ctx.set_field(sock, SSS_SOCK_TLSID, Value::Int(stream_id));
         ctx.set_field(sock, SSS_SOCK_CLOSED, Value::Int(0));
+        // NOTE: a blocking read/write on this accepted socket appears to be
+        // unreliable independent of this doc's fix (probed while validating
+        // the accept-path change below; H2's own TestNetUtils never reads or
+        // writes on the accepted socket, so it's outside this doc's scope —
+        // left uninvestigated rather than risk a half-understood change to
+        // this shared accept path).
 
         let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
         let p = ctx.create_string(&proto);
@@ -3772,7 +3830,89 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     });
     r.register(sss, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
     r.register(sss, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    // getEnabledProtocols/setEnabledProtocols — `javax.net.ssl.SSLServerSocket`
+    // is a real, abstract JDK class; unlike `SSLSocket`/`SSLEngine` (whose
+    // `cls_impl` natives cover these via the shared `with_engine` state),
+    // `SSLServerSocket` had no registration for either at all, so any caller
+    // that round-trips through them (H2's `CipherFactory.createServerSocket`
+    // calls `setEnabledProtocols(disableSSL(getEnabledProtocols()))`
+    // immediately after construction) hit `AbstractMethodError: ... has no
+    // Code attribute` — the interpreter found no native and no concrete
+    // bytecode to fall back to. Backed by the same
+    // `gc_stable_objref_key`-indexed side-table pattern as `sock_alpn_table`.
+    r.register(
+        sss,
+        "setEnabledProtocols",
+        "([Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mut list: Vec<String> = Vec::new();
+            if let Some(Value::Object(Some(arr))) = args.get(1) {
+                let len = ctx.array_length(*arr);
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                        if let Some(t) = ctx.read_string(s) {
+                            list.push(t);
+                        }
+                    }
+                }
+            }
+            if list.is_empty() {
+                list = vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()];
+            }
+            stash_sss_enabled_protocols(ctx, this, list);
+            Ok(None)
+        },
+    );
+    r.register(
+        sss,
+        "getEnabledProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let list = lookup_sss_enabled_protocols(ctx, this)
+                .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), list.len());
+            for (i, p) in list.iter().enumerate() {
+                let s = ctx.create_string(p);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    r.register(
+        sss,
+        "getSupportedProtocols",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 2);
+            let s1 = ctx.create_string("TLSv1.3");
+            let s2 = ctx.create_string("TLSv1.2");
+            ctx.set_array_element(arr, 0, Value::Object(Some(s1)));
+            ctx.set_array_element(arr, 1, Value::Object(Some(s2)));
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
     r.set_category(__prev_cat);
+}
+
+/// Side-table storing this `SSLServerSocket`'s `setEnabledProtocols` list.
+/// Same rationale/keying as `sock_alpn_table` (see `gc_stable_objref_key`'s
+/// doc comment) — `SSLServerSocket`'s synthetic 4-field layout has no spare
+/// slot for a `String[]`.
+fn sss_enabled_protocols_table() -> &'static Mutex<HashMap<u64, Vec<String>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn stash_sss_enabled_protocols(ctx: &dyn NativeContext, socket: ObjectRef, protocols: Vec<String>) {
+    let key = gc_stable_objref_key(ctx, socket);
+    sss_enabled_protocols_table().lock().insert(key, protocols);
+}
+
+fn lookup_sss_enabled_protocols(ctx: &dyn NativeContext, socket: ObjectRef) -> Option<Vec<String>> {
+    let key = gc_stable_objref_key(ctx, socket);
+    sss_enabled_protocols_table().lock().get(&key).cloned()
 }
 
 /// Side-table storing ALPN protocols per SSLSocket objectref. Used so

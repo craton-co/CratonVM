@@ -989,7 +989,64 @@ fn native_subject_do_as(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Shared by both registered overloads:
+    // <init>(String, Subject, CallbackHandler)V
+    // <init>(String, Subject, CallbackHandler, Configuration)V
+    let this = obj_arg(args, 0)?;
+    let name_obj = optional_obj_arg(args, 1);
+    let subject_arg = optional_obj_arg(args, 2);
+    let handler_obj = optional_obj_arg(args, 3);
+    let config_obj = optional_obj_arg(args, 4);
+    native_login_context_init_core(ctx, this, name_obj, subject_arg, handler_obj, config_obj)
+}
+
+fn native_login_context_init_name_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // <init>(String)V
+    let this = obj_arg(args, 0)?;
+    let name_obj = optional_obj_arg(args, 1);
+    native_login_context_init_core(ctx, this, name_obj, None, None, None)
+}
+
+fn native_login_context_init_name_handler(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // <init>(String, CallbackHandler)V — the overload H2's
+    // `JaasCredentialsValidator` uses. Previously unregistered, so it ran as
+    // un-intercepted real JDK bytecode and never populated the side-table
+    // `login()` depends on (see docs/known-issues/h2-suite-bugs/
+    // bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
+    let this = obj_arg(args, 0)?;
+    let name_obj = optional_obj_arg(args, 1);
+    let handler_obj = optional_obj_arg(args, 2);
+    native_login_context_init_core(ctx, this, name_obj, None, handler_obj, None)
+}
+
+fn native_login_context_init_name_subject(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // <init>(String, Subject)V
+    let this = obj_arg(args, 0)?;
+    let name_obj = optional_obj_arg(args, 1);
+    let subject_arg = optional_obj_arg(args, 2);
+    native_login_context_init_core(ctx, this, name_obj, subject_arg, None, None)
+}
+
+fn native_login_context_init_core(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name_obj: Option<ObjectRef>,
+    subject_arg: Option<ObjectRef>,
+    handler_obj: Option<ObjectRef>,
+    config_obj: Option<ObjectRef>,
+) -> MethodCallResult {
+    // Shared by every `LoginContext` constructor overload:
+    //   <init>(String)V
+    //   <init>(String, CallbackHandler)V
+    //   <init>(String, Subject)V
     //   <init>(String, Subject, CallbackHandler)V
     //   <init>(String, Subject, CallbackHandler, Configuration)V
     //
@@ -998,12 +1055,6 @@ fn native_login_context_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Tomcat's `JAASRealm`) pass a real `Configuration` object to the 4-arg
     // overload; record those Java objects on the LoginContext too so
     // `login()` can execute real `LoginModule` bytecode from the config.
-    let this = obj_arg(args, 0)?;
-    let name_obj = optional_obj_arg(args, 1);
-    let subject_arg = optional_obj_arg(args, 2);
-    let handler_obj = optional_obj_arg(args, 3);
-    let config_obj = optional_obj_arg(args, 4);
-
     let pin_base = ctx.pin_native_root(this);
     let name_pin = name_obj.map(|obj| PinnedObject::new(ctx, obj));
     let subject_pin = subject_arg.map(|obj| PinnedObject::new(ctx, obj));
@@ -1306,76 +1357,135 @@ fn run_java_configuration_login(
         else {
             return Ok(None);
         };
-        let Some(subject_obj) =
-            login_context_object_field(ctx, this, "subject", LOGIN_CONTEXT_SLOT_SUBJECT)
-        else {
-            return Err(RuntimeError::IllegalStateException {
-                message: "LoginContext subject missing".into(),
-            }
-            .into());
-        };
-
-        let config = PinnedObject::new(ctx, config_obj);
-        let subject = PinnedObject::new(ctx, subject_obj);
-        let handler =
-            login_context_object_field(ctx, this, "callbackHandler", LOGIN_CONTEXT_SLOT_HANDLER)
-                .map(|obj| PinnedObject::new(ctx, obj));
-        let name_obj = ctx.create_string(name);
-        let name_pin = PinnedObject::new(ctx, name_obj);
-        let specs = read_java_login_modules(ctx, config, name_pin)?;
-        if specs.is_empty() {
-            return Ok(Some(false));
+        // An explicit `Configuration` was passed to the 4-arg constructor
+        // (e.g. Tomcat's `JAASRealm`): no entries for `name` is a real
+        // failure, not a signal to fall back to something else.
+        match run_login_with_java_config(ctx, this, name, config_obj)? {
+            Some(success) => Ok(Some(success)),
+            None => Ok(Some(false)),
         }
-
-        let shared_state = new_hash_map_pinned(ctx)?;
-        let mut invoked = Vec::new();
-        let mut any_non_optional_success = false;
-        let mut any_required_failure = false;
-        let mut sufficient_success = false;
-
-        for spec in &specs {
-            if sufficient_success {
-                continue;
-            }
-            let runtime = instantiate_login_module(ctx, spec, subject, handler, shared_state)?;
-            let module_obj = runtime.module.current(ctx);
-            let login_ok = invoke_java_boolean(ctx, module_obj, "login")?;
-
-            match (spec.flag, login_ok) {
-                (ControlFlag::Required, true) | (ControlFlag::Requisite, true) => {
-                    any_non_optional_success = true;
-                }
-                (ControlFlag::Required, false) => {
-                    any_required_failure = true;
-                }
-                (ControlFlag::Requisite, false) => {
-                    any_required_failure = true;
-                    invoked.push(runtime);
-                    break;
-                }
-                (ControlFlag::Sufficient, true) => {
-                    any_non_optional_success = true;
-                    sufficient_success = true;
-                }
-                (ControlFlag::Sufficient, false) | (ControlFlag::Optional, _) => {}
-            }
-            invoked.push(runtime);
-        }
-
-        let login_success = any_non_optional_success && !any_required_failure;
-        if !login_success {
-            abort_java_modules(ctx, &invoked);
-            return Ok(Some(false));
-        }
-
-        let commit_success = commit_java_modules(ctx, &invoked)?;
-        if !commit_success {
-            abort_java_modules(ctx, &invoked);
-        }
-        Ok(Some(commit_success))
     })();
     ctx.unpin_native_roots(pin_base);
     result
+}
+
+/// Fallback for every constructor overload that does NOT take an explicit
+/// `Configuration` (all but the 4-arg `(..., Configuration)` form). Real
+/// JDK's `LoginContext` resolves those against the process-wide default
+/// `Configuration.getConfiguration()`; H2's `JaasCredentialsValidator`
+/// relies on exactly this path via the 2-arg `(String, CallbackHandler)`
+/// constructor — it calls `Configuration.setConfiguration(...)` itself and
+/// never touches the Rust-side security-domain registry (see
+/// docs/known-issues/h2-suite-bugs/bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
+/// Only consulted by the caller when the Rust-side registry
+/// (`LoginContext::modules`, populated by WildFly/Keycloak bootstrap) has no
+/// entry for `name`, so WildFly/Keycloak's own domains are unaffected.
+/// Returns `Ok(None)` ("fall through to the Rust-side domain modules") when
+/// there is no installed default `Configuration`, or it has no entry for
+/// `name` either — same as a `LoginContext` constructed with a name that
+/// matches nothing anywhere, which correctly ends in `lc.login()`'s
+/// no-modules failure.
+fn run_default_java_configuration_login(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+) -> Result<Option<bool>, MethodCallFailed> {
+    let pin_base = ctx.pin_native_root(this);
+    let result = (|| {
+        let Some(Value::Object(Some(config_obj))) = ctx.invoke(
+            "javax/security/auth/login/Configuration",
+            "getConfiguration",
+            "()Ljavax/security/auth/login/Configuration;",
+            &[],
+        )?
+        else {
+            return Ok(None);
+        };
+        let this = ctx.read_native_pin(pin_base, this);
+        run_login_with_java_config(ctx, this, name, config_obj)
+    })();
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+/// Shared driver for both of the above: read `name`'s entries from
+/// `config_obj`, instantiate and run each real Java `LoginModule` per JAAS
+/// control-flag semantics. Returns `Ok(None)` when `config_obj` has no
+/// entries for `name` — callers decide whether that means "fail" or "fall
+/// through to another source".
+fn run_login_with_java_config(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    name: &str,
+    config_obj: ObjectRef,
+) -> Result<Option<bool>, MethodCallFailed> {
+    let Some(subject_obj) =
+        login_context_object_field(ctx, this, "subject", LOGIN_CONTEXT_SLOT_SUBJECT)
+    else {
+        return Err(RuntimeError::IllegalStateException {
+            message: "LoginContext subject missing".into(),
+        }
+        .into());
+    };
+
+    let config = PinnedObject::new(ctx, config_obj);
+    let subject = PinnedObject::new(ctx, subject_obj);
+    let handler =
+        login_context_object_field(ctx, this, "callbackHandler", LOGIN_CONTEXT_SLOT_HANDLER)
+            .map(|obj| PinnedObject::new(ctx, obj));
+    let name_obj = ctx.create_string(name);
+    let name_pin = PinnedObject::new(ctx, name_obj);
+    let specs = read_java_login_modules(ctx, config, name_pin)?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+
+    let shared_state = new_hash_map_pinned(ctx)?;
+    let mut invoked = Vec::new();
+    let mut any_non_optional_success = false;
+    let mut any_required_failure = false;
+    let mut sufficient_success = false;
+
+    for spec in &specs {
+        if sufficient_success {
+            continue;
+        }
+        let runtime = instantiate_login_module(ctx, spec, subject, handler, shared_state)?;
+        let module_obj = runtime.module.current(ctx);
+        let login_ok = invoke_java_boolean(ctx, module_obj, "login")?;
+
+        match (spec.flag, login_ok) {
+            (ControlFlag::Required, true) | (ControlFlag::Requisite, true) => {
+                any_non_optional_success = true;
+            }
+            (ControlFlag::Required, false) => {
+                any_required_failure = true;
+            }
+            (ControlFlag::Requisite, false) => {
+                any_required_failure = true;
+                invoked.push(runtime);
+                break;
+            }
+            (ControlFlag::Sufficient, true) => {
+                any_non_optional_success = true;
+                sufficient_success = true;
+            }
+            (ControlFlag::Sufficient, false) | (ControlFlag::Optional, _) => {}
+        }
+        invoked.push(runtime);
+    }
+
+    let login_success = any_non_optional_success && !any_required_failure;
+    if !login_success {
+        abort_java_modules(ctx, &invoked);
+        return Ok(Some(false));
+    }
+
+    let commit_success = commit_java_modules(ctx, &invoked)?;
+    if !commit_success {
+        abort_java_modules(ctx, &invoked);
+    }
+    Ok(Some(commit_success))
 }
 
 fn native_login_context_login(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1391,6 +1501,18 @@ fn native_login_context_login(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .into());
         }
         return Ok(None);
+    }
+
+    if lc.modules.is_empty() {
+        if let Some(success) = run_default_java_configuration_login(ctx, this, &lc.name)? {
+            if !success {
+                return Err(RuntimeError::SecurityException {
+                    message: "LoginException: authentication failed".into(),
+                }
+                .into());
+            }
+            return Ok(None);
+        }
     }
 
     let result = lc.login();
@@ -1585,13 +1707,32 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         native_login_context_init,
     );
     // Tomcat's `JAASRealm.authenticate()` always calls this 4-arg
-    // overload (see the comment on `native_login_context_init`), so it
+    // overload (see the comment on `native_login_context_init_core`), so it
     // must be registered too or `login()` always finds no state to load.
     r.register(
         lc,
         "<init>",
         "(Ljava/lang/String;Ljavax/security/auth/Subject;Ljavax/security/auth/callback/CallbackHandler;Ljavax/security/auth/login/Configuration;)V",
         native_login_context_init,
+    );
+    // All five public `LoginContext` constructors must be registered — any
+    // JDK-legal construction path has to populate the side-table before
+    // `login()` (unconditionally a native override) can find it. H2's
+    // `JaasCredentialsValidator` uses the 2-arg (String, CallbackHandler)
+    // form; see docs/known-issues/h2-suite-bugs/
+    // bug-h2-jaas-logincontext-two-arg-ctor-gap.md.
+    r.register(lc, "<init>", "(Ljava/lang/String;)V", native_login_context_init_name_only);
+    r.register(
+        lc,
+        "<init>",
+        "(Ljava/lang/String;Ljavax/security/auth/callback/CallbackHandler;)V",
+        native_login_context_init_name_handler,
+    );
+    r.register(
+        lc,
+        "<init>",
+        "(Ljava/lang/String;Ljavax/security/auth/Subject;)V",
+        native_login_context_init_name_subject,
     );
     r.register(lc, "login", "()V", native_login_context_login);
     r.register(lc, "logout", "()V", native_login_context_logout);
