@@ -7470,6 +7470,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if let Value::Object(Some(o)) = value {
+                let new_cid = self.shared.heap.class_id_of(o);
+                let cn = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(new_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if cn.contains("RootReference") {
+                    eprintln!(
+                        "[LOADER-TRACE] set_field_volatile holder_obj={:p} slot={} new_obj={:p} new_class={} new_cid={}",
+                        obj.as_ptr(), index, o.as_ptr(), cn, new_cid.as_u32()
+                    );
+                }
+            }
+        }
         // T10.9.E вЂ” descriptor-aware volatile write.
         let class_id = self.shared.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
@@ -7542,6 +7560,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         });
         if swapped {
+            if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+                if let Value::Object(Some(o)) = new_val {
+                    let new_cid = self.shared.heap.class_id_of(o);
+                    let cn = self
+                        .shared
+                        .class_manager
+                        .read()
+                        .get_class(new_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    if cn.contains("RootReference") {
+                        let holder_cid = self.shared.heap.class_id_of(obj);
+                        let holder_cn = self
+                            .shared
+                            .class_manager
+                            .read()
+                            .get_class(holder_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[LOADER-TRACE] compare_and_swap_field SUCCESS holder_obj={:p} holder_class={} slot={} new_obj={:p} new_class={} new_cid={}",
+                            obj.as_ptr(), holder_cn, index, o.as_ptr(), cn, new_cid.as_u32()
+                        );
+                    }
+                }
+            }
             self.shared.heap.write_barrier(obj, new_val);
         }
         // T19.H7 diag: count CAS failures so we can spot a livelock.

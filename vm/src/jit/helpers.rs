@@ -1620,9 +1620,18 @@ pub(crate) fn compiled_entry_has_indy_trap(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // `&str`-only API (mirrors the compile-probe gate sites this consults —
+    // see `JitKey::declaring_class_id`'s doc comment); resolving the class
+    // globally by name preserves this helper's existing, not loader-aware,
+    // behavior rather than threading a `ClassId` through its 3 call sites.
+    let class_id = vm
+        .class_manager
+        .read()
+        .get_loaded_class_id(class_name)
+        .unwrap_or(cratonvm_types::ClassId::new(0));
     let jit_cache = vm.jit_cache.read();
     jit_cache
-        .get(class_name, method_name, descriptor)
+        .get(class_name, method_name, descriptor, class_id)
         .map_or(false, |c| c.has_indy_trap)
 }
 
@@ -5499,8 +5508,24 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // Gated on `statically_bound`: the lookup key is the static CP class, which
     // is only the correct dispatch target for invokespecial/invokestatic.
     if direct_static_compiled_callee_entry_enabled() && statically_bound && !redefine_jit_quiesced {
+        // `JitInvokeInfo` carries only the static-CP class NAME baked into this
+        // compiled call site at codegen time, not a loader-scoped `ClassId` —
+        // extending the raw `extern "C"` JIT ABI to also pass the caller's
+        // `ClassId` here would require touching the x64 codegen call-site
+        // emission itself. Resolving the name globally preserves this path's
+        // existing (already name-based, not loader-aware) behavior unchanged;
+        // it does not newly introduce the multi-loader-same-name collision —
+        // see `JitKey::declaring_class_id`'s doc comment for the interpreter-
+        // side fix this mirrors.
+        let info_class_id = vm
+            .class_manager
+            .read()
+            .get_loaded_class_id(info.class_name)
+            .unwrap_or(cratonvm_types::ClassId::new(0));
         let jit_cache = vm.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
+        if let Some(compiled) =
+            jit_cache.get(info.class_name, info.method_name, info.descriptor, info_class_id)
+        {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
             if crate::runtime::env_cache::jit_dispatch_dbg() {
@@ -6737,7 +6762,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     };
     let mut compiled = {
         let cache = vm.jit_cache.read();
-        cache.get(&class_name, "get", "(I)D")
+        cache.get(&class_name, "get", "(I)D", receiver_class_id)
     };
     if compiled.is_none() {
         // This direct scalar route bypasses the normal bytecode invocation
@@ -6749,7 +6774,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
             "(I)D",
             true,
         );
-        compiled = vm.jit_cache.read().get(&class_name, "get", "(I)D");
+        compiled = vm.jit_cache.read().get(&class_name, "get", "(I)D", receiver_class_id);
     }
     if let Some(compiled) = compiled {
         let args = [receiver.as_ptr() as i64, index as i32 as i64];
@@ -6833,7 +6858,7 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     };
     let compiled = {
         let cache = vm.jit_cache.read();
-        cache.get(&class_name, "get", "(I)D")
+        cache.get(&class_name, "get", "(I)D", receiver_class_id)
     };
     let Some(compiled) = compiled else {
         return Ok(None);
@@ -7741,8 +7766,18 @@ impl DeoptimizationController {
         let skip_eviction = reason == cratonvm_jit::deopt::DeoptReason::OsrExit
             && action == cratonvm_jit::deopt::DeoptAction::Reinterpret;
         if !skip_eviction {
+            // `deoptimize` is a `&str`-keyed public API with ~20 call sites;
+            // resolving the class globally by name here preserves this
+            // (pre-existing, not loader-aware) eviction behavior unchanged
+            // rather than threading a new `ClassId` parameter through every
+            // caller. See `JitKey::declaring_class_id`'s doc comment.
+            let class_id = vm
+                .class_manager
+                .read()
+                .get_loaded_class_id(class_name)
+                .unwrap_or(cratonvm_types::ClassId::new(0));
             let mut jit_cache = vm.jit_cache.write();
-            jit_cache.remove(class_name, method_name, descriptor);
+            jit_cache.remove(class_name, method_name, descriptor, class_id);
         }
 
         // deopt-osr Step 9 — advance the method's live compilation epoch so that

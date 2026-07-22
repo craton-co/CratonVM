@@ -5211,7 +5211,7 @@ pub fn execute(
                 // docs/bc-jit-ban-investigation.md).
                 let compiled = {
                     let jit_cache = shared.jit_cache.read();
-                    jit_cache.get(&class_name_str, method_name, method_descriptor)
+                    jit_cache.get(&class_name_str, method_name, method_descriptor, class_id)
                 };
                 // CRATONVM_JIT_C2_FIRST_CALL: set when the gated branch DEFERS a
                 // not-yet-hot method (returns None to interpret rather than compile).
@@ -5311,7 +5311,7 @@ pub fn execute(
                         ) {
                             Some(_) => {
                                 let jit_cache = shared.jit_cache.read();
-                                jit_cache.get(&class_name_str, method_name, method_descriptor)
+                                jit_cache.get(&class_name_str, method_name, method_descriptor, class_id)
                             }
                             None => None,
                         };
@@ -6081,9 +6081,10 @@ pub fn execute(
                             class_name_arc.clone(),
                             method_name_arc.clone(),
                             descriptor_arc.clone(),
+                            class_id,
                             cm,
                         );
-                        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc, class_id)
                         // `jit_cache` write-lock dropped here at end of scope.
                     };
                     // This first-call path compiles thousands of methods per run
@@ -7115,18 +7116,19 @@ pub(crate) fn try_osr_with_backoff(
     // never inline-compile here. Gated default-OFF: the historical inline OSR
     // below is byte-for-byte unchanged when `CRATONVM_BG_COMPILE` is unset.
     if crate::runtime::env_cache::bg_compile() {
-        let (cn, mn, md) = {
+        let (cn, mn, md, frame_class_id) = {
             let f = &thread.frames[*frame_idx];
             (
                 f.class_name().to_string(),
                 f.method_name().to_string(),
                 f.method_descriptor().to_string(),
+                f.class_id,
             )
         };
         let reusable = {
             let jc = shared.jit_cache.read();
             matches!(
-                jc.get_osr(&cn, &mn, &md),
+                jc.get_osr(&cn, &mn, &md, frame_class_id),
                 Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
             )
         };
@@ -8216,9 +8218,25 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         if opcode == 0xb0 {
                             // areturn: push the normalized reference value.
                             thread.frames[frame_idx].stack.push_unchecked(value);
+                        } else if opcode == 0xad {
+                            // lreturn: `push_compact` alone marks the parent
+                            // slot KIND_UNKNOWN, discarding the `is_long`
+                            // distinction this arm just computed via
+                            // `pop_compact_with_long_mark_unchecked`. A
+                            // collision-shaped long (bits alias the NaN-tag
+                            // int space, e.g. `0xFFFC_...` whose masked
+                            // payload also fits 32 bits) is then
+                            // indistinguishable from a real int the next time
+                            // the parent frame pops it (invokestatic argument
+                            // marshalling, `lload`, etc.), silently truncating
+                            // it. Mark KIND_LONG so it survives bit-exact.
+                            thread.frames[frame_idx].stack.push_compact_long(cv);
+                        } else if opcode == 0xaf {
+                            // dreturn: same reasoning as lreturn, KIND_DOUBLE.
+                            thread.frames[frame_idx].stack.push_compact_double(cv);
                         } else {
-                            // i/l/f/d-return: bit-exact raw slot copy preserves
-                            // collision-pattern longs (and doubles).
+                            // i/f-return: no collision ambiguity for 32-bit
+                            // values, raw copy is sufficient.
                             thread.frames[frame_idx].stack.push_compact(cv);
                         }
                         continue;
@@ -15022,6 +15040,29 @@ fn execute_instruction(
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
 
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && class_name.contains("RootReference")
+            {
+                let cm = shared.class_manager.read();
+                let ref_loader = cm.get_loader_id(referencing_class_id);
+                let target_loader = cm.get_loader_id(target_class_id);
+                eprintln!(
+                    "[LOADER-TRACE] new class_name={class_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}"
+                );
+                if matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application)) {
+                    eprintln!("[LOADER-TRACE-STACK] full Java stack for this Application-context 'new':");
+                    for (i, f) in thread.frames.iter().enumerate().rev() {
+                        eprintln!(
+                            "[LOADER-TRACE-STACK]   [{i}] {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        );
+                    }
+                }
+            }
+
             // JVMS 6.5 `new`, run-time exceptions: IllegalAccessError if the
             // referencing class does not have permission to access the
             // resolved class (JVMS 5.4.4 -- public, or same *runtime*
@@ -17646,14 +17687,21 @@ fn lookup_loader_initiated(
         .read()
         .class_defined_by_loader_exact(name, loader)
     {
+        if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && name.contains("RootReference") {
+            eprintln!("[LOADER-TRACE] lookup_loader_initiated name={name} loader={loader:?} HIT class_defined_by_loader_exact id={id:?}");
+        }
         return Some(id);
     }
-    shared
+    let cache_hit = shared
         .initiating_resolution_cache
         .read()
         .get(&loader)
         .and_then(|m| m.get(name))
-        .copied()
+        .copied();
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && name.contains("RootReference") {
+        eprintln!("[LOADER-TRACE] lookup_loader_initiated name={name} loader={loader:?} initiating_resolution_cache={cache_hit:?}");
+    }
+    cache_hit
 }
 
 fn is_isolated_url_loader_definition(
@@ -17724,7 +17772,7 @@ fn resolve_class_loader_aware(
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
             || name.contains("ManagementContextAutoConfiguration")
             || name.contains("ManagementPortType")
-            || name.contains("ChildManagementContextInitializerAotTests") || name.contains("SearchStrategy") || name.contains("MergedAnnotations"));
+            || name.contains("ChildManagementContextInitializerAotTests") || name.contains("SearchStrategy") || name.contains("MergedAnnotations") || name.contains("RootReference") || name.contains("MVMap") || name.contains("org/h2/Driver"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
@@ -20467,6 +20515,17 @@ fn execute_invoke_kind(
         None
     };
 
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && invoke_class.contains("RootReference") {
+        let cm = shared.class_manager.read();
+        let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
+        let cur_loader = cm.get_loader_id(current_class_id);
+        let recv_loader = receiver_class_id.and_then(|c| cm.get_loader_id(c));
+        drop(cm);
+        eprintln!(
+            "[LOADER-TRACE] invoke_kind method={}.{}{} is_special={} invoke_class={} invoke_class_resolved={:?} receiver_class_id={:?} recv_loader={:?} current_class_id={:?} cur_loader={:?} dispatch_override={:?}",
+            method_owner_name, method_name, method_descriptor, is_special, invoke_class, invoke_class_resolved, receiver_class_id, recv_loader, current_class_id, cur_loader, dispatch_override
+        );
+    }
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -21767,6 +21826,7 @@ fn try_invoke_cached_lambda_impl(
                 &cached.class_name,
                 &cached.method_name,
                 &cached.method_descriptor,
+                cached.declaring_class_id,
             )
         };
         if let Some(compiled) = compiled {
@@ -29667,6 +29727,17 @@ fn populate_invoke_cache(
         None => return,
     };
 
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
+        let cm = shared.class_manager.read();
+        let caller_loader = cm.get_loader_id(caller_class_id);
+        let target_loader = cm.get_loader_id(target_class_id);
+        drop(cm);
+        eprintln!(
+            "[LOADER-TRACE] populate_invoke_cache is_special={} caller_class_id={:?} caller_loader={:?} method={}.{}{} class_name(cp)={} loader_owner_override={:?} target_class_id={:?} target_loader={:?}",
+            is_special, caller_class_id, caller_loader, class_name, method_name, descriptor, class_name, loader_owner_override, target_class_id, target_loader
+        );
+    }
+
     let cm = shared.class_manager.read();
     let Some(class) = cm.get_class(target_class_id) else {
         return;
@@ -29986,6 +30057,7 @@ fn execute_invokestatic_cached(
                     &cached.class_name,
                     &cached.method_name,
                     &cached.method_descriptor,
+                    cached.declaring_class_id,
                 ) {
                     let ret = crate::jit::return_type(&cached.method_descriptor);
                     let heap = compiled.needs_heap();
@@ -30474,7 +30546,7 @@ fn compile_osr_artifact(
     // here (or no cached artifact) recompile exactly as before.
     let cached_osr = {
         let jit_cache = shared.jit_cache.read();
-        jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
+        jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc, class_id)
     };
     // Only reuse artifacts the OSR path itself produced: those carry the
     // eager invokestatic callee wiring (direct calls). A first-call/upgrade
@@ -31376,9 +31448,10 @@ fn compile_osr_artifact(
                 class_name_arc.clone(),
                 method_name_arc.clone(),
                 descriptor_arc.clone(),
+                class_id,
                 cm,
             );
-            jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc)
+            jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc, class_id)
         })()
     };
 
@@ -32372,6 +32445,7 @@ fn try_jit_upgrade_with_gate(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+            cached.declaring_class_id,
         ) {
             let ret = crate::jit::return_type(&cached.method_descriptor);
             let heap = compiled.needs_heap();
@@ -32671,10 +32745,18 @@ fn try_jit_upgrade_with_gate(
             let callee_method_arc: Arc<str> = Arc::from(callee_method);
             let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
             {
+                let callee_class_id = shared
+                    .class_manager
+                    .read()
+                    .find_class_by_name(callee_class)
+                    .unwrap_or(ClassId::new(0));
                 let jit_cache = shared.jit_cache.read();
-                if let Some(compiled) =
-                    jit_cache.get(&callee_class_arc, &callee_method_arc, &callee_desc_arc)
-                {
+                if let Some(compiled) = jit_cache.get(
+                    &callee_class_arc,
+                    &callee_method_arc,
+                    &callee_desc_arc,
+                    callee_class_id,
+                ) {
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an artifact containing an
                     // unconditional invokedynamic trap — its sentinel +
@@ -33138,6 +33220,7 @@ fn try_jit_upgrade_with_gate(
                     callee_cached.class_name.clone(),
                     callee_cached.method_name.clone(),
                     callee_cached.method_descriptor.clone(),
+                    callee_cached.declaring_class_id,
                     compiled,
                 );
             }
@@ -33254,12 +33337,14 @@ fn try_jit_upgrade_with_gate(
             cached.class_name.clone(),
             cached.method_name.clone(),
             cached.method_descriptor.clone(),
+            cached.declaring_class_id,
             compiled,
         );
         jit_cache.get(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+            cached.declaring_class_id,
         )?
     };
     if crate::runtime::env_cache::dbg_jitc() {
@@ -33429,8 +33514,24 @@ pub fn try_jit_compile_callee(
     // the previous `Arc::from` per name was three wasted heap allocations
     // on every dispatch-helper call.
     {
+        // `try_jit_compile_callee` is `&str`-only (called from both the
+        // interpreter, which has a precise `ClassId`, and raw JIT-ABI
+        // dispatch helpers keyed only by `JitInvokeInfo`'s static strings —
+        // see `JitKey::declaring_class_id`'s doc comment). Resolving the
+        // class globally by name here preserves this function's existing
+        // (pre-existing, not loader-aware) probe/publish behavior; it does
+        // not newly introduce the multi-loader-same-name collision this
+        // session fixed at the interpreter's own dispatch-side cache
+        // consultation (`execute_invoke_kind` / `execute_invokestatic_cached`
+        // / `try_jit_upgrade_with_gate`), which is what a same-named class
+        // loaded by a user `ClassLoader` actually dispatches through.
+        let probe_class_id = shared
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+            .unwrap_or(ClassId::new(0));
         let jit_cache = shared.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor) {
+        if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
             return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
             // Cast: JIT entry point to address
@@ -34068,7 +34169,13 @@ fn try_jit_compile_callee_slow(
     );
     {
         let mut jit_cache = shared.jit_cache.write();
-        jit_cache.put(receiver_key, method_name_key, method_desc_key, compiled);
+        jit_cache.put(
+            receiver_key,
+            method_name_key,
+            method_desc_key,
+            callee_class_id,
+            compiled,
+        );
     }
 
     Some((entry, needs_ctx))
@@ -36979,6 +37086,16 @@ fn execute_invokevirtual_cached(
                             actual_class_id.as_u32(),
                         );
                     }
+                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                        && (cached.class_name.contains("RootReference")
+                            || cached.class_name.contains("MVMap"))
+                    {
+                        eprintln!(
+                            "[LOADER-TRACE] execute_invokevirtual_cached HIT-CHECK method={}.{}{} cached.declaring={} cached_receiver_class_id={:?} actual_class_id={:?} match={}",
+                            cached.class_name, cached.method_name, cached.method_descriptor,
+                            cached.class_name, receiver_class_id, actual_class_id, actual_class_id == receiver_class_id
+                        );
+                    }
                     if actual_class_id != receiver_class_id {
                         return Ok(CachedCallResult::CacheMiss);
                     }
@@ -37155,6 +37272,7 @@ fn execute_invokevirtual_cached(
                                 &cached.class_name,
                                 &cached.method_name,
                                 &cached.method_descriptor,
+                                cached.declaring_class_id,
                             )
                         }
                         .or_else(|| {

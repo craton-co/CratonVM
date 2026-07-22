@@ -4228,10 +4228,31 @@ struct JitKey {
     class_name: Arc<str>,
     method_name: Arc<str>,
     descriptor: Arc<str>,
+    // Loader-identity fix (2026-07-22): two classes with the SAME binary
+    // name loaded by DIFFERENT `ClassLoader`s (e.g. a custom
+    // `ClassLoader(null)` re-loading an old H2 jar's own
+    // `org.h2.mvstore.RootReference` alongside the identically-named class
+    // already on the application classpath — see
+    // `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`'s
+    // `TestUpgrade` residual) are DISTINCT classes with unrelated bytecode,
+    // but the interpreter's own dispatch (`resolve_method_ref` /
+    // `execute_invoke_kind` / `try_stackless_invoke`) already correctly
+    // disambiguates them via `ClassId` (loader-aware) at every call site.
+    // This cache was the ONE place that didn't: keyed purely by
+    // (class_name, method_name, descriptor) STRINGS, so once EITHER
+    // same-named class's method got JIT-compiled first, every subsequent
+    // call to the OTHER class's identically-named-and-shaped method hit
+    // this cache and silently executed the WRONG class's compiled body —
+    // whichever compiled first permanently "won" the name, `put()`
+    // additionally evicting the loser's entry outright. Including the
+    // resolved declaring `ClassId` in the key gives each class's compiled
+    // method its own cache slot, exactly mirroring the interpreter's own
+    // per-`ClassId` dispatch and letting both coexist.
+    declaring_class_id: cratonvm_types::ClassId,
 }
 
-/// Compute a u64 hash key for a JIT cache entry by XOR-folding three
-/// independent FxHashes (class, method, descriptor). Using separate
+/// Compute a u64 hash key for a JIT cache entry by XOR-folding independent
+/// FxHashes (class, method, descriptor, declaring class id). Using separate
 /// hashers per component (rather than chained writes) keeps each call
 /// branch-free and avoids the per-call Arc clones the previous keyed
 /// lookup required.
@@ -4241,14 +4262,21 @@ struct JitKey {
 /// fix). A collision degrades to a cache miss, which is correct but
 /// slightly suboptimal (triggers a re-compile via the slow path).
 #[inline]
-fn compute_jit_key_hash(class: &str, method: &str, desc: &str) -> u64 {
+fn compute_jit_key_hash(
+    class: &str,
+    method: &str,
+    desc: &str,
+    declaring_class_id: cratonvm_types::ClassId,
+) -> u64 {
     let mut hc = FxHasher::default();
     hc.write(class.as_bytes());
     let mut hm = FxHasher::default();
     hm.write(method.as_bytes());
     let mut hd = FxHasher::default();
     hd.write(desc.as_bytes());
-    hc.finish() ^ hm.finish() ^ hd.finish()
+    let mut hi = FxHasher::default();
+    hi.write_u32(declaring_class_id.as_u32());
+    hc.finish() ^ hm.finish() ^ hd.finish() ^ hi.finish()
 }
 
 /// Per-VM JIT cache: maps method identity to compiled native code.
@@ -4416,12 +4444,14 @@ impl JitCache {
         class_name: &str,
         method_name: &str,
         descriptor: &str,
+        declaring_class_id: cratonvm_types::ClassId,
     ) -> Option<Arc<CompiledMethod>> {
-        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+        let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
         let (key, method) = self.methods.get(&h)?;
         if &*key.class_name == class_name
             && &*key.method_name == method_name
             && &*key.descriptor == descriptor
+            && key.declaring_class_id == declaring_class_id
         {
             Some(method.clone())
         } else {
@@ -4435,12 +4465,14 @@ impl JitCache {
         class_name: &str,
         method_name: &str,
         descriptor: &str,
+        declaring_class_id: cratonvm_types::ClassId,
     ) -> Option<Arc<CompiledMethod>> {
-        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+        let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
         let (key, method) = self.osr_methods.get(&h)?;
         if &*key.class_name == class_name
             && &*key.method_name == method_name
             && &*key.descriptor == descriptor
+            && key.declaring_class_id == declaring_class_id
         {
             Some(method.clone())
         } else {
@@ -4466,13 +4498,15 @@ impl JitCache {
         class_name: Arc<str>,
         method_name: Arc<str>,
         descriptor: Arc<str>,
+        declaring_class_id: cratonvm_types::ClassId,
         compiled: CompiledMethod,
     ) {
-        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor);
+        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
             method_name,
             descriptor,
+            declaring_class_id,
         };
         if let Some((_old_key, old_cm)) = self.methods.remove(&h) {
             self.retire_evicted_method(old_cm);
@@ -4510,14 +4544,16 @@ impl JitCache {
         class_name: Arc<str>,
         method_name: Arc<str>,
         descriptor: Arc<str>,
+        declaring_class_id: cratonvm_types::ClassId,
         compiled: CompiledMethod,
     ) {
         debug_assert!(compiled.compiled_via_osr);
-        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor);
+        let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
             method_name,
             descriptor,
+            declaring_class_id,
         };
         if let Some((_old_key, old_cm)) = self.osr_methods.remove(&h) {
             self.retire_evicted_method(old_cm);
@@ -4556,12 +4592,19 @@ impl JitCache {
     /// Verifies the full string key matches before removing, so a
     /// (rare) hash collision can't cause an unrelated cached entry to
     /// be evicted.
-    pub fn remove(&mut self, class_name: &str, method_name: &str, descriptor: &str) {
-        let h = compute_jit_key_hash(class_name, method_name, descriptor);
+    pub fn remove(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        declaring_class_id: cratonvm_types::ClassId,
+    ) {
+        let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
         if let Some((key, cm)) = self.methods.get(&h) {
             if &*key.class_name == class_name
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
+                && key.declaring_class_id == declaring_class_id
             {
                 // Keep this method's GC code-range registration live after
                 // eviction; retained code may still appear in active frames or
@@ -4575,6 +4618,7 @@ impl JitCache {
             if &*key.class_name == class_name
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
+                && key.declaring_class_id == declaring_class_id
             {
                 let cm = cm.clone();
                 self.osr_methods.remove(&h);
@@ -5118,7 +5162,14 @@ fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
 /// prior permanent-bail compilation attempt.  Checked at the top of
 /// `try_compile` to short-circuit re-attempts.
 pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
-    let h = compute_jit_key_hash(class_name, method_name, descriptor);
+    // This is a permanent-failure blocklist, not the dispatch cache — a
+    // name-only collision between two same-named classes from different
+    // loaders is benign here (worst case: one class's compilable method
+    // gets conservatively skipped because a same-named-and-shaped method
+    // elsewhere hit a genuine backend limitation), so a fixed sentinel
+    // `ClassId` keeps this hash's shape unchanged rather than threading a
+    // real class identity through this negative-cache-only path.
+    let h = compute_jit_key_hash(class_name, method_name, descriptor, cratonvm_types::ClassId::new(0));
     jit_bail_list().read().contains(&h)
 }
 
@@ -5126,7 +5177,7 @@ pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str)
 /// `x64::compile` path returns None (typically because of an unsupported
 /// backend pattern that won't change on retry).
 pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
-    let h = compute_jit_key_hash(class_name, method_name, descriptor);
+    let h = compute_jit_key_hash(class_name, method_name, descriptor, cratonvm_types::ClassId::new(0));
     jit_bail_list().write().insert(h);
 }
 
@@ -10797,11 +10848,17 @@ mod tests {
         let method: Arc<str> = Arc::from("testMethod");
         let desc: Arc<str> = Arc::from("(II)I");
 
-        cache.put(class.clone(), method.clone(), desc.clone(), cm);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cratonvm_types::ClassId::new(1),
+            cm,
+        );
         assert_eq!(cache.len(), 1);
         assert!(!cache.is_empty());
 
-        let result = cache.get(&class, &method, &desc);
+        let result = cache.get(&class, &method, &desc, cratonvm_types::ClassId::new(1));
         assert!(result.is_some());
     }
 
@@ -10812,12 +10869,14 @@ mod tests {
         let method: Arc<str> = Arc::from("hotLoop");
         let desc: Arc<str> = Arc::from("(I)I");
 
+        let cid = cratonvm_types::ClassId::new(1);
         let mut entry_buf = ExecutableBuffer::new(64).expect("alloc failed");
         entry_buf.emit(&[0xC3]);
         cache.put(
             class.clone(),
             method.clone(),
             desc.clone(),
+            cid,
             CompiledMethod::new(entry_buf),
         );
 
@@ -10825,10 +10884,12 @@ mod tests {
         osr_buf.emit(&[0xC3]);
         let mut osr = CompiledMethod::new(osr_buf);
         osr.compiled_via_osr = true;
-        cache.put_osr(class.clone(), method.clone(), desc.clone(), osr);
+        cache.put_osr(class.clone(), method.clone(), desc.clone(), cid, osr);
 
-        let entry = cache.get(&class, &method, &desc).expect("entry body");
-        let osr = cache.get_osr(&class, &method, &desc).expect("osr body");
+        let entry = cache.get(&class, &method, &desc, cid).expect("entry body");
+        let osr = cache
+            .get_osr(&class, &method, &desc, cid)
+            .expect("osr body");
         assert_ne!(entry.entry_ptr(), osr.entry_ptr());
         assert!(!entry.compiled_via_osr);
         assert!(osr.compiled_via_osr);
@@ -10841,11 +10902,12 @@ mod tests {
             class.clone(),
             method.clone(),
             desc.clone(),
+            cid,
             CompiledMethod::new(c2_buf),
         );
         assert_eq!(
             cache
-                .get_osr(&class, &method, &desc)
+                .get_osr(&class, &method, &desc, cid)
                 .expect("osr survives method-entry supersede")
                 .entry_ptr(),
             osr_entry
@@ -10860,16 +10922,18 @@ mod tests {
         let method: Arc<str> = Arc::from("replaceMethod");
         let desc: Arc<str> = Arc::from("()V");
 
+        let cid = cratonvm_types::ClassId::new(1);
         let mut old_buf = ExecutableBuffer::new(64).expect("alloc failed");
         old_buf.emit(&[0xC3]); // RET
         cache.put(
             class.clone(),
             method.clone(),
             desc.clone(),
+            cid,
             CompiledMethod::new(old_buf),
         );
         let old = cache
-            .get(&class, &method, &desc)
+            .get(&class, &method, &desc, cid)
             .expect("old compiled method");
         let old_entry = old.entry_ptr() as usize;
         register_jit_code_range(old_entry, old.code_len(), Arc::as_ptr(&old) as usize);
@@ -10881,6 +10945,7 @@ mod tests {
             class.clone(),
             method.clone(),
             desc.clone(),
+            cid,
             CompiledMethod::new(new_buf),
         );
 
@@ -10892,7 +10957,7 @@ mod tests {
             );
         }
         unregister_jit_code_range(old_entry);
-        if let Some(new_cm) = cache.get(&class, &method, &desc) {
+        if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
         }
     }
@@ -10904,22 +10969,26 @@ mod tests {
         let method: Arc<str> = Arc::from("removeMethod");
         let desc: Arc<str> = Arc::from("()V");
 
+        let cid = cratonvm_types::ClassId::new(1);
         let mut buf = ExecutableBuffer::new(64).expect("alloc failed");
         buf.emit(&[0xC3]); // RET
         cache.put(
             class.clone(),
             method.clone(),
             desc.clone(),
+            cid,
             CompiledMethod::new(buf),
         );
-        let cm = cache.get(&class, &method, &desc).expect("compiled method");
+        let cm = cache
+            .get(&class, &method, &desc, cid)
+            .expect("compiled method");
         let entry = cm.entry_ptr() as usize;
         register_jit_code_range(entry, cm.code_len(), Arc::as_ptr(&cm) as usize);
         drop(cm);
 
-        cache.remove(&class, &method, &desc);
+        cache.remove(&class, &method, &desc, cid);
 
-        assert!(cache.get(&class, &method, &desc).is_none());
+        assert!(cache.get(&class, &method, &desc, cid).is_none());
         if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
             assert_eq!(cache.retired_methods.len(), 1);
             assert!(
@@ -10940,12 +11009,15 @@ mod tests {
         let method_b: Arc<str> = Arc::from("testB");
         let desc_b: Arc<str> = Arc::from("(I)I");
 
+        let cid_a = cratonvm_types::ClassId::new(1);
+        let cid_b = cratonvm_types::ClassId::new(2);
         let mut buf_a = ExecutableBuffer::new(16).expect("alloc failed");
         buf_a.emit(&[0xC3]); // RET
         cache.put(
             class_a.clone(),
             method_a.clone(),
             desc_a.clone(),
+            cid_a,
             CompiledMethod::new(buf_a),
         );
 
@@ -10955,23 +11027,24 @@ mod tests {
             class_b.clone(),
             method_b.clone(),
             desc_b.clone(),
+            cid_b,
             CompiledMethod::new(buf_b),
         );
 
         let entry_a = cache
-            .get(&class_a, &method_a, &desc_a)
+            .get(&class_a, &method_a, &desc_a, cid_a)
             .expect("compiled A")
             .entry_ptr() as usize;
         let entry_b = cache
-            .get(&class_b, &method_b, &desc_b)
+            .get(&class_b, &method_b, &desc_b, cid_b)
             .expect("compiled B")
             .entry_ptr() as usize;
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.clear_all(), 2);
         assert!(cache.is_empty());
-        assert!(cache.get(&class_a, &method_a, &desc_a).is_none());
-        assert!(cache.get(&class_b, &method_b, &desc_b).is_none());
+        assert!(cache.get(&class_a, &method_a, &desc_a, cid_a).is_none());
+        assert!(cache.get(&class_b, &method_b, &desc_b, cid_b).is_none());
         if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
             assert_eq!(cache.retired_methods.len(), 2);
         }
@@ -10985,7 +11058,9 @@ mod tests {
         let class: Arc<str> = Arc::from("Missing");
         let method: Arc<str> = Arc::from("missing");
         let desc: Arc<str> = Arc::from("()V");
-        assert!(cache.get(&class, &method, &desc).is_none());
+        assert!(cache
+            .get(&class, &method, &desc, cratonvm_types::ClassId::new(1))
+            .is_none());
     }
 
     #[test]
@@ -11003,21 +11078,23 @@ mod tests {
     #[test]
     fn t10_jit_cache_fxhash_insert_lookup() {
         let mut cache = JitCache::new();
-        let mut keys: Vec<(Arc<str>, Arc<str>, Arc<str>)> = Vec::with_capacity(100);
+        let mut keys: Vec<(Arc<str>, Arc<str>, Arc<str>, cratonvm_types::ClassId)> =
+            Vec::with_capacity(100);
         for i in 0..100 {
             let class: Arc<str> = Arc::from(format!("pkg/Cls{i}"));
             let method: Arc<str> = Arc::from(format!("m{i}"));
             let desc: Arc<str> = Arc::from(format!("(I)I{i}"));
+            let cid = cratonvm_types::ClassId::new((i + 1) as u32);
             let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
             buf.emit(&[0xC3]); // RET
             let cm = CompiledMethod::new(buf);
-            cache.put(class.clone(), method.clone(), desc.clone(), cm);
-            keys.push((class, method, desc));
+            cache.put(class.clone(), method.clone(), desc.clone(), cid, cm);
+            keys.push((class, method, desc, cid));
         }
         assert_eq!(cache.len(), 100);
-        for (class, method, desc) in &keys {
+        for (class, method, desc, cid) in &keys {
             assert!(
-                cache.get(class, method, desc).is_some(),
+                cache.get(class, method, desc, *cid).is_some(),
                 "missing key {}/{}/{}",
                 class,
                 method,
@@ -11028,7 +11105,14 @@ mod tests {
         let missing_cls: Arc<str> = Arc::from("pkg/Unseen");
         let missing_m: Arc<str> = Arc::from("x");
         let missing_d: Arc<str> = Arc::from("()V");
-        assert!(cache.get(&missing_cls, &missing_m, &missing_d).is_none());
+        assert!(cache
+            .get(
+                &missing_cls,
+                &missing_m,
+                &missing_d,
+                cratonvm_types::ClassId::new(9999)
+            )
+            .is_none());
     }
 
     // ── count_param_slots tests ─────────────────────────────────────
