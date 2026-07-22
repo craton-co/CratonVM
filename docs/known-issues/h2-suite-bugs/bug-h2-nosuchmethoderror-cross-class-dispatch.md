@@ -18,11 +18,17 @@ picked the wrong target class somewhere upstream of the error report.
 
 ## Affected test classes
 
-**Cluster A — `PipedInputStream.flush()V`** (5 classes, all real
+**Cluster A -- `PipedInputStream.flush()V`** (6 classes, all real
 `java.io.PipedOutputStream`/`PipedInputStream` pairs, all PASS on HotSpot):
 `org.h2.test.db.TestLob`, `org.h2.test.jdbc.TestLobApi`,
 `org.h2.test.jdbc.TestSQLXML`, `org.h2.test.jdbc.TestUpdatableResultSet`,
-`org.h2.test.jdbc.TestResultSet`.
+`org.h2.test.jdbc.TestResultSet`, `org.h2.test.unit.TestShell` (added
+2026-07-22, via `bug-h2-suite-residual-fail-triage.md` -- `org.h2.tools
+.Shell.println()`/`.print()` call `out.flush()` where `out` wraps a
+`PipedOutputStream`; dispatch resolves it to the nonsensical
+`PipedInputStream.flush()V`, logged as a WARN and silently swallowed
+rather than propagated, so the Shell tool output is never written to the
+pipe and the reading side sees immediate EOF).
 
 ```
 WARN NoSuchMethodError method="java/io/PipedInputStream.flush()V" caller="java/io/OutputStreamWriter.close()V @pc=7"
