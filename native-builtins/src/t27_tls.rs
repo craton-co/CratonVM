@@ -3451,6 +3451,20 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// OpenSSL-backed fallback acceptor for identities rustls's `ring` crypto
+/// backend refuses to sign with. Originally written for DSA (rustls has no
+/// DSA `SigningKey` at all), but `ring::rsa::KeyPair::from_pkcs8` *also*
+/// rejects any RSA key below 2047 bits (a hard-coded policy floor, not a
+/// parsing failure) — `rustls::sign::any_supported_type` surfaces that as the
+/// same generic "failed to parse private key as RSA, ECDSA, or EdDSA" rustls
+/// gives for a genuinely-unparseable key, with no way to distinguish the two
+/// from the caller side. H2's bundled `TestNetUtils` self-signed test
+/// keystore carries exactly this: a legacy 1024-bit RSA key (generated 2005)
+/// that's syntactically well-formed PKCS#8 RSA but below ring's floor. Since
+/// OpenSSL enforces no such minimum (once `set_security_level(0)` is applied
+/// below), it accepts whatever key/cert pair rustls's stricter backend
+/// wouldn't — DSA, sub-2047-bit RSA, or any other legacy identity — so this
+/// accepts any key OpenSSL itself can use rather than gating on key type.
 /// Build a real TLS listener and its Java `SSLServerSocket` wrapper.  Keep
 /// every `SSLServerSocketFactory.createServerSocket` overload on this one
 /// path so callers cannot accidentally fall through to `ServerSocketFactory`'s
@@ -3458,9 +3472,6 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
 #[cfg(unix)]
 fn legacy_dsa_acceptor(cert_pem: &str, key_pem: &str) -> Result<SslAcceptor, String> {
     let key = PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|e| e.to_string())?;
-    if !key.dsa().is_ok() {
-        return Err("key is not DSA".to_string());
-    }
     let cert = X509::from_pem(cert_pem.as_bytes()).map_err(|e| e.to_string())?;
     let mut builder =
         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls_server()).map_err(|e| e.to_string())?;

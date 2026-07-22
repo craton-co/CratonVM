@@ -4,6 +4,28 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-22 H2 `cp500`/IBM500 charset FIXED
+
+FIXED (moved to `docs/internal/fixed-suite-bugs/`):
+[`bug-h2-charset-cp500-unsupported-FIXED.md`](../internal/fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md)
+— `Charset.forName("cp500")`/`("IBM500")` threw `UnsupportedCharsetException`
+because CratonVM's charset engine only curates a subset of the real JDK's
+`jdk.charsets`-module extended charsets, and IBM500 (EBCDIC 500
+International) wasn't one of them, breaking `org.h2.test.db.TestSetCollation`
+(`testCp500Collator`) and `org.h2.test.unit.TestCharsetCollator`. Fixed by
+adding IBM500 as a new single-byte codec in `native-api/src/charset.rs`
+(canonical-name aliases, decode/encode, 256-byte table + reverse-lookup),
+following the same pattern the existing IBM1047 codec uses. The 256-byte
+table was captured directly from real JDK25's `sun.nio.cs.ext.IBM500` (not a
+generic reference table) to match a genuine byte-0x15 NEL/LF ambiguity in
+this codepage exactly. Verified: standalone `Charset.forName`/round-trip
+probe, both affected H2 test classes pass (and reproduce on an unmodified
+pre-fix baseline binary, confirming the A/B), zero regressions in
+`cratonvm-native-api`/`cratonvm-native-builtins`'s combined 3236-test unit
+suite. This is the second time this exact bug was documented — the first
+doc was deleted by `b71e7402f` (2026-06-22 doc cleanup) without being fixed;
+this closure is a real fix, not another cleanup deletion.
+
 ## 2026-07-20 CRITICAL core JIT/OSR bug FIXED: back-edge OSR silently re-executed loop iterations after an `invokedynamic` trap
 
 FIXED (moved to `docs/internal/`):
