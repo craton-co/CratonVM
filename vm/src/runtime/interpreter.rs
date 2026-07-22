@@ -15776,6 +15776,28 @@ fn execute_instruction(
                                 "CRATONVM_DBG_CCE_BT: site=checkcast obj={obj_binary} @0x{:x} target={target_binary}",
                                 obj_ref.as_ptr() as usize
                             );
+                            // Java frame stack at the failing checkcast — a
+                            // checkcast CCE is VM-raised (no `athrow`
+                            // bytecode), so the ATHROW tracer never sees it
+                            // and, uncaught during parallel-extension-add,
+                            // the rollback path prints no stack either. The
+                            // frames are fully intact here (nothing has
+                            // unwound yet) — this names the exact producing
+                            // frame for the family's residual shapes.
+                            for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                                let cn = shared
+                                    .class_manager
+                                    .read()
+                                    .get_class(f.class_id)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  CCE-BT-STK[{i}] {}.{} pc={}",
+                                    cn,
+                                    f.method_name(),
+                                    f.pc
+                                );
+                            }
                         }
                         return Err(RuntimeError::ClassCastException {
                             message: format!("{obj_binary} cannot be cast to {target_binary}"),
