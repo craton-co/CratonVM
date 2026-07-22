@@ -15380,6 +15380,14 @@ fn invoke_on_class_shared_inner(
                                 | "contains"
                                 | "split"
                             ))
+                        // Compact strings are stored in byte[] and OpenJDK's
+                        // UTF-16 copy loop is prohibitively expensive before
+                        // this cold call-site can warm. Keep this concrete
+                        // bytecode override in sync with interpreter.rs's
+                        // force_native_over_real_jdk_bytecode gate.
+                        || (class_name == "java/lang/StringUTF16"
+                            && method_name == "getChars"
+                            && descriptor == "([BII[CI)V")
                         // `CRATONVM_NATIVE_MATCHER_FIND`: real-JDK-layout
                         // `Matcher.find()`/`find(int)`/`start`/`end`/`group`
                         // fast path — companion entry to the one in

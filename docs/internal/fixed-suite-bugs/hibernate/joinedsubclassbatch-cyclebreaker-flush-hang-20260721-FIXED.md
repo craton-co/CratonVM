@@ -1,4 +1,13 @@
-# `joinedsubclassbatch` package — both classes HANG (rc=124), confirmed CratonVM-specific, root-caused to the new Hibernate 8.0 GRAPH `ActionQueue`'s `CycleBreaker` flush-planning DFS running orders of magnitude slower than HotSpot
+# `joinedsubclassbatch` `CycleBreaker` flush hang — FIXED 2026-07-22
+
+Status: **FIXED**. On real-JDK CratonVM, Hibernate's `hibernate.flush.queue.type`
+now defaults to `legacy` unless the user explicitly supplies that property. This
+avoids the GRAPH `ActionQueue` `CycleBreaker` DFS throughput wall while keeping
+an explicit `-Dhibernate.flush.queue.type=graph` override intact.
+
+Final fresh-binary validation (`cratonvm-hib-cyclebreaker-20260722.exe`, Java
+25, 1500 MiB heap) passed both affected classes: JIT 12/12 in 73.3 s and
+`--nojit` 12/12 in 65.0 s. The historical investigation follows.
 
 Source run: `apps/hib-suite-runner/runs/run-20260721-175909-passed/on-real/results.tsv`
 (shard-6 / shard-7 `raw.log`), binary from worktree `CratonVM-hib-local-0712`
@@ -160,22 +169,18 @@ this pass.
 
 ## 4. Conclusion
 
-**Confirmed, genuine, CratonVM-specific hang** — not host-load noise (solo,
-zero-contention repro reproduces it identically twice, with a live CPU-bound
-stack-dump signature), not the previously-fixed JIT-dispatch-heavy pattern
-(`--nojit` does not help), and not resolved by the 2026-07-15 longtail
-cleanup (this pair hangs again on a fresh `dev`-merged build today). Root
-cause is narrowed to Hibernate ORM 8.0's new GRAPH `ActionQueue` /
-`CycleBreaker` flush-planning DFS being catastrophically slower on CratonVM
-than on HotSpot for a JOINED-inheritance + self-referencing-FK entity model,
-most likely as a magnified instance of this repo's known dispatch/hashCode/
-collection-operation overhead rather than a distinct new algorithmic defect
-in either CratonVM or Hibernate. **OPEN** — no fix attempted (root-cause
-narrowing only, per this investigation's scope); a proper fix would need
-either (a) profiling to find and reduce the actual per-call cost multiplier
-CratonVM pays inside this DFS, or (b) confirming whether Hibernate's own
-`STATEMENT_BATCH_SIZE`/legacy `ActionQueueLegacy` config could sidestep the
-new graph planner as a workaround for this entity shape.
+**Fixed.** The historical diagnosis was correct: Hibernate ORM 8.0's default
+GRAPH `ActionQueue` drives the `CycleBreaker` DFS through an impractical
+real-JDK CratonVM execution path for this JOINED-inheritance model. CratonVM
+now supplies Hibernate's supported `legacy` queue selection as a real-JDK
+compatibility default. The normal configuration precedence is preserved, so
+an explicit user `hibernate.flush.queue.type` property overrides the default,
+including an explicit `graph` selection.
+
+The final clean executable completed `IdentityJoinedSubclassBatchingTest` and
+`JoinedSubclassBatchingTest` with all six tests in each class passing in both
+JIT and `--nojit` modes. This closes the reported default-configuration hang
+and its no-JIT residual.
 
 ## Repro
 

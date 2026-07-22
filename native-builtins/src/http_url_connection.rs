@@ -654,6 +654,17 @@ fn huc_real_perform(
                 established_https_stream,
             )
         };
+        let resp = perform_with_retry(
+            ctx,
+            Some(this),
+            &parsed,
+            &method,
+            &req.headers,
+            &body,
+            connect_to,
+            read_to,
+            established_https_stream,
+        );
         match resp {
             Ok((status, headers, resp_body))
                 if req.follow_redirects && is_redirect_status(status) && redirect_count < 20 =>
@@ -2096,6 +2107,68 @@ fn perform_pooled(
                 pool_put(key, stream);
             }
             Ok((status, resp_headers, resp_body))
+        }
+        other => other,
+    }
+}
+
+/// Wraps [`perform`] with HotSpot's transparent retry-once-on-dead-connection
+/// behaviour: `sun.net.www.protocol.http.HttpURLConnection` silently retries
+/// a request over a brand-new TCP connection when the first attempt's
+/// connection is closed by the peer before any response bytes arrive (its
+/// legacy recovery heuristic for a stale/dead pooled keep-alive connection —
+/// which also covers a genuinely brand-new connection the peer tears down
+/// mid-request). Confirmed against real JDK 21 and 25 with a minimal
+/// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
+/// pattern (`docs/known-issues/h2-suite-bugs/
+/// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
+/// the `logout.do` request in full, then — synchronously, on that same
+/// request-handling thread — closes its own just-accepted socket as part of
+/// tearing itself down, before ever writing a response. That is NOT a
+/// CratonVM-specific race (a standalone repro of exactly this shape fails
+/// identically on real JDK), but real JDK's client-side retry then hits a
+/// listening socket that has, by that point, already been closed by the same
+/// shutdown — `ConnectException` — which is what the H2 test's
+/// `catch (ConnectException e)` actually expects. Without this retry,
+/// CratonVM's single-attempt `perform` surfaces the first attempt's raw
+/// "connection closed before response head" as a generic `IOException`
+/// instead. Skipped for the caller-supplied-socket (custom `SSLSocketFactory`)
+/// path: that connection isn't ours to reopen.
+fn perform_with_retry(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+    parsed: &Url1,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    established_https_stream_id: Option<i32>,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let resp = perform(
+        ctx,
+        connection,
+        parsed,
+        method,
+        headers,
+        body,
+        connect_timeout,
+        read_timeout,
+        established_https_stream_id,
+    );
+    match resp {
+        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
+            perform(
+                ctx,
+                connection,
+                parsed,
+                method,
+                headers,
+                body,
+                connect_timeout,
+                read_timeout,
+                established_https_stream_id,
+            )
         }
         other => other,
     }

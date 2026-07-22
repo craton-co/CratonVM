@@ -5846,6 +5846,99 @@ pub(crate) fn native_string_utf16_is_big_endian(
     Ok(Some(Value::Int(0)))
 }
 
+/// `java.lang.StringUTF16.getChars(byte[] value, int srcBegin, int srcEnd,
+/// char[] dst, int dstBegin)`.
+///
+/// OpenJDK implements this as a per-code-unit bytecode loop. Hibernate's
+/// metamodel bootstrap calls it heavily while constructing annotations and
+/// generated proxies, leaving a cold one-shot transaction entirely in the
+/// interpreter. Bulk-read the compact UTF-16 source and decode it in Rust,
+/// while retaining the JDK's deliberately asymmetric bounds behavior: when
+/// `srcBegin >= srcEnd` it performs no source or destination dereference.
+pub(crate) fn native_string_utf16_get_chars(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let src_begin = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let src_end = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if src_begin >= src_end {
+        return Ok(None);
+    }
+    let value = match args.first() {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
+        }
+    };
+    // `isub` in the JDK bytecode has wrapping `int` arithmetic.  Keep that
+    // behavior before the bounds check so extreme malformed ranges report a
+    // StringIndexOutOfBoundsException rather than overflowing Rust arithmetic.
+    let count = src_end.wrapping_sub(src_begin);
+    let source_len = (ctx.array_length(value) / 2) as i32;
+    if let Some(index) = bounds_off_count_violation(src_begin, count, source_len) {
+        return Err(
+            cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into(),
+        );
+    }
+    // The bytecode validates the source before its first destination access.
+    // Preserve that ordering when both inputs are invalid/null.
+    let dst = match args.get(3) {
+        Some(Value::Object(Some(arr))) => *arr,
+        _ => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            )
+        }
+    };
+    let dst_begin = match args.get(4) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = count as usize;
+    let dst_len = ctx.array_length(dst) as i64;
+    let copy_end = i64::from(dst_begin) + count as i64;
+    if dst_begin < 0 || copy_end > dst_len {
+        let index = if dst_begin < 0 {
+            dst_begin
+        } else {
+            (copy_end - 1).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        return Err(
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into(),
+        );
+    }
+    let mut bytes = vec![0u8; count * 2];
+    if ctx.read_byte_array_into(value, src_begin as usize * 2, &mut bytes) != bytes.len() {
+        return Err(
+            cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: src_begin,
+            }
+            .into(),
+        );
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from(pair[0]) | (u16::from(pair[1]) << 8))
+        .collect();
+    // The VM implementation performs one checked memcpy into the compact
+    // char-array payload. Keep the element fallback for test/mock contexts
+    // and unusual heaps that do not expose the bulk hook.
+    if !ctx.write_char_array_from(dst, dst_begin as usize, &units) {
+        for (index, unit) in units.into_iter().enumerate() {
+            ctx.set_array_element(dst, dst_begin as usize + index, Value::Int(unit as i32));
+        }
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // F4: String.checkBoundsBeginEnd / checkBoundsOffCount native overrides
 // ---------------------------------------------------------------------------
@@ -6075,6 +6168,12 @@ pub(crate) fn register_string_utf16_natives(registry: &mut NativeMethodRegistry)
         "isBigEndian",
         "()Z",
         native_string_utf16_is_big_endian,
+    );
+    registry.register(
+        "java/lang/StringUTF16",
+        "getChars",
+        "([BII[CI)V",
+        native_string_utf16_get_chars,
     );
 
     // F4: replace the JDK 25 implementation of String.checkBoundsBeginEnd and
@@ -7207,12 +7306,61 @@ mod tests {
     }
 
     #[test]
-    fn string_utf16_is_big_endian_registered() {
+    fn string_utf16_natives_are_registered() {
         let mut registry = NativeMethodRegistry::new();
         register_string_utf16_natives(&mut registry);
         assert!(registry
             .find("java/lang/StringUTF16", "isBigEndian", "()Z")
             .is_some());
+        assert!(registry
+            .find("java/lang/StringUTF16", "getChars", "([BII[CI)V")
+            .is_some());
+    }
+
+    #[test]
+    fn string_utf16_get_chars_copies_little_endian_code_units() {
+        let mut ctx = mock_ctx();
+        let source = ctx.new_array(ArrayElementType::Byte, 6);
+        // CratonVM compact UTF-16 storage is little-endian: A, omega, B.
+        for (index, byte) in [0x41, 0x00, 0xA9, 0x03, 0x42, 0x00].into_iter().enumerate() {
+            ctx.set_array_element(source, index, Value::Int(byte));
+        }
+        let dst = ctx.new_array(ArrayElementType::Char, 2);
+        assert_eq!(
+            native_string_utf16_get_chars(
+                &mut ctx,
+                &[
+                    Value::Object(Some(source)),
+                    Value::Int(1),
+                    Value::Int(3),
+                    Value::Object(Some(dst)),
+                    Value::Int(0),
+                ],
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(ctx.get_array_element(dst, 0), Value::Int(0x03A9));
+        assert_eq!(ctx.get_array_element(dst, 1), Value::Int(0x0042));
+    }
+
+    #[test]
+    fn string_utf16_get_chars_empty_range_does_not_dereference_arrays() {
+        let mut ctx = mock_ctx();
+        assert_eq!(
+            native_string_utf16_get_chars(
+                &mut ctx,
+                &[
+                    Value::Object(None),
+                    Value::Int(3),
+                    Value::Int(3),
+                    Value::Object(None),
+                    Value::Int(-1),
+                ],
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
