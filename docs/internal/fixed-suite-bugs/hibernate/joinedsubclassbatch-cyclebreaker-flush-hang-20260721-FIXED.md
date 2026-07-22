@@ -6,8 +6,8 @@ avoids the GRAPH `ActionQueue` `CycleBreaker` DFS throughput wall while keeping
 an explicit `-Dhibernate.flush.queue.type=graph` override intact.
 
 Final fresh-binary validation (`cratonvm-hib-cyclebreaker-20260722.exe`, Java
-25, 1500 MiB heap) passed both affected classes: JIT 12/12 in 75.7 s and
-`--nojit` 12/12 in 79.8 s. The historical investigation follows.
+25, 1500 MiB heap) passed both affected classes: JIT 12/12 in 73.3 s and
+`--nojit` 12/12 in 65.0 s. The historical investigation follows.
 
 Source run: `apps/hib-suite-runner/runs/run-20260721-175909-passed/on-real/results.tsv`
 (shard-6 / shard-7 `raw.log`), binary from worktree `CratonVM-hib-local-0712`
