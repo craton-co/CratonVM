@@ -8647,6 +8647,7 @@ pub mod lang_system;
 pub mod phases_early;
 pub mod phases_late;
 pub mod stamped_lock;
+pub mod tzdb;
 pub mod uncaught_handlers;
 #[cfg(feature = "synthetic-jdk")]
 pub mod util_time;
@@ -36807,15 +36808,50 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     "()Ljava/lang/String;",
                     &[Value::Object(Some(tz))],
                 ) {
-                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
-                    if has_id {
+                    let id_string = ctx.read_string(id_str).filter(|s| !s.is_empty());
+                    if let Some(id_string) = id_string {
+                        // TZDB-OFFSET (2026-07-22): `ZoneId.of(String)`'s
+                        // single-arg overload does not understand the
+                        // legacy 3-letter `ZoneId.SHORT_IDS` aliases (e.g.
+                        // "CTT") that `java.util.TimeZone` still accepts —
+                        // it would throw, which this native's `if let Ok`
+                        // guard silently swallowed, falling through to the
+                        // hardcoded-UTC bypass below and making
+                        // `ZoneId.systemDefault()` return UTC instead of
+                        // the zone `TimeZone.setDefault` was just set to.
+                        // Resolve through the same real tzdb.dat catalog
+                        // used for offset computation first so the id
+                        // passed to `ZoneId.of` is always a canonical IANA
+                        // name it accepts unaided; fall back to the raw id
+                        // (still correct for "UTC"/"GMT"/custom "+HH:MM"
+                        // forms `ZoneId.of` handles natively) if this
+                        // catalog doesn't recognize it. See
+                        // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+                        // Try the id verbatim first (preserves display
+                        // names/behavior for everything that already
+                        // worked, e.g. "UTC"/"GMT"/"Zulu"/"+08:00"/plain
+                        // IANA names); only fall back to the tzdb-resolved
+                        // canonical name for legacy short-id aliases the
+                        // single-arg overload alone doesn't understand.
+                        let orig_str = ctx.create_string(&id_string);
                         if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
                             "java/time/ZoneId",
                             "of",
                             "(Ljava/lang/String;)Ljava/time/ZoneId;",
-                            &[Value::Object(Some(id_str))],
+                            &[Value::Object(Some(orig_str))],
                         ) {
                             return Ok(Some(zone));
+                        }
+                        if let Some(resolved_id) = crate::tzdb::canonical_zone_id(ctx, &id_string) {
+                            let resolved_str = ctx.create_string(&resolved_id);
+                            if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                                "java/time/ZoneId",
+                                "of",
+                                "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                                &[Value::Object(Some(resolved_str))],
+                            ) {
+                                return Ok(Some(zone));
+                            }
                         }
                     }
                 }
@@ -37170,73 +37206,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
-    // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
-    // offsets for zones whose real IANA tzdata models a historical LMT-style
-    // offset before their first modern standardization transition.
-    // `tz_standard_offset_seconds`/`tz_dst_rule` above only know the
-    // CURRENT/modern standard offset and (for zones with a recurring annual
-    // DST rule) a `java.util.SimpleTimeZone`-representable rule — neither
-    // can express a ONE-TIME historical cutover, because SimpleTimeZone's
-    // `getOffsets(long, int[])` (what `GregorianCalendar.computeTime()`/
-    // `.computeFields()` actually call for a non-`ZoneInfo` zone — see
-    // `TimeZone.getOffsets`) only ever consults `rawOffset` (fixed at
-    // construction, no date parameter) plus the DST rule; there is no
-    // structural way to make `rawOffset` itself date-dependent. This table
-    // plus the `SimpleTimeZone.getOffsets` override below patches in the
-    // exact historical cutover(s) real HotSpot's tzdb encodes for the
-    // zones this project's Hibernate ORM suite exercises pre-standardization
-    // dates for (`ZonedDateTimeTest`'s 1904/1905 Europe/Paris boundary
-    // cases — see docs/known-issues/hibernate/hib-misc-residuals-20260716.md
-    // and docs/internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
-    //
-    // Values cross-checked against real HotSpot JDK 25's
-    // `ZoneId.of(id).getRules().getTransitions()` — the earliest transition
-    // each zone's tzdb rule-set models, i.e. the exact instant HotSpot
-    // itself switches away from the zone's Local Mean Time. Returns
-    // `(cutover_epoch_millis, pre_cutover_offset_seconds)`: for any queried
-    // instant strictly before `cutover_epoch_millis`, the real/correct
-    // offset is `pre_cutover_offset_seconds`, not the zone's modern
-    // rawOffset/DST rule. This is intentionally a small, explicit table
-    // (not full historical tzdata) — it only covers zones actually
-    // exercised pre-cutover by this codebase's test suites; a zone not
-    // listed here simply keeps the existing (correct, post-standardization)
-    // rawOffset/DST-rule behavior for every date, unchanged from before this
-    // fix.
-    fn historical_lmt_offset(zone_id: &str) -> Option<(i64, i32)> {
-        match zone_id {
-            // Europe/Paris: Paris Mean Time (+00:09:21) until the
-            // 1911-03-11 00:00 local switch to WET (UTC+0). Confirmed via
-            // `GeneralityRepro.java` that real HotSpot JDK 25's OWN legacy
-            // `TimeZone.getOffset(long)`/`GregorianCalendar` path (not just
-            // `java.time`) correctly resolves this to 561s pre-cutover —
-            // i.e. adding this entry makes CratonVM MATCH real HotSpot.
-            //
-            // Deliberately NOT extended to Europe/Amsterdam (+00:17:30
-            // until 1892-05-01) or Europe/Oslo (+00:53:28 until
-            // 1893-03-31), even though those zones have an analogous
-            // historical LMT cutover in real IANA tzdata and in
-            // `java.time`'s `ZoneRules`: probed with the same
-            // `GeneralityRepro.java` against real HotSpot JDK 25, and
-            // unlike Paris, HotSpot's own *legacy* `TimeZone`/
-            // `GregorianCalendar` path returns the flat MODERN offset
-            // (3600s) for both zones even strictly before their cutover
-            // instant — real HotSpot's compiled legacy `ZoneInfo` binary
-            // tzdata apparently doesn't carry these zones' pre-1892/1893
-            // LMT rule at all, even though `java.time`'s separate,
-            // text-tzdata-backed `ZoneRules` does. Adding a table entry
-            // for these two would make CratonVM's legacy path *more
-            // textbook-correct than real HotSpot* — i.e. diverge from the
-            // reference JVM this project targets bug-for-bug compatibility
-            // with, not converge on it. If a future test genuinely needs
-            // one of these (or another zone's) legacy-path LMT precision
-            // matched, re-verify against real HotSpot with
-            // `GeneralityRepro.java`-style probing FIRST — do not assume
-            // "real IANA tzdata has a cutover" implies "HotSpot's legacy
-            // Calendar path resolves it".
-            "Europe/Paris" => Some((-1855958961_000, 9 * 60 + 21)),
-            _ => None,
-        }
-    }
+    // HIB-PARIS-LMT (2026-07-17, superseded 2026-07-22): this used to be a
+    // small hand-picked table of pre-standardization Local Mean Time
+    // cutovers (see git history for the original `historical_lmt_offset`).
+    // Superseded by the TZDB-OFFSET fix below, which reads the real
+    // historical cutover for every zone directly from tzdb.dat instead of
+    // hand-listing one zone at a time — see
+    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
@@ -37405,15 +37381,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // to echo the bogus string back as the ID, so that detection
             // never fired (Jackson2ObjectMapperBuilderTests
             // .wrongTimeZoneStringSetter expected the throw and never got
-            // it). CratonVM has no full tzdata, so approximate "resolvable"
-            // with the curated offset table plus the universal IANA
-            // Area/Location pattern (a '/' in the id) — real zone ids all
-            // match one of those; "foo" matches neither.
+            // it).
+            //
+            // TZDB-OFFSET (2026-07-22): "resolvable" used to mean "in the
+            // ~40-zone curated `tz_standard_offset_seconds` table or
+            // contains a '/'" — which silently misrecognised any valid
+            // slash-free zone id outside that table (e.g. "CST6CDT",
+            // "EST5EDT", "MST7MDT", "PST8PDT" — the four POSIX-rule zone
+            // names `TimeZone.getAvailableIDs()` itself returns) as bogus,
+            // collapsing them to "GMT"/UTC+0 — see
+            // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+            // Now backed by the real tzdb.dat catalog (604 zones + legacy
+            // aliases), so this matches exactly what real HotSpot resolves.
             let recognized = id == "GMT"
-                || id == "UTC"
                 || custom_gmt.is_some()
-                || tz_standard_offset_seconds(&id).is_some()
-                || id.contains('/');
+                || crate::tzdb::get_zone_rules(ctx, &id).is_some();
             let id = if recognized {
                 custom_gmt.unwrap_or(id)
             } else {
@@ -37491,25 +37473,75 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    // HIB-PARIS-LMT (2026-07-17): SimpleTimeZone.getOffsets(long, int[]) —
-    // the package-private method GregorianCalendar.computeTime()/
-    // computeFields() actually call (via TimeZone.getOffsets / directly) for
-    // any zone that isn't a `sun.util.calendar.ZoneInfo` — which, per
-    // `alloc_synth_timezone` above, is every zone with a known
-    // `tz_dst_rule` (all the `Europe/*` zones the Hibernate ORM
-    // `ZonedDateTimeTest`/`LocalDateTimeTest` suites exercise). For dates
-    // strictly before a zone's `historical_lmt_offset` cutover, return the
-    // historical LMT offset directly; otherwise defer to the real
-    // SimpleTimeZone bytecode (its existing, already-correct
-    // rawOffset/DST-rule computation) via `invoke_virtual_bytecode_only` —
-    // skipping the native-override check so this doesn't re-enter itself.
-    // See `historical_lmt_offset` for why this can't be expressed by
-    // overriding `getRawOffset()` instead (no date parameter to key off).
-    registry.register(
-        "java/util/SimpleTimeZone",
-        "getOffsets",
-        "(J[I)I",
-        |ctx, args| {
+    // TZDB-OFFSET (2026-07-22): java.util.TimeZone offset queries backed by
+    // the real IANA tzdb data (`native_builtins::tzdb`, parsed from
+    // `${java.home}/lib/tzdb.dat` — the exact same file and binary format
+    // `java.time.zone.ZoneRules`/`sun.util.calendar.ZoneInfoFile` use,
+    // cross-checked bit-for-bit against real HotSpot JDK 25 across all 604
+    // zones). Supersedes the previous `tz_dst_rule`/`dst_start_year`/
+    // `historical_lmt_offset` hand-rolled approximations (a ~20-zone
+    // allowlist modeling only each zone's *current* recurring DST rule) —
+    // this covers every zone's full historical transition table instead.
+    //
+    // `GregorianCalendar.computeTime()`/`computeFields()` dispatch to one of
+    // two shapes depending on the receiver's concrete class: a `ZoneInfo`
+    // gets `getOffsets`/`getOffsetsByWall` called directly (downcast in
+    // `GregorianCalendar`'s own bytecode), anything else (e.g.
+    // `SimpleTimeZone`) goes through the generic `TimeZone.getOffset(long)`.
+    // Both concrete classes are covered below so it doesn't matter which one
+    // `alloc_synth_timezone` constructed for a given zone id.
+    fn tzdb_offsets(
+        ctx: &mut dyn NativeContext,
+        this: cratonvm_types::ObjectRef,
+        date_millis: i64,
+    ) -> (i32, i32) {
+        let id = match ctx.get_field_by_name(this, "ID") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let epoch_sec = date_millis.div_euclid(1000);
+        let (total_sec, standard_sec) = legacy_offset_and_standard(ctx, &id, epoch_sec);
+        let total_ms = total_sec.saturating_mul(1000);
+        let dst_ms = (total_sec - standard_sec).saturating_mul(1000);
+        (total_ms, dst_ms)
+    }
+
+    // `sun.util.calendar.ZoneInfoFile`'s real conversion from tzdb rules to
+    // the legacy `ZoneInfo` representation only ever models transitions from
+    // 1900 onward (`UTC1900` in that class) — any query before that floor
+    // falls through to `getLastRawOffset()` (the zone's CURRENT/modern
+    // standard offset, dstSavings=0), not the deep historical offset
+    // `java.time.zone.ZoneRules` (unfloored) would report. Mirrored here so
+    // the legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's
+    // legacy behavior bug-for-bug, same as it does post-1900 — see
+    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
+
+    fn legacy_offset_and_standard(ctx: &mut dyn NativeContext, id: &str, epoch_sec: i64) -> (i32, i32) {
+        if epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
+            let raw = crate::tzdb::raw_offset_seconds(ctx, id).unwrap_or(0);
+            return (raw, raw);
+        }
+        let total_sec = crate::tzdb::offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(0);
+        let standard_sec =
+            crate::tzdb::standard_offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(total_sec);
+        (total_sec, standard_sec)
+    }
+
+    fn register_tzdb_offset_natives_for(registry: &mut NativeMethodRegistry, class_name: &'static str) {
+        registry.register(class_name, "getOffset", "(J)I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let (total_ms, _dst_ms) = tzdb_offsets(ctx, this, date);
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getOffsets", "(J[I)I", |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
@@ -37519,31 +37551,58 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
-
+            let (total_ms, dst_ms) = tzdb_offsets(ctx, this, date);
+            if let Value::Object(Some(arr)) = offsets_arr {
+                ctx.set_array_element(arr, 0, Value::Int(total_ms - dst_ms));
+                ctx.set_array_element(arr, 1, Value::Int(dst_ms));
+            }
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getOffsetsByWall", "(J[I)I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let wall = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
             let id = match ctx.get_field_by_name(this, "ID") {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-
-            if let Some((cutover_millis, pre_offset_secs)) = historical_lmt_offset(&id) {
-                if date < cutover_millis {
-                    let offset_ms = pre_offset_secs.saturating_mul(1000);
-                    if let Value::Object(Some(arr)) = offsets_arr {
-                        ctx.set_array_element(arr, 0, Value::Int(offset_ms));
-                        ctx.set_array_element(arr, 1, Value::Int(0));
-                    }
-                    return Ok(Some(Value::Int(offset_ms)));
-                }
+            let local_epoch_sec = wall.div_euclid(1000);
+            let (total, epoch_sec) = if local_epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
+                (crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0), local_epoch_sec)
+            } else {
+                let t = crate::tzdb::offset_seconds_at_local(ctx, &id, local_epoch_sec).unwrap_or(0);
+                (t, local_epoch_sec - t as i64)
+            };
+            let (_, standard) = legacy_offset_and_standard(ctx, &id, epoch_sec);
+            let total_ms = total.saturating_mul(1000);
+            let dst_ms = (total - standard).saturating_mul(1000);
+            if let Value::Object(Some(arr)) = offsets_arr {
+                ctx.set_array_element(arr, 0, Value::Int(total_ms - dst_ms));
+                ctx.set_array_element(arr, 1, Value::Int(dst_ms));
             }
-
-            ctx.invoke_virtual_bytecode_only(
-                this,
-                "getOffsets",
-                "(J[I)I",
-                &[Value::Long(date), offsets_arr],
-            )
-        },
-    );
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getRawOffset", "()I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let id = match ctx.get_field_by_name(this, "ID") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
+            Ok(Some(Value::Int(raw.saturating_mul(1000))))
+        });
+    }
+    register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
+    register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
