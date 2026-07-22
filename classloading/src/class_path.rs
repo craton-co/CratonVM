@@ -1241,8 +1241,8 @@ impl ClassPath {
 
     /// Create a classpath from a list of path strings.
     ///
-    /// Each entry can be a directory or a `.jar` file. Non-existent paths and
-    /// invalid JAR files are silently skipped with a debug log message.
+    /// Each entry can be a directory or an archive file. Non-existent paths and
+    /// invalid archive files are silently skipped with a debug log message.
     ///
     /// JAR files are automatically scanned for Spring Boot fat JAR structure:
     /// if `BOOT-INF/classes/` or `BOOT-INF/lib/` are detected (via MANIFEST.MF
@@ -1290,22 +1290,6 @@ impl ClassPath {
                 let path = PathBuf::from(&p);
                 if path.is_dir() {
                     entries.push(ClassPathEntry::Directory(path));
-                } else if path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
-                    && path.exists()
-                {
-                    // Read into owned bytes and reject files that mutate
-                    // during the read, so classpath JARs fail closed instead
-                    // of exposing mmap truncation hazards.
-                    match read_file_for_classpath(&path) {
-                        Ok(data) => {
-                            Self::load_jar_data(&path, data, &mut entries);
-                        }
-                        Err(e) => {
-                            debug!("Failed to read JAR {}: {e}", path.display());
-                        }
-                    }
                 } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
                     match Self::load_jmod(&path) {
                         Ok(entry) => entries.push(entry),
@@ -1321,6 +1305,18 @@ impl ClassPath {
                     match Self::load_jimage(&path) {
                         Ok(entry) => entries.push(entry),
                         Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                    }
+                } else if path.is_file() {
+                    // A URLClassLoader treats every existing file URL as an
+                    // archive candidate, regardless of its suffix. Hibernate's
+                    // packaged-bootstrap tests use `.par`/`.war`/`.ear` ZIPs;
+                    // accepting only `.jar` here made the per-loader resolver
+                    // silently lose their resources while `add_path` accepted
+                    // the same URLs. `load_jar_data` fails closed for ordinary
+                    // non-archive files, so the broader admission is safe.
+                    match read_file_for_classpath(&path) {
+                        Ok(data) => Self::load_jar_data(&path, data, &mut entries),
+                        Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
                     }
                 } else {
                     debug!("Skipping non-existent classpath entry: {p}");
@@ -5747,6 +5743,25 @@ Implementation-Version: 999.999\n";
         let plain = dir.join("a.jar").to_string_lossy().into_owned();
         let cp = ClassPath::new(&[plain]);
         assert_eq!(cp.entry_count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Explicit URLClassLoader entries are archive URLs, not Java launcher
+    /// wildcard entries: a valid ZIP must remain searchable even when its
+    /// extension is `.par` rather than `.jar`.
+    #[test]
+    fn explicit_non_jar_archive_is_searchable() {
+        let dir = make_jar_dir("cratonvm_packaged_archive_suffix", &["payload.jar"]);
+        let jar = dir.join("payload.jar");
+        let par = dir.join("payload.par");
+        fs::rename(&jar, &par).unwrap();
+
+        let cp = ClassPath::new(&[par.to_string_lossy().into_owned()]);
+        assert_eq!(cp.entry_count(), 1, "the .par ZIP must be admitted as an archive");
+        let urls = cp.find_all_resource_urls("META-INF/services/dummy.SPI");
+        assert_eq!(urls.len(), 1, "the resource inside the .par must be visible");
+        assert!(urls[0].contains("payload.par"));
+
         let _ = fs::remove_dir_all(&dir);
     }
 
