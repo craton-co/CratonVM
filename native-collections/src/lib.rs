@@ -4839,7 +4839,12 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
                 .entries
                 .keys_in_java_hashmap_order()
                 .into_iter()
-                .filter_map(|k| state.entries.get(&k).map(|(key, _)| Value::Object(Some(*key))))
+                .filter_map(|k| {
+                    state
+                        .entries
+                        .get(&k)
+                        .map(|(key, _)| Value::Object(Some(*key)))
+                })
                 .collect()
         })
     {
@@ -6233,46 +6238,56 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let mut this = match args.first() {
+    let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if is_unmod_wrapper(ctx, this) {
-        return Err(unsupported_op());
-    }
-    if is_chm_receiver(ctx, this) {
-        return native_chm_remove(ctx, args);
-    }
-    if is_tree_map_receiver(ctx, this) {
-        return native_tm_remove(ctx, args);
-    }
-    if is_lhm_receiver(ctx, this) {
-        return native_lhm_remove(ctx, args);
-    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
-    if let Value::Object(Some(key_ref)) = key_val {
-        if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
-            let object_key = hm_int_fast_obj_key(ctx, this);
-            let mut table = hm_int_fast_table()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(state) = table.get_mut(&object_key) {
-                let old = state.entries.remove(&int_key).map(|(_, value)| value);
-                return Ok(Some(old.unwrap_or(Value::Object(None))));
+    // Keep both arguments rooted from native entry. `HashSet.remove()` is used
+    // by ThreadPoolExecutor.processWorkerExit while another thread can drive a
+    // collection cycle. The old version installed these roots only after the
+    // receiver-routing and integer-overlay checks, leaving their raw entry
+    // values vulnerable to a GC at that native boundary. Every delegated path
+    // now receives freshly read values, and the ordinary map path retains the
+    // same pins through hashCode()/equals().
+    let this_pin = ctx.pin_native_root(this);
+    let key_pin = pin_value(ctx, key_val);
+    let result = (|| -> MethodCallResult {
+        let mut this = ctx.read_native_pin(this_pin, this);
+        let key_val = read_pinned_elem(ctx, key_pin, key_val);
+        if is_unmod_wrapper(ctx, this) {
+            return Err(unsupported_op());
+        }
+        if is_chm_receiver(ctx, this) {
+            return native_chm_remove(ctx, &[Value::Object(Some(this)), key_val]);
+        }
+        if is_tree_map_receiver(ctx, this) {
+            return native_tm_remove(ctx, &[Value::Object(Some(this)), key_val]);
+        }
+        if is_lhm_receiver(ctx, this) {
+            return native_lhm_remove(ctx, &[Value::Object(Some(this)), key_val]);
+        }
+
+        if let Value::Object(Some(key_ref)) = key_val {
+            if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
+                let object_key = hm_int_fast_obj_key(ctx, this);
+                let mut table = hm_int_fast_table()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(state) = table.get_mut(&object_key) {
+                    let old = state.entries.remove(&int_key).map(|(_, value)| value);
+                    return Ok(Some(old.unwrap_or(Value::Object(None))));
+                }
             }
         }
-    }
 
-    let key_pin = pin_value(ctx, key_val);
-    this = materialize_hm_int_fast(ctx, this)?;
-    let key_val = read_pinned_elem(ctx, key_pin, key_val);
-
-    let remove_pin_base = ctx.pin_native_root(this);
-    let remove_key_pin = pin_value(ctx, key_val);
-    let result = native_map_remove_pinned(ctx, this, key_val, remove_pin_base, remove_key_pin);
-    ctx.unpin_native_roots(remove_pin_base);
-    ctx.unpin_native_roots(key_pin);
+        this = materialize_hm_int_fast(ctx, this)?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let key_val = read_pinned_elem(ctx, key_pin, key_val);
+        native_map_remove_pinned(ctx, this, key_val, this_pin, key_pin)
+    })();
+    ctx.unpin_native_roots(this_pin);
     result
 }
 
@@ -8795,18 +8810,14 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let mut source = source;
             let mut key = key;
             let mut want_val = want_val;
-            let has_key = match ctx.invoke_virtual(
-                source,
-                "containsKey",
-                "(Ljava/lang/Object;)Z",
-                &[key],
-            ) {
-                Ok(v) => matches!(v, Some(Value::Int(1))),
-                Err(e) => {
-                    ctx.unpin_native_roots(src_pin);
-                    return Err(e);
-                }
-            };
+            let has_key =
+                match ctx.invoke_virtual(source, "containsKey", "(Ljava/lang/Object;)Z", &[key]) {
+                    Ok(v) => matches!(v, Some(Value::Int(1))),
+                    Err(e) => {
+                        ctx.unpin_native_roots(src_pin);
+                        return Err(e);
+                    }
+                };
             source = ctx.read_native_pin(src_pin, source);
             key = read_pinned_elem(ctx, kh, key);
             want_val = read_pinned_elem(ctx, wh, want_val);
@@ -8877,8 +8888,22 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return Ok(Some(Value::Int(if was_present { 1 } else { 0 })));
     }
     // Ordinary (non-view) HashSet: remove from the backing only.
+    //
+    // `ThreadPoolExecutor.processWorkerExit` removes its Worker from this kind
+    // of HashSet while a collection can occur in the nested HashMap native.
+    // The map implementation roots its own entry arguments, but the outer
+    // HashSet frame still supplied those raw addresses at the nesting boundary.
+    // Retain both values here as well and refresh them immediately before the
+    // nested call, so neither layer can hand a from-space reference to the
+    // other.
+    let backing_pin = ctx.pin_native_root(backing);
+    let elem_pin = pin_value(ctx, elem);
+    let backing = ctx.read_native_pin(backing_pin, backing);
+    let elem = read_pinned_elem(ctx, elem_pin, elem);
     let remove_args = [Value::Object(Some(backing)), elem];
-    let old = native_map_remove(ctx, &remove_args)?;
+    let old = native_map_remove(ctx, &remove_args);
+    ctx.unpin_native_roots(backing_pin);
+    let old = old?;
     Ok(Some(Value::Int(
         if !matches!(old, Some(Value::Object(None))) {
             1
@@ -10242,8 +10267,16 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let (_, elem_handles) = pin_value_slice(ctx, &items);
     let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
     let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
-        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
         // JDK natural-order sorting probes the right run against the left
@@ -10258,7 +10291,11 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
     for (out, slot) in idx.iter().enumerate() {
-        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let i = if let Value::Int(v) = slot {
+            *v as usize
+        } else {
+            0
+        };
         let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
         ctx.set_array_element(arr, out, val);
     }
@@ -10333,8 +10370,14 @@ fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Opt
 fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
     let cid = ctx.class_id_of_object(obj);
     ctx.class_name_of_id(cid)
-        .or_else(|| ctx.lambda_proxy_host(cid).map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32())))
-        .or_else(|| ctx.lambda_functional_interface(cid).map(|iface| format!("lambda implementing {iface}")))
+        .or_else(|| {
+            ctx.lambda_proxy_host(cid)
+                .map(|host| format!("{host}$$Lambda/0x{:x}", cid.as_u32()))
+        })
+        .or_else(|| {
+            ctx.lambda_functional_interface(cid)
+                .map(|iface| format!("lambda implementing {iface}"))
+        })
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 
@@ -10713,8 +10756,16 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let (_, elem_handles) = pin_value_slice(ctx, &items);
     let mut idx: Vec<Value> = (0..items.len() as i32).map(Value::Int).collect();
     let sort_result = merge_sort_fallible(ctx, &mut idx, |c, a, b| {
-        let ia = if let Value::Int(v) = a { *v as usize } else { 0 };
-        let ib = if let Value::Int(v) = b { *v as usize } else { 0 };
+        let ia = if let Value::Int(v) = a {
+            *v as usize
+        } else {
+            0
+        };
+        let ib = if let Value::Int(v) = b {
+            *v as usize
+        } else {
+            0
+        };
         let ea = read_pinned_elem(c, elem_handles[ia], items[ia]);
         let eb = read_pinned_elem(c, elem_handles[ib], items[ib]);
         // See Arrays.sort(Object[]) above: retain the JDK's right-vs-left
@@ -10727,7 +10778,11 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     let data = ctx.read_native_pin(data_pin, data);
     for (out, slot) in idx.iter().enumerate() {
-        let i = if let Value::Int(v) = slot { *v as usize } else { 0 };
+        let i = if let Value::Int(v) = slot {
+            *v as usize
+        } else {
+            0
+        };
         let val = read_pinned_elem(ctx, elem_handles[i], items[i]);
         ctx.set_array_element(data, out, val);
     }
@@ -10794,8 +10849,8 @@ fn ensure_collections_empty_singletons(
     // (synthetic-jdk mode), preserving the old behaviour there.
     if let Some(idx) = ctx.static_field_index_by_name(cid, "EMPTY_LIST") {
         if !matches!(ctx.get_static_field(cid, idx), Value::Object(Some(_))) {
-            let list = alloc_real_jdk(ctx, "java/util/Collections$EmptyList")
-                .unwrap_or_else(|| {
+            let list =
+                alloc_real_jdk(ctx, "java/util/Collections$EmptyList").unwrap_or_else(|| {
                     let __al_n_fields = al_slots(ctx).2;
                     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
                     let arr = alloc_ref_array(ctx, 0);
@@ -13256,7 +13311,7 @@ fn stream_process_chain(
                             }
                             cur = r.unwrap_or(Value::Object(None));
                             cur_pin = pin_value(ctx, cur);
-                        },
+                        }
                         Err(e) if is_placeholder_object_class_cast(ctx, cur, &e) => {
                             // SPR-AOT-JUNIT-URI.1 (2026-07-08) - JUnit suite
                             // discovery can leak a raw Object placeholder into
@@ -13528,8 +13583,16 @@ fn stream_pull_synthetic_downstream(
             let stream_cur = ctx.read_native_pin(stream_pin, stream);
             let empty = alloc_ref_array(ctx, 0);
             let stream_cur = ctx.read_native_pin(stream_pin, stream);
-            ctx.set_field(stream_cur, STREAM_FIELD_ELEMENTS, Value::Object(Some(empty)));
-            ctx.set_field(stream_cur, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            ctx.set_field(
+                stream_cur,
+                STREAM_FIELD_ELEMENTS,
+                Value::Object(Some(empty)),
+            );
+            ctx.set_field(
+                stream_cur,
+                STREAM_FIELD_LAZY_SPLITERATOR,
+                Value::Object(None),
+            );
             return Ok(if downstream_stopped {
                 PullStep::Stop
             } else {
@@ -13803,10 +13866,8 @@ fn native_stream_chain_collector_accept(
     }
 
     // SAFETY: see `SpliteratorPullFrame::emit`'s doc comment above.
-    let emit: &mut dyn FnMut(
-        &mut dyn NativeContext,
-        Value,
-    ) -> Result<PullStep, MethodCallFailed> = unsafe { &mut *emit_ptr };
+    let emit: &mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
+        unsafe { &mut *emit_ptr };
     let outcome = stream_process_chain(ctx, elem, &chain, &chain_pins, 0, &mut state, emit);
 
     SPLITERATOR_PULL_STACK.with(|s| {
@@ -13859,10 +13920,14 @@ fn drain_spliterator_inline(
     // (short) lifetime, then transmute away the lifetime so it fits the
     // frame's (unbounded) field type -- mirrors `ChmMonitorGuard::acquire`'s
     // `&mut dyn NativeContext` lifetime-erasure a few hundred lines above.
-    let emit_raw: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
-        emit;
-    let emit_ptr: *mut dyn FnMut(&mut dyn NativeContext, Value) -> Result<PullStep, MethodCallFailed> =
-        unsafe { core::mem::transmute(emit_raw) };
+    let emit_raw: *mut dyn FnMut(
+        &mut dyn NativeContext,
+        Value,
+    ) -> Result<PullStep, MethodCallFailed> = emit;
+    let emit_ptr: *mut dyn FnMut(
+        &mut dyn NativeContext,
+        Value,
+    ) -> Result<PullStep, MethodCallFailed> = unsafe { core::mem::transmute(emit_raw) };
     let guard = PullFrameGuard::push(SpliteratorPullFrame {
         chain: chain.to_vec(),
         chain_pins: chain_pins.to_vec(),
@@ -15866,46 +15931,46 @@ fn native_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // drives a still-lazy source inline through the chain via
     // `stream_pull_internal`.
     if !stream_has_chain(ctx, this) {
-    if let Some(spl) = stream_lazy_spliterator(ctx, this) {
-        // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
-        // element and can trigger a moving GC that relocates `this`; the
-        // trailing `set_field(this, ...)` after the loop was reading the
-        // stale address captured at function entry. Pin `this` alongside
-        // `spl`/`consumer` and re-read it before that final use. Confirmed
-        // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
-        // ServiceLoader stream draining -- see
-        // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
-        let this_pin = ctx.pin_native_root(this);
-        let spl_pin = ctx.pin_native_root(spl);
-        const SAFETY_CAP: usize = 1_000_000;
-        let mut n = 0usize;
-        let result = loop {
-            let s = ctx.read_native_pin(spl_pin, spl);
-            let c = ctx.read_native_pin(con_pin, consumer);
-            match ctx.invoke_virtual(
-                s,
-                "tryAdvance",
-                "(Ljava/util/function/Consumer;)Z",
-                &[Value::Object(Some(c))],
-            ) {
-                Ok(Some(Value::Int(v))) if v != 0 => {
-                    n += 1;
-                    if n >= SAFETY_CAP {
-                        break Ok(None);
+        if let Some(spl) = stream_lazy_spliterator(ctx, this) {
+            // GC-SAFETY: the `tryAdvance` loop below re-enters Java once per
+            // element and can trigger a moving GC that relocates `this`; the
+            // trailing `set_field(this, ...)` after the loop was reading the
+            // stale address captured at function entry. Pin `this` alongside
+            // `spl`/`consumer` and re-read it before that final use. Confirmed
+            // live via CRATONVM_DBG_STALE_OBJREF during WildFly parallel-boot
+            // ServiceLoader stream draining -- see
+            // docs/known-issues/wildfly-parallel-boot-stale-objectref-residual.md.
+            let this_pin = ctx.pin_native_root(this);
+            let spl_pin = ctx.pin_native_root(spl);
+            const SAFETY_CAP: usize = 1_000_000;
+            let mut n = 0usize;
+            let result = loop {
+                let s = ctx.read_native_pin(spl_pin, spl);
+                let c = ctx.read_native_pin(con_pin, consumer);
+                match ctx.invoke_virtual(
+                    s,
+                    "tryAdvance",
+                    "(Ljava/util/function/Consumer;)Z",
+                    &[Value::Object(Some(c))],
+                ) {
+                    Ok(Some(Value::Int(v))) if v != 0 => {
+                        n += 1;
+                        if n >= SAFETY_CAP {
+                            break Ok(None);
+                        }
                     }
+                    Ok(_) => break Ok(None),
+                    Err(e) => break Err(e),
                 }
-                Ok(_) => break Ok(None),
-                Err(e) => break Err(e),
-            }
-        };
-        let this = ctx.read_native_pin(this_pin, this);
-        // `con_pin` is the first pin owned by this native; one truncate clears
-        // it and the later `this`/`spl` pins without violating stack order.
-        ctx.unpin_native_roots(con_pin);
-        // Mark consumed so a (illegal) second terminal sees an empty stream.
-        ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
-        return result;
-    }
+            };
+            let this = ctx.read_native_pin(this_pin, this);
+            // `con_pin` is the first pin owned by this native; one truncate clears
+            // it and the later `this`/`spl` pins without violating stack order.
+            ctx.unpin_native_roots(con_pin);
+            // Mark consumed so a (illegal) second terminal sees an empty stream.
+            ctx.set_field(this, STREAM_FIELD_LAZY_SPLITERATOR, Value::Object(None));
+            return result;
+        }
     }
     let elements = stream_elements(ctx, this)?;
     // GC-SAFETY: `accept` re-enters Java and can trigger a moving young GC that
@@ -17631,356 +17696,148 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // closure releases every pin the arms push (pins are a stack).
     let (_, elem_handles) = pin_value_slice(ctx, &elements);
     let result = (|| -> MethodCallResult {
-    match tag {
-        COLLECTOR_TAG_TO_LIST => make_list_of(ctx, &elements),
-        COLLECTOR_TAG_TO_SET => make_set_of(ctx, &elements),
-        COLLECTOR_TAG_TO_COLLECTION => {
-            // Invoke the supplier to materialize the target Collection, then
-            // add each stream element via Collection.add(Object). Fall back to
-            // a HashSet if the supplier is missing or fails.
-            let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
-            let coll_obj = match supplier {
-                Value::Object(Some(s)) => {
-                    match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
-                        Ok(Some(Value::Object(Some(c)))) => Some(c),
-                        _ => None,
+        match tag {
+            COLLECTOR_TAG_TO_LIST => make_list_of(ctx, &elements),
+            COLLECTOR_TAG_TO_SET => make_set_of(ctx, &elements),
+            COLLECTOR_TAG_TO_COLLECTION => {
+                // Invoke the supplier to materialize the target Collection, then
+                // add each stream element via Collection.add(Object). Fall back to
+                // a HashSet if the supplier is missing or fails.
+                let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let coll_obj = match supplier {
+                    Value::Object(Some(s)) => {
+                        match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+                            Ok(Some(Value::Object(Some(c)))) => Some(c),
+                            _ => None,
+                        }
                     }
-                }
-                _ => None,
-            };
-            match coll_obj {
-                Some(c) => {
-                    // cceres3: pin across GC-capable call (stream stale-at-store wave)
-                    let c_pin = ctx.pin_native_root(c);
-                    for i in 0..elements.len() {
+                    _ => None,
+                };
+                match coll_obj {
+                    Some(c) => {
+                        // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                        let c_pin = ctx.pin_native_root(c);
+                        for i in 0..elements.len() {
+                            let c = ctx.read_native_pin(c_pin, c);
+                            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                            let _ =
+                                ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                        }
                         let c = ctx.read_native_pin(c_pin, c);
-                        let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                        let _ = ctx.invoke_virtual(c, "add", "(Ljava/lang/Object;)Z", &[elem])?;
+                        Ok(Some(Value::Object(Some(c))))
                     }
-                    let c = ctx.read_native_pin(c_pin, c);
-                    Ok(Some(Value::Object(Some(c))))
-                }
-                None => {
-                    // cceres3: the supplier `get()` above may have moved the elements
-                    let elements = read_value_slice(ctx, &elem_handles, &elements);
-                    make_set_of(ctx, &elements)
+                    None => {
+                        // cceres3: the supplier `get()` above may have moved the elements
+                        let elements = read_value_slice(ctx, &elem_handles, &elements);
+                        make_set_of(ctx, &elements)
+                    }
                 }
             }
-        }
-        COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
-        COLLECTOR_TAG_JOINING => {
-            let mut parts = Vec::with_capacity(elements.len());
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            for i in 0..elements.len() {
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                parts.push(obj_to_display_string(ctx, &elem));
-            }
-            let joined = parts.join("");
-            let s = ctx.create_string(&joined);
-            Ok(Some(Value::Object(Some(s))))
-        }
-        COLLECTOR_TAG_JOINING_DELIM => {
-            let read = |ctx: &dyn NativeContext, field: usize| -> String {
-                match ctx.get_field(collector, field) {
-                    Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                    _ => String::new(),
+            COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
+            COLLECTOR_TAG_JOINING => {
+                let mut parts = Vec::with_capacity(elements.len());
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                for i in 0..elements.len() {
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    parts.push(obj_to_display_string(ctx, &elem));
                 }
-            };
-            let delim_str = read(ctx, COLLECTOR_FIELD_ARG1);
-            // ARG2 = prefix, ARG3 = suffix for the 3-arg
-            // `Collectors.joining(delimiter, prefix, suffix)`. They are unset
-            // (→ "") for the 1-arg `joining(delimiter)` form, so the same arm
-            // serves both. Previously the 3-arg form wasn't registered at all
-            // and prefix/suffix were ignored, so e.g.
-            // `joining(",","[","]")` produced "" instead of "[1,2,3]".
-            let prefix = read(ctx, COLLECTOR_FIELD_ARG2);
-            let suffix = read(ctx, COLLECTOR_FIELD_ARG3);
-            let mut parts = Vec::with_capacity(elements.len());
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            for i in 0..elements.len() {
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                parts.push(obj_to_display_string(ctx, &elem));
+                let joined = parts.join("");
+                let s = ctx.create_string(&joined);
+                Ok(Some(Value::Object(Some(s))))
             }
-            let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
-            let s = ctx.create_string(&joined);
-            Ok(Some(Value::Object(Some(s))))
-        }
-        COLLECTOR_TAG_TO_MAP => {
-            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            let key_fn_pin = ctx.pin_native_root(key_fn);
-            let val_fn_pin = ctx.pin_native_root(val_fn);
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
-            for i in 0..elements.len() {
-                let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let k = ctx
-                    .invoke_virtual(
-                        key_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let k_handle = pin_value(ctx, k);
-                let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let v = ctx
-                    .invoke_virtual(
-                        val_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let v_handle = pin_value(ctx, v);
-                // The 2-arg `Collectors.toMap(keyFn, valFn)` installs a throwing
-                // merger in real OpenJDK: a duplicate key raises
-                // `IllegalStateException("Duplicate key ...")`. The previous
-                // implementation silently last-wins-merged, so callers relying on
-                // the throw never saw it (e.g. keycloak IssuerSignedJWT.build()
-                // detects duplicate claim names exactly this way, then rethrows as
-                // IllegalArgumentException). Detect duplicates by Java `equals`
-                // over the keys collected so far and throw to match the JDK.
-                if let Value::Object(Some(_)) = k {
-                    for (j, (existing_k, _)) in pairs.iter().enumerate() {
-                        // cceres3: `equals` re-enters Java — refresh both keys
-                        let existing_k = read_pinned_elem(ctx, pair_handles[j].0, *existing_k);
-                        let k_cur = read_pinned_elem(ctx, k_handle, k);
-                        if let (Value::Object(Some(eref)), Value::Object(Some(kref))) =
-                            (existing_k, k_cur)
-                        {
-                            if map_keys_equal(ctx, eref, kref)? {
-                                return Err(
+            COLLECTOR_TAG_JOINING_DELIM => {
+                let read = |ctx: &dyn NativeContext, field: usize| -> String {
+                    match ctx.get_field(collector, field) {
+                        Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                };
+                let delim_str = read(ctx, COLLECTOR_FIELD_ARG1);
+                // ARG2 = prefix, ARG3 = suffix for the 3-arg
+                // `Collectors.joining(delimiter, prefix, suffix)`. They are unset
+                // (→ "") for the 1-arg `joining(delimiter)` form, so the same arm
+                // serves both. Previously the 3-arg form wasn't registered at all
+                // and prefix/suffix were ignored, so e.g.
+                // `joining(",","[","]")` produced "" instead of "[1,2,3]".
+                let prefix = read(ctx, COLLECTOR_FIELD_ARG2);
+                let suffix = read(ctx, COLLECTOR_FIELD_ARG3);
+                let mut parts = Vec::with_capacity(elements.len());
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                for i in 0..elements.len() {
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    parts.push(obj_to_display_string(ctx, &elem));
+                }
+                let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
+                let s = ctx.create_string(&joined);
+                Ok(Some(Value::Object(Some(s))))
+            }
+            COLLECTOR_TAG_TO_MAP => {
+                let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let key_fn_pin = ctx.pin_native_root(key_fn);
+                let val_fn_pin = ctx.pin_native_root(val_fn);
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let k = ctx
+                        .invoke_virtual(
+                            key_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let k_handle = pin_value(ctx, k);
+                    let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let v = ctx
+                        .invoke_virtual(
+                            val_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let v_handle = pin_value(ctx, v);
+                    // The 2-arg `Collectors.toMap(keyFn, valFn)` installs a throwing
+                    // merger in real OpenJDK: a duplicate key raises
+                    // `IllegalStateException("Duplicate key ...")`. The previous
+                    // implementation silently last-wins-merged, so callers relying on
+                    // the throw never saw it (e.g. keycloak IssuerSignedJWT.build()
+                    // detects duplicate claim names exactly this way, then rethrows as
+                    // IllegalArgumentException). Detect duplicates by Java `equals`
+                    // over the keys collected so far and throw to match the JDK.
+                    if let Value::Object(Some(_)) = k {
+                        for (j, (existing_k, _)) in pairs.iter().enumerate() {
+                            // cceres3: `equals` re-enters Java — refresh both keys
+                            let existing_k = read_pinned_elem(ctx, pair_handles[j].0, *existing_k);
+                            let k_cur = read_pinned_elem(ctx, k_handle, k);
+                            if let (Value::Object(Some(eref)), Value::Object(Some(kref))) =
+                                (existing_k, k_cur)
+                            {
+                                if map_keys_equal(ctx, eref, kref)? {
+                                    return Err(
                                     cratonvm_types::error::RuntimeError::IllegalStateException {
                                         message: "Duplicate key".to_string(),
                                     }
                                     .into(),
                                 );
+                                }
                             }
                         }
                     }
-                }
-                pairs.push((k, v));
-                pair_handles.push((k_handle, v_handle));
-            }
-            // cceres3: re-read every accumulated pair before map construction
-            let pairs: Vec<(Value, Value)> = pairs
-                .iter()
-                .zip(&pair_handles)
-                .map(|((k, v), (kh, vh))| {
-                    (
-                        read_pinned_elem(ctx, *kh, *k),
-                        read_pinned_elem(ctx, *vh, *v),
-                    )
-                })
-                .collect();
-            make_map_of(ctx, &pairs)
-        }
-        COLLECTOR_TAG_TO_MAP_MERGE => {
-            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
-                Value::Object(Some(r)) => Some(r),
-                _ => None,
-            };
-            // Walk elements, merging duplicate keys via the BinaryOperator.
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            let key_fn_pin = ctx.pin_native_root(key_fn);
-            let val_fn_pin = ctx.pin_native_root(val_fn);
-            let merge_fn_pin = merge_fn
-                .map(|mf| ctx.pin_native_root(mf))
-                .unwrap_or(usize::MAX);
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
-            for i in 0..elements.len() {
-                let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let k = ctx
-                    .invoke_virtual(
-                        key_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let k_handle = pin_value(ctx, k);
-                let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let v = ctx
-                    .invoke_virtual(
-                        val_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let mut v_handle = pin_value(ctx, v);
-                let mut idx = None;
-                for (j, (ek, _)) in pairs.iter().enumerate() {
-                    let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
-                    let k_cur = read_pinned_elem(ctx, k_handle, k);
-                    if values_equal(ctx, &ek, &k_cur) {
-                        idx = Some(j);
-                        break;
-                    }
-                }
-                if let Some(j) = idx {
-                    let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
-                    let v = read_pinned_elem(ctx, v_handle, v);
-                    let merged = if let Some(mf) = merge_fn {
-                        let mf = ctx.read_native_pin(merge_fn_pin, mf);
-                        ctx.invoke_virtual(
-                            mf,
-                            "apply",
-                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                            &[existing, v],
-                        )?
-                        .unwrap_or(Value::Object(None))
-                    } else {
-                        v
-                    };
-                    v_handle = pin_value(ctx, merged);
-                    pairs[j].1 = merged;
-                    pair_handles[j].1 = v_handle;
-                } else {
                     pairs.push((k, v));
                     pair_handles.push((k_handle, v_handle));
                 }
-            }
-            // cceres3: re-read every accumulated pair before map construction
-            let pairs: Vec<(Value, Value)> = pairs
-                .iter()
-                .zip(&pair_handles)
-                .map(|((k, v), (kh, vh))| {
-                    (
-                        read_pinned_elem(ctx, *kh, *k),
-                        read_pinned_elem(ctx, *vh, *v),
-                    )
-                })
-                .collect();
-            make_map_of(ctx, &pairs)
-        }
-        COLLECTOR_TAG_TO_MAP_SUPPLIER => {
-            let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
-                Value::Object(Some(r)) => Some(r),
-                _ => None,
-            };
-            let supplier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG4) {
-                Value::Object(Some(r)) => Some(r),
-                _ => None,
-            };
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            let key_fn_pin = ctx.pin_native_root(key_fn);
-            let val_fn_pin = ctx.pin_native_root(val_fn);
-            let merge_fn_pin = merge_fn
-                .map(|mf| ctx.pin_native_root(mf))
-                .unwrap_or(usize::MAX);
-            let map_obj = match supplier {
-                Some(s) => match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])? {
-                    Some(Value::Object(Some(m))) => Some(m),
-                    _ => None,
-                },
-                None => None,
-            };
-            let map_pin = map_obj
-                .map(|m| ctx.pin_native_root(m))
-                .unwrap_or(usize::MAX);
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
-            for i in 0..elements.len() {
-                let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let k = ctx
-                    .invoke_virtual(
-                        key_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let k_handle = pin_value(ctx, k);
-                let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let v = ctx
-                    .invoke_virtual(
-                        val_fn,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let mut v_handle = pin_value(ctx, v);
-                let mut idx = None;
-                for (j, (ek, _)) in pairs.iter().enumerate() {
-                    let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
-                    let k_cur = read_pinned_elem(ctx, k_handle, k);
-                    if values_equal(ctx, &ek, &k_cur) {
-                        idx = Some(j);
-                        break;
-                    }
-                }
-                if let Some(j) = idx {
-                    let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
-                    let v = read_pinned_elem(ctx, v_handle, v);
-                    let merged = if let Some(mf) = merge_fn {
-                        let mf = ctx.read_native_pin(merge_fn_pin, mf);
-                        ctx.invoke_virtual(
-                            mf,
-                            "apply",
-                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                            &[existing, v],
-                        )?
-                        .unwrap_or(Value::Object(None))
-                    } else {
-                        v
-                    };
-                    v_handle = pin_value(ctx, merged);
-                    pairs[j].1 = merged;
-                    pair_handles[j].1 = v_handle;
-                } else {
-                    pairs.push((k, v));
-                    pair_handles.push((k_handle, v_handle));
-                }
-            }
-            if let Some(m) = map_obj {
-                // cceres3: `put` re-enters Java — refresh map and pair per put
-                for (j, (k, v)) in pairs.iter().enumerate() {
-                    let m = ctx.read_native_pin(map_pin, m);
-                    let k = read_pinned_elem(ctx, pair_handles[j].0, *k);
-                    let v = read_pinned_elem(ctx, pair_handles[j].1, *v);
-                    ctx.invoke_virtual(
-                        m,
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[k, v],
-                    )?;
-                }
-                let m = ctx.read_native_pin(map_pin, m);
-                Ok(Some(Value::Object(Some(m))))
-            } else {
                 // cceres3: re-read every accumulated pair before map construction
                 let pairs: Vec<(Value, Value)> = pairs
                     .iter()
@@ -17994,425 +17851,336 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     .collect();
                 make_map_of(ctx, &pairs)
             }
-        }
-        COLLECTOR_TAG_COLLECTING_AND_THEN => {
-            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
-            let finisher = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Re-build a stream over the same elements and recursively collect
-            // through the downstream Collector, then apply finisher.apply().
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            let fin_pin = ctx.pin_native_root(finisher);
-            let ds_handle = pin_value(ctx, downstream);
-            let elems = read_value_slice(ctx, &elem_handles, &elements);
-            let inner_stream = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
-            let downstream = read_pinned_elem(ctx, ds_handle, downstream);
-            let downstream_result = native_stream_collect(ctx, &[inner_stream, downstream])?
-                .unwrap_or(Value::Object(None));
-            let finisher = ctx.read_native_pin(fin_pin, finisher);
-            let finished = ctx
-                .invoke_virtual(
-                    finisher,
-                    "apply",
-                    "(Ljava/lang/Object;)Ljava/lang/Object;",
-                    &[downstream_result],
-                )?
-                .unwrap_or(Value::Object(None));
-            Ok(Some(finished))
-        }
-        COLLECTOR_TAG_MAPPING => {
-            // mapping(mapper, downstream): apply `mapper` to every element, then
-            // feed the mapped values into the downstream collector via the same
-            // recursive sub-stream protocol the other downstream-aware arms use.
-            let mapper = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
-            // cceres3: pin across GC-capable call (stream stale-at-store wave)
-            let mapper_pin = ctx.pin_native_root(mapper);
-            let ds_handle = pin_value(ctx, downstream);
-            let mut mapped = Vec::with_capacity(elements.len());
-            let mut mapped_handles: Vec<usize> = Vec::with_capacity(elements.len());
-            for i in 0..elements.len() {
-                let mapper = ctx.read_native_pin(mapper_pin, mapper);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let m = ctx
-                    .invoke_virtual(
-                        mapper,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                mapped_handles.push(pin_value(ctx, m));
-                mapped.push(m);
-            }
-            let mapped = read_value_slice(ctx, &mapped_handles, &mapped);
-            let inner_stream = make_stream(ctx, &mapped)?.unwrap_or(Value::Object(None));
-            let downstream = read_pinned_elem(ctx, ds_handle, downstream);
-            native_stream_collect(ctx, &[inner_stream, downstream])
-        }
-        COLLECTOR_TAG_GROUPING_BY => {
-            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Group elements by classifier result into HashMap<K, ArrayList<V>>
-            // We use a Vec to collect groups, then build the map.
-            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
-            // groups hold element INDICES (the elements are pinned above) and
-            // every group key is pinned as produced.
-            let cls_pin = ctx.pin_native_root(classifier);
-            let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
-            let mut group_key_handles: Vec<usize> = Vec::new();
-            for i in 0..elements.len() {
-                let classifier = ctx.read_native_pin(cls_pin, classifier);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let key = ctx
-                    .invoke_virtual(
-                        classifier,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let key_handle = pin_value(ctx, key);
-                // Find existing group. Use real Java `equals` (not the
-                // identity/String/enum-only `values_equal`) so equal-but-
-                // distinct object keys (e.g. a `LinkedHashMap` group key) land
-                // in the SAME group rather than one group per element.
-                let mut found_idx = None;
-                for (gi, (gk, _)) in groups.iter().enumerate() {
-                    let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
-                    let key_cur = read_pinned_elem(ctx, key_handle, key);
-                    if group_key_equal(ctx, &gk, &key_cur) {
-                        found_idx = Some(gi);
-                        break;
-                    }
-                }
-                match found_idx {
-                    Some(gi) => groups[gi].1.push(i),
-                    None => {
-                        groups.push((key, vec![i]));
-                        group_key_handles.push(key_handle);
-                    }
-                }
-            }
-            // Build HashMap<K, ArrayList<V>> — pin each built list and re-read
-            // keys/lists right before map construction (each build allocates).
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
-            for (gi, (key, idxs)) in groups.iter().enumerate() {
-                let vals: Vec<Value> = idxs
-                    .iter()
-                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                    .collect();
-                let list = make_list_of_raw(ctx, &vals);
-                let list_handle = ctx.pin_native_root(list);
-                pairs.push((*key, Value::Object(Some(list))));
-                pair_handles.push((group_key_handles[gi], list_handle));
-            }
-            let pairs: Vec<(Value, Value)> = pairs
-                .iter()
-                .zip(&pair_handles)
-                .map(|((k, v), (kh, vh))| {
-                    (
-                        read_pinned_elem(ctx, *kh, *k),
-                        read_pinned_elem(ctx, *vh, *v),
-                    )
-                })
-                .collect();
-            make_map_of(ctx, &pairs)
-        }
-        COLLECTOR_TAG_PARTITIONING_BY => {
-            let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
-            // partitions hold element INDICES (the elements are pinned above).
-            let pred_pin = ctx.pin_native_root(predicate);
-            let mut true_idx: Vec<usize> = Vec::new();
-            let mut false_idx: Vec<usize> = Vec::new();
-            for i in 0..elements.len() {
-                let predicate = ctx.read_native_pin(pred_pin, predicate);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let result = ctx
-                    .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
-                    .unwrap_or(Value::Int(0));
-                if matches!(result, Value::Int(v) if v != 0) {
-                    true_idx.push(i);
-                } else {
-                    false_idx.push(i);
-                }
-            }
-            // Build HashMap with Boolean.TRUE and Boolean.FALSE keys — each
-            // allocation below can move the previous ones; keep them pinned and
-            // re-read right before map construction.
-            let true_vals: Vec<Value> = true_idx
-                .iter()
-                .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                .collect();
-            let true_al = make_list_of_raw(ctx, &true_vals);
-            let true_al_pin = ctx.pin_native_root(true_al);
-            let false_vals: Vec<Value> = false_idx
-                .iter()
-                .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                .collect();
-            let false_al = make_list_of_raw(ctx, &false_vals);
-            let false_al_pin = ctx.pin_native_root(false_al);
-            let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
-            ctx.set_field(true_key, 0, Value::Int(1));
-            let true_key_pin = ctx.pin_native_root(true_key);
-            let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
-            ctx.set_field(false_key, 0, Value::Int(0));
-            let true_al = ctx.read_native_pin(true_al_pin, true_al);
-            let false_al = ctx.read_native_pin(false_al_pin, false_al);
-            let true_key = ctx.read_native_pin(true_key_pin, true_key);
-            let pairs = [
-                (Value::Object(Some(true_key)), Value::Object(Some(true_al))),
-                (
-                    Value::Object(Some(false_key)),
-                    Value::Object(Some(false_al)),
-                ),
-            ];
-            make_map_of(ctx, &pairs)
-        }
-        COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM => {
-            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
-
-            // Group elements by classifier into Vec<(key, Vec<elem index>)>.
-            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
-            // groups hold element INDICES (the elements are pinned above) and
-            // every group key / group result is pinned as produced.
-            let cls_pin = ctx.pin_native_root(classifier);
-            let ds_handle = pin_value(ctx, downstream);
-            let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
-            let mut group_key_handles: Vec<usize> = Vec::new();
-            for i in 0..elements.len() {
-                let classifier = ctx.read_native_pin(cls_pin, classifier);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let key = ctx
-                    .invoke_virtual(
-                        classifier,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let key_handle = pin_value(ctx, key);
-                // Real Java `equals` for object keys (see the GROUPING_BY
-                // branch above) so equal-but-distinct keys share a group.
-                let mut found_idx = None;
-                for (gi, (gk, _)) in groups.iter().enumerate() {
-                    let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
-                    let key_cur = read_pinned_elem(ctx, key_handle, key);
-                    if group_key_equal(ctx, &gk, &key_cur) {
-                        found_idx = Some(gi);
-                        break;
-                    }
-                }
-                match found_idx {
-                    Some(gi) => groups[gi].1.push(i),
-                    None => {
-                        groups.push((key, vec![i]));
-                        group_key_handles.push(key_handle);
-                    }
-                }
-            }
-
-            // Apply downstream collector to each group inline to avoid recursion.
-            let downstream_tag = match downstream {
-                Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
-                    Value::Int(t) => Some((d, t)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
-            for (gi, (key, idxs)) in groups.iter().enumerate() {
-                let group_elems: Vec<Value> = idxs
-                    .iter()
-                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                    .collect();
-                let group_result = match downstream_tag {
-                    Some((_d, COLLECTOR_TAG_TO_LIST)) => {
-                        make_list_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
-                    }
-                    Some((_d, COLLECTOR_TAG_TO_SET)) => {
-                        make_set_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
-                    }
-                    Some((_d, COLLECTOR_TAG_COUNTING)) => {
-                        // Box as java/lang/Long so .intValue() works
-                        let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
-                        ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
-                        Value::Object(Some(long_obj))
-                    }
-                    _ => {
-                        // Fallback: build stream and collect (single level only)
-                        let group_stream =
-                            make_stream(ctx, &group_elems)?.unwrap_or(Value::Object(None));
-                        let downstream = read_pinned_elem(ctx, ds_handle, downstream);
-                        native_stream_collect(ctx, &[group_stream, downstream])?
-                            .unwrap_or(Value::Object(None))
-                    }
+            COLLECTOR_TAG_TO_MAP_MERGE => {
+                let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
                 };
-                let gr_handle = pin_value(ctx, group_result);
-                pairs.push((*key, group_result));
-                pair_handles.push((group_key_handles[gi], gr_handle));
-            }
-            // cceres3: re-read every accumulated pair before map construction
-            let pairs: Vec<(Value, Value)> = pairs
-                .iter()
-                .zip(&pair_handles)
-                .map(|((k, v), (kh, vh))| {
-                    (
-                        read_pinned_elem(ctx, *kh, *k),
-                        read_pinned_elem(ctx, *vh, *v),
-                    )
-                })
-                .collect();
-            make_map_of(ctx, &pairs)
-        }
-        // T2.3.18 — groupingBy(Function, Supplier, Collector).
-        // Semantically equivalent to the 2-arg downstream variant; the
-        // supplier argument just customizes the Map subtype — since our
-        // synthetic HashMap is the only map shape native code produces,
-        // we honor the spec by materializing the supplier's object and
-        // populating it via its put(K,V) method instead of our internal
-        // make_map_of helper. This keeps user-supplied LinkedHashMap /
-        // TreeMap / EnumMap suppliers working.
-        COLLECTOR_TAG_GROUPING_BY_SUPPLIER => {
-            let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
-            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG3);
-
-            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
-            // groups hold element INDICES (the elements are pinned above) and
-            // every group key / group result is pinned as produced.
-            let cls_pin = ctx.pin_native_root(classifier);
-            let sup_handle = pin_value(ctx, supplier);
-            let ds_handle = pin_value(ctx, downstream);
-            let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
-            let mut group_key_handles: Vec<usize> = Vec::new();
-            for i in 0..elements.len() {
-                let classifier = ctx.read_native_pin(cls_pin, classifier);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let key = ctx
-                    .invoke_virtual(
-                        classifier,
-                        "apply",
-                        "(Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[elem],
-                    )?
-                    .unwrap_or(Value::Object(None));
-                let key_handle = pin_value(ctx, key);
-                // Real Java `equals` for object keys (see the GROUPING_BY
-                // branch above) so equal-but-distinct keys share a group.
-                let mut found_idx = None;
-                for (gi, (gk, _)) in groups.iter().enumerate() {
-                    let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
-                    let key_cur = read_pinned_elem(ctx, key_handle, key);
-                    if group_key_equal(ctx, &gk, &key_cur) {
-                        found_idx = Some(gi);
-                        break;
+                let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                    Value::Object(Some(r)) => Some(r),
+                    _ => None,
+                };
+                // Walk elements, merging duplicate keys via the BinaryOperator.
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let key_fn_pin = ctx.pin_native_root(key_fn);
+                let val_fn_pin = ctx.pin_native_root(val_fn);
+                let merge_fn_pin = merge_fn
+                    .map(|mf| ctx.pin_native_root(mf))
+                    .unwrap_or(usize::MAX);
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let k = ctx
+                        .invoke_virtual(
+                            key_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let k_handle = pin_value(ctx, k);
+                    let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let v = ctx
+                        .invoke_virtual(
+                            val_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let mut v_handle = pin_value(ctx, v);
+                    let mut idx = None;
+                    for (j, (ek, _)) in pairs.iter().enumerate() {
+                        let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
+                        let k_cur = read_pinned_elem(ctx, k_handle, k);
+                        if values_equal(ctx, &ek, &k_cur) {
+                            idx = Some(j);
+                            break;
+                        }
+                    }
+                    if let Some(j) = idx {
+                        let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
+                        let v = read_pinned_elem(ctx, v_handle, v);
+                        let merged = if let Some(mf) = merge_fn {
+                            let mf = ctx.read_native_pin(merge_fn_pin, mf);
+                            ctx.invoke_virtual(
+                                mf,
+                                "apply",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[existing, v],
+                            )?
+                            .unwrap_or(Value::Object(None))
+                        } else {
+                            v
+                        };
+                        v_handle = pin_value(ctx, merged);
+                        pairs[j].1 = merged;
+                        pair_handles[j].1 = v_handle;
+                    } else {
+                        pairs.push((k, v));
+                        pair_handles.push((k_handle, v_handle));
                     }
                 }
-                match found_idx {
-                    Some(gi) => groups[gi].1.push(i),
-                    None => {
-                        groups.push((key, vec![i]));
-                        group_key_handles.push(key_handle);
-                    }
-                }
+                // cceres3: re-read every accumulated pair before map construction
+                let pairs: Vec<(Value, Value)> = pairs
+                    .iter()
+                    .zip(&pair_handles)
+                    .map(|((k, v), (kh, vh))| {
+                        (
+                            read_pinned_elem(ctx, *kh, *k),
+                            read_pinned_elem(ctx, *vh, *v),
+                        )
+                    })
+                    .collect();
+                make_map_of(ctx, &pairs)
             }
-
-            // Materialize the user-supplied Map via the Supplier. If the
-            // supplier cannot be invoked (null / not a real Supplier we can
-            // dispatch), fall back to a plain HashMap built via make_map_of.
-            let supplier = read_pinned_elem(ctx, sup_handle, supplier);
-            let map_obj = match supplier {
-                Value::Object(Some(s)) => {
-                    match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
-                        Ok(Some(Value::Object(Some(m)))) => Some(m),
+            COLLECTOR_TAG_TO_MAP_SUPPLIER => {
+                let key_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let val_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let merge_fn = match ctx.get_field(collector, COLLECTOR_FIELD_ARG3) {
+                    Value::Object(Some(r)) => Some(r),
+                    _ => None,
+                };
+                let supplier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG4) {
+                    Value::Object(Some(r)) => Some(r),
+                    _ => None,
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let key_fn_pin = ctx.pin_native_root(key_fn);
+                let val_fn_pin = ctx.pin_native_root(val_fn);
+                let merge_fn_pin = merge_fn
+                    .map(|mf| ctx.pin_native_root(mf))
+                    .unwrap_or(usize::MAX);
+                let map_obj = match supplier {
+                    Some(s) => match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])? {
+                        Some(Value::Object(Some(m))) => Some(m),
                         _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let map_pin = map_obj
-                .map(|m| ctx.pin_native_root(m))
-                .unwrap_or(usize::MAX);
-
-            let downstream = read_pinned_elem(ctx, ds_handle, downstream);
-            let downstream_tag = match downstream {
-                Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
-                    Value::Int(t) => Some((d, t)),
-                    _ => None,
-                },
-                _ => None,
-            };
-
-            let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
-            let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
-            for (gi, (key, idxs)) in groups.iter().enumerate() {
-                let group_elems: Vec<Value> = idxs
-                    .iter()
-                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                    .collect();
-                let group_result = match downstream_tag {
-                    Some((_d, COLLECTOR_TAG_TO_LIST)) => {
-                        make_list_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
-                    }
-                    Some((_d, COLLECTOR_TAG_TO_SET)) => {
-                        make_set_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
-                    }
-                    Some((_d, COLLECTOR_TAG_COUNTING)) => {
-                        let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
-                        ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
-                        Value::Object(Some(long_obj))
-                    }
-                    _ => {
-                        let group_stream =
-                            make_stream(ctx, &group_elems)?.unwrap_or(Value::Object(None));
-                        let downstream = read_pinned_elem(ctx, ds_handle, downstream);
-                        native_stream_collect(ctx, &[group_stream, downstream])?
-                            .unwrap_or(Value::Object(None))
-                    }
+                    },
+                    None => None,
                 };
-                let gr_handle = pin_value(ctx, group_result);
-                pairs.push((*key, group_result));
-                pair_handles.push((group_key_handles[gi], gr_handle));
-            }
-
-            if let Some(m) = map_obj {
-                // cceres3: `put` re-enters Java — refresh map and pair per put
-                for (j, (k, v)) in pairs.iter().enumerate() {
-                    let m = ctx.read_native_pin(map_pin, m);
-                    let k = read_pinned_elem(ctx, pair_handles[j].0, *k);
-                    let v = read_pinned_elem(ctx, pair_handles[j].1, *v);
-                    ctx.invoke_virtual(
-                        m,
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                        &[k, v],
-                    )?;
+                let map_pin = map_obj
+                    .map(|m| ctx.pin_native_root(m))
+                    .unwrap_or(usize::MAX);
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(elements.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let key_fn = ctx.read_native_pin(key_fn_pin, key_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let k = ctx
+                        .invoke_virtual(
+                            key_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let k_handle = pin_value(ctx, k);
+                    let val_fn = ctx.read_native_pin(val_fn_pin, val_fn);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let v = ctx
+                        .invoke_virtual(
+                            val_fn,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let mut v_handle = pin_value(ctx, v);
+                    let mut idx = None;
+                    for (j, (ek, _)) in pairs.iter().enumerate() {
+                        let ek = read_pinned_elem(ctx, pair_handles[j].0, *ek);
+                        let k_cur = read_pinned_elem(ctx, k_handle, k);
+                        if values_equal(ctx, &ek, &k_cur) {
+                            idx = Some(j);
+                            break;
+                        }
+                    }
+                    if let Some(j) = idx {
+                        let existing = read_pinned_elem(ctx, pair_handles[j].1, pairs[j].1);
+                        let v = read_pinned_elem(ctx, v_handle, v);
+                        let merged = if let Some(mf) = merge_fn {
+                            let mf = ctx.read_native_pin(merge_fn_pin, mf);
+                            ctx.invoke_virtual(
+                                mf,
+                                "apply",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                                &[existing, v],
+                            )?
+                            .unwrap_or(Value::Object(None))
+                        } else {
+                            v
+                        };
+                        v_handle = pin_value(ctx, merged);
+                        pairs[j].1 = merged;
+                        pair_handles[j].1 = v_handle;
+                    } else {
+                        pairs.push((k, v));
+                        pair_handles.push((k_handle, v_handle));
+                    }
                 }
-                let m = ctx.read_native_pin(map_pin, m);
-                Ok(Some(Value::Object(Some(m))))
-            } else {
-                // cceres3: re-read every accumulated pair before map construction
+                if let Some(m) = map_obj {
+                    // cceres3: `put` re-enters Java — refresh map and pair per put
+                    for (j, (k, v)) in pairs.iter().enumerate() {
+                        let m = ctx.read_native_pin(map_pin, m);
+                        let k = read_pinned_elem(ctx, pair_handles[j].0, *k);
+                        let v = read_pinned_elem(ctx, pair_handles[j].1, *v);
+                        ctx.invoke_virtual(
+                            m,
+                            "put",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[k, v],
+                        )?;
+                    }
+                    let m = ctx.read_native_pin(map_pin, m);
+                    Ok(Some(Value::Object(Some(m))))
+                } else {
+                    // cceres3: re-read every accumulated pair before map construction
+                    let pairs: Vec<(Value, Value)> = pairs
+                        .iter()
+                        .zip(&pair_handles)
+                        .map(|((k, v), (kh, vh))| {
+                            (
+                                read_pinned_elem(ctx, *kh, *k),
+                                read_pinned_elem(ctx, *vh, *v),
+                            )
+                        })
+                        .collect();
+                    make_map_of(ctx, &pairs)
+                }
+            }
+            COLLECTOR_TAG_COLLECTING_AND_THEN => {
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG1);
+                let finisher = match ctx.get_field(collector, COLLECTOR_FIELD_ARG2) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // Re-build a stream over the same elements and recursively collect
+                // through the downstream Collector, then apply finisher.apply().
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let fin_pin = ctx.pin_native_root(finisher);
+                let ds_handle = pin_value(ctx, downstream);
+                let elems = read_value_slice(ctx, &elem_handles, &elements);
+                let inner_stream = make_stream(ctx, &elems)?.unwrap_or(Value::Object(None));
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                let downstream_result = native_stream_collect(ctx, &[inner_stream, downstream])?
+                    .unwrap_or(Value::Object(None));
+                let finisher = ctx.read_native_pin(fin_pin, finisher);
+                let finished = ctx
+                    .invoke_virtual(
+                        finisher,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[downstream_result],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                Ok(Some(finished))
+            }
+            COLLECTOR_TAG_MAPPING => {
+                // mapping(mapper, downstream): apply `mapper` to every element, then
+                // feed the mapped values into the downstream collector via the same
+                // recursive sub-stream protocol the other downstream-aware arms use.
+                let mapper = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                // cceres3: pin across GC-capable call (stream stale-at-store wave)
+                let mapper_pin = ctx.pin_native_root(mapper);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut mapped = Vec::with_capacity(elements.len());
+                let mut mapped_handles: Vec<usize> = Vec::with_capacity(elements.len());
+                for i in 0..elements.len() {
+                    let mapper = ctx.read_native_pin(mapper_pin, mapper);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let m = ctx
+                        .invoke_virtual(
+                            mapper,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    mapped_handles.push(pin_value(ctx, m));
+                    mapped.push(m);
+                }
+                let mapped = read_value_slice(ctx, &mapped_handles, &mapped);
+                let inner_stream = make_stream(ctx, &mapped)?.unwrap_or(Value::Object(None));
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                native_stream_collect(ctx, &[inner_stream, downstream])
+            }
+            COLLECTOR_TAG_GROUPING_BY => {
+                let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // Group elements by classifier result into HashMap<K, ArrayList<V>>
+                // We use a Vec to collect groups, then build the map.
+                // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+                // groups hold element INDICES (the elements are pinned above) and
+                // every group key is pinned as produced.
+                let cls_pin = ctx.pin_native_root(classifier);
+                let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+                let mut group_key_handles: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let classifier = ctx.read_native_pin(cls_pin, classifier);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let key = ctx
+                        .invoke_virtual(
+                            classifier,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let key_handle = pin_value(ctx, key);
+                    // Find existing group. Use real Java `equals` (not the
+                    // identity/String/enum-only `values_equal`) so equal-but-
+                    // distinct object keys (e.g. a `LinkedHashMap` group key) land
+                    // in the SAME group rather than one group per element.
+                    let mut found_idx = None;
+                    for (gi, (gk, _)) in groups.iter().enumerate() {
+                        let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
+                        let key_cur = read_pinned_elem(ctx, key_handle, key);
+                        if group_key_equal(ctx, &gk, &key_cur) {
+                            found_idx = Some(gi);
+                            break;
+                        }
+                    }
+                    match found_idx {
+                        Some(gi) => groups[gi].1.push(i),
+                        None => {
+                            groups.push((key, vec![i]));
+                            group_key_handles.push(key_handle);
+                        }
+                    }
+                }
+                // Build HashMap<K, ArrayList<V>> — pin each built list and re-read
+                // keys/lists right before map construction (each build allocates).
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
+                for (gi, (key, idxs)) in groups.iter().enumerate() {
+                    let vals: Vec<Value> = idxs
+                        .iter()
+                        .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                        .collect();
+                    let list = make_list_of_raw(ctx, &vals);
+                    let list_handle = ctx.pin_native_root(list);
+                    pairs.push((*key, Value::Object(Some(list))));
+                    pair_handles.push((group_key_handles[gi], list_handle));
+                }
                 let pairs: Vec<(Value, Value)> = pairs
                     .iter()
                     .zip(&pair_handles)
@@ -18425,98 +18193,396 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     .collect();
                 make_map_of(ctx, &pairs)
             }
-        }
-        // T2.3.19 — partitioningBy(Predicate, Collector).
-        COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM => {
-            let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => r,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
-
-            // cceres3: pin across GC-capable call (stream stale-at-store wave) —
-            // partitions hold element INDICES (the elements are pinned above).
-            let pred_pin = ctx.pin_native_root(predicate);
-            let ds_handle = pin_value(ctx, downstream);
-            let mut true_idx: Vec<usize> = Vec::new();
-            let mut false_idx: Vec<usize> = Vec::new();
-            for i in 0..elements.len() {
-                let predicate = ctx.read_native_pin(pred_pin, predicate);
-                let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
-                let result = ctx
-                    .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
-                    .unwrap_or(Value::Int(0));
-                if matches!(result, Value::Int(v) if v != 0) {
-                    true_idx.push(i);
-                } else {
-                    false_idx.push(i);
+            COLLECTOR_TAG_PARTITIONING_BY => {
+                let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+                // partitions hold element INDICES (the elements are pinned above).
+                let pred_pin = ctx.pin_native_root(predicate);
+                let mut true_idx: Vec<usize> = Vec::new();
+                let mut false_idx: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let predicate = ctx.read_native_pin(pred_pin, predicate);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let result = ctx
+                        .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
+                        .unwrap_or(Value::Int(0));
+                    if matches!(result, Value::Int(v) if v != 0) {
+                        true_idx.push(i);
+                    } else {
+                        false_idx.push(i);
+                    }
                 }
+                // Build HashMap with Boolean.TRUE and Boolean.FALSE keys — each
+                // allocation below can move the previous ones; keep them pinned and
+                // re-read right before map construction.
+                let true_vals: Vec<Value> = true_idx
+                    .iter()
+                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                    .collect();
+                let true_al = make_list_of_raw(ctx, &true_vals);
+                let true_al_pin = ctx.pin_native_root(true_al);
+                let false_vals: Vec<Value> = false_idx
+                    .iter()
+                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                    .collect();
+                let false_al = make_list_of_raw(ctx, &false_vals);
+                let false_al_pin = ctx.pin_native_root(false_al);
+                let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+                ctx.set_field(true_key, 0, Value::Int(1));
+                let true_key_pin = ctx.pin_native_root(true_key);
+                let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+                ctx.set_field(false_key, 0, Value::Int(0));
+                let true_al = ctx.read_native_pin(true_al_pin, true_al);
+                let false_al = ctx.read_native_pin(false_al_pin, false_al);
+                let true_key = ctx.read_native_pin(true_key_pin, true_key);
+                let pairs = [
+                    (Value::Object(Some(true_key)), Value::Object(Some(true_al))),
+                    (
+                        Value::Object(Some(false_key)),
+                        Value::Object(Some(false_al)),
+                    ),
+                ];
+                make_map_of(ctx, &pairs)
             }
+            COLLECTOR_TAG_GROUPING_BY_DOWNSTREAM => {
+                let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
 
-            let downstream_tag = match downstream {
-                Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
-                    Value::Int(t) => Some((d, t)),
+                // Group elements by classifier into Vec<(key, Vec<elem index>)>.
+                // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+                // groups hold element INDICES (the elements are pinned above) and
+                // every group key / group result is pinned as produced.
+                let cls_pin = ctx.pin_native_root(classifier);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+                let mut group_key_handles: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let classifier = ctx.read_native_pin(cls_pin, classifier);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let key = ctx
+                        .invoke_virtual(
+                            classifier,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let key_handle = pin_value(ctx, key);
+                    // Real Java `equals` for object keys (see the GROUPING_BY
+                    // branch above) so equal-but-distinct keys share a group.
+                    let mut found_idx = None;
+                    for (gi, (gk, _)) in groups.iter().enumerate() {
+                        let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
+                        let key_cur = read_pinned_elem(ctx, key_handle, key);
+                        if group_key_equal(ctx, &gk, &key_cur) {
+                            found_idx = Some(gi);
+                            break;
+                        }
+                    }
+                    match found_idx {
+                        Some(gi) => groups[gi].1.push(i),
+                        None => {
+                            groups.push((key, vec![i]));
+                            group_key_handles.push(key_handle);
+                        }
+                    }
+                }
+
+                // Apply downstream collector to each group inline to avoid recursion.
+                let downstream_tag = match downstream {
+                    Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                        Value::Int(t) => Some((d, t)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            };
-
-            let reduce_bucket =
-                |ctx: &mut dyn NativeContext,
-                 bucket: &[Value]|
-                 -> Result<Value, cratonvm_types::error::MethodCallFailed> {
-                    let v = match downstream_tag {
+                };
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
+                for (gi, (key, idxs)) in groups.iter().enumerate() {
+                    let group_elems: Vec<Value> = idxs
+                        .iter()
+                        .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                        .collect();
+                    let group_result = match downstream_tag {
                         Some((_d, COLLECTOR_TAG_TO_LIST)) => {
-                            make_list_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                            make_list_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
                         }
                         Some((_d, COLLECTOR_TAG_TO_SET)) => {
-                            make_set_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                            make_set_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
                         }
                         Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                            // Box as java/lang/Long so .intValue() works
                             let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
-                            ctx.set_field(long_obj, 0, Value::Long(bucket.len() as i64));
+                            ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
                             Value::Object(Some(long_obj))
                         }
                         _ => {
-                            // cceres3: build the sub-stream via the pinned
-                            // `make_stream` and refresh `downstream` after it.
+                            // Fallback: build stream and collect (single level only)
                             let group_stream =
-                                make_stream(ctx, bucket)?.unwrap_or(Value::Object(None));
+                                make_stream(ctx, &group_elems)?.unwrap_or(Value::Object(None));
                             let downstream = read_pinned_elem(ctx, ds_handle, downstream);
                             native_stream_collect(ctx, &[group_stream, downstream])?
                                 .unwrap_or(Value::Object(None))
                         }
                     };
-                    Ok(v)
+                    let gr_handle = pin_value(ctx, group_result);
+                    pairs.push((*key, group_result));
+                    pair_handles.push((group_key_handles[gi], gr_handle));
+                }
+                // cceres3: re-read every accumulated pair before map construction
+                let pairs: Vec<(Value, Value)> = pairs
+                    .iter()
+                    .zip(&pair_handles)
+                    .map(|((k, v), (kh, vh))| {
+                        (
+                            read_pinned_elem(ctx, *kh, *k),
+                            read_pinned_elem(ctx, *vh, *v),
+                        )
+                    })
+                    .collect();
+                make_map_of(ctx, &pairs)
+            }
+            // T2.3.18 — groupingBy(Function, Supplier, Collector).
+            // Semantically equivalent to the 2-arg downstream variant; the
+            // supplier argument just customizes the Map subtype — since our
+            // synthetic HashMap is the only map shape native code produces,
+            // we honor the spec by materializing the supplier's object and
+            // populating it via its put(K,V) method instead of our internal
+            // make_map_of helper. This keeps user-supplied LinkedHashMap /
+            // TreeMap / EnumMap suppliers working.
+            COLLECTOR_TAG_GROUPING_BY_SUPPLIER => {
+                let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
                 };
-            let true_vals: Vec<Value> = true_idx
-                .iter()
-                .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                .collect();
-            let true_v = reduce_bucket(ctx, &true_vals)?;
-            let true_v_handle = pin_value(ctx, true_v);
-            let false_vals: Vec<Value> = false_idx
-                .iter()
-                .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
-                .collect();
-            let false_v = reduce_bucket(ctx, &false_vals)?;
-            let false_v_handle = pin_value(ctx, false_v);
-            let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
-            ctx.set_field(true_key, 0, Value::Int(1));
-            let true_key_pin = ctx.pin_native_root(true_key);
-            let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
-            ctx.set_field(false_key, 0, Value::Int(0));
-            let true_key = ctx.read_native_pin(true_key_pin, true_key);
-            let true_v = read_pinned_elem(ctx, true_v_handle, true_v);
-            let false_v = read_pinned_elem(ctx, false_v_handle, false_v);
-            let pairs = [
-                (Value::Object(Some(true_key)), true_v),
-                (Value::Object(Some(false_key)), false_v),
-            ];
-            make_map_of(ctx, &pairs)
+                let supplier = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG3);
+
+                // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+                // groups hold element INDICES (the elements are pinned above) and
+                // every group key / group result is pinned as produced.
+                let cls_pin = ctx.pin_native_root(classifier);
+                let sup_handle = pin_value(ctx, supplier);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut groups: Vec<(Value, Vec<usize>)> = Vec::new();
+                let mut group_key_handles: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let classifier = ctx.read_native_pin(cls_pin, classifier);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let key = ctx
+                        .invoke_virtual(
+                            classifier,
+                            "apply",
+                            "(Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[elem],
+                        )?
+                        .unwrap_or(Value::Object(None));
+                    let key_handle = pin_value(ctx, key);
+                    // Real Java `equals` for object keys (see the GROUPING_BY
+                    // branch above) so equal-but-distinct keys share a group.
+                    let mut found_idx = None;
+                    for (gi, (gk, _)) in groups.iter().enumerate() {
+                        let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
+                        let key_cur = read_pinned_elem(ctx, key_handle, key);
+                        if group_key_equal(ctx, &gk, &key_cur) {
+                            found_idx = Some(gi);
+                            break;
+                        }
+                    }
+                    match found_idx {
+                        Some(gi) => groups[gi].1.push(i),
+                        None => {
+                            groups.push((key, vec![i]));
+                            group_key_handles.push(key_handle);
+                        }
+                    }
+                }
+
+                // Materialize the user-supplied Map via the Supplier. If the
+                // supplier cannot be invoked (null / not a real Supplier we can
+                // dispatch), fall back to a plain HashMap built via make_map_of.
+                let supplier = read_pinned_elem(ctx, sup_handle, supplier);
+                let map_obj = match supplier {
+                    Value::Object(Some(s)) => {
+                        match ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[]) {
+                            Ok(Some(Value::Object(Some(m)))) => Some(m),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let map_pin = map_obj
+                    .map(|m| ctx.pin_native_root(m))
+                    .unwrap_or(usize::MAX);
+
+                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                let downstream_tag = match downstream {
+                    Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                        Value::Int(t) => Some((d, t)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(groups.len());
+                let mut pair_handles: Vec<(usize, usize)> = Vec::with_capacity(groups.len());
+                for (gi, (key, idxs)) in groups.iter().enumerate() {
+                    let group_elems: Vec<Value> = idxs
+                        .iter()
+                        .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                        .collect();
+                    let group_result = match downstream_tag {
+                        Some((_d, COLLECTOR_TAG_TO_LIST)) => {
+                            make_list_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
+                        }
+                        Some((_d, COLLECTOR_TAG_TO_SET)) => {
+                            make_set_of(ctx, &group_elems)?.unwrap_or(Value::Object(None))
+                        }
+                        Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                            let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                            ctx.set_field(long_obj, 0, Value::Long(group_elems.len() as i64));
+                            Value::Object(Some(long_obj))
+                        }
+                        _ => {
+                            let group_stream =
+                                make_stream(ctx, &group_elems)?.unwrap_or(Value::Object(None));
+                            let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                            native_stream_collect(ctx, &[group_stream, downstream])?
+                                .unwrap_or(Value::Object(None))
+                        }
+                    };
+                    let gr_handle = pin_value(ctx, group_result);
+                    pairs.push((*key, group_result));
+                    pair_handles.push((group_key_handles[gi], gr_handle));
+                }
+
+                if let Some(m) = map_obj {
+                    // cceres3: `put` re-enters Java — refresh map and pair per put
+                    for (j, (k, v)) in pairs.iter().enumerate() {
+                        let m = ctx.read_native_pin(map_pin, m);
+                        let k = read_pinned_elem(ctx, pair_handles[j].0, *k);
+                        let v = read_pinned_elem(ctx, pair_handles[j].1, *v);
+                        ctx.invoke_virtual(
+                            m,
+                            "put",
+                            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                            &[k, v],
+                        )?;
+                    }
+                    let m = ctx.read_native_pin(map_pin, m);
+                    Ok(Some(Value::Object(Some(m))))
+                } else {
+                    // cceres3: re-read every accumulated pair before map construction
+                    let pairs: Vec<(Value, Value)> = pairs
+                        .iter()
+                        .zip(&pair_handles)
+                        .map(|((k, v), (kh, vh))| {
+                            (
+                                read_pinned_elem(ctx, *kh, *k),
+                                read_pinned_elem(ctx, *vh, *v),
+                            )
+                        })
+                        .collect();
+                    make_map_of(ctx, &pairs)
+                }
+            }
+            // T2.3.19 — partitioningBy(Predicate, Collector).
+            COLLECTOR_TAG_PARTITIONING_BY_DOWNSTREAM => {
+                let predicate = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                    Value::Object(Some(r)) => r,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+
+                // cceres3: pin across GC-capable call (stream stale-at-store wave) —
+                // partitions hold element INDICES (the elements are pinned above).
+                let pred_pin = ctx.pin_native_root(predicate);
+                let ds_handle = pin_value(ctx, downstream);
+                let mut true_idx: Vec<usize> = Vec::new();
+                let mut false_idx: Vec<usize> = Vec::new();
+                for i in 0..elements.len() {
+                    let predicate = ctx.read_native_pin(pred_pin, predicate);
+                    let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+                    let result = ctx
+                        .invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?
+                        .unwrap_or(Value::Int(0));
+                    if matches!(result, Value::Int(v) if v != 0) {
+                        true_idx.push(i);
+                    } else {
+                        false_idx.push(i);
+                    }
+                }
+
+                let downstream_tag = match downstream {
+                    Value::Object(Some(d)) => match ctx.get_field(d, COLLECTOR_FIELD_TAG) {
+                        Value::Int(t) => Some((d, t)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+
+                let reduce_bucket =
+                    |ctx: &mut dyn NativeContext,
+                     bucket: &[Value]|
+                     -> Result<Value, cratonvm_types::error::MethodCallFailed> {
+                        let v = match downstream_tag {
+                            Some((_d, COLLECTOR_TAG_TO_LIST)) => {
+                                make_list_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                            }
+                            Some((_d, COLLECTOR_TAG_TO_SET)) => {
+                                make_set_of(ctx, bucket)?.unwrap_or(Value::Object(None))
+                            }
+                            Some((_d, COLLECTOR_TAG_COUNTING)) => {
+                                let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                                ctx.set_field(long_obj, 0, Value::Long(bucket.len() as i64));
+                                Value::Object(Some(long_obj))
+                            }
+                            _ => {
+                                // cceres3: build the sub-stream via the pinned
+                                // `make_stream` and refresh `downstream` after it.
+                                let group_stream =
+                                    make_stream(ctx, bucket)?.unwrap_or(Value::Object(None));
+                                let downstream = read_pinned_elem(ctx, ds_handle, downstream);
+                                native_stream_collect(ctx, &[group_stream, downstream])?
+                                    .unwrap_or(Value::Object(None))
+                            }
+                        };
+                        Ok(v)
+                    };
+                let true_vals: Vec<Value> = true_idx
+                    .iter()
+                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                    .collect();
+                let true_v = reduce_bucket(ctx, &true_vals)?;
+                let true_v_handle = pin_value(ctx, true_v);
+                let false_vals: Vec<Value> = false_idx
+                    .iter()
+                    .map(|&i| read_pinned_elem(ctx, elem_handles[i], elements[i]))
+                    .collect();
+                let false_v = reduce_bucket(ctx, &false_vals)?;
+                let false_v_handle = pin_value(ctx, false_v);
+                let true_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+                ctx.set_field(true_key, 0, Value::Int(1));
+                let true_key_pin = ctx.pin_native_root(true_key);
+                let false_key = alloc_synthetic(ctx, "java/lang/Boolean", 1);
+                ctx.set_field(false_key, 0, Value::Int(0));
+                let true_key = ctx.read_native_pin(true_key_pin, true_key);
+                let true_v = read_pinned_elem(ctx, true_v_handle, true_v);
+                let false_v = read_pinned_elem(ctx, false_v_handle, false_v);
+                let pairs = [
+                    (Value::Object(Some(true_key)), true_v),
+                    (Value::Object(Some(false_key)), false_v),
+                ];
+                make_map_of(ctx, &pairs)
+            }
+            _ => Ok(Some(Value::Object(None))),
         }
-        _ => Ok(Some(Value::Object(None))),
-    }
     })();
     ctx.unpin_native_roots(collector_pin);
     result
@@ -19816,14 +19882,14 @@ fn native_int_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut mapped_handles: Vec<usize> = Vec::with_capacity(elements.len());
     for elem in &elements {
         let function = ctx.read_native_pin(fn_pin, function);
-        let result =
-            match ctx.invoke_virtual(function, "apply", "(I)Ljava/lang/Object;", &[*elem]) {
-                Ok(r) => r,
-                Err(e) => {
-                    ctx.unpin_native_roots(fn_pin);
-                    return Err(e);
-                }
-            };
+        let result = match ctx.invoke_virtual(function, "apply", "(I)Ljava/lang/Object;", &[*elem])
+        {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(fn_pin);
+                return Err(e);
+            }
+        };
         let v = result.unwrap_or(Value::Object(None));
         mapped_handles.push(pin_value(ctx, v));
         mapped.push(v);
@@ -25044,7 +25110,11 @@ fn ll_pinned_find(
     let mut this = this;
     let mut target = target;
     let start_field = if from_tail { "tail" } else { "head" };
-    let step_slot = if from_tail { LL_NODE_PREV } else { LL_NODE_NEXT };
+    let step_slot = if from_tail {
+        LL_NODE_PREV
+    } else {
+        LL_NODE_NEXT
+    };
     let mut cur_opt = match ll_get(ctx, this, start_field) {
         Value::Object(Some(r)) => Some(r),
         _ => None,
@@ -31430,15 +31500,16 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // `this`/`data`/`key` (shadowed here) instead of the pre-search copies
     // above; `key`'s own staleness (not just `this`/`data`) was the actual
     // root cause of the residual panics that survived the earlier fix.
-    let (search, mut this, data, key) = match tm_binary_search(ctx, this, data, size, &comparator, &key) {
-        Ok(t) => t,
-        Err(e) => {
-            if pin_base != usize::MAX {
-                ctx.unpin_native_roots(pin_base);
+    let (search, mut this, data, key) =
+        match tm_binary_search(ctx, this, data, size, &comparator, &key) {
+            Ok(t) => t,
+            Err(e) => {
+                if pin_base != usize::MAX {
+                    ctx.unpin_native_roots(pin_base);
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
     let value = read_pinned_elem(ctx, vh0, value);
     let result = match search {
         Ok(idx) => {
@@ -36051,9 +36122,7 @@ fn chm_compute_if_absent_absent_path(
                 let key_now = read_pinned_elem(ctx, key_pin, key);
                 let _resize_flag = ChmResizeLockGuard::enter();
                 let marker = Value::Object(Some(segc));
-                if let Err(e) =
-                    native_map_put(ctx, &[Value::Object(Some(segc)), key_now, marker])
-                {
+                if let Err(e) = native_map_put(ctx, &[Value::Object(Some(segc)), key_now, marker]) {
                     reserve_err = Some(e);
                 }
                 segc = ctx.read_native_pin(seg_pin, segc);

@@ -613,18 +613,23 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
         }
     }
     let logger = allocate_logger(ctx, name);
+    // This factory re-enters real JULI bytecode and allocates handler state.
+    // Keep its new Logger rooted throughout, refreshing it after every
+    // GC-capable boundary before it is stored or returned.
+    let logger_pin = ctx.pin_native_root(logger);
+    let mut logger = logger;
     // Do not merely cache the child: Tomcat's addLogger bytecode applies the
     // current context-class-loader configuration, wires its parent chain and
     // instantiates any per-logger handlers. Bypassing this path was why the
     // per-webapp FileHandler and root level disappeared.
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    logger = ctx.read_native_pin(logger_pin, logger);
     if ctx
         .class_name_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         == Some("org/apache/juli/ClassLoaderLogManager")
     {
         let manager_pin = ctx.pin_native_root(manager);
-        let logger_pin = ctx.pin_native_root(logger);
         let manager = ctx.read_native_pin(manager_pin, manager);
         let logger_arg = ctx.read_native_pin(logger_pin, logger);
         let _ = ctx.invoke_virtual_bytecode_only(
@@ -633,16 +638,18 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
             "(Ljava/util/logging/Logger;)Z",
             &[Value::Object(Some(logger_arg))],
         );
-        ctx.unpin_native_roots(logger_pin);
+        logger = ctx.read_native_pin(logger_pin, logger);
         ctx.unpin_native_roots(manager_pin);
     }
     if let Some(root) = tomcat_juli_root_logger(ctx) {
+        logger = ctx.read_native_pin(logger_pin, logger);
         if let Some(handlers) = crate::jul_logger_handlers_get(ctx, root) {
             // `publish_to_jul_handlers` is intentionally compact and does not
             // walk a Java parent chain.  Share JULI's already-filtered root
             // handler list with the context-local child so it observes the
             // same per-webapp FileHandler configuration.
             crate::jul_logger_handlers_set(ctx, logger, handlers);
+            logger = ctx.read_native_pin(logger_pin, logger);
         } else {
             // Older JULI setup paths register a root handler through the
             // name-keyed compatibility table. Snapshot that current root list
@@ -665,19 +672,24 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
                         &[Value::Object(Some(list)), Value::Object(Some(handler))],
                     );
                 }
+                logger = ctx.read_native_pin(logger_pin, logger);
                 crate::jul_logger_handlers_set(ctx, logger, list);
+                logger = ctx.read_native_pin(logger_pin, logger);
             }
         }
     }
+    logger = ctx.read_native_pin(logger_pin, logger);
     let mut registry = tomcat_juli_logger_registry()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&address) = registry.get(&key) {
         if address != 0 {
+            ctx.unpin_native_roots(logger_pin);
             return unsafe { object_from_u64(address) };
         }
     }
     registry.insert(key, logger.as_ptr() as u64);
+    ctx.unpin_native_roots(logger_pin);
     logger
 }
 
@@ -795,22 +807,39 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         // behaviour T19.H1 established elsewhere.
         return Ok(Some(Value::Int(0)));
     };
+    // `wildfly_core::get_logger` below can allocate and trigger a moving GC.
+    // Keep the real-JDK Logger receiver rooted through that call before
+    // storing its address in the cross-call registry.
+    let logger_pin = ctx.pin_native_root(logger);
     let name = read_jul_logger_name(ctx, logger);
     if !is_valid_logger_name(&name) {
         tracing::warn!(
             rejected_name = %name,
             "LogManager.addLogger: rejected suspicious logger name"
         );
+        ctx.unpin_native_roots(logger_pin);
         return Ok(Some(Value::Int(0)));
     }
+    if logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&name)
+    {
+        // Already registered — spec says return false.
+        ctx.unpin_native_roots(logger_pin);
+        return Ok(Some(Value::Int(0)));
+    }
+    // Also track in wildfly_core so tracing redaction picks this up. This is
+    // deliberately outside the registry lock because it may allocate.
+    let _mirror = crate::wildfly_core::get_logger(&name);
+    let logger = ctx.read_native_pin(logger_pin, logger);
     let mut reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
     if reg.contains_key(&name) {
-        // Already registered — spec says return false.
+        ctx.unpin_native_roots(logger_pin);
         return Ok(Some(Value::Int(0)));
     }
-    // Also track in wildfly_core so tracing redaction picks this up.
-    let _mirror = crate::wildfly_core::get_logger(&name);
     reg.insert(name, logger.as_ptr() as u64);
+    ctx.unpin_native_roots(logger_pin);
     Ok(Some(Value::Int(1)))
 }
 
@@ -4181,10 +4210,8 @@ mod tests {
     use cratonvm_native_api::NativeMethodRegistry;
     use cratonvm_types::Value;
 
-    static LOGF_SECOND_OLD: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-    static LOGF_SECOND_NEW: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_SECOND_OLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static LOGF_SECOND_NEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static LOGF_THROWABLE_OLD: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
     static LOGF_THROWABLE_NEW: std::sync::atomic::AtomicUsize =

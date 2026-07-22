@@ -2187,7 +2187,7 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // The pending-decode side-table is keyed on this (header-stable) value
     // rather than the raw `ObjectRef`, which a moving GC would relocate.
     let isr_key = ctx.identity_hash_code(this);
-    let out_arr = match args.get(1) {
+    let mut out_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(-1))),
     };
@@ -2245,7 +2245,12 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let want = (len - written).saturating_add(3);
     if !eof_seen {
         let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, want);
-        let read_result = ctx.invoke_virtual(
+        // The delegated read can run arbitrary stream bytecode and move both
+        // arrays. They are consumed after the call, so retain native roots
+        // and reload their current addresses before decoding/copying.
+        let out_arr_pin = ctx.pin_native_root(out_arr);
+        let bytes_arr_pin = ctx.pin_native_root(bytes_arr);
+        let read_result = match ctx.invoke_virtual(
             in_stream,
             "read",
             "([BII)I",
@@ -2254,7 +2259,16 @@ fn native_isr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 Value::Int(0),
                 Value::Int(want as i32),
             ],
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                ctx.unpin_native_roots(out_arr_pin);
+                return Err(error);
+            }
+        };
+        out_arr = ctx.read_native_pin(out_arr_pin, out_arr);
+        let bytes_arr = ctx.read_native_pin(bytes_arr_pin, bytes_arr);
+        ctx.unpin_native_roots(out_arr_pin);
         let n = match read_result {
             Some(Value::Int(n)) => n,
             _ => -1,
@@ -3611,7 +3625,8 @@ fn native_baos_to_string_charset(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let charset_name = baos_charset_name_of(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
+    let charset_name =
+        baos_charset_name_of(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
     let data = match ctx.get_field(this, BAOS_FIELD_DATA) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Object(None))),
@@ -3659,11 +3674,15 @@ fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
     ctx.set_field(this, 1, Value::Int(1));
     // flush() (DataOutputStream/BufferedOutputStream flush their own buffer), then
-    // close the wrapped stream so its close()/finish() runs.
+    // close the wrapped stream so its close()/finish() runs. `flush()` is
+    // virtual and can collect; refresh `this` before reading its `out` slot.
+    let this_pin = ctx.pin_native_root(this);
     let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+    let this = ctx.read_native_pin(this_pin, this);
     if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
         let _ = ctx.invoke_virtual_declared("java/io/OutputStream", out, "close", "()V", &[]);
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -5590,13 +5609,24 @@ fn native_is_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => 0,
     };
     let mut skipped: i64 = 0;
+    // Each delegated read is GC-capable; `this` is reused by the next loop
+    // iteration, so a raw native local would become stale after a collection.
+    let this_pin = ctx.pin_native_root(this);
     for _ in 0..n {
-        let b = ctx.invoke_virtual(this, "read", "()I", &[])?;
+        let this = ctx.read_native_pin(this_pin, this);
+        let b = match ctx.invoke_virtual(this, "read", "()I", &[]) {
+            Ok(result) => result,
+            Err(error) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(error);
+            }
+        };
         match b {
             Some(Value::Int(-1)) | None => break,
             _ => skipped += 1,
         }
     }
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Long(skipped)))
 }
 
@@ -8053,26 +8083,45 @@ fn native_reader_read_charbuffer(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     };
 
+    // Every virtual dispatch below may move the reader, target and temporary
+    // char array. Keep the values that survive a dispatch rooted and reload
+    // them before their next use.
+    let this_pin = ctx.pin_native_root(this);
+    let target_pin = ctx.pin_native_root(target);
     // remaining = target.limit() - target.position()
-    let limit = match ctx.invoke_virtual(target, "limit", "()I", &[])? {
-        Some(Value::Int(v)) => v,
-        _ => 0,
+    let limit = match ctx.invoke_virtual(target, "limit", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        Ok(_) => 0,
+        Err(error) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(error);
+        }
     };
-    let position = match ctx.invoke_virtual(target, "position", "()I", &[])? {
-        Some(Value::Int(v)) => v,
-        _ => 0,
+    let target = ctx.read_native_pin(target_pin, target);
+    let position = match ctx.invoke_virtual(target, "position", "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        Ok(_) => 0,
+        Err(error) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(error);
+        }
     };
+    let target = ctx.read_native_pin(target_pin, target);
     let remaining = (limit - position).max(0) as usize;
     if remaining == 0 {
+        ctx.unpin_native_roots(this_pin);
         return Ok(Some(Value::Int(0)));
     }
 
     // char[] chars = new char[min(remaining, 4096)]
     let chunk = remaining.min(4096);
     let chars = ctx.new_array(ArrayElementType::Char, chunk);
+    let chars_pin = ctx.pin_native_root(chars);
 
     // int n = this.read(chars, 0, chars.length)
-    let read_result = ctx.invoke_virtual(
+    let this = ctx.read_native_pin(this_pin, this);
+    let chars = ctx.read_native_pin(chars_pin, chars);
+    let read_result = match ctx.invoke_virtual(
         this,
         "read",
         "([CII)I",
@@ -8081,7 +8130,15 @@ fn native_reader_read_charbuffer(ctx: &mut dyn NativeContext, args: &[Value]) ->
             Value::Int(0),
             Value::Int(chunk as i32),
         ],
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(error);
+        }
+    };
+    let target = ctx.read_native_pin(target_pin, target);
+    let chars = ctx.read_native_pin(chars_pin, chars);
     let n = match read_result {
         Some(Value::Int(v)) => v,
         _ => -1,
@@ -8089,12 +8146,16 @@ fn native_reader_read_charbuffer(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
     if n > 0 {
         // target.put(chars, 0, n)
-        let _ = ctx.invoke_virtual(
+        let put_result = ctx.invoke_virtual(
             target,
             "put",
             "([CII)Ljava/nio/CharBuffer;",
             &[Value::Object(Some(chars)), Value::Int(0), Value::Int(n)],
-        )?;
+        );
+        ctx.unpin_native_roots(this_pin);
+        put_result?;
+    } else {
+        ctx.unpin_native_roots(this_pin);
     }
 
     Ok(Some(Value::Int(n)))
@@ -12440,15 +12501,30 @@ fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    // 1) Flush the buffered bytes.
-    native_bos_flush(ctx, args)?;
+    // 1) Flush the buffered bytes. The flush invokes arbitrary wrapped
+    // OutputStream bytecode; preserve the receiver across it and across the
+    // subsequent close before touching its side-table identity.
+    let this_pin = ctx.pin_native_root(this);
+    let flush_result = native_bos_flush(ctx, args);
+    let mut this = ctx.read_native_pin(this_pin, this);
+    if let Err(error) = flush_result {
+        ctx.unpin_native_roots(this_pin);
+        return Err(error);
+    }
     // 2) Close the inner stream (matches the JDK
     //    `try (out) {}` block in BufferedOutputStream.close).
     let (out_slot, _, _) = bos_slots(ctx);
     if let Some(inner) = bos_inner(ctx, this, out_slot) {
-        ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[])?;
+        let close_result =
+            ctx.invoke_virtual_declared("java/io/OutputStream", inner, "close", "()V", &[]);
+        this = ctx.read_native_pin(this_pin, this);
+        if let Err(error) = close_result {
+            ctx.unpin_native_roots(this_pin);
+            return Err(error);
+        }
     }
     bos_side_buffers().lock().remove(&bos_side_key(ctx, this));
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -15179,7 +15255,10 @@ fn dc_fds() -> &'static Mutex<HashMap<i32, FdId>> {
 }
 
 fn dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
-    dc_fds().lock().get(&ctx.identity_hash_code(channel)).copied()
+    dc_fds()
+        .lock()
+        .get(&ctx.identity_hash_code(channel))
+        .copied()
 }
 
 /// Expose the real-JDK DatagramChannel's fd-table identity to the selector
@@ -16516,12 +16595,12 @@ fn native_dc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = bb_read_byte(ctx, view, view.pos as usize + index)?;
     }
-    let sent = ctx
-        .fd_table()
-        .udp_send_connected(fd, &bytes)
-        .map_err(|e| RuntimeError::IOException {
-            message: format!("DatagramChannel.write: {e}"),
-        })?;
+    let sent =
+        ctx.fd_table()
+            .udp_send_connected(fd, &bytes)
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("DatagramChannel.write: {e}"),
+            })?;
     buf_set_position(ctx, buffer, view.pos + sent as i32);
     Ok(Some(Value::Int(sent as i32)))
 }
@@ -16672,7 +16751,7 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // cannot expose its ephemeral port rather than returning null to JNDI.
     let addr = dc_fd(ctx, this)
         .and_then(|fd| ctx.fd_table().udp_local_addr(fd).ok())
-    .unwrap_or_else(|| "0.0.0.0:0".to_string());
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
     let (host, port) = addr
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))

@@ -1798,7 +1798,9 @@ fn perform(
         // TLS ticket cache required for a following connection to resume.
         // If no custom SSLContext was captured, use cached system roots.
         let cfg = connection
-            .and_then(|connection| crate::t27_tls::huc_client_config_for_connection(ctx, connection))
+            .and_then(|connection| {
+                crate::t27_tls::huc_client_config_for_connection(ctx, connection)
+            })
             .or_else(crate::t27_tls::huc_default_client_config)
             .unwrap_or_else(shared_legacy_config);
         let server_name = ServerName::try_from(parsed.host.clone())
@@ -2890,20 +2892,32 @@ fn huc_get_header_field_key_indexed(
 /// that reads response state our shim never populated → empty map.
 fn huc_get_header_fields(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let headers = if let Some(url_str) = huc_real_object_url(ctx, this) {
-        if url_str.starts_with("http://") || url_str.starts_with("https://") {
-            huc_real_perform(ctx, this, &url_str)?;
-            huc_real_headers(ctx, this)
+    // URL lookup can enter real-JDK code and collect. Keep the carrier rooted
+    // until the subsequent perform/header operations have consumed it.
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        let headers = if let Some(url_str) = huc_real_object_url(ctx, this) {
+            let this = ctx.read_native_pin(this_pin, this);
+            if url_str.starts_with("http://") || url_str.starts_with("https://") {
+                huc_real_perform(ctx, this, &url_str)?;
+                let this = ctx.read_native_pin(this_pin, this);
+                huc_real_headers(ctx, this)
+            } else {
+                ensure_connected(ctx, this)?;
+                let this = ctx.read_native_pin(this_pin, this);
+                with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
+            }
         } else {
             ensure_connected(ctx, this)?;
+            let this = ctx.read_native_pin(this_pin, this);
             with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
-        }
-    } else {
-        ensure_connected(ctx, this)?;
-        with_state(ctx, this, |s| s.response_headers.clone()).unwrap_or_default()
-    };
-    let map = build_header_map(ctx, &headers)?;
-    Ok(Some(Value::Object(Some(map))))
+        };
+        let map = build_header_map(ctx, &headers)?;
+        Ok(Some(Value::Object(Some(map))))
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 /// Content length per the real `URLConnection.getContentLengthLong()` contract:
