@@ -101,10 +101,12 @@ Branch `fix/otlp-mockito-bytebuddy-hang-20260720`, worktree
   (`whenPropertiesUrlIsNotSetThenUseOtlpConfigUrlAsFallback`) is a **separate,
   narrower** bug — not a hang, not related to `isOverridden` — tracked in
   `docs/known-issues/springboot/mockito-inline-nested-selfcall-stub-bypass.md`.
-- `JacksonAutoConfigurationTests`: still times out even post-fix, at up to 600s (10
-  minutes — not a "just needs a bigger timeout" gap). Its `--stack-dump-on-timeout`
-  dumps show a normal, non-repeating, slowly-progressing Spring-context-refresh call
-  stack (`OnBeanCondition.getMatchingBeans` / `DefaultBindConstructorProvider`
+- `JacksonAutoConfigurationTests`: this was a separate severe-slowdown issue at
+  the time of this Mockito fix. It was subsequently fixed; see
+  `docs/internal/springboot/jacksonautoconfigurationtests-severe-slowdown-FIXED-20260722.md`.
+  The earlier `--stack-dump-on-timeout` dumps showed a normal, non-repeating,
+  slowly-progressing Spring-context-refresh call stack
+  (`OnBeanCondition.getMatchingBeans` / `DefaultBindConstructorProvider`
   reflection work) — **zero** Mockito/ByteBuddy frames anywhere in any dump. CPU-sampled
   the live process twice 20s apart (per
   `[[reference_cpu_sample_deadlock_vs_slow_technique]]`): the worker thread's

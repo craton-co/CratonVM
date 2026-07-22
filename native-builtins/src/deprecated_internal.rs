@@ -757,10 +757,25 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             let frames = ctx.capture_stack_trace(0);
             if depth as usize <= frames.len() {
                 let frame = &frames[(depth - 1) as usize];
-                let class_name = frame.class_name.replace('.', "/");
-                let cid = ctx
-                    .ensure_class_initialized(&class_name)
-                    .unwrap_or(cratonvm_types::ClassId::new(0));
+                // Prefer the frame's own `class_id` (captured live from the
+                // interpreter frame) over a name-based re-lookup. A name-keyed
+                // lookup collapses to whichever class of that name loaded
+                // FIRST/globally-registered, which is wrong whenever the actual
+                // caller was loaded by a distinct ClassLoader from a same-named
+                // class elsewhere on the classpath (e.g. a custom parentless
+                // ClassLoader that `defineClass`-loads its own copy of a class
+                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
+                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
+                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
+                // comment for the matching guidance.
+                let cid = match frame.class_id {
+                    Some(cid) => cid,
+                    None => {
+                        let class_name = frame.class_name.replace('.', "/");
+                        ctx.ensure_class_initialized(&class_name)
+                            .unwrap_or(cratonvm_types::ClassId::new(0))
+                    }
+                };
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -781,10 +796,25 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             // Return frame 2 (the actual caller)
             if frames.len() > 2 {
                 let frame = &frames[2];
-                let class_name = frame.class_name.replace('.', "/");
-                let cid = ctx
-                    .ensure_class_initialized(&class_name)
-                    .unwrap_or(cratonvm_types::ClassId::new(0));
+                // Prefer the frame's own `class_id` (captured live from the
+                // interpreter frame) over a name-based re-lookup. A name-keyed
+                // lookup collapses to whichever class of that name loaded
+                // FIRST/globally-registered, which is wrong whenever the actual
+                // caller was loaded by a distinct ClassLoader from a same-named
+                // class elsewhere on the classpath (e.g. a custom parentless
+                // ClassLoader that `defineClass`-loads its own copy of a class
+                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
+                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
+                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
+                // comment for the matching guidance.
+                let cid = match frame.class_id {
+                    Some(cid) => cid,
+                    None => {
+                        let class_name = frame.class_name.replace('.', "/");
+                        ctx.ensure_class_initialized(&class_name)
+                            .unwrap_or(cratonvm_types::ClassId::new(0))
+                    }
+                };
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -824,10 +854,25 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
                 None
             };
             if let Some(frame) = target {
-                let class_name = frame.class_name.replace('.', "/");
-                let cid = ctx
-                    .ensure_class_initialized(&class_name)
-                    .unwrap_or(cratonvm_types::ClassId::new(0));
+                // Prefer the frame's own `class_id` (captured live from the
+                // interpreter frame) over a name-based re-lookup. A name-keyed
+                // lookup collapses to whichever class of that name loaded
+                // FIRST/globally-registered, which is wrong whenever the actual
+                // caller was loaded by a distinct ClassLoader from a same-named
+                // class elsewhere on the classpath (e.g. a custom parentless
+                // ClassLoader that `defineClass`-loads its own copy of a class
+                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
+                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
+                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
+                // comment for the matching guidance.
+                let cid = match frame.class_id {
+                    Some(cid) => cid,
+                    None => {
+                        let class_name = frame.class_name.replace('.', "/");
+                        ctx.ensure_class_initialized(&class_name)
+                            .unwrap_or(cratonvm_types::ClassId::new(0))
+                    }
+                };
                 let mirror = ctx.get_class_mirror(cid);
                 Ok(Some(Value::Object(Some(mirror))))
             } else {
@@ -863,18 +908,16 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             };
             if let Some(frame) = target {
                 // Prefer the frame's own `class_id` (captured live from the
-                // interpreter frame) over a name-based re-lookup. A
-                // name-keyed lookup collapses to whichever class of that
-                // name loaded FIRST/globally-registered, which is wrong
-                // whenever the actual caller was loaded by a distinct
-                // ClassLoader from a same-named class elsewhere on the
-                // classpath (e.g. a custom parentless ClassLoader that
-                // `defineClass`-loads its own copy of a class also present
-                // on the system classpath — see H2 `Upgrade.loadH2`'s
-                // dynamic-driver-loading pattern, `DriverManager
-                // .deregisterDriver`'s caller-classloader check). See the
-                // matching guidance on `StackTraceEntry::class_id`'s doc
-                // comment.
+                // interpreter frame) over a name-based re-lookup. A name-keyed
+                // lookup collapses to whichever class of that name loaded
+                // FIRST/globally-registered, which is wrong whenever the actual
+                // caller was loaded by a distinct ClassLoader from a same-named
+                // class elsewhere on the classpath (e.g. a custom parentless
+                // ClassLoader that `defineClass`-loads its own copy of a class
+                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
+                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
+                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
+                // comment for the matching guidance.
                 let cid = match frame.class_id {
                     Some(cid) => cid,
                     None => {

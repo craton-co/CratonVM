@@ -44053,6 +44053,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 let _ = ctx.array_length(tm_arr);
             }
 
+            // Capture the live manager objects before any helper below can
+            // allocate or re-enter Java.  The native-call funnel keeps the
+            // arguments rooted, but the copied ObjectRefs in `km_arg`/
+            // `tm_arg` are not rewritten after a moving collection.  Delaying
+            // this capture could therefore publish an old array element into
+            // the long-lived TLS side table; a later handshake would then
+            // dispatch `checkServerTrusted` on whatever object reused that
+            // address.  The tables themselves are GC-rooted/remapped once
+            // populated, so install them at this first post-validation point.
+            let kms_array = match km_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            let tms_array = match tm_arg {
+                Value::Object(Some(array)) => Some(array),
+                _ => None,
+            };
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
+
             // FIX (es-restclient-https): if the supplied TrustManager[] is
             // bound to an explicit KeyStore (a custom truststore, not the
             // default), capture its trust anchors keyed by THIS SSLContext's
@@ -44089,19 +44109,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // transfers, a Java-supplied TrustManager is retained only in the
             // synthetic fields and HttpURLConnection silently falls back to
             // the platform verifier.
-            let kms_array = match km_arg {
-                Value::Object(Some(array)) => Some(array),
-                _ => None,
-            };
             let resolved_identity =
                 crate::x509_manager::resolved_identity_pem_for_key_manager_array(ctx, kms_array);
             crate::t27_tls::attach_pending_identity_to_ctx(ctx, this, resolved_identity);
-            let tms_array = match tm_arg {
-                Value::Object(Some(array)) => Some(array),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_array);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_array);
             Ok(None)
         },
     );
@@ -45008,6 +45018,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             );
         }
         Ok(Some(Value::Int(if closed { 0 } else { 1 })))
+    });
+    // `java.net.Socket` has the same registrations, but a real-JDK
+    // `SSLSocket` receiver does not reliably inherit them through the native
+    // dispatch lookup.  Falling through to Socket's bytecode reads the real
+    // `Socket.impl` / `shutIn` fields from this synthetic overlay and can
+    // report a live TLS connection as input-shut.  HttpComponents 5.4 checks
+    // `isInputShutdown()` immediately before every request-body write and
+    // turns that false positive into `ConnectionClosedException`.
+    //
+    // There is no independent half-close state for a rustls SSLSocket: the
+    // only supported shutdown operation is `close()`, which marks the shared
+    // side-table entry closed.  Use that authoritative state for both
+    // directions rather than interpreting the host JDK's physical layout.
+    r.register(ssl_sock, "isInputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
+    });
+    r.register(ssl_sock, "isOutputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let closed = crate::net_phase_e::sock_is_closed_for_upcall(ctx, this);
+        Ok(Some(Value::Int(if closed { 1 } else { 0 })))
     });
     r.register(ssl_sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;

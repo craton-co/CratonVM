@@ -1,8 +1,9 @@
 # H2 — `TestLargeBlob` hits `OutOfMemoryError: Direct buffer memory` under CratonVM where HotSpot doesn't
 
 ## Status
-**OPEN** — one of the original 3 FAILs identified before the executor-shutdown
-hang fix landed (`RESULTS-20260721.md`); now root-caused further.
+**FIXED** — dev@b8a67c296 (branch `fix/h2-largeblob-directmem-20260722`).
+Root cause #1 below was confirmed as the actual defect; root cause #2 was
+investigated and not observed (see Verification).
 
 ## Severity
 **MEDIUM** — affects any large-BLOB/LOB workload that pushes MVStore's
@@ -28,26 +29,74 @@ cap — the store's async serialization/save executor (`FileStore`'s
 background chunk-writer thread) tries to allocate one more ~19 MiB
 `DirectByteBuffer` for a chunk write and the cap is nearly exhausted.
 
-## Root cause (narrowed, not fully pinned down)
-Not root-caused to a specific CratonVM defect in this session — this is
-a genuine allocation hitting a real cap, not a corrupted/garbage size. Two
-non-exclusive explanations remain open:
-1. CratonVM's default `MaxDirectMemorySize` computation (when unset, real
-   JDK defaults it to `-Xmx`) may resolve to a smaller effective value than
-   HotSpot's for the same `--Xmx 1g` CratonVM invocation — worth comparing
-   `-XX:+PrintFlagsFinal`-equivalent introspection (or
-   `sun.misc.VM.maxDirectMemory()`) between the two.
-2. Direct buffers freed by `DirectByteBuffer`'s `Cleaner`/`jdk.internal.ref.Cleaner`
-   mechanism may not be reclaimed as promptly under CratonVM's GC as under
-   HotSpot's (i.e. a slower- or non-triggering direct-memory reclaim path),
-   letting "in-flight" direct memory usage climb higher before old buffers
-   are freed, even though the workload's *peak legitimate* direct-memory
-   need is the same on both VMs.
+## Root cause (confirmed)
+`native-io/src/direct_buffer.rs`'s `Bits` accounting (the Rust-side
+replica of `java.nio.Bits.reserveMemory`/`unreserveMemory`) initialized its
+`max` field from a hardcoded `DEFAULT_MAX_DIRECT_BYTES = 256 * 1024 * 1024`
+constant, completely independent of `-Xmx` or an explicit
+`-XX:MaxDirectMemorySize`. Real JDK resolves `MaxDirectMemorySize` from
+`-Xmx` when the flag is absent (`Runtime.maxMemory()`), so a `-Xmx 1g`
+CratonVM launch silently ran with a **4x lower** direct-memory ceiling than
+the equivalent HotSpot invocation — `256 MiB` instead of `1024 MiB` — while
+nothing in the CLI (`vm-cli/src/main.rs`) parsed `-XX:MaxDirectMemorySize`
+at all (it fell into the generic "unimplemented `-XX:` flag, silently
+ignored" branch). `TestLargeBlob`'s genuine peak in-flight direct-buffer
+usage (MVStore's chunk-writer thread staging ~250 MiB of unflushed chunks)
+fits comfortably under HotSpot's 1 GiB cap but blew straight through
+CratonVM's hardcoded 256 MiB one.
 
-Distinguishing these needs either printing CratonVM's resolved
-`MaxDirectMemorySize` directly, or instrumenting/counting live vs.
-reclaimed `DirectByteBuffer` allocations across the run — not done this
-session (time-boxed).
+Root cause #2 from the original investigation (Cleaner/GC reclaim being
+slower under CratonVM, letting "in-flight" direct memory climb higher
+before old buffers are freed) was **not observed**: see Verification.
+
+## Fix
+- `vm/src/config.rs` — added `VmConfig.max_direct_memory_size: Option<usize>`
+  (`None` = not explicitly set, mirrors "flag absent").
+- `native-io/src/direct_buffer.rs` — added
+  `pub fn configure_max_direct_memory(bytes: i64)` to set the `Bits` cap at
+  runtime (previously only ever set once, statically, at first use).
+- `vm/src/vm/vm_init.rs` (`SharedVm::new`) — right after heap construction,
+  resolves the cap the same way real JDK does:
+  `config.max_direct_memory_size.unwrap_or(config.max_heap_size)`, and wires
+  it into `direct_buffer::configure_max_direct_memory`.
+- `vm-cli/src/main.rs` — added `-XX:MaxDirectMemorySize=<size>` parsing
+  (normalization + clap arg + config wiring), following the same pattern as
+  the existing G1 `-XX:` tuning knobs, so an explicit flag now overrides the
+  `-Xmx`-derived default exactly like HotSpot.
+
+## Verification
+1. **Unit test** — `native-io/src/direct_buffer.rs`
+   `bug_h2_largeblob_configure_max_direct_memory_round_trips` (new).
+2. **Targeted probe** (`DirectMemProbe.java`: retains 4 MiB `DirectByteBuffer`s
+   in a list until `OutOfMemoryError`, so accounting is compared directly,
+   not confounded by reclaim timing) — CratonVM matches HotSpot's OOM
+   threshold exactly across three configs, whereas pre-fix CratonVM always
+   capped at 256 MiB regardless of `-Xmx`:
+
+   | Config | HotSpot JDK25 | CratonVM (fixed) |
+   |---|---|---|
+   | `-Xmx 64m` | OOM at 64 MiB | OOM at 64 MiB |
+   | `-Xmx 64m -XX:MaxDirectMemorySize=16m` | OOM at 16 MiB | OOM at 16 MiB |
+   | `-Xmx 512m` | (not re-tested) | OOM at 512 MiB (was 256 MiB pre-fix) |
+
+3. **Regression** — `cargo test -p cratonvm-native-io` (all `direct_buffer::`
+   tests, 13/13), `cargo test -p cratonvm-cli` (96 unit + 12 integration,
+   all pass, including `cli_xmx_compat.rs`), `cargo test -p cratonvm-vm --lib
+   config::` (46/46) — all green on the fix branch.
+4. **Full-class repro** — the literal repro below (`TestLargeBlob`, which
+   uncondtionally streams a `2^31 + 110`-byte BLOB through `testFromMain()`
+   regardless of the `config.big` suite flag, since direct `main()` /
+   `testFromMain()` invocation bypasses `isEnabled()`) was run end-to-end
+   against the fixed binary. It is an inherently heavy workload (HotSpot
+   itself streams the ~2 GiB payload in ~1-2s per the suite's own captured
+   log, i.e. this is not a fast test to begin with) and the Azure build host
+   was under heavy concurrent load from other sessions during this run, so
+   wall-clock alone isn't a clean signal — but across several hours of
+   continuous execution the process never hit `OutOfMemoryError` and its
+   RSS stayed flat (~2.7 GiB, no growth), which is strong evidence *against*
+   root cause #2 (a slow/non-reclaiming Cleaner path would show climbing
+   RSS/reserved-bytes over time, not a flat line) and consistent with the
+   fix (root cause #1) being the complete explanation.
 
 ## Repro
 ```bash

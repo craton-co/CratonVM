@@ -1273,6 +1273,56 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         m3_abstract_bean_definition_resolve_bean_class,
     );
 
+    // `ConfigurationClassBeanDefinitionReader` can receive a parent-loader
+    // `Method` from Spring's already-materialised configuration metadata while
+    // the active `ModifiedClassPathClassLoader` context has reloaded the same
+    // configuration class. `RootBeanDefinition` retains that Method and later
+    // resolves its parameters against a child `DefaultListableBeanFactory`.
+    // The raw `ObjectProvider` identity check then misses and turns an optional
+    // provider into a required bean. Preserve a method already owned by a
+    // defining loader, but canonicalize an application/global Method through
+    // the active TCCL before caching it in the bean definition.
+    registry.register(
+        "org/springframework/beans/factory/support/RootBeanDefinition",
+        "setResolvedFactoryMethod",
+        "(Ljava/lang/reflect/Method;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let mut method = match args.get(1) {
+                Some(Value::Object(Some(method))) => Some(*method),
+                _ => None,
+            };
+            if let Some(incoming) = method {
+                if let Some((declaring, name, descriptor)) =
+                    crate::lang_class::method_class_name_desc(ctx, incoming)
+                {
+                    if crate::classloader::defining_loader_for(declaring.as_u32()).is_none() {
+                        if let Some(class_name) = ctx.class_name_of_id(declaring) {
+                            if let Some(child_declaring) = resolve_class_id_via_tccl(ctx, &class_name)
+                            {
+                                if child_declaring != declaring {
+                                    if let Some(meta) = ctx.declared_methods(child_declaring).into_iter().find(
+                                        |meta| meta.name == name && meta.descriptor == descriptor,
+                                    ) {
+                                        method = Some(crate::lang_class::create_method_object(ctx, &meta));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.set_field_by_name(this, "resolvedFactoryMethod", Value::Object(method));
+            ctx.unpin_native_roots(this_pin);
+            Ok(None)
+        },
+    );
+
     // Loader identity (2026-07-21, WebFluxManagementChildContextConfiguration
     // IntegrationTests#refreshSucceedsWithoutHealth): `AbstractBeanDefinition.
     // setBeanClass(Class)` is the common tail of EVERY bean-registration path

@@ -13,6 +13,15 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
+/// Whether the array-class diagnostic is enabled. The environment is fixed for
+/// a VM process, so read it once: `Object.getClass()` is hot in reflection
+/// workloads and querying the process environment allocates and locks.
+#[inline]
+fn dbg_toarray_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_TOARRAY").is_some())
+}
+
 #[inline]
 pub(crate) fn unsafe_offset_is_heap_slot(
     ctx: &dyn NativeContext,
@@ -8647,6 +8656,7 @@ pub mod lang_system;
 pub mod phases_early;
 pub mod phases_late;
 pub mod stamped_lock;
+pub mod tzdb;
 pub mod uncaught_handlers;
 #[cfg(feature = "synthetic-jdk")]
 pub mod util_time;
@@ -12247,17 +12257,28 @@ fn antlr_parser_delegate_transition(
     let names = antlr_names_for_object(ctx, config);
     let descriptor =
         antlr_parser_transition_delegate_descriptor(names, transition_name, bools.len());
+    // `predTransition` / `precedenceTransition` execute Java bytecode and may
+    // allocate.  These three graph objects are then used to resume the native
+    // closure walk, so retain GC-remapped copies for the duration of the call.
+    let simulator_pin = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let transition_pin = ctx.pin_native_root(transition);
     let mut args = Vec::with_capacity(2 + bools.len());
+    let simulator = ctx.read_native_pin(simulator_pin, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let transition = ctx.read_native_pin(transition_pin, transition);
     args.push(Value::Object(Some(config)));
     args.push(Value::Object(Some(transition)));
     args.extend(bools.iter().map(|value| antlr_bool(*value)));
-    match ctx.invoke_virtual(simulator, method_name, &descriptor, &args)? {
+    let result = ctx.invoke_virtual(simulator, method_name, &descriptor, &args);
+    ctx.unpin_native_roots(simulator_pin);
+    match result? {
         Some(Value::Object(obj)) => Ok(obj),
         _ => Ok(None),
     }
 }
 
-fn native_antlr_parser_get_epsilon_target(
+fn native_antlr_parser_get_epsilon_target_impl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -12328,6 +12349,33 @@ fn native_antlr_parser_get_epsilon_target(
         _ => None,
     };
     Ok(Some(Value::Object(target)))
+}
+
+fn native_antlr_parser_get_epsilon_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let config = obj_arg(args, 1)?;
+    let transition = obj_arg(args, 2)?;
+    // Several branches call Java and then return to the native closure walk.
+    // Keep the graph endpoints in one contiguous pin frame, and always unwind
+    // it even when the Java call propagates an exception.
+    let pin_base = ctx.pin_native_root(this);
+    let config_pin = ctx.pin_native_root(config);
+    let transition_pin = ctx.pin_native_root(transition);
+    let rooted = [
+        Value::Object(Some(ctx.read_native_pin(pin_base, this))),
+        Value::Object(Some(ctx.read_native_pin(config_pin, config))),
+        Value::Object(Some(ctx.read_native_pin(transition_pin, transition))),
+        args.get(3).cloned().unwrap_or(Value::Int(0)),
+        args.get(4).cloned().unwrap_or(Value::Int(0)),
+        args.get(5).cloned().unwrap_or(Value::Int(0)),
+        args.get(6).cloned().unwrap_or(Value::Int(0)),
+    ];
+    let result = native_antlr_parser_get_epsilon_target_impl(ctx, &rooted);
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn antlr_parser_merge_cache(
@@ -12446,7 +12494,7 @@ fn antlr_parser_native_get_epsilon_target(
     }
 }
 
-fn antlr_parser_closure_checking_stop_state_impl(
+fn antlr_parser_closure_checking_stop_state_unrooted(
     ctx: &mut dyn NativeContext,
     simulator: ObjectRef,
     config: ObjectRef,
@@ -12467,11 +12515,20 @@ fn antlr_parser_closure_checking_stop_state_impl(
             if !antlr_prediction_context_is_empty(ctx, context) {
                 let size = antlr_prediction_context_size(ctx, context);
                 for index in 0..size {
+                    // A previous recursive edge can collect.  Fetch the
+                    // context again through the rooted config before reading
+                    // this slot instead of retaining a raw graph reference.
+                    let Some(context) = antlr_atn_config_context(ctx, config) else {
+                        continue;
+                    };
                     let return_state = antlr_prediction_context_return_state(ctx, context, index);
                     if return_state == ANTLR_EMPTY_RETURN_STATE {
                         if full_ctx {
                             let names = antlr_names_for_object(ctx, config);
                             let empty = antlr_empty_instance(ctx, names)?;
+                            let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+                                continue;
+                            };
                             let next_config = antlr_alloc_atn_config(
                                 ctx,
                                 names,
@@ -12551,7 +12608,7 @@ fn antlr_parser_closure_checking_stop_state_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn antlr_parser_closure_impl(
+fn antlr_parser_closure_unrooted(
     ctx: &mut dyn NativeContext,
     simulator: ObjectRef,
     config: ObjectRef,
@@ -12570,6 +12627,11 @@ fn antlr_parser_closure_impl(
         antlr_parser_add_config(ctx, simulator, configs, config)?;
     }
 
+    // `add` can allocate.  Re-read `state` from the rooted config before
+    // dereferencing its transition array.
+    let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+        return Ok(None);
+    };
     let transition_count =
         match native_antlr_atn_state_get_number_of_transitions(ctx, &[Value::Object(Some(state))])?
         {
@@ -12590,9 +12652,16 @@ fn antlr_parser_closure_impl(
             }
         }
 
+        // The prior iteration (and the loop-entry predicate above) may have
+        // allocated.  Do not carry the old raw ATNState reference across it.
+        let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+            continue;
+        };
         let Some(transition) = antlr_atn_state_transition_ref(ctx, state, transition_index)? else {
             continue;
         };
+        let transition_pin = ctx.pin_native_root(transition);
+        let transition = ctx.read_native_pin(transition_pin, transition);
         let continue_collecting =
             collect_predicates && !antlr_transition_is_action(ctx, transition);
         // `inContext` mirrors real ANTLR's `getEpsilonTarget(config, t, collectPredicates,
@@ -12616,13 +12685,29 @@ fn antlr_parser_closure_impl(
             treat_eof_as_epsilon,
         )?
         else {
+            ctx.unpin_native_roots(transition_pin);
             continue;
         };
+        // The epsilon target itself is often a freshly allocated config.  It
+        // must remain rooted while the native walk adds it to Java sets and
+        // recursively resumes prediction.
+        let next_config_pin = ctx.pin_native_root(next_config);
+        let next_config = ctx.read_native_pin(next_config_pin, next_config);
 
         let mut next_depth = depth;
+        // `getEpsilonTarget` can collect; reload the state through the rooted
+        // config before using it below.
+        let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+            ctx.unpin_native_roots(transition_pin);
+            continue;
+        };
         if antlr_state_is_rule_stop(ctx, state) {
             if let Some(dfa) = antlr_parser_dfa(ctx, simulator) {
                 if antlr_dfa_is_precedence(ctx, dfa) {
+                    let Some(dfa) = antlr_parser_dfa(ctx, simulator) else {
+                        ctx.unpin_native_roots(transition_pin);
+                        continue;
+                    };
                     let outermost =
                         antlr_int_field(ctx, transition, "outermostPrecedenceReturn", 1);
                     if Some(outermost) == antlr_dfa_start_rule(ctx, dfa) {
@@ -12633,6 +12718,7 @@ fn antlr_parser_closure_impl(
             let reaches = antlr_atn_config_reaches(ctx, next_config).saturating_add(1);
             antlr_atn_config_set_reaches(ctx, next_config, reaches);
             if !antlr_set_add_object(ctx, closure_busy, next_config)? {
+                ctx.unpin_native_roots(transition_pin);
                 continue;
             }
             antlr_set_field_value(ctx, configs, "dipsIntoOuterContext", 6, Value::Int(1));
@@ -12640,6 +12726,7 @@ fn antlr_parser_closure_impl(
         } else if !antlr_transition_is_epsilon(ctx, transition)
             && !antlr_set_add_object(ctx, closure_busy, next_config)?
         {
+            ctx.unpin_native_roots(transition_pin);
             continue;
         }
 
@@ -12647,7 +12734,7 @@ fn antlr_parser_closure_impl(
             next_depth = next_depth.saturating_add(1);
         }
 
-        antlr_parser_closure_checking_stop_state_impl(
+        let result = antlr_parser_closure_checking_stop_state_impl(
             ctx,
             simulator,
             next_config,
@@ -12657,10 +12744,86 @@ fn antlr_parser_closure_impl(
             full_ctx,
             next_depth,
             treat_eof_as_epsilon,
-        )?;
+        );
+        ctx.unpin_native_roots(transition_pin);
+        result?;
     }
 
     Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn antlr_parser_closure_checking_stop_state_impl(
+    ctx: &mut dyn NativeContext,
+    simulator: ObjectRef,
+    config: ObjectRef,
+    configs: ObjectRef,
+    closure_busy: ObjectRef,
+    collect_predicates: bool,
+    full_ctx: bool,
+    depth: i32,
+    treat_eof_as_epsilon: bool,
+) -> MethodCallResult {
+    // Every recursive closure step may allocate or invoke Java.  The four
+    // arguments form the live prediction graph, so keep one balanced native
+    // root frame around the complete step rather than trusting raw ObjectRefs
+    // across a moving collection.
+    let pin_base = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let configs_pin = ctx.pin_native_root(configs);
+    let closure_busy_pin = ctx.pin_native_root(closure_busy);
+    let simulator = ctx.read_native_pin(pin_base, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let configs = ctx.read_native_pin(configs_pin, configs);
+    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let result = antlr_parser_closure_checking_stop_state_unrooted(
+        ctx,
+        simulator,
+        config,
+        configs,
+        closure_busy,
+        collect_predicates,
+        full_ctx,
+        depth,
+        treat_eof_as_epsilon,
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn antlr_parser_closure_impl(
+    ctx: &mut dyn NativeContext,
+    simulator: ObjectRef,
+    config: ObjectRef,
+    configs: ObjectRef,
+    closure_busy: ObjectRef,
+    collect_predicates: bool,
+    full_ctx: bool,
+    depth: i32,
+    treat_eof_as_epsilon: bool,
+) -> MethodCallResult {
+    let pin_base = ctx.pin_native_root(simulator);
+    let config_pin = ctx.pin_native_root(config);
+    let configs_pin = ctx.pin_native_root(configs);
+    let closure_busy_pin = ctx.pin_native_root(closure_busy);
+    let simulator = ctx.read_native_pin(pin_base, simulator);
+    let config = ctx.read_native_pin(config_pin, config);
+    let configs = ctx.read_native_pin(configs_pin, configs);
+    let closure_busy = ctx.read_native_pin(closure_busy_pin, closure_busy);
+    let result = antlr_parser_closure_unrooted(
+        ctx,
+        simulator,
+        config,
+        configs,
+        closure_busy,
+        collect_predicates,
+        full_ctx,
+        depth,
+        treat_eof_as_epsilon,
+    );
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn native_antlr_parser_closure_checking_stop_state(
@@ -12842,9 +13005,13 @@ fn antlr_parser_reachable_target(
     transition: ObjectRef,
     symbol: i32,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let simulator_pin = ctx.pin_native_root(simulator);
+    let transition_pin = ctx.pin_native_root(transition);
+    let simulator = ctx.read_native_pin(simulator_pin, simulator);
     let max_token_type = antlr_parser_atn(ctx, simulator)
         .map(|atn| antlr_int_field(ctx, atn, "maxTokenType", 6))
         .unwrap_or(i32::MAX);
+    let transition = ctx.read_native_pin(transition_pin, transition);
     let matches = match native_antlr_transition_matches(
         ctx,
         &[
@@ -12857,11 +13024,14 @@ fn antlr_parser_reachable_target(
         Some(Value::Int(v)) => v != 0,
         _ => false,
     };
-    if matches {
-        Ok(antlr_transition_target(ctx, transition))
+    let target = if matches {
+        let transition = ctx.read_native_pin(transition_pin, transition);
+        antlr_transition_target(ctx, transition)
     } else {
-        Ok(None)
-    }
+        None
+    };
+    ctx.unpin_native_roots(simulator_pin);
+    Ok(target)
 }
 
 fn antlr_atn_next_tokens_contains_epsilon(
@@ -13017,6 +13187,11 @@ fn native_antlr_parser_compute_reach_set(
             _ => 0,
         };
         for transition_index in 0..transition_count {
+            // Matching a previous edge can allocate.  Reacquire the state
+            // from the pinned config before indexing `transitions` again.
+            let Some(state) = antlr_ref_field(ctx, config, "state", 0) else {
+                continue;
+            };
             let Some(transition) = antlr_atn_state_transition_ref(ctx, state, transition_index)?
             else {
                 continue;
@@ -36642,15 +36817,50 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     "()Ljava/lang/String;",
                     &[Value::Object(Some(tz))],
                 ) {
-                    let has_id = matches!(ctx.read_string(id_str), Some(s) if !s.is_empty());
-                    if has_id {
+                    let id_string = ctx.read_string(id_str).filter(|s| !s.is_empty());
+                    if let Some(id_string) = id_string {
+                        // TZDB-OFFSET (2026-07-22): `ZoneId.of(String)`'s
+                        // single-arg overload does not understand the
+                        // legacy 3-letter `ZoneId.SHORT_IDS` aliases (e.g.
+                        // "CTT") that `java.util.TimeZone` still accepts —
+                        // it would throw, which this native's `if let Ok`
+                        // guard silently swallowed, falling through to the
+                        // hardcoded-UTC bypass below and making
+                        // `ZoneId.systemDefault()` return UTC instead of
+                        // the zone `TimeZone.setDefault` was just set to.
+                        // Resolve through the same real tzdb.dat catalog
+                        // used for offset computation first so the id
+                        // passed to `ZoneId.of` is always a canonical IANA
+                        // name it accepts unaided; fall back to the raw id
+                        // (still correct for "UTC"/"GMT"/custom "+HH:MM"
+                        // forms `ZoneId.of` handles natively) if this
+                        // catalog doesn't recognize it. See
+                        // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+                        // Try the id verbatim first (preserves display
+                        // names/behavior for everything that already
+                        // worked, e.g. "UTC"/"GMT"/"Zulu"/"+08:00"/plain
+                        // IANA names); only fall back to the tzdb-resolved
+                        // canonical name for legacy short-id aliases the
+                        // single-arg overload alone doesn't understand.
+                        let orig_str = ctx.create_string(&id_string);
                         if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
                             "java/time/ZoneId",
                             "of",
                             "(Ljava/lang/String;)Ljava/time/ZoneId;",
-                            &[Value::Object(Some(id_str))],
+                            &[Value::Object(Some(orig_str))],
                         ) {
                             return Ok(Some(zone));
+                        }
+                        if let Some(resolved_id) = crate::tzdb::canonical_zone_id(ctx, &id_string) {
+                            let resolved_str = ctx.create_string(&resolved_id);
+                            if let Ok(Some(zone @ Value::Object(Some(_)))) = ctx.invoke(
+                                "java/time/ZoneId",
+                                "of",
+                                "(Ljava/lang/String;)Ljava/time/ZoneId;",
+                                &[Value::Object(Some(resolved_str))],
+                            ) {
+                                return Ok(Some(zone));
+                            }
                         }
                     }
                 }
@@ -37005,73 +37215,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     }
 
-    // HIB-PARIS-LMT (2026-07-17): pre-standardization Local Mean Time (LMT)
-    // offsets for zones whose real IANA tzdata models a historical LMT-style
-    // offset before their first modern standardization transition.
-    // `tz_standard_offset_seconds`/`tz_dst_rule` above only know the
-    // CURRENT/modern standard offset and (for zones with a recurring annual
-    // DST rule) a `java.util.SimpleTimeZone`-representable rule — neither
-    // can express a ONE-TIME historical cutover, because SimpleTimeZone's
-    // `getOffsets(long, int[])` (what `GregorianCalendar.computeTime()`/
-    // `.computeFields()` actually call for a non-`ZoneInfo` zone — see
-    // `TimeZone.getOffsets`) only ever consults `rawOffset` (fixed at
-    // construction, no date parameter) plus the DST rule; there is no
-    // structural way to make `rawOffset` itself date-dependent. This table
-    // plus the `SimpleTimeZone.getOffsets` override below patches in the
-    // exact historical cutover(s) real HotSpot's tzdb encodes for the
-    // zones this project's Hibernate ORM suite exercises pre-standardization
-    // dates for (`ZonedDateTimeTest`'s 1904/1905 Europe/Paris boundary
-    // cases — see docs/known-issues/hibernate/hib-misc-residuals-20260716.md
-    // and docs/internal/fixed-suite-bugs/hib-paris-lmt-precision-FIXED.md).
-    //
-    // Values cross-checked against real HotSpot JDK 25's
-    // `ZoneId.of(id).getRules().getTransitions()` — the earliest transition
-    // each zone's tzdb rule-set models, i.e. the exact instant HotSpot
-    // itself switches away from the zone's Local Mean Time. Returns
-    // `(cutover_epoch_millis, pre_cutover_offset_seconds)`: for any queried
-    // instant strictly before `cutover_epoch_millis`, the real/correct
-    // offset is `pre_cutover_offset_seconds`, not the zone's modern
-    // rawOffset/DST rule. This is intentionally a small, explicit table
-    // (not full historical tzdata) — it only covers zones actually
-    // exercised pre-cutover by this codebase's test suites; a zone not
-    // listed here simply keeps the existing (correct, post-standardization)
-    // rawOffset/DST-rule behavior for every date, unchanged from before this
-    // fix.
-    fn historical_lmt_offset(zone_id: &str) -> Option<(i64, i32)> {
-        match zone_id {
-            // Europe/Paris: Paris Mean Time (+00:09:21) until the
-            // 1911-03-11 00:00 local switch to WET (UTC+0). Confirmed via
-            // `GeneralityRepro.java` that real HotSpot JDK 25's OWN legacy
-            // `TimeZone.getOffset(long)`/`GregorianCalendar` path (not just
-            // `java.time`) correctly resolves this to 561s pre-cutover —
-            // i.e. adding this entry makes CratonVM MATCH real HotSpot.
-            //
-            // Deliberately NOT extended to Europe/Amsterdam (+00:17:30
-            // until 1892-05-01) or Europe/Oslo (+00:53:28 until
-            // 1893-03-31), even though those zones have an analogous
-            // historical LMT cutover in real IANA tzdata and in
-            // `java.time`'s `ZoneRules`: probed with the same
-            // `GeneralityRepro.java` against real HotSpot JDK 25, and
-            // unlike Paris, HotSpot's own *legacy* `TimeZone`/
-            // `GregorianCalendar` path returns the flat MODERN offset
-            // (3600s) for both zones even strictly before their cutover
-            // instant — real HotSpot's compiled legacy `ZoneInfo` binary
-            // tzdata apparently doesn't carry these zones' pre-1892/1893
-            // LMT rule at all, even though `java.time`'s separate,
-            // text-tzdata-backed `ZoneRules` does. Adding a table entry
-            // for these two would make CratonVM's legacy path *more
-            // textbook-correct than real HotSpot* — i.e. diverge from the
-            // reference JVM this project targets bug-for-bug compatibility
-            // with, not converge on it. If a future test genuinely needs
-            // one of these (or another zone's) legacy-path LMT precision
-            // matched, re-verify against real HotSpot with
-            // `GeneralityRepro.java`-style probing FIRST — do not assume
-            // "real IANA tzdata has a cutover" implies "HotSpot's legacy
-            // Calendar path resolves it".
-            "Europe/Paris" => Some((-1855958961_000, 9 * 60 + 21)),
-            _ => None,
-        }
-    }
+    // HIB-PARIS-LMT (2026-07-17, superseded 2026-07-22): this used to be a
+    // small hand-picked table of pre-standardization Local Mean Time
+    // cutovers (see git history for the original `historical_lmt_offset`).
+    // Superseded by the TZDB-OFFSET fix below, which reads the real
+    // historical cutover for every zone directly from tzdb.dat instead of
+    // hand-listing one zone at a time — see
+    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
@@ -37240,15 +37390,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // to echo the bogus string back as the ID, so that detection
             // never fired (Jackson2ObjectMapperBuilderTests
             // .wrongTimeZoneStringSetter expected the throw and never got
-            // it). CratonVM has no full tzdata, so approximate "resolvable"
-            // with the curated offset table plus the universal IANA
-            // Area/Location pattern (a '/' in the id) — real zone ids all
-            // match one of those; "foo" matches neither.
+            // it).
+            //
+            // TZDB-OFFSET (2026-07-22): "resolvable" used to mean "in the
+            // ~40-zone curated `tz_standard_offset_seconds` table or
+            // contains a '/'" — which silently misrecognised any valid
+            // slash-free zone id outside that table (e.g. "CST6CDT",
+            // "EST5EDT", "MST7MDT", "PST8PDT" — the four POSIX-rule zone
+            // names `TimeZone.getAvailableIDs()` itself returns) as bogus,
+            // collapsing them to "GMT"/UTC+0 — see
+            // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+            // Now backed by the real tzdb.dat catalog (604 zones + legacy
+            // aliases), so this matches exactly what real HotSpot resolves.
             let recognized = id == "GMT"
-                || id == "UTC"
                 || custom_gmt.is_some()
-                || tz_standard_offset_seconds(&id).is_some()
-                || id.contains('/');
+                || crate::tzdb::get_zone_rules(ctx, &id).is_some();
             let id = if recognized {
                 custom_gmt.unwrap_or(id)
             } else {
@@ -37326,25 +37482,75 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    // HIB-PARIS-LMT (2026-07-17): SimpleTimeZone.getOffsets(long, int[]) —
-    // the package-private method GregorianCalendar.computeTime()/
-    // computeFields() actually call (via TimeZone.getOffsets / directly) for
-    // any zone that isn't a `sun.util.calendar.ZoneInfo` — which, per
-    // `alloc_synth_timezone` above, is every zone with a known
-    // `tz_dst_rule` (all the `Europe/*` zones the Hibernate ORM
-    // `ZonedDateTimeTest`/`LocalDateTimeTest` suites exercise). For dates
-    // strictly before a zone's `historical_lmt_offset` cutover, return the
-    // historical LMT offset directly; otherwise defer to the real
-    // SimpleTimeZone bytecode (its existing, already-correct
-    // rawOffset/DST-rule computation) via `invoke_virtual_bytecode_only` —
-    // skipping the native-override check so this doesn't re-enter itself.
-    // See `historical_lmt_offset` for why this can't be expressed by
-    // overriding `getRawOffset()` instead (no date parameter to key off).
-    registry.register(
-        "java/util/SimpleTimeZone",
-        "getOffsets",
-        "(J[I)I",
-        |ctx, args| {
+    // TZDB-OFFSET (2026-07-22): java.util.TimeZone offset queries backed by
+    // the real IANA tzdb data (`native_builtins::tzdb`, parsed from
+    // `${java.home}/lib/tzdb.dat` — the exact same file and binary format
+    // `java.time.zone.ZoneRules`/`sun.util.calendar.ZoneInfoFile` use,
+    // cross-checked bit-for-bit against real HotSpot JDK 25 across all 604
+    // zones). Supersedes the previous `tz_dst_rule`/`dst_start_year`/
+    // `historical_lmt_offset` hand-rolled approximations (a ~20-zone
+    // allowlist modeling only each zone's *current* recurring DST rule) —
+    // this covers every zone's full historical transition table instead.
+    //
+    // `GregorianCalendar.computeTime()`/`computeFields()` dispatch to one of
+    // two shapes depending on the receiver's concrete class: a `ZoneInfo`
+    // gets `getOffsets`/`getOffsetsByWall` called directly (downcast in
+    // `GregorianCalendar`'s own bytecode), anything else (e.g.
+    // `SimpleTimeZone`) goes through the generic `TimeZone.getOffset(long)`.
+    // Both concrete classes are covered below so it doesn't matter which one
+    // `alloc_synth_timezone` constructed for a given zone id.
+    fn tzdb_offsets(
+        ctx: &mut dyn NativeContext,
+        this: cratonvm_types::ObjectRef,
+        date_millis: i64,
+    ) -> (i32, i32) {
+        let id = match ctx.get_field_by_name(this, "ID") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let epoch_sec = date_millis.div_euclid(1000);
+        let (total_sec, standard_sec) = legacy_offset_and_standard(ctx, &id, epoch_sec);
+        let total_ms = total_sec.saturating_mul(1000);
+        let dst_ms = (total_sec - standard_sec).saturating_mul(1000);
+        (total_ms, dst_ms)
+    }
+
+    // `sun.util.calendar.ZoneInfoFile`'s real conversion from tzdb rules to
+    // the legacy `ZoneInfo` representation only ever models transitions from
+    // 1900 onward (`UTC1900` in that class) — any query before that floor
+    // falls through to `getLastRawOffset()` (the zone's CURRENT/modern
+    // standard offset, dstSavings=0), not the deep historical offset
+    // `java.time.zone.ZoneRules` (unfloored) would report. Mirrored here so
+    // the legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's
+    // legacy behavior bug-for-bug, same as it does post-1900 — see
+    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
+
+    fn legacy_offset_and_standard(ctx: &mut dyn NativeContext, id: &str, epoch_sec: i64) -> (i32, i32) {
+        if epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
+            let raw = crate::tzdb::raw_offset_seconds(ctx, id).unwrap_or(0);
+            return (raw, raw);
+        }
+        let total_sec = crate::tzdb::offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(0);
+        let standard_sec =
+            crate::tzdb::standard_offset_seconds_at_instant(ctx, id, epoch_sec).unwrap_or(total_sec);
+        (total_sec, standard_sec)
+    }
+
+    fn register_tzdb_offset_natives_for(registry: &mut NativeMethodRegistry, class_name: &'static str) {
+        registry.register(class_name, "getOffset", "(J)I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let date = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let (total_ms, _dst_ms) = tzdb_offsets(ctx, this, date);
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getOffsets", "(J[I)I", |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
@@ -37354,31 +37560,58 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
-
+            let (total_ms, dst_ms) = tzdb_offsets(ctx, this, date);
+            if let Value::Object(Some(arr)) = offsets_arr {
+                ctx.set_array_element(arr, 0, Value::Int(total_ms - dst_ms));
+                ctx.set_array_element(arr, 1, Value::Int(dst_ms));
+            }
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getOffsetsByWall", "(J[I)I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let wall = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let offsets_arr = args.get(2).cloned().unwrap_or(Value::Object(None));
             let id = match ctx.get_field_by_name(this, "ID") {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-
-            if let Some((cutover_millis, pre_offset_secs)) = historical_lmt_offset(&id) {
-                if date < cutover_millis {
-                    let offset_ms = pre_offset_secs.saturating_mul(1000);
-                    if let Value::Object(Some(arr)) = offsets_arr {
-                        ctx.set_array_element(arr, 0, Value::Int(offset_ms));
-                        ctx.set_array_element(arr, 1, Value::Int(0));
-                    }
-                    return Ok(Some(Value::Int(offset_ms)));
-                }
+            let local_epoch_sec = wall.div_euclid(1000);
+            let (total, epoch_sec) = if local_epoch_sec < ZONEINFO_LEGACY_FLOOR_EPOCH_SEC {
+                (crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0), local_epoch_sec)
+            } else {
+                let t = crate::tzdb::offset_seconds_at_local(ctx, &id, local_epoch_sec).unwrap_or(0);
+                (t, local_epoch_sec - t as i64)
+            };
+            let (_, standard) = legacy_offset_and_standard(ctx, &id, epoch_sec);
+            let total_ms = total.saturating_mul(1000);
+            let dst_ms = (total - standard).saturating_mul(1000);
+            if let Value::Object(Some(arr)) = offsets_arr {
+                ctx.set_array_element(arr, 0, Value::Int(total_ms - dst_ms));
+                ctx.set_array_element(arr, 1, Value::Int(dst_ms));
             }
-
-            ctx.invoke_virtual_bytecode_only(
-                this,
-                "getOffsets",
-                "(J[I)I",
-                &[Value::Long(date), offsets_arr],
-            )
-        },
-    );
+            Ok(Some(Value::Int(total_ms)))
+        });
+        registry.register(class_name, "getRawOffset", "()I", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let id = match ctx.get_field_by_name(this, "ID") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
+            Ok(Some(Value::Int(raw.saturating_mul(1000))))
+        });
+    }
+    register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
+    register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo",
@@ -43943,7 +44176,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
 
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if dbg_toarray_enabled() {
         eprintln!(
             "[DBG_TOARRAY] native_object_get_class ENTER kind={:?} cid={:?} len={}",
             ctx.heap_kind_of(this),
@@ -44009,7 +44242,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `isPrimitive()==true` for an `Object[]` mirror produced here and
         // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
         // null` inside `GenericConversionService.convert`.
-        if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        if dbg_toarray_enabled() {
             eprintln!(
                 "[DBG_TOARRAY] getClass array_class_name={:?} comp_cid={:?} arr_len={}",
                 array_class_name,
@@ -72429,53 +72662,56 @@ pub(crate) fn transition_real_executor_to_shutdown(
     ctx: &mut dyn NativeContext,
     executor: ObjectRef,
 ) -> MethodCallResult {
+    // This bridge calls into Java several times (AtomicInteger, the executor
+    // hooks, and finally ThreadPoolExecutor.tryTerminate).  Keep both the
+    // receiver and `ctl` rooted across those calls; otherwise a moving
+    // collection can leave the final invokespecial targeting a stale
+    // executor, observed as an intermittent `this.ctl == null` while JUnit
+    // closes its ScheduledThreadPoolExecutor timeout resource.
+    let executor_pin = ctx.pin_native_root(executor);
+    let executor = ctx.read_native_pin(executor_pin, executor);
     let Value::Object(Some(ctl)) = ctx.get_field_by_name(executor, "ctl") else {
+        ctx.unpin_native_roots(executor_pin);
         return Ok(None);
     };
-    let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
-        Some(Value::Int(value)) => value,
-        _ => return Ok(None),
-    };
-    // ThreadPoolExecutor packs run state in the high 3 bits and worker count
-    // below. SHUTDOWN is run-state 0, so retain only the worker-count bits.
-    let shutdown = current & 0x1fff_ffff;
-    let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
-    // A graceful ThreadPoolExecutor shutdown must wake idle workers so they
-    // observe SHUTDOWN and leave getTask().  Merely updating ctl leaks every
-    // worker blocked in LinkedBlockingQueue.take().
-    let _ = interrupt_executor_workers(ctx, executor);
-    // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue. Its
-    // real `onShutdown()` removes cancelled delayed tasks (including JUnit's
-    // cancelled timeout watchdog); without it, the queue stays nonempty until
-    // the original timeout expires and `awaitTermination()` cannot finish.
-    // Preserve the JDK shutdown ordering while keeping the existing native
-    // transition for real ThreadPoolExecutor receivers.
-    let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
-    // BUG-H2-HANG-0721 / onShutdown() finalization: the real
-    // `ThreadPoolExecutor.shutdown()` body ends with an unconditional
-    // `tryTerminate()` call (see JDK source) -- this is the ONLY thing that
-    // ever moves a pool whose workerCount is *already* zero at shutdown()
-    // time (never used, or already fully drained -- e.g. `onShutdown()`
-    // above may have just emptied the queue) from SHUTDOWN to
-    // TIDYING/TERMINATED and fires `termination.signalAll()`. When
-    // workerCount > 0, `processWorkerExit()` (real bytecode, runs when each
-    // interrupted worker actually exits) eventually calls its own
-    // `tryTerminate()` and self-heals -- but a pool with zero workers has no
-    // worker left to ever run that path, so without this call here the pool
-    // is stuck in SHUTDOWN forever and `awaitTermination()` (real bytecode,
-    // genuinely blocks on `termination.awaitNanos`) hangs for the full
-    // requested timeout. H2's `Utils.shutdownExecutor` calls
-    // `awaitTermination(1, TimeUnit.DAYS)`, so this is an effectively
-    // permanent hang for the extremely common "FileStore closed before its
-    // background serialization/save executor ever ran a task" case (most
-    // H2 TestDb-based tests hit this on deleteDb()/close()).
-    let _ = ctx.invoke_special_bytecode_only(
-        "java/util/concurrent/ThreadPoolExecutor",
-        "tryTerminate",
-        "()V",
-        &[Value::Object(Some(executor))],
-    )?;
-    Ok(None)
+    let ctl_pin = ctx.pin_native_root(ctl);
+    let result = (|| {
+        let ctl = ctx.read_native_pin(ctl_pin, ctl);
+        let current = match ctx.invoke_virtual(ctl, "get", "()I", &[])? {
+            Some(Value::Int(value)) => value,
+            _ => return Ok(None),
+        };
+        // ThreadPoolExecutor packs run state in the high 3 bits and worker
+        // count below. SHUTDOWN is run-state 0, so retain only the worker
+        // count bits.
+        let shutdown = current & 0x1fff_ffff;
+        let ctl = ctx.read_native_pin(ctl_pin, ctl);
+        let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
+        // A graceful ThreadPoolExecutor shutdown must wake idle workers so
+        // they observe SHUTDOWN and leave getTask().  Merely updating ctl
+        // leaks every worker blocked in LinkedBlockingQueue.take().
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = interrupt_executor_workers(ctx, executor);
+        // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue.
+        // Its real `onShutdown()` removes cancelled delayed tasks (including
+        // JUnit's cancelled timeout watchdog); without it, the queue stays
+        // nonempty until the original timeout expires and awaitTermination()
+        // cannot finish.
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = ctx.invoke_virtual_bytecode_only(executor, "onShutdown", "()V", &[])?;
+        // A zero-worker pool has no worker-exit path to call tryTerminate(),
+        // so finalize it explicitly after the shutdown hook.
+        let executor = ctx.read_native_pin(executor_pin, executor);
+        let _ = ctx.invoke_special_bytecode_only(
+            "java/util/concurrent/ThreadPoolExecutor",
+            "tryTerminate",
+            "()V",
+            &[Value::Object(Some(executor))],
+        )?;
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(executor_pin);
+    result
 }
 
 /// Log a message only if the logger's current level allows `method_level`.
@@ -79562,7 +79798,7 @@ fn array_new_instance_for_component(
             let comp_id = ctx
                 .ensure_class_initialized(comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
-            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            if dbg_toarray_enabled() {
                 eprintln!(
                     "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
                     comp_name, comp_id, length

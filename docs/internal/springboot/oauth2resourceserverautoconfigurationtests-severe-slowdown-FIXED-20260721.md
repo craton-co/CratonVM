@@ -51,8 +51,8 @@ native-thrown Java exceptions.
 
 ## Related residual boundary
 
-`JacksonAutoConfigurationTests` remains tracked separately in
-`docs/known-issues/springboot/jacksonautoconfigurationtests-severe-slowdown.md`.
-It shares the high-level reflection/JUnit workload shape, but still exceeds
-the normal 300-second class budget after this change in both JIT modes; it is
-not represented as fixed by this OAuth2 closure.
+`JacksonAutoConfigurationTests` was subsequently fixed in
+`docs/internal/springboot/jacksonautoconfigurationtests-severe-slowdown-FIXED-20260722.md`.
+It shares the high-level reflection/JUnit workload shape, but at the time of
+this OAuth2 change it still exceeded the normal 300-second class budget in
+both JIT modes; it was not represented as fixed by this OAuth2 closure.

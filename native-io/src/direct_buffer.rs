@@ -87,6 +87,23 @@ fn bits() -> &'static Bits {
     })
 }
 
+/// Configure the process-wide direct-memory soft cap at VM boot, mirroring
+/// real JDK's `-XX:MaxDirectMemorySize` resolution: an explicit flag value if
+/// given, otherwise `-Xmx` (`Runtime.maxMemory()`). Called once from
+/// `vm_init::SharedVm::new` with the config's resolved value; falls back to
+/// `DEFAULT_MAX_DIRECT_BYTES` for any caller (e.g. unit tests) that never
+/// boots a full VM and so never calls this.
+///
+/// See docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md:
+/// before this, the cap was hardcoded to 256 MiB regardless of `-Xmx`, so a
+/// `-Xmx 1g` H2 MVStore workload with genuine ~250 MiB peak direct-buffer
+/// usage (chunk writer thread) hit a ceiling HotSpot doesn't impose at the
+/// same heap size.
+pub fn configure_max_direct_memory(bytes: i64) {
+    let clamped = bytes.max(0);
+    bits().max.store(clamped, Ordering::Relaxed);
+}
+
 fn oom(message: impl Into<String>) -> MethodCallFailed {
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
         message: message.into(),
@@ -1350,6 +1367,20 @@ mod tests {
         if used > 0 {
             bits_unreserve_memory(&mut ctx, &[Value::Long(used), Value::Long(used)]).unwrap();
         }
+        bits().max.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn bug_h2_largeblob_configure_max_direct_memory_round_trips() {
+        let _g = bits_test_lock();
+        let saved = bits().max.load(Ordering::Relaxed);
+        configure_max_direct_memory(777 * 1024 * 1024);
+        assert_eq!(bits().max.load(Ordering::Relaxed), 777 * 1024 * 1024);
+        // Negative input (e.g. an overflowed/garbage config value) must clamp
+        // to 0 rather than going negative, which would make every reservation
+        // trivially pass the `next > max` check below zero.
+        configure_max_direct_memory(-5);
+        assert_eq!(bits().max.load(Ordering::Relaxed), 0);
         bits().max.store(saved, Ordering::Relaxed);
     }
 

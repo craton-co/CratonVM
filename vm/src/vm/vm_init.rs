@@ -1335,6 +1335,24 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+
+        // bug-h2-largeblob-direct-memory-oom fix — resolve the process-wide
+        // direct-buffer accounting cap (java.nio.Bits.reserveMemory's ceiling)
+        // the same way real JDK resolves `-XX:MaxDirectMemorySize`: an
+        // explicit flag value if the launcher passed one, otherwise `-Xmx`.
+        // Previously native_io::direct_buffer hardcoded a 256 MiB cap
+        // regardless of `-Xmx`, so a `-Xmx 1g` H2 MVStore workload with a
+        // genuine ~250 MiB direct-buffer working set (chunk writer thread)
+        // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
+        // same heap size. See
+        // docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+        let direct_memory_cap = config
+            .max_direct_memory_size
+            .unwrap_or(config.max_heap_size);
+        cratonvm_native_io::direct_buffer::configure_max_direct_memory(
+            direct_memory_cap as i64,
+        );
+
         // fork6 GC_STRESS fix — wire the SATB write barrier to the concurrent
         // old-gen cycle. `enable_concurrent_gc` previously had NO production
         // caller: the heap's `concurrent_gc_state` stayed `None`, so
@@ -1654,7 +1672,21 @@ impl SharedVm {
                 );
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
                 // bytecode depends on internal sun.net classes we don't support.
-                cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(
+                //
+                // Call `register_url_codec` directly rather than the whole-module
+                // `register_deprecated_io_util_natives` — that function ALSO
+                // re-registers this module's Date constructors/getters/setters
+                // (and everything else in the module), which is a genuine
+                // duplicate registration of `java/util/Date`'s deprecated
+                // multi-arg constructors: `deprecated_util.rs` registers its own
+                // (Julian/Gregorian-cutover-aware, default-timezone-aware) version
+                // of the same natives earlier in boot, and `NativeMethodRegistry`'s
+                // registration table is last-write-wins, so this second call was
+                // silently clobbering the correct implementation back to the
+                // naive proleptic-Gregorian one with no timezone offset at all.
+                // See `bug-h2-suite-residual-fail-triage.md`'s
+                // `TestPreparedStatement.testDate8` writeup.
+                cratonvm_native_builtins::deprecated_io_util::register_url_codec(
                     &mut native_methods,
                 );
                 // KC26: Register Charset/StandardCharsets natives
@@ -2284,7 +2316,11 @@ impl SharedVm {
                 real_jdk_to_array_typed,
             );
             native_methods.set_category(__prev_toarray);
-            cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(
+            // See the KC26 URL-codec registration comment above: only
+            // `register_url_codec` is wanted here, not the whole
+            // `deprecated_io_util` module (which would re-clobber
+            // `deprecated_util.rs`'s correct `java/util/Date` natives).
+            cratonvm_native_builtins::deprecated_io_util::register_url_codec(
                 &mut native_methods,
             );
             cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);

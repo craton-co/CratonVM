@@ -2545,7 +2545,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
         || name.starts_with("com/sun/")
 }
 
-fn loader_aware_reflect_assignable(
+pub(crate) fn loader_aware_reflect_assignable(
     ctx: &dyn NativeContext,
     source_class_id: ClassId,
     target_class_id: ClassId,
@@ -5615,10 +5615,17 @@ pub(crate) fn native_class_get_declared_field(
 ///   +0 в†’ String (raw descriptor, e.g. "(II)I")
 ///   +1 в†’ Int    (parameter count вЂ” cached)
 ///   +2 в†’ Int    (accessible flag, 0 or 1)
-const METHOD_EXTRA_SLOTS: usize = 3;
+// The fourth tail slot marks metadata written by `create_method_object` as
+// immutable and safe to use without rebuilding the JDK field descriptor.
+const METHOD_EXTRA_SLOTS: usize = 4;
 const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
 const METHOD_EXTRA_OFFSET_ACCESSIBLE: usize = 2;
+const METHOD_EXTRA_OFFSET_TRUSTED: usize = 3;
+// Marker for Method mirrors constructed by `create_method_object`. Real JDK
+// Method objects do not reserve this CratonVM tail slot, so their descriptor
+// still takes the defensive field-reconstruction path below.
+const METHOD_EXTRA_TRUSTED_MARKER: i32 = 0x4d45_5448; // "METH"
 
 // Legacy synthetic Method mirror slots used when `java/lang/reflect/Method`
 // has no real JDK field metadata (synthetic-JDK mode). These mirror the
@@ -5908,6 +5915,11 @@ pub(crate) fn create_method_object(
         Value::Int(param_descs.len() as i32),
     );
     ctx.set_field(obj, base + METHOD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
+    ctx.set_field(
+        obj,
+        base + METHOD_EXTRA_OFFSET_TRUSTED,
+        Value::Int(METHOD_EXTRA_TRUSTED_MARKER),
+    );
 
     ctx.unpin_native_roots(obj_pin);
     obj
@@ -5928,6 +5940,21 @@ pub(crate) fn read_method_descriptor(
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => None,
     }
+}
+
+/// Whether this Method mirror was constructed by CratonVM with a dedicated,
+/// post-layout metadata tail. Unmarked real-JDK mirrors can have an unrelated
+/// field at the calculated tail offset and must not skip descriptor validation.
+#[inline]
+fn method_has_trusted_metadata(ctx: &dyn NativeContext, method_obj: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(method_obj);
+    let base = method_extra_base(ctx, class_id);
+    let marker = base + METHOD_EXTRA_OFFSET_TRUSTED;
+    ctx.object_num_fields(method_obj) > marker
+        && matches!(
+            ctx.get_field(method_obj, marker),
+            Value::Int(METHOD_EXTRA_TRUSTED_MARKER)
+        )
 }
 
 /// Single type token for a `java.lang.Class` mirror (`java/lang/String` в†’
@@ -6016,10 +6043,21 @@ pub(crate) fn method_descriptor_for_invoke(
         close + 1 < d.len()
     }
 
-    let composed = compose_method_descriptor_from_type_fields(ctx, method_obj);
+    // Mirrors built by `create_method_object` own a post-layout descriptor
+    // slot that Java code cannot mutate. Take that fast path before doing the
+    // defensive descriptor scan/reconstruction required for a real JDK
+    // `Method` mirror. Besides avoiding field walks, returning the stored
+    // string directly avoids a second allocation from `trim().to_string()` on
+    // every reflective invocation.
+    if method_has_trusted_metadata(ctx, method_obj) {
+        if let Some(d) = read_method_descriptor(ctx, method_obj) {
+            return d;
+        }
+    }
 
     if let Some(d) = read_method_descriptor(ctx, method_obj) {
         if looks_like_jvm_method_descriptor(&d) {
+            let composed = compose_method_descriptor_from_type_fields(ctx, method_obj);
             let (slot_params, slot_ret) = parse_descriptor_param_and_return(d.trim());
             let (comp_params, comp_ret) = parse_descriptor_param_and_return(&composed);
             // Only trust the CratonVM extra-slot descriptor when it agrees with
@@ -6033,7 +6071,7 @@ pub(crate) fn method_descriptor_for_invoke(
             return d.trim().to_string();
         }
     }
-    composed
+    compose_method_descriptor_from_type_fields(ctx, method_obj)
 }
 
 /// Read the CratonVM-specific cached parameter count extra slot.
@@ -6511,11 +6549,16 @@ pub(crate) fn native_method_invoke(
 
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
-    check_access(
-        modifiers,
-        accessible,
-        &format!("Method.invoke: {}.{}", class_name, method_name),
-    )?;
+    let is_public = (modifiers & ACC_PUBLIC) != 0;
+    // Most framework reflection invokes public methods. Do not format an
+    // exception-only diagnostic string on that successful hot path.
+    if !accessible && !is_public {
+        check_access(
+            modifiers,
+            false,
+            &format!("Method.invoke: {}.{}", class_name, method_name),
+        )?;
+    }
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
     // the override flag short-circuits the deep check (JEP 403).
     //
@@ -6523,7 +6566,6 @@ pub(crate) fn native_method_invoke(
     // only `exports`, not `opens`. Only enforce the deep check when the
     // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
     // setAccessible / opens is required.
-    let is_public = (modifiers & 0x0001) != 0;
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
             return Err(
@@ -9961,7 +10003,7 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// Class-level annotation-proxy identity cache
+// Reflection annotation-proxy identity cache
 //
 // HotSpot caches annotation instances per class (`Class.annotationData`), so
 // repeated `getAnnotation(X)` / `getDeclaredAnnotations()` on the SAME class
@@ -9970,8 +10012,10 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 // identity-sensitive callers (annotations used as `IdentityHashMap` keys, or
 // caches keyed on the annotation instance).
 //
-// We cache the proxy keyed by (queried class id, annotation type descriptor),
-// mirroring HotSpot's per-class `annotationData`. The cached `ObjectRef`s live
+// We cache the proxy keyed by a reflection holder identity plus annotation type.
+// Class entries mirror HotSpot's per-class `annotationData`; method entries add
+// the exact (name, descriptor) because two methods on one class can carry
+// different values of the same annotation type. The cached `ObjectRef`s live
 // only in this process-global side-table, invisible to the heap field scan, so
 // they MUST be GC-rooted and remapped вЂ” see `gc_scan_annotation_proxy_roots`
 // (roots.rs) and `gc_update_annotation_proxy_refs` (gc.rs). Without that, a
@@ -10051,12 +10095,13 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// scan re-locks this cache вЂ” that would deadlock). On a concurrent first-build
 /// race the loser's proxy is dropped (still reachable from the caller's stack
 /// until the next GC), exactly as `OscCache` documents.
-fn cached_annotation_proxy(
+fn cached_annotation_proxy_for_key(
     ctx: &mut dyn NativeContext,
-    queried_class_id: ClassId,
+    holder_class_id: ClassId,
+    key: String,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
-    let key = (queried_class_id.as_u32(), ann.type_descriptor.clone());
+    let key = (holder_class_id.as_u32(), key);
     if let Some(&cached) = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -10069,12 +10114,12 @@ fn cached_annotation_proxy(
     // (e.g. Spring's OverridingClassLoader / FilteringClassLoader) yield a
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
-    let container_loader = crate::classloader::defining_loader_for(queried_class_id.as_u32());
+    let container_loader = crate::classloader::defining_loader_for(holder_class_id.as_u32());
     if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
-        let holder = ctx.class_name_of_id(queried_class_id).unwrap_or_default();
+        let holder = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
         eprintln!(
             "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
-            queried_class_id.as_u32(),
+            holder_class_id.as_u32(),
             ann.type_descriptor,
             if container_loader.is_some() {
                 "SOME"
@@ -10093,6 +10138,39 @@ fn cached_annotation_proxy(
         forget_annotation_proxy_child_roots(proxy);
     }
     cached
+}
+
+/// Build-or-fetch the cached annotation proxy for a class annotation. Keep the
+/// historical key shape for class entries so existing class annotation identity
+/// remains unchanged.
+fn cached_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    cached_annotation_proxy_for_key(ctx, queried_class_id, ann.type_descriptor.clone(), ann)
+}
+
+/// Cache key for an annotation declared directly on a reflected method or
+/// constructor. NUL separators make the component boundaries unambiguous, and
+/// the leading `M` keeps this namespace disjoint from class-annotation keys.
+fn method_annotation_proxy_key(method_name: &str, method_desc: &str, ann_type: &str) -> String {
+    format!("M\0{method_name}\0{method_desc}\0{ann_type}")
+}
+
+fn cached_method_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    cached_annotation_proxy_for_key(
+        ctx,
+        declaring_class_id,
+        method_annotation_proxy_key(method_name, method_desc, &ann.type_descriptor),
+        ann,
+    )
 }
 
 /// GC root scan for the annotation-proxy cache (companion to
@@ -11623,13 +11701,43 @@ pub(crate) fn annotation_element_to_java_typed(
 /// so a downstream `(Annotation[][]) result` cast (e.g. ByteBuddy's
 /// `JavaDispatcher`-backed reflective `Executable.getParameterAnnotations()`
 /// used by Hibernate's `BytecodeProviderImpl`) throws a `ClassCastException`.
+thread_local! {
+    /// Bootstrap `Annotation` class id, scoped to both the owning VM and the
+    /// mutator thread. This avoids a class-manager lookup on every reflective
+    /// annotation-array allocation without leaking a VM-local ClassId into a
+    /// subsequent in-process VM.
+    static ANNOTATION_COMPONENT_CLASS_CACHE: std::cell::Cell<Option<(usize, ClassId)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn annotation_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
-    ctx.class_id_by_name("java/lang/annotation/Annotation")
+    // Reflection-heavy frameworks ask for annotation arrays thousands of times
+    // per test class. `class_id_by_name` takes the class-manager lock, so cache
+    // the bootstrap `Annotation` id per VM and mutator thread. ClassId values
+    // are VM-local; keying by `vm_identity` is essential for in-process VM
+    // tests.
+    let scope = ctx.vm_identity();
+    if let Some(class_id) = ANNOTATION_COMPONENT_CLASS_CACHE.with(|cache| {
+        cache
+            .get()
+            .and_then(|(cached_scope, class_id)| (cached_scope == scope).then_some(class_id))
+    }) {
+        return class_id;
+    }
+
+    let class_id = ctx
+        .class_id_by_name("java/lang/annotation/Annotation")
         .or_else(|| {
             ctx.ensure_class_initialized("java/lang/annotation/Annotation")
                 .ok()
         })
-        .unwrap_or(ClassId::new(0))
+        .unwrap_or(ClassId::new(0));
+    // Do not cache the synthetic fallback: a later call may be able to load
+    // Annotation after bootstrap has progressed.
+    if class_id.as_u32() != 0 {
+        ANNOTATION_COMPONENT_CLASS_CACHE.with(|cache| cache.set(Some((scope, class_id))));
+    }
+    class_id
 }
 
 /// Resolve the `ClassId` of `Annotation[]` (`[Ljava/lang/annotation/Annotation;`)
@@ -11722,9 +11830,7 @@ fn build_annotation_array_for(
 
 /// Like [`build_annotation_array`] but routes each proxy through the per-class
 /// identity cache, so `getDeclaredAnnotations()` / `getAnnotations()` return the
-/// SAME instances `getAnnotation()` returns for `queried_class_id`. Used only by
-/// the CLASS-level annotation natives (field/method annotation arrays keep the
-/// fresh-build path вЂ” their key space is different).
+/// SAME instances `getAnnotation()` returns for `queried_class_id`.
 fn build_class_annotation_array(
     ctx: &mut dyn NativeContext,
     queried_class_id: ClassId,
@@ -11738,6 +11844,32 @@ fn build_class_annotation_array(
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
         cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
+    })
+}
+
+/// Equivalent to [`build_class_annotation_array`] for Method and Constructor.
+/// The returned array is always fresh, as required by the reflection API, while
+/// its annotation elements retain the identity HotSpot caches per executable.
+fn build_method_annotation_array(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
+    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
+        .iter()
+        .filter(|a| annotation_type_loadable(ctx, a))
+        .collect();
+    let component = annotation_component_class_id(ctx);
+    build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
+        cached_method_annotation_proxy(
+            ctx,
+            declaring_class_id,
+            method_name,
+            method_desc,
+            resolvable[i],
+        )
     })
 }
 
@@ -12437,7 +12569,13 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
+    let arr = build_method_annotation_array(
+        ctx,
+        class_id,
+        &method_name,
+        &method_desc,
+        &annotations,
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12522,10 +12660,15 @@ pub(crate) fn native_method_get_annotation(
             }
         }
     }
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, container_loader);
+            let proxy = cached_method_annotation_proxy(
+                ctx,
+                class_id,
+                &method_name,
+                &method_desc,
+                ann,
+            );
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -16023,7 +16166,7 @@ pub(crate) fn native_class_get_annotated_superclass(
     };
 
     let tree = ctx.class_extends_type_annotations(class_id, CLASS_EXTENDS_SUPERCLASS_INDEX);
-    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns);
+    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns, Some(class_id));
     if !tree.children.is_empty() {
         stash_annotated_type_argument_anns(at, tree.children);
     }
@@ -16095,7 +16238,7 @@ pub(crate) fn native_class_get_annotated_interfaces(
             let tree = class_id
                 .map(|cid| ctx.class_extends_type_annotations(cid, i as u16))
                 .unwrap_or_default();
-            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns);
+            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns, class_id);
             if !tree.children.is_empty() {
                 stash_annotated_type_argument_anns(at, tree.children);
             }
@@ -16299,6 +16442,7 @@ fn make_annotated_type_with_anns(
     ctx: &mut dyn NativeContext,
     backing_type: ObjectRef,
     anns: &[cratonvm_native_api::AnnotationData],
+    declaring_class_id: Option<ClassId>,
 ) -> ObjectRef {
     // GC-SAFETY: `build_annotation_array`, `ensure_class_initialized`,
     // `alloc_object`, and (in the `else` branch) `annotated_type_fill_
@@ -16310,7 +16454,7 @@ fn make_annotated_type_with_anns(
     let backing_pin = ctx.pin_native_root(backing_type);
     // Build the proxy array first (it allocates) before we allocate the
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
-    let ann_arr = build_annotation_array(ctx, anns);
+    let ann_arr = build_annotation_array_for(ctx, declaring_class_id, anns);
     let ann_pin = ctx.pin_native_root(ann_arr);
     let backing_type = ctx.read_native_pin(backing_pin, backing_type);
 
@@ -16438,12 +16582,13 @@ pub(crate) fn native_method_get_annotated_return_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (anns, type_arg_anns) = match method_class_name_desc(ctx, this) {
+    let (declaring_class_id, anns, type_arg_anns) = match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => (
+            Some(cid),
             ctx.method_return_type_annotations(cid, &name, &desc),
             ctx.method_return_type_argument_annotations(cid, &name, &desc),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         this,
@@ -16457,7 +16602,7 @@ pub(crate) fn native_method_get_annotated_return_type(
             _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
         },
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16495,7 +16640,7 @@ pub(crate) fn native_parameter_get_annotated_type(
         Value::Int(i) => i as usize,
         _ => 0,
     };
-    let (anns, type_arg_anns) = match method_class_name_desc(ctx, exec) {
+    let (declaring_class_id, anns, type_arg_anns) = match method_class_name_desc(ctx, exec) {
         Some((cid, name, desc)) => {
             let anns = ctx
                 .method_parameter_type_annotations(cid, &name, &desc)
@@ -16507,9 +16652,9 @@ pub(crate) fn native_parameter_get_annotated_type(
                 .get(idx)
                 .cloned()
                 .unwrap_or_default();
-            (anns, type_arg_anns)
+            (Some(cid), anns, type_arg_anns)
         }
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror = match ctx.invoke_virtual(
         exec,
@@ -16525,7 +16670,7 @@ pub(crate) fn native_parameter_get_annotated_type(
         }
         _ => parameter_erased_type_mirror(ctx, this),
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16543,13 +16688,14 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (per_param, per_param_type_args, count) = match method_class_name_desc(ctx, this) {
+    let (declaring_class_id, per_param, per_param_type_args, count) =
+        match method_class_name_desc(ctx, this) {
         Some((cid, name, desc)) => {
             let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
             let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
-            (pta, pta_args, count_method_params(&desc))
+            (Some(cid), pta, pta_args, count_method_params(&desc))
         }
-        None => (Vec::new(), Vec::new(), 0),
+        None => (None, Vec::new(), Vec::new(), 0),
     };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
@@ -16597,7 +16743,7 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
             .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, anns);
+        let at = make_annotated_type_with_anns(ctx, tm, anns, declaring_class_id);
         // Stash this parameter's TYPE_ARGUMENT-level annotations (e.g. the
         // `@Valid` in `List<@Valid Person>`) alongside the AnnotatedType we
         // just built, so a later `getAnnotatedActualTypeArguments()` call on
@@ -16623,12 +16769,13 @@ pub(crate) fn native_field_get_annotated_type(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let (anns, type_arg_anns) = match field_class_and_name(ctx, this) {
+    let (declaring_class_id, anns, type_arg_anns) = match field_class_and_name(ctx, this) {
         Some((cid, name)) => (
+            Some(cid),
             ctx.field_type_annotations(cid, &name),
             ctx.field_type_argument_annotations(cid, &name),
         ),
-        None => (Vec::new(), Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
     let type_mirror =
         match ctx.invoke_virtual(this, "getGenericType", "()Ljava/lang/reflect/Type;", &[]) {
@@ -16638,7 +16785,7 @@ pub(crate) fn native_field_get_annotated_type(
                 _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
             },
         };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns);
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
     stash_annotated_type_argument_anns(at, type_arg_anns);
     Ok(Some(Value::Object(Some(at))))
 }
@@ -16831,7 +16978,7 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
             .as_ref()
             .and_then(|v| v.get(i))
             .unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, &node.anns);
+        let at = make_annotated_type_with_anns(ctx, tm, &node.anns, None);
         if !node.children.is_empty() {
             stash_annotated_type_argument_anns(at, node.children.clone());
         }
@@ -18756,6 +18903,15 @@ mod tests {
         assert_eq!(
             desc, "()I",
             "C6: Method raw descriptor must survive in the extra slot"
+        );
+        assert!(
+            method_has_trusted_metadata(&ctx, method_obj),
+            "CratonVM-created Method mirrors must identify their dedicated metadata tail"
+        );
+        assert_eq!(
+            method_descriptor_for_invoke(&ctx, method_obj),
+            "()I",
+            "Method.invoke must use the trusted immutable descriptor directly"
         );
 
         // Parameter count is 0.
