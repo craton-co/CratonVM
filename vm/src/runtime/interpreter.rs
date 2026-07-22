@@ -17786,7 +17786,10 @@ fn resolve_class_loader_aware(
             || name.contains("MergedAnnotations")
             || name.contains("RootReference")
             || name.contains("MVMap")
-            || name.contains("org/h2/Driver"));
+            || name.contains("org/h2/Driver")
+            || name.contains("AotTestContextInitializers")
+            || name.contains("AotMergedContextConfiguration")
+            || name.contains("DefaultCacheAwareContextLoaderDelegate"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
