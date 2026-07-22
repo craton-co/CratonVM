@@ -17546,6 +17546,28 @@ fn invoke_on_class_shared_inner(
                         .unwrap_or_default(),
                     "NoSuchMethodError"
                 );
+                // CRATONVM_DBG_CCE_BT: a dispatch miss whose receiver resolved
+                // to bare `java/lang/Object` is the stale-ObjectRef family's
+                // cid=0 signature surfacing at INVOKE (the checkcast tracer's
+                // sibling — e.g. `Object.read([CII)I` in Elytron's
+                // MechanismDatabase when a Reader ref went stale). Dump the
+                // frame stack so the producing frame is named, exactly like
+                // CCE-BT-STK.
+                if class_name == "java/lang/Object"
+                    && crate::runtime::interpreter::dbg_cce_bt_enabled()
+                {
+                    eprintln!(
+                        "CRATONVM_DBG_CCE_BT: site=nsme_dispatch method={class_name}.{method_name}{descriptor}"
+                    );
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                        eprintln!(
+                            "  CCE-BT-STK[{i}] {}.{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.pc
+                        );
+                    }
+                }
                 // Optional operator diagnostic: at the terminal not-found point
                 // (no native and no loadable bytecode), emit one clear line so
                 // operators can see exactly what is missing. Gated on

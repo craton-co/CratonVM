@@ -1,13 +1,17 @@
 # WildFly boot: `ClassCastException: java.lang.Object cannot be cast to org.jboss.as.controller.AttributeDefinition` initializing `org.jboss.as.remoting` during parallel-extension-add
 
-Status: **MULTI-PRODUCER FAMILY, TWO PRODUCERS FIXED AND VERIFIED CLOSED 2026-07-19, TWO REMAIN OPEN** —
-see "2026-07-19 session (continued a fourth time): the doc's own originally-named root cause #2 FOUND and
-FIXED" near the bottom for the latest status. This session fixed and independently verified (0/400 each)
-both the `Class.forName`/`asSubclass` mirror-staleness producer (`4bdae388f`) and the doc's own
-originally-named `compare_via_compare_to`/`Comparator.comparing` producer (`bdfd6cff4`). Two items remain
-open: an undiagnosed fifth producer (`Object cannot be cast to String`, MSC service-start,
-`org.wildfly.extension.metrics.registry`) and the separately-tracked, pre-existing register-invisible-root
-family (see `wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`).
+Status: **ALL KNOWN PRODUCERS FIXED — see "2026-07-22 session" at the bottom.** The previously-undiagnosed
+fifth producer (`Object cannot be cast to String`, MSC service-start,
+`org.wildfly.extension.metrics.registry`) was live-captured, root-caused (Properties `entrySet()`
+materialization baking stale refs), and fixed; a sixth producer (`collect_entries_via_iterator` /
+map-copy-constructor stale refs — the mechanism behind the doc's namesake fatal `checkcast` crashes still
+firing on 2026-07-22 dev) was found and fixed in the same session. The separately-tracked
+register-invisible-root family was closed earlier (young start-set truncation,
+`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md`).
+
+Prior status (2026-07-19): two producers fixed and verified 0/400 each (`Class.forName`/`asSubclass`
+mirror staleness `4bdae388f`, `compare_via_compare_to`/`Comparator.comparing` `bdfd6cff4`); fifth
+producer undiagnosed.
 
 **Update, same day, later session:** three unrelated boot blockers (real-vs-synthetic `Module`/
 `ModuleClassLoader` field-layout gaps plus a missing native `findClass` overload registration — see
@@ -886,3 +890,157 @@ post-fix live-reproduction batches plus `cargo test` regression checks (no new f
 pre-existing ones on unpatched `dev`). Two items remain open: the undiagnosed fifth producer above, and
 the pre-existing, separately-tracked register-invisible-root family (its own doc, unaffected by anything
 in this session).
+
+## 2026-07-22 session: fifth producer ROOT-CAUSED and FIXED (Properties entrySet materialization); a sixth producer (polymorphic map-copy iterator walk) found and fixed — the doc's namesake fatal checkcast shape finally explained
+
+Worktree `/data/wt-remoting-cce-close-20260722`, branch `fix/wildfly-remoting-cce-close-20260722`,
+forked from `origin/dev @ 7379a391a`. Baseline binary `probes/cvm-remoting-cce-close-20260722.bin`,
+fixed binary `probes/cvm-remoting-cce-close-20260722-fix1.bin`.
+
+### Methodology delta vs prior sessions
+
+- Same `xargs -P` isolated `standalone.sh` harness (fresh dist copy per slot, `standalone/data`/
+  `tmp`/`log` reset between reuses), `CRATONVM_DBG_CCE_BT=1` + `CRATONVM_DBG_MSC=1` armed, 60s poll
+  window per attempt (every family member fires within ~8s of boot). **20-way parallelism took the
+  Azure host down mid-baseline (hard reboot at ~280/400 attempts) — use P=10.**
+- **Boot currently wedges in `awaitStability` on this config** (`[msc] awaitStability copy problems:
+  skipped 16 null slots` looping forever; ~5 constant background service-start failures: undertow
+  default-server, applicationKS keystore, infinispan `java.base` `ModuleNotFoundException` x2; no
+  `WFLYSRV0025/0026` ever prints). Confirmed NOT a fresh regression — byte-identical on the
+  2026-07-21 round-9 frozen binary (`/data/frozen-cvm-stw-goal-fix11-20260721`) under the same
+  harness; round-9's "healthy" bar was mgmt-port-bound, not a completed boot line. Out of scope for
+  this doc (flagged separately); trials remain valid for this family since extension-add + metrics
+  service start complete long before the wedge.
+- **The fifth producer reproduces far above its historical rate on current dev**: 2 hits in the
+  280-attempt baseline (~0.7%/attempt vs the historical ~1/2,700) — the very first wave produced a
+  hit with both diagnostics firing, the capture the 2026-07-19 sessions never got. Combined family
+  rate in the baseline: 5 events / 280 attempts (~1.8%).
+
+### Fifth producer root cause (FIXED): Properties `entrySet()` materialization baked stale refs
+
+Live capture (`probes/out/boot-19.log`, also `boot-136.log`):
+`CRATONVM_DBG_CCE_BT: site=checkcast obj=java.lang.Object @0x... target=java.lang.String` plus the
+full Java stack via `CRATONVM_DBG_MSC`'s printStackTrace:
+`JmxMetricCollector$MetricProperty.<init>` <- `loadMetadataFromProperties` <- `findMetadata` <-
+`register` <- `init` <- `WildFlyMetricRegistryService.start`. The construct (confirmed via `javap`
+of the actual wildfly-metrics jar): `properties.entrySet().stream().map(MetricProperty::new)` over
+the freshly-`load()`ed `jmx-metrics.properties`; `MetricProperty.<init>` does
+`(String) entry.getKey()`.
+
+Two stacked defects, both the classic Family-1 "raw Rust snapshot across interleaved allocations"
+shape, in the **initial materialization** builders (every *resync* path was hardened by the cceres3
+wave; these builders were missed):
+
+1. `native_properties_entry_set` (`native-builtins/src/properties_sidetable.rs`): the
+   `create_string` loop accumulated raw `ObjectRef`s in a Rust `Vec` while every subsequent
+   `create_string` (and the `chm_extra_entries` Java re-entry) could move the earlier ones.
+2. `make_static_entry_set` (`native-collections/src/lib.rs`): completely unpinned — per-entry
+   `Map$Entry`/node allocations while storing the caller's raw `(key, value)` pairs; `set`/
+   `backing`/`source`/bucket-array refs also carried raw across allocations.
+
+A GC landing mid-materialization bakes a pre-move String address into an entry's key slot; the
+reclaimed block later reads as zeroed -> cid 0 -> bare `java.lang.Object` (the established cid=0
+trap) -> `(String) getKey()` CCE. Non-fatal only because MSC treats a service-start failure as
+non-fatal.
+
+### Sixth producer root cause (FIXED): `collect_entries_via_iterator` — the polymorphic map-copy walk was completely unpinned
+
+The baseline also reproduced THREE FATAL family members, all traced to one function:
+
+- `boot-121.log`: `CRATONVM_DBG_CCE_BT: site=checkcast obj=java.lang.Object ... target=
+  org.jboss.as.controller.OperationStepHandler` -> `System.exit(1)` — this doc's namesake fatal
+  crash shape, still live on 2026-07-22 dev.
+- `boot-89.log`: `NoSuchMethodError: java/lang/Object.entrySet()` at
+  `ConcreteResourceRegistration.getOrCreateSubregistry @pc=116`.
+- `boot-86.log`: `NoSuchMethodError: java/lang/Object.hasNext()` at the same caller/pc.
+
+`javap` of the actual wildfly-controller jar shows pc=116 is the return site of
+`new HashMap<>(this.children)` where `children` is a `Collections.singletonMap` — i.e. WildFly's
+registration registries copying small maps under locks during `parallel-extension-add`, exactly
+where ~40 threads are allocating heavily. That copy is intercepted by
+`native_map_init_from_map` -> `collect_entries_any` -> `collect_entries_via_iterator_inner`
+(the polymorphic `entrySet().iterator()` fallback used for map shapes CratonVM doesn't model —
+`SingletonMap` among them), and that walk had **no pin discipline at all**:
+
+- `source` was carried raw across the destination's bucket-array allocation in
+  `native_map_init_from_map` (a stale source -> `entrySet()` dispatch on bare Object = boot-89).
+- `it` was reused raw across every GC-capable `hasNext`/`next`/`getKey`/`getValue` dispatch
+  (= boot-86's `Object.hasNext()`).
+- `entry` was reused raw across `getKey` when calling `getValue`.
+- the accumulated `out` pairs sat raw across the entire remaining walk — the caller then pinned
+  ALREADY-STALE addresses and copied garbage into the destination map, which is precisely how a
+  later, arbitrarily-distant read of that map produces a bare-Object receiver for whatever cast
+  that consumer performs (= boot-121's `OperationStepHandler`, and plausibly much of the
+  historical "cast-target menagerie" residual rate of this family).
+
+### Fix inventory (all on this branch)
+
+`native-collections/src/lib.rs`:
+- `collect_entries_via_iterator_inner` — full pin chain (source/set/it/entry) + accumulate-pinned
+  pairs read back through pins at the end (mirrors `chm_extra_entries`).
+- `native_map_init_from_map` — pin `source` across the buckets allocation.
+- `native_chm_init_from_map` + `chm_init_segments` — pin `this`/`source`/segments across the 2N+1
+  segment/bucket allocations (also fixes `new ConcurrentHashMap<>(map)` copies).
+- `native_tm_put_all` — pin `source`/`this` across `tm_materialize_deser_array`.
+- `make_static_entry_set` — full pin/refresh (mirrors `resync_view_set`'s hardened entry loop).
+- `native_chm_entry_set` — same (the CHM live-entrySet builder had the identical defect).
+- `native_chm_values` — pin values across the list/array allocations.
+- `make_view_list_of` — pin source+values across allocations (generic values-view builder).
+- `native_props_property_names` — route through the already-hardened `make_snapshot_enumeration`.
+- `native_props_string_property_names` — pin the defaults-chain keys across `hs_contains`/`hs_add`
+  Java re-entry.
+- `chm_collect_all_entries`/`_keys`/`_values` — skip in-flight `computeIfAbsent` RESERVATION
+  markers (value == the segment object), extending the 2026-07-21 `chm_seg_get` marker filter to
+  iteration: previously a concurrent `computeIfAbsent` exposed the bare-Object marker as an entry
+  value to `entrySet()`/`values()`/`forEach`/`toString` consumers.
+
+`native-builtins/src/properties_sidetable.rs`:
+- `native_properties_entry_set` — pin every created string / extra entry, refresh the pair vec
+  through the pins immediately before `make_static_entry_set`.
+
+### Verification
+
+- `cargo test -p cratonvm-native-collections --lib`: 74 passed, 0 failed.
+- `cargo test -p cratonvm-native-builtins --lib`: 3063 passed, 0 failed, 6 ignored.
+- Baseline (unfixed `7379a391a`, `results-baseline.tsv`): 280 attempts — 2 metrics-registry CCEs
+  (`MSCCCE`), 3 fatal events (OperationStepHandler checkcast crash, `Object.entrySet` NSME,
+  `Object.hasNext` NSME), ~1.8% combined.
+- Post-fix (`-fix1.bin`, `results-fix1.tsv`): 451 attempts — **0 metrics-registry CCEs** (baseline
+  rate predicts ~3.2; P(0) ≈ 4%) and **0 `Object.entrySet`/`Object.hasNext` map-copy NSMEs**
+  (same math) — both fixed producers verified closed. 3 events of a REMAINING, distinct shape:
+  `checkcast obj=java.lang.Object target=org.jboss.as.controller.OperationStepHandler`, fatal
+  (exit 1), ~0.67%/attempt — statistically unchanged from baseline (1/280), i.e. NOT touched by
+  these fixes. See below.
+
+### Seventh producer ROOT-CAUSED and FIXED: `Map.getOrDefault` returned the raw `args` default across the GC-capable lookup
+
+The surviving signature — interpreter `checkcast` of a bare-Object (cid=0) receiver to
+`org.jboss.as.controller.OperationStepHandler`, fatal via parallel-extension-add rollback,
+~0.5%/attempt on both baseline and fix1 — was captured with the new `CCE-BT-STK` tracer on the very
+first hunt wave (hunt attempt 2):
+
+```
+CCE-BT-STK[21] org/wildfly/extension/undertow/ListenerResourceDefinition.registerAttributes pc=59
+CCE-BT-STK[20] org/wildfly/extension/undertow/HttpsListenerResourceDefinition.registerAttributes pc=5
+CCE-BT-STK[19] org/jboss/as/controller/registry/NodeSubregistry.registerChild pc=75
+...(registerSubModel/registerChildren chain)...
+CCE-BT-STK[9]  org/wildfly/extension/undertow/UndertowExtension.initialize pc=28
+```
+
+`javap` of the undertow jar: pc 51–59 is
+`this.writeAttributeHandlers.getOrDefault(attr, handler)` → `checkcast OperationStepHandler`. The
+producer is **`native_map_get_or_default`** (`native-collections/src/lib.rs`): it ran the
+GC-capable `native_map_get` (key `hashCode`/`equals` dispatch) and then returned the DEFAULT value
+as a raw `args[2]` copy — a pre-move address whenever a moving GC landed during the lookup. The
+absent-key branch is the COMMON case for undertow's listener attributes (only a few attributes have
+dedicated write handlers), executed dozens of times per listener definition during the
+parallel-extension-add allocation storm — matching both the rate and the "arbitrary cast target"
+history of this family (any `getOrDefault` caller anywhere inherits this defect with its own cast
+target). The same raw-default defect existed in ALL the sibling variants and is fixed in each:
+`native_map_get_or_default`, `native_lhm_get_or_default` (raw across `lhm_find_node`),
+`native_tm_get_or_default` (raw across `tm_materialize_deser_array` + `tm_binary_search`'s
+Comparator dispatch; the raw `args` KEY pinned too), `native_chm_get_or_default` (raw across
+`chm_key_hash`/`chm_seg_get`). The unmodifiable-map wrapper delegates into these and is covered
+transitively.
+
+Verification: post-fix3 campaign — RESULT-PENDING-FIX3.

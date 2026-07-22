@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -631,17 +631,29 @@ fn huc_real_perform(
         } else {
             None
         };
-        let resp = perform(
-            ctx,
-            Some(this),
-            &parsed,
-            &method,
-            &req.headers,
-            &body,
-            connect_to,
-            read_to,
-            established_https_stream,
-        );
+        let resp = if parsed.scheme == "http" {
+            perform_pooled(
+                ctx,
+                &parsed,
+                &method,
+                &req.headers,
+                &body,
+                connect_to,
+                read_to,
+            )
+        } else {
+            perform_with_retry(
+                ctx,
+                Some(this),
+                &parsed,
+                &method,
+                &req.headers,
+                &body,
+                connect_to,
+                read_to,
+                established_https_stream,
+            )
+        };
         match resp {
             Ok((status, headers, resp_body))
                 if req.follow_redirects && is_redirect_status(status) && redirect_count < 20 =>
@@ -709,6 +721,13 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
             ))
         }
+        // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
+        // reach Java as `ConnectException`, not a generic IOException — real
+        // code catches it specifically (see the type's own doc).
+        Err(ref e) if e.starts_with(CONNECT_REFUSED_SENTINEL) => Err(RuntimeError::ConnectException {
+            message: e.trim_start_matches(CONNECT_REFUSED_SENTINEL).to_string(),
+        }
+        .into()),
         // A transport failure before a response is available is an IOException.
         Err(e) => Err(ioex(format!("HttpURLConnection response failed: {e}"))),
     }
@@ -1116,6 +1135,16 @@ const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
 /// failures (e.g. a malformed-but-present HTTP response).
 const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__: ";
 
+/// Prefix on an error string returned by [`perform`] when its TCP connect
+/// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
+/// recognises this and raises `java.net.ConnectException` (real-JDK
+/// behaviour — see the typed `RuntimeError::ConnectException` variant's doc),
+/// matching every other native connect path in this codebase (plain
+/// `Socket`/`SocketChannel`), instead of folding a refused connection into
+/// the generic IOException used for other connect failures (DNS failure,
+/// timeout).
+const CONNECT_REFUSED_SENTINEL: &str = "__cratonvm_connect_refused__: ";
+
 /// Map a socket-read `io::Error` to an error string, flagging a timeout via
 /// [`READ_TIMEOUT_SENTINEL`]. A blocking `read` that hits `SO_RCVTIMEO`
 /// surfaces as `WouldBlock` (Unix) or `TimedOut` (Windows).
@@ -1499,6 +1528,7 @@ fn perform(
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
     // Blocking region: pure OS-level TCP connect, no Java interaction at all —
     // safe to mark this thread GC-parked for however long it takes.
+    let mut last_err_refused = false;
     ctx.begin_blocking_region();
     for sa in addrs {
         match TcpStream::connect_timeout(&sa, connect_timeout) {
@@ -1506,13 +1536,24 @@ fn perform(
                 tcp = Some(s);
                 break;
             }
-            Err(e) => last_err = Some(format!("connect {sa}: {e}")),
+            Err(e) => {
+                last_err_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+                last_err = Some(format!("connect {sa}: {e}"));
+            }
         }
     }
     ctx.end_blocking_region();
-    let tcp = tcp.ok_or_else(|| {
-        last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"))
-    })?;
+    let tcp = match tcp {
+        Some(t) => t,
+        None => {
+            let msg = last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"));
+            return Err(if last_err_refused {
+                format!("{CONNECT_REFUSED_SENTINEL}{msg}")
+            } else {
+                msg
+            });
+        }
+    };
     let _ = tcp.set_read_timeout(Some(read_timeout));
     let _ = tcp.set_write_timeout(Some(read_timeout));
     let _ = tcp.set_nodelay(true);
@@ -1726,6 +1767,337 @@ fn perform(
         })();
         ctx.end_blocking_region();
         result
+    }
+}
+
+/// Wraps [`perform`] with HotSpot's transparent retry-once-on-dead-connection
+/// behaviour: `sun.net.www.protocol.http.HttpURLConnection` silently retries
+/// a request over a brand-new TCP connection when the first attempt's
+/// connection is closed by the peer before any response bytes arrive (its
+/// legacy recovery heuristic for a stale/dead pooled keep-alive connection —
+/// which also covers a genuinely brand-new connection the peer tears down
+/// mid-request). Confirmed against real JDK 21 and 25 with a minimal
+/// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
+/// pattern (`docs/known-issues/h2-suite-bugs/
+/// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
+/// the `logout.do` request in full, then — synchronously, on that same
+/// request-handling thread — closes its own just-accepted socket as part of
+/// tearing itself down, before ever writing a response. That is NOT a
+/// CratonVM-specific race (a standalone repro of exactly this shape fails
+/// identically on real JDK), but real JDK's client-side retry then hits a
+/// listening socket that has, by that point, already been closed by the same
+/// shutdown — `ConnectException` — which is what the H2 test's
+/// `catch (ConnectException e)` actually expects. Without this retry,
+/// CratonVM's single-attempt `perform` surfaces the first attempt's raw
+/// "connection closed before response head" as a generic `IOException`
+/// instead. Skipped for the caller-supplied-socket (custom `SSLSocketFactory`)
+/// path: that connection isn't ours to reopen.
+fn perform_with_retry(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+    parsed: &Url1,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    established_https_stream_id: Option<i32>,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let resp = perform(
+        ctx,
+        connection,
+        parsed,
+        method,
+        headers,
+        body,
+        connect_timeout,
+        read_timeout,
+        established_https_stream_id,
+    );
+    match resp {
+        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
+            perform(
+                ctx,
+                connection,
+                parsed,
+                method,
+                headers,
+                body,
+                connect_timeout,
+                read_timeout,
+                established_https_stream_id,
+            )
+        }
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plain-HTTP keep-alive connection pool
+//
+// Real JDK's `sun.net.www.http.HttpClient`/`KeepAliveCache` pools/reuses a
+// TCP connection across *separate* `HttpURLConnection` instances to the same
+// `(host, port)` whenever the previous response was fully drained and
+// neither side sent `Connection: close`. This codebase's `perform()` never
+// did that — every call opened, used, and implicitly dropped a brand-new
+// `TcpStream`. That's not just a performance gap: some servers key
+// connection-scoped state off the TCP connection itself (H2's `WebServer`
+// per-`WebThread` session-locale persistence is one confirmed case — see
+// `docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md`
+// for the full root-cause writeup with a `tcpdump`-confirmed repro).
+//
+// Deliberately scoped conservative for this first implementation:
+//   - plain HTTP only (no TLS session reuse to get right, and no
+//     interaction with the already-hardened HTTPS/custom-`SSLSocketFactory`
+//     branches of `perform`/`perform_with_retry`, which this pool never
+//     touches at all).
+//   - never pools a chunked response (sidesteps getting the exact
+//     "0\r\n\r\n" trailer consumption right — `read_chunked` doesn't
+//     currently guarantee it hasn't left the trailing CRLF unread on the
+//     wire, which would corrupt the next reused request's response parse;
+//     simplest safe answer here is to just never reuse that connection).
+//   - a pooled connection is liveness-checked with a non-blocking `peek()`
+//     before being handed out (catches the common "peer already closed"
+//     case cheaply), AND *every* use — pooled or freshly connected — falls
+//     back to one fresh-connection retry on any transport failure, so a
+//     `peek()` TOCTOU race (connection dies between the peek and our write)
+//     can never do worse than one wasted reconnect. This retry-of-last-resort
+//     is a superset of `perform_with_retry`'s HotSpot-parity retry (that one
+//     only retries a *fresh* connection's specific "closed before response
+//     head" failure; this one also retries a *reused* connection on any
+//     failure, since staleness can surface as a write error too).
+//   - small per-key cap and a short idle timeout, evaluated lazily on
+//     access (no background reaper thread, unlike real JDK's actual
+//     `KeepAliveCache`) — bounds memory/fd growth for the common case (the
+//     same handful of hosts:ports hit repeatedly within one test run)
+//     without the complexity of proactive cross-key eviction. A host:port
+//     that's contacted once and never again leaks its pooled entries for
+//     the life of the process; acceptable for now given the alternative
+//     (a background reaper) adds its own correctness surface.
+// ---------------------------------------------------------------------------
+
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const POOL_MAX_PER_KEY: usize = 4;
+/// Read timeout used ONLY for a reused pooled connection's first response —
+/// deliberately much shorter than the caller's configured read timeout
+/// (which defaults to 60s and can be set much higher). The liveness `peek()`
+/// in `pool_take_live` only catches a peer that has already sent a FIN; it
+/// cannot catch a peer that accepts our write into a half-dead connection
+/// (e.g. it already closed its read side, or closed between the peek and
+/// our write — a TOCTOU race) and then never responds. Without this, that
+/// case stalls for the *full* read timeout before the fallback-to-fresh
+/// retry ever kicks in — observed directly: an early version of this pool
+/// using the caller's full read timeout for reused connections made
+/// `org.h2.test.server.TestWeb` intermittently take 25s+ (a stale
+/// connection or two hit per run, each stalling most of the way to a 60s
+/// default) instead of the sub-second baseline. This bounds that worst case
+/// to one short stall per stale hit instead of one long one; a genuinely
+/// alive reused connection replying at all (even slowly) is expected to
+/// beat this easily since it's on a warm connection with no fresh TCP
+/// handshake to pay for.
+const POOL_REUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+type PoolKey = (String, u16);
+
+fn conn_pool() -> &'static Mutex<HashMap<PoolKey, Vec<(TcpStream, Instant)>>> {
+    static POOL: OnceLock<Mutex<HashMap<PoolKey, Vec<(TcpStream, Instant)>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pop a still-live pooled connection for `key`, discarding (not returning)
+/// any entry that's aged out or whose peer has already closed. A
+/// non-blocking `peek()` distinguishes "idle and healthy" (`WouldBlock`, no
+/// data waiting) from "peer closed" (`Ok(0)`) or "peer sent something
+/// unsolicited" (`Ok(n>0)` — also treated as unusable; a healthy idle
+/// keep-alive connection has nothing to say until we write a request).
+fn pool_take_live(key: &PoolKey) -> Option<TcpStream> {
+    loop {
+        let candidate = {
+            let mut pool = conn_pool().lock().ok()?;
+            let list = pool.get_mut(key)?;
+            list.pop()
+        };
+        let (stream, inserted_at) = candidate?;
+        if inserted_at.elapsed() >= POOL_IDLE_TIMEOUT {
+            continue;
+        }
+        let _ = stream.set_nonblocking(true);
+        let mut probe = [0u8; 1];
+        let live = matches!(
+            stream.peek(&mut probe),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        );
+        let _ = stream.set_nonblocking(false);
+        if live {
+            return Some(stream);
+        }
+    }
+}
+
+/// Return a connection to the pool for reuse, dropping it instead if the
+/// per-key cap is already full (closing an idle connection is harmless —
+/// it just means the next request to this host:port pays for a fresh
+/// connect, same as before this pool existed).
+fn pool_put(key: PoolKey, stream: TcpStream) {
+    if let Ok(mut pool) = conn_pool().lock() {
+        let list = pool.entry(key).or_default();
+        if list.len() < POOL_MAX_PER_KEY {
+            list.push((stream, Instant::now()));
+        }
+    }
+}
+
+/// Whether a just-completed request/response on this connection is safe to
+/// hand back to the pool: neither side asked for `Connection: close`, and
+/// the response wasn't chunked (see the module doc above for why chunked
+/// responses are excluded).
+fn is_poolable(resp_headers: &[(String, String)], req_headers: &[(String, String)]) -> bool {
+    let has_close = |hs: &[(String, String)]| {
+        hs.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("connection")
+                && v.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("close"))
+        })
+    };
+    let is_chunked = resp_headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    !is_chunked && !has_close(resp_headers) && !has_close(req_headers)
+}
+
+/// Plain-TCP connect loop shared by [`perform`]'s http/https-agnostic connect
+/// stage and this pool's fresh-connection path. Tags a refused connection
+/// with [`CONNECT_REFUSED_SENTINEL`], exactly like `perform`'s own copy of
+/// this loop (kept as a separate, small, duplicated function rather than
+/// factored into `perform` itself — `perform` is already verified/merged
+/// for the non-pooled path and this avoids touching it again for what's a
+/// ~15-line loop).
+fn connect_plain(parsed: &Url1, connect_timeout: Duration) -> Result<TcpStream, String> {
+    let addr = format!("{}:{}", parsed.host, parsed.port);
+    let mut addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+        .map_err(|e| format!("resolve {addr}: {e}"))?
+        .collect();
+    addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
+    let mut last_err: Option<String> = None;
+    let mut last_err_refused = false;
+    for sa in addrs {
+        match TcpStream::connect_timeout(&sa, connect_timeout) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last_err_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+                last_err = Some(format!("connect {sa}: {e}"));
+            }
+        }
+    }
+    let msg = last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"));
+    Err(if last_err_refused {
+        format!("{CONNECT_REFUSED_SENTINEL}{msg}")
+    } else {
+        msg
+    })
+}
+
+/// Configure a connection (pooled or fresh) identically before use.
+fn configure_stream(stream: &TcpStream, read_timeout: Duration) {
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let _ = stream.set_write_timeout(Some(read_timeout));
+    let _ = stream.set_nodelay(true);
+}
+
+/// Write `req` and read one response over `stream`, bracketed in a blocking
+/// region exactly like `perform`'s own plain-HTTP write+read (pure OS I/O,
+/// no Java-heap touch inside the closure).
+fn attempt_plain(
+    ctx: &mut dyn NativeContext,
+    stream: &mut TcpStream,
+    req: &[u8],
+    head: bool,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    ctx.begin_blocking_region();
+    let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+        stream.write_all(req).map_err(|e| format!("write: {e}"))?;
+        stream.flush().map_err(|e| format!("flush: {e}"))?;
+        read_response(stream, head)
+    })();
+    ctx.end_blocking_region();
+    result
+}
+
+/// Plain-HTTP entry point used in place of [`perform_with_retry`] whenever
+/// `parsed.scheme == "http"`: tries a pooled connection first, falls back to
+/// (and, on success, pools) a fresh one. See the module doc above for the
+/// pooling contract and why this is a separate, self-contained function
+/// rather than a modification of `perform`. Each of the two branches below
+/// makes at most one retry attempt, matching `perform_with_retry`'s
+/// exactly-once bound — a pooled-connection failure retries once fresh; a
+/// pool-miss's fresh connection retries once more only on the specific
+/// HotSpot-parity "closed before response head" shape (`perform_with_retry`'s
+/// own condition).
+fn perform_pooled(
+    ctx: &mut dyn NativeContext,
+    parsed: &Url1,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let head = method.eq_ignore_ascii_case("HEAD");
+    let req = build_request(method, parsed, headers, body);
+    let key: PoolKey = (parsed.host.clone(), parsed.port);
+
+    if let Some(mut stream) = pool_take_live(&key) {
+        // Short probe timeout, not the caller's full `read_timeout` — see
+        // `POOL_REUSE_PROBE_TIMEOUT`'s doc.
+        configure_stream(&stream, read_timeout.min(POOL_REUSE_PROBE_TIMEOUT));
+        let result = attempt_plain(ctx, &mut stream, &req, head);
+        return match result {
+            Ok((status, resp_headers, resp_body)) => {
+                if is_poolable(&resp_headers, headers) {
+                    pool_put(key, stream);
+                }
+                Ok((status, resp_headers, resp_body))
+            }
+            Err(_) => {
+                // Stale despite the liveness peek (TOCTOU, or the peer
+                // closed at this exact moment) — exactly one fresh retry.
+                let mut fresh = connect_plain(parsed, connect_timeout)?;
+                configure_stream(&fresh, read_timeout);
+                let result2 = attempt_plain(ctx, &mut fresh, &req, head);
+                if let Ok((_, ref resp_headers, _)) = result2 {
+                    if is_poolable(resp_headers, headers) {
+                        pool_put(key, fresh);
+                    }
+                }
+                result2
+            }
+        };
+    }
+
+    // Pool miss: normal fresh-connect path, preserving `perform_with_retry`'s
+    // original HotSpot-parity single retry (e.g. H2 WebServer's
+    // self-shutdown-on-logout — see the sibling FIXED doc).
+    let mut stream = connect_plain(parsed, connect_timeout)?;
+    configure_stream(&stream, read_timeout);
+    let result = attempt_plain(ctx, &mut stream, &req, head);
+    match result {
+        Err(ref e) if e == "connection closed before response head" => {
+            let mut fresh = connect_plain(parsed, connect_timeout)?;
+            configure_stream(&fresh, read_timeout);
+            let result2 = attempt_plain(ctx, &mut fresh, &req, head);
+            if let Ok((_, ref resp_headers, _)) = result2 {
+                if is_poolable(resp_headers, headers) {
+                    pool_put(key, fresh);
+                }
+            }
+            result2
+        }
+        Ok((status, resp_headers, resp_body)) => {
+            if is_poolable(&resp_headers, headers) {
+                pool_put(key, stream);
+            }
+            Ok((status, resp_headers, resp_body))
+        }
+        other => other,
     }
 }
 
