@@ -504,6 +504,14 @@ Picked up the 7 items still open after the first follow-up session (worktree
   workload. No targeted fix attempted, matching `TestFileLock`/
   `TestTransaction`'s existing characterization — would require broader
   interpreter throughput work, not a discrete patch.
+  **Second confirmed instance (2026-07-22, follow-up session)**:
+  `TestWeb.testWebApp()`'s `autoCompleteList.do?query=select 'abc` empty-body
+  failure — originally tracked as a separate, seemingly-unrelated doc
+  (`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, an `RuleElement
+  .link` NPE hypothesis from an incomplete isolated repro) — turned out to
+  be the exact same `Sentence.MAX_PROCESSING_TIME` budget-exhaustion
+  mechanism, this time for a query with an unclosed string literal. See
+  that doc (now closed/reclassified) for the full faithful-repro writeup.
 
 - **`TestUpgrade` — `SecurityException` half confirmed still FIXED**
   (from the first follow-up session), **but the secondary
@@ -818,4 +826,25 @@ confirmation the second-pass session couldn't get; check
 `/tmp/testrandommapops.log` on the Azure host (or a future session's own
 rerun) for the outcome if this doc wasn't updated with a result before the
 session ended.
+
+**Outcome (2026-07-22, same session):** the full 2-hour run completed its
+`timeout` wrapper without ever exiting on its own — killed at the 7200s mark,
+no assertion, no crash, no output past the initial start line the entire run
+(`/tmp/testrandommapops.log` on the Azure host, PID `1793972`, confirmed via
+`ps` to still be at 99.9% CPU with zero new log output moments before the
+`timeout` wrapper reaped it). This is consistent with, and strengthens, the
+existing "very likely fixed, not 100% verified" characterization — two hours
+of continuous CPU-bound execution with no assertion failure or crash is
+strong evidence the original fast, deterministic `rev (1654, null)` bug is
+genuinely gone, not just delayed. But it also means a true exit-0 completion
+is not achievable within a normal session's time budget at the current
+interpreter throughput: `TestAll.big`'s fuzz workload (up to 3000 ops × 100
+rounds) does not complete in 2+ hours under CratonVM real-JDK mode. Whoever
+next needs a definitive confirmation should either (a) run it detached with a
+much longer timeout (a half-day+) and check back later, or (b) treat "no
+crash after 2 CPU-hours" as sufficient confidence and close this item as
+fixed — the latter is this session's recommendation, since the odds of an
+assertion or crash appearing only after hour 3+ but not in the first 2 are
+low for a genuinely-fixed, purely-CPU-bound fuzz loop (as opposed to e.g. a
+rare race that needs a specific interleaving to trigger).
 
