@@ -9471,6 +9471,18 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => Some(*a),
                 _ => None,
             };
+            let tms_arr = match args.get(2) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            // Install the long-lived manager roots before resolving identity
+            // or transferring pending context state.  Those helpers can
+            // allocate/re-enter Java; native-call argument pins survive that
+            // collection, but the copied ObjectRefs above do not get rewritten
+            // afterwards.  Retaining them later could publish a recycled
+            // receiver into the TLS manager table.
+            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
+            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
             // the KeyManager[] this call actually received (immune to an
             // intervening, unrelated SSLContext.init draining the
@@ -9492,12 +9504,6 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // these — so without this, custom/OCSP/CRL trust managers are
             // silently never invoked. Consulted post-handshake by
             // `t27_tls::engine_run_trust_check`.
-            let tms_arr = match args.get(2) {
-                Some(Value::Object(Some(a))) => Some(*a),
-                _ => None,
-            };
-            crate::t27_tls::attach_trust_managers_to_ctx(ctx, this, tms_arr);
-            crate::t27_tls::attach_key_managers_to_ctx(ctx, this, kms_arr);
             Ok(None)
         },
     );

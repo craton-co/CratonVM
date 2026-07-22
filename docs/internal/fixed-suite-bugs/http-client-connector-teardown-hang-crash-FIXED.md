@@ -1,4 +1,38 @@
-# spring-boot-http-client connector test classes: intermittent hang/crash after ~20 Tomcat NIO cycles; Jetty client 100%-reproducible TLS-handshake-never-starts hang
+# spring-boot-http-client connector teardown hang/crash — FIXED
+
+**Status (2026-07-22): fully fixed and closed.** This record was moved from
+`docs/known-issues/springboot` after final validation of all seven affected
+client-factory/connector classes in both execution modes.
+
+The final residual was an overlay-dispatch bug in the direct `SSLSocket`
+path. `HttpComponents` calls `SSLSocket.isInputShutdown()` immediately before
+writing a request body. Although `java.net.Socket` has a native override, a
+real-JDK `SSLSocket` receiver did not reliably inherit it through native
+lookup. It instead executed host-JDK `Socket` bytecode against the synthetic
+TLS object, interpreting unrelated overlay fields as `Socket.impl`/`shutIn`.
+That produced an intermittent false positive and
+`ConnectionClosedException: Connection is closed` during the POST HTTPS case.
+`register_p68_ssl` now registers `isInputShutdown()` and
+`isOutputShutdown()` directly on `SSLSocket`, using the GC-safe socket
+side-table close state.
+
+The same closure also fixes the adjacent moving-GC lifetime residual in
+`SSLContext.init`: TrustManager[] and KeyManager[] are now retained in the
+long-lived TLS tables before helpers that may allocate or re-enter Java. This
+prevents a stale copied object reference from later dispatching certificate
+validation to a recycled receiver.
+
+Verification on the final release binary:
+
+- Three full JIT and three full `--nojit` runs of
+  `HttpComponentsClientHttpRequestFactoryBuilderTests`: 32/32 passed each.
+- Final seven-class matrix in each mode: 213/213 tests passed in `--nojit`
+  and 213/213 passed with JIT; no class exceeded the 180-second per-process
+  hang guard.
+
+The detailed historical investigation is retained below for provenance.
+
+# Historical investigation: spring-boot-http-client connector test classes
 
 **Status (2026-07-21): Cluster A (`JettyClientHttpConnectorBuilderTests`,
 100%-reproducible before this session) is FIXED — two real, independent bugs
