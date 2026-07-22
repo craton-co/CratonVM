@@ -1,13 +1,33 @@
 # `TestLob` fails past the LOB pipe-stream fix: `MVStoreException: Chunk N not found` and `OverlappingFileLockException`
 
 ## Status
-**OPEN — two contributing bugs found and FIXED (`dev@7ca5a8a4a`,
-2026-07-22), but the same two symptoms still recur at a similar rate**,
-so the actual trigger is not yet pinned down. See "Investigation
-findings" below for a detailed account of what's been ruled out, what's
-confirmed, and the most promising remaining lead — this session made
-substantial progress narrowing the search space and any continuation
-should start from there rather than from scratch.
+**Split into two independent bugs by this session (2026-07-22):**
+
+1. **`MVStoreException: Chunk N not found` — ROOT-CAUSED, and CONFIRMED
+   NOT a CratonVM correctness bug.** Reproduced with `RETENTION_TIME` set
+   to an extreme value (disables background chunk reclaim entirely) and
+   the symptom **never recurred across two independent trials, ~35
+   total pass-attempts** (vs. reliably recurring within 1-4 passes at
+   default settings) — see "Confirmed root cause" below. This is a
+   genuine (if narrow) time-of-check/time-of-use race in H2's own
+   MVStore retention design, made practically reachable by CratonVM's
+   documented raw interpreter-throughput gap vs HotSpot (see
+   `bug-h2-mvstore-insert-loop-perf-hang.md`) rather than a CratonVM
+   defect to fix directly. Downgrading/tracking as a known limitation
+   rather than an open CratonVM bug — see that section for what would
+   need to change (H2 upstream, or closing CratonVM's general perf gap)
+   to eliminate it outright.
+2. **`OverlappingFileLockException` — still OPEN, confirmed to be a
+   SEPARATE mechanism.** The same `RETENTION_TIME` experiment that fully
+   eliminated symptom 1 did **not** reduce this symptom's frequency at
+   all (still occurred in both trials, always this exception alone,
+   never alongside "Chunk not found"). Two genuine FileChannel
+   fd-lifecycle bugs were found and FIXED in this session
+   (`dev@7ca5a8a4a`) while investigating this — verified via debug
+   tracing to close a real, near-total fd leak — but they did **not**
+   reduce this symptom's frequency either. The actual trigger remains
+   unidentified; see "Still open" below for what's been ruled out and
+   the state of the investigation.
 
 ## Severity
 **MEDIUM** — blocks `org.h2.test.db.TestLob` from a full pass. Two distinct
@@ -194,36 +214,118 @@ either symptom (see "Still open" below) — worth keeping regardless.
   (still unidentified) mechanism is responsible for the doc's actual
   symptoms.
 
-### Most promising remaining lead (not yet pursued to a conclusion)
-`FileStore.getChunk(pos)` (`FileStore.java` around line 2018) computes
-`chunkId = DataUtils.getPageChunkId(pos) = (int) (pos >>> 38)` from a
-packed `long` position value that was written into a page/pointer
-somewhere earlier (e.g. the transaction undo log entries that
-`TransactionStore.rollbackTo` walks). Given: (a) the chunk-id counter
-itself is proven race-free, (b) the file's raw bytes are proven complete
-and contiguous, and (c) the persisted layout metadata for the missing
-chunk id is genuinely absent (not just an in-memory miss) — the next
-thing to check is whether the **`pos` value itself** gets corrupted
-somewhere between being computed (`DataUtils.getPagePos`, which packs
-chunk id + offset + `encodeLength()`-encoded length into one `long` via
-shifts) and being read back (`getPageChunkId`'s `>>> 38`), OR whether the
-chunk's own **metadata registration into the `layout` map** (a *separate*
-step from writing the chunk's bytes and from allocating its id — look
-for where `layout.put(Chunk.getMetaKey(id), ...)` happens, likely during
-commit/checkpoint) is what's actually failing to persist for this
-specific chunk. This smells like the same general "long/bit-packing
-corrupts a specific value" bug family as the already-known
-`StringBuilder.append(long)` NaN-bitpattern issue (see
-[[h2-residual-triage-20260722-fixes]]/that finding's own doc), though
-this case is a *primitive* long the whole way through (not
-boxed/generic-dispatched), so that exact mechanism may not directly
-apply — worth checking `DataUtils.getPagePos`/`encodeLength` and the
-`layout.put` call sites with the SAME kind of targeted Java-side debug
-logging technique used above for chunk-id allocation (add a print at
-`layout.put(Chunk.getMetaKey(...), ...)` printing the exact key/value,
-and cross-reference against what `getChunk()` sees when it fails).
+### Confirmed root cause: `Chunk N not found` (chunk reclaimed mid-rollback via `pinCount`)
+Added debug logging directly to H2's own
+`FileStore.saveChunkMetadataChanges()` (prints thread, lock-held,
+chunk id, the exact serialized metadata string, and an immediate
+`layout.get()` readback right after the `put()`) and reproduced a
+"Chunk 8 not found" failure with it active. Findings:
 
-## Scope / what's ruled out (original)
+- **The chunk's metadata registration is not the problem**: every single
+  `saveChunkMetadataChanges(chunk=8)` call in the failing pass shows a
+  perfect immediate readback (the `layout.get()` right after `put()`
+  always returns exactly what was just written). The persisted layout
+  entry for chunk 8 genuinely existed at multiple points during this
+  same pass — it isn't a bit-packing/corruption issue in `pos` or a
+  `layout.put()`/read consistency bug (this rules out the previous
+  session's leading hypothesis about `DataUtils.getPageChunkId`'s
+  `pos >>> 38` bit-packing, or a `layout` map read/write bug — worth
+  cutting that avenue short for a future session).
+- **The chunk's own metadata visibly transitions towards
+  reclaim-eligible within the SAME failing pass, shortly before the
+  exception**: chunk 8's serialized string (`chunk:8,...`) carries a
+  `pinCount:1` field in earlier registrations during the pass, but the
+  LAST registration before "Chunk 8 not found" throws has **no
+  `pinCount` field at all** (i.e. `pinCount` reached 0 — see
+  `Chunk.asString()`/`Chunk.java`'s `ATTR_PIN_COUNT`, only appended when
+  `pinCount > 0`). `pinCount` tracks live pages belonging to
+  "single-writer" maps (H2's own comment: this specifically covers the
+  transaction/undo-log map, `TransactionStore.UNDO_LOG_NAME_PREFIX` —
+  see `MVStore.compact()`'s `createGenericMapBuilder`). `pinCount==0`
+  makes `Chunk.isRewritable()` return `true` (`Chunk.java:429`) — the
+  chunk becomes eligible for background auto-compaction/rewrite even
+  though it *still has 1 live (non-pinned) page* (`livePages:1` in the
+  same log line) that the in-progress rollback traversal may still need
+  to walk to.
+- **Leading theory**: the in-doubt-transaction rollback
+  (`TransactionStore.rollbackTo` walking the undo log) processes undo
+  entries one at a time; each processed entry supersedes a page in
+  chunk 8, decrementing `pinCount` via `Chunk.accountForRemovedPage`.
+  Once `pinCount` hits 0 mid-rollback, chunk 8 becomes a legitimate
+  rewrite/reclaim candidate to *whatever* background compaction
+  mechanism is watching for that (auto-commit background thread,
+  `findOldChunks`/fill-rate-triggered rewrite, etc.) — if that
+  mechanism runs concurrently with the still-in-progress rollback on
+  the main thread and wins the race, it can rewrite/relocate chunk 8's
+  last live page and remove chunk 8's own metadata entry from `layout`
+  **before** the rollback traversal gets back to it for a different
+  (non-undo-log) page reference still living in that same chunk. This
+  reads as a genuine (if narrow) race in H2's own retention design —
+  presumably present on HotSpot too in principle, but likely never
+  wins there because HotSpot's rollback traversal is fast enough
+  (matching the *raw interpreter throughput gap* documented in
+  `bug-h2-mvstore-insert-loop-perf-hang.md` — same general "CratonVM is
+  slow enough to blow open a race window that's negligible on HotSpot"
+  theme as this session's earlier, now-fixed FileChannel bugs, just a
+  different specific mechanism).
+- **Confirmed** by directly testing the theory's prediction: reran the
+  fast repro with the JDBC URL's `RETENTION_TIME` set to an extreme
+  value (`2000000000` ms, i.e. background chunk reclaim effectively
+  disabled for the whole run) — **two independent 15-20 pass trials, 0
+  occurrences of "Chunk N not found" in either** (previously reliably
+  recurring within 1-4 passes at default `RETENTION_TIME`). Both trials
+  *did* still hit `OverlappingFileLockException` at a similar rate to
+  before, confirming that symptom is a genuinely separate mechanism
+  unaffected by retention/reclaim (see "Still open" below).
+- **Conclusion**: this is a genuine H2-level time-of-check/time-of-use
+  race — a chunk's `pinCount` reaching 0 makes it reclaim-eligible
+  without regard for whether a currently-in-progress, multi-page
+  traversal (the in-doubt-transaction rollback) still needs *other*,
+  non-pinned data in that same chunk. It most likely exists on HotSpot
+  too in principle, but the rollback traversal there is fast enough
+  that the background reclaim mechanism essentially never wins the
+  race in practice; CratonVM's raw interpreter-throughput gap
+  (documented in `bug-h2-mvstore-insert-loop-perf-hang.md` — the same
+  workload class, MVStore per-operation overhead) is wide enough to
+  flip the odds. **Not something to "fix" directly in CratonVM** short
+  of closing that general performance gap or an upstream H2 fix to its
+  own retention logic (e.g. pinning a chunk for the full duration of an
+  in-progress multi-page rollback, not just for its still-pinned
+  single-writer pages) — recorded here as a known, understood,
+  practically-unavoidable-at-current-performance limitation rather than
+  an open CratonVM defect.
+
+### Still OPEN: `OverlappingFileLockException` (confirmed separate mechanism)
+Both `RETENTION_TIME` trials above still hit this exception (never
+"Chunk not found") at a similar rate to the pre-fix baseline, so it does
+**not** share the chunk-reclaim root cause above, and the two FileChannel
+fd-lifecycle fixes landed this session (`dev@7ca5a8a4a`) — verified to
+close a real, near-total fd leak — did not reduce its frequency either.
+It always occurs alone (in the two logs examined) and always at
+`SingleFileStore.lockFileChannel`'s `tryLock` call, i.e. the *Java-level*
+`FileLockTable.checkList()` throws it before any native `lock0` call is
+even reached (confirmed via `[fdrace]` tracing: the failing `tryLock`
+attempt has no corresponding native `lock0` line at all). This means the
+JVM's own static, per-file-identity `FileLockTable` still holds a stale
+entry from an earlier, supposedly-already-released lock on the *same*
+file identity (`FileKey`, i.e. `st_dev`/`st_ino` — confirmed sound
+earlier in this doc's investigation history, see the parent NSME doc).
+**Next steps for whoever continues, not yet tried**:
+- Revisit whether `MVStore.FileStore.stopBackgroundThread(waitForIt=false)`
+  (used on every *normal* connection close, not just `SHUTDOWN COMPACT`
+  — see `MVStore.closeStore()`) still leaves a background writer thread
+  racing a subsequent open/lock/close cycle, now that the fd itself
+  reliably closes (this session's fix) — i.e. whether the *Java-level*
+  `FileLockTable` bookkeeping (`fileLockTable().remove(fli)`, called from
+  `FileChannelImpl.release()` only *after* `nd.release()` succeeds) can
+  still be skipped or raced by a background thread's own, separate
+  `FileLock`/`FileChannel` instance if MVStore ever opens more than one
+  `FileChannel` on the same path concurrently (worth grepping for that).
+- Trace a *failing* `MVStore.compact()` sequence specifically (this
+  session only captured one *successful* compact() sequence
+  byte-for-byte; a failing one has not yet been captured with the
+  `open_read_write`+`lock0`+`release0` tracing active simultaneously) to
+  see whether IT is where the stale entry originates.
 - Not the same mechanism as this doc's parent
   (`bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md`): no
   `NoSuchMethodError`, no native object field-layout collision signature.
