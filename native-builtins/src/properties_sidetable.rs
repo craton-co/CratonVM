@@ -169,6 +169,190 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
     pack_obj_key(hash, generation)
 }
 
+// --- GC-aware reclaim for the total-object cap ---------------------------------
+//
+// `MAX_TOTAL_OBJECTS` used to be a hard, never-decremented ceiling: once
+// 10_000 distinct `Properties` objects had EVER been registered in this
+// process's lifetime, every subsequent brand-new object silently lost all
+// `put`/`getProperty` calls forever (no exception, no eviction). See
+// docs/known-issues/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop.md.
+// H2's `TestAnalyzeTableTx` (10_000 connections in a loop, each constructing
+// a JDBC-properties object) crosses that watermark and starts reading back
+// empty username/password, which H2 correctly reports as "Wrong user name or
+// password".
+//
+// Fix: track each registered object's liveness with a real
+// `java.lang.ref.WeakReference` enqueued on a process-wide
+// `ReferenceQueue`, so a `Properties` object that has become unreachable can
+// be reclaimed and its slot reused. This makes `MAX_TOTAL_OBJECTS` mean what
+// its doc comment always claimed it meant — a cap on *concurrently alive*
+// tracked objects — instead of "objects ever constructed".
+//
+// The `WeakReference` itself is kept alive via `add_global_root` (a real GC
+// root) for exactly as long as its target might still be reclaimed; the
+// *referent* (the `Properties` object) is only weakly reachable through it,
+// so it can still be collected normally. When the referent dies, the GC
+// clears and enqueues the `WeakReference`; polling the queue tells us which
+// side-table slot to free.
+struct WeakTrackEntry {
+    /// Packed `key_for` identity of the tracked `Properties` object —
+    /// the slot in `table()` (and `system_props_keys()`) to free on reclaim.
+    props_key: usize,
+    /// `add_global_root` handle for the `WeakReference` object itself.
+    global_root: usize,
+}
+
+/// `key_for(weak_ref_obj) -> WeakTrackEntry`. Keyed the same GC-stable way as
+/// `table()` (see `key_for`) since the `WeakReference` object is itself a
+/// live, moving-GC-relocatable object between registration and the moment it
+/// gets polled off the queue.
+fn weak_track_registry() -> &'static Mutex<FxHashMap<usize, WeakTrackEntry>> {
+    static R: OnceLock<Mutex<FxHashMap<usize, WeakTrackEntry>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Global root handle for the single process-wide `ReferenceQueue` used to
+/// detect reclaimed `Properties` objects. `None` until the first object is
+/// ever registered (or permanently, if this `NativeContext` doesn't support
+/// global roots / real GC integration — e.g. test mocks — in which case
+/// reclaim is simply never attempted and behavior falls back to the old
+/// strict-cap semantics).
+fn weak_track_queue_root() -> &'static Mutex<Option<usize>> {
+    static Q: OnceLock<Mutex<Option<usize>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(None))
+}
+
+/// Get (creating on first use) the shared `ReferenceQueue`'s global-root
+/// handle and resolve it to the live object. Returns `None` if this context
+/// doesn't support global roots (mocks) or object construction failed.
+fn weak_track_queue(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    if let Some(handle) = *weak_track_queue_root().lock() {
+        return if handle == 0 {
+            None
+        } else {
+            ctx.resolve_global_root(handle)
+        };
+    }
+    // Lazily create the shared queue. Deliberately do NOT hold the registry
+    // lock across this call: construction can allocate/trigger a GC, which
+    // can run arbitrary Java finalizers that might re-enter this module on
+    // the same thread — holding the lock here would self-deadlock (this
+    // `Mutex` isn't reentrant). This opens a benign race if two+ threads
+    // both reach this branch as the very first-ever callers: at most a
+    // couple of extra queues get constructed; every loser below just
+    // resolves and uses the winner's queue instead, abandoning its own
+    // (global-rooted) queue object — a harmless one-time leak of a tiny
+    // object, bounded by thread count, only possible in this first-use
+    // window.
+    let queue = match ctx.new_object_initialized("java/lang/ref/ReferenceQueue", "()V", &[]) {
+        Ok(Some(Value::Object(Some(q)))) => q,
+        _ => {
+            weak_track_queue_root().lock().get_or_insert(0);
+            return None;
+        }
+    };
+    let handle = ctx.add_global_root(queue);
+    let winner = {
+        let mut slot = weak_track_queue_root().lock();
+        if slot.is_none() {
+            *slot = Some(handle);
+        }
+        (*slot).unwrap()
+    };
+    if winner != handle {
+        // Lost the race — use the already-installed queue instead.
+        return if winner == 0 {
+            None
+        } else {
+            ctx.resolve_global_root(winner)
+        };
+    }
+    if handle == 0 {
+        None
+    } else {
+        Some(queue)
+    }
+}
+
+/// Register the object pinned under `obj_pin` (already inserted into
+/// `table()` under `props_key`) for GC-aware reclaim. Best-effort: if this
+/// context can't create real `WeakReference`/`ReferenceQueue` objects
+/// (mocks) or root them, the entry simply never gets reclaimed early —
+/// identical to the pre-fix behavior.
+///
+/// Takes the pin handle (not a bare `ObjectRef`) because
+/// `weak_track_queue` may itself allocate (lazily constructing the shared
+/// `ReferenceQueue` on first use), which can trigger a moving GC — the
+/// pinned reference is re-read afterwards so the object we hand to
+/// `WeakReference`'s constructor is never a stale pre-GC pointer.
+fn register_weak_track(
+    ctx: &mut dyn NativeContext,
+    obj_pin: usize,
+    obj_fallback: ObjectRef,
+    props_key: usize,
+) {
+    let Some(queue) = weak_track_queue(ctx) else {
+        return;
+    };
+    let obj = ctx.read_native_pin(obj_pin, obj_fallback);
+    let weak_ref = match ctx.new_object_initialized(
+        "java/lang/ref/WeakReference",
+        "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V",
+        &[Value::Object(Some(obj)), Value::Object(Some(queue))],
+    ) {
+        Ok(Some(Value::Object(Some(w)))) => w,
+        _ => return,
+    };
+    let global_root = ctx.add_global_root(weak_ref);
+    if global_root == 0 {
+        return;
+    }
+    let wk = key_for(ctx, weak_ref);
+    weak_track_registry().lock().insert(
+        wk,
+        WeakTrackEntry {
+            props_key,
+            global_root,
+        },
+    );
+}
+
+/// Drain every reference the GC has already enqueued (i.e. objects it found
+/// unreachable), freeing their side-table slots. Cheap when the queue is
+/// empty (a handful of `poll()` calls). Never holds `table()` /
+/// `weak_track_registry()` locks while calling back into `ctx` — `poll()`
+/// can run arbitrary reference-processing bookkeeping.
+fn drain_reclaimed(ctx: &mut dyn NativeContext) {
+    let Some(handle) = *weak_track_queue_root().lock() else {
+        return;
+    };
+    if handle == 0 {
+        return;
+    }
+    // Bounded by MAX_TOTAL_OBJECTS: that's the most entries that could ever
+    // be simultaneously enqueued (one per tracked object).
+    for _ in 0..MAX_TOTAL_OBJECTS {
+        // Re-resolve on every iteration rather than hoisting `queue` out of
+        // the loop: `poll()` can allocate/trigger GC, and a moving collector
+        // may relocate the queue object between iterations. A cached
+        // pre-call `ObjectRef` would then be stale for the next `poll()`.
+        let Some(queue) = ctx.resolve_global_root(handle) else {
+            return;
+        };
+        let polled = ctx.invoke_virtual(queue, "poll", "()Ljava/lang/ref/Reference;", &[]);
+        let reference_obj = match polled {
+            Ok(Some(Value::Object(Some(r)))) => r,
+            _ => break,
+        };
+        let wk = key_for(ctx, reference_obj);
+        if let Some(entry) = weak_track_registry().lock().remove(&wk) {
+            table().lock().remove(&entry.props_key);
+            system_props_keys().lock().remove(&entry.props_key);
+            ctx.remove_global_root(entry.global_root);
+        }
+    }
+}
+
 // --- system-Properties marker -------------------------------------------------
 //
 // `Properties.setProperty`/`put` formerly mirrored EVERY write to the global
@@ -665,19 +849,61 @@ where
 
 /// Insert (or overwrite) a key/value pair in the side-table for a
 /// given Properties object.  Enforces per-object and global caps.
-fn put_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
+///
+/// The global cap is now a *concurrently alive* cap, not a *lifetime* one:
+/// hitting it triggers an opportunistic reclaim of already-GC'd entries
+/// (`drain_reclaimed`), and if that's not enough, an explicit GC cycle to
+/// give truly-dead entries a chance to be discovered before falling back to
+/// the (now extremely rare) old silent-drop behavior. See
+/// `register_weak_track` / `drain_reclaimed` above.
+fn put_kv(ctx: &mut dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
     if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
         return;
     }
     let k = key_for(ctx, obj);
-    let mut t = table().lock();
-    if t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&k) {
+    // `drain_reclaimed`/`force_gc` below can run a moving collection; pin
+    // `obj` so the reference we pass to `register_weak_track` afterwards is
+    // still valid (not a pre-GC, potentially-forwarded stale pointer).
+    let obj_pin = ctx.pin_native_root(obj);
+    let mut at_cap = {
+        let t = table().lock();
+        t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&k)
+    };
+    if at_cap {
+        drain_reclaimed(ctx);
+        at_cap = {
+            let t = table().lock();
+            t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&k)
+        };
+    }
+    if at_cap {
+        // Nothing had been GC'd yet (e.g. a tight allocation loop that
+        // hasn't triggered a collection) — force one so genuinely-dead
+        // entries get a chance to be reclaimed before we give up.
+        ctx.force_gc();
+        drain_reclaimed(ctx);
+        at_cap = {
+            let t = table().lock();
+            t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&k)
+        };
+    }
+    if at_cap {
+        ctx.unpin_native_roots(obj_pin);
         return;
     }
-    let entry = t.entry(k).or_default();
-    if entry.len() < MAX_PROPS_PER_OBJECT || entry.contains_key(key) {
-        entry.insert(key.to_string(), value.to_string());
+    let is_new = {
+        let mut t = table().lock();
+        let is_new = !t.contains_key(&k);
+        let entry = t.entry(k).or_default();
+        if entry.len() < MAX_PROPS_PER_OBJECT || entry.contains_key(key) {
+            entry.insert(key.to_string(), value.to_string());
+        }
+        is_new
+    };
+    if is_new {
+        register_weak_track(ctx, obj_pin, obj, k);
     }
+    ctx.unpin_native_roots(obj_pin);
 }
 
 /// Look up a key in the side-table.  Returns `None` if either the
@@ -729,7 +955,7 @@ pub fn remove_property_from_sidetable(ctx: &dyn NativeContext, obj: ObjectRef, k
 /// real-JDK CHM round-trip does not populate the wrapper's internal
 /// `properties` field correctly under our interpreter.
 pub fn store_property_in_sidetable(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     obj: ObjectRef,
     key: &str,
     value: &str,
