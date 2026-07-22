@@ -389,36 +389,6 @@ pub fn rootsnap_cache() -> bool {
     })
 }
 
-// Opt-in: skip the SECOND, redundant `update_root_snapshot` that
-// `native_return_pushed_to_stack` runs after pushing a native's return value
-// onto the operand stack. The FIRST snapshot (in `safe_native_call`, gated on
-// `native_pending_return.is_some()`) already published the returned object as a
-// conservative root; once the value is on the operand stack it is covered by the
-// next snapshot refresh (the next native call's `safe_native_call`, or the
-// safepoint-poll refresh in `safepoint_check`/`maybe_gc` that every STW
-// responder runs BEFORE the collector reads its roots). The post-return thread
-// is interruptible, so a moving STW collector never reads this snapshot — it
-// waits for the thread to refresh at the barrier. Dropping the rebuild halves
-// `update_root_snapshot` frequency on the hot reflective-deploy path (bug 04:
-// `update_root_snapshot` is ~68% of an embedded-server deploy). Default-OFF: it
-// touches GC root publication; verified with the bt18 checksum oracle (68332206).
-// See `native_return_pushed_to_stack`.
-//
-// DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang) — halves
-// `update_root_snapshot` frequency on every object-returning native call.
-// Validated: bt16=14985902, bt18=68332206 (== golden, with vs without).
-// Off-switch: `CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT=0`.
-#[inline]
-pub fn skip_redundant_native_snapshot() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match std::env::var("CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT") {
-            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => true,
-        },
-    )
-}
-
 // Opt-in: keep the `rootsnap_cache` frozen-frame cache valid ACROSS a GC by
 // remapping its cached roots through the collection's `pointer_map`, instead of
 // discarding the whole cache on every `collection_count` bump. The cache holds
