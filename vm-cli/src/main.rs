@@ -256,6 +256,17 @@ struct Args {
     #[arg(long = "XX:IHOP", value_name = "PCT", overrides_with = "g1_ihop")]
     g1_ihop: Option<String>,
 
+    /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
+    /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
+    /// `-Xmx` instead of a fixed value. See
+    /// docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+    #[arg(
+        long = "XX:MaxDirectMemorySize",
+        value_name = "SIZE",
+        overrides_with = "max_direct_memory"
+    )]
+    max_direct_memory: Option<String>,
+
     /// `-XX:G1HeapRegionSize=<bytes>` → G1 region size (honoured under G1).
     #[arg(
         long = "XX:G1RegionSize",
@@ -1200,6 +1211,10 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push("--XX:MaxGCPause".into());
             out.push(v.to_string());
             i += 1;
+        } else if let Some(v) = a.strip_prefix("-XX:MaxDirectMemorySize=") {
+            out.push("--XX:MaxDirectMemorySize".into());
+            out.push(v.to_string());
+            i += 1;
         } else if a == "-XX:+UseStringDeduplication" {
             out.push("--XX:StringDedup".into());
             out.push("true".into());
@@ -2035,6 +2050,14 @@ fn run() -> Result<()> {
     }
     if let Some(s) = &args.g1_string_dedup {
         config.g1_string_dedup = Some(s == "true");
+    }
+    if let Some(s) = &args.max_direct_memory {
+        match parse_size(s) {
+            Some(sz) if sz > 0 => config.max_direct_memory_size = Some(sz),
+            _ => eprintln!(
+                "Warning: ignoring -XX:MaxDirectMemorySize={s} (expected a byte size)"
+            ),
+        }
     }
 
     // Missing native audit. NEW-10: `--dump-missing-natives FILE` and
