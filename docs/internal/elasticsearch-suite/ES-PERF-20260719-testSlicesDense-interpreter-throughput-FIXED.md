@@ -1,12 +1,14 @@
-# ES PERF — `testSlicesDense` (IVFKnn) is genuinely slow under CratonVM, not hung or corrupt
+# ES PERF — `testSlicesDense` (IVFKnn) interpreter throughput — FIXED
 
-Status: OPEN (performance only — not a hang, not a correctness bug in the
-unmodified default configuration). 2026-07-21: lifting the LUCENE-POSTINGS.1
-JIT ban (env-var only, no code change) gives a real ~26% testSlicesDense
-speedup but surfaces a genuine, separate JIT correctness gap on broader
-Lucene coverage — the ban stays in place; see the dated section below.
+Status: FIXED 2026-07-21. The global `org/apache/lucene/*` JIT ban was the
+remaining throughput limiter, but lifting it exposed a real residual:
+JIT-compiled `ACC_SYNCHRONIZED` methods had no implicit monitor
+prologue/epilogue. `IndexWriter.doWait()` therefore called `Object.wait()`
+without owning its monitor, producing `IllegalMonitorStateException` and
+downstream postings corruption. The JIT now rejects synchronized methods at
+every admission path; Lucene is otherwise JIT eligible and the blanket ban is
+removed. Historical investigation notes below are retained for provenance.
 
-Split out from
 [`ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b.md`](../../internal/elasticsearch-suite/ES-HANG-20260709-server-org-elasticsearch-search-vectors-diversifyingchildrenivfknnfloatslicedvectorquerytests-3ff8aa1c4b-FIXED.md)
 (archived to `docs/internal/` 2026-07-19: every hang/corruption/crash bug that
 doc tracked across its 2026-07-09 through 2026-07-19 history is now fixed —
@@ -295,5 +297,28 @@ the 2026-07-21 timing note above, don't treat a specific number as a tight
 regression signal) and a suite-timeout-shaped JUnit failure (or `OK` if
 `-Dtests.timeoutSuite` is raised past the actual completion time, currently
 ~825000 on this host). Use a `--stack-dump-on-timeout` value comfortably
-above that if you want to rule out a real hang rather than just observing
-the expected slow completion.
+above that if you want to rule out a real hang rather than just observing the expected slow completion.
+
+## Resolution (2026-07-21)
+
+The residual in the historical 2026-07-21 entry was traced to compiled
+`ACC_SYNCHRONIZED` methods lacking the JVM implicit monitor contract. The
+interpreter/JIT boundary now excludes synchronized methods from initial JIT
+admission, invocation-counter upgrades, OSR, and both direct-callee compiler
+paths. This is deliberately fail-closed until compiled monitor
+prologue/epilogue support exists. The global Lucene package ban is therefore
+removed, allowing the rest of the hot Lucene code to compile.
+
+Validation on the Azure host (the final post-merge source was rebuilt into the uniquely named binary and re-ran the focused JIT/`--nojit` probe):
+
+- Focused private synchronized-`wait()` probe: passed with JIT and with
+  `--nojit` (`SYNC_JIT_PROBE_OK 2200` in both modes).
+- `ES812PostingsFormatTests` with Lucene JIT enabled: `OK (32 tests)`,
+  `Time: 1,439.677`; no monitor exception or postings corruption.
+- Exact fixed-seed `testSlicesDense`, default configuration with no Lucene
+  allow-list override on the feature build before an unrelated H2/Spring `dev` merge: `OK (1 test)`, `Time: 2,920.288`.
+
+The dense time reflects a contended shared host and is not a strict
+performance comparison point. The acceptance result is that the complete test
+passes under the default, unbanned Lucene configuration without a timeout,
+monitor failure, or data-corruption signature.
