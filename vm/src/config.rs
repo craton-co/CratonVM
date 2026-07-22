@@ -52,6 +52,17 @@ pub struct VmConfig {
     /// Maximum heap size in bytes (equivalent to `-Xmx`).
     pub max_heap_size: usize,
 
+    /// Maximum direct (off-heap NIO) buffer memory in bytes, equivalent to
+    /// `-XX:MaxDirectMemorySize`. `None` means the flag was not passed
+    /// explicitly; real JDK then defaults the cap to `-Xmx` (`max_heap_size`),
+    /// and `vm_init` resolves it the same way when wiring up
+    /// `native_io::direct_buffer`'s accounting. See
+    /// docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md —
+    /// previously this cap was a hardcoded 256 MiB regardless of `-Xmx`,
+    /// which OOM'd direct-buffer-heavy workloads (H2 MVStore chunk writes)
+    /// that HotSpot handles fine at the same `-Xmx`.
+    pub max_direct_memory_size: Option<usize>,
+
     /// Initial heap size in bytes (equivalent to `-Xms`).
     pub initial_heap_size: usize,
 
@@ -369,6 +380,7 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             max_heap_size: 256 * 1024 * 1024,    // 256 MB
+            max_direct_memory_size: None,
             initial_heap_size: 16 * 1024 * 1024, // 16 MB
             // Default raised from 1024 to 8192 (root-cause fix for
             // DefaultListableBeanFactoryTests.extensiveCircularReference):

@@ -1335,6 +1335,24 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+
+        // bug-h2-largeblob-direct-memory-oom fix — resolve the process-wide
+        // direct-buffer accounting cap (java.nio.Bits.reserveMemory's ceiling)
+        // the same way real JDK resolves `-XX:MaxDirectMemorySize`: an
+        // explicit flag value if the launcher passed one, otherwise `-Xmx`.
+        // Previously native_io::direct_buffer hardcoded a 256 MiB cap
+        // regardless of `-Xmx`, so a `-Xmx 1g` H2 MVStore workload with a
+        // genuine ~250 MiB direct-buffer working set (chunk writer thread)
+        // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
+        // same heap size. See
+        // docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+        let direct_memory_cap = config
+            .max_direct_memory_size
+            .unwrap_or(config.max_heap_size);
+        cratonvm_native_io::direct_buffer::configure_max_direct_memory(
+            direct_memory_cap as i64,
+        );
+
         // fork6 GC_STRESS fix — wire the SATB write barrier to the concurrent
         // old-gen cycle. `enable_concurrent_gc` previously had NO production
         // caller: the heap's `concurrent_gc_state` stayed `None`, so
