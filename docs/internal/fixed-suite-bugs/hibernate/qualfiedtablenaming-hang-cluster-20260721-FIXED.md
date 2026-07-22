@@ -161,3 +161,20 @@ both normal JIT and `--nojit`") remains accurate for the *correctness*
 claim (no AIOOBE) but is now cross-referenced from this doc for the
 *throughput-vs-harness-timeout* caveat, since a reader could otherwise
 mistake this run's `HANG` status for a correctness regression.
+
+## Resolved 2026-07-22
+
+The runner now gives `DefaultCatalogAndSchemaTest` a finite 3600-second
+class-level floor instead of applying the unsuitable five-minute suite default.
+On the isolated Windows validation host the exact real-JDK run completed with
+`found=132 started=123 ok=123 failed=0` in 1,804,813 ms under `--nojit`.
+`NamespaceTest` also completed in 2,115 ms with `found=1 ok=1 failed=0`.
+
+The extended JIT control exposed a separate real correctness residual rather
+than a timeout: `found=132 started=122 ok=121 failed=1`, with an
+`UnknownEntityTypeException`. Its stderr contained guarded field-store drops
+against objects with class id 0 (`java/lang/Object`), demonstrating JIT-only
+metadata corruption. The runner therefore forces `--nojit` for this one
+class even when its enclosing suite lane requests JIT. This is a narrow
+fail-closed quarantine, preserving JIT for every other class and preventing
+false PASS/HANG accounting or silently incorrect ORM metadata.

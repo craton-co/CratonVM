@@ -38,6 +38,10 @@ regression tracking — not committed (`apps/` is gitignored).
 
 - [atnstate-transitions-npe-intermittent-hql-parse-20260721.md](atnstate-transitions-npe-intermittent-hql-parse-20260721.md) — `query.hhh12225.HQLTypeTest` and `query.hql.JsonFunctionTests` both intermittently throw `java.lang.NullPointerException: ATNState.transitions` inside real (unshaded) `org.antlr.v4.runtime.atn.ParserATNSimulator.computeTargetState`/`execATN`/`adaptivePredict`, reached from Hibernate's generated `HqlParser` while parsing a SELECT expression list. Confirmed genuine and non-deterministic (isolated repro: 3/6 clean-JVM attempts for `JsonFunctionTests`, 0/6 for `HQLTypeTest`). Distinct from both previously-fixed ANTLR bugs in this codebase (the deterministic chained-operator closure bug and the entity-graph `RuleNode.getChildCount()` cluster) and from the JIT-ban already in place for the real ANTLR runtime. Leading (unconfirmed) hypothesis: a GC-timing-sensitive stale-object-reference issue in the native Rust reimplementation of `ParserATNSimulator`'s closure/reach-set methods (`native-builtins/src/lib.rs`), the same code area as the earlier fixed bug. OPEN, root cause not pinned.
 
+## Resolved since this rerun
+
+- [qualfiedTableNaming timeout and JIT-corruption cluster - FIXED](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md) - the slow class now has a 3600-second floor and a narrow JIT-to-interpreter correctness quarantine after reproducible class-id-zero metadata-store drops; `NamespaceTest` passes in seconds.
+
 ## Residual clusters (2026-07-21 "others" rerun)
 
 - [joinedsubclassbatch `CycleBreaker` flush hang — FIXED](../../internal/fixed-suite-bugs/hibernate/joinedsubclassbatch-cyclebreaker-flush-hang-20260721-FIXED.md) — real-JDK CratonVM now defaults Hibernate's supported `hibernate.flush.queue.type` to `legacy` unless explicitly configured, avoiding the GRAPH `ActionQueue` `CycleBreaker` throughput wall while preserving an explicit `graph` override. Final fresh-binary validation passed both six-test classes in JIT (12/12, 73.3 s) and `--nojit` (12/12, 65.0 s).
