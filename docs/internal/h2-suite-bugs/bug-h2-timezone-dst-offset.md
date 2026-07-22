@@ -1,7 +1,14 @@
 # H2 — timezone / DST offset miscalculation (date-time correctness)
 
 ## Status
-**OPEN** — `java.time` / `TimeZone` zone-rule offset computation.
+**FIXED** (2026-07-22) — see
+`bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md` in this same
+directory for the full root-cause/fix writeup (this doc was rediscovered
+independently as `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`
+before either doc's relationship to the other was noticed; both cover the
+exact same bug — this doc's three symptoms below, `TestDateStorage`'s
+8-hour DST-gap shift and `TestValue`'s 1-hour delta included, all verified
+fixed alongside `TestTimeStampWithTimeZone`'s 3h/6h deltas).
 
 ## Severity
 **MEDIUM-HIGH (correctness)** — wrong timestamps for any zone-aware conversion.
