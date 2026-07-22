@@ -83,7 +83,7 @@ fix below).
 > from pure throughput. The stall coincides with the cross-thread STW JIT-root WARN
 > (`scan_active_jit_frames … cross_thread_jit_gap_hits=1 global_jit_depth=6`,
 > Family A4 / [[fork6-fjp-multithread-jit-root-reclamation]]). See the archived
-> [spring-boot-buildsrc-coldpath-hangs-2026-06-22.md](../internal/spring-boot-probe-sweep/spring-boot-buildsrc-coldpath-hangs-2026-06-22.md)
+> [spring-boot-buildsrc-coldpath-hangs-2026-06-22.md](fixed-suite-bugs/springboot/spring-boot-buildsrc-coldpath-hangs-2026-06-22.md)
 > suite context.
 
 > ## 🔬 FULL RE-INVESTIGATION 2026-06-23 (dev `99510377`) — it is NOT a hang; it is a 3-bug cascade

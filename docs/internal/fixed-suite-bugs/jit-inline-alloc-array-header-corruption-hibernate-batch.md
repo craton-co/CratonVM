@@ -15,11 +15,11 @@ and its repro notes under
 [`docs/known-issues/repros/family-a-throttle-park/`](../../known-issues/repros/family-a-throttle-park/README.md).
 
 **Discovered:** 2026-07-03, while chasing HIB-CV-38 (see
-[`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](../hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
+[`docs/internal/hibernate-bugs/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md`](hibernate/HIB-CV-38-boolean-type-field-static-slot-corruption-FIXED.md)
 for the unrelated bug that doc was originally filed for — that one is fixed).
 **Also the likely explanation for HIB-CV-39** (a `DynamicBatchFetchTest` SIGSEGV
 filed before the HIB-CV-38 fix landed): see
-[`docs/internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md`](../hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md)
+[`docs/internal/hibernate-bugs/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md`](hibernate/HIB-CV-39-dynamicbatchfetch-sigsegv-regression.md)
 for the closure reasoning — with HIB-CV-38 fixed, the identical repro no longer
 SIGSEGVs and instead deterministically reproduces this bug.
 

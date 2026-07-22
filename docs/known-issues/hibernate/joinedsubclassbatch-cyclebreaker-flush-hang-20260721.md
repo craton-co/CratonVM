@@ -18,7 +18,7 @@ the per-class forked process with zero `@@RESULT` ever printed):
 
 Both classes appear in two earlier docs:
 
-- [`hibernate-hang-clusters-summary.md`](../../internal/hibernate-bugs/hibernate-hang-clusters-summary.md)
+- [`hibernate-hang-clusters-summary.md`](../../internal/fixed-suite-bugs/hibernate/hibernate-hang-clusters-summary.md)
   listed them as **inferred** (not confirmed) members of Cluster H2 (ByteBuddy
   `MethodGraph` proxy-factory bootstrap hang) — but that cluster's own
   confirmed class was later re-verified as **does-not-reproduce**

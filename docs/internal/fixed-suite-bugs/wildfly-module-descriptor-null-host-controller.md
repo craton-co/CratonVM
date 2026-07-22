@@ -108,7 +108,7 @@ end to end**: hand-driving `bin/domain.sh` against a binary WildFly
 32.0.1.Final distribution under a fresh build of this fix does not reach
 extension loading — domain-mode boot stalls (non-deterministically, across
 two attempts) shortly after `WFLYSRV0049 ... starting`, consistent with the
-`CRATONVM_MSC_REAL_START` gap ([bug-15](../wildfly-suite-bugs/bug-15-msc-real-start-servicenotfound-and-domain-hang.md))
+`CRATONVM_MSC_REAL_START` gap ([bug-15](wildfly/bug-15-msc-real-start-servicenotfound-and-domain-hang.md))
 already tracked against this same boot path (see
 [wildfly-domain-managed-servers-timeout.md](../../known-issues/wildfly-domain-managed-servers-timeout.md)).
 A full Maven + `wildfly-core` testsuite rerun (as the original evidence run

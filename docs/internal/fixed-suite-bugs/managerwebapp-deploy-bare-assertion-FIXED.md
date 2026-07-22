@@ -19,7 +19,7 @@
 >
 > ### Bug 1 — `InetSocketAddress(String,int)` never resolved the hostname
 > (dev commit `0e8c0df4`, landed independently by a concurrent session the
-> same day — see [`form-authenticator-cookie-session-bare-assertion.md`](../tomcat-08-07/form-authenticator-cookie-session-bare-assertion.md)
+> same day — see [`form-authenticator-cookie-session-bare-assertion.md`](tomcat/form-authenticator-cookie-session-bare-assertion.md)
 > for that write-up). The synthetic `InetSocketAddress.<init>(String,int)`
 > native always left `addr=None`, so every request into any webapp
 > configured with `RemoteCIDRValve` (Tomcat manager's default
