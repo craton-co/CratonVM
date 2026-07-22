@@ -7,6 +7,35 @@
 | **Symptom this run** | `HANG`, `process-died rc=124` — the suite harness's flat 300s per-invocation timeout expired with **zero** `@@RESULT`/`@@FAIL` ever printed. |
 | **"RCA"** | Literally **R**oot-**C**ause-**A**nalysis — the test's domain model (`DefaultTemplatesVault`) is a small RCA rule-engine schema (`rca_cause`, `rca_condition`, `rca_expression`, `RCATemplate`, …), not an abbreviation for anything CratonVM-related. |
 
+## Resolved 2026-07-22
+
+The original `update_root_snapshot` hypothesis was ruled out for this path:
+the focused root-snapshot diagnostic emitted no samples before the timeout.
+The recurrent leaf was instead Hibernate's immutable `NavigablePath.equals`
+recursion while it deduplicated the densely connected EAGER-fetch graph.
+
+`native-builtins` now provides a GC-safe native mirror for the Hibernate 7.2
+`NavigablePath` equality/accessor contract. It preserves identity,
+`EntityIdentifierNavigablePath` local-name handling, aliases, and recursive
+parent equality, while pinning every object across a re-entrant String or
+parent comparison. This removes the repeated interpreter-frame cost without
+changing Hibernate's graph-building rules.
+
+Validated with the suite's real-JDK, fork-per-class harness and the normal
+120-second JUnit timeout using the release binary built from this change:
+
+| Mode | Result |
+|---|---|
+| `--nojit` | PASS, 65926 ms |
+| JIT | PASS, 65615 ms |
+
+Both runs used `passed.txt` index 1907,
+`org.hibernate.orm.test.insertordering.InsertOrderingRCATest`, and the
+standard 180-second harness cap. The former 300-second pre-schema-creation
+hang is closed. The older, separately documented JDBC batch-insert throughput
+history remains historical context only; this eager-fetch recursion residual
+is fixed.
+
 ## Source run
 
 `apps/hib-suite-runner/runs/run-20260721-175909-passed/on-real/shard-5/raw.log`

@@ -414,7 +414,10 @@ fn should_skip_jit_internal(
     // are included defensively even though only `makeInt` was observed
     // faulting in this workload.
     if class_name == "java/util/stream/MatchOps"
-        && matches!(method_name, "makeInt" | "makeRef" | "makeLong" | "makeDouble")
+        && matches!(
+            method_name,
+            "makeInt" | "makeRef" | "makeLong" | "makeDouble"
+        )
     {
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
@@ -4514,11 +4517,23 @@ mod tests {
         // unconditionally, under both policies, regardless of allow-packages.
         for meth in ["makeInt", "makeRef", "makeLong", "makeDouble"] {
             assert_eq!(
-                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Conservative),
+                check(
+                    "java/util/stream/MatchOps",
+                    meth,
+                    false,
+                    true,
+                    SkipPolicy::Conservative
+                ),
                 Some(SkipReason::StreamMatchOpsUncommonTrap)
             );
             assert_eq!(
-                check("java/util/stream/MatchOps", meth, false, true, SkipPolicy::Aggressive),
+                check(
+                    "java/util/stream/MatchOps",
+                    meth,
+                    false,
+                    true,
+                    SkipPolicy::Aggressive
+                ),
                 Some(SkipReason::StreamMatchOpsUncommonTrap)
             );
             assert_eq!(
@@ -4536,7 +4551,13 @@ mod tests {
         }
         // A sibling MatchOps method not in the targeted list stays eligible.
         assert_eq!(
-            check("java/util/stream/MatchOps$MatchKind", "values", false, true, SkipPolicy::Conservative),
+            check(
+                "java/util/stream/MatchOps$MatchKind",
+                "values",
+                false,
+                true,
+                SkipPolicy::Conservative
+            ),
             None
         );
     }

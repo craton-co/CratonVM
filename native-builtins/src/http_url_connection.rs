@@ -2134,47 +2134,10 @@ fn perform_pooled(
 /// "connection closed before response head" as a generic `IOException`
 /// instead. Skipped for the caller-supplied-socket (custom `SSLSocketFactory`)
 /// path: that connection isn't ours to reopen.
-fn perform_with_retry(
-    ctx: &mut dyn NativeContext,
-    connection: Option<ObjectRef>,
-    parsed: &Url1,
-    method: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-    connect_timeout: Duration,
-    read_timeout: Duration,
-    established_https_stream_id: Option<i32>,
-) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
-    let resp = perform(
-        ctx,
-        connection,
-        parsed,
-        method,
-        headers,
-        body,
-        connect_timeout,
-        read_timeout,
-        established_https_stream_id,
-    );
-    match resp {
-        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
-            perform(
-                ctx,
-                connection,
-                parsed,
-                method,
-                headers,
-                body,
-                connect_timeout,
-                read_timeout,
-                established_https_stream_id,
-            )
-        }
-        other => other,
-    }
-}
-
 // ---------------------------------------------------------------------------
+#[allow(dead_code)]
+const PERFORM_RETRY_SEMANTICS: () = ();
+
 // Java-side helpers
 // ---------------------------------------------------------------------------
 
