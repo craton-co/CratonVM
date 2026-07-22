@@ -714,6 +714,87 @@ instance ends up referenced by the `UserDefined`-loader `MVMap`'s own
   a `--nojit` run reproduces the full trace in well under 5 minutes and is
   the fastest way to pick this back up.
 
+### Follow-up session (2026-07-22, fourth pass): narrowed to a specific
+### polymorphic-inline-cache-miss correlation; still not closed
+
+Worktree `/data/wt-h2-testupgrade-20260722` on the Azure host, branch
+`fix/h2-testupgrade-rootreference-20260722`, branched from `origin/dev`
+(`ffe407a5f`). Re-ran the existing `CRATONVM_DBG_LOADER_TRACE=1 --nojit`
+repro (confirms the bug is unchanged/still open) and, this time, grepped the
+full `[LOADER-TRACE]` output (100k+ lines) systematically instead of
+sampling, cross-referencing `execute_invokevirtual_cached`'s HIT-CHECK lines
+against the `compare_and_swap_field`/`set_field_volatile` lines by
+timestamp/line-number adjacency. Found a precise, reproducible correlation
+that narrows the search significantly:
+
+- **Confirmed (again, via a fresh trace) that every single `new
+  RootReference(...)` allocation in the failure window resolves its target
+  class correctly relative to its OWN referencing class's loader** — e.g.
+  `referencing_class_id=ClassId(1619) referencing_loader=Some(UserDefined(5))
+  target_class_id=ClassId(1619)`, and the one Application-context `new`
+  observed in the same window (`referencing_class_id=ClassId(1168)
+  referencing_loader=Some(Application) target_class_id=ClassId(1168)`) is
+  likewise self-consistent. This rules out `Instruction::New`'s
+  `resolve_class_loader_aware` call as the mechanism — reconfirms the
+  third-pass session's finding, now with a wider sample.
+- **New finding**: immediately before/after the corrupting
+  `compare_and_swap_field` writes (a `cid=1168` `RootReference` landing in an
+  `AtomicReference` holder whose entire history otherwise shows `cid=1619`
+  objects — e.g. holder `0x200c647f4b0` gets 10 consecutive `cid=1619`
+  writes, then one `cid=1168` write at trace line 113022), the
+  `execute_invokevirtual_cached` HIT-CHECK immediately preceding it shows a
+  **polymorphic inline-cache miss** at the *same* call site:
+  ```
+  execute_invokevirtual_cached HIT-CHECK method=org/h2/mvstore/MVMap.compareAndSetRoot(...)Z
+    cached.declaring=org/h2/mvstore/MVMap cached_receiver_class_id=ClassId(1162)
+    actual_class_id=ClassId(1613) match=false
+  compare_and_swap_field SUCCESS holder_obj=0x200c647f4b0 ... new_cid=1168
+  execute_invokevirtual_cached HIT-CHECK method=org/h2/mvstore/RootReference.removeUnusedOldVersions(J)V
+    cached.declaring=org/h2/mvstore/RootReference cached_receiver_class_id=ClassId(1619)
+    actual_class_id=ClassId(1168) match=false
+  ```
+  and separately, aggregating every HIT-CHECK for `RootReference`'s
+  package-private chained-update methods
+  (`tryLock`/`updatePageAndLockedStatus`/`tryUnlockAndUpdateVersion`) across
+  the whole run: **1 single occurrence** (out of ~300) of
+  `RootReference.tryUnlockAndUpdateVersion(JI)... cached_receiver_class_id=
+  ClassId(1619) actual_class_id=ClassId(1168) match=false` — i.e. a call
+  site whose inline cache had been warmed by a `UserDefined(5)` receiver
+  suddenly sees an `Application` receiver (or vice versa) exactly once, right
+  in the failure window.
+- **Ruled out**: the `actual_class_id != receiver_class_id` guard in
+  `execute_invokevirtual_cached` (`vm/src/runtime/interpreter.rs`, the
+  `CachedInvokeTarget::VirtualBytecode` arm) is itself correct — on a
+  mismatch it unconditionally returns `CachedCallResult::CacheMiss`, forcing
+  the slow path to re-resolve against the ACTUAL receiver's own class. By
+  inspection this cannot be the mechanism that lets a wrong-class method body
+  execute; the corruption has to be happening either in what the slow path
+  resolves TO after a miss, or upstream of this guard (i.e. the receiver
+  object itself, at the point it's pushed onto the operand stack for one of
+  these calls, is already the wrong object — not a dispatch bug on a correct
+  receiver, but a wrong receiver reaching a correct dispatcher).
+- **Working hypothesis for the next session**: given both (new) is
+  confirmed sound and (cache-miss guard) is confirmed sound, the remaining
+  candidates are narrower than the third-pass session's list: (a) the
+  SLOW-PATH re-resolution invoked after a `CacheMiss` on one of
+  `RootReference`'s package-private chained-update methods
+  (`tryLock`/`updatePageAndLockedStatus`/`tryUnlockAndUpdateVersion`/
+  `updateRootPage`) — does it correctly re-cache keyed by the receiver's
+  OWN `ClassId`, or could two different `RootReference` classes'
+  call sites alias the same `thread.invoke_cache` slot
+  (`(caller_class_id, cp_index, is_special)`)? (b) whether `AtomicReference
+  .get()` (`native_atomic_ref_get`, `native-builtins/src/lib.rs`) can, under
+  a race with a concurrent GC/compaction or a background MVStore thread,
+  return a stale/wrong-generation value for a specific field-slot-0 read —
+  not yet directly instrumented. **Concrete next step**: add a trace
+  specifically at `native_atomic_ref_get`'s call site printing the
+  `caller_class_id`/`cp_index` of the *calling* bytecode (not just the class
+  of the returned value, which the existing trace already covers) for every
+  `AtomicReference.get()` on a holder whose class is `RootReference`'s
+  atomic root field — this would directly confirm or refute the
+  `thread.invoke_cache` key-aliasing hypothesis in (a) above without another
+  full investigative pass.
+
 ### Regression check
 
 Ran the 5 `TestDataUtils`-family repros, then a broad manual spot-check
