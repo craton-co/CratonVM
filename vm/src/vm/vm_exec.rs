@@ -1065,7 +1065,9 @@ fn safe_native_call_impl(
                         .unwrap_or_else(|| unsafe { crate::types::ObjectRef::from_raw(ptr) });
                     thread.native_pending_return = Some(exc_ref);
                     thread.native_pin_roots.truncate(pin_base);
-                    crate::runtime::interpreter::update_root_snapshot(shared, thread);
+                    // The exception router runs while this thread is still runnable.
+                    // Publish its pending return only at the next collector-visible
+                    // boundary, just like an ordinary object return.
                     return Err(MethodCallFailed::ExceptionThrown(exc_ref));
                 }
                 thread.native_pin_roots.truncate(pin_base);
@@ -1225,25 +1227,17 @@ fn safe_native_call_impl(
         });
     }
     thread.native_pin_roots.truncate(pin_base);
-    // A running JIT thread cannot be collected from this ordinary (non-blocking)
-    // return boundary: a peer-requested STW waits for the thread to reach its
-    // next safepoint, which refreshes the authoritative snapshot. Keep the
-    // object in native_pending_return across the short Rust-to-JIT handoff and
-    // avoid a full precise/conservative JIT-frame scan on every object-returning
-    // native call. Blocking natives publish through deposit_root_snapshot before
-    // they park, and interpreted callers retain the eager publication below.
+    // A running thread cannot be collected at this ordinary, non-blocking
+    // return boundary. A peer-requested STW waits for this thread to reach its
+    // next safepoint, and that safepoint refreshes the authoritative snapshot
+    // before the collector reads it. A blocking native takes the separate
+    // `deposit_root_snapshot` path before it parks. Keep object returns and
+    // native-thrown exceptions in `native_pending_return` across this short
+    // handoff, but do not rebuild the full O(stack-depth) snapshot here.
     //
-    // This matters for native collection bridges: HashMap.get returns an object
-    // on every operation, and eagerly scanning the active compiled frame made
-    // root publication dominate the entire benchmark.
-    let running_jit_handoff = crate::jit::conservative_roots::current_thread_jit_depth() != 0
-        && !shared
-            .gc_barrier
-            .stw_requested
-            .load(std::sync::atomic::Ordering::Acquire);
-    if thread.native_pending_return.is_some() && !running_jit_handoff {
-        crate::runtime::interpreter::update_root_snapshot(shared, thread);
-    }
+    // This applies equally to interpreted and JIT callers: publishing on every
+    // native return was pure running-thread overhead, while safepoints and
+    // blocking transitions remain the only collector-visible publication sites.
 
     out
 }
@@ -1251,21 +1245,11 @@ fn safe_native_call_impl(
 /// Clear [`JvmThread::native_pending_return`] after its object has been pushed
 /// onto the caller operand stack (stackless native invoke path).
 #[inline]
-pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) {
+pub fn native_return_pushed_to_stack(_shared: &SharedVm, thread: &mut JvmThread) {
     thread.native_pending_return = None;
-    // The matching `safe_native_call` already published a root snapshot
-    // covering the just-returned object (via `native_pending_return`); now that
-    // the value is also an operand-stack root it stays covered by the next
-    // snapshot refresh, and a moving STW collector never reads THIS (post-return,
-    // interruptible) snapshot — it waits for this thread to refresh at the
-    // safepoint barrier. So this second publish is redundant. Skipping it halves
-    // `update_root_snapshot` frequency on the reflective-deploy hot path (bug 04:
-    // ~68% of an embedded-server deploy). Opt-in + default-OFF because it touches
-    // GC root publication; see `env_cache::skip_redundant_native_snapshot`.
-    if crate::runtime::env_cache::skip_redundant_native_snapshot() {
-        return;
-    }
-    crate::runtime::interpreter::update_root_snapshot(shared, thread);
+    // The caller has already placed the return value on an interpreter operand
+    // stack. It is published by the next safepoint (or by a blocking deposit),
+    // so rebuilding a snapshot while this thread remains runnable is redundant.
 }
 
 /// Acquire a Java monitor, blocking GC-SAFELY on contention. Returns the
@@ -18331,6 +18315,57 @@ mod tests {
             thread.native_pin_roots.len(),
             0,
             "safe_native_call still owns and releases native handoff pins"
+        );
+        assert!(
+            thread.root_snapshot.lock().is_empty(),
+            "a runnable native exception must defer snapshot publication until a collector-visible boundary"
+        );
+
+        crate::runtime::interpreter::update_root_snapshot(&shared, &mut thread);
+        assert!(
+            thread
+                .root_snapshot
+                .lock()
+                .iter()
+                .any(|root| root.as_ptr() == thrown.as_ptr()),
+            "the next safepoint must publish the pending native exception"
+        );
+    }
+
+    #[test]
+    fn safe_native_object_return_is_published_at_the_next_safepoint() {
+        fn object_native(
+            ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _args: &[Value],
+        ) -> MethodCallResult {
+            Ok(Some(Value::Object(Some(
+                ctx.alloc_object(ClassId::new(0), 0),
+            ))))
+        }
+
+        let shared = test_shared();
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let returned = match safe_native_call(&shared, &mut thread, object_native, &[])
+            .expect("native return should succeed")
+        {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected object native return, got {other:?}"),
+        };
+
+        assert_eq!(thread.native_pending_return, Some(returned));
+        assert!(
+            thread.root_snapshot.lock().is_empty(),
+            "a runnable native return must defer snapshot publication until a collector-visible boundary"
+        );
+
+        crate::runtime::interpreter::update_root_snapshot(&shared, &mut thread);
+        assert!(
+            thread
+                .root_snapshot
+                .lock()
+                .iter()
+                .any(|root| root.as_ptr() == returned.as_ptr()),
+            "the next safepoint must publish the pending native return"
         );
     }
 
