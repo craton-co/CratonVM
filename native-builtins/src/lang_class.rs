@@ -3836,6 +3836,19 @@ pub(crate) fn coerce_arg_strict(
                             if !ctx.is_interface_class(expected_cid) {
                                 let arg_cid = ctx.class_id_of_object(obj);
                                 if !ctx.is_subclass(arg_cid, expected_cid) {
+                                    if std::env::var_os("CRATONVM_DBG_COERCE").is_some() {
+                                        let arg_name =
+                                            ctx.class_name_of_id(arg_cid).unwrap_or_default();
+                                        let near_name = near
+                                            .and_then(|n| ctx.class_name_of_id(n))
+                                            .unwrap_or_default();
+                                        eprintln!(
+                                            "[DBG_COERCE] {context}: rejecting -- expected={internal} (cid={expected_cid:?}, loader={:?}) arg_class={arg_name} (cid={arg_cid:?}, loader={:?}) near={near:?}/{near_name} (loader={:?})",
+                                            ctx.loader_id_of_class(expected_cid),
+                                            ctx.loader_id_of_class(arg_cid),
+                                            near.map(|n| ctx.loader_id_of_class(n)),
+                                        );
+                                    }
                                     return Err(illegal_arg_exc(
                                         "argument type mismatch".to_string(),
                                     ));
