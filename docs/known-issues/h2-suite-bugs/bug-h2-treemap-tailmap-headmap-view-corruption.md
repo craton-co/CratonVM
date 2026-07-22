@@ -6,6 +6,21 @@ correctness bug, reproducible with pure `java.util.TreeMap` and no H2 code
 at all. Reproduces identically with JIT on and `--nojit` — an interpreter
 (or object-model), not JIT-codegen, bug.
 
+**Correction (2026-07-22):** the "Leading hypothesis" below
+(`find_by_method_descriptor` reachability) is **refuted** — confirmed via a
+full-crate grep while root-causing
+`bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md` that
+`NativeMethodRegistry::find_by_method_descriptor` has no callers anywhere in
+the dispatch path (dead code, only referenced by its own definition and
+tests). That doc's own two clusters turned out to be a different, unrelated
+mechanism (native construction writing into a hardcoded object field-slot
+index that collides with a real-JDK class's actual field at that index) that
+does not apply here (`TreeMap` has no native registration of any kind, so
+there is no construction-time field write for it to collide with). This
+doc's actual root cause is still open and needs a fresh hypothesis — the
+"same underlying dispatch defect" connection to that other doc was informed
+speculation, not a confirmed shared cause, and should not be assumed.
+
 ## Severity
 **HIGH** — `TreeMap`/`NavigableMap` submap views are a common, ordinary
 JDK collections idiom. Any code that iterates `tailMap`/`headMap`/(likely)
