@@ -15,7 +15,7 @@ OpenJDK implements this method as a Java loop over every UTF-16 code unit. Hiber
 
 ## Implementation details
 
-`native-builtins/src/lang_string.rs` now bulk-reads the compact UTF-16 byte array and writes decoded code units into the destination `char[]`. The native preserves the JDK method's observable edge behavior:
+`native-builtins/src/lang_string.rs` now bulk-reads the compact UTF-16 byte array, decodes it into Rust UTF-16 units, and uses the VM's checked `write_char_array_from` memcpy path for the destination `char[]`. The element-by-element write remains only as a fallback for test/mock contexts and heaps that decline the bulk hook. The native preserves the JDK method's observable edge behavior:
 
 - an empty/reversed source range returns without dereferencing either array;
 - source validation happens before destination dereference;
@@ -36,10 +36,10 @@ cargo test -p cratonvm-vm string_utf16_get_chars_force_native_covers_cached_disp
 # 1 passed
 ```
 
-The release binary was built in the task-specific target directory and copied as `cratonvm-hib-locktimeout-utf16-20260722-019f8a10.exe`:
+The final merged release binary was built in the task-specific integration target directory and copied as `cratonvm-hib-locktimeout-final-20260722-019f8a10.exe`:
 
 ```text
-SHA-256  7A1F816E5048CCEEED9278D017DA7A45BD077E7FF33E61204BE77A6430EB6195
+SHA-256  E678B01D14E0D53CA7525FD978EC0E176991D64EBCF182C20EDF289D2843E607
 ```
 
 Using `apps/hib-suite-runner`, with a fresh process for each run:
@@ -51,7 +51,9 @@ Using `apps/hib-suite-runner`, with a fresh process for each run:
 
 | Mode | Runs | Result |
 |---|---:|---|
-| JIT | 3/3 | `LockTest`: `found=23 started=15 ok=15 failed=0 aborted=0 skipped=8` (10028–10979 ms full class) |
-| `--nojit` | 3/3 | `LockTest`: `found=23 started=15 ok=15 failed=0 aborted=0 skipped=8` (11291–12799 ms full class) |
+| JIT | 3/3 initial fresh processes; final merged quiet-core run | `LockTest`: `found=23 started=15 ok=15 failed=0 aborted=0 skipped=8` (initial 10028–10979 ms; final 11732 ms full class) |
+| `--nojit` | 3/3 initial fresh processes; final merged quiet-core run | `LockTest`: `found=23 started=15 ok=15 failed=0 aborted=0 skipped=8` (initial 11291–12799 ms; final 13166 ms full class) |
+
+The final quiet-core runs used six otherwise idle logical CPUs while unrelated suites and Rust release builds occupied other cores. The earlier per-element native could pass on a quiet host but still missed the internal timeout during shared-host contention; the bulk destination copy removed that residual and passed both modes under the same moderate load before final integration.
 
 The former timeout method and all structurally similar sibling lock tests are covered by those complete-class runs. No residual failure from this issue remains.
