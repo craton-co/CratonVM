@@ -310,8 +310,53 @@ JVM's own static, per-file-identity `FileLockTable` still holds a stale
 entry from an earlier, supposedly-already-released lock on the *same*
 file identity (`FileKey`, i.e. `st_dev`/`st_ino` — confirmed sound
 earlier in this doc's investigation history, see the parent NSME doc).
+**A follow-up trace run (after the two fixes landed) captured a failing
+sequence directly**, narrowing it further:
+```
+open_read_write(fd=24, ..., create=true)   # rollback connection's store
+lock0(fd=24) ... Ok(true)                  # acquires the exclusive lock
+pwrite_at(fd=24, ...) x2 [non-main thread] # CHECKPOINT SYNC's write, on H2's own writer thread
+close(fd=25)                                # *** no release0/lock0 for fd=24 ever appears ***
+[timing] rollback+checkpoint: 1573ms        # the rollback connection's try-with-resources
+                                             #   block has just exited -- Connection.close()
+                                             #   should have run fileLock.release() by HERE
+open_read_write(fd=26, ..., create=true)   # SHUTDOWN COMPACT's own store, SAME path
+close(fd=27)
+EXCEPTION: OverlappingFileLockException     # no lock0(fd=26) attempt appears at all --
+                                             #   the Java-level FileLockTable.checkList()
+                                             #   threw before reaching native code
+```
+`fd=24` (the connection that actually holds the exclusive lock) never
+shows a corresponding `release0` anywhere in the trace, even though the
+log's own timing print confirms its try-with-resources block *has*
+already exited by the time the next connection opens. This means
+`SingleFileStore.close()`'s explicit, supposed-to-be-synchronous
+`fileLock.release()` call either isn't running for this connection, or
+runs but doesn't reach the native `release0` this session's fix wired
+up — i.e. the JVM-level `FileLockTable` removal for this specific lock
+is not happening via the deterministic `Connection.close()` path, and
+(per this session's *other* fix, the `Cleaner`/`Closer.run()` one) may
+only be getting cleared later, asynchronously, whenever the
+Cleaner-triggered fd close eventually runs — which can lose the race
+against the very next `tryLock()` moments later. `fd=25`/`fd=27` (both
+closed but never seen in the `open_read_write` trace at all) are
+unexplained — likely allocated via a different, untraced fd-allocating
+code path, and may themselves be part of the answer (e.g. a
+retried/duplicate open attempt for the `SHUTDOWN COMPACT` connection
+after its own first `tryLock()` also failed against fd=24's
+still-held lock).
+
 **Next steps for whoever continues, not yet tried**:
-- Revisit whether `MVStore.FileStore.stopBackgroundThread(waitForIt=false)`
+1. Add H2-side Java debug prints directly to `SingleFileStore.close()`
+   and `FileLock.release()` (the same technique that successfully
+   root-caused the chunk-not-found symptom) to confirm definitively
+   whether the rollback connection's explicit, synchronous release path
+   runs at all, and if so, whether it actually reaches the native
+   `release0` this session wired up.
+2. Trace ALL fd-allocating functions simultaneously (not just
+   `open_read_write` — also `open_random_access`, `open_read`,
+   `open_write`, etc.) to resolve what `fd=25`/`fd=27` actually are.
+3. Revisit whether `MVStore.FileStore.stopBackgroundThread(waitForIt=false)`
   (used on every *normal* connection close, not just `SHUTDOWN COMPACT`
   — see `MVStore.closeStore()`) still leaves a background writer thread
   racing a subsequent open/lock/close cycle, now that the fd itself
@@ -321,11 +366,8 @@ earlier in this doc's investigation history, see the parent NSME doc).
   still be skipped or raced by a background thread's own, separate
   `FileLock`/`FileChannel` instance if MVStore ever opens more than one
   `FileChannel` on the same path concurrently (worth grepping for that).
-- Trace a *failing* `MVStore.compact()` sequence specifically (this
-  session only captured one *successful* compact() sequence
-  byte-for-byte; a failing one has not yet been captured with the
-  `open_read_write`+`lock0`+`release0` tracing active simultaneously) to
-  see whether IT is where the stale entry originates.
+
+## Scope / what's ruled out (original)
 - Not the same mechanism as this doc's parent
   (`bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md`): no
   `NoSuchMethodError`, no native object field-layout collision signature.
