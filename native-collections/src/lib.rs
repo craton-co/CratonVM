@@ -7410,6 +7410,14 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     // actually has entries do we pay for the polymorphic `entrySet().iterator()`
     // walk — the same contract the JDK's `HashMap.putMapEntries` relies on — so
     // the copy works for ANY `Map`.
+    //
+    // cceres5 (live-captured on the FIXED fix3 binary, boot-145: the
+    // `Object.entrySet()` NSME at getOrCreateSubregistry recurred): the
+    // `isEmpty()` invoke below dispatches real bytecode (GC-capable) and
+    // `source` was carried RAW across it into the iterator walk -- the walk's
+    // own entry pin then faithfully pinned an ALREADY-STALE address. Pin +
+    // refresh across the probe.
+    let source_pin = ctx.pin_native_root(source);
     let nonempty = matches!(
         ctx.invoke(
             "java/util/Map",
@@ -7419,6 +7427,8 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
         ),
         Ok(Some(Value::Int(0)))
     );
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.unpin_native_roots(source_pin);
     if nonempty {
         return collect_entries_via_iterator(ctx, source);
     }
