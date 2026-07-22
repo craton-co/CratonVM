@@ -15109,6 +15109,45 @@ fn invoke_on_class_shared_inner(
                                 // our stream pipeline already consumes.
                                 | "spliterator"
                             ))
+                        // `Map.values()` (native_map_values) returns a plain
+                        // `java/util/ArrayList` that stashes its source map
+                        // in a spare trailing capacity slot so a later
+                        // `Map.put`/`remove` on the source is reflected on
+                        // read (`resync_values_view`, called from
+                        // `native_al_size`/`native_al_is_empty`/
+                        // `native_al_get`/`native_al_contains`/
+                        // `native_al_iterator`/`native_al_to_array*` etc. in
+                        // native-collections/src/lib.rs). Real `ArrayList`
+                        // bytecode declares its own `size()`/`isEmpty()`/
+                        // `get()`/etc., so without this force-entry the
+                        // receiver-has-own-bytecode rule picks real bytecode
+                        // over the registered native, skipping the resync
+                        // entirely and freezing the returned Collection at
+                        // whatever the source map held at `values()` call
+                        // time (H2 `TestAlter.testAlterTableDropIdentityColumn`:
+                        // `Schema.getAllSequences()` captures
+                        // `ConcurrentHashMap.values()` once, before any
+                        // sequence exists). `resync_values_view` is a cheap
+                        // no-op for an ordinary ArrayList (no stashed source
+                        // map in the trailing slot), so forcing these
+                        // methods through the native is safe for plain
+                        // ArrayLists too. Companion entry in
+                        // interpreter.rs::force_native_over_real_jdk_bytecode.
+                        || (matches!(class_name, "java/util/ArrayList")
+                            && matches!(
+                                method_name,
+                                "size"
+                                    | "isEmpty"
+                                    | "get"
+                                    | "contains"
+                                    | "iterator"
+                                    | "toArray"
+                                    | "indexOf"
+                                    | "lastIndexOf"
+                                    | "toString"
+                                    | "hashCode"
+                                    | "equals"
+                            ))
                         // Surefire ForkedBooter: ManagementFactory.getRuntimeMXBean() /
                         // getThreadMXBean() — the real-JDK code path delegates
                         // through `getPlatformMXBean(Class)` + PlatformComponent

@@ -1215,54 +1215,32 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Throwable.toString() — format as `ClassName: message`.
+    // Throwable.toString() was previously re-registered HERE with a
+    // raw-field-scanning implementation (format `ClassName: message`,
+    // reading field slots 0..5 directly for any non-empty String) meant to
+    // fix JBoss Modules printing `org.jboss.modules.ModuleNotFoundException@0`
+    // instead of the module name (dispatch was resolving to
+    // `Object.toString()`, losing the message).
     //
-    // The real JDK's `Throwable.toString()` does exactly `getClass().getName()
-    // + (message != null ? ": " + message : "")`.  Our dispatch sometimes
-    // resolves `throwable.toString()` to `Object.toString()` (producing
-    // `ClassName@hashCode`), losing the message — JBoss Modules then prints
-    // `org.jboss.modules.ModuleNotFoundException@0` instead of the module
-    // name.  Register a native on Throwable that reads class name from the
-    // class_manager and detailMessage from field 0, mirroring the JDK.
-    r.register(
-        "java/lang/Throwable",
-        "toString",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(obj))) => *obj,
-                _ => return Ok(Some(Value::Object(Some(ctx.create_string("null"))))),
-            };
-            let cid = ctx.class_id_of_object(this);
-            let cname = ctx
-                .class_name_of_id(cid)
-                .unwrap_or_else(|| "Throwable".to_string())
-                .replace('/', ".");
-            // Walk field slots 0..5 probing for a String field — we don't
-            // know the exact layout (Throwable has backtrace:Object at slot 0
-            // and detailMessage:String at slot 1 on HotSpot, but our
-            // synthetic path sometimes allocates with fewer slots).  Use
-            // whichever slot resolves to a non-empty String first.
-            let mut msg = String::new();
-            let n = ctx.object_num_fields(this).min(6);
-            for i in 0..n {
-                if let Value::Object(Some(s)) = ctx.get_field(this, i) {
-                    if let Some(text) = ctx.read_string(s) {
-                        if !text.is_empty() {
-                            msg = text;
-                            break;
-                        }
-                    }
-                }
-            }
-            let out = if msg.is_empty() {
-                cname
-            } else {
-                format!("{cname}: {msg}")
-            };
-            Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
-        },
-    );
+    // Removed 2026-07-22: this was a duplicate/last-write-wins registration
+    // that silently clobbered the correct `java/lang/Throwable.toString()`
+    // native (`native_throwable_to_string` in lang_misc.rs, registered
+    // earlier by `register_throwable_subclass_natives` within this same
+    // `register_essential_natives` call chain) — which already fixes the
+    // JBoss Modules symptom AND does so correctly, via a real virtual
+    // dispatch to `getLocalizedMessage()`/`getMessage()` (honoring any
+    // subclass override), rather than a raw, override-blind field scan.
+    // The raw-field version broke every Throwable subclass whose
+    // getMessage()/getLocalizedMessage() override computes the message
+    // dynamically rather than storing it in one of the receiver's own
+    // first 6 field slots — e.g. `org.h2.jdbc.JdbcSQLSyntaxErrorException`
+    // (H2's `TestLinkedTable.testHiddenSQL`), whose overridden
+    // `getMessage()` returns a lazily-rebuilt `message` field appended with
+    // the SQL statement text: `super.toString()` (an invokespecial to
+    // `Throwable.toString()`) silently reverted to the ORIGINAL short
+    // constructor message, dropping the SQL-statement suffix (and any
+    // password the test asserts is present in it). See
+    // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md.
 
     // JBoss Modules JDKModuleFinder.findModule — bypass.
     //

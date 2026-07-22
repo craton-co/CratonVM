@@ -1290,12 +1290,32 @@ fn execute_string_concat(
     // declared `Value::Long(...)` instead, which formats correctly.
     let mut arg_values: Vec<Value> = Vec::with_capacity(arg_types.len());
     for i in 0..arg_types.len() {
-        let cv = thread.frames[frame_idx].stack.pop_compact();
         let desc_byte = arg_types
             .get(arg_types.len() - 1 - i)
             .copied()
             .unwrap_or('L') as u8;
-        arg_values.push(cv.decode_by_descriptor(desc_byte));
+        // BC SM2-family fix (2026-07-22): use the long-mark-aware pop
+        // (`pop_arg_for_descriptor_checked`, already relied on by
+        // `pop_coerced_invoke_args_virtual`/`decode_arg_kind_aware` for
+        // invoke-argument marshalling) instead of a plain `pop_compact()` +
+        // `decode_by_descriptor()`. A `J`-descriptor arg whose raw bits
+        // collide with the NaN-tag space AND whose masked payload fits in
+        // 32 bits (e.g. `-1125899906842623L` == `0xFFFC000000000001`, which
+        // is bit-for-bit identical to `CompactValue::int(1)`'s tagged
+        // encoding) is genuinely undecodable from the bits alone —
+        // `decode_by_descriptor` falls back to its i2l-widening heuristic
+        // and truncates the long to its low 32 bits. The interpreter
+        // already tracks provenance for exactly this case via the
+        // parallel `KIND_LONG` marker pushed alongside the operand stack
+        // slot; consulting it here (as the invoke-argument path already
+        // does) resolves the ambiguity instead of guessing from bits.
+        // String concatenation with a computed long value colliding this
+        // way is not exotic — H2's `DataUtils.parseHexLong` round-trip
+        // (`TestDataUtils.testParse`) hits it via plain `"" + longValue`.
+        let v = thread.frames[frame_idx]
+            .stack
+            .pop_arg_for_descriptor_checked(desc_byte)?;
+        arg_values.push(v);
     }
     arg_values.reverse();
 
