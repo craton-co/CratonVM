@@ -9248,6 +9248,24 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     ctx.set_field(this, DOS_FIELD_OUT, args[1]);
     ctx.set_field_by_name(this, DOS_WRITTEN_FIELD, Value::Int(0));
+    // Real JDK 25's `DataOutputStream(OutputStream)` constructor also
+    // allocates `private final byte[] writeBuffer = new byte[8]` -- an
+    // internal scratch buffer real bytecode for `writeChars`/`writeUTF`
+    // (neither has a native override here) reads via a plain `getfield`
+    // and hands to `jdk/internal/util/ByteArray.setUnsignedShort`/
+    // `OutputStream.write([BII)V`. Every other DataOutputStream method is
+    // natively overridden and never touches this field, so its absence was
+    // invisible until real bytecode for one of those two methods ran: a
+    // null `writeBuffer` there means `writeChars` silently loses every
+    // byte with no exception raised (whichever of the null-array store or
+    // the subsequent `out.write(null, 0, 2)` is the one swallowing it was
+    // not pinned down further -- the observable, verified fact is just
+    // that seeding this field fixes the symptom). Seed it
+    // here exactly like the real constructor does, so any current or
+    // future not-natively-overridden method that depends on it works.
+    // See docs/known-issues/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss.md.
+    let write_buffer = ctx.new_array(ArrayElementType::Byte, 8);
+    ctx.set_field_by_name(this, "writeBuffer", Value::Object(Some(write_buffer)));
     Ok(None)
 }
 
