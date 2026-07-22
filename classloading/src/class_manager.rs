@@ -3031,6 +3031,18 @@ impl ClassManager {
                 bytes.len()
             );
         }
+        if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some()
+            && (name.contains("RepositoryConfiguration") || name.contains("RawFactoryMethod"))
+        {
+            let haystack = String::from_utf8_lossy(bytes);
+            let has_factory_data = haystack.contains("CGLIB$FACTORY_DATA");
+            eprintln!(
+                "[FBCGLIB-DBG] define_class name={name} override_name={:?} loader_id={:?} bytes_len={} has_CGLIB$FACTORY_DATA_utf8={has_factory_data}",
+                options.override_name,
+                loader_id,
+                bytes.len(),
+            );
+        }
         if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
             && (name.contains("ObservationRegistry")
                 || name.contains("RestClientObservationAutoConfigurationWithoutMetricsTests")
@@ -3203,8 +3215,20 @@ impl ClassManager {
             // pool-interned name); the duplicate-define probe now pays
             // zero extra allocation regardless of how many classes the
             // loader has defined.
-            if loaded_classes_probe(&self.loaded_classes, loader_id, &stored_name_preview).is_some()
-            {
+            let dup = loaded_classes_probe(&self.loaded_classes, loader_id, &stored_name_preview);
+            // Diagnostic for the "real cglib re-enhances an already-native-
+            // CGLIB-generated class" family (see native-builtins/src/
+            // cglib_enhancer.rs's `emit_public_static_field` doc comment):
+            // confirms whether a same-name collision was actually detected
+            // and rejected here (as opposed to real cglib silently
+            // succeeding under a different name).
+            if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && dup.is_some() {
+                eprintln!(
+                    "[FBCGLIB-DBG] duplicate-define rejected: name={stored_name_preview} loader_id={loader_id:?} existing={:?}",
+                    dup
+                );
+            }
+            if dup.is_some() {
                 return Err(VmError::Linkage(
                     LinkageError::IncompatibleClassChangeError {
                         message: format!(

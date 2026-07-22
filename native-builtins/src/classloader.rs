@@ -4640,6 +4640,17 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             }
         }
     }
+    if let Some(bytes) = defined_class_resource_bytes(ctx, resource_name) {
+        let len = bytes.len();
+        let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
+        tracing::debug!(
+            target: "cratonvm_vm::runtime::resources",
+            resource = %resource_name,
+            bytes = len,
+            "ClassLoader.getResourceAsStream served DEFINED-CLASS resource"
+        );
+        return Ok(Some(Value::Object(Some(stream))));
+    }
     match ctx.find_resource(resource_name) {
         None => Ok(Some(Value::Object(None))),
         Some(bytes) => {
@@ -4654,6 +4665,42 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             Ok(Some(Value::Object(Some(stream))))
         }
     }
+}
+
+/// Serve a `"<internal/name>.class"` resource request from a class that was
+/// dynamically DEFINED (via `Unsafe.defineClass`/`Lookup.defineClass`/
+/// `ClassLoader.defineClass`/the various native `define_class_full` callers
+/// such as `ConfigurationClassEnhancer.enhance`'s CGLIB-proxy emitter),
+/// rather than found on a classpath jar/directory — `ctx.find_resource`
+/// only ever searches the bootstrap/extension/application CLASSPATHS, so a
+/// runtime-generated class's bytecode was previously never retrievable
+/// through `getResourceAsStream`/`Class.getResourceAsStream` at all.
+///
+/// This matters for real bytecode-introspection tooling: ASM's
+/// `ClassReader` (used by real CGLIB, e.g. when Spring AOP's
+/// `proxyTargetClass=true` auto-proxy creator tries to CGLIB-subclass an
+/// ALREADY-native-CGLIB-generated `ConfigurationClassEnhancer` proxy class
+/// a SECOND time) resolves a class's own bytecode this way — without it,
+/// generation fails with cglib's generic `Could not generate CGLIB
+/// subclass... Common causes... final class or non-visible class`, even
+/// though the class is neither.
+///
+/// Looked up via the existing `class_id_by_name` + `class_bytes` trait
+/// methods — a loader-blind global name lookup, same as `resolve_or_load_
+/// class_id` elsewhere in this codebase uses for similar "resolve this
+/// well-known name" cases. That is unsound in general once 2+ loaders
+/// define a same-named class (see the documented duplicate-`ClassId`
+/// family elsewhere in this codebase's history) — but every class this
+/// function can actually reach was named by one of THIS crate's own
+/// generators, all of which mint a process-globally-unique, monotonically-
+/// countered suffix (`$$SpringCGLIB$$<n>`, `...$$FB<n>`, etc.), so no two
+/// loaders ever define one under the identical name in practice. A future
+/// caller relying on this for a DIFFERENT (non-uniquely-named) class would
+/// need a proper (name, defining-loader) lookup instead.
+fn defined_class_resource_bytes(ctx: &dyn NativeContext, resource_name: &str) -> Option<Vec<u8>> {
+    let internal_name = resource_name.strip_suffix(".class")?;
+    let class_id = ctx.class_id_by_name(internal_name)?;
+    ctx.class_bytes(class_id)
 }
 
 /// `java.lang.Module.getResourceAsStream(String)` (args: `[Module receiver,

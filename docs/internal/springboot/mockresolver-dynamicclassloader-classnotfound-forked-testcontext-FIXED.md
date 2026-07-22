@@ -1,5 +1,17 @@
 # Mockito `MockResolver` plugin `ClassNotFoundException` inside Spring's `@CompileWithForkedClassLoader` test context
 
+**Status: FIXED 2026-07-21.** This document's original forked-loader
+identity issue was already repaired by the `Class.getDeclaredClasses()`
+loader-aware lookup on `dev`. Revalidation then exposed and repaired the
+remaining instrumentation residual: an explicitly-null `Class.forName`
+loader rejected Mockito's `MockMethodDispatcher` even after
+`Instrumentation.appendToBootstrapClassLoaderSearch` had appended its JAR.
+`Class.forName(name, false, null)` now permits only names recorded from an
+actual runtime-appended bootstrap JAR, and the complete affected Spring Boot
+class passes with the Byte Buddy agent in both JIT and interpreter-only
+execution. The historical investigation below is retained for provenance;
+its open/residual statements are superseded by this resolution.
+
 **Status: OPEN — found 2026-07-20, investigated 2026-07-20 (session 2),
 root-caused and PARTIALLY FIXED 2026-07-21 (session 3). Session 2's "likely
 GC-timing-dependent, not reproducible" verdict is SUPERSEDED — session 3

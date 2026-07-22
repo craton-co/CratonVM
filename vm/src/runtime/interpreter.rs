@@ -4589,7 +4589,7 @@ pub fn execute(
     // SpringApplication.run() catch the failure, log it through its own
     // failure path, and at least produce a partial banner / startup-failure
     // banner before exiting.
-    let (code_attr, source_file, class_name_str) = {
+    let (code_attr, source_file, class_name_str, is_synchronized) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("class {class_id} not found"),
@@ -4604,6 +4604,7 @@ pub fn execute(
                 })
             })?;
         let has_code = method.code().is_some();
+        let is_synchronized = method.is_synchronized();
         let class_name_owned = class.name.to_string();
         let code_attr_opt = method.code().cloned();
         let source_file = class.source_file.clone();
@@ -5022,7 +5023,7 @@ pub fn execute(
                 }));
             }
         };
-        (code_attr, source_file, class_name_owned)
+        (code_attr, source_file, class_name_owned, is_synchronized)
     };
 
     // If the JIT early-compile path encounters an exception from a callee
@@ -5166,6 +5167,7 @@ pub fn execute(
             || static_skip_reason.is_some()
             || fjp_skip
             || native_skip
+            || is_synchronized
             || gpu_gate_skip
         {
             // Method has known JIT issues — skip JIT.
@@ -5191,7 +5193,7 @@ pub fn execute(
             // call-site-dependent, not per-method-permanent, so they must NOT
             // poison this method's entry for future calls where those flags
             // may differ.
-            if static_skip_reason.is_some() || fjp_skip || native_skip {
+            if static_skip_reason.is_some() || fjp_skip || native_skip || is_synchronized {
                 shared.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
@@ -25034,11 +25036,18 @@ fn force_native_over_real_jdk_bytecode(
             "org/apache/maven/surefire/booter/ForkedBooter"
                 | "org/apache/tomcat/util/buf/CharChunk"
                 | "org/apache/tomcat/util/buf/AbstractChunk"
+                | "org/apache/catalina/connector/Response"
                 | "org/apache/tomcat/util/bcel/classfile/Constant"
         ))
         || class_name == "java/net/URI"
     {
         return false;
+    }
+    if class_name == "org/apache/catalina/connector/Response"
+        && method_name == "toAbsolute"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/lang/String;"
+    {
+        return true;
     }
     if class_name == "org/apache/tomcat/util/buf/CharChunk"
         && matches!(
@@ -30249,6 +30258,20 @@ fn compile_osr_artifact(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // A compiled entry has no ACC_SYNCHRONIZED monitor prologue/epilogue.
+    // Keep synchronized methods out of OSR until that monitor contract is
+    // implemented for compiled frames.
+    if shared
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .and_then(|class| class.methods.iter().find(|m| {
+            &*m.name == method_name.as_str() && &*m.descriptor == method_descriptor.as_str()
+        }))
+        .is_some_and(|method| method.is_synchronized())
+    {
+        return None;
+    }
     // Respect the JIT skip list for OSR — classes that are skipped from
     // normal JIT compilation must also be skipped from OSR to avoid
     // re-executing loop bodies with buggy compiled code. Use the canonical
@@ -32062,6 +32085,12 @@ fn try_jit_upgrade_with_gate(
     if crate::classloading::any_class_redefined() {
         return None;
     }
+    // The compiled-call ABI has no ACC_SYNCHRONIZED monitor prologue/epilogue.
+    // Do not let a cached interpreter target become a compiled monitor-less
+    // body through the invocation-counter upgrade path.
+    if cached.is_synchronized {
+        return None;
+    }
     // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
     // expensive gates below (two superclass-chain walks under the
     // class_manager read lock). The retry stride re-enters this function
@@ -32565,6 +32594,11 @@ fn try_jit_upgrade_with_gate(
                 callee_desc,
                 store,
             )?;
+            // Direct callee compilation must share the synchronized-method gate.
+            if method.is_synchronized() {
+                return None;
+            }
+
             let code_attr = method.code()?;
 
             // jit-invokestatic-clinit-gap fix (2026-07-17): JVMS §5.5
@@ -33425,6 +33459,11 @@ fn try_jit_compile_callee_slow(
         descriptor,
         store,
     )?;
+    // Direct dispatcher compilation also bypasses interpreter frame creation.
+    if method.is_synchronized() {
+        return None;
+    }
+
     let code_attr = method.code()?;
     // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
     // same gap as the `callee_compiler` (compile-time direct_calls) and

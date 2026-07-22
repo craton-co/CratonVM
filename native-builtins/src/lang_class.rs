@@ -1781,7 +1781,18 @@ pub(crate) fn native_class_for_name(
     // Spring Boot nested-JAR rescue below). Those fallbacks are appropriate
     // only after a non-null application loader participated in resolution.
     let explicit_bootstrap_loader = matches!(args.get(2), Some(Value::Object(None)));
-    if explicit_bootstrap_loader && !crate::classloader::is_bootstrap_class_name(&internal_name) {
+    // A null loader normally restricts Class.forName to JDK bootstrap classes.
+    // Instrumentation.appendToBootstrapClassLoaderSearch deliberately extends
+    // that namespace at runtime, however: Mockito injects its
+    // MockMethodDispatcher into such a JAR and immediately resolves it via
+    // Class.forName(name, false, null).  Rejecting it before the class manager
+    // sees the appended search path makes a successfully appended class appear
+    // absent.  The recorded set is populated only from the actual appended
+    // JAR, so it does not widen bootstrap visibility to application classes.
+    if explicit_bootstrap_loader
+        && !crate::classloader::is_bootstrap_class_name(&internal_name)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal_name)
+    {
         return Err(
             cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
@@ -5531,6 +5542,9 @@ pub(crate) fn native_class_get_declared_field(
         }
     };
     let target_name = ctx.read_string(name_obj).unwrap_or_default();
+    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+        eprintln!("[FBCGLIB-DBG] Class.getDeclaredField({target_name})");
+    }
 
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
@@ -9199,6 +9213,11 @@ pub(crate) fn native_class_get_field(
             .into())
         }
     };
+
+    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+        let cname = ctx.class_name_of_id(class_id);
+        eprintln!("[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}");
+    }
 
     // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
     // resolved hierarchy walk. `getField` keys on `(class_id, name, "")`

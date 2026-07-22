@@ -1098,6 +1098,137 @@ fn char_chunk_starts_with(
     true
 }
 
+/// Restricts the native Response fast path to characters that require no
+/// Tomcat URL encoding or path normalization.
+fn simple_absolute_component(text: &str, allow_slash: bool) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'.' | b'-' | b'_' | b'~')
+                || (allow_slash && b == b'/')
+        })
+}
+
+/// Fast path for Tomcat's overwhelmingly common simple relative redirect.
+/// All non-trivial forms execute the original bytecode, preserving Tomcat's
+/// full escaping and normalization contract.
+fn native_response_to_absolute_fallback(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "toAbsolute",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        &args[1..],
+    )
+}
+
+fn native_response_request_string(
+    ctx: &mut dyn NativeContext,
+    request: ObjectRef,
+    name: &str,
+) -> Option<String> {
+    match ctx.invoke_virtual(request, name, "()Ljava/lang/String;", &[]).ok()? {
+        Some(Value::Object(Some(o))) => ctx.read_string(o),
+        _ => None,
+    }
+}
+
+fn native_response_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let location = match args.get(1) {
+        Some(Value::Object(Some(o))) => match ctx.read_string(*o) {
+            Some(s) => s,
+            None => return native_response_to_absolute_fallback(ctx, this, args),
+        },
+        Some(Value::Object(None)) => return Ok(Some(Value::Object(None))),
+        _ => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    if !simple_absolute_component(&location, false)
+        || location.starts_with('.')
+        || !location.contains('.')
+    {
+        return native_response_to_absolute_fallback(ctx, this, args);
+    }
+    let request = match ctx.get_field_by_name(this, "request") {
+        Value::Object(Some(o)) => o,
+        _ => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    let scheme = match native_response_request_string(ctx, request, "getScheme") {
+        Some(v) => v,
+        None => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    let server = match native_response_request_string(ctx, request, "getServerName") {
+        Some(v) => v,
+        None => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    let path = match native_response_request_string(ctx, request, "getDecodedRequestURI") {
+        Some(v) => v,
+        None => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    let port = match ctx.invoke_virtual(request, "getServerPort", "()I", &[])? {
+        Some(Value::Int(v)) if v > 0 => v,
+        _ => return native_response_to_absolute_fallback(ctx, this, args),
+    };
+    if !simple_absolute_component(&scheme, false)
+        || !simple_absolute_component(&server, false)
+        || !path.starts_with('/')
+        || !simple_absolute_component(path.trim_start_matches('/'), true)
+        || path.contains("//")
+        || path.contains("/./")
+        || path.contains("/../")
+    {
+        return native_response_to_absolute_fallback(ctx, this, args);
+    }
+    let Some(slash) = path.rfind('/') else {
+        return native_response_to_absolute_fallback(ctx, this, args);
+    };
+    let default_port = (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+    let mut absolute =
+        String::with_capacity(scheme.len() + server.len() + path.len() + location.len() + 16);
+    absolute.push_str(&scheme);
+    absolute.push_str("://");
+    absolute.push_str(&server);
+    if !default_port {
+        absolute.push(':');
+        absolute.push_str(&port.to_string());
+    }
+    absolute.push_str(&path[..slash + 1]);
+    absolute.push_str(&location);
+    Ok(Some(Value::Object(Some(
+        ctx.create_string_uninterned_gc_safe(&absolute),
+    ))))
+}
+
+/// Fast native materialization for Tomcat's `CharChunk.toString()`.
+///
+/// The method is already listed as a force-native hot path, but previously
+/// had no matching registration and consequently paid StringCache plus Java
+/// bytecode dispatch for every response URL. Dynamic output stays uninterned.
+fn native_char_chunk_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let mut units = Vec::with_capacity(end.saturating_sub(start));
+    for i in start..end {
+        units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
+    }
+    if units.is_empty() {
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    }
+    let text = String::from_utf16_lossy(&units);
+    Ok(Some(Value::Object(Some(ctx.create_string_uninterned_gc_safe(&text)))))
+}
+
 fn native_char_chunk_equals_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -27699,6 +27830,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             },
         );
     }
+    registry.register(
+        "org/apache/catalina/connector/Response",
+        "toAbsolute",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        native_response_to_absolute,
+    );
+    registry.register(
+        "org/apache/tomcat/util/buf/CharChunk",
+        "toString",
+        "()Ljava/lang/String;",
+        native_char_chunk_to_string,
+    );
     registry.register(
         "org/apache/tomcat/util/buf/CharChunk",
         "equals",
