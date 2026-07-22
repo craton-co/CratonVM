@@ -10003,7 +10003,7 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// Class-level annotation-proxy identity cache
+// Reflection annotation-proxy identity cache
 //
 // HotSpot caches annotation instances per class (`Class.annotationData`), so
 // repeated `getAnnotation(X)` / `getDeclaredAnnotations()` on the SAME class
@@ -10012,8 +10012,10 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
 // identity-sensitive callers (annotations used as `IdentityHashMap` keys, or
 // caches keyed on the annotation instance).
 //
-// We cache the proxy keyed by (queried class id, annotation type descriptor),
-// mirroring HotSpot's per-class `annotationData`. The cached `ObjectRef`s live
+// We cache the proxy keyed by a reflection holder identity plus annotation type.
+// Class entries mirror HotSpot's per-class `annotationData`; method entries add
+// the exact (name, descriptor) because two methods on one class can carry
+// different values of the same annotation type. The cached `ObjectRef`s live
 // only in this process-global side-table, invisible to the heap field scan, so
 // they MUST be GC-rooted and remapped вЂ” see `gc_scan_annotation_proxy_roots`
 // (roots.rs) and `gc_update_annotation_proxy_refs` (gc.rs). Without that, a
@@ -10093,12 +10095,13 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// scan re-locks this cache вЂ” that would deadlock). On a concurrent first-build
 /// race the loser's proxy is dropped (still reachable from the caller's stack
 /// until the next GC), exactly as `OscCache` documents.
-fn cached_annotation_proxy(
+fn cached_annotation_proxy_for_key(
     ctx: &mut dyn NativeContext,
-    queried_class_id: ClassId,
+    holder_class_id: ClassId,
+    key: String,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> ObjectRef {
-    let key = (queried_class_id.as_u32(), ann.type_descriptor.clone());
+    let key = (holder_class_id.as_u32(), key);
     if let Some(&cached) = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -10111,12 +10114,12 @@ fn cached_annotation_proxy(
     // (e.g. Spring's OverridingClassLoader / FilteringClassLoader) yield a
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
-    let container_loader = crate::classloader::defining_loader_for(queried_class_id.as_u32());
+    let container_loader = crate::classloader::defining_loader_for(holder_class_id.as_u32());
     if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
-        let holder = ctx.class_name_of_id(queried_class_id).unwrap_or_default();
+        let holder = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
         eprintln!(
             "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
-            queried_class_id.as_u32(),
+            holder_class_id.as_u32(),
             ann.type_descriptor,
             if container_loader.is_some() {
                 "SOME"
@@ -10135,6 +10138,39 @@ fn cached_annotation_proxy(
         forget_annotation_proxy_child_roots(proxy);
     }
     cached
+}
+
+/// Build-or-fetch the cached annotation proxy for a class annotation. Keep the
+/// historical key shape for class entries so existing class annotation identity
+/// remains unchanged.
+fn cached_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    cached_annotation_proxy_for_key(ctx, queried_class_id, ann.type_descriptor.clone(), ann)
+}
+
+/// Cache key for an annotation declared directly on a reflected method or
+/// constructor. NUL separators make the component boundaries unambiguous, and
+/// the leading `M` keeps this namespace disjoint from class-annotation keys.
+fn method_annotation_proxy_key(method_name: &str, method_desc: &str, ann_type: &str) -> String {
+    format!("M\0{method_name}\0{method_desc}\0{ann_type}")
+}
+
+fn cached_method_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    cached_annotation_proxy_for_key(
+        ctx,
+        declaring_class_id,
+        method_annotation_proxy_key(method_name, method_desc, &ann.type_descriptor),
+        ann,
+    )
 }
 
 /// GC root scan for the annotation-proxy cache (companion to
@@ -11665,13 +11701,43 @@ pub(crate) fn annotation_element_to_java_typed(
 /// so a downstream `(Annotation[][]) result` cast (e.g. ByteBuddy's
 /// `JavaDispatcher`-backed reflective `Executable.getParameterAnnotations()`
 /// used by Hibernate's `BytecodeProviderImpl`) throws a `ClassCastException`.
+thread_local! {
+    /// Bootstrap `Annotation` class id, scoped to both the owning VM and the
+    /// mutator thread. This avoids a class-manager lookup on every reflective
+    /// annotation-array allocation without leaking a VM-local ClassId into a
+    /// subsequent in-process VM.
+    static ANNOTATION_COMPONENT_CLASS_CACHE: std::cell::Cell<Option<(usize, ClassId)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn annotation_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
-    ctx.class_id_by_name("java/lang/annotation/Annotation")
+    // Reflection-heavy frameworks ask for annotation arrays thousands of times
+    // per test class. `class_id_by_name` takes the class-manager lock, so cache
+    // the bootstrap `Annotation` id per VM and mutator thread. ClassId values
+    // are VM-local; keying by `vm_identity` is essential for in-process VM
+    // tests.
+    let scope = ctx.vm_identity();
+    if let Some(class_id) = ANNOTATION_COMPONENT_CLASS_CACHE.with(|cache| {
+        cache
+            .get()
+            .and_then(|(cached_scope, class_id)| (cached_scope == scope).then_some(class_id))
+    }) {
+        return class_id;
+    }
+
+    let class_id = ctx
+        .class_id_by_name("java/lang/annotation/Annotation")
         .or_else(|| {
             ctx.ensure_class_initialized("java/lang/annotation/Annotation")
                 .ok()
         })
-        .unwrap_or(ClassId::new(0))
+        .unwrap_or(ClassId::new(0));
+    // Do not cache the synthetic fallback: a later call may be able to load
+    // Annotation after bootstrap has progressed.
+    if class_id.as_u32() != 0 {
+        ANNOTATION_COMPONENT_CLASS_CACHE.with(|cache| cache.set(Some((scope, class_id))));
+    }
+    class_id
 }
 
 /// Resolve the `ClassId` of `Annotation[]` (`[Ljava/lang/annotation/Annotation;`)
@@ -11764,9 +11830,7 @@ fn build_annotation_array_for(
 
 /// Like [`build_annotation_array`] but routes each proxy through the per-class
 /// identity cache, so `getDeclaredAnnotations()` / `getAnnotations()` return the
-/// SAME instances `getAnnotation()` returns for `queried_class_id`. Used only by
-/// the CLASS-level annotation natives (field/method annotation arrays keep the
-/// fresh-build path вЂ” their key space is different).
+/// SAME instances `getAnnotation()` returns for `queried_class_id`.
 fn build_class_annotation_array(
     ctx: &mut dyn NativeContext,
     queried_class_id: ClassId,
@@ -11780,6 +11844,32 @@ fn build_class_annotation_array(
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
         cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
+    })
+}
+
+/// Equivalent to [`build_class_annotation_array`] for Method and Constructor.
+/// The returned array is always fresh, as required by the reflection API, while
+/// its annotation elements retain the identity HotSpot caches per executable.
+fn build_method_annotation_array(
+    ctx: &mut dyn NativeContext,
+    declaring_class_id: ClassId,
+    method_name: &str,
+    method_desc: &str,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
+    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
+        .iter()
+        .filter(|a| annotation_type_loadable(ctx, a))
+        .collect();
+    let component = annotation_component_class_id(ctx);
+    build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
+        cached_method_annotation_proxy(
+            ctx,
+            declaring_class_id,
+            method_name,
+            method_desc,
+            resolvable[i],
+        )
     })
 }
 
@@ -12479,7 +12569,13 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_annotation_array_for(ctx, Some(class_id), &annotations);
+    let arr = build_method_annotation_array(
+        ctx,
+        class_id,
+        &method_name,
+        &method_desc,
+        &annotations,
+    );
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12564,10 +12660,15 @@ pub(crate) fn native_method_get_annotation(
             }
         }
     }
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, container_loader);
+            let proxy = cached_method_annotation_proxy(
+                ctx,
+                class_id,
+                &method_name,
+                &method_desc,
+                ann,
+            );
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }

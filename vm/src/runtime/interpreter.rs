@@ -16591,13 +16591,33 @@ fn array_is_assignable_to_impl(
     if src_comp == "java/lang/Object" {
         return lenient || tgt_comp == "java/lang/Object";
     }
-    let src_id = match shared.class_manager.write().load_class(&src_comp) {
-        Ok(id) => id,
-        Err(_) => return false,
+    // Array casts are common on reflection API results. In particular, a
+    // correctly typed `Annotation[]` is routinely widened to `Object[]` by
+    // JUnit and Spring. The old path unconditionally acquired the
+    // class-manager *write* lock and invoked `load_class` for both components,
+    // even though these bootstrap types are already loaded. That turns every
+    // such cast into a global synchronization point; an imprecise `Object[]`
+    // happens to skip it through the lenient fallback above, which masked the
+    // cost while violating the reflection return-type contract.
+    //
+    // Preserve the existing name-based, loader-agnostic semantics, but resolve
+    // from the read-side class table first. `load_class_concurrent` retains the
+    // old on-demand loading behavior for a genuine miss without forcing the
+    // warm path through an exclusive lock.
+    let resolve_component = |name: &str| {
+        shared
+            .class_manager
+            .read()
+            .find_class_by_name(name)
+            .or_else(|| shared.load_class_concurrent(name).ok())
     };
-    let tgt_id = match shared.class_manager.write().load_class(&tgt_comp) {
-        Ok(id) => id,
-        Err(_) => return false,
+    let src_id = match resolve_component(&src_comp) {
+        Some(id) => id,
+        None => return false,
+    };
+    let tgt_id = match resolve_component(&tgt_comp) {
+        Some(id) => id,
+        None => return false,
     };
     shared.class_manager.read().is_subclass_of(src_id, tgt_id)
 }
