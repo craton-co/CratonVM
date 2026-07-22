@@ -25850,7 +25850,12 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return Ok(existing);
     }
 
-    // Otherwise call function.apply(key) and store the (non-null) result.
+    // The mapper result is not one of this native call's original arguments,
+    // so it is the only ObjectRef that needs an explicit root across the
+    // direct (and potentially allocating) `native_lhm_put` below. `this` and
+    // `key` remain in the surrounding safe-native argument root set. A short
+    // global root avoids the per-frame snapshot work of three transient pins
+    // while preserving the result through a moving collection.
     let result = ctx.invoke_virtual(
         function,
         "apply",
@@ -25861,7 +25866,19 @@ fn native_lhm_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if let Value::Object(None) = new_val {
         return Ok(Some(Value::Object(None)));
     }
-    native_lhm_put(ctx, &[Value::Object(Some(this)), key, new_val])?;
+    let result_root = match new_val {
+        Value::Object(Some(obj)) => Some(ctx.add_global_root(obj)),
+        _ => None,
+    };
+    let put_result = native_lhm_put(ctx, &[Value::Object(Some(this)), key, new_val]);
+    let new_val = match result_root.and_then(|root| ctx.resolve_global_root(root)) {
+        Some(obj) => Value::Object(Some(obj)),
+        None => new_val,
+    };
+    if let Some(root) = result_root {
+        ctx.remove_global_root(root);
+    }
+    put_result?;
     Ok(Some(new_val))
 }
 
