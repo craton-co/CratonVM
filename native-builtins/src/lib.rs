@@ -13,6 +13,15 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::ClassId;
 use cratonvm_types::{ObjectRef, Value};
 
+/// Whether the array-class diagnostic is enabled. The environment is fixed for
+/// a VM process, so read it once: `Object.getClass()` is hot in reflection
+/// workloads and querying the process environment allocates and locks.
+#[inline]
+fn dbg_toarray_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_TOARRAY").is_some())
+}
+
 #[inline]
 pub(crate) fn unsafe_offset_is_heap_slot(
     ctx: &dyn NativeContext,
@@ -43943,7 +43952,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
 
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if dbg_toarray_enabled() {
         eprintln!(
             "[DBG_TOARRAY] native_object_get_class ENTER kind={:?} cid={:?} len={}",
             ctx.heap_kind_of(this),
@@ -44009,7 +44018,7 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `isPrimitive()==true` for an `Object[]` mirror produced here and
         // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
         // null` inside `GenericConversionService.convert`.
-        if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        if dbg_toarray_enabled() {
             eprintln!(
                 "[DBG_TOARRAY] getClass array_class_name={:?} comp_cid={:?} arr_len={}",
                 array_class_name,
@@ -79562,7 +79571,7 @@ fn array_new_instance_for_component(
             let comp_id = ctx
                 .ensure_class_initialized(comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
-            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            if dbg_toarray_enabled() {
                 eprintln!(
                     "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
                     comp_name, comp_id, length

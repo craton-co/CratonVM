@@ -1,8 +1,39 @@
-# `JacksonAutoConfigurationTests` — severe (600s+) slowdown, not a hang/deadlock
+# `JacksonAutoConfigurationTests` — severe slowdown fixed
 
-**Status: OPEN — root cause narrowed 2026-07-21, refined further same day
-after isolating JUnit5's own overhead directly (see "Root cause narrowed"
-and "Refinement" below), not fixed.** Originally found 2026-07-20, split out
+**Status: FIXED 2026-07-22.** The remaining post-root-snapshot slowdown was
+caused by method and constructor annotation reflection rebuilding synthetic
+annotation proxy objects on every `getAnnotation()` and
+`getDeclaredAnnotations()` call. JUnit and Spring repeatedly inspect the same
+method metadata while constructing each test invocation, making that allocation
+and proxy-materialisation path compound across the class's 162 real invocations.
+
+`native-builtins/src/lang_class.rs` now caches method/constructor annotation
+proxies by `(declaring class, method name, descriptor, annotation type)`, just
+as class annotation proxies are cached. Reflection still returns a fresh,
+correctly typed defensive `Annotation[]` each call, while its elements retain
+the identity that HotSpot exposes. The proxy cache is rooted and remapped by
+the existing annotation-cache GC hooks.
+
+The typed array uncovered two residual performance traps that were closed in
+the same delivery: `Object.getClass()` now caches its diagnostic environment
+gate, and array assignability resolves already-loaded component classes through
+the class-manager read path instead of taking an exclusive loader lock on every
+`Annotation[]` widening cast. Two later speculative reflection caches were
+removed because their global GC root/remap work made the no-JIT path slower.
+
+Validation with task-specific binary
+`cratonvm-jackson-autoconfig-closure-r9-20260722-019f8775.exe` completed the
+full `module/spring-boot-jackson` `JacksonAutoConfigurationTests` class under
+the normal 300-second suite budget in every required mode: no-JIT **222.366s**
+and two JIT confirmations at **214.515s** and **233.105s**, all **162/162
+tests passed** with no failures. The current-dev baseline had timed out at
+300 seconds in both modes without completing the class. The focused VM
+regression verifies method annotation-proxy identity, a fresh defensive array,
+and the exact `Annotation[]` runtime type.
+
+The historical investigation below is retained for the original symptom and
+the already-delivered native-return root-publication contributor. Originally
+found 2026-07-20, split out
 of
 `docs/known-issues/springboot/otlpmetricspropertiesconfigadaptertests-mockito-bytebuddy-hang.md`
 (that doc's root cause is FIXED; this class was miscategorized into it).
@@ -352,7 +383,7 @@ for the sibling case (47 tests, Spring Security instead of Jackson, same
 "severe slowdown, not a hang" shape, same suspected JUnit5-machinery
 contribution).
 
-## Follow-up (2026-07-21): native-return root publication fixed, Jackson remains open
+## Historical follow-up (2026-07-21): native-return root publication fixed, Jackson remained open
 
 The OAuth2 follow-up implemented the previously deferred part of the shared
 root-snapshot hypothesis: ordinary object-returning native calls and
