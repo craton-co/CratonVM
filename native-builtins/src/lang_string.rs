@@ -721,7 +721,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             for _ in 0..count {
                 chars.extend_from_slice(&cs_chars);
             }
-            sb_write_chars(ctx, this, &chars);
+            let this = sb_write_chars(ctx, this, &chars);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -745,7 +745,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             for _ in 0..count {
                 chars.extend_from_slice(&s_chars);
             }
-            sb_write_chars(ctx, this, &chars);
+            let this = sb_write_chars(ctx, this, &chars);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -811,7 +811,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             for _ in 0..count {
                 chars.extend_from_slice(&units);
             }
-            sb_write_chars(ctx, this, &chars);
+            let this = sb_write_chars(ctx, this, &chars);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -1560,11 +1560,16 @@ pub(crate) fn sb_ensure_capacity(
 }
 
 /// Helper: append a slice of u16 chars to a StringBuilder.
+/// Returns the CURRENT (pin-refreshed) `this`: the grow path allocates, and
+/// callers that return `this` to Java (every `append` overload — chained
+/// `.append(...)` dispatches on that return value) must hand back the
+/// post-move address, not their raw pre-call copy (cceres5, live-captured at
+/// `JndiName.getAbsoluteName`'s chained appends).
 pub(crate) fn sb_append_chars(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     chars: &[u16],
-) {
+) -> cratonvm_types::ObjectRef {
     // Most appends do not grow. Reuse this first state read instead of
     // entering `sb_ensure_capacity` and then reading the buffer/count again.
     let (current_buf, current_count) = sb_state(ctx, this);
@@ -1589,16 +1594,18 @@ pub(crate) fn sb_append_chars(
         }
     }
     sb_set_count(ctx, this, (count + chars.len()) as i32);
+    this
 }
 
-/// Helper: append a Rust string to a StringBuilder.
+/// Helper: append a Rust string to a StringBuilder. Returns the CURRENT
+/// `this` (see `sb_append_chars`).
 pub(crate) fn sb_append_str(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     text: &str,
-) {
+) -> cratonvm_types::ObjectRef {
     let chars: Vec<u16> = text.encode_utf16().collect();
-    sb_append_chars(ctx, this, &chars);
+    sb_append_chars(ctx, this, &chars)
 }
 
 pub(crate) fn native_sb_init_default(
@@ -1738,7 +1745,7 @@ pub(crate) fn native_sb_append_string(
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    sb_append_str(ctx, this, &text);
+    let this = sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1754,7 +1761,7 @@ pub(crate) fn native_sb_append_int(
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    sb_append_str(ctx, this, &val.to_string());
+    let this = sb_append_str(ctx, this, &val.to_string());
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1770,7 +1777,7 @@ pub(crate) fn native_sb_append_char(
         Some(Value::Int(v)) => *v as u16,
         _ => 0,
     };
-    sb_append_chars(ctx, this, &[ch]);
+    let this = sb_append_chars(ctx, this, &[ch]);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1782,7 +1789,7 @@ pub(crate) fn native_sb_append_null(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    sb_append_str(ctx, this, "null");
+    let this = sb_append_str(ctx, this, "null");
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1865,7 +1872,7 @@ pub(crate) fn native_sb_repeat_codepoint(
     for _ in 0..count {
         chars.extend_from_slice(&unit);
     }
-    sb_append_chars(ctx, this, &chars);
+    let this = sb_append_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1894,7 +1901,7 @@ pub(crate) fn native_sb_repeat_charsequence(
     for _ in 0..count {
         chars.extend_from_slice(&units);
     }
-    sb_write_chars(ctx, this, &chars);
+    let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1974,7 +1981,7 @@ pub(crate) fn native_sb_append_boolean(
         Some(Value::Int(v)) => *v != 0,
         _ => false,
     };
-    sb_append_str(ctx, this, if val { "true" } else { "false" });
+    let this = sb_append_str(ctx, this, if val { "true" } else { "false" });
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1996,7 +2003,7 @@ pub(crate) fn native_sb_append_long(
         Some(Value::Int(i)) => *i as i64,
         _ => 0,
     };
-    sb_append_str(ctx, this, &val.to_string());
+    let this = sb_append_str(ctx, this, &val.to_string());
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2015,7 +2022,7 @@ pub(crate) fn native_sb_append_double(
         Some(Value::Int(i)) => *i as f64,
         _ => 0.0,
     };
-    sb_append_str(ctx, this, &format_double(val));
+    let this = sb_append_str(ctx, this, &format_double(val));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2031,7 +2038,7 @@ pub(crate) fn native_sb_append_float(
         Some(Value::Float(v)) => *v,
         _ => 0.0,
     };
-    sb_append_str(ctx, this, &format_float(val));
+    let this = sb_append_str(ctx, this, &format_float(val));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2174,7 +2181,7 @@ pub(crate) fn native_sb_append_object(
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    sb_append_str(ctx, this, &text);
+    let this = sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2197,7 +2204,7 @@ pub(crate) fn native_sb_append_charsequence(
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    sb_append_str(ctx, this, &text);
+    let this = sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2232,7 +2239,7 @@ pub(crate) fn native_sb_append_charsequence_off_len(
 
     // null CharSequence → append "null" per AbstractStringBuilder.appendNull.
     let Some(cs_obj) = cs else {
-        sb_append_str(ctx, this, "null");
+        let this = sb_append_str(ctx, this, "null");
         return Ok(Some(Value::Object(Some(this))));
     };
 
@@ -2254,9 +2261,11 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     let len = chars.len();
     let s = (start.max(0) as usize).min(len);
     let e = (end.max(0) as usize).min(len);
-    if e > s {
-        sb_append_chars(ctx, this, &chars[s..e]);
-    }
+    let this = if e > s {
+        sb_append_chars(ctx, this, &chars[s..e])
+    } else {
+        this
+    };
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2636,7 +2645,7 @@ pub(crate) fn native_sb_append_code_point(
             &buf[..1]
         }
     };
-    sb_append_chars(ctx, this, encoded);
+    let this = sb_append_chars(ctx, this, encoded);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2689,7 +2698,7 @@ pub(crate) fn sb_write_chars(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     chars: &[u16],
-) {
+) -> cratonvm_types::ObjectRef {
     let current_count = sb_state(ctx, this).1 as usize;
     let additional = chars.len().saturating_sub(current_count);
     let (this, buf) = sb_ensure_capacity(ctx, this, additional);
@@ -2697,6 +2706,7 @@ pub(crate) fn sb_write_chars(
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
     sb_set_count(ctx, this, chars.len() as i32);
+    this
 }
 
 /// insert(int, String) — insert string at offset
@@ -2724,7 +2734,7 @@ pub(crate) fn native_sb_insert_string(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2751,7 +2761,7 @@ pub(crate) fn native_sb_insert_char(
     result.extend_from_slice(&chars[..offset]);
     result.push(ch);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2779,7 +2789,7 @@ pub(crate) fn native_sb_insert_int(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2812,7 +2822,7 @@ pub(crate) fn native_sb_insert_object(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2872,7 +2882,7 @@ pub(crate) fn native_sb_insert_char_array_off_len(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2913,7 +2923,7 @@ pub(crate) fn native_sb_insert_char_array(
     result.extend_from_slice(&chars[..offset]);
     result.extend_from_slice(&insert_chars);
     result.extend_from_slice(&chars[offset..]);
-    sb_write_chars(ctx, this, &result);
+    let this = sb_write_chars(ctx, this, &result);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2937,7 +2947,7 @@ pub(crate) fn native_sb_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if start < end {
         chars.drain(start..end);
     }
-    sb_write_chars(ctx, this, &chars);
+    let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2955,12 +2965,14 @@ pub(crate) fn native_sb_delete_char_at(
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let chars = sb_read_chars(ctx, this);
-    if index < chars.len() {
+    let this = if index < chars.len() {
         let mut result = Vec::with_capacity(chars.len() - 1);
         result.extend_from_slice(&chars[..index]);
         result.extend_from_slice(&chars[index + 1..]);
-        sb_write_chars(ctx, this, &result);
-    }
+        sb_write_chars(ctx, this, &result)
+    } else {
+        this
+    };
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2989,7 +3001,7 @@ pub(crate) fn native_sb_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if start <= end {
         chars.splice(start..end, repl_chars);
     }
-    sb_write_chars(ctx, this, &chars);
+    let this = sb_write_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
