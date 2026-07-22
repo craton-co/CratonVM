@@ -1586,7 +1586,7 @@ fn register_locale_noop(r: &mut NativeMethodRegistry) {
 // T8.2.13 / T8.2.14 — URLDecoder.decode(String) / URLEncoder.encode(String)
 // ---------------------------------------------------------------------------
 
-fn register_url_codec(r: &mut NativeMethodRegistry) {
+pub fn register_url_codec(r: &mut NativeMethodRegistry) {
     // URLDecoder.decode(String)String — deprecated single-arg form, uses UTF-8
     r.register(
         "java/net/URLDecoder",

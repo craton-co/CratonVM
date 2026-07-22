@@ -61,12 +61,82 @@ fn days_in_month(year: i32, month: i32) -> i32 {
     }
 }
 
+/// Julian Day Number of the default `GregorianCalendar` cutover instant
+/// (1582-10-15, proleptic Gregorian) — the earliest date `Date`'s deprecated
+/// field-based constructors (and `GregorianCalendar` itself, by default)
+/// interpret as Gregorian. Anything earlier is interpreted as a Julian
+/// calendar date, per `java.util.GregorianCalendar`'s documented default
+/// cutover (`Date(Long.MIN_VALUE)` disables this; that path is unaffected
+/// here since it never calls these helpers).
+const CUTOVER_JDN: i64 = 2_299_161;
+/// Julian Day Number of the Unix epoch (1970-01-01, proleptic Gregorian).
+const JDN_UNIX_EPOCH: i64 = 2_440_588;
+
+/// Proleptic-Gregorian (year, 1-based month, day) -> Julian Day Number.
+/// Fliegel & Van Flandern (1968); all divisions truncate toward zero,
+/// matching the formula's original (C-style) integer-division semantics.
+#[inline]
+fn gregorian_to_jdn(year: i64, month: i64, day: i64) -> i64 {
+    let a = (month - 14) / 12;
+    let term1 = (1461 * (year + 4800 + a)) / 4;
+    let term2 = (367 * (month - 2 - 12 * a)) / 12;
+    let term3 = (3 * ((year + 4900 + a) / 100)) / 4;
+    term1 + term2 - term3 + day - 32075
+}
+
+/// Proleptic-Julian (year, 1-based month, day) -> Julian Day Number.
+/// Fliegel & Van Flandern (1968), Julian-calendar variant.
+#[inline]
+fn julian_to_jdn(year: i64, month: i64, day: i64) -> i64 {
+    let inner = (month - 9) / 7;
+    367 * year - (7 * (year + 5001 + inner)) / 4 + (275 * month) / 9 + day + 1_729_777
+}
+
+/// Julian Day Number -> proleptic-Gregorian (year, 1-based month, day).
+/// Fliegel & Van Flandern inverse formula.
+#[inline]
+fn jdn_to_gregorian(jdn: i64) -> (i64, i64, i64) {
+    let mut l = jdn + 68_569;
+    let n = (4 * l) / 146_097;
+    l -= (146_097 * n + 3) / 4;
+    let mut y = (4000 * (l + 1)) / 1_461_001;
+    l = l - (1461 * y) / 4 + 31;
+    let m = (80 * l) / 2447;
+    let d = l - (2447 * m) / 80;
+    let l2 = m / 11;
+    let month = m + 2 - 12 * l2;
+    y = 100 * (n - 49) + y + l2;
+    (y, month, d)
+}
+
+/// Julian Day Number -> proleptic-Julian (year, 1-based month, day).
+/// Fliegel & Van Flandern inverse formula, Julian-calendar variant.
+#[inline]
+fn jdn_to_julian(jdn: i64) -> (i64, i64, i64) {
+    let c = jdn + 32_082;
+    let d2 = (4 * c + 3) / 1461;
+    let e = c - (1461 * d2) / 4;
+    let m2 = (5 * e + 2) / 153;
+    let d = e - (153 * m2 + 2) / 5 + 1;
+    let m = m2 + 3 - 12 * (m2 / 10);
+    let y = d2 - 4800 + (m2 / 10);
+    (y, m, d)
+}
+
 /// Convert (year, month, date, hrs, min, sec) to Unix epoch milliseconds.
 ///
 /// - `year`  — full Gregorian year (not the +1900 deprecated form; callers
 ///   must add 1900 before calling this function).
 /// - `month` — 0-based (0 = January).
 /// - `date`  — 1-based day of month.
+///
+/// Matches `java.util.Date`'s deprecated multi-arg constructors, which are
+/// specified in terms of `GregorianCalendar`'s default Julian/Gregorian
+/// hybrid calendar: dates before 1582-10-15 (Gregorian) are interpreted as
+/// Julian calendar dates, not proleptic-Gregorian ones — see
+/// `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`'s
+/// `TestPreparedStatement.testDate8` writeup for the ~10-day discrepancy
+/// this produces if the cutover is ignored.
 pub(crate) fn date_fields_to_millis(
     year: i32,
     month: i32,
@@ -75,28 +145,23 @@ pub(crate) fn date_fields_to_millis(
     min: i32,
     sec: i32,
 ) -> i64 {
-    // Count days from 1970-01-01 to the start of `year`.
-    let mut days: i64 = 0;
-    if year >= 1970 {
-        for y in 1970..year {
-            days += if is_leap(y) { 366 } else { 365 };
-        }
+    let (y, m, d) = (year as i64, month as i64 + 1, date as i64);
+    let greg_jdn = gregorian_to_jdn(y, m, d);
+    let jdn = if greg_jdn >= CUTOVER_JDN {
+        greg_jdn
     } else {
-        for y in year..1970 {
-            days -= if is_leap(y) { 366 } else { 365 };
-        }
-    }
-    // Add days for the completed months within the year.
-    for m in 0..month {
-        days += days_in_month(year, m) as i64;
-    }
-    // Add the remaining days (date is 1-based).
-    days += (date - 1) as i64;
+        julian_to_jdn(y, m, d)
+    };
+    let days = jdn - JDN_UNIX_EPOCH;
 
     days * 86_400_000 + hrs as i64 * 3_600_000 + min as i64 * 60_000 + sec as i64 * 1_000
 }
 
 /// Decompose Unix epoch milliseconds into a [`DateParts`] struct.
+///
+/// Inverse of [`date_fields_to_millis`] — same Julian/Gregorian hybrid
+/// cutover applies (dates before 1582-10-15 Gregorian decode as Julian
+/// calendar fields).
 pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
     // Seconds / minutes / hours
     let sec_total = millis.div_euclid(1_000);
@@ -105,53 +170,22 @@ pub(crate) fn millis_to_date_parts(millis: i64) -> DateParts {
     let min = min_total.rem_euclid(60) as i32;
     let hr_total = min_total.div_euclid(60);
     let hrs = hr_total.rem_euclid(24) as i32;
-    let mut day_count = hr_total.div_euclid(24); // days since Unix epoch (may be negative)
+    let day_count = hr_total.div_euclid(24); // days since Unix epoch (may be negative)
 
     // Day of week: 1970-01-01 was a Thursday (= 4, with Sunday = 0).
     let day_of_week = ((day_count.rem_euclid(7) + 4) % 7) as i32;
 
-    // Walk forward (or backward) through years to find the Gregorian year.
-    let mut year: i32 = 1970;
-    if day_count >= 0 {
-        loop {
-            let days_in_year: i64 = if is_leap(year) { 366 } else { 365 };
-            if day_count < days_in_year {
-                break;
-            }
-            day_count -= days_in_year;
-            year += 1;
-        }
+    let jdn = day_count + JDN_UNIX_EPOCH;
+    let (year, month_1based, date) = if jdn >= CUTOVER_JDN {
+        jdn_to_gregorian(jdn)
     } else {
-        loop {
-            year -= 1;
-            let days_in_year: i64 = if is_leap(year) { 366 } else { 365 };
-            day_count += days_in_year;
-            if day_count >= 0 {
-                break;
-            }
-        }
-    }
-
-    // Walk through months in the final year.
-    let mut month: i32 = 0;
-    loop {
-        let dim = days_in_month(year, month) as i64;
-        if day_count < dim {
-            break;
-        }
-        day_count -= dim;
-        month += 1;
-        if month >= 12 {
-            break;
-        }
-    }
-
-    let date = day_count as i32 + 1; // 1-based
+        jdn_to_julian(jdn)
+    };
 
     DateParts {
-        year,
-        month,
-        date,
+        year: year as i32,
+        month: (month_1based - 1) as i32,
+        date: date as i32,
         hrs,
         min,
         sec,
@@ -1907,6 +1941,40 @@ mod tests {
     fn test_date_fields_to_millis_y2k() {
         // 2000-01-01 00:00:00 UTC
         assert_eq!(date_fields_to_millis(2000, 0, 1, 0, 0, 0), 946_684_800_000);
+    }
+
+    #[test]
+    fn test_date_fields_to_millis_julian_cutover_matches_gregorian_change() {
+        // GMT millis for 1582-10-15 (the default GregorianCalendar cutover,
+        // interpreted as a plain Gregorian date since it's ON the cutover)
+        // and 1582-10-04 (the preceding Julian calendar date, i.e. what
+        // GregorianCalendar's default cutover documents as the "day before")
+        // must be exactly one day (86_400_000 ms) apart.
+        let gregorian_side = date_fields_to_millis(1582, 9, 15, 0, 0, 0);
+        let julian_side = date_fields_to_millis(1582, 9, 4, 0, 0, 0);
+        assert_eq!(gregorian_side - julian_side, 86_400_000);
+    }
+
+    #[test]
+    fn test_date_fields_to_millis_julian_before_cutover_matches_proleptic_gregorian_equivalent() {
+        // Regression test for `bug-h2-suite-residual-fail-triage.md`'s
+        // TestPreparedStatement.testDate8: fields (1582, September, 25) are
+        // before the 1582-10-15 cutover, so they must be interpreted as a
+        // JULIAN calendar date — which is the same instant as proleptic
+        // Gregorian 1582-10-05 (confirmed against real HotSpot JDK25).
+        let julian_sept25 = date_fields_to_millis(1582, 8, 25, 0, 0, 0);
+        // 1582-10-05 is also before the cutover, so it round-trips through
+        // the Julian branch too when fed back through the same helper -
+        // instead assert the known-good absolute value derived from HotSpot
+        // (`Date.valueOf("1582-09-25")` in UTC, i.e. with zero tz offset).
+        assert_eq!(julian_sept25, -12_220_156_800_000);
+    }
+
+    #[test]
+    fn test_millis_to_date_parts_julian_before_cutover_round_trips() {
+        let millis = date_fields_to_millis(1582, 8, 25, 0, 0, 0);
+        let p = millis_to_date_parts(millis);
+        assert_eq!((p.year, p.month, p.date), (1582, 8, 25));
     }
 
     #[test]
