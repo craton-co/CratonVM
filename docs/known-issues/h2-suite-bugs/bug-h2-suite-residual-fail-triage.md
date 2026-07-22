@@ -1,7 +1,7 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed, mostly closed after three follow-up sessions.** Of the
+**OPEN, mixed, mostly closed after four follow-up sessions.** Of the
 original 11 items: **8 now confirmed FIXED** (`TestPreparedStatement`,
 `TestShell`, `TestRandomMapOps` [very likely — see its section],
 `TestLinkedTable`, `TestAlter`, `TestDataUtils` [now fully fixed — see the
@@ -19,9 +19,13 @@ systemic bug was found and fixed** in the process (the JIT compiled-code
 cache was keyed by class NAME only, with no loader/`ClassId` component —
 see the third-pass section for the full writeup) — real and worth keeping,
 but confirmed **not sufficient by itself** to close `TestUpgrade` (the
-NoSuchMethodError reproduces identically with `--nojit`). See each item
-below, and the "Follow-up session (2026-07-22, second pass)" and "third
-pass" summaries further down, for full detail.
+NoSuchMethodError reproduces identically with `--nojit`). A **ninth item is
+now also FIXED**: the `TestPreparedStatement.testDate8` 1-hour-offset
+residual discovered during the third pass (distinct from the
+already-fixed Julian/Gregorian cutover bug in the same test class) — see
+the "Follow-up session (2026-07-22, fourth pass)" section. See each item
+below, and the "Follow-up session (2026-07-22, second pass)", "third
+pass", and "fourth pass" summaries further down, for full detail.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -728,8 +732,9 @@ observed**. One *new*, unrelated finding surfaced:
 confirmed via a from-scratch build of unmodified `dev@ad909ee8f` that this is
 **pre-existing, not a regression from this session**; it's a distinct residual
 from the already-fixed Julian/Gregorian cutover bug in the same test class.
-Filed separately, not fixed here (out of scope for this pass) — see the
-spawned follow-up task / a new doc for it.
+Filed separately, not fixed here (out of scope for this pass) at the time —
+**now FIXED, see the "Follow-up session (2026-07-22, fourth pass)" section
+below.**
 
 `org.h2.test.store.TestRandomMapOps` was kicked off again with a full 2-hour
 timeout at the end of this session to try for the definitive exit-0
@@ -738,3 +743,116 @@ confirmation the second-pass session couldn't get; check
 rerun) for the outcome if this doc wasn't updated with a result before the
 session ended.
 
+
+
+## Follow-up session (2026-07-22, fourth pass): `TestPreparedStatement.testDate8` 1-hour-offset residual — FIXED
+
+Picked up the residual filed at the end of the third pass (see immediately
+above). Re-confirmed it still reproduces on current `dev` HEAD
+(`becf0f642f9`, 2026-07-22) with an unmodified, from-scratch build before
+touching anything, per this repo's "check already fixed first" convention —
+still reproduced identically:
+```
+AssertionError: Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000
+	at org/h2/test/jdbc/TestPreparedStatement.testDate8(TestPreparedStatement.java:728)
+```
+
+### Root cause
+
+**Not** a date-arithmetic or calendar-cutover bug (the working hypothesis
+going in — a historical-date DST/zone-offset edge case — turned out to be
+wrong; the actual bug isn't date-dependent at all). `testDate8` wraps its
+Julian/Gregorian-transition assertions in:
+```java
+TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"));
+```
+and the failing assertion (`assertEquals(Date.valueOf("1582-09-25"),
+rs.getDate(1))`) compares a value built via `java.sql.Date.valueOf` (which
+routes through `java.util.Date`'s deprecated field constructors and the
+already-fixed JDN-based `date_fields_to_millis`/`date_fields_to_default_millis`
+in `deprecated_util.rs`) against a value the H2 JDBC driver computes
+independently. The JDN/cutover math on both sides is correct — verified by
+isolating `Date.valueOf("1582-09-25")` alone (no H2 involved) under
+`TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"))`: CratonVM produced
+`-12220156800000` where real HotSpot JDK 25 produces `-12220160400000` —
+an exact 3,600,000 ms (1h) discrepancy, reproducing with **any** date, not
+just 1582 ones.
+
+Traced further with a direct probe of `TimeZone.getTimeZone("GMT+01")`
+itself (no `Date`/H2 involved at all):
+```
+tz id=GMT+01:00 rawOffset=0 getOffset(0)=0 getOffset(now)=0   <- CratonVM (WRONG)
+tz id=GMT+01:00 rawOffset=3600000 getOffset(...)=3600000      <- real HotSpot JDK 25
+```
+Every synthetic **custom fixed-offset** `TimeZone` — any id of the form
+`"GMT±HH:MM"` / `"GMT±HHMM"` / `"GMT±H"` / `"UTC±HH:MM"`, canonicalised by
+`normalize_gmt_custom_id` in `native-builtins/src/lib.rs` — resolved every
+offset query (`getRawOffset()`, `getOffset(long)`, `getOffsets(long,int[])`,
+`getOffsetsByWall(long,int[])`) to **0**, regardless of the requested
+offset. `TimeZone.getTimeZone("GMT+01")`'s canonical `ID` field
+(`"GMT+01:00"`) was set correctly, so `getID()`/`toString()` looked right —
+only the numeric offset was silently wrong, which is exactly why `testDate8`
+(fixed-offset-zone-dependent) was the symptom while dates alone were red
+herrings.
+
+Root cause, once traced into `native-builtins/src/lib.rs`'s `getRawOffset`/
+`getOffset`/`getOffsets`/`getOffsetsByWall` native registrations for
+`sun/util/calendar/ZoneInfo`/`java/util/SimpleTimeZone`: none of them read
+the object's own `rawOffset` field (which `alloc_synth_timezone` *does* set
+correctly via the `tz_standard_offset_seconds` lookup table — a dead code
+path for this purpose, it turns out). They instead all go through
+`crate::tzdb::raw_offset_seconds`/`offset_seconds_at_instant`/
+`offset_seconds_at_local`/`standard_offset_seconds_at_instant`, which in
+turn call `tzdb::get_zone_rules(ctx, zone_id)` — a lookup **purely against
+the real `tzdb.dat` catalog** (604 IANA zones + aliases). A synthetic
+`"GMT+01:00"` id has no `tzdb.dat` entry (real Java doesn't need one either
+— it builds these zones' `ZoneInfo` directly from the parsed offset, never
+touching tzdb), so `get_zone_rules` returned `None` for every custom-offset
+id, and every caller's `.unwrap_or(0)` silently substituted 0.
+
+### Fix
+
+`native-builtins/src/tzdb.rs`: added `parse_fixed_gmt_offset_seconds(id)` —
+a self-contained parser for `"GMT±HH:MM"`/`"GMT±HHMM"`/`"GMT±H"`/
+`"UTC±HH:MM"` ids (handles both the canonicalised form
+`normalize_gmt_custom_id` produces and the short forms it accepts on input)
+— and `fixed_offset_rules(offset_seconds)`, which builds a degenerate
+`ZoneRulesData` with empty transition tables and a single constant offset
+(the existing `offset_at_instant`/`offset_at_local`/
+`standard_offset_at_instant`/`raw_offset` functions already treat empty
+transition vectors as "constant offset, no DST" — no changes needed there).
+`get_zone_rules` now falls back to this synthetic rule set when the tzdb
+catalog lookup misses and the id parses as a fixed GMT/UTC offset — fixing
+`getRawOffset`/`getOffset`/`getOffsets`/`getOffsetsByWall` for **every**
+custom-offset zone uniformly (not just `"GMT+01"`), since all four go
+through this same shared lookup. `get_zone_rules`'s one other caller
+(`TimeZone.getTimeZone`'s "is this id resolvable, or should it fall back to
+bogus-id `GMT`" check) already short-circuits `custom_gmt.is_some()` before
+reaching `get_zone_rules`, so this fallback doesn't change that path's
+behavior.
+
+**Verified bit-for-bit against real HotSpot JDK 25**:
+- `TimeZone.getTimeZone("GMT+01"/"GMT+01:00"/"GMT+1"/"GMT+0100").getRawOffset()`
+  / `.getOffset(0)` / `.getOffset(now)`: all now `3600000`, matching HotSpot
+  exactly (was `0`).
+- `TimeZone.getTimeZone("GMT-05"/"GMT-05:00").getOffset(...)`: `-18000000`,
+  matching HotSpot (was `0`).
+- `TimeZone.getTimeZone("UTC"/"GMT"/"GMT+00").getOffset(...)`: unchanged at
+  `0` (still correct — not custom-offset ids, or a genuinely zero offset).
+- `Date.valueOf("1582-09-25")` under `TimeZone.setDefault(GMT+01)`:
+  `-12220160400000`, now matching HotSpot exactly (was `-12220156800000`,
+  off by +3,600,000 ms).
+- `org.h2.test.jdbc.TestPreparedStatement` (the full class, including
+  `testDate8`): clean pass, no assertion failures.
+
+3 new regression unit tests added to `native-builtins/src/tzdb.rs`'s
+existing `#[cfg(test)] mod tests`, alongside 2 more covering the
+`fixed_offset_rules`/`get_zone_rules` fallback plumbing directly (5 new,
+7/7 total in the module including the 2 pre-existing tests, all pass).
+
+**Regression check**: spot-ran `TestAlter`, `TestShell`, `TestLinkedTable`
+(the classes this doc's own history most recently touched) against the
+fixed binary — all clean, no regressions.
+
+Fix commit landed on `dev` via branch
+`fix/h2-testdate8-1hour-offset-20260722`.

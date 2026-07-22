@@ -351,6 +351,77 @@ fn rules_cache() -> &'static Mutex<HashMap<String, Option<Arc<ZoneRulesData>>>> 
     RULES_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Parses a synthetic fixed-offset zone id — `"GMT+HH:MM"`, `"GMT-HH:MM"`,
+/// `"UTC+HH:MM"`, or the un-normalised short forms `TimeZone.getTimeZone`
+/// also accepts before canonicalising (`"GMT+2"`, `"GMT+0800"`, ...) — into
+/// a whole-zone offset in seconds. Returns `None` for anything else (bare
+/// `"GMT"`/`"UTC"` are real zero-offset named zones handled by the tzdb
+/// catalog itself, and real IANA ids never start with `GMT`/`UTC` followed
+/// by a sign).
+///
+/// TESTDATE8-1H (2026-07-22): `TimeZone.getTimeZone("GMT+01")` and friends
+/// canonicalise to `"GMT+01:00"` fine (`normalize_gmt_custom_id` in
+/// lib.rs), but every *offset query* against the resulting `ZoneInfo`
+/// (`getOffset`, `getOffsets`, `getOffsetsByWall`, `getRawOffset`) is wired
+/// through `get_zone_rules`/this module's wrapper functions, which only
+/// know about zones present in the real `tzdb.dat` catalog — a synthetic
+/// "GMT+01:00" id has no catalog entry, so every one of those queries
+/// silently returned `None` -> the caller's `.unwrap_or(0)` -> a 0 offset
+/// instead of the requested +1h. Confirmed against real HotSpot JDK 25:
+/// `TimeZone.getTimeZone("GMT+01").getRawOffset()` is `3600000` there, `0`
+/// here pre-fix, for every custom "GMT±HH:MM" id (not date-dependent, not
+/// specific to `TestPreparedStatement.testDate8`'s 1582 date — that test
+/// just happened to be the one that surfaced it, via
+/// `TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"))` feeding
+/// `java.util.Date`'s deprecated field constructors).
+fn parse_fixed_gmt_offset_seconds(zone_id: &str) -> Option<i32> {
+    let body = zone_id
+        .strip_prefix("GMT")
+        .or_else(|| zone_id.strip_prefix("UTC"))?;
+    let mut chars = body.chars();
+    let sign = match chars.next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let rest = chars.as_str();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.splitn(2, ':');
+    let first = parts.next()?;
+    let (h, m) = match parts.next() {
+        Some(minute_part) => (first.parse::<i32>().ok()?, minute_part.parse::<i32>().ok()?),
+        None if first.len() > 2 => {
+            // Un-normalised "HHMM" form ("GMT+0800").
+            let h: i32 = first[..first.len() - 2].parse().ok()?;
+            let m: i32 = first[first.len() - 2..].parse().ok()?;
+            (h, m)
+        }
+        None => (first.parse::<i32>().ok()?, 0),
+    };
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+        return None;
+    }
+    Some(sign * (h * 3600 + m * 60))
+}
+
+/// A degenerate, no-transitions rule set representing a fixed-offset zone
+/// (never observes DST) — used as the [`get_zone_rules`] fallback for
+/// synthetic "GMT±HH:MM" ids that the tzdb catalog itself has no entry
+/// for. `offset_at_instant`/`offset_at_local`/`standard_offset_at_instant`/
+/// `raw_offset` all treat empty transition vectors as "constant offset,
+/// taken from the first/last element" — see their bodies below.
+fn fixed_offset_rules(offset_seconds: i32) -> ZoneRulesData {
+    ZoneRulesData {
+        standard_transitions: Vec::new(),
+        standard_offsets: vec![offset_seconds],
+        savings_instant_transitions: Vec::new(),
+        wall_offsets: vec![offset_seconds],
+        last_rules: Vec::new(),
+    }
+}
+
 /// Looks up (parsing + caching on first use) the full rule set for a zone
 /// id, resolving tzdb aliases and the legacy `ZoneId.SHORT_IDS` first.
 pub fn get_zone_rules(ctx: &mut dyn NativeContext, zone_id: &str) -> Option<Arc<ZoneRulesData>> {
@@ -358,7 +429,7 @@ pub fn get_zone_rules(ctx: &mut dyn NativeContext, zone_id: &str) -> Option<Arc<
         return hit.clone();
     }
     let cat = catalog(ctx);
-    let result = cat.and_then(|cat| {
+    let mut result = cat.and_then(|cat| {
         let resolved = cat
             .aliases
             .get(zone_id)
@@ -370,6 +441,11 @@ pub fn get_zone_rules(ctx: &mut dyn NativeContext, zone_id: &str) -> Option<Arc<
             .and_then(|bytes| parse_zone_rules(bytes))
             .map(Arc::new)
     });
+    if result.is_none() {
+        if let Some(offset_seconds) = parse_fixed_gmt_offset_seconds(zone_id) {
+            result = Some(Arc::new(fixed_offset_rules(offset_seconds)));
+        }
+    }
     rules_cache()
         .lock()
         .unwrap()
@@ -685,5 +761,69 @@ mod tests {
                 "failed to parse zone {id}"
             );
         }
+    }
+
+    // TESTDATE8-1H regression tests — synthetic "GMT+HH:MM" custom-offset
+    // zone ids used to resolve to a 0 offset everywhere (getOffset,
+    // getRawOffset, ...) because `get_zone_rules` only consulted the real
+    // tzdb.dat catalog, which has no entry for these synthetic ids.
+
+    #[test]
+    fn parse_fixed_gmt_offset_seconds_normalised_forms() {
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+01:00"), Some(3600));
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT-05:00"), Some(-5 * 3600));
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+00:00"), Some(0));
+        assert_eq!(
+            parse_fixed_gmt_offset_seconds("GMT+05:30"),
+            Some(5 * 3600 + 1800)
+        );
+        assert_eq!(parse_fixed_gmt_offset_seconds("UTC+02:00"), Some(2 * 3600));
+    }
+
+    #[test]
+    fn parse_fixed_gmt_offset_seconds_short_forms() {
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+1"), Some(3600));
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+2"), Some(2 * 3600));
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+0800"), Some(8 * 3600));
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT-0530"), Some(-(5 * 3600 + 1800)));
+    }
+
+    #[test]
+    fn parse_fixed_gmt_offset_seconds_rejects_non_offset_ids() {
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT"), None);
+        assert_eq!(parse_fixed_gmt_offset_seconds("UTC"), None);
+        assert_eq!(parse_fixed_gmt_offset_seconds("America/New_York"), None);
+        assert_eq!(parse_fixed_gmt_offset_seconds("Europe/Paris"), None);
+        // Out-of-range hour/minute must not silently clamp.
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+24:00"), None);
+        assert_eq!(parse_fixed_gmt_offset_seconds("GMT+01:60"), None);
+    }
+
+    #[test]
+    fn fixed_offset_rules_constant_across_all_queries() {
+        let rules = fixed_offset_rules(3600);
+        // 1582-09-25T00:00:00Z-ish epoch second (the testDate8 regression
+        // date) and a modern one — a fixed-offset zone has no DST, so the
+        // answer must be identical (and non-zero) at both.
+        for epoch_sec in [-12_220_156_800i64, 0, 1_500_120_000] {
+            assert_eq!(offset_at_instant(&rules, epoch_sec), 3600);
+            assert_eq!(offset_at_local(&rules, epoch_sec), 3600);
+            assert_eq!(standard_offset_at_instant(&rules, epoch_sec), 3600);
+        }
+        assert_eq!(raw_offset(&rules), 3600);
+    }
+
+    #[test]
+    fn get_zone_rules_falls_back_to_fixed_gmt_offset() {
+        // No NativeContext is exercised here (parse_fixed_gmt_offset_seconds
+        // + fixed_offset_rules are the pure, ctx-free half of the fix that
+        // `get_zone_rules` delegates to once the tzdb catalog lookup misses);
+        // the full ctx-driven path is covered by the Java-level repro in
+        // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md.
+        let rules = parse_fixed_gmt_offset_seconds("GMT+01:00")
+            .map(fixed_offset_rules)
+            .expect("GMT+01:00 must resolve to a fixed-offset rule set");
+        assert_eq!(raw_offset(&rules), 3600);
+        assert_eq!(offset_at_instant(&rules, -12_220_156_800), 3600);
     }
 }
