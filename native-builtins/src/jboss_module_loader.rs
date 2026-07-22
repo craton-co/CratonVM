@@ -1056,6 +1056,54 @@ fn read_finders_array(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Optio
 
 /// `LocalModuleLoader.loadModule(String name)` — locate the module on
 /// disk, parse `module.xml`, and return a populated `Module`.
+/// True for JPMS platform module names (`java.base`, `java.logging`,
+/// `jdk.unsupported`, ...). These are JDK modules, not JBoss modules — a
+/// JBoss module tree never contains them (JBoss module names in the `java.*`
+/// namespace don't exist; `javax.*` API shims don't match the `java.` prefix
+/// because of the trailing dot).
+fn is_jdk_platform_module(name: &str) -> bool {
+    name == "java.base" || name.starts_with("java.") || name.starts_with("jdk.")
+}
+
+/// Build, root, and cache a synthetic `Module` for a JPMS platform module —
+/// empty resource roots, no dependencies. See the call site in
+/// `native_loader_load_module` for the rationale (infinispan's
+/// `ModuleClassLoaderMarshaller` requires `loadModule("java.base")` to
+/// succeed on every cache-container start).
+fn synthesize_platform_module(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+    name: &str,
+) -> MethodCallResult {
+    let resolved = ResolvedModule {
+        module_xml_path: PathBuf::new(),
+        module_dir: PathBuf::new(),
+        mx: ModuleXml {
+            name: name.to_string(),
+            ..Default::default()
+        },
+        resource_roots: Vec::new(),
+    };
+    {
+        let mut store = resolved_modules().lock();
+        store
+            .entry(name.to_string())
+            .or_insert_with(|| resolved.clone());
+    }
+    let module = build_module_object(ctx, name, loader, &resolved);
+    // Same keep-alive + race-loser discipline as the normal loadModule tail.
+    ctx.register_var_handle_root(module);
+    let mkey = ctx.identity_hash_code(module);
+    let mut cache = module_cache().lock();
+    if let Some(&(ekey, existing)) = cache.get(name) {
+        return Ok(Some(Value::Object(Some(
+            ctx.read_var_handle_root(ekey).unwrap_or(existing),
+        ))));
+    }
+    cache.insert(name.to_string(), (mkey, module));
+    Ok(Some(Value::Object(Some(module))))
+}
+
 pub(crate) fn native_loader_load_module(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1135,6 +1183,11 @@ pub(crate) fn native_loader_load_module(
         }
     }
     if roots.is_empty() {
+        if is_jdk_platform_module(&name) {
+            let this_now = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
+            return synthesize_platform_module(ctx, this_now, &name);
+        }
         if std::env::var_os("CRATONVM_DBG_WF").is_some() {
             eprintln!("[jboss-module] loadModule({name}) no roots; receiver_has_finders={receiver_has_finders}");
         }
@@ -1166,6 +1219,26 @@ pub(crate) fn native_loader_load_module(
             r
         }
         Err(RuntimeError::ClassNotFoundException { .. }) => {
+            // JPMS platform modules (`java.base`, `java.logging`, `jdk.*`,
+            // ...) are not JBoss modules and never resolve from the module
+            // tree — real jboss-modules serves them through its JDK module
+            // bridge with a Module whose class loader sees platform classes.
+            // WildFly's clustering marshaller calls `loadModule("java.base")`
+            // on every infinispan cache-container start; throwing
+            // `ModuleNotFoundException` here failed those services on every
+            // standalone boot. Synthesize an empty-resource module instead —
+            // JDK classes resolve through the shared bootstrap path regardless
+            // of the requesting loader, so no resource roots are needed. Tree
+            // resolution above still wins for any name a distribution really
+            // ships (checked first, so this is strictly a fallback).
+            if is_jdk_platform_module(&name) {
+                if dbg_wf {
+                    eprintln!("[jboss-module] loadModule({name}) synthesizing JDK platform module");
+                }
+                let this_now = ctx.read_native_pin(this_pin, this);
+                ctx.unpin_native_roots(this_pin);
+                return synthesize_platform_module(ctx, this_now, &name);
+            }
             if dbg_wf {
                 eprintln!("[jboss-module] loadModule({name}) not found in roots");
             }

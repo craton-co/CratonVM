@@ -45178,7 +45178,21 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
             ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n != "java/lang/Object"
         );
-        if !is_canonical && receiver_classed && depth < 2 {
+        // WildFly's `org.jboss.stdio` override streams REDIRECT stdout back
+        // INTO the logging framework (delegating stream → JUL "stdout" logger
+        // → jboss-logmanager). Dispatching a framework log RECORD into them is
+        // circular by construction: on real HotSpot these records flow
+        // logger → ConsoleHandler → the fd saved BEFORE the stdio swap, never
+        // through the live `System.out`. The dispatch below therefore
+        // black-holed every WildFly boot log line (WFLYSRV0049/0025 included —
+        // boot "completed" invisibly, startup-marker written but no console
+        // output). Route framework records straight to the canonical fd-backed
+        // stream for these redirect streams.
+        let is_stdio_redirect = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            Some(n) if n.starts_with("org/jboss/stdio/")
+        );
+        if !is_canonical && receiver_classed && !is_stdio_redirect && depth < 2 {
             EMIT_FRAMEWORK_LOG_DEPTH.with(|d| d.set(depth + 1));
             // GC-safety: `create_string` can trigger a moving collection;
             // pin `out` across it and re-read the (possibly relocated) ref
@@ -45205,7 +45219,12 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
             stream_writeln(ctx, &[Value::Object(Some(out_after))], text);
             return;
         }
-        stream_writeln(ctx, &[Value::Object(Some(out))], text);
+        let sink = if is_stdio_redirect {
+            canonical.unwrap_or(out)
+        } else {
+            out
+        };
+        stream_writeln(ctx, &[Value::Object(Some(sink))], text);
     }
 }
 

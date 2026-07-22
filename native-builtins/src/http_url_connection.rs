@@ -631,7 +631,7 @@ fn huc_real_perform(
         } else {
             None
         };
-        let resp = perform(
+        let resp = perform_with_retry(
             ctx,
             Some(this),
             &parsed,
@@ -709,6 +709,13 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
             ))
         }
+        // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
+        // reach Java as `ConnectException`, not a generic IOException — real
+        // code catches it specifically (see the type's own doc).
+        Err(ref e) if e.starts_with(CONNECT_REFUSED_SENTINEL) => Err(RuntimeError::ConnectException {
+            message: e.trim_start_matches(CONNECT_REFUSED_SENTINEL).to_string(),
+        }
+        .into()),
         // A transport failure before a response is available is an IOException.
         Err(e) => Err(ioex(format!("HttpURLConnection response failed: {e}"))),
     }
@@ -1116,6 +1123,16 @@ const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
 /// failures (e.g. a malformed-but-present HTTP response).
 const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__: ";
 
+/// Prefix on an error string returned by [`perform`] when its TCP connect
+/// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
+/// recognises this and raises `java.net.ConnectException` (real-JDK
+/// behaviour — see the typed `RuntimeError::ConnectException` variant's doc),
+/// matching every other native connect path in this codebase (plain
+/// `Socket`/`SocketChannel`), instead of folding a refused connection into
+/// the generic IOException used for other connect failures (DNS failure,
+/// timeout).
+const CONNECT_REFUSED_SENTINEL: &str = "__cratonvm_connect_refused__: ";
+
 /// Map a socket-read `io::Error` to an error string, flagging a timeout via
 /// [`READ_TIMEOUT_SENTINEL`]. A blocking `read` that hits `SO_RCVTIMEO`
 /// surfaces as `WouldBlock` (Unix) or `TimedOut` (Windows).
@@ -1499,6 +1516,7 @@ fn perform(
     addrs.sort_by_key(|sa| u8::from(sa.is_ipv6()));
     // Blocking region: pure OS-level TCP connect, no Java interaction at all —
     // safe to mark this thread GC-parked for however long it takes.
+    let mut last_err_refused = false;
     ctx.begin_blocking_region();
     for sa in addrs {
         match TcpStream::connect_timeout(&sa, connect_timeout) {
@@ -1506,13 +1524,24 @@ fn perform(
                 tcp = Some(s);
                 break;
             }
-            Err(e) => last_err = Some(format!("connect {sa}: {e}")),
+            Err(e) => {
+                last_err_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+                last_err = Some(format!("connect {sa}: {e}"));
+            }
         }
     }
     ctx.end_blocking_region();
-    let tcp = tcp.ok_or_else(|| {
-        last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"))
-    })?;
+    let tcp = match tcp {
+        Some(t) => t,
+        None => {
+            let msg = last_err.unwrap_or_else(|| format!("could not resolve any address for {addr}"));
+            return Err(if last_err_refused {
+                format!("{CONNECT_REFUSED_SENTINEL}{msg}")
+            } else {
+                msg
+            });
+        }
+    };
     let _ = tcp.set_read_timeout(Some(read_timeout));
     let _ = tcp.set_write_timeout(Some(read_timeout));
     let _ = tcp.set_nodelay(true);
@@ -1726,6 +1755,68 @@ fn perform(
         })();
         ctx.end_blocking_region();
         result
+    }
+}
+
+/// Wraps [`perform`] with HotSpot's transparent retry-once-on-dead-connection
+/// behaviour: `sun.net.www.protocol.http.HttpURLConnection` silently retries
+/// a request over a brand-new TCP connection when the first attempt's
+/// connection is closed by the peer before any response bytes arrive (its
+/// legacy recovery heuristic for a stale/dead pooled keep-alive connection —
+/// which also covers a genuinely brand-new connection the peer tears down
+/// mid-request). Confirmed against real JDK 21 and 25 with a minimal
+/// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
+/// pattern (`docs/known-issues/h2-suite-bugs/
+/// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
+/// the `logout.do` request in full, then — synchronously, on that same
+/// request-handling thread — closes its own just-accepted socket as part of
+/// tearing itself down, before ever writing a response. That is NOT a
+/// CratonVM-specific race (a standalone repro of exactly this shape fails
+/// identically on real JDK), but real JDK's client-side retry then hits a
+/// listening socket that has, by that point, already been closed by the same
+/// shutdown — `ConnectException` — which is what the H2 test's
+/// `catch (ConnectException e)` actually expects. Without this retry,
+/// CratonVM's single-attempt `perform` surfaces the first attempt's raw
+/// "connection closed before response head" as a generic `IOException`
+/// instead. Skipped for the caller-supplied-socket (custom `SSLSocketFactory`)
+/// path: that connection isn't ours to reopen.
+fn perform_with_retry(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+    parsed: &Url1,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    established_https_stream_id: Option<i32>,
+) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    let resp = perform(
+        ctx,
+        connection,
+        parsed,
+        method,
+        headers,
+        body,
+        connect_timeout,
+        read_timeout,
+        established_https_stream_id,
+    );
+    match resp {
+        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
+            perform(
+                ctx,
+                connection,
+                parsed,
+                method,
+                headers,
+                body,
+                connect_timeout,
+                read_timeout,
+                established_https_stream_id,
+            )
+        }
+        other => other,
     }
 }
 
