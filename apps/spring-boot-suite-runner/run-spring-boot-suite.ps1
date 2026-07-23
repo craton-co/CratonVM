@@ -288,14 +288,23 @@ function New-PathingJar {
   $signature = 'pathing-jar-manifest-url-v1' + "`n" + (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
   $hash = (Get-Sha256Hex $signature).Substring(0, 16)
   $stem = ConvertTo-SafeFileStem $(if ($Module) { $Module } else { 'universal' })
-  $jarPath = Join-Path $pathingDir "$stem-$hash.jar"
+  # Spring Boot's ModifiedClassPathClassLoader expands the manifest class
+  # path only for IntelliJ-style `classpath.jar` files.  The runner needs
+  # that expansion for @ClassPathExclusions/@ClassPathOverrides: otherwise
+  # it sees this one wrapper JAR instead of the individual dependency JARs.
+  # Keep module/content isolation in directories so the wrapper name itself
+  # can retain the recognized IntelliJ convention.
+  $jarDir = Join-Path (Join-Path $pathingDir $stem) $hash
+  $jarPath = Join-Path $jarDir 'classpath.jar'
   if (Test-Path $jarPath) { return [System.IO.Path]::GetFullPath($jarPath) }
+  New-Item -ItemType Directory -Force -Path $jarDir | Out-Null
 
   Add-Type -AssemblyName System.IO.Compression | Out-Null
   Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
   $urls = @($Entries | ForEach-Object { ConvertTo-ManifestClasspathUrl $_ })
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add('Manifest-Version: 1.0')
+  $lines.Add('Created-By: IntelliJ IDEA')
   $lines.Add('Main-Class: SbRunner')
   foreach ($line in (Split-ManifestLine ('Class-Path: ' + ($urls -join ' ')))) { $lines.Add($line) }
   $lines.Add('')

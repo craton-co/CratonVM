@@ -1675,7 +1675,9 @@ fn dbg_is_entity_name(n: &str) -> bool {
     n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
 }
 
-pub(crate) fn class_for_name_one_arg_caller_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+pub(crate) fn class_for_name_one_arg_caller_loader(
+    ctx: &mut dyn NativeContext,
+) -> Option<ObjectRef> {
     for caller_cid in ctx.frame_class_ids() {
         if matches!(
             ctx.class_name_of_id(caller_cid).as_deref(),
@@ -3418,7 +3420,10 @@ pub(crate) fn descriptor_to_class_mirror(
 /// `ClassId(0)` / java.lang.Object).  Otherwise `invokevirtual Class.isArray`
 /// on the returned mirror walks up Object's superclass chain and raises
 /// `NoSuchMethodError: java/lang/Object.isArray()Z`.
-pub(crate) fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
+pub(crate) fn synthetic_class_mirror(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> cratonvm_types::ObjectRef {
     // Resolve java/lang/Class вЂ” ensure it's loaded so we get its real ClassId.
     let class_class_id = ctx
         .ensure_class_initialized("java/lang/Class")
@@ -7797,7 +7802,6 @@ pub(crate) fn native_class_get_declared_methods(
             visible = reordered;
         }
 
-
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
@@ -9335,7 +9339,9 @@ pub(crate) fn native_class_get_field(
 
     if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
         let cname = ctx.class_name_of_id(class_id);
-        eprintln!("[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}");
+        eprintln!(
+            "[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}"
+        );
     }
 
     // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
@@ -12646,13 +12652,8 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_method_annotation_array(
-        ctx,
-        class_id,
-        &method_name,
-        &method_desc,
-        &annotations,
-    );
+    let arr =
+        build_method_annotation_array(ctx, class_id, &method_name, &method_desc, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12739,13 +12740,8 @@ pub(crate) fn native_method_get_annotation(
     }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = cached_method_annotation_proxy(
-                ctx,
-                class_id,
-                &method_name,
-                &method_desc,
-                ann,
-            );
+            let proxy =
+                cached_method_annotation_proxy(ctx, class_id, &method_name, &method_desc, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -13327,9 +13323,9 @@ pub(crate) fn native_class_get_generic_interfaces(
                         host_id
                             .map(|host_id| ctx.get_class_mirror(host_id))
                             .map(|host_mirror| {
-                            crate::generics::GenericDeclScope::new(Value::Object(Some(
-                                host_mirror,
-                            )))
+                                crate::generics::GenericDeclScope::new(Value::Object(Some(
+                                    host_mirror,
+                                )))
                             });
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
@@ -14656,12 +14652,11 @@ pub(crate) fn native_class_get_package(
 // propagates up as `IllegalStateException: Failed to create invoker for
 // Invoker` -- the canonical I2 blocker for ByteBuddy + Mockito.
 //
-// Fix: register our own native bodies for the three methods below so they
-// short-circuit before touching the null `packages` field. They mirror the
-// `cl_get_defined_package` synthetic-mode native (returns null) and the
-// `native_class_get_package` synthetic Package builder so that
-// `postDefineClass` and `Class.getPackage()` keep working without depending
-// on `packages` being non-null.
+// Fix: register native bodies for the three methods below so they avoid the
+// null `packages` field. `getDefinedPackage` derives a conservative answer
+// from classpath-visible class files; the package builders synthesize the
+// JDK object shape so `postDefineClass` and `Class.getPackage()` keep working
+// without depending on `packages` being non-null.
 
 /// `ClassLoader.getDefinedPackage(String name) -> Package` вЂ” returns null
 /// (no package is defined on this classloader). JDK semantics: returning
@@ -14669,10 +14664,30 @@ pub(crate) fn native_class_get_package(
 /// package by that name. ByteBuddy's `Resolver$ForModuleSystem.accept`
 /// already null-checks the result, so returning null is a clean exit.
 pub(crate) fn i2_classloader_get_defined_package(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+    // Avoid the real-JDK `ClassLoader.packages` map: it can be uninitialised
+    // for a user-created loader.  Returning null unconditionally, however,
+    // violates the application loader's contract. Spring Boot uses this
+    // probe to distinguish a package directory from an XML resource.
+    let package_name = match args.get(1) {
+        Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if package_name.is_empty() || package_name.contains('/') {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // A class file immediately below the package path is a conservative,
+    // classpath-backed proof that the package exists. It avoids synthesising
+    // packages for arbitrary names or resource-only directories.
+    let class_glob = format!("{}/*.class", package_name.replace('.', "/"));
+    if ctx.find_all_resource_urls(&class_glob).is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let package = i2_alloc_synthetic_package(ctx, &package_name);
+    Ok(Some(Value::Object(Some(package))))
 }
 
 /// `ClassLoader.getDefinedPackages() -> Package[]` вЂ” returns an empty array.
@@ -16780,13 +16795,13 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     let this = obj_arg(args, 0)?;
     let (declaring_class_id, per_param, per_param_type_args, count) =
         match method_class_name_desc(ctx, this) {
-        Some((cid, name, desc)) => {
-            let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
-            let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
-            (Some(cid), pta, pta_args, count_method_params(&desc))
-        }
-        None => (None, Vec::new(), Vec::new(), 0),
-    };
+            Some((cid, name, desc)) => {
+                let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
+                let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
+                (Some(cid), pta, pta_args, count_method_params(&desc))
+            }
+            None => (None, Vec::new(), Vec::new(), 0),
+        };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
     let erased_type_mirrors: Vec<ObjectRef> =
@@ -19579,7 +19594,7 @@ Implementation-Title: opensaml-core-api\r\n\
 
         assert_eq!(
             manifest_attr_for_package(&attrs, Some("org/opensaml/core/"), "Implementation-Version")
-            .as_deref(),
+                .as_deref(),
             Some("5.2.1")
         );
         assert_eq!(
