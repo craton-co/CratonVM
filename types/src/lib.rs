@@ -12,6 +12,7 @@ mod class_id;
 pub mod compact_value;
 pub mod error;
 pub mod field_layout;
+pub mod field_watch;
 pub mod float_format;
 mod heap_types;
 pub mod intern;

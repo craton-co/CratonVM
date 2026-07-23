@@ -15320,6 +15320,30 @@ fn execute_instruction(
             if let Value::Object(Some(old_ref)) = old_value {
                 shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
             }
+            // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
+            // real putfield to any Page/RootReference field, unconditional
+            // (not tied to a construction-site guess or a GC-move-fragile
+            // address watch list). See docs/known-issues/h2-suite-bugs/
+            // bug-h2-suite-residual-fail-triage.md.
+            if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some() {
+                let decl_name = shared
+                    .class_manager
+                    .read()
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if decl_name.contains("Page") || decl_name.contains("RootReference") {
+                    eprintln!(
+                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field_index={} old={:?} new={:?} thread={}",
+                        obj_ref.as_ptr(),
+                        decl_name,
+                        field.field_index,
+                        old_value,
+                        value,
+                        thread.thread_id.0,
+                    );
+                }
+            }
             if field.is_volatile {
                 // CRATONVM_DBG_AQS_TRACE (2026-07-21): ledger entry for the
                 // synchronizer family's plain volatile state writes
@@ -18897,6 +18921,31 @@ fn retarget_instance_field_to_receiver(
         || receiver_class_id == field.declaring_class_id
         || !should_use_loader_initiated_resolution(shared, current_class_id)
     {
+        if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some()
+            && !field.is_static
+            && receiver_class_id != ClassId::new(0)
+            && receiver_class_id != field.declaring_class_id
+        {
+            // Fired the mismatch condition but bailed on
+            // should_use_loader_initiated_resolution — worth knowing this
+            // gate is the reason retargeting was skipped for a genuinely
+            // mismatched receiver.
+            let cm = shared.class_manager.read();
+            let decl_name = cm
+                .get_class(field.declaring_class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            let recv_name = cm
+                .get_class(receiver_class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            if decl_name.contains("Page") || decl_name.contains("RootReference") {
+                eprintln!(
+                    "[RETARGET-SKIP] cp_index={} cached_decl={}({:?}) actual_recv={}({:?}) cached_field_index={} loader_initiated_gate=false",
+                    cp_index, decl_name, field.declaring_class_id, recv_name, receiver_class_id, field.field_index
+                );
+            }
+        }
         return None;
     }
 
@@ -18918,6 +18967,12 @@ fn retarget_instance_field_to_receiver(
         return None;
     }
 
+    let dbg = std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some()
+        && (resolved_decl.name.contains("Page") || resolved_decl.name.contains("RootReference"));
+    let cached_field_index = field.field_index;
+    let cached_decl_name = resolved_decl.name.to_string();
+    let recv_name_for_dbg = receiver_class.name.to_string();
+
     let mut cursor = Some(receiver_class_id);
     while let Some(cid) = cursor {
         let class = cm.class_store.get(cid)?;
@@ -18927,9 +18982,18 @@ fn retarget_instance_field_to_receiver(
                 continue;
             }
             if &*f.name == field_name && &*f.descriptor == descriptor {
+                let new_index = class.first_field_index + instance_idx;
+                if dbg {
+                    eprintln!(
+                        "[RETARGET-HIT] cp_index={} field={} cached_decl={}({:?}) cached_index={} actual_recv={}({:?}) new_decl_cid={:?} new_index={} {}",
+                        cp_index, field_name, cached_decl_name, field.declaring_class_id,
+                        cached_field_index, recv_name_for_dbg, receiver_class_id, cid, new_index,
+                        if new_index != cached_field_index { "**INDEX CHANGED**" } else { "(same index)" }
+                    );
+                }
                 return Some(ResolvedField {
                     declaring_class_id: cid,
-                    field_index: class.first_field_index + instance_idx,
+                    field_index: new_index,
                     is_static: false,
                     is_volatile: f.is_volatile(),
                     is_reference: f.descriptor.starts_with('L') || f.descriptor.starts_with('['),
@@ -18941,6 +19005,12 @@ fn retarget_instance_field_to_receiver(
         cursor = class.superclass;
     }
 
+    if dbg {
+        eprintln!(
+            "[RETARGET-MISS] cp_index={} field={} cached_decl={}({:?}) actual_recv={}({:?}) — walked full hierarchy, no matching field found",
+            cp_index, field_name, cached_decl_name, field.declaring_class_id, recv_name_for_dbg, receiver_class_id
+        );
+    }
     None
 }
 
@@ -19889,6 +19959,9 @@ fn execute_invoke_kind(
             args.get(1).map(describe).unwrap_or_default(),
         );
     }
+    if let Value::Object(Some(o)) = &args[0] {
+        cratonvm_types::field_watch::watch(*o);
+    }
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && method_class_name.contains("RootReference")
         && method_name.as_ref() == "<init>"
@@ -19919,6 +19992,9 @@ fn execute_invoke_kind(
             args.get(2).map(describe).unwrap_or_default(),
             args.get(3).map(describe).unwrap_or_default(),
         );
+    }
+    if let Value::Object(Some(o)) = &args[0] {
+        cratonvm_types::field_watch::watch(*o);
     }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
@@ -38833,6 +38909,9 @@ fn execute_invokevirtual_cached(
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
             }
+            if let Value::Object(Some(o)) = &args_slice[0] {
+                cratonvm_types::field_watch::watch(*o);
+            }
             if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
                 && cached.class_name.contains("RootReference")
                 && cached.method_name.as_ref() == "<init>"
@@ -38863,6 +38942,9 @@ fn execute_invokevirtual_cached(
                     args_slice.get(2).map(describe).unwrap_or_default(),
                     args_slice.get(3).map(describe).unwrap_or_default(),
                 );
+            }
+            if let Value::Object(Some(o)) = &args_slice[0] {
+                cratonvm_types::field_watch::watch(*o);
             }
 
             if let Some(res) = intercept_classloader_set_default_assertion_status(
