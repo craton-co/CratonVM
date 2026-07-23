@@ -1,12 +1,13 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed, mostly closed after five follow-up sessions.** Of the
-original 11 items: **8 now confirmed FIXED** (`TestPreparedStatement`,
-`TestShell`, `TestRandomMapOps` [very likely — ~99 CPU-minutes clean before
-an unrelated host-wide OOM kill cut the confirmation run short; see its
-section for the corrected account — a prior version of this doc incorrectly
-claimed a clean 2-hour completion], `TestLinkedTable`, `TestAlter`,
+**OPEN, mixed, mostly closed after seven follow-up sessions.** Of the
+original 11 items: **8 now confirmed FIXED, high confidence** (`TestPreparedStatement`,
+`TestShell`, `TestRandomMapOps` [confirmed via a clean 2-full-pass, ~4
+CPU-hour re-run with zero incidents — see the final "definitive re-run"
+section for the corrected account; an earlier attempt had genuinely been
+OOM-killed by an unrelated concurrent session and a prior version of this
+doc incorrectly described that as a clean completion], `TestLinkedTable`, `TestAlter`,
 `TestDataUtils` [now fully fixed — see the "Follow-up session (2026-07-22,
 third pass)" section], plus the `SecurityException` half of `TestUpgrade`),
 **1 root-caused as a genuine performance-margin issue rather than a
@@ -1168,3 +1169,73 @@ orchestrated sessions for most of this pass (two `cargo build` attempts
 were `SIGKILL`'d by the OOM killer before a third succeeded once load
 dropped) — worth checking `free -g`/`ps aux --sort=-%mem` before assuming a
 build failure here is a code problem rather than host contention.
+
+### Addendum (same session, static check while `TestRandomMapOps` ran):
+### `init_locals_pooled`/`Frame::new_pooled_cached` ruled out
+
+Read `vm/src/runtime/frame.rs`'s `Frame::new_pooled_cached` and the
+`init_locals_pooled` helper it calls directly (the pooled-frame
+construction path the sixth pass's hypothesis pointed at). Both look
+correct on inspection: `init_locals_pooled` unconditionally does
+`locals.clear(); locals.resize(n, uninitialized); kinds.clear();
+kinds.resize(n, LKIND_OTHER);` — a full wipe — before
+`copy_args_to_locals` writes the actual call arguments starting at slot 0,
+for exactly `args.len()` slots. There is no code path here that could
+leave a stale value from a previous pooled use in a slot the new call
+should have populated; a pooled `Vec`'s prior contents are discarded, not
+selectively overwritten. This rules out the pooled-frame *construction*
+step specifically as the mechanism — it does not rule out the hypothesis
+generally, since the actual argument values (`args`/`args_slice`) are
+built *before* this function is called, by popping the operand stack in
+the invoke dispatcher (`execute_invokevirtual_cached`, the
+`CachedInvokeTarget::VirtualBytecode` arm, `vm/src/runtime/interpreter.rs`
+~L37170-37310 for the cache-hit path, a parallel cache-miss path nearby).
+**Narrows the "concrete next step" from the sixth pass**: the remaining
+suspect is specifically the operand-stack argument *popping* for an
+`invokespecial` call to `RootReference.tryUpdate` (i.e. `is_special=true`
+in this dispatcher) — not frame/locals construction, which is now
+confirmed clean.
+
+### `TestRandomMapOps` — definitive re-run (2026-07-23, same session as the
+### sixth/seventh pass): 2 full passes clean, killed by timeout as expected
+
+Re-ran with a fresh 4-hour `timeout` wrapper (worktree
+`/data/wt-h2-testupgrade-20260722`, binary
+`target/release/cratonvm-testupgrade3`, started 2026-07-23 00:26:06 UTC) on
+a host with confirmed-available memory (checked `free -g` immediately
+before launch), specifically to get a real outcome after the OOM-truncated
+attempt this doc previously (and incorrectly) described as a clean 2-hour
+completion.
+
+**Outcome: clean, unambiguous.** The run completed **two full passes**
+with zero assertion failures and zero crashes:
+```
+02:09:09  1:43:02.634  Done pass #0
+03:53:40  3:27:34.053  Done pass #1
+```
+then continued silently into pass #2 for another ~32 minutes before the
+`timeout 14400` wrapper reaped it at the 4-hour mark (00:26:06 + 4h =
+04:26:06 UTC; process confirmed gone by the next check at 04:29). Checked
+`dmesg` for an OOM kill on this PID — none found this time (contrast with
+the prior attempt on this same day, PID `1793972`, which genuinely was
+OOM-killed at ~99 minutes by an unrelated concurrent session's memory
+spike, as this doc's sixth-pass-adjacent correction already recorded). No
+output whatsoever in the log between `Done pass #1` and the process
+disappearing — consistent with `timeout` cleanly `SIGTERM`/`SIGKILL`-ing a
+still-healthy, still-computing process mid-pass, not with a hang (the
+process's CPU time tracked wall-clock 1:1 the entire run, confirmed via
+repeated `ps` samples during the run) or a crash (a crash or uncaught
+exception would have printed to the log before the process exited; this
+log's last line is the routine `Done pass #1` progress message).
+
+**Conclusion**: this is materially stronger evidence than any previous
+session obtained — 2 complete passes (not 0, as in every prior attempt)
+plus a third partial pass, ~4 full CPU-hours, zero incidents. Upgrading
+the characterization from "very likely fixed, not 100% verified" to
+**fixed, high confidence** — the original fast, deterministic `rev (1654,
+null)` assertion failure this class used to hit immediately is
+conclusively gone, and nothing in 4 hours of continued heavy fuzz load
+surfaced any other issue. A literal exit-0 (all 100 rounds) is still not
+practically obtainable in any reasonable session's timeframe given
+`TestAll.big`'s workload size and current interpreter throughput, and
+isn't necessary to close this out — treating this as closed.
