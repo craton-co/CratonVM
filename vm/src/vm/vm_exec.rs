@@ -855,9 +855,10 @@ fn safe_native_call_impl(
     // records the threshold crossing; only that request is consumed here.
     // A general `needs_gc()` check is intentionally not enough: it would force
     // a collection for every native dispatch on allocation-heavy JIT paths.
-    let native_array_gc = shared
-        .native_array_gc_requested
-        .swap(false, std::sync::atomic::Ordering::Relaxed);
+    let native_array_gc = crate::runtime::env_cache::disable_jit()
+        && shared
+            .native_array_gc_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut requested_gc = false;
     if native_array_gc && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared) {
         crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -4813,7 +4814,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let array = self.shared
             .heap
             .alloc_array(ClassId::new(0), element_type, length);
-        if self.shared.heap.needs_gc() {
+        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
             self.shared
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4837,7 +4838,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let array = self.shared
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, length);
-        if self.shared.heap.needs_gc() {
+        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
             self.shared
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
