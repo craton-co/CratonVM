@@ -39,6 +39,10 @@ impl ClassFileMethod {
         self.access_flags.contains(MethodAccessFlags::SYNCHRONIZED)
     }
 
+    pub fn is_bridge(&self) -> bool {
+        self.access_flags.contains(MethodAccessFlags::BRIDGE)
+    }
+
     /// Returns the Code attribute, if present and already decoded.
     /// Lazy attributes must be force-decoded by the caller first.
     pub fn code(&self) -> Option<&crate::attribute::CodeAttribute> {

@@ -4580,9 +4580,34 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
         // Declared-only check: inspect this exact class, NOT its superclasses.
+        //
+        // Exclude compiler-generated bridge methods (ACC_BRIDGE, 0x0040).
+        // A bridge is not a genuine override in the OOP sense CratonVM's
+        // callers care about ("does this class provide its OWN real
+        // implementation") -- it is javac's forwarding stub for visibility
+        // (e.g. `StringBuilder.substring(int)` forwarding to its
+        // package-private superclass `AbstractStringBuilder`'s real
+        // implementation) or covariant-return erasure. Counting it as a
+        // "declared override" broke
+        // `native_mockito_mock_method_advice_is_overridden`'s ancestor walk:
+        // for a Mockito inline mock of `StringBuilder`, it saw
+        // `StringBuilder`'s bridge `substring(int)` between the mock's own
+        // class and `AbstractStringBuilder` (the reflected Method's real
+        // declaring class) and concluded "overridden -- do not intercept
+        // here", silently skipping Mockito's advice and returning the real
+        // (empty-buffer) computation instead of the stubbed answer. Real
+        // JDK reflection call sites never see bridges as "the" declared
+        // method for this kind of check (ByteBuddy's own `MethodGraph`
+        // merges a bridge into its bridged target), so excluding them here
+        // matches that semantics. The other two callers (constructor checks,
+        // a `ClassLoader.findResources` override probe) are unaffected:
+        // constructors can never be bridges, and `findResources`'s fixed,
+        // non-generic signature is never bridge-erased in practice.
         let cm = self.shared.class_manager.read();
         match cm.class_store.get(class_id) {
-            Some(class) => class.find_method(name, descriptor).is_some(),
+            Some(class) => class
+                .find_method(name, descriptor)
+                .is_some_and(|m| !m.is_bridge()),
             None => false,
         }
     }
