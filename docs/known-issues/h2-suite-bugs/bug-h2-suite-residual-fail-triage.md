@@ -1168,3 +1168,29 @@ orchestrated sessions for most of this pass (two `cargo build` attempts
 were `SIGKILL`'d by the OOM killer before a third succeeded once load
 dropped) — worth checking `free -g`/`ps aux --sort=-%mem` before assuming a
 build failure here is a code problem rather than host contention.
+
+### Addendum (same session, static check while `TestRandomMapOps` ran):
+### `init_locals_pooled`/`Frame::new_pooled_cached` ruled out
+
+Read `vm/src/runtime/frame.rs`'s `Frame::new_pooled_cached` and the
+`init_locals_pooled` helper it calls directly (the pooled-frame
+construction path the sixth pass's hypothesis pointed at). Both look
+correct on inspection: `init_locals_pooled` unconditionally does
+`locals.clear(); locals.resize(n, uninitialized); kinds.clear();
+kinds.resize(n, LKIND_OTHER);` — a full wipe — before
+`copy_args_to_locals` writes the actual call arguments starting at slot 0,
+for exactly `args.len()` slots. There is no code path here that could
+leave a stale value from a previous pooled use in a slot the new call
+should have populated; a pooled `Vec`'s prior contents are discarded, not
+selectively overwritten. This rules out the pooled-frame *construction*
+step specifically as the mechanism — it does not rule out the hypothesis
+generally, since the actual argument values (`args`/`args_slice`) are
+built *before* this function is called, by popping the operand stack in
+the invoke dispatcher (`execute_invokevirtual_cached`, the
+`CachedInvokeTarget::VirtualBytecode` arm, `vm/src/runtime/interpreter.rs`
+~L37170-37310 for the cache-hit path, a parallel cache-miss path nearby).
+**Narrows the "concrete next step" from the sixth pass**: the remaining
+suspect is specifically the operand-stack argument *popping* for an
+`invokespecial` call to `RootReference.tryUpdate` (i.e. `is_special=true`
+in this dispatcher) — not frame/locals construction, which is now
+confirmed clean.
