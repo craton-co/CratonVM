@@ -52272,7 +52272,25 @@ fn native_atomic_ref_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
-    Ok(Some(ctx.get_field_volatile(this, 0)))
+    let val = ctx.get_field_volatile(this, 0);
+    if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if let Value::Object(Some(o)) = val {
+            let val_cid = ctx.class_id_of_object(o);
+            let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
+            if val_cn.contains("RootReference") {
+                let frames = ctx.frame_class_ids();
+                let caller_cid = frames.first().copied();
+                let caller_cn = caller_cid
+                    .and_then(|c| ctx.class_name_of_id(c))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[LOADER-TRACE] native_atomic_ref_get thread={} holder_obj={:p} val_obj={:p} val_class={} val_cid={} caller_class_id={:?} caller_class={}",
+                    ctx.thread_id(), this.as_ptr(), o.as_ptr(), val_cn, val_cid.as_u32(), caller_cid, caller_cn
+                );
+            }
+        }
+    }
+    Ok(Some(val))
 }
 
 fn native_atomic_ref_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -52286,6 +52304,23 @@ fn native_atomic_ref_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = unsafe_obj(args, 0).unwrap();
     let expected = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if let Value::Object(Some(o)) = new_val {
+            let val_cid = ctx.class_id_of_object(o);
+            let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
+            if val_cn.contains("RootReference") {
+                let frames = ctx.frame_class_ids();
+                let caller_cid = frames.first().copied();
+                let caller_cn = caller_cid
+                    .and_then(|c| ctx.class_name_of_id(c))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[LOADER-TRACE] native_atomic_ref_cas PRE thread={} holder_obj={:p} new_obj={:p} new_class={} new_cid={} caller_class_id={:?} caller_class={}",
+                    ctx.thread_id(), this.as_ptr(), o.as_ptr(), val_cn, val_cid.as_u32(), caller_cid, caller_cn
+                );
+            }
+        }
+    }
     let result = ctx.compare_and_swap_field(this, 0, expected, new_val);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
 }

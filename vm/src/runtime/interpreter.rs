@@ -15056,7 +15056,8 @@ fn execute_instruction(
                 let ref_loader = cm.get_loader_id(referencing_class_id);
                 let target_loader = cm.get_loader_id(target_class_id);
                 eprintln!(
-                    "[LOADER-TRACE] new class_name={class_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}"
+                    "[LOADER-TRACE] new thread={:?} class_name={class_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}",
+                    thread.thread_id
                 );
                 if matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application)) {
                     eprintln!("[LOADER-TRACE-STACK] full Java stack for this Application-context 'new':");
