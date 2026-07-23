@@ -120,11 +120,69 @@ pub enum SkipReason {
     /// Keep this symbol-completion method interpreted until its JIT lowering
     /// is understood.
     ClassFinderComplete,
+    /// Javac's `ClassFinder.fillIn` -- the method `ClassFinder.complete`
+    /// itself calls to do the actual symbol completion -- is a FIFTH
+    /// distinct JIT residual in the same repeated-in-process-compilation
+    /// scenario as `ClassReaderReadClass`/`ClassFinderComplete` above.
+    /// `ClassFinderComplete`'s own doc comment noted `fillIn` was
+    /// bisect-RULED-OUT for the two symptoms known at the time (a
+    /// deprecation-warning `-Werror` false positive and duplicated-token
+    /// generated source) -- but `fillIn` gets its own independent JIT
+    /// tier-up eligibility separate from its caller `complete` (forcing
+    /// `complete` to interpret does not prevent `fillIn` from itself
+    /// getting hot enough to tier up under a longer-running loop), and DOES
+    /// independently miscompile: `java.lang.NullPointerException` thrown
+    /// directly from `ClassFinder.fillIn` (JDK 25.0.3, line ~395) reached
+    /// via `Types.unboxedType` -> `ClassFinder.complete` -> `fillIn`
+    /// while attributing a `new Object[]{...}` array-initializer literal,
+    /// surfacing as real javac's own internal-compiler-error report rather
+    /// than a Spring-visible `CompilationException`. Reproduced
+    /// deterministically at iteration 38 of a Spring-free, ~30-line
+    /// standalone repro (`ToolProvider.getSystemJavaCompiler().getTask(...)
+    /// .call()` looped in one process, each iteration compiling a trivial
+    /// user class against a small JSpecify-`@Nullable`-annotated
+    /// `@FunctionalInterface` also in scope) -- with `ClassFinderComplete`
+    /// already interpreted per the fix above. Keep this symbol-completion
+    /// method interpreted until its own JIT lowering is understood too.
+    ClassFinderFillIn,
+    /// Javac's `ClassReader.readInnerClasses` -- the InnerClasses attribute
+    /// reader, a moderately complex loop (per-entry: 4 constant-pool-index
+    /// reads, an `adjustClassFlags` call, conditional `enterClass`/
+    /// `enterMember` calls and `ClassType.setEnclosingType` field writes) --
+    /// is a SIXTH distinct JIT residual in the same repeated-in-process-
+    /// javac-compilation family as `ClassReaderReadClass`/
+    /// `ClassFinderComplete`/`ClassFinderFillIn` above. Symptom: real
+    /// javac's own `class file truncated at offset N` diagnostic (thrown
+    /// from `ClassReader.nextChar`/`nextByte`/`nextInt` once the shared
+    /// `bp` buffer-position cursor has been driven past the end of the
+    /// classfile) -- consistent with the entry-count loop in this method's
+    /// own JIT-compiled body over- or under-consuming `nextChar()` calls per
+    /// iteration once tier-compiled, desynchronizing `bp` from every
+    /// subsequent attribute read for the rest of that classfile (and
+    /// possibly the next one read from the same shared `ClassReader`).
+    /// Bisected by binary search over every other method on `ClassReader`
+    /// (all TYPE_ANNOTATIONS/signature/attribute/nextByte-family candidates
+    /// ruled out first, since the trigger classfile has JSpecify
+    /// `@Nullable` TYPE_USE annotations on a generic method return type and
+    /// an array return type -- an initially much more obvious suspect that
+    /// turned out to be a red herring): `CRATONVM_JIT_BISECT_SKIP=.../
+    /// ClassReader.readInnerClasses` (this exact method alone) is
+    /// sufficient against a Spring-free, ~30-line standalone repro
+    /// (`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped
+    /// ~40x in one process, each iteration compiling a trivial user class
+    /// against a small JSpecify-annotated `@FunctionalInterface` also in
+    /// scope), reproducing deterministically at iteration 38 every time.
+    /// Confirmed JIT-only via `--nojit` (all iterations pass). Keep this
+    /// InnerClasses-attribute-reading method interpreted until its own JIT
+    /// lowering is understood.
+    ClassReaderReadInnerClasses,
+
     /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
     /// stack after tiered compilation while H2 compiles a generated alias.
     /// Keep this symbol-completion method interpreted until its invokespecial
     /// lowering is corrected.
     ClassSymbolComplete,
+
     /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
@@ -510,6 +568,13 @@ fn should_skip_jit_internal(
         return Some(SkipReason::ClassFinderComplete);
     }
 
+    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
+        return Some(SkipReason::ClassFinderFillIn);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
+        return Some(SkipReason::ClassReaderReadInnerClasses);
+
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
     // the real in-process javac compiler.  After this exact method tiers up,
     // `Symbol$ClassSymbol.complete()` deterministically reaches an
@@ -521,6 +586,7 @@ fn should_skip_jit_internal(
     // interpreted until the special-call lowering is root-caused.
     if class_name == "com/sun/tools/javac/code/Symbol$ClassSymbol" && method_name == "complete" {
         return Some(SkipReason::ClassSymbolComplete);
+
     }
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`

@@ -39,6 +39,22 @@ smaller/individual differences not yet clustered.
 > by `49d7834e9` (reactor-netty startup-hang residuals fix), confirmed via
 > reproduction rather than code reading alone.
 
+> Closure update (2026-07-23): the `module/spring-boot-data-redis` 4-class
+> HANG cluster (`DataRedisAutoConfigurationTests`,
+> `DataRedisAutoConfigurationJedisTests`,
+> `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
+> `DataRedisHealthContributorAutoConfigurationTests` — see
+> `RESULTS-20260723.md`'s residual table) is fixed — see
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
+> classpath scan from scratch on every call (no caching), and `JarFile`
+> entry lookups eagerly decompressed every entry in a jar just to answer an
+> existence check — both general classloading bugs, not Redis-specific,
+> just tipped over the 300s timeout by this module's unusually large
+> (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
+> and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
+> fix (not caused by it): `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md`.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |

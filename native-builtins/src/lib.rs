@@ -8278,20 +8278,56 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    // Spring Framework 7.0.7 delegates every parameter shape directly to
-    // ParameterResolutionDelegate. Keep this native mirror deliberately
-    // narrow: the former ApplicationContext / BeanOverride branches drifted
-    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    // Real Spring source (spring-framework-recheck, verified 2026-07-23) still
+    // has an isBeanOverride(Parameter) short-circuit ahead of the generic
+    // ParameterResolutionDelegate fallback: a @BeanOverride-annotated (e.g.
+    // @MockitoBean/@MockitoSpyBean) constructor parameter with a resolvable
+    // BeanOverrideHandler.getBeanName() is looked up DIRECTLY by name via
+    // applicationContext.getBean(name), bypassing ambiguous by-type
+    // autowiring entirely. The prior "narrowed" comment here claiming this
+    // was removed upstream was wrong (or based on a stale/different
+    // checkout) -- without this branch, EVERY bean-override constructor
+    // parameter whose override name doesn't happen to equal the parameter's
+    // own name (or carry an explicit @Qualifier) falls through to
+    // ParameterResolutionDelegate.resolveDependency and throws
+    // NoUniqueBeanDefinitionException, since all sibling override beans
+    // share the same declared type. Restore the shortcut by calling the
+    // real (unmodified) BeanOverrideUtils.resolveHandlerForParameter, which
+    // itself performs the isBeanOverride check internally (returns null for
+    // non-override parameters), so this is purely additive.
     let application_context = spring_extension_get_application_context(ctx, extension_context)?;
-    let bean_factory_result = match application_context {
-        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
-            application_context,
-            "getAutowireCapableBeanFactory",
-            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-            &[],
-        )?,
+    let application_context_obj = match application_context {
+        Some(Value::Object(Some(application_context))) => application_context,
         other => return Ok(other),
     };
+
+    if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+        "org/springframework/test/context/bean/override/BeanOverrideUtils",
+        "resolveHandlerForParameter",
+        "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+        &[
+            Value::Object(Some(parameter)),
+            Value::Object(Some(test_class)),
+        ],
+    ) {
+        if let Ok(Some(Value::Object(Some(bean_name)))) =
+            ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+        {
+            return ctx.invoke_virtual(
+                application_context_obj,
+                "getBean",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(bean_name))],
+            );
+        }
+    }
+
+    let bean_factory_result = ctx.invoke_virtual(
+        application_context_obj,
+        "getAutowireCapableBeanFactory",
+        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+        &[],
+    )?;
     let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
@@ -26675,6 +26711,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/nio/channels/FileChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Real bytecode (sun/nio/ch/FileChannelImpl.truncate) checks the
+            // writable field and throws NonWritableChannelException before
+            // touching the fd -- this concrete-class override bypasses that
+            // bytecode entirely (see bug-27 comment above), so it must
+            // replicate the check itself or a channel opened FileChannel.open(
+            // path, READ) silently truncates the real file instead of
+            // rejecting the call (docs/known-issues/h2-suite-bugs/
+            // bug-h2-files-setposixfilepermissions-FIXED.md residual).
+            let writable = !matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0));
+            if !writable {
+                return Err(throw_non_writable_channel_exception(ctx));
+            }
             let fd_id: Option<u32> = match ctx.get_field_by_name(this, "fd") {
                 Value::Object(Some(fd_obj)) => match ctx.get_field_by_name(fd_obj, "fd") {
                     Value::Int(v) if v >= 0 => Some(v as u32),
@@ -26692,16 +26740,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
             .max(0) as u64;
             if let Some(fd) = fd_id {
-                let cur = ctx
+                // Real FileChannel.truncate() contract: a no-op when the
+                // requested size is >= the current file size (only ever
+                // shrinks). The original bug-27 code called rw_set_length
+                // unconditionally, which *grows* (zero-extends) the file
+                // when truncate() is called with a larger size -- caught by
+                // TestFileSystem.testRandomAccess, which runs the identical
+                // op sequence against a real RandomAccessFile oracle and
+                // expects truncate(9800) on a 570-byte file to be a no-op.
+                let cur_size = ctx.fd_table().file_size(fd).unwrap_or(0);
+                if new_len < cur_size {
+                    ctx.fd_table().rw_set_length(fd, new_len).map_err(|e| {
+                        cratonvm_types::error::RuntimeError::IOException {
+                            message: e.to_string(),
+                        }
+                    })?;
+                }
+                let cur_pos = ctx
                     .fd_table()
                     .rw_seek(fd, std::io::SeekFrom::Current(0))
                     .unwrap_or(0);
-                ctx.fd_table().rw_set_length(fd, new_len).map_err(|e| {
-                    cratonvm_types::error::RuntimeError::IOException {
-                        message: e.to_string(),
-                    }
-                })?;
-                if cur > new_len {
+                if cur_pos > new_len {
                     let _ = ctx
                         .fd_table()
                         .rw_seek(fd, std::io::SeekFrom::Start(new_len));
@@ -65462,6 +65521,24 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
 /// via its public `(String charsetName)` constructor, matching real JDK's
 /// `Charset.forName` contract for a syntactically valid but unsupported name.
+fn throw_non_writable_channel_exception(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    match ctx.new_object("java/nio/channels/NonWritableChannelException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let _ = ctx.invoke(
+                "java/nio/channels/NonWritableChannelException",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(exc))],
+            );
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => RuntimeError::IOException {
+            message: "Channel is not writable".into(),
+        }
+        .into(),
+    }
+}
+
 fn throw_unsupported_charset_exception(
     ctx: &mut dyn NativeContext,
     name: &str,
