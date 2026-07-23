@@ -10612,6 +10612,39 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
                 thread.thread_id.0,
             );
         }
+        // WFLYCTL0079 round 2: the executor-dispatch trace above (each
+        // ExtensionInitializeTask.call() runs exactly once, modulo the
+        // Callable<V> bridge pair) never caught a genuine repeat in 1600
+        // boots. The actual registry mutation is several frames deeper —
+        // `ExtensionAddHandler.initializeExtension` eventually calls
+        // `registerAttributes(ManagementResourceRegistration)` on the
+        // transactions subsystem's root resource definition, which is
+        // where `HORNETQ_STORE_ENABLE_ASYNC_IO` actually gets registered
+        // (via an `AliasedHandler`, decompiled bytecode confirms). A
+        // retry/re-registration at THIS level wouldn't require
+        // `call()` itself to re-run. Trace (receiver, registration-arg)
+        // identity pairs directly at the registration call site instead.
+        if frame_ref.method_name() == "registerAttributes"
+            && frame_ref.class_name()
+                == "org/jboss/as/txn/subsystem/TransactionSubsystemRootResourceDefinition"
+        {
+            let recv = frame_ref.get_local(0);
+            let recv_addr = match recv {
+                Value::Object(Some(o)) => o.as_ptr() as usize,
+                _ => 0,
+            };
+            let reg = frame_ref.get_local(1);
+            let reg_addr = match reg {
+                Value::Object(Some(o)) => o.as_ptr() as usize,
+                _ => 0,
+            };
+            static ORDINAL2: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let ord = ORDINAL2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[DUPREG] #{ord} TransactionSubsystemRootResourceDefinition.registerAttributes() recv=0x{recv_addr:x} registration=0x{reg_addr:x} tid={}",
+                thread.thread_id.0,
+            );
+        }
     }
 }
 
@@ -16314,6 +16347,49 @@ fn execute_instruction(
                                     f.method_name(),
                                     f.pc
                                 );
+                            }
+                            // stw-residual-close FIX (2026-07-23): a checkcast
+                            // CCE against a bare `java.lang.Object` (this
+                            // family's signature -- the checked value reads
+                            // back with an all-zero/degraded header instead
+                            // of its real class) is mechanistically the SAME
+                            // "stale ref surfaces after a nested allocating
+                            // call" shape `[stale-recv]` already forensics,
+                            // just consumed at a site with no healing path.
+                            // Reuse the exact same forensic probes here so
+                            // the NEXT capture (rare -- observed 2x so far,
+                            // once fatal/PathAddress, once non-fatal/
+                            // FieldElement$Label) doesn't need a follow-up
+                            // campaign just to get gcpart/pushprov/zeroed
+                            // data. Only meaningful when the receiver
+                            // degraded to bare Object (obj_binary check);
+                            // a genuine app-level CCE (real type A vs B) has
+                            // nothing useful to probe here.
+                            if obj_binary == "java.lang.Object" && remap_trace_on() {
+                                let addr = obj_ref.as_ptr() as usize;
+                                for (e, moved_to, mlen, as_dest) in
+                                    crate::memory::gc::gcpart_probe(addr)
+                                {
+                                    eprintln!(
+                                        "  CCE-BT-GCPART epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                                    );
+                                }
+                                for (ago, site) in push_prov_find(addr) {
+                                    eprintln!("  CCE-BT-PUSHPROV pushed {ago} pushes ago at {site}");
+                                }
+                                for (age, site, tag, s, l) in
+                                    cratonvm_gc::zero_forensics::probe(addr)
+                                {
+                                    eprintln!(
+                                        "  CCE-BT-ZEROED age={age} site={} tag={tag} range=0x{s:x}+0x{l:x}",
+                                        if site == 1 { "sweep-span" } else { "fromspace-reset" },
+                                    );
+                                }
+                                for (ago, parent, fidx) in getfield_ring_find(addr) {
+                                    eprintln!(
+                                        "  CCE-BT-GETFIELD pushed {ago} getfields ago from parent=0x{parent:x} fld[{fidx}]"
+                                    );
+                                }
                             }
                         }
                         return Err(RuntimeError::ClassCastException {
