@@ -4405,7 +4405,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$And", 2);
+            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4428,7 +4428,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Or", 2);
+            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4450,7 +4450,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.unpin_native_roots(this_pin);
@@ -4468,7 +4468,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate it (native stale-local family).
             let target_pin = pinned_object_value(ctx, target);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
             ctx.set_field(
                 composite,
                 0,
@@ -4485,7 +4485,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$And.test(x) = first.test(x) && second.test(x)
     r.register(
-        "java/util/function/Predicate$And",
+        "java/util/function/Predicate$$Lambda$And",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
@@ -4530,7 +4530,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$Or.test(x) = first.test(x) || second.test(x)
     r.register(
-        "java/util/function/Predicate$Or",
+        "java/util/function/Predicate$$Lambda$Or",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
@@ -4575,7 +4575,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$Negate.test(x) = !inner.test(x)
     r.register(
-        "java/util/function/Predicate$Negate",
+        "java/util/function/Predicate$$Lambda$Negate",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
