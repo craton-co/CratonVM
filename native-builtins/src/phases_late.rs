@@ -22233,10 +22233,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Cached parse + decompress (O(1) per call; avoids re-parsing the
-            // whole central directory on every entry — see `jar_contents_cached`).
-            let bytes: Option<std::sync::Arc<Vec<u8>>> = jar_contents_cached(&path)
-                .and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
+            // Cached, lazy decompress (O(1) per call after the first read of
+            // this entry; avoids both re-parsing the whole central directory
+            // on every entry AND decompressing entries nothing ever reads —
+            // see `jar_entry_bytes_cached`).
+            let bytes: Option<std::sync::Arc<Vec<u8>>> =
+                jar_entry_bytes_cached(&path, &entry_name);
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -23198,14 +23200,15 @@ fn spring_default_app_ctx_factory_create(
 // 4-field synthetic JarEntry instances (name, size, compressedSize, method).
 // =============================================================================
 
-/// One central-directory entry's metadata plus its decompressed bytes.
+/// One central-directory entry's metadata. Deliberately excludes decompressed
+/// bytes — see `jar_contents_cached`'s doc comment for why those are cached
+/// separately (and lazily) via `jar_entry_bytes_cached` instead of here.
 pub(crate) struct JarEntryRec {
     pub(crate) size: i64,
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
     pub(crate) times: JarEntryTimes,
-    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
 
 /// ZIP extended timestamp fields are authoritative when a JDK-created entry
@@ -23359,7 +23362,8 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
     ctx.unpin_native_roots(entry_pin);
 }
 
-/// Per-path cache of a JAR's parsed central directory + decompressed entries.
+/// Per-path cache of a JAR's parsed central directory (metadata only — no
+/// decompressed bytes; see `jar_entry_bytes_cached` for those).
 ///
 /// The `java.util.jar.JarFile` natives (`getInputStream`/`getEntry`/`entries`/
 /// `stream`/lookup) previously called `zip::ZipArchive::new(file)` on EVERY
@@ -23368,8 +23372,25 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
 /// `.class` entry, making that O(N²) over a jar's entry count — for a large jar
 /// like byte-buddy (~3k classes) the web-fragment scan never finishes within
 /// the test timeout (TestValidator HANG; it passes on HotSpot where each lookup
-/// is O(1)). Parse + decompress once and cache, keyed by (path, mtime) so a jar
-/// rewritten on disk (e.g. a test-generated temp jar) is not served stale.
+/// is O(1)). Parse once and cache, keyed by (path, mtime) so a jar rewritten on
+/// disk (e.g. a test-generated temp jar) is not served stale.
+///
+/// PERF (2026-07-23): this cache used to also eagerly `read_to_end` (i.e.
+/// fully INFLATE) every entry's bytes on the very first touch, regardless of
+/// whether the caller wanted bytes at all. `getJarEntry`/`entries`/`stream`/
+/// `getManifest` only need metadata (size/csize/method/crc/times) — a single
+/// `ClassUtils.isPresent()`-style existence check on a jar with thousands of
+/// classes (e.g. testcontainers.jar, 12.5k entries) was paying the FULL
+/// decompression cost of every unrelated entry (measured ~60-70us/entry —
+/// genuine DEFLATE work, not native-dispatch overhead) just to answer one
+/// membership question. On `module/spring-boot-data-redis`'s ~121-jar test
+/// classpath this made ordinary Spring context bootstrap (which does hundreds
+/// of such isPresent/loadClass checks) blow past the 300s suite timeout —
+/// `DataRedisAutoConfigurationTests`, `DataRedisAutoConfigurationJedisTests`,
+/// `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+/// `DataRedisHealthContributorAutoConfigurationTests` all HANG. Bytes are now
+/// decompressed lazily, per-entry, only when `getInputStream` is actually
+/// called for that entry — see `jar_entry_bytes_cached`.
 pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarContents>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<JarContents>>>> =
@@ -23396,8 +23417,11 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
     let mut by_name = std::collections::HashMap::with_capacity(len);
     let mut order = Vec::with_capacity(len);
     for i in 0..len {
-        use std::io::Read;
-        let Ok(mut entry) = archive.by_index(i) else {
+        // Metadata only — deliberately no `read_to_end`/decompression here.
+        // `by_index` parses the local file header (cheap: no inflate), which
+        // is enough for every field below. See the doc comment above for why
+        // eagerly decompressing was a severe perf bug.
+        let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
@@ -23408,10 +23432,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut buf).is_err() {
-            continue;
-        }
         order.push(name.clone());
         by_name.insert(
             name,
@@ -23421,7 +23441,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 method,
                 crc,
                 times,
-                bytes: Arc::new(buf),
             },
         );
     }
@@ -23431,6 +23450,46 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, contents.clone());
     Some(contents)
+}
+
+/// Per-(path, mtime, entry name) cache of ONE entry's decompressed bytes.
+/// Companion to `jar_contents_cached`: that cache is metadata-only (cheap,
+/// built eagerly for the whole jar); this one does the actual DEFLATE
+/// inflate, lazily, only for entries some caller's `getInputStream` actually
+/// reads. Re-opens the archive and seeks straight to the named entry rather
+/// than iterating — `by_name` on a `zip::ZipArchive` uses its already-parsed
+/// central-directory name index, so this stays cheap even on jars with
+/// thousands of entries.
+pub(crate) fn jar_entry_bytes_cached(path: &str, entry_name: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>> =
+        OnceLock::new();
+    if path.is_empty() || entry_name.is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{path}\u{0}{mtime}\u{0}{entry_name}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(b) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(b.clone());
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name(entry_name).ok()?;
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buf).ok()?;
+    let bytes = Arc::new(buf);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, bytes.clone());
+    Some(bytes)
 }
 
 /// Read the central directory of `path` and return a Vec of allocated
@@ -24407,29 +24466,26 @@ fn p59_jar_file_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// Read MANIFEST.MF from a JAR file and create a Manifest synthetic object.
+///
+/// PERF (2026-07-23): this used to `File::open` + `zip::ZipArchive::new` the
+/// WHOLE jar itself, independent of (and redundant with)
+/// `jar_contents_cached`/`jar_entry_bytes_cached`'s caches — every single
+/// `new JarFile(path)` (this runs from every `<init>` handler) re-parsed the
+/// entire central directory again just to grab one entry. For a jar the size
+/// of testcontainers.jar (12.5k entries, ~17MB) that central-directory parse
+/// alone measured ~105ms; Spring Boot test suites that construct many
+/// short-lived JarFile/classloader instances over the run (one context
+/// refresh per `@Test` method, `ApplicationContextRunner`, etc.) pay that
+/// cost again on every construction. Route through the same lazily-cached
+/// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
+/// FIRST touch of a given (path, mtime) pays for the archive open.
 fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     if path.is_empty() {
         return Value::Object(None);
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Value::Object(None),
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Value::Object(None),
-    };
-    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
-        Ok(mut entry) => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if entry.read_to_end(&mut buf).is_ok() {
-                buf
-            } else {
-                return Value::Object(None);
-            }
-        }
-        Err(_) => return Value::Object(None),
+    let manifest_bytes = match jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") {
+        Some(b) => (*b).clone(),
+        None => return Value::Object(None),
     };
     // Parse the main section, including folded continuation lines, through the
     // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
