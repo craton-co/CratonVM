@@ -1789,6 +1789,17 @@ pub struct ReplaceMethodSpec {
     pub descriptor: String,
     /// Bean name of the `MethodReplacer` to dispatch to.
     pub replacer_bean_name: String,
+    /// Internal name of the class that actually DECLARES this method --
+    /// not necessarily the enhanced subclass's immediate superclass. A
+    /// replaced method inherited from a grandparent (or higher) class,
+    /// e.g. `MethodReplaceCandidate.replaceMe` inherited two levels down
+    /// through `SerializableMethodReplacerCandidate`, must reflectively
+    /// resolve via ITS OWN declaring class: `Class.getDeclaredMethod` only
+    /// finds methods declared directly on the class it's called on, so
+    /// always querying the immediate superclass threw
+    /// `NoSuchMethodException` for anything declared further up
+    /// (XmlBeanFactoryTests.serializableMethodReplacerAndSuperclass).
+    pub declaring_internal: String,
 }
 
 /// Per-wrapper constant-pool indices for boxing args / unboxing the replacer
@@ -1969,6 +1980,10 @@ pub fn build_replace_override_subclass(
         let desc_idx = cw.add_utf8(&m.descriptor);
         let name_str_idx = cw.add_string(&m.name);
         let replacer_str_idx = cw.add_string(&m.replacer_bean_name);
+        // Resolve the Method reflectively against the class that actually
+        // declares it (see the field doc on `declaring_internal`), not
+        // always the enhanced subclass's immediate superclass.
+        let declaring_class_idx = cw.add_class(&m.declaring_internal);
 
         let params = parse_param_descriptors(&m.descriptor);
         let ret = m.descriptor.split(')').nth(1).unwrap_or("V").to_string();
@@ -2028,9 +2043,9 @@ pub fn build_replace_override_subclass(
         code.push(0x3A); // astore mr_slot
         code.push(mr_slot);
 
-        // (B) method = Super.class.getDeclaredMethod(name, paramClasses)
-        code.push(0x13); // ldc_w Super.class
-        code.extend_from_slice(&b(super_class_idx));
+        // (B) method = DeclaringClass.class.getDeclaredMethod(name, paramClasses)
+        code.push(0x13); // ldc_w DeclaringClass.class
+        code.extend_from_slice(&b(declaring_class_idx));
         code.push(0x13); // ldc_w "<name>"
         code.extend_from_slice(&b(name_str_idx));
         push_int(&mut code, params.len() as i32);

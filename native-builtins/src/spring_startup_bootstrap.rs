@@ -2763,10 +2763,12 @@ fn try_build_replace_override(
         name: String,
         descriptor: String,
         access_flags: u16,
+        declaring_internal: String,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
+        let cid_internal = ctx.class_name_of_id(cid).unwrap_or_default();
         for m in ctx.declared_methods(cid) {
             if m.name.starts_with('<') {
                 continue;
@@ -2786,6 +2788,7 @@ fn try_build_replace_override(
                 name: m.name.clone(),
                 descriptor: m.descriptor.clone(),
                 access_flags: m.access_flags,
+                declaring_internal: cid_internal.clone(),
             });
         }
         cursor = ctx.superclass_of(cid);
@@ -2825,6 +2828,7 @@ fn try_build_replace_override(
             name: c.name.clone(),
             descriptor: c.descriptor.clone(),
             replacer_bean_name: cfg.replacer_bean_name.clone(),
+            declaring_internal: c.declaring_internal.clone(),
         });
     }
     if specs.is_empty() {
