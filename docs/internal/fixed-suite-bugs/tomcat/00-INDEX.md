@@ -27,7 +27,7 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
 | [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run + HotSpot control diff (corrected 2026-07-24 for a harness CWD bug) | **91 classes** (was miscounted as 23) | FAIL/HANG/CRASH | 🔴 **OPEN** (individually undiagnosed, like 05) |
-| [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work) |
+| [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work); its category J (9 classes, HANG-classification) turned out NOT to be a fixture gap at all — ✅ **FIXED**, see [hang-classification-unconfirmed-host-contention-FIXED.md](hang-classification-unconfirmed-host-contention-FIXED.md) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed

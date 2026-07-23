@@ -1,0 +1,71 @@
+# Tomcat suite — known issues index
+
+Split out of `docs/internal/fixed-suite-bugs/tomcat/18-fixture-environment-gaps-20260724.md`
+(2026-07-24) into one file per independently-actionable item, so different
+sessions can pick separate items up in parallel without stepping on each
+other. Source data and the full 35-class categorization with root-cause
+detail: that doc, plus `apps/tomcat-suite-runner/RESULTS-20260724-cwdfix.md`
+on the Azure host. All of this is against the Linux Tomcat fixture at
+`/data/data/tomcat-dohead-fixture-20260717` (symlinked
+`/data/data/apps/tomcat`), reusable Linux runner at
+`apps/tomcat-suite-runner/run-tomcat-suite.sh`.
+
+## Fixture-completion work — ALL 6 IMPLEMENTED 2026-07-23
+
+| Doc | Classes | Outcome |
+|---|---:|---|
+| [missing-antjar-classpath.md](missing-antjar-classpath.md) | 2 | ✅ Fixed — 1 PASS both, 1 revealed a real regression |
+| [missing-httpd-binary.md](missing-httpd-binary.md) | 8 | ✅ Fully fixed — all 8 PASS both VMs, no regressions |
+| [largeheap-flat-heap-oom.md](largeheap-flat-heap-oom.md) | 3 | ⚠️ Partial — 2 now PASS HotSpot/reveal regressions, 1 still fails both (narrower) |
+| [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md) | 8 | ⚠️ Root-cause theory was wrong (see doc) — real fix was the lib-jars doc below; 2 PASS both, 6 revealed regressions |
+| [missing-build-lib-jars.md](missing-build-lib-jars.md) | 1 | ✅ Fixed via `ant deploy` — also fixed most of the "conf/Catalina/localhost" bucket above |
+| [unbuilt-virtual-webapp-submodule.md](unbuilt-virtual-webapp-submodule.md) | 1 | ⚠️ Root-cause theory was wrong (no Maven module) — one method now passes, a second method reveals a narrower regression |
+
+As predicted, completing these turned several into real CratonVM
+regressions rather than clean passes — see
+[regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md)
+for the full accounting: **12 PASS both VMs / 9 confirmed CratonVM-only
+regressions / 2 still fail on both (different, narrower reasons than
+originally documented)**. One regression was root-caused precisely: a `%20`
+in a file path isn't decoded back to a space when CratonVM resolves a
+`file:` URL, breaking `TestDeployTask`.
+
+Note: none of this fixture work is git-tracked — it all lives on the Azure
+host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`).
+A future session rebuilding this fixture from scratch needs to redo these
+steps (see each doc's "RESOLVED" note for the exact commands).
+
+## Untriaged oddities — RESOLVED 2026-07-23
+
+Both classes formerly tracked here (`org.apache.catalina.startup.TestTomcat`'s
+misleading "Deliberately Broken" log line, and
+`org.apache.jasper.compiler.TestNonstandardTagPerformance`'s self-referential
+`ClassNotFoundException`) are fully triaged and closed — see
+[19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md](../../internal/fixed-suite-bugs/tomcat/19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md)
+in `docs/internal/fixed-suite-bugs/tomcat/`. Short version: "Deliberately
+Broken" was always a red herring (from tests that deliberately trigger and
+catch it); the real bug underneath was a genuine CratonVM regression — a
+`java.util.Hashtable` field-misresolution bug that silently doubled
+`Hashtable.size()` on every `put()`, which corrupted Jasper's embedded ECJ
+Java compiler (JSPs use a `Hashtable` internally) and broke JSP compilation
+entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
+`TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
+in `.suite/all-tests.txt`) with no code fix needed.
+
+## Needs investigation, not yet root-caused
+
+| Doc | Classes |
+|---|---:|
+| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
+
+## Fixed and moved to `docs/internal/`
+
+| Doc | Classes | Outcome |
+|---|---:|---|
+| [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
+
+## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
+
+| Doc | Classes |
+|---|---:|
+| [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |

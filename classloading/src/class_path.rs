@@ -3230,6 +3230,41 @@ impl ClassPath {
         out
     }
 
+    /// Build the `file:`-path segment of a reconstructed `jar:file:...!/...`
+    /// resource URL for a `NestedDirectory`/`NestedJar` entry's `parent_jar`.
+    ///
+    /// `NestedDirectory`/`NestedJar` entries reached via `add_path`'s
+    /// DaCapo-style `<jar>!/<prefix>/` handoff (see its doc comment) carry a
+    /// `parent_jar` that is the UNTOUCHED substring of whatever raw `jar:`
+    /// URL string the caller built — `extract_url_path` in
+    /// `native-builtins/src/classloader.rs` strips only a spurious leading
+    /// `/` before a Windows drive letter (for `PathBuf` resolvability) and
+    /// otherwise never rewrites separators. Real Java's `URL`/`URLClassLoader`
+    /// machinery is equally hands-off: `new URL(String)` never normalizes,
+    /// so a caller-built `"jar:file:" + file.getAbsolutePath() + "!/..."`
+    /// (Windows: backslash-separated, no leading `/`) round-trips through
+    /// HotSpot byte-for-byte. Forcibly rewriting `parent_jar` to a canonical
+    /// forward-slash `/C:/...` form here — as this used to do unconditionally
+    /// — produced a URL that differed from HotSpot's for exactly that raw,
+    /// backslash-spelled case (Spring Boot's
+    /// `TomcatEmbeddedWebappClassLoaderTests`, which builds the expected URL
+    /// via `File.getAbsolutePath()` directly, no `toURI()`).
+    ///
+    /// A backslash anywhere in `parent_jar` can only mean it came from that
+    /// raw, unnormalized path (real on-disk jar discovery always resolves
+    /// through `canonicalize_cached` into the `JarFile`/`Directory` variants,
+    /// not this one) — preserve it verbatim. Otherwise fall back to the
+    /// historical canonical-forward-slash form.
+    fn nested_jar_url_path(parent_jar: &Path) -> std::borrow::Cow<'_, str> {
+        let raw = parent_jar.to_string_lossy();
+        if raw.contains('\\') {
+            raw
+        } else {
+            let p = raw.trim_start_matches('/');
+            std::borrow::Cow::Owned(format!("/{p}"))
+        }
+    }
+
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
         diag_resource_call_wrapper("find_all_resource_urls", || {
             self.find_all_resource_urls_impl(resource_name)
@@ -3441,19 +3476,17 @@ impl ClassPath {
                         continue;
                     }
                     if simple_resource_glob(name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
+                        let p = Self::nested_jar_url_path(parent_jar);
                         for candidate in
                             Self::matching_resource_entry_names(entries_cache.keys(), name)
                         {
-                            urls.push(format!("jar:file:/{p}!/{prefix}{candidate}"));
+                            urls.push(format!("jar:file:{p}!/{prefix}{candidate}"));
                         }
                         continue;
                     }
                     if entries_cache.contains_key(name) {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{prefix}{name}"));
+                        let p = Self::nested_jar_url_path(parent_jar);
+                        urls.push(format!("jar:file:{p}!/{prefix}{name}"));
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -3467,19 +3500,17 @@ impl ClassPath {
                         continue;
                     }
                     if simple_resource_glob(name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
+                        let p = Self::nested_jar_url_path(parent_jar);
                         for candidate in
                             Self::matching_resource_entry_names(entry_index.iter(), name)
                         {
-                            urls.push(format!("jar:file:/{p}!/{nested_path}!/{candidate}"));
+                            urls.push(format!("jar:file:{p}!/{nested_path}!/{candidate}"));
                         }
                         continue;
                     }
                     if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{nested_path}!/{name}"));
+                        let p = Self::nested_jar_url_path(parent_jar);
+                        urls.push(format!("jar:file:{p}!/{nested_path}!/{name}"));
                     }
                 }
                 ClassPathEntry::JmodFile {
