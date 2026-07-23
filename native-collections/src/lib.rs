@@ -4005,8 +4005,10 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // so subsequent reads see `Object(None)` instead of `Int(0)` and we
     // would fall through to slot 2 (`MAP_FIELD_CAPACITY`) and report the
     // bucket count as the size.
+    let this_cid = ctx.class_id_of_object(this);
     let size_by_name = ctx
-        .resolve_field_index("java/util/HashMap", "size")
+        .resolve_field_index_by_class_id(this_cid, "size")
+        .or_else(|| ctx.resolve_field_index_by_class_id(this_cid, "count"))
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
     // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
@@ -4060,7 +4062,11 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
 /// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
 fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "size") {
+    let this_cid = ctx.class_id_of_object(this);
+    let jdk_slot = ctx
+        .resolve_field_index_by_class_id(this_cid, "size")
+        .or_else(|| ctx.resolve_field_index_by_class_id(this_cid, "count"));
+    if let Some(slot) = jdk_slot {
         if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, Value::Int(size));
         }

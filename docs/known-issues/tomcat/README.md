@@ -35,11 +35,27 @@ host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`
 A future session rebuilding this fixture from scratch needs to redo these
 steps (see each doc's "RESOLVED" note for the exact commands).
 
+## Untriaged oddities — RESOLVED 2026-07-23
+
+Both classes formerly tracked here (`org.apache.catalina.startup.TestTomcat`'s
+misleading "Deliberately Broken" log line, and
+`org.apache.jasper.compiler.TestNonstandardTagPerformance`'s self-referential
+`ClassNotFoundException`) are fully triaged and closed — see
+[19-hashtable-size-count-misresolution-jsp-ecj-npe-FIXED.md](../../internal/fixed-suite-bugs/tomcat/19-hashtable-size-count-misresolution-jsp-ecj-npe-FIXED.md)
+in `docs/internal/fixed-suite-bugs/tomcat/`. Short version: "Deliberately
+Broken" was always a red herring (from tests that deliberately trigger and
+catch it); the real bug underneath was a genuine CratonVM regression — a
+`java.util.Hashtable` field-misresolution bug that silently doubled
+`Hashtable.size()` on every `put()`, which corrupted Jasper's embedded ECJ
+Java compiler (JSPs use a `Hashtable` internally) and broke JSP compilation
+entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
+`TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
+in `.suite/all-tests.txt`) with no code fix needed.
+
 ## Needs investigation, not yet root-caused
 
 | Doc | Classes |
 |---|---:|
-| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
 | [hang-classification-unconfirmed-host-contention.md](hang-classification-unconfirmed-host-contention.md) | 9 |
 
 ## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
@@ -47,7 +63,3 @@ steps (see each doc's "RESOLVED" note for the exact commands).
 | Doc | Classes |
 |---|---:|
 | [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |
-
-Total accounted for: 6 + 2 + 1 = 9 docs covering all 35 non-PASS classes from
-the "true fixture gap" bucket, plus the 2 classes where the real panic also
-reproduces.
