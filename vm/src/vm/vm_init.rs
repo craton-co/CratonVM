@@ -5385,6 +5385,12 @@ impl Vm {
             ThreadId(0),
             &main_thread.tlab as *const cratonvm_gc::Tlab as usize,
         );
+        // XT-FRAME-SCAN: publish the primordial thread's `JvmThread` address
+        // too (the same Box keeps it stable) so a worker-initiated takeover
+        // that freezes main mid-JIT can walk its interpreter frames.
+        shared
+            .thread_registry
+            .set_jvm_thread_addr(ThreadId(0), &*main_thread as *const JvmThread as usize);
         // Publish the primordial thread's OS id too. A worker can initiate a
         // multi-threaded STW while the main thread is running JIT code; without
         // this id the takeover backend can freeze and scan main but cannot prove

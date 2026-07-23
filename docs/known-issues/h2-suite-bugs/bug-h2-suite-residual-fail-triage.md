@@ -1032,3 +1032,139 @@ reverted in-place in this worktree's copy and are not part of any commit.
 
 Fix commit landed on `dev` via branch
 `fix/h2-testdate8-1hour-offset-20260722`.
+
+## Follow-up session (2026-07-22, sixth pass): `TestUpgrade` — ruled out
+## dispatch/resolution *and* cross-thread races; corruption traced to a
+## stale (non-freshly-constructed) argument value, still OPEN
+
+Same worktree/branch as the fifth pass
+(`/data/wt-h2-testupgrade-20260722`, `fix/h2-testupgrade-rootreference-20260722`).
+Picked up the fifth pass's concrete next step: added targeted tracing to
+`native_atomic_ref_get`/`native_atomic_ref_cas`
+(`native-builtins/src/lib.rs`) printing the *caller's* `ClassId` (via
+`NativeContext::frame_class_ids()`) and thread id (via
+`NativeContext::thread_id()`/`JvmThread::thread_id`) alongside the existing
+held-object-class trace, plus a thread id on the `Instruction::New` trace
+(`vm/src/runtime/interpreter.rs`) — all gated behind the existing
+`CRATONVM_DBG_LOADER_TRACE` env var, zero cost when unset, **left in the
+tree** (uncommitted as of this writeup — see "Status of this session's
+changes" below).
+
+### Two prior hypotheses now directly refuted
+
+1. **Cross-thread race (the fifth pass's leading theory)**: refuted with
+   hard evidence. For every "mixed" `AtomicReference` holder found (one
+   whose CAS history shows objects from *both* `RootReference` classes —
+   e.g. holder `0x200c624b2b0`: a healthy `cid=1617` (UserDefined(5)) write
+   followed by a corrupting `cid=1168` (Application) write), **every single
+   CAS on that holder happened on `thread=0`** — the same thread, no
+   interleaving from thread 6/7/10 (which *do* exist and *do* call
+   `compareAndSetRoot`, but only ever self-consistently within their own
+   world, confirmed separately). This rules out a genuine data race between
+   the main thread and `MVStore`'s background auto-commit thread(s) as the
+   mechanism — a real, useful negative result, since the doc's third/fifth
+   pass sections had flagged this as a leading candidate.
+2. **Wrong-class dispatch on a correctly-identified receiver**: still
+   refuted (reconfirmed) — `execute_invokevirtual_cached`'s mismatch guard
+   is sound, and, new this pass, `resolve_class_by_name`'s "GLOBAL-FIRST
+   fallback" path (`vm/src/runtime/interpreter.rs` ~L17880-17910, the
+   function containing the `[LOADER-TRACE] name=... resolved via
+   GLOBAL-FIRST fallback` line seen throughout every trace so far) was
+   directly checked and is **not** the mechanism either: `grep`-ing every
+   trace run for a `GLOBAL-FIRST fallback` event whose `referencing_loader`
+   is `UserDefined(_)` (i.e. a case where UserDefined(5) bytecode should
+   have used loader-aware resolution but fell through to the loader-blind
+   global path instead) returns **zero hits**, in any of this session's
+   three trace runs. Every `GLOBAL-FIRST fallback` observed is `Application`
+   resolving `Application` — itself correct, expected behavior (Application
+   classes have no reason to use loader-initiated resolution), not a bug.
+   `should_use_loader_initiated_resolution`
+   (`vm/src/runtime/interpreter.rs` ~L17653) does gate loader-aware
+   resolution behind a narrow Groovy/Spring-fork allowlist *unless*
+   `CRATONVM_LOADER_AWARE_RESOLUTION` is set — but that env var's own
+   default (`vm/src/runtime/env_cache.rs::loader_aware_resolution`,
+   `Err(_) => true`) is **on** by default, and the gate's own
+   `get_loader_id(referencing_class_id)` direct-hit path (checked before
+   ever consulting the narrow allowlist) correctly identifies UserDefined(5)
+   classes in every observed case — so this path is sound for this bug,
+   despite superficially looking like a promising lead (a stale doc comment
+   two lines above the function, claiming the gate "stays off" by default,
+   is itself now wrong/outdated and worth a follow-up correction someday,
+   but is not connected to this bug).
+
+### New finding: the corrupting object is not freshly constructed nearby
+
+For the specific corrupting CAS events examined line-by-line (e.g. holder
+`0x200c624b2b0` at trace line ~94531 in
+`/tmp/testupgrade-trace3.log` on the Azure host — not preserved past the
+session, re-run `CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit
+.TestUpgrade` to reproduce, takes well under 5 minutes): the ~40 lines
+immediately preceding the corrupting `native_atomic_ref_cas PRE ...
+new_cid=1168` contain **no** `[LOADER-TRACE] new ...RootReference` line at
+all — only a burst of ~14 repeated `resolve name=RootReference
+referencing_class_id=ClassId(1168) referencing_loader=Some(Application)`
+lines (Application's own, unrelated `RootReference` class-name resolution
+activity, running sequentially on the *same* thread=0 immediately before,
+not concurrently) followed directly by the corrupting CAS. Since every
+`new RootReference(...)` allocation observed anywhere in three separate
+trace runs this session (and the fifth pass) resolves its target class
+correctly relative to its own referencing class, and none appears in this
+specific window, the `RootReference` object being passed as `updated` to
+UserDefined(5)'s `MVMap.compareAndSetRoot` here was **not just constructed
+here** — it must already have existed (most plausibly: it's the object
+Application's own, immediately-preceding, unrelated code was just working
+with) and is reaching this call site as an already-stale value in some
+storage location the interpreter believes holds `tryUpdate`'s fresh
+`updatedRootReference` parameter.
+
+### Working hypothesis for the next session: local-variable/argument-slot
+### staleness in `RootReference.tryUpdate`'s invokespecial call
+
+Given `RootReference.tryUpdate(RootReference<K,V> updatedRootReference)`
+is private (2 local slots: `this`, `updatedRootReference`) and is always
+called as `tryUpdate(new RootReference<>(this, ...))` from a sibling
+private/package-private method
+(`updateRootPage`/`tryLock`/`updatePageAndLockedStatus`/
+`tryUnlockAndUpdateVersion`), the most concrete remaining explanation
+consistent with every finding so far (sound dispatch, sound `new`
+resolution, no cross-thread race, corrupting value not freshly
+constructed) is **frame/local-slot reuse**: if the interpreter pools/reuses
+`Frame` objects (`Frame::new_pooled_cached`, already flagged as a suspect
+in the second-pass session's `TestDataUtils` investigation for a *different*
+bug — the `KIND_LONG` tag-loss family, since fixed) and a pooled frame
+previously used for an Application-context `tryUpdate` call still has
+`updatedRootReference`'s local slot populated with that Application
+`RootReference` object, a bug in the NEW call's argument-marshalling that
+fails to overwrite that slot (e.g. an early-return/fast-path that assumes
+"same slot count, skip re-writing" for some class of invokespecial calls)
+would produce exactly this symptom: `tryUpdate` reads its OWN stale local
+instead of the freshly-`new`'d argument the caller actually pushed.
+
+**Concrete next step, not yet attempted**: instrument
+`execute_invokespecial_cached`/whatever code path marshals arguments into
+a newly-entered private-method frame (grep `Frame::new_pooled_cached` and
+its callers in `vm/src/runtime/interpreter.rs`) to print, on frame entry
+for `RootReference.tryUpdate`/`tryLock`/`updatePageAndLockedStatus`/
+`tryUnlockAndUpdateVersion` specifically, (a) the object reference actually
+present in local slot 1 immediately after argument marshalling completes,
+compared against (b) the object reference that was on top of the operand
+stack in the CALLER's frame immediately before the `invokespecial`
+instruction executed. A mismatch between (a) and (b) for any call would be
+a direct, unambiguous confirmation of this hypothesis and would pinpoint
+the exact marshalling function responsible.
+
+### Status of this session's changes
+
+The `native_atomic_ref_get`/`native_atomic_ref_cas`/`Instruction::New`
+thread-id-and-caller-class tracing added this session is a small,
+`CRATONVM_DBG_LOADER_TRACE`-gated, zero-cost-when-unset diagnostic — same
+category as the existing loader trace already in the tree — and is left
+**uncommitted** in `/data/wt-h2-testupgrade-20260722` pending review (not
+pushed to `dev` as of this writeup; whoever picks this up next should
+either commit it as-is or fold it into whatever further instrumentation
+the "concrete next step" above requires). The Azure host this session ran
+on was under heavy, fluctuating memory pressure from several concurrent
+orchestrated sessions for most of this pass (two `cargo build` attempts
+were `SIGKILL`'d by the OOM killer before a third succeeded once load
+dropped) — worth checking `free -g`/`ps aux --sort=-%mem` before assuming a
+build failure here is a code problem rather than host contention.

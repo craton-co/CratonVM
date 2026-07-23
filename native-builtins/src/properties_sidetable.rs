@@ -482,10 +482,28 @@ fn drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<
 
     // --- Strategy 3: invoke_virtual read([BII)I loop ---
     // Handles any real InputStream implementation.
+    //
+    // Producer-#11 fix (stw-residual-close 20260722): this loop re-enters
+    // Java (`InputStream.read` — arbitrary real-JDK bytecode, 20+ frames
+    // under WildFly's elytron/infinispan boot); any nested safepoint can run
+    // a moving young collection, after which the raw `stream`/`chunk_arr`
+    // copies captured before the call are from-space addresses whose memory
+    // the collection's `Arena::reset` has already zeroed — the next
+    // dispatch reads an all-zero header (the fatal
+    // `MechanismDatabase.<init>` `Object.read([CII)I` NSME shape) and the
+    // element loop reads garbage. Pin both and re-read the pins (remapped
+    // in place by every GC path: initiator, safepoint-arrival, blocked-wake)
+    // after every re-entry.
     let chunk_size = 8192usize;
+    let stream_pin = ctx.pin_native_root(stream);
     let chunk_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk_size);
+    let chunk_pin = ctx.pin_native_root(chunk_arr);
+    let mut stream = stream;
+    let mut chunk_arr = chunk_arr;
     let mut out = Vec::new();
     loop {
+        stream = ctx.read_native_pin(stream_pin, stream);
+        chunk_arr = ctx.read_native_pin(chunk_pin, chunk_arr);
         let n = match ctx.invoke_virtual(
             stream,
             "read",
@@ -502,22 +520,31 @@ fn drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Option<
                     "[DRAIN-DBG] drain_input_stream: read returned non-int {:?}",
                     other
                 );
+                ctx.unpin_native_roots(stream_pin);
                 return None;
             }
-            Err(_) => return None,
+            Err(_) => {
+                ctx.unpin_native_roots(stream_pin);
+                return None;
+            }
         };
         if n <= 0 {
             break;
         }
+        // The nested read may have moved the chunk array — re-read the pin
+        // before pulling elements out of it.
+        chunk_arr = ctx.read_native_pin(chunk_pin, chunk_arr);
         for i in 0..n as usize {
             if let Value::Int(b) = ctx.get_array_element(chunk_arr, i) {
                 out.push(b as u8);
             }
         }
         if out.len() > MAX_LOAD_BYTES {
+            ctx.unpin_native_roots(stream_pin);
             return None;
         }
     }
+    ctx.unpin_native_roots(stream_pin);
     // Empty stream / immediate EOF is valid — `Properties.load` must still
     // complete (Surefire booter uses an optional props stream).
     props_diag_eprintln!(
@@ -1287,10 +1314,18 @@ fn native_properties_load(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(None),
     };
+    // Producer-#11 fix: `drain_input_stream` can re-enter Java and GC;
+    // refresh `this` through a pin before keying the side-table store.
+    let this_pin = ctx.pin_native_root(this);
     let bytes = match drain_input_stream(ctx, stream) {
         Some(b) => b,
-        None => return Ok(None),
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Ok(None);
+        }
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     if bytes.len() > MAX_LOAD_BYTES {
         return Ok(None);
     }
@@ -1370,8 +1405,25 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Scratch buffer for `Reader.read(char[], 0, len)`.  4 KiB is
     // the size every JDK BufferedReader uses internally, so this
     // matches the shape callers expect and avoids tiny chunked reads.
+    //
+    // Producer-#11 fix (stw-residual-close 20260722): the read loop below
+    // re-enters Java (`Reader.read` — the real-JDK
+    // InputStreamReader/StreamDecoder bytecode); any nested safepoint can
+    // run a moving young collection, after which the raw
+    // `this`/`reader`/`buf` copies captured before the call are from-space
+    // addresses whose memory `Arena::reset` has already zeroed. This was
+    // captured live as the fatal WildFly `MechanismDatabase.<init>`
+    // `java/lang/Object.read([CII)I` NSME during parallel-extension-add
+    // (elytron reads MechanismDatabase.properties through exactly this
+    // loop while ~30 sibling threads run moving GCs). Pin all three and
+    // re-read the pins after every re-entry.
     const CHUNK: usize = 4096;
+    let this_pin = ctx.pin_native_root(this);
+    let reader_pin = ctx.pin_native_root(reader);
     let buf = ctx.new_array(ArrayElementType::Char, CHUNK);
+    let buf_pin = ctx.pin_native_root(buf);
+    let mut reader = reader;
+    let mut buf = buf;
 
     // Cap accumulated text at 2 * MAX_LOAD_BYTES chars.  In ISO-8859-1
     // each char re-encodes to one byte, so this matches the byte cap
@@ -1381,7 +1433,9 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let mut accumulated = String::new();
 
     loop {
-        let res = ctx.invoke_virtual(
+        reader = ctx.read_native_pin(reader_pin, reader);
+        buf = ctx.read_native_pin(buf_pin, buf);
+        let res = match ctx.invoke_virtual(
             reader,
             "read",
             "([CII)I",
@@ -1390,7 +1444,13 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 Value::Int(0),
                 Value::Int(CHUNK as i32),
             ],
-        )?;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
         let n = match res {
             Some(Value::Int(n)) => n,
             // Anything else (None, non-int) means the read protocol
@@ -1405,6 +1465,9 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
         let n = n as usize;
         let n = n.min(CHUNK);
+        // The nested read may have moved the chunk array — re-read the pin
+        // before pulling elements out of it.
+        buf = ctx.read_native_pin(buf_pin, buf);
         for i in 0..n {
             if accumulated.len() >= char_cap {
                 break;
@@ -1432,8 +1495,15 @@ fn native_properties_load_reader(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // chars to `?`; intentionally wrong UTF-8 decoding must preserve U+FFFD.
     let parsed = match parse_properties_text_strict(&accumulated) {
         Ok(parsed) => parsed,
-        Err(()) => return Err(throw_malformed_unicode_escape(ctx)),
+        Err(()) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(throw_malformed_unicode_escape(ctx));
+        }
     };
+    // Refresh `this` through its pin — the read loop's re-entries may have
+    // relocated it — before keying the side-table store.
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     store_parsed_entries(ctx, this, &parsed);
     Ok(None)
 }
