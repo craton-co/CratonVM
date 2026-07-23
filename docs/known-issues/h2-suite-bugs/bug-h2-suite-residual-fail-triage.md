@@ -1427,8 +1427,87 @@ never with `describe()`-style before/after argument dumps).
 `CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
 continues to reproduce the failure in well under 5 minutes.
 
-Fix commits landed on `dev` via branch
-`fix/h2-testupgrade-round7-20260723`.
+### Same-session addendum: `MVMap.compareAndSetRoot`'s own argument
+### marshalling directly traced — the corrupting call finally caught
+
+Extended the same per-call `describe()`-style tracing to
+`MVMap.compareAndSetRoot` itself (never before traced this precisely — only
+via the coarser, cache-hit-only `HIT-CHECK` tag, which never fired for it
+in any pass since it apparently never gets served from the cache within a
+single `TestUpgrade` run — it dispatches once via
+`execute_invokevirtual_vtable_fast` or, rarely, the slow path, and the run
+fails before it warms up further). Instrumented all three of
+`compareAndSetRoot`'s possible dispatch sites
+(`execute_invokevirtual_vtable_fast`, `execute_invokevirtual_cached`'s
+`VirtualBytecode` arm, `execute_invoke_kind`) uniformly, printing
+`receiver_map` (`args[0]`, the `MVMap` this call executes against),
+`expected` (`args[1]`), and `updated` (`args[2]`) — each as
+`addr / cid / loader_class`.
+
+**327 calls captured in a full `--nojit` run. 326 are perfectly
+self-consistent**: receiver `MVMap` cid `1162`/`1250` (`Application`'s two
+observed class-registration numbers within this run — H2 appears to
+load/re-resolve `MVMap` more than once) always paired with
+`expected`/`updated` cid `1168` (`Application` `RootReference`); receiver
+cid `1613` (`UserDefined` `MVMap`) paired with `1619` (`UserDefined`
+`RootReference`) 17/18 times. **The 327th (last) call is the anomaly**:
+```
+[CASROOT-TRACE/vtfast] caller_class_id=ClassId(1168) cp_index=100
+  receiver_map(args[0])=cid=ClassId(1613) loader_class=org/h2/mvstore/MVMap
+  expected(args[1])=cid=ClassId(1168) loader_class=org/h2/mvstore/RootReference
+  updated(args[2])=cid=ClassId(1168) loader_class=org/h2/mvstore/RootReference
+```
+The **caller** here is `Application`-loaded code (`caller_class_id=1168` —
+almost certainly `Application`'s own `RootReference.tryUpdate`, called on an
+`Application` `this` with a freshly-constructed `Application`
+`updatedRootReference`, both self-consistent per the `expected`/`updated`
+pair). But the **receiver** — `this.root.map` read from inside that
+`tryUpdate` body (`RootReference.root` is a `Page<K,V>`; `Page.map` is the
+`final` field pointing back to the owning `MVMap`) — resolves to the
+**`UserDefined` `MVMap`** instead of `Application`'s own. This is the
+*opposite* direction from every prior pass's working hypothesis (which
+assumed the old/`UserDefined` side reaches into the new/`Application` side);
+here it's `Application`'s own migration-time code that ends up holding a
+`Page` whose `map` field still points at the **old** `MVMap`.
+
+This single event is a strong, direct, first-of-its-kind capture of the
+actual corrupting call (not an inference from a `NoSuchMethodError`
+several frames downstream) — and it reframes the search: `Page.map` is
+`final`, set once at construction (`Page.java:131/135/140`) and preserved
+byte-exact by `clone()` (audited this pass — `native_object_clone` in
+`native-builtins/src/lib.rs` allocates the clone via the SOURCE object's own
+`class_id` directly, not a name lookup, and copies fields by index; this is
+loader-correct and confirmed NOT the bug). So some code path, running in
+`Application`'s own context during `Upgrade.upgrade()`'s migration, must be
+constructing (or reusing) a `Page` with the `UserDefined` `MVMap` passed as
+its `map` constructor argument — plausibly a page-copying step that
+legitimately touches both old and new stores during migration, where a
+transient/scratch `Page` (correctly holding a reference to the OLD `MVMap`
+for the copy) ends up incorrectly wired into `Application`'s own live root
+chain instead of being replaced with a properly-`Application`-owned `Page`
+before that chain is committed.
+
+**Concrete next step, not yet attempted**: this reframes the search away
+from generic VM dispatch machinery (dispatch, argument marshalling, GC
+forwarding, and private-invokevirtual resolution are now all either fixed
+or ruled out) and toward `Page` **construction call sites specifically
+active during `Upgrade.upgrade()`'s migration path** — grep
+`org/h2/mvstore/MVStore.java`'s and `MVMap.java`'s page-copy/migration
+logic (whatever `Upgrade.upgrade()` calls to move data from the old store
+into the new one) for any `new Page<>(...)` or `page.copy(...)` call that
+passes a captured/closed-over `MVMap` reference rather than deriving it
+fresh from the CURRENT context. Trace `Page`'s three constructors
+(`Page.java:131,135,140`) themselves next, gated the same way, printing the
+`map` argument's loader identity against the CALLING frame's own loader —
+mirroring exactly what this pass did for `tryUpdate` and
+`compareAndSetRoot`, one level further into the object graph.
+`CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
+continues to reproduce in well under 5 minutes; the new `[CASROOT-TRACE/*]`
+tags are left in the tree alongside `[TRYUPDATE-TRACE/*]`, both zero-cost
+when the env var is unset.
+
+Fix commits (both dispatch fixes plus this tracing) landed on `dev` via
+branch `fix/h2-testupgrade-round7-20260723`.
 
 ## Follow-up session (seventh pass, 2026-07-23): two more real dispatch bugs
 ## found and fixed via new targeted tracing; `TestUpgrade` narrowed further
