@@ -4064,6 +4064,57 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Walk from an arbitrary `SSLSocketFactory`-typed object down to the
+    // `SSLContext` it ultimately carries. The fast path is our own synthetic
+    // carrier (`alloc_concurrent_synthetic("javax/net/ssl/SSLSocketFactory",
+    // 1)`, field 0 = the SSLContext, as returned by `SSLContext.
+    // getSocketFactory()`), but real test/application code routinely wraps
+    // that in a REAL bytecode subclass that delegates to it — e.g. Tomcat's
+    // own `TesterSupport.ClientSSLSocketFactory(SSLSocketFactory delegate)`,
+    // used by `TesterSupport.configureClientSsl()` (every `TestCustomSsl`/
+    // `TestClientCert*`-style test). That subclass's field 0 is its own
+    // `delegate` field — itself another `SSLSocketFactory`, one hop short of
+    // the actual `SSLContext` — so blindly reading field 0 once returned the
+    // wrapper's delegate and treated IT as the SSLContext. Every
+    // `ctx_obj_key`-keyed lookup keyed off the real SSLContext (trust roots,
+    // key managers, identity) then silently missed for a completely
+    // unrelated object's identity, and the client fell back to the platform
+    // default trust store — rejecting the test's self-signed CA with
+    // `SSLHandshakeException: ... UnknownIssuer`. Recurse through any number
+    // of such wrapper layers (bounded) instead of assuming a fixed depth.
+    fn resolve_sslcontext_from_factory(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        factory: ObjectRef,
+    ) -> Option<ObjectRef> {
+        const MAX_DEPTH: usize = 8;
+        const SSL_CONTEXT: &str = "javax/net/ssl/SSLContext";
+        let mut current = factory;
+        for _ in 0..MAX_DEPTH {
+            let cid = ctx.class_id_of_object(current);
+            if ctx.class_name_of_id(cid).as_deref() == Some(SSL_CONTEXT) {
+                return Some(current);
+            }
+            let nfields = ctx.class_num_total_fields(cid);
+            let mut next = None;
+            for i in 0..nfields {
+                if let Value::Object(Some(candidate)) = ctx.get_field(current, i) {
+                    let sub_cid = ctx.class_id_of_object(candidate);
+                    let sub_name = ctx.class_name_of_id(sub_cid).unwrap_or_default();
+                    if sub_name == SSL_CONTEXT {
+                        return Some(candidate);
+                    }
+                    if next.is_none() && sub_name.ends_with("SSLSocketFactory") {
+                        next = Some(candidate);
+                    }
+                }
+            }
+            match next {
+                Some(candidate) => current = candidate,
+                None => return None,
+            }
+        }
+        None
+    }
     // Capture the client identity (cert+key) carried by the factory's
     // SSLContext so the native HttpsURLConnection client can present a client
     // certificate for mTLS. `setDefaultSSLSocketFactory` is static (factory =
@@ -4073,7 +4124,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) {
-        if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
+        if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
                 capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
             } else {
