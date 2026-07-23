@@ -27790,23 +27790,32 @@ pub(crate) fn is_string_builder_layout_native_override(
         // writes through `String.checkIndex` against the compact
         // byte[]/coder layout, which CratonVM's synthetic builder doesn't
         // have, so it AIOOBE'd instead of writing the synthetic char[].
-        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "setCharAt"
-            | "toString"
+        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "length"
+            | "setCharAt" | "toString"
     ) {
         return true;
     }
-    // `length()` is deliberately NOT blanket-immune (unlike its siblings
-    // above): `MockitoBeanByTypeLookup*IntegrationTests` explicitly
-    // `verify(mock, times(1)).length()`s a Mockito-mocked StringBuilder,
-    // which only works if `length()` can route through the woven advice for
-    // a mock receiver. A genuinely real receiver is instead re-forced native
-    // by `intercept_force_registered_native`'s per-call, per-INSTANCE
-    // "field 0 (buffer) non-null" check -- mirroring the
-    // `java/net/HttpURLConnection` real-carrier exemption below -- so real
-    // `StringBuilder.length()` still reads the synthetic layout correctly
-    // instead of misreading real JDK's incompatible compact-string
-    // `count` field offset (silently returned 0 instead of the real length
-    // when this was tried as a blanket immune-list removal).
+    // KNOWN GAP (2026-07-23): `length()` stays blanket-immune even though
+    // that means it can never route to a Mockito mock's woven advice --
+    // `verify(mock).length()` silently no-ops instead of throwing "wanted
+    // but not invoked", which then surfaces as `UnfinishedVerificationException`
+    // on the NEXT unrelated `verify()` call once its own pending-verification
+    // state is never cleared (see
+    // `MockitoBeanByTypeLookup*IntegrationTests`' two still-failing
+    // disambiguated-qualifier tests). A per-INSTANCE "is this receiver a
+    // real, `<init>`-constructed StringBuilder" check was attempted here
+    // (mirroring the `java/net/HttpURLConnection` real-carrier exemption
+    // below, gated on field 0 being non-null) and DOES NOT WORK for this
+    // class: CratonVM's synthetic StringBuilder layout pre-populates the
+    // `char[]` buffer (field 0) and its default 16-char capacity AT OBJECT
+    // ALLOCATION, not at `<init>` time, so an Objenesis-constructed mock
+    // (whose `<init>` never runs) has an indistinguishable field 0 from a
+    // genuinely real instance -- confirmed via direct inspection
+    // (`CRATONVM_DBG_LEN`-style tracing showed `arr_len=16` for both). A
+    // correct fix needs an authoritative "is this a Mockito mock" signal --
+    // e.g. a callback into `MockMethodDispatcher.get(id, instance)
+    // .isMocked(instance)` from the dispatch layer -- which is a real
+    // engineering task, not a quick per-instance heuristic; left open.
     // `substring(int, int)` -- deliberately excludes `substring(int)`.
     // `substring(int)` must stay evictable: `MockitoBeanByTypeLookup*
     // IntegrationTests` explicitly stubs/verifies `.substring(anyInt())`
@@ -28210,45 +28219,6 @@ fn intercept_force_registered_native(
     // stubbing/verification. Deliberately not narrowed to a specific method
     // allowlist: any native registered on this class for a real carrier is
     // safe to force, since the receiver check alone already gates out mocks.
-    // StringBuilder/StringBuffer/AbstractStringBuilder `length()`: real-carrier
-    // re-force, mirroring the HttpURLConnection block below. `length()` was
-    // removed from `is_string_builder_layout_native_override`'s blanket
-    // immune list so a Mockito-mocked receiver's `length()` call routes
-    // through the woven advice (required for `verify(mock).length()` to see
-    // the invocation and clear Mockito's pending-verification state -- see
-    // `is_string_builder_layout_native_override`'s doc comment). A genuinely
-    // real StringBuilder's `length()` must still hit the native: real JDK's
-    // `AbstractStringBuilder.length()` bytecode reads a `count` field at an
-    // offset that assumes the incompatible compact byte[]/coder layout, not
-    // CratonVM's synthetic char[]-backed one. Field 0 (the char[] buffer) is
-    // populated only once `<init>` has actually run; a Mockito mock is
-    // Objenesis-constructed (no constructor ever runs), so field 0 stays
-    // null there and this exemption never fires for an actual mock.
-    if matches!(
-        class_name,
-        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
-    ) && method_name == "length"
-        && method_descriptor == "()I"
-        && matches!(
-            args.first(),
-            Some(Value::Object(Some(receiver)))
-                if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
-        )
-    {
-        if let Some(callback) = shared.native_methods.find(class_name, method_name, method_descriptor) {
-            return Some((|| {
-                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-                if let Some(value) = result {
-                    push_invoke_return_value(
-                        &mut thread.frames[frame_idx].stack,
-                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
-                    )?;
-                    crate::vm::native_return_pushed_to_stack(shared, thread);
-                }
-                Ok(CachedCallResult::Handled)
-            })());
-        }
-    }
     if class_name == "java/net/HttpURLConnection"
         && matches!(
             args.first(),
