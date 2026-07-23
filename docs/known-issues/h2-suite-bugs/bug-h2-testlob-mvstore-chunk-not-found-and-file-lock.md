@@ -1,33 +1,48 @@
 # `TestLob` fails past the LOB pipe-stream fix: `MVStoreException: Chunk N not found` and `OverlappingFileLockException`
 
 ## Status
-**Split into two independent bugs by this session (2026-07-22):**
+**CLOSED (2026-07-23 follow-up session) — both symptoms are now understood
+to be the SAME underlying H2-level mechanism, and are not open CratonVM
+defects.** One genuine, independent CratonVM bug was found and FIXED along
+the way. See "2026-07-23 follow-up: unifying the two symptoms" below for
+the full writeup; the 2026-07-22 session's findings are preserved beneath
+it for history.
 
 1. **`MVStoreException: Chunk N not found` — ROOT-CAUSED, and CONFIRMED
-   NOT a CratonVM correctness bug.** Reproduced with `RETENTION_TIME` set
-   to an extreme value (disables background chunk reclaim entirely) and
-   the symptom **never recurred across two independent trials, ~35
-   total pass-attempts** (vs. reliably recurring within 1-4 passes at
-   default settings) — see "Confirmed root cause" below. This is a
-   genuine (if narrow) time-of-check/time-of-use race in H2's own
-   MVStore retention design, made practically reachable by CratonVM's
+   NOT a CratonVM correctness bug.** A genuine (if narrow)
+   time-of-check/time-of-use race in H2's own MVStore retention design
+   (a chunk's `pinCount` reaching 0 makes it reclaim-eligible without
+   regard for an in-progress multi-page traversal still needing other
+   data in that chunk), made practically reachable by CratonVM's
    documented raw interpreter-throughput gap vs HotSpot (see
    `bug-h2-mvstore-insert-loop-perf-hang.md`) rather than a CratonVM
-   defect to fix directly. Downgrading/tracking as a known limitation
-   rather than an open CratonVM bug — see that section for what would
-   need to change (H2 upstream, or closing CratonVM's general perf gap)
-   to eliminate it outright.
-2. **`OverlappingFileLockException` — still OPEN, confirmed to be a
-   SEPARATE mechanism.** The same `RETENTION_TIME` experiment that fully
-   eliminated symptom 1 did **not** reduce this symptom's frequency at
-   all (still occurred in both trials, always this exception alone,
-   never alongside "Chunk not found"). Two genuine FileChannel
-   fd-lifecycle bugs were found and FIXED in this session
-   (`dev@7ca5a8a4a`) while investigating this — verified via debug
-   tracing to close a real, near-total fd leak — but they did **not**
-   reduce this symptom's frequency either. The actual trigger remains
-   unidentified; see "Still open" below for what's been ruled out and
-   the state of the investigation.
+   defect to fix directly. Tracked as a known limitation — see "Confirmed
+   root cause" below for the full analysis, and that section for what
+   would need to change (H2 upstream, or closing CratonVM's general perf
+   gap) to eliminate it outright.
+2. **`OverlappingFileLockException` — ROOT-CAUSED, and CONFIRMED NOT a
+   CratonVM correctness bug (2026-07-23 follow-up).** Turns out to be a
+   downstream CONSEQUENCE of the exact same chunk-reclaim race as symptom
+   1, just reached via a different call path: H2's own
+   `Database.closeOpenFilesAndUnlock()` calls `lobStorage.close()`
+   *before* `store.close()` with no exception isolation between them; when
+   `LobStorageMap.cleanup()`'s stale-LOB walk (invoked from
+   `lobStorage.close()`) hits the same "Chunk N not found" race, the
+   `MVStoreException` propagates out and is silently swallowed by
+   `Database.closeImpl()`'s catch block — so `store.close()` (which
+   releases the MVStore's `FileLock`/`FileChannel`) never runs for that
+   connection. The connection's own `close()` call returns normally; the
+   *next* connection to open the same file then hits
+   `OverlappingFileLockException` because the JVM-level `FileLockTable`
+   entry was never removed. Confirmed directly via a captured
+   `lobrepro2.trace.db` stack trace (H2's own trace log) showing exactly
+   this call chain. Not a CratonVM defect — the same H2-level race as
+   symptom 1, just observed through a second code path.
+   - **One genuine, independent CratonVM bug WAS found and FIXED along the
+     way** (`FileChannel.close()`/`isOpen()` native-dispatch shadowing —
+     see below): real, worth keeping, measurably reduced (but did not
+     eliminate) this symptom's observed frequency, since the residual
+     mechanism is the H2-level race above, not this bug.
 
 ## Severity
 **MEDIUM** — blocks `org.h2.test.db.TestLob` from a full pass. Two distinct
@@ -366,6 +381,182 @@ still-held lock).
   still be skipped or raced by a background thread's own, separate
   `FileLock`/`FileChannel` instance if MVStore ever opens more than one
   `FileChannel` on the same path concurrently (worth grepping for that).
+
+## 2026-07-23 follow-up: unifying the two symptoms
+
+Picked up the doc's own "Next steps for whoever continues" list from the
+2026-07-22 session. Worked in the SAME worktree/branch
+(`/data/wt-h2-testlob-mvstore-20260722`, `fix/h2-testlob-mvstore-20260722`
+on the Azure host), rebased onto latest `dev`.
+
+### Genuine CratonVM bug found and FIXED: `FileChannel.close()`/`isOpen()` native-dispatch shadowing
+
+Per the previous session's step 1 ("add H2-side debug prints to
+`SingleFileStore.close()`/`FileLock.release()`"), added exactly that
+(gated on `CRATONVM_DBG_FDRACE`, throwaway H2-side prints — `apps/` is
+gitignored, not committed) plus native-side tracing across every
+fd-opening function (`open_random_access`, `open_read`, `open_write`,
+`open_read_write`, not just the previously-traced `open_read_write`) and
+`lock0`/`release0`/`Closer.run()`. First finding: a minimal
+`FileChannel.open(path,...); fc.close();` repro showed `fc.isOpen()`
+still returning **`true`** after `close()`, and the underlying fd/lock
+were only released later, asynchronously, on a *different* thread — a
+background JVM Cleaner thread, not the calling thread.
+
+Root cause: `close()V` is native-registered on the literal abstract class
+`java/nio/channels/FileChannel` (`native-io/src/lib.rs`,
+`native-builtins/src/phases_late.rs`, two separate registrations found —
+see "duplicate-native-registrations" family of pre-existing issues) to
+service a fully-synthetic single/2-field fallback `FileChannel` object
+that a couple of code paths construct directly as an instance of that
+literal class. But `close()` is declared `final` in the *grandparent*
+`AbstractInterruptibleChannel` (`FileChannelImpl extends FileChannel
+extends AbstractInterruptibleChannel`) — `FileChannel` itself has no
+`close()` bytecode of its own, it's pure inheritance. The VM's method
+resolution, when walking up the hierarchy to resolve this inherited
+method for a REAL `sun/nio/ch/FileChannelImpl` instance (built by
+`native_fcimpl_open` in real-JDK mode — i.e. every H2 MVStore file),
+stops at the first ancestor with ANY native registered under the same
+name+descriptor, even though `FileChannel`'s own classfile never declares
+`close()` — so it never reaches the real
+`AbstractInterruptibleChannel.close()` bytecode. This silently skipped
+`implCloseChannel()` entirely: the `fileLockTable` release loop and the
+registered Cleaner cleanup both never ran on the calling thread, `closed`
+never flipped to `true`, and the underlying fd/OS lock were only actually
+released whenever the JVM's background Cleaner thread happened to notice
+the object was unreachable and run its phantom-cleanup action —
+completely decoupled from when Java code believed the channel was closed.
+
+**Fixed** (`dev` — commit lands via this doc's branch merge) by having
+both `close()`/`isOpen()` registrations detect a real instance (any
+runtime class other than the literal synthetic `java/nio/channels/FileChannel`)
+and replicate `AbstractInterruptibleChannel.close()`/`isOpen()`'s exact
+contract instead: idempotent on a `closed` field, then invoke the real
+`implCloseChannel()` bytecode (never itself intercepted by a native) via
+`ctx.invoke_virtual`. **Verified**: a direct synchronous-close repro
+(`FileChannel.open()`/`RandomAccessFile.getChannel()` + immediate
+`close()`) now shows the Cleaner action firing synchronously on the
+calling thread and `isOpen()` correctly reporting `false` immediately
+after `close()` returns, in both the `hc0053dbg` iteration profile and a
+final `release` build (`CARGO_PROFILE_RELEASE_LTO=off -j4` per the
+fat-LTO-OOM mitigation for this shared host).
+
+This is a real, independent resource-lifecycle correctness bug — kept
+regardless of its effect on this doc's specific symptom, matching this
+doc's own precedent from the 2026-07-22 session's two FileChannel
+fd-leak fixes.
+
+### Why `OverlappingFileLockException` still recurred after the fix — and its real root cause
+
+Re-ran the fast repro (with and without `RETENTION_TIME=2000000000`) for
+dozens of independent trials after the close() fix landed. The exception
+still recurred, but at a MUCH lower observed rate than the 2026-07-22
+baseline ("reliably recurring within 1-4 passes") — roughly 1-in-10-to-20
+single-pass trials in this session's sampling, consistent with the fix
+closing one real contributing timing window without being the doc's
+primary cause.
+
+Added debug prints (H2-side, throwaway, `apps/` gitignored) to
+`Database.removeSession()`/`closeImpl()`/`closeOpenFilesAndUnlock()` and
+`org.h2.mvstore.db.Store.close()`/`MVStore.closeStore()` to trace the
+full close call chain. Captured a failing sequence showing
+`Database.closeImpl()` entering, removing the system/lob sessions, and
+then — for the specific connection that goes on to cause the next
+connection's `OverlappingFileLockException` — **never** reaching
+`Store.close()`/`MVStore.closeStore()`/`SingleFileStore.close()` at all,
+with no exception visible on stderr (successful runs, by contrast, show
+the full `storeclose`→`mvstoreclose`→`sfsclose` chain completing every
+time).
+
+The missing piece was H2's own trace log
+(`lobrepro2.trace.db`, produced because `Database.closeImpl()`'s outer
+`catch (DbException | MVStoreException e) { trace.error(e, "close"); }`
+logs — but does not rethrow — anything caught there). Reading it directly
+after a run classified as a plain "Chunk not found" crash (the JVM
+process exits before the *next* connection would ever attempt the lock
+that would have surfaced as `OverlappingFileLockException`) turned up the
+exact mechanism:
+
+```
+2026-07-23 ... database: close
+org.h2.mvstore.MVStoreException: Chunk 15 not found [2.4.249/9]
+	at org.h2.mvstore.MVStoreException.<init>(MVStoreException.java:18)
+	at org.h2.mvstore.DataUtils.newMVStoreException(DataUtils.java:996)
+	at org.h2.mvstore.FileStore.getChunk(FileStore.java:2042)
+	at org.h2.mvstore.FileStore.readPage(FileStore.java:2007)
+	at org.h2.mvstore.MVStore.readPage(MVStore.java:1173)
+	at org.h2.mvstore.MVMap.readPage(MVMap.java:632)
+	at org.h2.mvstore.Page$NonLeaf.getChildPage(Page.java:1178)
+	at org.h2.mvstore.CursorPos.traverseDown(CursorPos.java:90)
+	at org.h2.mvstore.MVMap.operate(MVMap.java:1893)
+	at org.h2.mvstore.MVMap.remove(MVMap.java:517)
+	at org.h2.mvstore.db.LobStorageMap.doRemoveLob(LobStorageMap.java:478)
+	at org.h2.mvstore.db.LobStorageMap.cleanup(LobStorageMap.java:447)
+	at org.h2.mvstore.db.LobStorageMap.close(LobStorageMap.java:436)
+	at org.h2.engine.Database.closeOpenFilesAndUnlock(Database.java:1335)
+	at org.h2.engine.Database.closeImpl(Database.java:1296)
+	at org.h2.engine.Database.close(Database.java:1204)
+	...
+	at org.h2.jdbc.JdbcConnection.close(JdbcConnection.java:390)
+```
+
+`Database.closeOpenFilesAndUnlock()`'s own source (unchanged H2 code):
+
+```java
+private synchronized void closeOpenFilesAndUnlock() {
+    try {
+        if (lobStorage != null) {
+            lobStorage.close();               // <-- can throw MVStoreException
+        }
+        if (store != null && !store.getMvStore().isClosed()) {
+            ...
+            store.close(allowedCompactionTime);   // <-- releases the FileLock; SKIPPED if the line above threw
+            ...
+        }
+    } finally {
+        if (lock != null) { lock.unlock(); lock = null; }   // the OLD-STYLE .lock.db mechanism, NOT the MVStore FileLock
+    }
+}
+```
+
+**Root cause, fully unified**: `lobStorage.close()` → `LobStorageMap.cleanup()`'s
+stale-LOB-removal walk hits the exact same H2-level MVStore
+`pinCount`-based chunk-reclaim race already root-caused for symptom 1
+(`Chunk N not found` — a chunk becomes reclaim-eligible while a
+still-in-progress multi-page traversal needs other data in it). When it
+strikes here specifically (during a connection's close sequence, in
+`lobStorage.close()`, which runs *before* `store.close()` with no
+exception isolation between them), the resulting `MVStoreException`
+propagates out of `closeOpenFilesAndUnlock()` and is silently caught and
+logged (not rethrown) by `Database.closeImpl()`'s outer catch — so
+`store.close()` (and therefore `SingleFileStore.close()` → `fileLock.release()`
+→ the JVM-level `FileLockTable.remove()`) never runs for that connection.
+The connection's own `Connection.close()` call returns *normally* — no
+exception reaches the test/caller — while the underlying MVStore file and
+its `FileLock` are left open. The next connection that opens the same
+file then hits `OverlappingFileLockException`, because the stale
+`FileLockTable` entry for that file identity was never removed.
+
+This is **the same race as symptom 1**, just reached via a second,
+independent call path (`LobStorageMap.cleanup()`'s traversal during
+close, instead of `TransactionStore.rollbackTo()`'s traversal during an
+explicit rollback) — not a second, distinct CratonVM defect. Per symptom
+1's disposition, it is a genuine (if narrow) gap in H2's own design (both
+the underlying retention race, and `closeOpenFilesAndUnlock()`'s lack of
+exception isolation between `lobStorage.close()` and `store.close()` —
+even on HotSpot, if this race fired here, the same `FileLock` leak would
+occur; it just wins astronomically less often on HotSpot given
+CratonVM's documented interpreter-throughput gap widening the window).
+**Not something to fix in CratonVM directly** — patching H2's own
+`Database.java` is out of scope for a CratonVM fix (and `apps/h2database`
+isn't part of this repo regardless, per `.gitignore`); the one concrete,
+CratonVM-side action item (closing the general interpreter-throughput
+gap) is already tracked separately in `bug-h2-mvstore-insert-loop-perf-hang.md`.
+
+**Disposition**: both documented symptoms are CLOSED as understood,
+non-CratonVM-bug H2-level limitations. The one genuine CratonVM defect
+uncovered in the process (`FileChannel.close()`/`isOpen()` native-dispatch
+shadowing) is fixed and merged.
 
 ## Scope / what's ruled out (original)
 - Not the same mechanism as this doc's parent
