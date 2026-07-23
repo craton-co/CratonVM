@@ -4295,6 +4295,37 @@ impl NativeMethodRegistry {
         }
     }
 
+    /// Combined `find` + `kind_of`: computes the 128-bit
+    /// `(class, method, descriptor)` hash once and looks up both the
+    /// callback and its category from it, instead of the two independent
+    /// hashes (one full byte-walk each) `invoke_or_native`'s
+    /// synthetic-stub check used to pay on every native dispatch --
+    /// `find(...)` to get the callback, then immediately `kind_of(...)`
+    /// with the identical three strings to classify it. A gdb sampling
+    /// profile of a hung-looking H2 `TestFileSystem.testConcurrent` run
+    /// (two real threads, heavy native-call volume) caught both live
+    /// threads inside `hash_byte_pair`/`native_method_hash` disproportionately
+    /// often, which is this exact redundant second pass. Only covers the
+    /// fast exact-hash path (mirroring `find`'s own fast path); falls back
+    /// to the slow `find`+`kind_of` pair on a miss so descriptor-quirk
+    /// rewriting keeps working unchanged.
+    #[inline]
+    pub fn find_with_kind(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<(NativeCallback, NativeKind)> {
+        let key = native_method_hash(class_name, method_name, descriptor);
+        if let Some(cb) = self.methods.get(&key).copied() {
+            let kind = self.category_by_key.get(&key).copied().unwrap_or(NativeKind::Bridge);
+            return Some((cb, kind));
+        }
+        let cb = self.find(class_name, method_name, descriptor)?;
+        let kind = self.kind_of(class_name, method_name, descriptor).unwrap_or(NativeKind::Bridge);
+        Some((cb, kind))
+    }
+
     /// Look up a native method implementation (zero allocation on the
     /// fast path; zero allocation on a miss with a clean descriptor).
     #[inline]

@@ -30,6 +30,69 @@ fn stdio_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Disable Windows' `SIO_UDP_CONNRESET` behavior on a freshly created UDP
+/// socket.
+///
+/// By default, Windows Sockets propagates an ICMP "port unreachable" reply
+/// to an *earlier* outbound datagram as `WSAECONNRESET` (os error 10054) on
+/// the *next* `recv`/`WSARecv` call on that socket — even though UDP is
+/// connectionless and no such reset actually occurred. JDK's own native UDP
+/// implementation on Windows explicitly disables this quirk at socket
+/// creation (`NET_CreateSocket` issues this same `WSAIoctl`), which is why
+/// real HotSpot's JNDI DNS client tolerates a non-responsive/rejecting DNS
+/// peer while CratonVM's did not: the mongo-java-driver's `JndiDnsClient`
+/// (`DefaultDnsResolver.resolveAdditionalQueryParametersFromTxtRecords`)
+/// polls a connected `DatagramChannel` for a TXT record and — without this
+/// fix — any ICMP port-unreachable on the query surfaces as a
+/// `javax.naming.CommunicationException` wrapping this reset instead of a
+/// clean timeout/retry, breaking `MongoAutoConfigurationTests.configuresProtocol`
+/// and `PropertiesMongoConnectionDetailsTests.protocolCanBeConfigured`.
+/// No-op on non-Windows (the other platforms don't have this behavior).
+#[cfg(target_os = "windows")]
+fn disable_udp_connreset(socket: &std::net::UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+
+    // winsock2.h: `#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)`.
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dw_io_control_code: u32,
+            lpv_in_buffer: *mut core::ffi::c_void,
+            cb_in_buffer: u32,
+            lpv_out_buffer: *mut core::ffi::c_void,
+            cb_out_buffer: u32,
+            lpcb_bytes_returned: *mut u32,
+            lp_overlapped: *mut core::ffi::c_void,
+            lp_completion_routine: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut new_behavior: i32 = 0; // FALSE — do not report ICMP resets on this UDP socket.
+    let mut bytes_returned: u32 = 0;
+    // Best-effort: an ioctl failure here (e.g. an unsupported Windows
+    // version) is not fatal — it just leaves the OS default quirk in place,
+    // same as before this fix existed.
+    unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &mut new_behavior as *mut i32 as *mut core::ffi::c_void,
+            size_of::<i32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned as *mut u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn disable_udp_connreset(_socket: &std::net::UdpSocket) {}
+
 /// Connect to `addr`, trying IPv4 candidate addresses before IPv6.
 ///
 /// `std::net::TcpStream::connect(host:port)` resolves the host and tries each
@@ -1064,6 +1127,7 @@ impl FileDescriptorTable {
         }
         let addr = bind_addr.unwrap_or("0.0.0.0:0");
         let socket = std::net::UdpSocket::bind(addr)?;
+        disable_udp_connreset(&socket);
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(socket))));
@@ -1105,6 +1169,7 @@ impl FileDescriptorTable {
         socket.set_reuse_address(true)?;
         socket.bind(&sock_addr.into())?;
         let udp: std::net::UdpSocket = socket.into();
+        disable_udp_connreset(&udp);
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(udp))));

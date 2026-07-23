@@ -8278,20 +8278,56 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    // Spring Framework 7.0.7 delegates every parameter shape directly to
-    // ParameterResolutionDelegate. Keep this native mirror deliberately
-    // narrow: the former ApplicationContext / BeanOverride branches drifted
-    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    // Real Spring source (spring-framework-recheck, verified 2026-07-23) still
+    // has an isBeanOverride(Parameter) short-circuit ahead of the generic
+    // ParameterResolutionDelegate fallback: a @BeanOverride-annotated (e.g.
+    // @MockitoBean/@MockitoSpyBean) constructor parameter with a resolvable
+    // BeanOverrideHandler.getBeanName() is looked up DIRECTLY by name via
+    // applicationContext.getBean(name), bypassing ambiguous by-type
+    // autowiring entirely. The prior "narrowed" comment here claiming this
+    // was removed upstream was wrong (or based on a stale/different
+    // checkout) -- without this branch, EVERY bean-override constructor
+    // parameter whose override name doesn't happen to equal the parameter's
+    // own name (or carry an explicit @Qualifier) falls through to
+    // ParameterResolutionDelegate.resolveDependency and throws
+    // NoUniqueBeanDefinitionException, since all sibling override beans
+    // share the same declared type. Restore the shortcut by calling the
+    // real (unmodified) BeanOverrideUtils.resolveHandlerForParameter, which
+    // itself performs the isBeanOverride check internally (returns null for
+    // non-override parameters), so this is purely additive.
     let application_context = spring_extension_get_application_context(ctx, extension_context)?;
-    let bean_factory_result = match application_context {
-        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
-            application_context,
-            "getAutowireCapableBeanFactory",
-            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-            &[],
-        )?,
+    let application_context_obj = match application_context {
+        Some(Value::Object(Some(application_context))) => application_context,
         other => return Ok(other),
     };
+
+    if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+        "org/springframework/test/context/bean/override/BeanOverrideUtils",
+        "resolveHandlerForParameter",
+        "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+        &[
+            Value::Object(Some(parameter)),
+            Value::Object(Some(test_class)),
+        ],
+    ) {
+        if let Ok(Some(Value::Object(Some(bean_name)))) =
+            ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+        {
+            return ctx.invoke_virtual(
+                application_context_obj,
+                "getBean",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(bean_name))],
+            );
+        }
+    }
+
+    let bean_factory_result = ctx.invoke_virtual(
+        application_context_obj,
+        "getAutowireCapableBeanFactory",
+        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+        &[],
+    )?;
     let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
@@ -25939,6 +25975,91 @@ fn native_jsp_servlet_handle_missing_resource(
     Ok(None)
 }
 
+/// Reject a zone-qualified address (`fe80::1%16`) rather than trying to use
+/// it without its scope id — a plain `connect`/`send_to` to the bare
+/// address would resolve to the wrong interface (or fail outright) for a
+/// link-local IPv6 destination. Returns the address unchanged when it
+/// carries no `%zone` suffix.
+fn strip_zone_id(addr: &str) -> Option<&str> {
+    if addr.contains('%') {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// Discover this host's configured DNS nameserver IPs for
+/// `sun/net/dns/ResolverConfigurationImpl.os_nameservers`.
+///
+/// The real JDK's native `loadDNSconfig0` reads these via Windows' IP Helper
+/// API (`GetNetworkParams`). We don't wrap that API, but publishing an empty
+/// nameserver list (the prior behavior) makes `com.sun.jndi.dns.DnsClient`
+/// fall back to its own hardcoded default of querying `127.0.0.1:53` — and
+/// since nothing listens there, that query can only time out or fail with a
+/// communication error, never the clean NXDOMAIN response
+/// (`DnsWithResponseCodeException` with response code 3) that
+/// mongo-java-driver's `DefaultDnsResolver.resolveAdditionalQueryParametersFromTxtRecords`
+/// specifically tolerates. Real HotSpot instead queries the actual
+/// OS-configured server, which answers (even if just NXDOMAIN for a
+/// non-existent TXT record). Shell out to `ipconfig /all` and parse its
+/// "DNS Servers" lines as a pragmatic stand-in for the IP Helper API so
+/// CratonVM's JNDI DNS client reaches the same real, responsive server
+/// HotSpot does. Falls back to an empty string (prior behavior) if
+/// `ipconfig` is unavailable or unparsable — never fatal.
+fn os_dns_nameservers_string() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let output = match std::process::Command::new("ipconfig").arg("/all").output() {
+            Ok(o) if o.status.success() => o,
+            _ => return String::new(),
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut servers = Vec::new();
+        let mut collecting = false;
+        // Label lines ("   DNS Servers . . . . . : 1.2.3.4") sit at a small
+        // indent; continuation lines carrying additional server addresses
+        // are indented much further ("                          fe80::1%16").
+        // Distinguish by indent depth rather than by colon-presence — an
+        // IPv6 continuation value itself contains colons and would
+        // otherwise be misread as a new "label: value" line, dropping any
+        // real servers listed after it.
+        const CONTINUATION_INDENT: usize = 10;
+        for raw_line in text.lines() {
+            let indent = raw_line.len() - raw_line.trim_start().len();
+            let line = raw_line.trim();
+            if collecting && indent >= CONTINUATION_INDENT && !line.is_empty() {
+                // A zone-qualified link-local address (`fe80::1%16`) isn't a
+                // usable destination without also carrying the scope id
+                // through our UDP layer — skip it and keep collecting.
+                if let Some(host) = strip_zone_id(line) {
+                    if host.parse::<std::net::IpAddr>().is_ok() {
+                        servers.push(host.to_string());
+                    }
+                }
+                continue;
+            }
+            collecting = false;
+            if let Some(idx) = line.find(':') {
+                let (label, value) = line.split_at(idx);
+                if label.to_ascii_lowercase().contains("dns servers") {
+                    collecting = true;
+                    let value = value[1..].trim();
+                    if let Some(host) = strip_zone_id(value) {
+                        if host.parse::<std::net::IpAddr>().is_ok() {
+                            servers.push(host.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        servers.join(" ")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        String::new()
+    }
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // ModifiedClassPathClassLoader can legitimately materialize a second
     // Spring-core namespace. Spring's package-private Adapt.isIn helper is
@@ -38523,7 +38644,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "os_searchlist",
                 Value::Object(Some(searchlist)),
             );
-            let nameservers = ctx.create_string("");
+            let nameservers = ctx.create_string(&os_dns_nameservers_string());
             ctx.set_static_field_by_name(
                 "sun/net/dns/ResolverConfigurationImpl",
                 "os_nameservers",
@@ -38543,7 +38664,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "os_searchlist",
                 Value::Object(Some(searchlist)),
             );
-            let nameservers = ctx.create_string("");
+            let nameservers = ctx.create_string(&os_dns_nameservers_string());
             ctx.set_static_field_by_name(
                 "sun/net/dns/ResolverConfigurationImpl",
                 "os_nameservers",
@@ -44108,6 +44229,41 @@ fn native_springboot_mongo_reactive_customizer_destroy(
             ctx,
             &[Value::Object(Some(event_loop_group))],
         )?;
+        // `shutdownGracefully` only CASes the group into ST_SHUTTING_DOWN
+        // synchronously; the ST_SHUTDOWN transition `isShutdown()` observes
+        // happens later, on the event-loop thread's own run loop noticing
+        // the zero quiet period has already elapsed. That's asynchronous
+        // relative to this (Spring's context-close) thread, so a caller
+        // that checks `isShutdown()` immediately after `destroy()` returns
+        // (e.g. `MongoReactiveAutoConfigurationTests
+        // .nettyTransportSettingsAreConfiguredAutomatically`) can observe
+        // `false` even though shutdown was correctly requested. Poll for
+        // the real transition with a bound instead of the stale
+        // `awaitUninterruptibly()` this bridge exists to avoid — bounded so
+        // a pathological group that never confirms still can't hang context
+        // destruction. Use `ctx.park` (the VM-cooperative wait also used by
+        // e.g. `LockSupport.park`), not `std::thread::sleep`: a raw OS sleep
+        // here starves the event-loop thread of whatever this thread holds
+        // while blocked, so the poll always loses the race and hits the
+        // deadline instead of observing the transition. Traced empirically:
+        // a freshly-created, never-used group's `isShutdown()` flips true in
+        // ~200ms, but a group that actually attempted Mongo connections
+        // takes ~1.6-2.5s — its child event loops have live/pending channel
+        // state from those attempts to unwind first, not just an idle
+        // selector to notice the zero quiet period. Bound generously above
+        // that observed range so the common case still converges well
+        // inside it and only a truly pathological group hits the cap.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4000);
+        loop {
+            let is_shutdown = matches!(
+                ctx.invoke_virtual(event_loop_group, "isShutdown", "()Z", &[])?,
+                Some(Value::Int(v)) if v != 0
+            );
+            if is_shutdown || std::time::Instant::now() >= deadline {
+                break;
+            }
+            ctx.park(Some(std::time::Duration::from_millis(5)));
+        }
         ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(None));
     }
     Ok(None)
