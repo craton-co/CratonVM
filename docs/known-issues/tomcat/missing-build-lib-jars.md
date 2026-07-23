@@ -1,7 +1,21 @@
 # Missing `output/build/lib/*.jar` — 1 class
 
-**Not a CratonVM bug.** Fails identically on real JDK 25 (HotSpot) in the
-same fixture.
+> ✅ **RESOLVED, 2026-07-23** (and turned out to matter far more broadly than
+> just `TestTomcatNoServer` — see below). `cd /data/data/apps/tomcat &&
+> JAVA_HOME=/home/victor/jdk25 ant deploy` (5 seconds, `BUILD SUCCESSFUL`)
+> populated `output/build/lib/` with all 32 expected jars
+> (`tomcat-util.jar`, `catalina.jar`, `tomcat-coyote.jar`, etc.).
+> `TestTomcatNoServer` now passes on both VMs. **This same fix was actually
+> the real blocker for most of the 8 classes documented in
+> [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md)**
+> — that doc's original root-cause guess (a missing `conf/Catalina/localhost/`
+> directory) was wrong; the missing `lib/` jars were the actual cause of
+> most of those `LifecycleException`s. See that doc's correction note and
+> [regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md)
+> for the 6 classes that turned out to be real CratonVM regressions once
+> this was fixed.
+
+**Not a CratonVM bug** (the missing-jars gap itself).
 
 ## Symptom
 

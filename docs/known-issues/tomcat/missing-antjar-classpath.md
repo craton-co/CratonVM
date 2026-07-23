@@ -1,7 +1,17 @@
 # Missing `org.apache.tools.ant` on the Linux test classpath — 2 classes
 
-**Not a CratonVM bug.** Fails identically on real JDK 25 (HotSpot) in the
-same fixture.
+> ✅ **RESOLVED, 2026-07-23.** Appended `/usr/share/java/ant.jar` +
+> `/usr/share/java/ant-launcher.jar` (already installed via the host's `ant`
+> apt package — no download needed) to `.suite/cp-linux-fixed.txt`.
+> `TestJspC` now passes on both VMs. **`TestDeployTask` now reveals a real,
+> separate CratonVM regression** (unrelated to the classpath fix): a `%20`
+> in a file path isn't decoded back to a space when resolving a `file:` URL
+> to read a jar, so `dir%20with%20spaces/context.jar` 404s even though
+> `dir with spaces/context.jar` exists on disk. See
+> [regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md).
+
+**Not a CratonVM bug** (the classpath gap itself). Fails identically on real
+JDK 25 (HotSpot) in the same fixture.
 
 ## Symptom
 
