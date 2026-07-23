@@ -2236,6 +2236,60 @@ fn count_descriptor_params(desc: &str) -> i32 {
     c
 }
 
+// Real CGLIB's `AbstractClassGenerator` caches a generated proxy class per
+// (superclass, callback/config) key and returns the SAME `Class` for a
+// repeat `Enhancer.createClass()` of an identical configuration, rather
+// than emitting a fresh numbered subclass every time. Without this,
+// re-synthesising a lookup/replace-override subclass for the exact same
+// bean class + override config (e.g. a fresh `DefaultListableBeanFactory`
+// reloading the identical XML bean definitions, as
+// XmlBeanFactoryTests.methodInjectedBeanMustBeOfSameEnhancedCglibSubclassTypeAcrossBeanFactories
+// does 10 times in a loop) produced a DIFFERENT `$$SpringCGLIB$$<n>` name
+// each time (the shared `ENHANCER_COUNTER` just kept incrementing), even
+// though callers reasonably expect `ClassUtils.isCglibProxyClass` +
+// repeated-identical-config enhancement to be stable across separate
+// `BeanFactory` instances, exactly like real CGLIB.
+fn lookup_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lookup_method_spec_cache_key(specs: &[crate::cglib_enhancer::LookupMethodSpec]) -> String {
+    specs
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                s.name,
+                s.descriptor,
+                s.return_internal,
+                s.bean_name.as_deref().unwrap_or(""),
+                s.is_lookup
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn replace_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn replace_method_spec_cache_key(specs: &[crate::cglib_enhancer::ReplaceMethodSpec]) -> String {
+    specs
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}",
+                s.name, s.descriptor, s.replacer_bean_name, s.declaring_internal
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+
 /// bug-B2: method-injection (`<lookup-method>` / `@Lookup`). A lookup-method
 /// bean is declared on an ABSTRACT class; the old shim refused to instantiate
 /// abstract classes and returned null → "Target object must not be null". Real
@@ -2492,15 +2546,29 @@ fn try_build_method_injection(
         return None; // no abstract methods to implement → ordinary path
     }
 
-    let (new_name, bytes) = crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
-    let opts = DefineClassFull {
-        override_name: Some(new_name.clone()),
-        skip_verification: true,
-        ..Default::default()
+    let cache_key = (super_cid.as_u32(), lookup_method_spec_cache_key(&specs));
+    let cached_name = lookup_override_subclass_cache()
+        .lock()
+        .get(&cache_key)
+        .cloned();
+    let new_name = if let Some(name) = cached_name {
+        name
+    } else {
+        let (new_name, bytes) =
+            crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
+        let opts = DefineClassFull {
+            override_name: Some(new_name.clone()),
+            skip_verification: true,
+            ..Default::default()
+        };
+        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+            return None;
+        }
+        lookup_override_subclass_cache()
+            .lock()
+            .insert(cache_key, new_name.clone());
+        new_name
     };
-    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
-        return None;
-    }
     let inst = match ctx.new_object(&new_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
@@ -2850,19 +2918,32 @@ fn try_build_replace_override(
     // comment). Our own synthesised classes are always named
     // "<original>$$SpringCGLIB$$LM<n>" / "...$$RM<n>".
     let own_bean_factory_field = !super_internal.contains("$$SpringCGLIB$$");
-    let (new_name, bytes) = crate::cglib_enhancer::build_replace_override_subclass(
-        &super_internal,
-        &specs,
-        own_bean_factory_field,
-    );
-    let opts = DefineClassFull {
-        override_name: Some(new_name.clone()),
-        skip_verification: true,
-        ..Default::default()
+    let cache_key = (super_cid.as_u32(), replace_method_spec_cache_key(&specs));
+    let cached_name = replace_override_subclass_cache()
+        .lock()
+        .get(&cache_key)
+        .cloned();
+    let new_name = if let Some(name) = cached_name {
+        name
+    } else {
+        let (new_name, bytes) = crate::cglib_enhancer::build_replace_override_subclass(
+            &super_internal,
+            &specs,
+            own_bean_factory_field,
+        );
+        let opts = DefineClassFull {
+            override_name: Some(new_name.clone()),
+            skip_verification: true,
+            ..Default::default()
+        };
+        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+            return None;
+        }
+        replace_override_subclass_cache()
+            .lock()
+            .insert(cache_key, new_name.clone());
+        new_name
     };
-    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
-        return None;
-    }
     let inst = match ctx.new_object(&new_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
