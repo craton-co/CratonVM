@@ -25669,7 +25669,7 @@ fn force_native_over_real_jdk_bytecode(
     // methods read compact-string fields that do not exist on our synthetic
     // char[]-backed builders, so all registered layout operations must resolve
     // through their native implementations.
-    if is_string_builder_layout_native_override(class_name, method_name) {
+    if is_string_builder_layout_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_undertow_native_override(class_name, method_name, method_descriptor) {
@@ -27730,26 +27730,72 @@ fn redefine_immune_reflection_native(class_name: &str, method_name: &str) -> boo
 pub(crate) fn is_string_builder_layout_native_override(
     class_name: &str,
     method_name: &str,
+    method_descriptor: &str,
 ) -> bool {
-    matches!(
+    if !matches!(
         class_name,
         "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
-    ) && matches!(
+    ) {
+        return false;
+    }
+    if matches!(
         method_name,
         // Keep this deliberately narrow: these direct JDK bodies read the
         // incompatible compact-string layout on synthetic builders. Other
         // operations keep their established dispatch to avoid turning the
         // high-volume AOT code-generation path into an all-native slow path.
-        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "length" | "toString"
-    )
+        //
+        // `setCharAt` joined this list once the invoke-cache redefine guards
+        // became precise enough to actually evict a stale native shadow for
+        // a genuinely real (non-mock) StringBuilder after an UNRELATED
+        // Mockito.mock(StringBuilder.class) redefined the class elsewhere in
+        // the process: real `AbstractStringBuilder.setCharAt`'s bytecode
+        // writes through `String.checkIndex` against the compact
+        // byte[]/coder layout, which CratonVM's synthetic builder doesn't
+        // have, so it AIOOBE'd instead of writing the synthetic char[].
+        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "setCharAt"
+            | "toString"
+    ) {
+        return true;
+    }
+    // `length()` is deliberately NOT blanket-immune (unlike its siblings
+    // above): `MockitoBeanByTypeLookup*IntegrationTests` explicitly
+    // `verify(mock, times(1)).length()`s a Mockito-mocked StringBuilder,
+    // which only works if `length()` can route through the woven advice for
+    // a mock receiver. A genuinely real receiver is instead re-forced native
+    // by `intercept_force_registered_native`'s per-call, per-INSTANCE
+    // "field 0 (buffer) non-null" check -- mirroring the
+    // `java/net/HttpURLConnection` real-carrier exemption below -- so real
+    // `StringBuilder.length()` still reads the synthetic layout correctly
+    // instead of misreading real JDK's incompatible compact-string
+    // `count` field offset (silently returned 0 instead of the real length
+    // when this was tried as a blanket immune-list removal).
+    // `substring(int, int)` -- deliberately excludes `substring(int)`.
+    // `substring(int)` must stay evictable: `MockitoBeanByTypeLookup*
+    // IntegrationTests` explicitly stubs/verifies `.substring(anyInt())`
+    // on a Mockito-mocked StringBuilder, which only works if the redefine
+    // guards can drop this method's native shadow so the woven advice
+    // actually runs (see the `Native{}` cache-hit redefine guard). But
+    // `substring(int, int)`'s native shadow needs the SAME layout-safety
+    // forcing as `setCharAt` above for a REAL (non-mock) receiver: Mockito
+    // itself calls `new StringBuilder(...).substring(start, end)` inside
+    // `StringUtil.join` (`Reporter.unfinishedVerificationException`'s
+    // message formatting) on its own internal, never-mocked StringBuilder,
+    // and once ANY StringBuilder in the process gets Mockito-redefined,
+    // real `AbstractStringBuilder.substring(int,int)` bytecode AIOOBE'd
+    // reading the incompatible compact layout -- masking the ACTUAL
+    // "unfinished verification" failure behind a crash in the exception
+    // message it was trying to construct. No test in this suite stubs or
+    // verifies the two-arg overload, so forcing it native is safe.
+    method_name == "substring" && method_descriptor == "(II)Ljava/lang/String;"
 }
 
 fn redefine_immune_string_builder_native(
     class_name: &str,
     method_name: &str,
-    _method_descriptor: &str,
+    method_descriptor: &str,
 ) -> bool {
-    is_string_builder_layout_native_override(class_name, method_name)
+    is_string_builder_layout_native_override(class_name, method_name, method_descriptor)
 }
 
 fn redefine_immune_path_native(
@@ -28127,6 +28173,45 @@ fn intercept_force_registered_native(
     // stubbing/verification. Deliberately not narrowed to a specific method
     // allowlist: any native registered on this class for a real carrier is
     // safe to force, since the receiver check alone already gates out mocks.
+    // StringBuilder/StringBuffer/AbstractStringBuilder `length()`: real-carrier
+    // re-force, mirroring the HttpURLConnection block below. `length()` was
+    // removed from `is_string_builder_layout_native_override`'s blanket
+    // immune list so a Mockito-mocked receiver's `length()` call routes
+    // through the woven advice (required for `verify(mock).length()` to see
+    // the invocation and clear Mockito's pending-verification state -- see
+    // `is_string_builder_layout_native_override`'s doc comment). A genuinely
+    // real StringBuilder's `length()` must still hit the native: real JDK's
+    // `AbstractStringBuilder.length()` bytecode reads a `count` field at an
+    // offset that assumes the incompatible compact byte[]/coder layout, not
+    // CratonVM's synthetic char[]-backed one. Field 0 (the char[] buffer) is
+    // populated only once `<init>` has actually run; a Mockito mock is
+    // Objenesis-constructed (no constructor ever runs), so field 0 stays
+    // null there and this exemption never fires for an actual mock.
+    if matches!(
+        class_name,
+        "java/lang/StringBuilder" | "java/lang/StringBuffer" | "java/lang/AbstractStringBuilder"
+    ) && method_name == "length"
+        && method_descriptor == "()I"
+        && matches!(
+            args.first(),
+            Some(Value::Object(Some(receiver)))
+                if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
+        )
+    {
+        if let Some(callback) = shared.native_methods.find(class_name, method_name, method_descriptor) {
+            return Some((|| {
+                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result {
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                    )?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                }
+                Ok(CachedCallResult::Handled)
+            })());
+        }
+    }
     if class_name == "java/net/HttpURLConnection"
         && matches!(
             args.first(),
@@ -37639,6 +37724,47 @@ fn execute_invokevirtual_cached(
                 return Ok(CachedCallResult::CacheMiss);
             }
         }
+        // `Native` (the invokespecial/invokestatic direct-callback target --
+        // see "Static cache entries: invokespecial uses Bytecode/Native"
+        // below, since this function also serves invokespecial) carries no
+        // `receiver_class_id` field, so the shadow_cid check above can never
+        // catch it. `execute_invokestatic_cached` already resolves the CP
+        // method-ref's owning class name and consults
+        // `native_shadow_suppressed_by_redefine` to evict exactly this kind
+        // of stale shadow for invokestatic; this function never did the same
+        // for invokespecial. Concretely: Mockito's inline mock maker weaves
+        // `AbstractStringBuilder.substring(int)`'s OWN body while
+        // `StringBuilder.substring(int)`'s compiler-generated bridge still
+        // forwards to it via `invokespecial`; `native_sb_substring` stays
+        // registered on `AbstractStringBuilder` forever, so once this
+        // invokespecial call site cached `Native` (warmed right after call
+        // #1's correct, uncached dispatch), it was never evicted --
+        // call #2 onward silently ran the native (real, empty-buffer)
+        // implementation instead of Mockito's woven advice.
+        if matches!(&target, CachedInvokeTarget::Native { .. }) {
+            if let Ok((mcn, mn, desc, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+                // Mirror `receiver_redefined` (populate_virtual_invoke_cache /
+                // execute_invokevirtual_vtable_fast): a plain
+                // `native_shadow_suppressed_by_redefine` call has no idea
+                // about the redefine-immune allowlists, so without these it
+                // would evict e.g. `setCharAt`'s native shadow for a
+                // genuinely real, non-mock `StringBuilder` the instant ANY
+                // StringBuilder anywhere in the process got Mockito-mocked
+                // (real bytecode reads the incompatible compact byte[]/coder
+                // layout -- see `is_string_builder_layout_native_override` --
+                // and crashes with ArrayIndexOutOfBoundsException).
+                if native_shadow_suppressed_by_redefine(shared, &mcn)
+                    && !redefine_immune_reflection_native(&mcn, &mn)
+                    && !redefine_immune_string_builder_native(&mcn, &mn, &desc)
+                    && !redefine_immune_path_native(&mcn, &mn, &desc)
+                {
+                    thread
+                        .invoke_cache
+                        .evict(caller_class_id, cp_index, is_special);
+                    return Ok(CachedCallResult::CacheMiss);
+                }
+            }
+        }
     }
     // [PB-DIAG] one-shot dump for InfoCmp.getInfoCmp at pc 38
     if crate::runtime::env_cache::dbg_pbstart() {
@@ -38621,7 +38747,38 @@ fn populate_virtual_invoke_cache(
             && method_name.as_ref() == "execute"
             && descriptor.as_ref() == "(Ljava/lang/Runnable;)V"
             && threadpool_executor_has_real_workers(shared, receiver_value);
-        let direct_native_callback = if native_signature_may_exist && !is_real_tpe_execute {
+        // JVMTI redefine guard: this direct-native-override lookup has no
+        // awareness of JVMTI `redefineClasses` -- unlike the SLOW,
+        // uncached dispatch path (`intercept_force_registered_native` /
+        // `should_force_registered_native_over_bytecode`), which correctly
+        // cedes to a redefined class's woven bytecode. A Mockito inline
+        // mock of e.g. `StringBuilder` redefines BOTH `StringBuilder` and
+        // `AbstractStringBuilder` in place (advice woven into
+        // `substring(int)`'s own body) while `native_sb_substring` stays
+        // registered on both class names forever. Call #1 at a fresh call
+        // site takes the slow path (correct: runs the woven advice), but
+        // this populate step -- run to warm the cache for next time --
+        // still matched the always-present native registration and cached
+        // it as `VirtualNative`, with nothing to notice the receiver had
+        // already been redefined. Every call #2+ then hit that cached
+        // native directly, silently skipping Mockito's advice and running
+        // the real (empty-buffer) implementation instead of the stubbed
+        // answer. Mirrors the `receiver_redefined` guard in
+        // `execute_invokevirtual_vtable_fast` -- `is_string_builder_layout_native_override`'s
+        // methods (append/charAt/delete/getChars/insert/length/toString/
+        // <init>) stay forced-native even after redefine because their real
+        // JDK bodies assume a compact byte[]/coder layout CratonVM's
+        // synthetic StringBuilder doesn't have; `substring` is deliberately
+        // NOT in that list; it (RE-)validated the SAME cache before this fix.
+        let receiver_redefined = crate::classloading::any_class_redefined()
+            && cm.class_redefine_generation(receiver_class_id) > 0
+            && !redefine_immune_reflection_native(&lookup_name, &method_name)
+            && !redefine_immune_string_builder_native(&lookup_name, &method_name, &descriptor)
+            && !redefine_immune_path_native(&lookup_name, &method_name, &descriptor);
+        let direct_native_callback = if native_signature_may_exist
+            && !is_real_tpe_execute
+            && !receiver_redefined
+        {
             shared
                 .native_methods
                 .find(&lookup_name, &method_name, &descriptor)

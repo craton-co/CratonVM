@@ -17135,6 +17135,7 @@ fn invoke_on_class_shared_inner(
                         || crate::runtime::interpreter::is_string_builder_layout_native_override(
                             class_name,
                             method_name,
+                            descriptor,
                         )
                         // Keep in sync with interpreter.rs's
                         // `force_native_over_real_jdk_bytecode` entry for the
