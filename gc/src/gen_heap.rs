@@ -2519,6 +2519,29 @@ impl GenerationalHeap {
             return;
         }
         debug_assert!(index < self.get_header(obj_ref).num_slots as usize);
+        // FIELD-WATCH (TestUpgrade RootReference/MVMap residual, software
+        // watchpoint — see cratonvm_types::field_watch and
+        // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md).
+        // Zero cost unless CRATONVM_DBG_FIELD_WATCH is set AND obj_ref was
+        // explicitly registered via field_watch::watch() at construction.
+        // Every write is reported (not deduped) — a count reaching 2 for a
+        // `final` field is the direct signal we're chasing.
+        if cratonvm_types::field_watch::is_watched(obj_ref) {
+            let count = cratonvm_types::field_watch::record_write(obj_ref, index);
+            let old = self.get_field(obj_ref, index);
+            let (class_name, _) = crate::gc::resolve_class_info(header.class_id.as_u32())
+                .unwrap_or_else(|| ("<unresolved>".to_string(), 0));
+            eprintln!(
+                "[FIELD-WATCH] obj={:p} class={} index={} write_count={} old={:?} new={:?} thread={}",
+                obj_ref.as_ptr(),
+                class_name,
+                index,
+                count,
+                old,
+                value,
+                std::thread::current().name().unwrap_or("?"),
+            );
+        }
         // Compact reference-field layout: store reference fields as 8-byte
         // pointers; primitive fields stay 16-byte cells. The write barrier fires
         // in every arm (card-mark old→young + SATB), same as the legacy path.

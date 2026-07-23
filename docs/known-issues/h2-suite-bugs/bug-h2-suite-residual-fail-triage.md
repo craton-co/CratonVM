@@ -1700,5 +1700,95 @@ continues to reproduce in well under 5 minutes. All tracing
 each with `/slow`, `/bc`, `/vbc`, `/vtfast` variants as applicable) is left
 in the tree, gated behind the existing env var, zero cost when unset.
 
+
+
+### Same-session addendum #5 (debugger-equivalent approach): direct
+### bytecode-level field write/retarget tracing — both come back clean;
+### the "corrupting event" from addendum #1 is now in doubt
+
+`rr` is not installed on the Azure host and its hardware-perf-counter
+requirements are unreliable on this class of cloud VM
+(`/proc/sys/kernel/perf_event_paranoid=4`); `gdb` is available but setting a
+hardware watchpoint requires knowing the exact heap byte-offset of
+`Page.map`/`RootReference.root` for this custom object layout in advance,
+and — more fundamentally — a raw memory watchpoint can't survive a moving
+GC relocating the object mid-run anyway. Implemented the equivalent
+entirely in Rust instead, at the two places semantically load-bearing for
+"is a `final` field ever written more than once, and is the cross-loader
+index-retargeting logic that field reads/writes go through ever wrong":
+
+**1. Direct `putfield` tracing, unconditional, at the actual bytecode
+execution point** (`Instruction::Putfield`'s real write call in
+`interpreter.rs`, not a construction-site guess) — logs every write to any
+`Page`/`RootReference` field, with a running per-`(object, field_index)`
+write count. **30,761 writes captured in a full run. `field_index=0`
+(confirmed, by inspecting the raw log, to be `Page.map` and
+`RootReference.root` respectively — each class's first declared field) was
+written more than once for exactly zero objects.** 594 `(object, index)`
+pairs total received more than one write across the whole run, all on
+other (legitimately-mutable, e.g. `Page.pos`/`pageNo`/`memory`,
+`RootReference.previous`) fields — none on `map`/`root`. This is a
+definitive, bytecode-level, exhaustive refutation of "a `final` field gets
+overwritten a second time" for both fields, for the entire run — not
+merely "every construction site I checked was clean" (addenda #2/#4) but
+"every actual write, from any code path whatsoever, was clean."
+
+**2. Traced `retarget_instance_field_to_receiver`** — a pre-existing
+function (not written this session) that fires exactly when a `getfield`/
+`putfield`'s CACHED field resolution (`declaring_class_id`) doesn't match
+the ACTUAL receiver's class — i.e. precisely the cross-loader-mismatch
+shape this whole investigation has chased, for FIELD access specifically
+(the invoke-dispatch equivalent of everything fixed/ruled out earlier).
+This was a strong candidate: if its receiver-hierarchy walk ever computed
+a wrong `field_index` for one loader's copy vs. the other, a `getfield`
+could silently read a completely different (but validly-typed-looking)
+field as if it were `map`/`root`. **53 retargeting events fired in a full
+run — every single one recomputed the identical index the cache already
+had** (`cp_index=81` / `field=root`, hit repeatedly with `cached_decl`
+alternating between the `UserDefined` and `Application` `RootReference`
+copies, always resolving to `field_index=0` either way). Zero index
+changes, zero misses, zero silent skips. This function is also exonerated.
+
+**Where this leaves the investigation**: every mechanism capable of making
+a `final` reference field hold the wrong value — construction-site
+argument passing (addenda #1/#2/#4, exhaustive), GC address staleness in
+both the argument-popping and receiver-peek windows (addendum #1/#3,
+fixed), private-`invokevirtual` loader resolution (addendum #1, fixed),
+and now the actual field write operation and its cross-loader index
+retargeting (this addendum, exhaustive) — has been checked and found
+sound. **This raises real doubt about whether addendum #1's single
+captured `compareAndSetRoot` event was ever a bug at all**, rather than a
+legitimate, transient artifact of `Upgrade.upgrade()`'s own migration
+logic (which the third pass already established genuinely constructs and
+holds references into BOTH the old and new `MVStore` simultaneously as
+part of normal operation). If every individual mechanical step between
+construction and that read is now proven correct, the anomaly reported
+there deserves to be treated as unconfirmed rather than as the found root
+cause.
+
+**Recommended next step, a genuinely different angle from six-plus passes
+of VM-internals tracing**: stop looking for a CratonVM mechanism bug and
+instead determine whether this exact intermediate state
+(`Application`-context code transiently observing a `UserDefined`-loader
+`MVMap` via `RootReference.root.map`) is something H2's own
+`Upgrade.upgrade()` legitimately produces on **real HotSpot too** —
+temporarily instrument the same call sites (`RootReference.tryUpdate`,
+`MVMap.compareAndSetRoot`) via a Java agent or simple `System.err`
+prints in a local H2 checkout, run the identical `TestUpgrade` scenario
+under HotSpot, and see whether the same cross-store reference visibility
+ever occurs there (and if so, whether/how HotSpot's execution order
+prevents it from ever reaching a `hasChangesSince` call with the wrong
+`RootReference`, e.g. via a memory-ordering guarantee CratonVM's
+interpreter doesn't provide, or a scheduling/timing difference that just
+never lands two operations in the observed order on HotSpot). That answer
+determines whether this is a genuine CratonVM correctness bug still to be
+found (and where), or an H2-side assumption CratonVM's execution timing
+happens to violate.
+
+`CRATONVM_DBG_FIELD_WATCH=1 --nojit org.h2.test.unit.TestUpgrade`
+(putfield + retarget tracing, both unconditional and independent of the
+existing `CRATONVM_DBG_LOADER_TRACE`) reproduces in well under 5 minutes,
+alongside all prior tracing tags, all left in the tree.
+
 Fix commits (all three dispatch/GC-forwarding fixes plus the tracing
 additions) landed on `dev` via branch `fix/h2-testupgrade-round7-20260723`.
