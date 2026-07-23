@@ -1506,5 +1506,120 @@ continues to reproduce in well under 5 minutes; the new `[CASROOT-TRACE/*]`
 tags are left in the tree alongside `[TRYUPDATE-TRACE/*]`, both zero-cost
 when the env var is unset.
 
-Fix commits (both dispatch fixes plus this tracing) landed on `dev` via
-branch `fix/h2-testupgrade-round7-20260723`.
+
+
+### Same-session addendum #2: `Page` constructors and `copy(map, ...)` call
+### sites ruled out — corruption entry point still not pinned down
+
+Extended tracing to `Page`'s three constructors (`Page.java:131,135,140` —
+`<init>` calls, gated on `class_name.contains("Page")`), comparing each
+call's own class context against the `map` constructor argument's loader.
+**1542 constructor calls captured in a full run — zero mismatches.** Every
+`Application`-context `Page`/`Leaf`/`NonLeaf` construction receives an
+`Application` `map`; every `UserDefined`-context one receives a
+`UserDefined` `map`, without exception. `Page` construction itself is
+clean.
+
+Also read (not traced — structurally unambiguous) both call sites of the
+abstract `Page.copy(MVMap<K,V> map, boolean eraseChildrenRefs)`:
+`MVMap.java:650` (`root = root.copy(this, false)`) and `MVMap.java:1182`
+(`source.copy(this, true)`) both pass the **enclosing method's own `this`**
+as the `map` argument — this can't independently introduce a cross-loader
+value; a bug here would only be a symptom of the enclosing `MVMap` method
+already executing against the wrong receiver, which is a dispatch question
+already covered (and not found buggy) by this pass's earlier tracing. The
+six other `.copy()` call sites in `MVMap.java` are all the no-arg
+`Page.copy()` (→ `clone()`, already audited as loader-correct).
+
+**Net result of this pass's four tracing rounds** (`tryUpdate`,
+`compareAndSetRoot`, `Page.<init>`, `Page.copy()`'s call sites): the
+*single* concretely-caught corrupting event remains the one
+`compareAndSetRoot` call recorded in the first addendum above —
+`Application`-context code reading `this.root.map` (i.e. `Page.map` on
+whatever `Page` `RootReference.root` pointed to at that moment) and getting
+`UserDefined`'s `MVMap`. Every upstream construction/assignment path this
+pass checked is individually clean, which either means (a) the corrupting
+`Page` was legitimately constructed with the `UserDefined` `map` at some
+EARLIER point for a legitimate transient reason (H2's own migration logic
+touching both stores) and something fails to swap it out before it reaches
+`Application`'s live root chain — an H2-semantic/timing bug surfaced by
+CratonVM rather than a CratonVM dispatch bug per se — or (b) the actual
+mutation happens through a path not yet traced (e.g. `RootReference`'s
+`previous`-chain-walking constructor, which copies `r.root` directly rather
+than constructing a `Page`; or a `Page` field mutated post-construction via
+some non-`<init>` route this session didn't consider).
+
+**Not attempted this session, for whoever picks this up next**: trace
+`RootReference`'s "version change" constructor
+(`RootReference(RootReference<K,V> r, long version, int attempt)`,
+`RootReference.java`, the one that walks `r.previous`) — it's the one
+private constructor whose body reads a field (`r.root`) from its argument
+rather than only forwarding constructor parameters straight through, making
+it structurally different from the four already-clean `tryUpdate`-adjacent
+constructors this pass checked. Second: reconsider whether the bug is in H2
+itself (does the SAME migration sequence, run under a debugger or with
+extra logging on real HotSpot, ever transiently hold a stale old-store
+`Page` reference the way this trace shows CratonVM doing? If HotSpot
+provably never does, that argues for (b) above rather than (a)).
+
+
+
+### Same-session addendum #3: fixed a real receiver GC-forwarding gap too
+### (`peek_at` without forwarding) — also NOT sufficient, and this matters
+
+`execute_invokevirtual_vtable_fast` and three arms of
+`execute_invokevirtual_cached` (`VirtualBytecode`, `VirtualNative`,
+`Intrinsic`) all obtain the dispatch receiver via a bare
+`stack.peek_at(num_params)` and immediately call `shared.heap.class_id_of`/
+`kind_of` on it to pick the dispatch target — with **no**
+`load_and_forward` barrier, unlike `execute_invoke_kind`'s slow path (where
+the receiver is `args[0]`, covered by the args-forwarding loop). This is a
+real gap of the same shape as addendum #1's fix, and matters specifically
+because the compareAndSetRoot corruption (addendum #1) was caught via
+`[CASROOT-TRACE/vtfast]` — i.e. `execute_invokevirtual_vtable_fast`, one of
+the exact functions with this gap, dispatching on a receiver
+(`this.root.map`) obtained via two chained `getfield`s immediately before
+the call. Fixed by forwarding the receiver in all 4 sites. Verified
+harmless (`TestAlter`, `TestShell`, `TestLinkedTable` — clean) and a clean
+release build.
+
+**Also confirmed NOT sufficient to close `TestUpgrade`** — rebuilt, reran
+`--nojit`, identical `NoSuchMethodError` still reproduces. This is a
+meaningful negative result, not just another miss: it positively rules out
+the entire "stale from-space address" theory as the mechanism, for BOTH
+the argument-popping window (addendum #1) and the receiver-peek window
+(this addendum). The wrong `RootReference`/`MVMap` object reaching
+`compareAndSetRoot` is not a dangling/moved pointer being misread — it is
+a **genuinely live, correctly-allocated object of the wrong class**
+already sitting in the field/slot the interpreter reads. Every GC-timing
+hypothesis this doc's history has proposed (this session's addenda, and
+the sixth pass's cross-thread-race and stale-argument theories) is now
+either fixed-and-ruled-out or directly refuted. The bug is a **logic**
+error in which object ends up written where, not a **memory-safety**
+error in how an already-correct object reference is read.
+
+**Suggested different approach for whoever continues**: printf-style
+tracing keeps requiring a correct a-priori guess of which single call site
+to instrument, and this session burned 4 rounds (`tryUpdate`,
+`compareAndSetRoot`, `Page.<init>`, `Page.copy()`) narrowing without
+closing. Two structurally different approaches likely to be more
+productive from here:
+1. **Trace every write to `RootReference.root` / every write to
+   `Page.map`** unconditionally (not just at hand-picked call sites) for
+   the duration of a single `TestUpgrade` run, keyed by object identity, to
+   build a complete provenance chain for the ONE `Page` that ends up with
+   the wrong `map` — rather than checking individual call sites one at a
+   time on each pass.
+2. Actually run `Upgrade.upgrade()`'s migration logic under real HotSpot
+   with the same kind of instrumentation (temporarily patched into a local
+   H2 build) to see whether a transient old-store `Page` reference is
+   EVER legitimately reachable mid-migration on HotSpot too — this would
+   distinguish "CratonVM corrupts something H2 never exposes" from "H2
+   itself relies on some ordering/timing guarantee CratonVM does not
+   provide," which have very different fixes.
+
+`CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
+continues to reproduce in well under 5 minutes.
+
+Fix commits (all three dispatch/GC-forwarding fixes plus the tracing
+additions) landed on `dev` via branch `fix/h2-testupgrade-round7-20260723`.

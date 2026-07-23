@@ -19860,6 +19860,35 @@ fn execute_invoke_kind(
             args.get(2).map(describe).unwrap_or_default(),
         );
     }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_class_name.contains("Page")
+        && method_name.as_ref() == "<init>"
+    {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[PAGEINIT-TRACE/slow] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+            current_class_id,
+            cp_index,
+            method_descriptor,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+        );
+    }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
     // Preserve the enum member identity by its declaring binary name and enum
@@ -37031,6 +37060,16 @@ fn execute_invokevirtual_vtable_fast(
         }
         _ => return Ok(CachedCallResult::CacheMiss),
     };
+    // Refresh via the same GC-forwarding barrier applied to invoke args
+    // (see `refresh_stale_object_args`). This value came from a bare
+    // `peek_at` (not a `pop`), so while it's technically still visible to
+    // root-scanning on the operand stack, downstream consumers here
+    // (`class_id_of`/`kind_of` used to pick the dispatch target) are
+    // exactly the class-resolution step implicated in the TestUpgrade
+    // RootReference residual — refresh defensively before trusting it for
+    // dispatch. See docs/known-issues/h2-suite-bugs/
+    // bug-h2-suite-residual-fail-triage.md.
+    let receiver_obj = shared.heap.load_and_forward(receiver_obj);
 
     // Arrays go through java/lang/Object — don't dispatch via the
     // receiver's array-component vtable. Let the slow path handle it.
@@ -37959,6 +37998,12 @@ fn execute_invokevirtual_cached(
 
             match receiver_val {
                 Value::Object(Some(obj_ref)) => {
+                    // Refresh via the same GC-forwarding barrier as invoke
+                    // args (`refresh_stale_object_args`) — this receiver
+                    // came from a bare `peek_at`, not a `pop`. See
+                    // docs/known-issues/h2-suite-bugs/
+                    // bug-h2-suite-residual-fail-triage.md.
+                    let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -38389,6 +38434,12 @@ fn execute_invokevirtual_cached(
 
             match receiver_val {
                 Value::Object(Some(obj_ref)) => {
+                    // Refresh via the same GC-forwarding barrier as invoke
+                    // args (`refresh_stale_object_args`) — this receiver
+                    // came from a bare `peek_at`, not a `pop`. See
+                    // docs/known-issues/h2-suite-bugs/
+                    // bug-h2-suite-residual-fail-triage.md.
+                    let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -38525,6 +38576,12 @@ fn execute_invokevirtual_cached(
                 let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params_usize);
                 match receiver_val {
                     Value::Object(Some(obj_ref)) => {
+                        // Refresh via the same GC-forwarding barrier as
+                        // invoke args (`refresh_stale_object_args`) — this
+                        // receiver came from a bare `peek_at`, not a `pop`.
+                        // See docs/known-issues/h2-suite-bugs/
+                        // bug-h2-suite-residual-fail-triage.md.
+                        let obj_ref = shared.heap.load_and_forward(obj_ref);
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
                         if crate::jit::profile::is_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
@@ -38683,6 +38740,35 @@ fn execute_invokevirtual_cached(
                     "[TRYUPDATE-TRACE] caller_class_id={:?} cp_index={} post-refresh receiver(args[0])={} updated(args[1])={}",
                     caller_class_id,
                     cp_index,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                );
+            }
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("Page")
+                && cached.method_name.as_ref() == "<init>"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[PAGEINIT-TRACE/bc] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+                    caller_class_id,
+                    cp_index,
+                    cached.method_descriptor,
                     describe(&args_slice[0]),
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
